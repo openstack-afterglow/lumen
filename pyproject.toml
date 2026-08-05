@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Afterglow Lumen durable chat, LLM, and agent service"
 requires-python = ">=3.12"
 dependencies = [
-    "afterglow-crypto",
+    "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@aee36e8ea173e486f443fa816de4e6397d11cff2",
     "fastapi==0.125.0",
     "uvicorn[standard]==0.39.0",
     "openstacksdk==3.3.0",
@@ -54,8 +54,8 @@ lumen-api = "lumen.main:run"
 lumen-worker = "lumen.worker:main"
 lumen-migrate = "lumen.scripts.migrate:main"
 
-[tool.uv.sources]
-afterglow-crypto = { path = "../afterglow-crypto", editable = true }
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["lumen"]

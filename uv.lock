@@ -10,14 +10,11 @@ resolution-markers = [
 
 [[package]]
 name = "afterglow-crypto"
-version = "0.1.0"
-source = { editable = "../afterglow-crypto" }
+version = "0.1.1"
+source = { git = "https://github.com/openstack-afterglow/afterglow-crypto.git?rev=aee36e8ea173e486f443fa816de4e6397d11cff2#aee36e8ea173e486f443fa816de4e6397d11cff2" }
 dependencies = [
     { name = "cryptography" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "cryptography", specifier = ">=42.0.0" }]
 
 [[package]]
 name = "aiohappyeyeballs"
@@ -1377,7 +1374,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "afterglow-crypto", editable = "../afterglow-crypto" },
+    { name = "afterglow-crypto", git = "https://github.com/openstack-afterglow/afterglow-crypto.git?rev=aee36e8ea173e486f443fa816de4e6397d11cff2" },
     { name = "aiomysql", specifier = ">=0.2.0" },
     { name = "beautifulsoup4", specifier = "==4.14.3" },
     { name = "boto3", specifier = ">=1.35.0" },
