@@ -71,6 +71,8 @@ def _load_toml() -> dict[str, Any]:
             "keystone_domain": openstack.get("user_domain_name", "Default"),
             "keystone_region_name": openstack.get("region_name", "RegionOne"),
             "keystone_interface": openstack.get("interface", "internal"),
+            "insecure": openstack.get("insecure", False),
+            "os_cacert": openstack.get("cacert", ""),
         }
     database = data.get("database", {})
     cache = data.get("cache", {})

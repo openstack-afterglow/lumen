@@ -136,6 +136,8 @@ def test_lumen_maps_afterglow_openstack_section(monkeypatch):
                 "username": "lumen",
                 "project_name": "lumen-service",
                 "region_name": "RegionTwo",
+                "insecure": True,
+                "cacert": "/etc/ssl/certs/keystone-ca.pem",
             }
         },
     )
@@ -146,3 +148,5 @@ def test_lumen_maps_afterglow_openstack_section(monkeypatch):
     assert settings["keystone_admin_username"] == "lumen"
     assert settings["keystone_admin_project"] == "lumen-service"
     assert settings["keystone_region_name"] == "RegionTwo"
+    assert settings["insecure"] is True
+    assert settings["os_cacert"] == "/etc/ssl/certs/keystone-ca.pem"
