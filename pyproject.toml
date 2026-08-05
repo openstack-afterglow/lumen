@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lumen"
+version = "0.1.0"
+description = "Afterglow Lumen durable chat, LLM, and agent service"
+requires-python = ">=3.12"
+dependencies = [
+    "afterglow-crypto",
+    "fastapi==0.125.0",
+    "uvicorn[standard]==0.39.0",
+    "openstacksdk==3.3.0",
+    "keystoneauth1>=5.12.0",
+    "python-keystoneclient==5.4.0",
+    "jinja2==3.1.6",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.2",
+    "redis[hiredis]==5.0.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiomysql>=0.2.0",
+    "slowapi>=0.1.9",
+    "pyyaml>=6.0",
+    "httpx>=0.28.1",
+    "boto3>=1.35.0",
+    "litellm==1.93.0",
+    "mcp==1.28.1",
+    "jsonschema==4.26.0",
+    "beautifulsoup4==4.14.3",
+    "puremagic==1.30",
+    "Pillow==12.1.1",
+    "pypdf==6.7.3",
+    "mutagen==1.47.0",
+    "pgvector==0.4.2",
+    "langgraph==1.2.2",
+    "langchain-core==1.4.9",
+    "langgraph-checkpoint-postgres==3.1.0",
+    "psycopg[binary]==3.3.4",
+    "langchain-mcp-adapters==0.3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28.1",
+    "fakeredis[lua]>=2.21",
+    "ruff>=0.7.0",
+]
+
+[project.scripts]
+lumen-api = "lumen.main:run"
+lumen-worker = "lumen.worker:main"
+lumen-migrate = "lumen.scripts.migrate:main"
+
+[tool.uv.sources]
+afterglow-crypto = { path = "../afterglow-crypto", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["lumen"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "crypto: encryption-domain unit tests",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501", "B008", "B904", "SIM103", "SIM105", "SIM108"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B", "SIM", "E402"]
