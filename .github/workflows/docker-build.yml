@@ -1,18 +1,23 @@
 name: Docker Build & Push
 
 on:
+  pull_request:
+    branches: [main, dev]
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ['v*']
   workflow_dispatch:
-
 env:
   REGISTRY: ghcr.io
   IMAGE_OWNER: ${{ github.repository_owner }}
 
 jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
   build-and-push:
     name: Build & Push Lumen Images
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
