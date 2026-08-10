@@ -43,8 +43,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/lumen-api
           tags: |
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
+            type=sha,prefix=sha-
 
       - name: Build and push API
         uses: docker/build-push-action@v5
@@ -61,8 +63,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/lumen-worker
           tags: |
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
+            type=sha,prefix=sha-
 
       - name: Build and push Worker
         uses: docker/build-push-action@v5
