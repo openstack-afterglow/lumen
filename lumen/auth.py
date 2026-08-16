@@ -5,9 +5,16 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from fastapi import Depends, Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Request, Security
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
 from lumen.config import get_settings
+
+keystone_token_scheme = APIKeyHeader(name="X-Auth-Token", auto_error=False, scheme_name="KeystoneToken")
+keystone_bearer_scheme = HTTPBearer(auto_error=False, scheme_name="KeystoneBearer")
+
+api_key_bearer_scheme = HTTPBearer(auto_error=False, scheme_name="APIKeyBearer")
+x_api_key_scheme = APIKeyHeader(name="x-api-key", auto_error=False, scheme_name="XApiKey")
 
 _logger = logging.getLogger(__name__)
 _admin_role_id_cache: str | None = None
@@ -27,9 +34,9 @@ def cache_mode(
 
 
 def _get_admin_ks_client():
-    from keystoneclient.v3 import client as ks_client
-    from keystoneauth1.identity import v3
     from keystoneauth1 import session as ks_session
+    from keystoneauth1.identity import v3
+    from keystoneclient.v3 import client as ks_client
 
     settings = get_settings()
     auth = v3.Password(
@@ -80,8 +87,8 @@ def _is_system_admin(user_id: str) -> bool:
 
 def validate_token(token: str, project_id: str = "") -> dict:
     settings = get_settings()
-    from keystoneauth1.identity import v3
     from keystoneauth1 import session as ks_session
+    from keystoneauth1.identity import v3
 
     auth = v3.Token(
         auth_url=settings.keystone_auth_url,
@@ -95,33 +102,34 @@ def validate_token(token: str, project_id: str = "") -> dict:
         raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 Keystone 토큰입니다") from exc
 
     tok = tok_data.get("token", {})
-    user = tok.get("user", {})
-    proj = tok.get("project", {})
+    user = tok.get("user") or {}
+    proj = tok.get("project") or {}
     roles = [r.get("name", "") for r in tok.get("roles", [])]
 
     u_id = user.get("id", "")
+    p_id = proj.get("id", "")
+    if not p_id:
+        raise HTTPException(status_code=401, detail="Project-scoped Keystone token required")
     is_sys_admin = "admin" in roles and _is_system_admin(u_id)
-
     return {
         "user_id": u_id,
         "username": user.get("name", ""),
-        "project_id": proj.get("id", ""),
-        "project_name": proj.get("name", ""),
+        "project_id": p_id,
         "roles": roles,
         "is_system_admin": is_sys_admin,
     }
 
 
 async def require_token(
-    x_auth_token: str | None = Header(None, alias="X-Auth-Token"),
+    x_auth_token: str | None = Security(keystone_token_scheme),
+    bearer: HTTPAuthorizationCredentials | None = Security(keystone_bearer_scheme),
     x_project_id: str | None = Header(None, alias="X-Project-Id"),
-    authorization: str | None = Header(None, alias="Authorization"),
 ) -> dict:
     token = x_auth_token
-    if not token and authorization and authorization.startswith("Bearer "):
-        token = authorization[7:].strip()
+    if not token and bearer and bearer.credentials:
+        token = bearer.credentials.strip()
     if not token:
-        raise HTTPException(status_code=401, detail="X-Auth-Token 헤더가 필요합니다")
+        raise HTTPException(status_code=401, detail="X-Auth-Token 또는 Bearer 토큰이 필요합니다")
     try:
         info = validate_token(token, project_id=x_project_id or "")
         info["token"] = token
@@ -157,14 +165,14 @@ def require_chat_api_host(request: Request) -> None:
 
 async def get_api_key_info(
     request: Request,
-    authorization: str | None = Header(None),
-    x_api_key: str | None = Header(None),
+    bearer: HTTPAuthorizationCredentials | None = Security(api_key_bearer_scheme),
+    x_api_key: str | None = Security(x_api_key_scheme),
 ) -> dict:
     from lumen.services import api_key_store as aks
 
     raw = None
-    if authorization and authorization.startswith("Bearer "):
-        raw = authorization[7:].strip()
+    if bearer and bearer.credentials:
+        raw = bearer.credentials.strip()
     elif x_api_key:
         raw = x_api_key.strip()
     if not raw:

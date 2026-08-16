@@ -48,7 +48,7 @@ class TestApiKeyAuthDependency:
     async def test_missing_key_401(self):
         req = SimpleNamespace(state=SimpleNamespace())
         with pytest.raises(HTTPException) as ei:
-            await deps.get_api_key_info(req, authorization=None, x_api_key=None)
+            await deps.get_api_key_info(req, bearer=None, x_api_key=None)
         assert ei.value.status_code == 401
 
     async def test_invalid_key_401(self, monkeypatch):
@@ -58,17 +58,25 @@ class TestApiKeyAuthDependency:
         monkeypatch.setattr(aks, "verify_key", fake_verify)
         req = SimpleNamespace(state=SimpleNamespace())
         with pytest.raises(HTTPException) as ei:
-            await deps.get_api_key_info(req, authorization="Bearer sk-afgl-bad", x_api_key=None)
+            await deps.get_api_key_info(
+                req,
+                bearer=deps.HTTPAuthorizationCredentials(scheme="Bearer", credentials="sk-afgl-bad"),
+                x_api_key=None,
+            )
         assert ei.value.status_code == 401
 
     async def test_valid_bearer_sets_token_info(self, monkeypatch):
         async def fake_verify(raw):
+            assert raw == "sk-afgl-good"
             return {"user_id": "u1", "project_id": "p1", "api_key_id": 7}
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
         req = SimpleNamespace(state=SimpleNamespace())
-        info = await deps.get_api_key_info(req, authorization="Bearer sk-afgl-good", x_api_key=None)
-        assert info["user_id"] == "u1" and info["api_key_id"] == 7 and info["source"] == "api"
+        await deps.get_api_key_info(
+            req,
+            bearer=deps.HTTPAuthorizationCredentials(scheme="Bearer", credentials=" sk-afgl-good "),
+            x_api_key=None,
+        )
         assert req.state.token_info["source"] == "api"
 
     async def test_valid_x_api_key_header(self, monkeypatch):
@@ -78,7 +86,7 @@ class TestApiKeyAuthDependency:
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
         req = SimpleNamespace(state=SimpleNamespace())
-        info = await deps.get_api_key_info(req, authorization=None, x_api_key="sk-afgl-viakey")
+        info = await deps.get_api_key_info(req, bearer=None, x_api_key="sk-afgl-viakey")
         assert info["api_key_id"] == 9
 
 

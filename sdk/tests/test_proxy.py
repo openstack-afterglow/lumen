@@ -57,12 +57,27 @@ JSON_METHOD_TABLE = [
         {"message_id": 3},
         None,
     ),
-
     # -- Completions & Runs --
-    ("create_completion", ("conv-1",), {"model": "gpt-4"}, "POST", "/v1/conversations/conv-1/completions", {"model": "gpt-4"}, None),
+    (
+        "create_completion",
+        ("conv-1",),
+        {"model_id": 1, "parts": [{"type": "text", "text": "hello"}]},
+        "POST",
+        "/v1/conversations/conv-1/completions",
+        {"model_id": 1, "parts": [{"type": "text", "text": "hello"}]},
+        None,
+    ),
     ("regenerate_message", ("conv-1", 2), {}, "POST", "/v1/conversations/conv-1/messages/2/regenerate", None, None),
     ("retry_run", ("conv-1", "run-1"), {}, "POST", "/v1/conversations/conv-1/runs/run-1/retry", None, None),
-    ("temp_completion", (), {"model": "gpt-4"}, "POST", "/v1/temp-completions", {"model": "gpt-4"}, None),
+    (
+        "temp_completion",
+        (),
+        {"model_id": 1, "parts": [{"type": "text", "text": "hello"}]},
+        "POST",
+        "/v1/temp-completions",
+        {"model_id": 1, "parts": [{"type": "text", "text": "hello"}]},
+        None,
+    ),
     ("list_conversation_runs", ("conv-1",), {}, "GET", "/v1/conversations/conv-1/runs", None, None),
     ("get_temp_thread", ("temp-1",), {}, "GET", "/v1/temp-threads/temp-1", None, None),
     ("active_runs", (), {}, "GET", "/v1/runs", None, None),
@@ -70,28 +85,27 @@ JSON_METHOD_TABLE = [
     (
         "resolve_tool_approval",
         ("run-1", "call-1"),
-        {"approved": True},
+        {"decision": "approved"},
         "POST",
         "/v1/runs/run-1/approvals/call-1",
-        {"approved": True},
+        {"decision": "approved"},
         None,
     ),
     (
         "resolve_run_interaction",
         ("run-1", "inter-1"),
-        {"value": "ok"},
+        {"response": {"option_ids": [1]}},
         "POST",
         "/v1/runs/run-1/interactions/inter-1",
-        {"value": "ok"},
+        {"response": {"option_ids": [1]}},
         None,
     ),
     ("cancel_run", ("run-1",), {}, "POST", "/v1/runs/run-1/cancel", None, None),
-
     # -- Models & Capabilities --
-    ("discovery", (), {}, "GET", "/v1", None, None),
+    ("discovery", (), {}, "GET", "/v1/", None, None),
     ("models", (), {}, "GET", "/v1/models", None, None),
+    ("chat_models", (), {}, "GET", "/v1/chat/models", None, None),
     ("capabilities", (), {"model_id": 1}, "GET", "/v1/capabilities", None, {"model_id": 1}),
-
     # -- Agents --
     ("agents", (), {}, "GET", "/v1/agents", None, None),
     ("create_agent", (), {"name": "Agent1"}, "POST", "/v1/agents", {"name": "Agent1"}, None),
@@ -100,33 +114,38 @@ JSON_METHOD_TABLE = [
     ("update_agent", (1,), {"name": "Updated"}, "PATCH", "/v1/agents/1", {"name": "Updated"}, None),
     ("delete_agent", (1,), {}, "DELETE", "/v1/agents/1", None, None),
     ("clone_agent", (1,), {}, "POST", "/v1/agents/1/clone", None, None),
-
     # -- Workspaces --
     ("workspaces", (), {}, "GET", "/v1/workspaces", None, None),
     ("create_workspace", (), {"name": "WS1"}, "POST", "/v1/workspaces", {"name": "WS1"}, None),
     ("get_workspace", (1,), {}, "GET", "/v1/workspaces/1", None, None),
     ("update_workspace", (1,), {"name": "WS2"}, "PATCH", "/v1/workspaces/1", {"name": "WS2"}, None),
     ("delete_workspace", (1,), {}, "DELETE", "/v1/workspaces/1", None, None),
-
     # -- Memories --
     ("memories", (), {}, "GET", "/v1/memories", None, None),
     ("create_memory", (), {"content": "mem"}, "POST", "/v1/memories", {"content": "mem"}, None),
     ("search_memories", (), {"query": "mem"}, "POST", "/v1/memories/search", {"query": "mem"}, None),
     ("update_memory", (1,), {"content": "updated"}, "PATCH", "/v1/memories/1", {"content": "updated"}, None),
     ("delete_memory", (1,), {}, "DELETE", "/v1/memories/1", None, None),
-
     # -- Code Workspaces & Git Credentials --
     ("git_credentials", (), {}, "GET", "/v1/git-credentials", None, None),
     (
         "create_git_credential",
         (),
-        {"provider": "github"},
+        {"host": "github.com", "username": "git", "token": "secret"},
         "POST",
         "/v1/git-credentials",
-        {"provider": "github"},
+        {"host": "github.com", "username": "git", "token": "secret"},
         None,
     ),
-    ("update_git_credential", (1,), {"token": "abc"}, "PUT", "/v1/git-credentials/1", {"token": "abc"}, None),
+    (
+        "update_git_credential",
+        (1,),
+        {"username": "git", "token": "updated"},
+        "PUT",
+        "/v1/git-credentials/1",
+        {"username": "git", "token": "updated"},
+        None,
+    ),
     ("delete_git_credential", (1,), {}, "DELETE", "/v1/git-credentials/1", None, None),
     ("code_workspaces", (), {}, "GET", "/v1/code-workspaces", None, None),
     ("create_code_workspace", (), {"name": "code"}, "POST", "/v1/code-workspaces", {"name": "code"}, None),
@@ -141,12 +160,9 @@ JSON_METHOD_TABLE = [
         {"workspace_id": "cw-1"},
         None,
     ),
-
     # -- Assets --
-    ("upload_asset", (), {"name": "file.txt"}, "POST", "/v1/assets", {"name": "file.txt"}, None),
     ("get_asset", ("asset-1",), {}, "GET", "/v1/assets/asset-1", None, None),
     ("delete_asset", ("asset-1",), {}, "DELETE", "/v1/assets/asset-1", None, None),
-
     # -- Extensions, MCP & Custom Tools --
     ("mcp_servers", (), {}, "GET", "/v1/mcp-servers", None, None),
     ("create_mcp_server", (), {"url": "http://mcp"}, "POST", "/v1/mcp-servers", {"url": "http://mcp"}, None),
@@ -155,7 +171,6 @@ JSON_METHOD_TABLE = [
     ("mcp_server_oauth_status", (1,), {}, "GET", "/v1/mcp-servers/1/oauth", None, None),
     ("start_mcp_server_oauth", (1,), {}, "POST", "/v1/mcp-servers/1/oauth/start", None, None),
     ("disconnect_mcp_server_oauth", (1,), {}, "DELETE", "/v1/mcp-servers/1/oauth", None, None),
-    ("mcp_oauth_callback", (), {"code": "abc"}, "GET", "/v1/mcp-oauth/callback", None, {"code": "abc"}),
     ("custom_tools", (), {}, "GET", "/v1/custom-tools", None, None),
     ("create_custom_tool", (), {"name": "t1"}, "POST", "/v1/custom-tools", {"name": "t1"}, None),
     ("update_custom_tool", (1,), {"name": "t2"}, "PATCH", "/v1/custom-tools/1", {"name": "t2"}, None),
@@ -176,7 +191,6 @@ JSON_METHOD_TABLE = [
     ("admin_create_skill", (), {"name": "sk1"}, "POST", "/v1/admin/skills", {"name": "sk1"}, None),
     ("admin_update_skill", (1,), {"name": "sk2"}, "PATCH", "/v1/admin/skills/1", {"name": "sk2"}, None),
     ("admin_delete_skill", (1,), {}, "DELETE", "/v1/admin/skills/1", None, None),
-
     # -- Usage & API Keys --
     ("usage", (), {}, "GET", "/v1/usage", None, None),
     ("usage_timeseries", (), {"bucket": "day"}, "GET", "/v1/usage/timeseries", None, {"bucket": "day"}),
@@ -184,7 +198,6 @@ JSON_METHOD_TABLE = [
     ("api_keys", (), {}, "GET", "/v1/api-keys", None, None),
     ("create_api_key", (), {"name": "key1"}, "POST", "/v1/api-keys", {"name": "key1"}, None),
     ("revoke_api_key", (1,), {}, "DELETE", "/v1/api-keys/1", None, None),
-
     # -- Admin Providers, Models & Stats --
     ("admin_providers", (), {}, "GET", "/v1/admin/providers", None, None),
     ("admin_create_provider", (), {"name": "p1"}, "POST", "/v1/admin/providers", {"name": "p1"}, None),
@@ -263,20 +276,18 @@ STREAM_METHOD_TABLE = [
         None,
     ),
 ]
-TEXT_METHOD_TABLE = [
-    ("download_asset", ("asset-1",), "/v1/assets/asset-1/download"),
+OTHER_METHOD_TABLE = [
+    ("upload_asset", (), {"files": {"file": ("a.txt", b"data")}}, "POST", "/v1/assets"),
+    ("download_asset", ("asset-1",), {}, "GET", "/v1/assets/asset-1/download"),
 ]
 
-_PUBLIC_PROXY_METHODS = {
-    name for name, value in Proxy.__dict__.items()
-    if not name.startswith("_") and callable(value)
-}
+_PUBLIC_PROXY_METHODS = {name for name, value in Proxy.__dict__.items() if not name.startswith("_") and callable(value)}
 
 
 def test_route_tables_cover_every_public_proxy_method():
     """Regression guard: every public Proxy method must appear in exactly one route table."""
     covered = {row[0] for row in JSON_METHOD_TABLE}
-    covered |= {row[0] for row in TEXT_METHOD_TABLE}
+    covered |= {row[0] for row in OTHER_METHOD_TABLE}
     covered |= {row[0] for row in STREAM_METHOD_TABLE}
     assert covered == _PUBLIC_PROXY_METHODS
 
@@ -299,15 +310,32 @@ def test_json_methods_issue_expected_request(method_name, args, kwargs, http_met
     assert result == ({"ok": True} if status != 204 else None)
 
 
-@pytest.mark.parametrize("method_name,args,path", TEXT_METHOD_TABLE)
-def test_text_methods_return_raw_body(method_name, args, path):
+def test_upload_asset_sends_files_multipart():
     proxy = Proxy(session=MagicMock(), service_type="lumen")
-    proxy.request = MagicMock(return_value=_response(200, text="http://example.com/asset.png"))
+    proxy.request = MagicMock(return_value=_response(200, payload={"id": "asset-1"}))
 
-    result = getattr(proxy, method_name)(*args)
+    files = {"file": ("a.txt", b"hello", "text/plain")}
+    res = proxy.upload_asset(files=files)
 
-    proxy.request.assert_called_once_with(path, "GET", raise_exc=True)
-    assert result == "http://example.com/asset.png"
+    proxy.request.assert_called_once_with("/v1/assets", "POST", files=files, raise_exc=True)
+    assert res == {"id": "asset-1"}
+
+
+def test_download_asset_handles_307_contract():
+    proxy = Proxy(session=MagicMock(), service_type="lumen")
+    redirect_resp = SimpleNamespace(status_code=307, headers={"Location": "https://s3.example.com/asset-1"})
+    proxy.request = MagicMock(return_value=redirect_resp)
+
+    url = proxy.download_asset("asset-1", allow_redirects=False)
+    proxy.request.assert_called_once_with("/v1/assets/asset-1/download", "GET", allow_redirects=False, raise_exc=True)
+    assert url == "https://s3.example.com/asset-1"
+
+    content_resp = SimpleNamespace(status_code=200, content=b"asset-bytes", headers={})
+    proxy.request = MagicMock(return_value=content_resp)
+
+    content = proxy.download_asset("asset-1", allow_redirects=True)
+    proxy.request.assert_called_once_with("/v1/assets/asset-1/download", "GET", allow_redirects=True, raise_exc=True)
+    assert content == b"asset-bytes"
 
 
 @pytest.mark.parametrize("method_name,args,kwargs,http_method,path,body,params,headers", STREAM_METHOD_TABLE)
@@ -347,6 +375,8 @@ def test_run_events_resume_parameters():
         stream=True,
     )
     assert list(result) == lines
+
+
 def test_identifiers_are_escaped_as_single_path_segments():
     proxy = Proxy(session=MagicMock(), service_type="lumen")
     proxy.request = MagicMock(return_value=_response(200, payload={"ok": True}))
@@ -358,6 +388,7 @@ def test_identifiers_are_escaped_as_single_path_segments():
         "GET",
         raise_exc=True,
     )
+
 
 def test_completion_and_code_workspace_idempotency_headers():
     proxy = Proxy(session=MagicMock(), service_type="lumen")
@@ -380,6 +411,8 @@ def test_completion_and_code_workspace_idempotency_headers():
         headers={"Idempotency-Key": "ik-2"},
         raise_exc=True,
     )
+
+
 def test_service_description_constructs_with_required_service_type():
     description = LumenService()
     assert description.service_type == "lumen"

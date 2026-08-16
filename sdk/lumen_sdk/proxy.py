@@ -90,9 +90,7 @@ class Proxy(proxy.Proxy):
         return self._json_request("DELETE", f"/v1/conversations/{_segment(conversation_id)}")
 
     def set_conversation_workspace(self, conversation_id, **attrs):
-        return self._json_request(
-            "PATCH", f"/v1/conversations/{_segment(conversation_id)}/workspace", body=attrs
-        )
+        return self._json_request("PATCH", f"/v1/conversations/{_segment(conversation_id)}/workspace", body=attrs)
 
     def list_messages(self, conversation_id, **query):
         return self._json_request(
@@ -100,14 +98,10 @@ class Proxy(proxy.Proxy):
         )
 
     def set_active_leaf(self, conversation_id, **attrs):
-        return self._json_request(
-            "PATCH", f"/v1/conversations/{_segment(conversation_id)}/active-leaf", body=attrs
-        )
+        return self._json_request("PATCH", f"/v1/conversations/{_segment(conversation_id)}/active-leaf", body=attrs)
 
     def fork_conversation(self, conversation_id, **attrs):
-        return self._json_request(
-            "POST", f"/v1/conversations/{_segment(conversation_id)}/fork", body=attrs
-        )
+        return self._json_request("POST", f"/v1/conversations/{_segment(conversation_id)}/fork", body=attrs)
 
     # -- Completions & Runs ---------------------------------------------
 
@@ -157,14 +151,10 @@ class Proxy(proxy.Proxy):
         lei = last_event_id or query.pop("last_event_id", None)
         params = _query(after_seq=seq, **query)
         headers = {"Last-Event-ID": str(lei)} if lei is not None else None
-        return self._stream_request(
-            "GET", f"/v1/runs/{_segment(run_id)}/events", params=params, headers=headers
-        )
+        return self._stream_request("GET", f"/v1/runs/{_segment(run_id)}/events", params=params, headers=headers)
 
     def list_conversation_runs(self, conversation_id, **query):
-        return self._json_request(
-            "GET", f"/v1/conversations/{_segment(conversation_id)}/runs", params=_query(**query)
-        )
+        return self._json_request("GET", f"/v1/conversations/{_segment(conversation_id)}/runs", params=_query(**query))
 
     def get_temp_thread(self, temp_thread_id):
         return self._json_request("GET", f"/v1/temp-threads/{_segment(temp_thread_id)}")
@@ -176,9 +166,7 @@ class Proxy(proxy.Proxy):
         return self._json_request("GET", f"/v1/runs/{_segment(run_id)}")
 
     def resolve_tool_approval(self, run_id, call_id, **attrs):
-        return self._json_request(
-            "POST", f"/v1/runs/{_segment(run_id)}/approvals/{_segment(call_id)}", body=attrs
-        )
+        return self._json_request("POST", f"/v1/runs/{_segment(run_id)}/approvals/{_segment(call_id)}", body=attrs)
 
     def resolve_run_interaction(self, run_id, interaction_id, **attrs):
         return self._json_request(
@@ -193,10 +181,13 @@ class Proxy(proxy.Proxy):
     # -- Models & Capabilities ------------------------------------------
 
     def discovery(self):
-        return self._json_request("GET", "/v1")
+        return self._json_request("GET", "/v1/")
 
     def models(self):
         return self._json_request("GET", "/v1/models")
+
+    def chat_models(self):
+        return self._json_request("GET", "/v1/chat/models")
 
     def capabilities(self, **query):
         return self._json_request("GET", "/v1/capabilities", params=_query(**query))
@@ -205,6 +196,7 @@ class Proxy(proxy.Proxy):
 
     def agents(self, **query):
         return self._json_request("GET", "/v1/agents", params=_query(**query))
+
     def create_agent(self, **attrs):
         return self._json_request("POST", "/v1/agents", body=attrs)
 
@@ -227,6 +219,7 @@ class Proxy(proxy.Proxy):
 
     def workspaces(self, **query):
         return self._json_request("GET", "/v1/workspaces", params=_query(**query))
+
     def create_workspace(self, **attrs):
         return self._json_request("POST", "/v1/workspaces", body=attrs)
 
@@ -243,6 +236,7 @@ class Proxy(proxy.Proxy):
 
     def memories(self, **query):
         return self._json_request("GET", "/v1/memories", params=_query(**query))
+
     def create_memory(self, **attrs):
         return self._json_request("POST", "/v1/memories", body=attrs)
 
@@ -259,6 +253,7 @@ class Proxy(proxy.Proxy):
 
     def git_credentials(self, **query):
         return self._json_request("GET", "/v1/git-credentials", params=_query(**query))
+
     def create_git_credential(self, **attrs):
         return self._json_request("POST", "/v1/git-credentials", body=attrs)
 
@@ -270,6 +265,7 @@ class Proxy(proxy.Proxy):
 
     def code_workspaces(self, **query):
         return self._json_request("GET", "/v1/code-workspaces", params=_query(**query))
+
     def create_code_workspace(self, idempotency_key: str | None = None, **attrs):
         ik = idempotency_key or attrs.pop("idempotency_key", None)
         headers = {"Idempotency-Key": ik} if ik else None
@@ -282,20 +278,25 @@ class Proxy(proxy.Proxy):
         return self._json_request("DELETE", f"/v1/code-workspaces/{_segment(workspace_id)}")
 
     def set_conversation_code_workspace(self, conversation_id, **attrs):
-        return self._json_request(
-            "PUT", f"/v1/conversations/{_segment(conversation_id)}/code-workspace", body=attrs
-        )
+        return self._json_request("PUT", f"/v1/conversations/{_segment(conversation_id)}/code-workspace", body=attrs)
 
     # -- Assets ---------------------------------------------------------
 
-    def upload_asset(self, files=None, **attrs):
-        return self._json_request("POST", "/v1/assets", body=attrs if attrs else None, files=files)
+    def upload_asset(self, file=None, files=None):
+        if files is None and file is not None:
+            files = {"file": file}
+        return self._json_request("POST", "/v1/assets", files=files)
 
     def get_asset(self, asset_id):
         return self._json_request("GET", f"/v1/assets/{_segment(asset_id)}")
 
-    def download_asset(self, asset_id):
-        return self._text_request("GET", f"/v1/assets/{_segment(asset_id)}/download")
+    def download_asset(self, asset_id, allow_redirects: bool = False):
+        response = self.request(
+            f"/v1/assets/{_segment(asset_id)}/download", "GET", allow_redirects=allow_redirects, raise_exc=True
+        )
+        if not allow_redirects or response.status_code in (301, 302, 303, 307, 308):
+            return response.headers.get("Location")
+        return response.content
 
     def delete_asset(self, asset_id):
         return self._json_request("DELETE", f"/v1/assets/{_segment(asset_id)}")
@@ -304,6 +305,7 @@ class Proxy(proxy.Proxy):
 
     def mcp_servers(self, **query):
         return self._json_request("GET", "/v1/mcp-servers", params=_query(**query))
+
     def create_mcp_server(self, **attrs):
         return self._json_request("POST", "/v1/mcp-servers", body=attrs)
 
@@ -322,11 +324,9 @@ class Proxy(proxy.Proxy):
     def disconnect_mcp_server_oauth(self, item_id):
         return self._json_request("DELETE", f"/v1/mcp-servers/{_segment(item_id)}/oauth")
 
-    def mcp_oauth_callback(self, **query):
-        return self._json_request("GET", "/v1/mcp-oauth/callback", params=_query(**query))
-
     def custom_tools(self, **query):
         return self._json_request("GET", "/v1/custom-tools", params=_query(**query))
+
     def create_custom_tool(self, **attrs):
         return self._json_request("POST", "/v1/custom-tools", body=attrs)
 
@@ -338,6 +338,7 @@ class Proxy(proxy.Proxy):
 
     def skills(self, **query):
         return self._json_request("GET", "/v1/skills", params=_query(**query))
+
     def create_skill(self, **attrs):
         return self._json_request("POST", "/v1/skills", body=attrs)
 
@@ -349,6 +350,7 @@ class Proxy(proxy.Proxy):
 
     def admin_mcp_servers(self, **query):
         return self._json_request("GET", "/v1/admin/mcp-servers", params=_query(**query))
+
     def admin_create_mcp_server(self, **attrs):
         return self._json_request("POST", "/v1/admin/mcp-servers", body=attrs)
 
@@ -360,6 +362,7 @@ class Proxy(proxy.Proxy):
 
     def admin_custom_tools(self, **query):
         return self._json_request("GET", "/v1/admin/custom-tools", params=_query(**query))
+
     def admin_create_custom_tool(self, **attrs):
         return self._json_request("POST", "/v1/admin/custom-tools", body=attrs)
 
@@ -371,6 +374,7 @@ class Proxy(proxy.Proxy):
 
     def admin_skills(self, **query):
         return self._json_request("GET", "/v1/admin/skills", params=_query(**query))
+
     def admin_create_skill(self, **attrs):
         return self._json_request("POST", "/v1/admin/skills", body=attrs)
 
@@ -384,6 +388,7 @@ class Proxy(proxy.Proxy):
 
     def usage(self, **query):
         return self._json_request("GET", "/v1/usage", params=_query(**query))
+
     def usage_timeseries(self, **query):
         return self._json_request("GET", "/v1/usage/timeseries", params=_query(**query))
 
@@ -392,6 +397,7 @@ class Proxy(proxy.Proxy):
 
     def api_keys(self, **query):
         return self._json_request("GET", "/v1/api-keys", params=_query(**query))
+
     def create_api_key(self, **attrs):
         return self._json_request("POST", "/v1/api-keys", body=attrs)
 
@@ -402,6 +408,7 @@ class Proxy(proxy.Proxy):
 
     def admin_providers(self, **query):
         return self._json_request("GET", "/v1/admin/providers", params=_query(**query))
+
     def admin_create_provider(self, **attrs):
         return self._json_request("POST", "/v1/admin/providers", body=attrs)
 
@@ -412,9 +419,7 @@ class Proxy(proxy.Proxy):
         return self._json_request("DELETE", f"/v1/admin/providers/{_segment(provider_id)}")
 
     def admin_provider_available_models(self, provider_id):
-        return self._json_request(
-            "GET", f"/v1/admin/providers/{_segment(provider_id)}/available-models"
-        )
+        return self._json_request("GET", f"/v1/admin/providers/{_segment(provider_id)}/available-models")
 
     def admin_models(self, **query):
         return self._json_request("GET", "/v1/admin/models", params=_query(**query))

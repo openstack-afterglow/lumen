@@ -21,6 +21,7 @@ from typing import Any
 from sqlalchemy import delete, select, update
 
 from lumen.config import get_settings
+from lumen.crypto import decrypt_chat_content, derive_encryption_subkey, encrypt_chat_content
 from lumen.db import get_session_factory, is_db_available
 from lumen.models.chat_agent_platform import ChatRunInteraction
 from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
@@ -69,7 +70,6 @@ from lumen.services.run_store import (
     replay_events,
 )
 from lumen.services.structured_output import StructuredOutputError, parse_structured_output
-from lumen.crypto import decrypt_chat_content, derive_encryption_subkey, encrypt_chat_content
 
 logger = logging.getLogger(__name__)
 _LEASE_SECONDS = 45
@@ -290,8 +290,8 @@ def descriptor(run: ChatRun) -> ChatRunDescriptor:
         conversation_id=run.conversation_id,
         temp_thread_id=run.temp_thread_id,
         status=run.status,
-        events_url=f"/api/v1/chat/runs/{run.id}/events",
-        cancel_url=f"/api/v1/chat/runs/{run.id}/cancel",
+        events_url=f"/v1/runs/{run.id}/events",
+        cancel_url=f"/v1/runs/{run.id}/cancel",
     )
 
 

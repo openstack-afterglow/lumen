@@ -7,13 +7,38 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from lumen.cache import close_cache
 from lumen.config import get_settings
 from lumen.db import close_db, init_db
 
 logger = logging.getLogger(__name__)
+
+
+class LinkDescription(BaseModel):
+    rel: str
+    href: str
+
+
+class VersionDescription(BaseModel):
+    id: str = "v1.0"
+    status: str = "CURRENT"
+    min_version: str = "1.0"
+    version: str = "1.0"
+    links: list[LinkDescription]
+
+
+class RootDiscoveryResponse(BaseModel):
+    versions: list[VersionDescription]
+
+
+class VersionDiscoveryResponse(BaseModel):
+    version: VersionDescription
+
+
+class HealthResponse(BaseModel):
+    status: str = "ok"
 
 
 @asynccontextmanager
@@ -29,21 +54,17 @@ async def lifespan(app: FastAPI):
             unhealthy_seconds=settings.database_unhealthy_seconds,
         )
 
-    try:
+    if settings.chat_checkpointer_postgres_url:
         from lumen.services.checkpointer import chat_checkpointer
 
-        if settings.chat_checkpointer_postgres_url:
-            await chat_checkpointer.start(settings.chat_checkpointer_postgres_url)
-    except Exception:
-        logger.warning("chat checkpointer failed to initialize on startup", exc_info=True)
+        ok = await chat_checkpointer.start(settings.chat_checkpointer_postgres_url)
+        if not ok:
+            raise RuntimeError("configured chat checkpointer failed to initialize")
 
-    try:
+    if settings.chat_semantic_memory_enabled:
         from lumen.services.semantic_memory import setup_semantic_memory
 
-        if settings.chat_semantic_memory_enabled:
-            await setup_semantic_memory()
-    except Exception:
-        logger.warning("semantic memory setup failed on startup", exc_info=True)
+        await setup_semantic_memory()
 
     yield
 
@@ -58,8 +79,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Lumen Service",
-    description="Afterglow Lumen durable chat, LLM, and agent service API",
+    title="Lumen",
+    description="Lumen durable agent, LLM, and chat service API",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -76,7 +97,7 @@ if origins:
     )
 
 
-@app.get("/", tags=["Discovery"])
+@app.get("/", tags=["Discovery"], response_model=RootDiscoveryResponse)
 async def root_discovery(request: Request):
     base_url = str(request.base_url).rstrip("/")
     return {
@@ -92,7 +113,7 @@ async def root_discovery(request: Request):
     }
 
 
-@app.get("/v1/", tags=["Discovery"])
+@app.get("/v1/", tags=["Discovery"], response_model=VersionDiscoveryResponse)
 async def v1_discovery(request: Request):
     base_url = str(request.base_url).rstrip("/")
     return {
@@ -106,7 +127,7 @@ async def v1_discovery(request: Request):
     }
 
 
-@app.get("/v1/health", tags=["Health"])
+@app.get("/v1/health", tags=["Health"], response_model=HealthResponse)
 async def health():
     return {"status": "ok"}
 

@@ -11,8 +11,7 @@ from fastapi import APIRouter, Request
 router = APIRouter()
 
 
-@router.get("")
-@router.get("/")
+@router.get("/compat")
 async def discovery(request: Request) -> dict:
     base = str(request.base_url).rstrip("/")
     return {

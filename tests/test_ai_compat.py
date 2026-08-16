@@ -199,7 +199,7 @@ class TestOpenAIEndpoint:
 
 class TestDiscoveryAndHostGate:
     async def test_discovery_public(self, client):
-        resp = await client.get("/v1")
+        resp = await client.get("/v1/compat")
         assert resp.status_code == 200
         body = resp.json()
         assert set(body["formats"]) == {"openai", "anthropic"}
@@ -211,21 +211,21 @@ class TestDiscoveryAndHostGate:
 
         monkeypatch.setattr("lumen.auth.get_settings", lambda: SimpleNamespace(chat_api_hosts="api.cloud.example"))
         # 기본 client Host="test" → 허용 목록 밖 → 404(존재 숨김)
-        assert (await client.get("/v1")).status_code == 404
+        assert (await client.get("/v1/compat")).status_code == 404
         assert (await client.get("/v1/models", headers=_H)).status_code == 404
 
     async def test_allowed_host_passes(self, client, monkeypatch):
         from types import SimpleNamespace
 
         monkeypatch.setattr("lumen.auth.get_settings", lambda: SimpleNamespace(chat_api_hosts="api.cloud.example"))
-        resp = await client.get("/v1", headers={"host": "api.cloud.example"})
+        resp = await client.get("/v1/compat", headers={"host": "api.cloud.example"})
         assert resp.status_code == 200
 
     async def test_unset_allows_all(self, client, monkeypatch):
         from types import SimpleNamespace
 
         monkeypatch.setattr("lumen.auth.get_settings", lambda: SimpleNamespace(chat_api_hosts=""))
-        assert (await client.get("/v1")).status_code == 200
+        assert (await client.get("/v1/compat")).status_code == 200
 
 
 class TestAnthropicEndpoint:
