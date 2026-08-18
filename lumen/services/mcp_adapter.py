@@ -8,8 +8,7 @@ MCP token or a user's Keystone credential.
 
 from __future__ import annotations
 
-import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -44,7 +43,7 @@ class Principal:
     user_id: str
     project_id: str
     snapshot: LumenSnapshot
-    entries: tuple["RegistryEntry", ...]
+    entries: tuple[RegistryEntry, ...]
     service_fingerprint: str
 
 

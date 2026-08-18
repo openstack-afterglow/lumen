@@ -11,12 +11,12 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from lumen.auth import get_token_info
+from lumen.auth import require_scopes
 from lumen.config import get_settings
 from lumen.services import memory_retrieval as mr
 from lumen.services import memory_store as ms
-from lumen.services import provider_store as ps
 from lumen.services import workspace_store as ws
+from lumen.services.providers import routing as ps
 from lumen.services.semantic_memory import SemanticMemoryUnavailable, semantic_memory_available
 
 router = APIRouter()
@@ -57,6 +57,8 @@ async def _resolve_namespace(
     *, scope: Literal["account", "project", "workspace"], workspace_id: int | None, token_info: dict
 ) -> tuple[str | None, int | None]:
     if scope == "account":
+        if token_info["auth_type"] == "api_key":
+            raise HTTPException(status_code=403, detail="API 키는 계정 메모리에 접근할 수 없습니다")
         return None, workspace_id
     project_id = token_info["project_id"]
     if scope == "workspace":
@@ -72,7 +74,7 @@ async def _resolve_namespace(
 
 
 @router.post("/memories", status_code=201)
-async def create_memory(payload: MemoryCreate, token_info: dict = Depends(get_token_info)):
+async def create_memory(payload: MemoryCreate, token_info: dict = Depends(require_scopes("native:memory:write"))):
     try:
         project_id, workspace_id = await _resolve_namespace(
             scope=payload.scope, workspace_id=payload.workspace_id, token_info=token_info
@@ -90,16 +92,20 @@ async def create_memory(payload: MemoryCreate, token_info: dict = Depends(get_to
 
 
 @router.get("/memories")
-async def list_memories(token_info: dict = Depends(get_token_info)):
+async def list_memories(token_info: dict = Depends(require_scopes("native:memory:read"))):
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
-        return await ms.list_memories(user_id=token_info["user_id"], project_id=token_info["project_id"])
+        return await ms.list_memories(
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            **({"include_account": False} if token_info["auth_type"] == "api_key" else {}),
+        )
     except ms.ChatStorageUnavailable:
         return []
 
 
 @router.post("/memories/search")
-async def search_memories(payload: MemorySearch, token_info: dict = Depends(get_token_info)):
+async def search_memories(payload: MemorySearch, token_info: dict = Depends(require_scopes("native:memory:read"))):
     """User-initiated semantic search; vector IDs are rechecked in MySQL before disclosure."""
     try:
         if not semantic_memory_available():
@@ -134,21 +140,29 @@ async def search_memories(payload: MemorySearch, token_info: dict = Depends(get_
 
 
 @router.patch("/memories/{memory_id}")
-async def update_memory(memory_id: int, payload: MemoryUpdate, token_info: dict = Depends(get_token_info)):
+async def update_memory(
+    memory_id: int, payload: MemoryUpdate, token_info: dict = Depends(require_scopes("native:memory:write"))
+):
     try:
         return await ms.update_memory(
             memory_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
             patch=payload.model_dump(exclude_unset=True),
+            **({"include_account": False} if token_info["auth_type"] == "api_key" else {}),
         )
     except (ms.MemoryNotFound, ms.MemoryForbidden, ms.MemoryValidationError, ms.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
 
 
 @router.delete("/memories/{memory_id}", status_code=204)
-async def delete_memory(memory_id: int, token_info: dict = Depends(get_token_info)):
+async def delete_memory(memory_id: int, token_info: dict = Depends(require_scopes("native:memory:write"))):
     try:
-        await ms.delete_memory(memory_id, user_id=token_info["user_id"], project_id=token_info["project_id"])
+        await ms.delete_memory(
+            memory_id,
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            **({"include_account": False} if token_info["auth_type"] == "api_key" else {}),
+        )
     except (ms.MemoryNotFound, ms.MemoryForbidden, ms.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc

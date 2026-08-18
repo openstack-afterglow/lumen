@@ -913,3 +913,80 @@ _CHAT_RUN_EVENT = TypeAdapter(ChatRunEvent)
 
 def validate_chat_run_event(event: object) -> ChatRunEvent:
     return _CHAT_RUN_EVENT.validate_python(event)
+
+
+class UsageRecord(_StrictModel):
+    id: int
+    created_at: datetime
+    model_name: str
+    provider: str | None = None
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    credited_cost: str
+    source: Literal["web", "api"]
+    api_key_id: int | None = None
+    conversation_id: str | None = None
+    run_id: str | None = None
+    pricing_status: str
+
+
+class UsageRecordPage(_StrictModel):
+    records: list[UsageRecord]
+    next_before_id: int | None = None
+
+
+class TempCompletionRequest(BaseModel):
+    """Canonical first-turn temporary completion request."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    parts: list[UserInputPart] = Field(min_length=1, max_length=32)
+    model_id: str = Field(min_length=1, max_length=190)
+    features: ChatFeatureOptions = Field(default_factory=ChatFeatureOptions)
+    reasoning_effort: ReasoningEffort = "auto"
+    execution_mode: str = Field(default="chat", pattern="^(chat|plan|code)$")
+    code_workspace_id: str | None = Field(default=None, max_length=36)
+    skill_ids: list[int] = Field(default_factory=list, max_length=100)
+    temp_thread_id: str | None = Field(default=None, max_length=36)
+
+    @field_validator("skill_ids")
+    @classmethod
+    def validate_skill_ids(cls, value: list[int]) -> list[int]:
+        if len(set(value)) != len(value) or any(item < 1 for item in value):
+            raise ValueError("skill_ids must be unique positive ids")
+        return value
+
+    @model_validator(mode="after")
+    def validate_execution_mode(self) -> TempCompletionRequest:
+        if self.execution_mode == "chat" and (
+            self.code_workspace_id is not None or self.features.tool_policy.workspace_write_mode != "ask"
+        ):
+            raise ValueError("chat mode cannot select a code workspace or auto-edit")
+        if self.execution_mode != "code" and self.features.tool_policy.workspace_write_mode == "auto_edit":
+            raise ValueError("auto_edit is only available in code mode")
+        return self
+
+
+class ToolApprovalDecisionRequest(BaseModel):
+    decision: Literal["approve", "deny"]
+
+
+class RunInteractionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    option_ids: list[str] = Field(default_factory=list, max_length=5)
+    text: str | None = Field(default=None, max_length=4_000)
+
+    @field_validator("option_ids")
+    @classmethod
+    def validate_option_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value) or any(not option_id for option_id in value):
+            raise ValueError("option_ids must be unique non-empty strings")
+        return value
+
+
+class RunInteractionResponseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    response: RunInteractionResponse

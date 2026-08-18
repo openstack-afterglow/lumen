@@ -16,9 +16,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from lumen.auth import get_api_key_info
+from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
-from lumen.services import provider_store as ps
+from lumen.services.providers import errors, repository
 
 router = APIRouter()
 
@@ -115,8 +115,10 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-@router.post("/chat/completions")
-async def chat_completions(body: OpenAIChatRequest, token_info: dict = Depends(get_api_key_info)):
+@router.post("/chat/completions", openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]})
+async def chat_completions(
+    body: OpenAIChatRequest, token_info: dict = Depends(require_api_key_scopes("compat:completions:write"))
+):
     user_id, project_id = token_info["user_id"], token_info["project_id"]
     api_key_id = token_info.get("api_key_id")
     try:
@@ -169,10 +171,10 @@ async def chat_completions(body: OpenAIChatRequest, token_info: dict = Depends(g
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-@router.get("/models")
-async def list_models(token_info: dict = Depends(get_api_key_info)):
+@router.get("/models", openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]})
+async def list_models(token_info: dict = Depends(require_api_key_scopes("models:read"))):
     try:
-        models = await ps.list_models(active_only=True)
-    except ps.ChatStorageUnavailable:
+        models = await repository.list_models(active_only=True)
+    except errors.ChatStorageUnavailable:
         models = []
     return models_list(models)

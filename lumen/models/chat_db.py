@@ -6,7 +6,6 @@
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from uuid import uuid4
 
 from sqlalchemy import (
     BIGINT,
@@ -327,6 +326,7 @@ class ChatApiKey(Base):
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False, default="")
     key_prefix: Mapped[str] = mapped_column(VARCHAR(24), nullable=False)  # 표시용(시크릿 아님)
     key_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)  # SHA-256 hex
+    scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -14,7 +14,7 @@ from collections.abc import Mapping
 
 from lumen.services import conversation_store as cs
 from lumen.services import credit, litellm_client
-from lumen.services import provider_store as ps
+from lumen.services.providers import routing as ps
 
 logger = logging.getLogger(__name__)
 

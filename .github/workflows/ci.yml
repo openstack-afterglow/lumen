@@ -21,7 +21,8 @@ jobs:
           python-version: '3.12'
           enable-cache: true
       - run: uv sync --all-extras --frozen
-      - run: uv run pytest tests
+      - run: uv run ruff check lumen tests
+      - run: uv run pytest -m "not integration" tests
 
   sdk:
     name: SDK tests and lint
@@ -38,3 +39,37 @@ jobs:
       - run: uv sync --all-extras --frozen
       - run: uv run pytest
       - run: uv run ruff check .
+
+
+  integration:
+    name: Native API integration
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MYSQL_DATABASE: lumen
+          MYSQL_USER: lumen
+          MYSQL_PASSWORD: lumen
+          MYSQL_ROOT_PASSWORD: root
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: mysql+aiomysql://lumen:lumen@127.0.0.1:3306/lumen
+      REDIS_URL: redis://127.0.0.1:6379/0
+      LUMEN_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - run: uv run lumen-migrate --apply
+      - run: uv run pytest -m integration

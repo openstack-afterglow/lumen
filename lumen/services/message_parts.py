@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from lumen.models.chat_contracts import ChatPart, ChatParts, validate_chat_parts
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
+from lumen.models.chat_contracts import ChatPart, ChatParts, validate_chat_parts
 
 
 class MessagePartsError(ValueError):

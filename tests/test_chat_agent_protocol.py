@@ -1,7 +1,6 @@
 import pytest
 from pydantic import ValidationError
 
-from lumen.services import tool_runtime
 from lumen.services.agent_protocol import (
     AgentExecutionPolicy,
     ToolBinding,
@@ -10,7 +9,9 @@ from lumen.services.agent_protocol import (
     validate_tool_arguments,
 )
 from lumen.services.agent_runtime_v2 import dispatch_tool_call
-from lumen.services.tool_runtime import v2_builtin_tool_bindings
+from lumen.services.tool_runtime import bindings as tool_runtime
+from lumen.services.tool_runtime import dispatch
+from lumen.services.tool_runtime.contracts import v2_builtin_tool_bindings
 from lumen.services.tools import ToolContext
 
 
@@ -200,7 +201,7 @@ async def test_v2_dynamic_binding_dispatches_only_schema_validated_arguments(mon
 
     monkeypatch.setattr(tool_runtime, "_load_custom", load_custom)
     monkeypatch.setattr(tool_runtime, "_load_mcp", load_mcp)
-    monkeypatch.setattr(tool_runtime, "_execute_custom_http_tool", execute_custom)
+    monkeypatch.setattr(dispatch, "_execute_custom_http_tool", execute_custom)
 
     bindings = await tool_runtime.v2_tool_bindings(ToolContext(project_id="project", user_id="user"))
     binding = next(binding for binding in bindings.values() if binding.definition.source == "custom_http")
@@ -261,13 +262,19 @@ async def test_lumen_bindings_freeze_only_the_selected_grant_snapshot(monkeypatc
         return type(
             "Principal",
             (),
-            {"grant_id": snapshot.grant_id, "scopes": frozenset({"mcp:read"}), "service_fingerprint": "services-fingerprint"},
+            {
+                "grant_id": snapshot.grant_id,
+                "scopes": frozenset({"mcp:read"}),
+                "service_fingerprint": "services-fingerprint",
+            },
         )()
 
     monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshot", selected)
     monkeypatch.setattr(tool_runtime.mcp_lumen, "resolve_lumen_principal", resolve)
     monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_entries", lambda _principal: (entry,))
-    monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_service_fingerprint", lambda _principal: "services-fingerprint")
+    monkeypatch.setattr(
+        tool_runtime.mcp_registry, "enabled_service_fingerprint", lambda _principal: "services-fingerprint"
+    )
 
     bindings = await tool_runtime._lumen_registry_bindings(
         ToolContext(
@@ -318,7 +325,11 @@ async def test_lumen_binding_refuses_dispatch_after_selection_changes(monkeypatc
             return type(
                 "Principal",
                 (),
-                {"grant_id": snapshot.grant_id, "scopes": frozenset({"mcp:read"}), "service_fingerprint": "services-fingerprint"},
+                {
+                    "grant_id": snapshot.grant_id,
+                    "scopes": frozenset({"mcp:read"}),
+                    "service_fingerprint": "services-fingerprint",
+                },
             )()
         raise tool_runtime.mcp_lumen.McpLumenAuthorityError("selection changed")
 
@@ -328,7 +339,9 @@ async def test_lumen_binding_refuses_dispatch_after_selection_changes(monkeypatc
     monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshot", selected)
     monkeypatch.setattr(tool_runtime.mcp_lumen, "resolve_lumen_principal", resolve)
     monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_entries", lambda _principal: (entry,))
-    monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_service_fingerprint", lambda _principal: "services-fingerprint")
+    monkeypatch.setattr(
+        tool_runtime.mcp_registry, "enabled_service_fingerprint", lambda _principal: "services-fingerprint"
+    )
     monkeypatch.setattr(tool_runtime.mcp_registry, "dispatch", unexpected_dispatch)
 
     binding = (await tool_runtime._lumen_registry_bindings(ToolContext(project_id="project", user_id="user")))[0]
@@ -387,7 +400,9 @@ async def test_lumen_mutation_reuses_remote_bridge_with_durable_idempotency(monk
     monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshot", selected)
     monkeypatch.setattr(tool_runtime.mcp_lumen, "resolve_lumen_principal", resolve)
     monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_entries", lambda _principal: (entry,))
-    monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_service_fingerprint", lambda _principal: "services-fingerprint")
+    monkeypatch.setattr(
+        tool_runtime.mcp_registry, "enabled_service_fingerprint", lambda _principal: "services-fingerprint"
+    )
     monkeypatch.setattr(tool_runtime.mcp_registry, "parse_entry_arguments", lambda *_args: args)
     monkeypatch.setattr(tool_runtime.mcp_ledger, "claim_mutation", claim)
 
@@ -402,8 +417,6 @@ async def test_lumen_mutation_reuses_remote_bridge_with_durable_idempotency(monk
     assert result.model_content == '{"status":"accepted"}'
     assert sources == ["lumen"]
     assert idempotency_keys == [tool_runtime._lumen_idempotency_key(run_id="run-1", tool_call_id="call-1")]
-
-
 
 
 @pytest.mark.asyncio
@@ -434,7 +447,11 @@ async def test_lumen_binding_fingerprint_changes_with_remote_catalog(monkeypatch
         return type(
             "Principal",
             (),
-            {"grant_id": snapshot.grant_id, "scopes": frozenset({"mcp:write"}), "service_fingerprint": next(fingerprints)},
+            {
+                "grant_id": snapshot.grant_id,
+                "scopes": frozenset({"mcp:write"}),
+                "service_fingerprint": next(fingerprints),
+            },
         )()
 
     monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshot", selected)
@@ -445,6 +462,8 @@ async def test_lumen_binding_fingerprint_changes_with_remote_catalog(monkeypatch
     second = (await tool_runtime._lumen_registry_bindings(ToolContext(project_id="project", user_id="user")))[0]
 
     assert first.config_fingerprint != second.config_fingerprint
+
+
 def test_lumen_mutation_idempotency_is_unique_per_durable_tool_call():
     assert tool_runtime._lumen_idempotency_key(run_id="run-1", tool_call_id="call-1") == (
         tool_runtime._lumen_idempotency_key(run_id="run-1", tool_call_id="call-1")

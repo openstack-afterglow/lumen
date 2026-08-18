@@ -239,6 +239,7 @@ async def timeseries(
     user_id: str | None = None,
     model_name: str | None = None,
     include_system: bool = True,
+    api_key_id: int | None = None,
 ) -> list[dict]:
     """시간버킷(hour/day/month)별 × source(web/api/system)별 시계열(오름차순).
 
@@ -256,6 +257,8 @@ async def timeseries(
         conds.append(ChatUsageLog.user_id == user_id)
     if model_name:
         conds.append(ChatUsageLog.model_name == model_name)
+    if api_key_id is not None:
+        conds.append(ChatUsageLog.api_key_id == api_key_id)
     if not include_system:
         conds.append(ChatUsageLog.source != "system")
     bexpr = _bucket_expr(bucket)
@@ -299,6 +302,7 @@ async def by_api_key(
     *,
     user_id: str | None = None,
     limit: int = 50,
+    api_key_id: int | None = None,
 ) -> list[dict]:
     """API 키별 집계(토큰 desc) — source="api" 만. 폐기된 키도 원장 보존(name None 가능).
 
@@ -310,6 +314,8 @@ async def by_api_key(
     conds = [*_base_conds(range_key, project_id), ChatUsageLog.source == "api", ChatUsageLog.api_key_id.isnot(None)]
     if user_id:
         conds.append(ChatUsageLog.user_id == user_id)
+    if api_key_id is not None:
+        conds.append(ChatUsageLog.api_key_id == api_key_id)
     total_tok = ChatUsageLog.prompt_tokens + ChatUsageLog.completion_tokens
     try:
         async with factory() as session:

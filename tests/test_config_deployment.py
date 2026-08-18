@@ -3,10 +3,7 @@
 import os
 from unittest.mock import patch
 
-from pathlib import Path
-import pytest
-
-from lumen.config import Settings, _load_toml, get_settings, load_raw_toml
+from lumen.config import _load_toml, get_settings, load_raw_toml
 
 
 def test_lumen_toml_config_loading(monkeypatch, tmp_path):

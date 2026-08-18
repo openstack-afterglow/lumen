@@ -7,7 +7,8 @@
 """
 
 from lumen.services import conversation_store as cs
-from lumen.services import tool_runtime
+from lumen.services.tool_runtime import dispatch as tool_runtime
+from lumen.services.tool_runtime import selection
 from lumen.services.tools import ToolContext, execute_tool, tool_schemas
 
 _CTX = ToolContext(project_id="proj-A", user_id="user-A")
@@ -26,7 +27,7 @@ class TestSchemas:
 
     async def test_run_policy_can_disable_all_tool_schemas_and_execution(self):
         disabled = ToolContext(project_id="proj-A", user_id="user-A", tools_enabled=False)
-        assert await tool_runtime.context_tool_schemas(disabled) == []
+        assert await selection.context_tool_schemas(disabled) == []
         assert "disabled" in await tool_runtime.context_execute("list_my_conversations", {}, disabled)
 
 

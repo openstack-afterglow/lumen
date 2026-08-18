@@ -11,18 +11,14 @@ import logging
 import os
 import socket
 
+from lumen.cache import _get_redis
 from lumen.config import get_settings
 from lumen.db import init_db
-from lumen.cache import _get_redis
 from lumen.services.agent_workspace_runtime import configured_workspace_policy
 from lumen.services.code_workspace_service import delete_pending_workspaces, provision_pending_workspaces
-from lumen.services.durable_runs import (
-    execute_queued_run,
-    expire_pending_inputs,
-    purge_expired_temp_threads,
-    queued_run_ids,
-    recover_stale_runs,
-)
+from lumen.services.durable_runs.execution import execute_queued_run, queued_run_ids
+from lumen.services.durable_runs.interactions import expire_pending_inputs
+from lumen.services.durable_runs.lifecycle import purge_expired_temp_threads, recover_stale_runs
 
 logger = logging.getLogger(__name__)
 _QUEUE = "afterglow:chat:runs"

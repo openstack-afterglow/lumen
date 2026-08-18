@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from lumen.services import provider_store as ps
+from lumen.services.providers import routing as ps
 
 _CONTEXT_TOKEN_LIMITS = {"low": 512, "medium": 2048, "high": 4096}
 

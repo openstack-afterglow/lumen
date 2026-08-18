@@ -7,7 +7,8 @@ import pytest
 
 from lumen.api.compat import anthropic as an
 from lumen.api.compat import openai as oa
-from lumen.services import api_key_store as aks
+from lumen.auth import get_principal
+from lumen.main import app
 from lumen.services import completion_api as core
 
 _H = {"Authorization": "Bearer sk-afgl-test"}
@@ -114,10 +115,20 @@ class TestAnthropicTranslate:
 # ── 엔드포인트 ────────────────────────────────────────────────────────────────
 @pytest.fixture
 def _auth(monkeypatch):
-    async def fake_verify(raw):
-        return {"user_id": "u1", "project_id": "p1", "api_key_id": 7}
 
-    monkeypatch.setattr(aks, "verify_key", fake_verify)
+    async def fake_principal():
+        return {
+            "auth_type": "api_key",
+            "user_id": "u1",
+            "project_id": "p1",
+            "api_key_id": 7,
+            "scopes": ("models:read", "compat:completions:write"),
+            "source": "api",
+            "roles": [],
+            "is_system_admin": False,
+        }
+
+    monkeypatch.setitem(app.dependency_overrides, get_principal, fake_principal)
 
 
 @pytest.fixture
@@ -187,12 +198,12 @@ class TestOpenAIEndpoint:
         assert "data: [DONE]" in text
 
     async def test_models(self, client, _auth, monkeypatch):
-        from lumen.services import provider_store as ps
+        from lumen.services.providers import repository
 
         async def fake_list(active_only=False):
             return [{"model_name": "gpt-4o", "provider_name": "openai"}]
 
-        monkeypatch.setattr(ps, "list_models", fake_list)
+        monkeypatch.setattr(repository, "list_models", fake_list)
         resp = await client.get("/v1/models", headers=_H)
         assert resp.status_code == 200 and resp.json()["data"][0]["id"] == "gpt-4o"
 

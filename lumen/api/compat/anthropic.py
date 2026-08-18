@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from lumen.auth import get_api_key_info
+from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
 
 router = APIRouter()
@@ -177,8 +177,10 @@ def _event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-@router.post("/messages")
-async def messages(body: AnthropicMessagesRequest, token_info: dict = Depends(get_api_key_info)):
+@router.post("/messages", openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]})
+async def messages(
+    body: AnthropicMessagesRequest, token_info: dict = Depends(require_api_key_scopes("compat:completions:write"))
+):
     user_id, project_id = token_info["user_id"], token_info["project_id"]
     api_key_id = token_info.get("api_key_id")
     internal = to_internal_messages(body)

@@ -1,14 +1,11 @@
 from decimal import Decimal
 from types import SimpleNamespace
 
-import lumen.services.provider_store as provider_store
+import lumen.services.providers.pricing as provider_pricing
+import lumen.services.providers.routing as provider_store
 from lumen.services.capabilities import litellm_capabilities, normalize_capabilities
-from lumen.services.provider_store import (
-    _model_public,
-    _pricing_aware_capabilities,
-    _resolved_model,
-    _resolved_provider,
-)
+from lumen.services.providers.pricing import _model_public, _pricing_aware_capabilities
+from lumen.services.providers.routing import _resolved_model, _resolved_provider
 
 
 def _model(*, metadata: dict, input_price: str | None = "0.000001", output_price: str | None = "0.000002"):
@@ -260,7 +257,7 @@ def test_resolved_model_gates_litellm_fallback_prices(monkeypatch):
         is_active=True,
     )
     monkeypatch.setattr(
-        provider_store,
+        provider_pricing,
         "effective_prices_per_million",
         lambda *_: (Decimal("1"), Decimal("2")),
     )

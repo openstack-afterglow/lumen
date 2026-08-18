@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from lumen_sdk import register
+from lumen_sdk._api import _LumenApiMixin
 from lumen_sdk.proxy import Proxy
 from lumen_sdk.service import LumenService
 
@@ -195,6 +196,15 @@ JSON_METHOD_TABLE = [
     ("usage", (), {}, "GET", "/v1/usage", None, None),
     ("usage_timeseries", (), {"bucket": "day"}, "GET", "/v1/usage/timeseries", None, {"bucket": "day"}),
     ("usage_keys", (), {"range": "all"}, "GET", "/v1/usage/keys", None, {"range": "all"}),
+    (
+        "usage_records",
+        (),
+        {"limit": 10, "before_id": 20},
+        "GET",
+        "/v1/usage/records",
+        None,
+        {"limit": 10, "before_id": 20},
+    ),
     ("api_keys", (), {}, "GET", "/v1/api-keys", None, None),
     ("create_api_key", (), {"name": "key1"}, "POST", "/v1/api-keys", {"name": "key1"}, None),
     ("revoke_api_key", (1,), {}, "DELETE", "/v1/api-keys/1", None, None),
@@ -281,7 +291,9 @@ OTHER_METHOD_TABLE = [
     ("download_asset", ("asset-1",), {}, "GET", "/v1/assets/asset-1/download"),
 ]
 
-_PUBLIC_PROXY_METHODS = {name for name, value in Proxy.__dict__.items() if not name.startswith("_") and callable(value)}
+_PUBLIC_PROXY_METHODS = {
+    name for name, value in _LumenApiMixin.__dict__.items() if not name.startswith("_") and callable(value)
+}
 
 
 def test_route_tables_cover_every_public_proxy_method():

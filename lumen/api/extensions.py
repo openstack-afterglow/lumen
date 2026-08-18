@@ -1,10 +1,10 @@
-"""빌트인 AI 채팅 확장 API — MCP 서버 / 커스텀 HTTP 툴 관리.
+"""빌트인 AI 채팅 확장 API — MCP 서버 / 커스텀 HTTP 툴 / skill 관리.
 
 - 관리자 라우터(require_admin): scope='global' 확장 CRUD (전체 적용).
-- 사용자 라우터(get_token_info): 본인 scope='user' 확장 CRUD (본인 적용) + 활성 global 열람.
+- 사용자 라우터(get_principal): 본인 scope='user' 확장 CRUD (본인 적용) + 활성 global 열람.
 
-⚠️ MCP 서버는 등록·관리 전용(실행은 langchain-mcp-adapters 핀 이동 후). 커스텀 툴 실행은 후속 슬라이스.
-소유권/스코프 검증은 extensions_store 가 강제하고, 예외를 HTTP 상태로 매핑한다.
+MCP와 커스텀 HTTP 툴은 durable worker의 ``tool_runtime``에서 frozen selection을 재검증한 뒤 실행한다.
+소유권/스코프 검증은 ``extensions_store``가 강제하고, API-key user route는 ``native:extensions`` scope를 요구한다.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from lumen.auth import get_token_info, require_admin
+from lumen.auth import get_principal, require_admin, require_scopes
 from lumen.services import extensions_store as es
 from lumen.services import mcp_oauth
 
@@ -208,7 +208,7 @@ def _owner(token_info: dict) -> tuple[str, str]:
 
 
 @user_router.get("/mcp-servers")
-async def user_list_mcp(token_info: dict = Depends(get_token_info)):
+async def user_list_mcp(token_info: dict = Depends(require_scopes("native:extensions:read"))):
     uid, pid = _owner(token_info)
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
@@ -220,7 +220,7 @@ async def user_list_mcp(token_info: dict = Depends(get_token_info)):
 
 
 @user_router.post("/mcp-servers", status_code=201)
-async def user_create_mcp(body: McpServerBody, token_info: dict = Depends(get_token_info)):
+async def user_create_mcp(body: McpServerBody, token_info: dict = Depends(require_scopes("native:extensions:write"))):
     uid, pid = _owner(token_info)
     try:
         source = await es.create(
@@ -232,7 +232,9 @@ async def user_create_mcp(body: McpServerBody, token_info: dict = Depends(get_to
 
 
 @user_router.patch("/mcp-servers/{item_id}")
-async def user_update_mcp(item_id: int, body: McpServerBody, token_info: dict = Depends(get_token_info)):
+async def user_update_mcp(
+    item_id: int, body: McpServerBody, token_info: dict = Depends(require_scopes("native:extensions:write"))
+):
     uid, pid = _owner(token_info)
     try:
         source = await es.update(
@@ -246,7 +248,7 @@ async def user_update_mcp(item_id: int, body: McpServerBody, token_info: dict = 
 
 
 @user_router.delete("/mcp-servers/{item_id}", status_code=204)
-async def user_delete_mcp(item_id: int, token_info: dict = Depends(get_token_info)):
+async def user_delete_mcp(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:write"))):
     uid, pid = _owner(token_info)
     try:
         await es.delete("mcp", item_id, requester_user_id=uid, requester_project_id=pid)
@@ -255,7 +257,7 @@ async def user_delete_mcp(item_id: int, token_info: dict = Depends(get_token_inf
 
 
 @user_router.get("/mcp-servers/{item_id}/oauth")
-async def user_get_mcp_oauth_status(item_id: int, token_info: dict = Depends(get_token_info)):
+async def user_get_mcp_oauth_status(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:read"))):
     uid, pid = _owner(token_info)
     try:
         return await mcp_oauth.status(item_id, user_id=uid, project_id=pid)
@@ -265,8 +267,10 @@ async def user_get_mcp_oauth_status(item_id: int, token_info: dict = Depends(get
 
 @user_router.post("/mcp-servers/{item_id}/oauth/start")
 async def user_start_mcp_oauth(
-    item_id: int, request: Request, response: Response, token_info: dict = Depends(get_token_info)
+    item_id: int, request: Request, response: Response, token_info: dict = Depends(get_principal)
 ):
+    if token_info["auth_type"] == "api_key":
+        raise HTTPException(status_code=403, detail="MCP OAuth 시작은 Keystone 세션이 필요합니다")
     uid, pid = _owner(token_info)
     initiator_nonce = secrets.token_urlsafe(32)
     try:
@@ -292,7 +296,9 @@ async def user_start_mcp_oauth(
 
 
 @user_router.delete("/mcp-servers/{item_id}/oauth", status_code=204)
-async def user_disconnect_mcp_oauth(item_id: int, token_info: dict = Depends(get_token_info)):
+async def user_disconnect_mcp_oauth(
+    item_id: int, token_info: dict = Depends(require_scopes("native:extensions:write"))
+):
     uid, pid = _owner(token_info)
     try:
         await mcp_oauth.disconnect(item_id, user_id=uid, project_id=pid)
@@ -302,7 +308,7 @@ async def user_disconnect_mcp_oauth(item_id: int, token_info: dict = Depends(get
 
 
 @user_router.get("/custom-tools")
-async def user_list_tools(token_info: dict = Depends(get_token_info)):
+async def user_list_tools(token_info: dict = Depends(require_scopes("native:extensions:read"))):
     uid, pid = _owner(token_info)
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
@@ -314,7 +320,7 @@ async def user_list_tools(token_info: dict = Depends(get_token_info)):
 
 
 @user_router.post("/custom-tools", status_code=201)
-async def user_create_tool(body: CustomToolBody, token_info: dict = Depends(get_token_info)):
+async def user_create_tool(body: CustomToolBody, token_info: dict = Depends(require_scopes("native:extensions:write"))):
     uid, pid = _owner(token_info)
     try:
         return await es.create(
@@ -325,7 +331,9 @@ async def user_create_tool(body: CustomToolBody, token_info: dict = Depends(get_
 
 
 @user_router.patch("/custom-tools/{item_id}")
-async def user_update_tool(item_id: int, body: CustomToolBody, token_info: dict = Depends(get_token_info)):
+async def user_update_tool(
+    item_id: int, body: CustomToolBody, token_info: dict = Depends(require_scopes("native:extensions:write"))
+):
     uid, pid = _owner(token_info)
     try:
         return await es.update(
@@ -336,7 +344,7 @@ async def user_update_tool(item_id: int, body: CustomToolBody, token_info: dict 
 
 
 @user_router.delete("/custom-tools/{item_id}", status_code=204)
-async def user_delete_tool(item_id: int, token_info: dict = Depends(get_token_info)):
+async def user_delete_tool(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:write"))):
     uid, pid = _owner(token_info)
     try:
         await es.delete("tool", item_id, requester_user_id=uid, requester_project_id=pid)
@@ -345,7 +353,7 @@ async def user_delete_tool(item_id: int, token_info: dict = Depends(get_token_in
 
 
 @user_router.get("/skills")
-async def user_list_skills(token_info: dict = Depends(get_token_info)):
+async def user_list_skills(token_info: dict = Depends(require_scopes("native:extensions:read"))):
     uid, pid = _owner(token_info)
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
@@ -357,7 +365,7 @@ async def user_list_skills(token_info: dict = Depends(get_token_info)):
 
 
 @user_router.post("/skills", status_code=201)
-async def user_create_skill(body: SkillBody, token_info: dict = Depends(get_token_info)):
+async def user_create_skill(body: SkillBody, token_info: dict = Depends(require_scopes("native:extensions:write"))):
     uid, pid = _owner(token_info)
     try:
         return await es.create(
@@ -368,7 +376,9 @@ async def user_create_skill(body: SkillBody, token_info: dict = Depends(get_toke
 
 
 @user_router.patch("/skills/{item_id}")
-async def user_update_skill(item_id: int, body: SkillBody, token_info: dict = Depends(get_token_info)):
+async def user_update_skill(
+    item_id: int, body: SkillBody, token_info: dict = Depends(require_scopes("native:extensions:write"))
+):
     uid, pid = _owner(token_info)
     try:
         return await es.update(
@@ -379,7 +389,7 @@ async def user_update_skill(item_id: int, body: SkillBody, token_info: dict = De
 
 
 @user_router.delete("/skills/{item_id}", status_code=204)
-async def user_delete_skill(item_id: int, token_info: dict = Depends(get_token_info)):
+async def user_delete_skill(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:write"))):
     uid, pid = _owner(token_info)
     try:
         await es.delete("skill", item_id, requester_user_id=uid, requester_project_id=pid)

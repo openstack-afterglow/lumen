@@ -27,8 +27,9 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from lumen.services import agent_runtime_v2, litellm_client, tool_runtime
+from lumen.services import agent_runtime_v2, litellm_client
 from lumen.services.checkpointer import chat_checkpointer
+from lumen.services.tool_runtime import bindings, contracts, dispatch, selection
 from lumen.services.tools import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -430,7 +431,7 @@ def _build_graph(params: dict, ctx: ToolContext):
             binding = v2_bindings.get(tool_name)
             if binding is not None:
                 return binding.definition.source, binding.definition.activity_category
-        return await tool_runtime.context_tool_activity_metadata(tool_name, ctx)
+        return await selection.context_tool_activity_metadata(tool_name, ctx)
 
     async def call_model(state: ChatState) -> dict:
         writer = get_stream_writer()
@@ -455,27 +456,25 @@ def _build_graph(params: dict, ctx: ToolContext):
 
         messages = list(state["messages"])
         v2_bindings = params.get("v2_bindings")
-        if isinstance(ctx.binding_session, tool_runtime.ToolBindingSession) and not ctx.binding_session.loaded_names:
+        if isinstance(ctx.binding_session, contracts.ToolBindingSession) and not ctx.binding_session.loaded_names:
             restored = await boundary("loaded_tool_names")
             if isinstance(restored, list) and all(isinstance(name, str) for name in restored):
                 if isinstance(v2_bindings, dict):
-                    await tool_runtime.restore_v2_deferred_bindings(
+                    await bindings.restore_v2_deferred_bindings(
                         ctx,
                         v2_bindings,
                         restored,
                         include_managed=True,
                     )
                 else:
-                    await tool_runtime.restore_v2_deferred_bindings(
+                    await bindings.restore_v2_deferred_bindings(
                         ctx,
                         ctx.binding_session.legacy_bindings,
                         restored,
                         include_managed=False,
                     )
         schemas = (
-            _v2_tool_schemas(v2_bindings)
-            if isinstance(v2_bindings, dict)
-            else await tool_runtime.context_tool_schemas(ctx)
+            _v2_tool_schemas(v2_bindings) if isinstance(v2_bindings, dict) else await selection.context_tool_schemas(ctx)
         )
 
         reasoning_effort = None if params["model"] in _REASONING_UNSUPPORTED else params.get("reasoning_effort")
@@ -1044,7 +1043,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                         "error_code": execution_result.error_code,
                         "replayed": False,
                     }
-                execution_result = await tool_runtime.context_execute_result(
+                execution_result = await dispatch.context_execute_result(
                     tool_call["name"],
                     prepared["arguments"],
                     replace(
@@ -1282,17 +1281,17 @@ async def stream(
         managed_search=managed_search,
         managed_fetch=managed_fetch,
         managed_advisor=managed_advisor,
-        binding_session=tool_runtime.ToolBindingSession(),
+        binding_session=contracts.ToolBindingSession(),
     )
     if execution_protocol_version == 2:
-        initial_bindings = await tool_runtime.v2_tool_bindings(ctx)
+        initial_bindings = await bindings.v2_tool_bindings(ctx)
         params["v2_bindings"] = {
             name: binding
             for name, binding in initial_bindings.items()
             if getattr(binding, "load_policy", None) != "on_demand"
         }
         if "list_available_tools" in params["v2_bindings"]:
-            params["v2_bindings"]["list_available_tools"] = tool_runtime._catalog_binding(
+            params["v2_bindings"]["list_available_tools"] = bindings._catalog_binding(
                 params["v2_bindings"],
                 include_managed=True,
             )

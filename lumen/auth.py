@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Literal, NotRequired, TypedDict
 
 from fastapi import Depends, Header, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
@@ -18,6 +19,18 @@ x_api_key_scheme = APIKeyHeader(name="x-api-key", auto_error=False, scheme_name=
 
 _logger = logging.getLogger(__name__)
 _admin_role_id_cache: str | None = None
+
+
+class Principal(TypedDict):
+    auth_type: Literal["keystone", "api_key"]
+    user_id: str
+    project_id: str
+    api_key_id: int | None
+    scopes: tuple[str, ...]
+    source: Literal["web", "api"]
+    roles: list[str]
+    is_system_admin: bool
+    token: NotRequired[str]
 
 
 @dataclass
@@ -120,6 +133,121 @@ def validate_token(token: str, project_id: str = "") -> dict:
     }
 
 
+def _keystone_principal(info: dict, token: str) -> Principal:
+    return {
+        "auth_type": "keystone",
+        "user_id": info["user_id"],
+        "project_id": info["project_id"],
+        "api_key_id": None,
+        "scopes": (),
+        "source": "web",
+        "roles": list(info["roles"]),
+        "is_system_admin": bool(info["is_system_admin"]),
+        "token": token,
+    }
+
+
+async def get_principal(
+    request: Request,
+    _keystone_token: str | None = Security(keystone_token_scheme),
+    _keystone_bearer: HTTPAuthorizationCredentials | None = Security(keystone_bearer_scheme),
+    _api_key_bearer: HTTPAuthorizationCredentials | None = Security(api_key_bearer_scheme),
+    _x_api_key: str | None = Security(x_api_key_scheme),
+) -> Principal:
+    """Resolve exactly one Keystone or scoped API-key credential for user routes."""
+    from lumen.services import api_key_store as aks
+
+    del _keystone_token, _keystone_bearer, _api_key_bearer, _x_api_key
+
+    x_api_key = (request.headers.get("X-API-Key") or "").strip()
+    authorization = (request.headers.get("Authorization") or "").strip()
+    x_auth_token = (request.headers.get("X-Auth-Token") or "").strip()
+    supplied = [value for value in (x_api_key, authorization, x_auth_token) if value]
+    if len(supplied) > 1:
+        raise HTTPException(status_code=400, detail="여러 인증 credential을 동시에 보낼 수 없습니다")
+
+    if not supplied:
+        raise HTTPException(status_code=401, detail="인증 credential이 필요합니다")
+
+    raw_api_key: str | None = None
+    keystone_token: str | None = None
+    if x_api_key:
+        raw_api_key = x_api_key
+    elif x_auth_token:
+        keystone_token = x_auth_token
+    elif authorization.lower().startswith("bearer "):
+        bearer = authorization[7:].strip()
+        if bearer.startswith("sk-afgl-"):
+            raw_api_key = bearer
+        else:
+            keystone_token = bearer
+    else:
+        raise HTTPException(status_code=401, detail="유효한 Bearer 인증 credential이 필요합니다")
+
+    if raw_api_key is not None:
+        info = await aks.verify_key(raw_api_key)
+        if info is None:
+            raise HTTPException(status_code=401, detail="유효하지 않은 API 키입니다")
+        requested_project = (request.headers.get("X-Project-Id") or "").strip()
+        if requested_project and requested_project != info["project_id"]:
+            raise HTTPException(status_code=403, detail="API 키 프로젝트와 X-Project-Id가 일치하지 않습니다")
+        scopes = info.get("scopes")
+        if not isinstance(scopes, tuple) or not scopes:
+            raise HTTPException(status_code=401, detail="유효하지 않은 API 키입니다")
+        principal: Principal = {
+            "auth_type": "api_key",
+            "user_id": info["user_id"],
+            "project_id": info["project_id"],
+            "api_key_id": info["api_key_id"],
+            "scopes": scopes,
+            "source": "api",
+            "roles": [],
+            "is_system_admin": False,
+        }
+    else:
+        assert keystone_token is not None
+        try:
+            principal = _keystone_principal(
+                validate_token(keystone_token, project_id=request.headers.get("X-Project-Id") or ""),
+                keystone_token,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=401, detail="인증 실패") from exc
+
+    request.state.token_info = principal
+    return principal
+
+
+def ensure_scopes(principal: Principal, *required: str) -> Principal:
+    """Enforce every required scope for API keys; Keystone sessions retain existing authority."""
+    if principal["auth_type"] == "keystone":
+        return principal
+    missing = tuple(scope for scope in sorted(set(required)) if scope not in principal["scopes"])
+    if missing:
+        raise HTTPException(status_code=403, detail=f"API 키에 필요한 scope가 없습니다: {', '.join(missing)}")
+    return principal
+
+
+def require_scopes(*required: str):
+    async def dependency(principal: Principal = Depends(get_principal)) -> Principal:
+        return ensure_scopes(principal, *required)
+
+    return dependency
+
+
+def require_api_key_scopes(*required: str):
+    scoped_dependency = require_scopes(*required)
+
+    async def dependency(principal: Principal = Depends(scoped_dependency)) -> Principal:
+        if principal["auth_type"] != "api_key":
+            raise HTTPException(status_code=401, detail="API 키가 필요합니다")
+        return principal
+
+    return dependency
+
+
 async def require_token(
     x_auth_token: str | None = Security(keystone_token_scheme),
     bearer: HTTPAuthorizationCredentials | None = Security(keystone_bearer_scheme),
@@ -167,7 +295,8 @@ async def get_api_key_info(
     request: Request,
     bearer: HTTPAuthorizationCredentials | None = Security(api_key_bearer_scheme),
     x_api_key: str | None = Security(x_api_key_scheme),
-) -> dict:
+) -> Principal:
+    """Legacy API-key-only dependency retained for compat route callers."""
     from lumen.services import api_key_store as aks
 
     raw = None
@@ -179,19 +308,21 @@ async def get_api_key_info(
         raise HTTPException(status_code=401, detail="API 키가 필요합니다 (Authorization: Bearer 또는 x-api-key)")
 
     info = await aks.verify_key(raw)
-    if info is None:
+    scopes = info.get("scopes") if info else None
+    if not isinstance(scopes, tuple) or not scopes:
         raise HTTPException(status_code=401, detail="유효하지 않은 API 키입니다")
-
-    token_info = {
+    principal: Principal = {
+        "auth_type": "api_key",
         "user_id": info["user_id"],
         "project_id": info["project_id"],
         "api_key_id": info["api_key_id"],
+        "scopes": scopes,
         "source": "api",
         "roles": [],
         "is_system_admin": False,
     }
-    request.state.token_info = token_info
-    return token_info
+    request.state.token_info = principal
+    return principal
 
 
 def get_admin_connection_for_project(project_id: str):

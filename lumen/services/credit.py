@@ -157,6 +157,7 @@ async def apply_usage_in_transaction(
     conversation_id: str | None = None,
     source: str = "web",
     api_key_id: int | None = None,
+    run_id: str | None = None,
     charge_wallet: bool = True,
     usage_components: list[dict[str, Any]] | None = None,
 ) -> Decimal:
@@ -189,6 +190,7 @@ async def apply_usage_in_transaction(
             api_key_id=api_key_id,
             pricing_status=usage_cost.pricing_status,
             pricing_snapshot=pricing_snapshot,
+            run_id=run_id,
             usage_components=usage_components,
         )
     )
@@ -219,6 +221,7 @@ async def apply_usage(
     conversation_id: str | None = None,
     source: str = "web",
     api_key_id: int | None = None,
+    run_id: str | None = None,
     charge_wallet: bool = True,
 ) -> Decimal:
     factory = _require_db()
@@ -242,6 +245,7 @@ async def apply_usage(
                         source=source,
                         api_key_id=api_key_id,
                         charge_wallet=charge_wallet,
+                        run_id=run_id,
                     )
             except IntegrityError as exc:
                 await session.rollback()

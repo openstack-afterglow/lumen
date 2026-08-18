@@ -64,6 +64,7 @@ packages = ["lumen"]
 asyncio_mode = "auto"
 markers = [
     "crypto: encryption-domain unit tests",
+    "integration: MariaDB/Redis가 필요한 end-to-end tests",
 ]
 
 [tool.ruff]

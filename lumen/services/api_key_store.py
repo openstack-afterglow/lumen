@@ -24,6 +24,35 @@ logger = logging.getLogger(__name__)
 
 _KEY_PREFIX = "sk-afgl-"  # 발급 키 접두(식별·표시용)
 
+DEFAULT_API_KEY_SCOPES = ("models:read", "compat:completions:write")
+API_KEY_SCOPES = frozenset(
+    {
+        "models:read",
+        "compat:completions:write",
+        "native:conversations:read",
+        "native:conversations:write",
+        "native:runs:read",
+        "native:runs:write",
+        "native:extensions:read",
+        "native:extensions:write",
+        "native:tools:execute",
+        "native:memory:read",
+        "native:memory:write",
+        "native:agents:use",
+        "usage:read",
+    }
+)
+
+
+def _valid_scopes(scopes: object) -> tuple[str, ...] | None:
+    if not isinstance(scopes, list) or not scopes:
+        return None
+    if any(not isinstance(scope, str) or scope not in API_KEY_SCOPES for scope in scopes):
+        return None
+    if len(set(scopes)) != len(scopes):
+        return None
+    return tuple(scopes)
+
 
 class ApiKeyStorageUnavailable(RuntimeError):
     """chat DB 미구성/장애."""
@@ -60,6 +89,7 @@ def _public(row: ChatApiKey) -> dict:
         "id": row.id,
         "name": row.name,
         "key_prefix": row.key_prefix,
+        "scopes": list(row.scopes),
         "is_active": row.is_active,
         "last_used_at": _iso(row.last_used_at),
         "created_at": _iso(row.created_at),
@@ -67,8 +97,11 @@ def _public(row: ChatApiKey) -> dict:
     }
 
 
-async def create_key(user_id: str, project_id: str, name: str) -> dict:
+async def create_key(user_id: str, project_id: str, name: str, scopes: list[str]) -> dict:
     """새 API 키 발급. 반환 dict 의 `key` 는 평문(1회만 노출) — 이후 조회 불가."""
+    validated_scopes = _valid_scopes(scopes)
+    if validated_scopes is None:
+        raise ValueError("API 키 scope가 올바르지 않습니다")
     raw = _KEY_PREFIX + secrets.token_urlsafe(32)
     key_prefix = raw[: len(_KEY_PREFIX) + 4]  # 예: sk-afgl-AbCd
     row = ChatApiKey(
@@ -77,6 +110,7 @@ async def create_key(user_id: str, project_id: str, name: str) -> dict:
         name=(name or "").strip()[:100],
         key_prefix=key_prefix,
         key_hash=_hash_key(raw),
+        scopes=list(validated_scopes),
         is_active=True,
     )
     factory = _require_db()
@@ -154,10 +188,14 @@ async def verify_key(raw: str) -> dict | None:
             # 조회는 해시로 했지만 타이밍 안전 비교를 명시(CLAUDE.md §4).
             if not hmac.compare_digest(row.key_hash, computed):
                 return None
+            scopes = _valid_scopes(row.scopes)
+            if scopes is None:
+                return None
             info = {
                 "user_id": row.owner_user_id,
                 "project_id": row.owner_project_id,
                 "api_key_id": row.id,
+                "scopes": scopes,
             }
             # last_used_at 갱신(best-effort — 실패해도 인증은 성공).
             try:

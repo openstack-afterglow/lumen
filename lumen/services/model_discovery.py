@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import logging
 
-from lumen.services import provider_store
+from lumen.services.providers import errors
+from lumen.services.providers import routing as provider_store
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ async def discover_models(provider_id: int) -> dict:
     """프로바이더의 사용 가능 모델 목록. {"models": [...], "source": "api"|"litellm"|"none"}."""
     prov = await provider_store.get_provider_for_discovery(provider_id)
     if prov is None:
-        raise provider_store.ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
+        raise errors.ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
 
     ptype = prov["provider_type"]
     if ptype in _OPENAI_COMPATIBLE:

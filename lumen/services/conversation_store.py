@@ -17,13 +17,13 @@ from sqlalchemy import literal, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import aliased
 
+from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import ChatConversation, ChatMessage, ChatWorkspace
 from lumen.models.chat_runs import ChatRun, ChatRunSegment, ChatRunTurn
 from lumen.services.message_parts import deserialize_parts, serialize_parts
 from lumen.services.message_timestamps import message_timestamps
 from lumen.services.run_store import replay_events
-from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 
 logger = logging.getLogger(__name__)
 

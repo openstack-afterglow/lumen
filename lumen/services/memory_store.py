@@ -18,10 +18,10 @@ from sqlalchemy import or_, select
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.exc import OperationalError
 
+from lumen.crypto import decrypt_chat_content, derive_encryption_subkey, encrypt_chat_content
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import ChatMemory, ChatMemoryOwnerLock
 from lumen.models.chat_jobs import ChatMemoryOutbox
-from lumen.crypto import decrypt_chat_content, derive_encryption_subkey, encrypt_chat_content
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +146,19 @@ def _scope_predicate(*, project_id: str | None, workspace_id: int | None):
     return or_(*predicates)
 
 
+def _project_scope_predicate(*, project_id: str | None, workspace_id: int | None):
+    predicates = [
+        (ChatMemory.scope == "project") & (ChatMemory.project_id == project_id) & ChatMemory.workspace_id.is_(None)
+    ]
+    if workspace_id is not None:
+        predicates.append(
+            (ChatMemory.scope == "workspace")
+            & (ChatMemory.project_id == project_id)
+            & (ChatMemory.workspace_id == workspace_id)
+        )
+    return or_(*predicates)
+
+
 def _exact_scope_predicate(*, scope: str, project_id: str | None, workspace_id: int | None):
     _validate_namespace(scope=scope, project_id=project_id, workspace_id=workspace_id)
     return (
@@ -159,12 +172,16 @@ def _not_expired_predicate():
     return or_(ChatMemory.expires_at.is_(None), ChatMemory.expires_at > datetime.now(UTC))
 
 
-async def _load_owned(session, memory_id: int, user_id: str, project_id: str | None) -> ChatMemory:
+async def _load_owned(
+    session, memory_id: int, user_id: str, project_id: str | None, *, include_account: bool = True
+) -> ChatMemory:
     row = await session.get(ChatMemory, memory_id)
     if row is None:
         raise MemoryNotFound(f"메모리 {memory_id} 를 찾을 수 없습니다")
     if row.user_id != user_id or not _visible_in_project(row, project_id):
         raise MemoryForbidden("메모리에 접근할 권한이 없습니다")
+    if not include_account and row.scope == "account":
+        raise MemoryForbidden("계정 메모리에 접근할 권한이 없습니다")
     return row
 
 
@@ -227,7 +244,9 @@ async def create_memory(
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def list_memories(*, user_id: str, project_id: str | None = None, workspace_id: int | None = None) -> list[dict]:
+async def list_memories(
+    *, user_id: str, project_id: str | None = None, workspace_id: int | None = None, include_account: bool = True
+) -> list[dict]:
     factory = _require_db()
     try:
         async with factory() as session:
@@ -239,7 +258,11 @@ async def list_memories(*, user_id: str, project_id: str | None = None, workspac
                             ChatMemory.user_id == user_id,
                             ChatMemory.status == "active",
                             _not_expired_predicate(),
-                            _scope_predicate(project_id=project_id, workspace_id=workspace_id),
+                            (
+                                _scope_predicate(project_id=project_id, workspace_id=workspace_id)
+                                if include_account
+                                else _project_scope_predicate(project_id=project_id, workspace_id=workspace_id)
+                            ),
                         )
                         .order_by(ChatMemory.updated_at.desc())
                     )
@@ -291,11 +314,18 @@ async def hydrate_candidate_ids(
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def update_memory(memory_id: int, *, user_id: str, project_id: str | None = None, patch: dict) -> dict:
+async def update_memory(
+    memory_id: int,
+    *,
+    user_id: str,
+    project_id: str | None = None,
+    patch: dict,
+    include_account: bool = True,
+) -> dict:
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
-            row = await _load_owned(session, memory_id, user_id, project_id)
+            row = await _load_owned(session, memory_id, user_id, project_id, include_account=include_account)
             if "content" in patch:
                 content = (patch["content"] or "").strip()
                 if not content:
@@ -316,11 +346,13 @@ async def update_memory(memory_id: int, *, user_id: str, project_id: str | None 
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def delete_memory(memory_id: int, *, user_id: str, project_id: str | None = None) -> None:
+async def delete_memory(
+    memory_id: int, *, user_id: str, project_id: str | None = None, include_account: bool = True
+) -> None:
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
-            row = await _load_owned(session, memory_id, user_id, project_id)
+            row = await _load_owned(session, memory_id, user_id, project_id, include_account=include_account)
             row.status = "deleting"
             row.is_active = False
             plaintext = decrypt_chat_content(row.content) if row.content else ""
@@ -449,6 +481,7 @@ async def active_contents_for_run(
     user_id: str,
     project_id: str | None,
     workspace_id: int | None = None,
+    include_account: bool = True,
 ) -> list[str]:
     """Hydrate only active MySQL rows in the caller's exact visible namespaces."""
     if not is_db_available():
@@ -467,7 +500,11 @@ async def active_contents_for_run(
                             ChatMemory.is_active.is_(True),
                             ChatMemory.status == "active",
                             _not_expired_predicate(),
-                            _scope_predicate(project_id=project_id, workspace_id=workspace_id),
+                            (
+                                _scope_predicate(project_id=project_id, workspace_id=workspace_id)
+                                if include_account
+                                else _project_scope_predicate(project_id=project_id, workspace_id=workspace_id)
+                            ),
                         )
                         .order_by(ChatMemory.updated_at.desc())
                         .limit(_MAX_INJECT)

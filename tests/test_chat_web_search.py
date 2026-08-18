@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from lumen.services import provider_store as ps
+from lumen.services.providers import routing as ps
 from lumen.services.web_search import ManagedSearchError, search_selected_provider, search_with_route
 
 

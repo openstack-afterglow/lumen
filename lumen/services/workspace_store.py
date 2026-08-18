@@ -11,9 +11,9 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
+from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import ChatWorkspace
-from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 
 logger = logging.getLogger(__name__)
 

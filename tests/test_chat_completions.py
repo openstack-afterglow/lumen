@@ -6,9 +6,11 @@ from fastapi import HTTPException
 
 from lumen.api import completions
 from lumen.models.chat_contracts import ChatFeatureOptions, ChatRunDescriptor, UserAssetInputPart
-from lumen.services import capabilities, credit, durable_runs
+from lumen.services import capabilities, chat_admission, credit
 from lumen.services import conversation_store as cs
-from lumen.services import provider_store as ps
+from lumen.services.durable_runs import admission, common, queries
+from lumen.services.durable_runs import errors as durable_errors
+from lumen.services.providers import routing as ps
 
 _BASE = "/api/v1/chat/conversations"
 _HEADERS = {"Idempotency-Key": "d27ac16a-0e5b-465f-89cc-eefe6e9d0001"}
@@ -27,7 +29,7 @@ async def test_selected_skills_are_loaded_once_from_owned_active_extensions(monk
             {"id": 2, "name": "unused", "instructions": "second"},
         ]
 
-    monkeypatch.setattr(completions.es, "list_for_user", fake_list)
+    monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
     instructions, provenance = await completions._load_skill_snapshot(None, [1], "u1", "p1")
 
     assert instructions == ["first"]
@@ -66,8 +68,8 @@ async def test_extension_selection_expands_omitted_ids_for_default_chat(monkeypa
         assert (user_id, project_id) == ("u1", "p1")
         return {7: 3, 8: 4}
 
-    monkeypatch.setattr(completions.es, "list_for_user", fake_list)
-    monkeypatch.setattr(completions.es, "mcp_credential_versions", fake_credential_versions)
+    monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
+    monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", fake_credential_versions)
 
     no_agent = await completions._resolve_extension_selection(None, ChatFeatureOptions(), user_id="u1", project_id="p1")
     assert [item["id"] for item in no_agent["tools"]] == [7, 8]
@@ -108,8 +110,8 @@ async def test_mcp_selection_snapshots_credential_version(monkeypatch):
         assert (user_id, project_id) == ("u1", "p1")
         return {7: 4}
 
-    monkeypatch.setattr(completions.es, "list_for_user", fake_list)
-    monkeypatch.setattr(completions.es, "mcp_credential_versions", credential_versions)
+    monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
+    monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", credential_versions)
 
     selection = await completions._resolve_extension_selection(
         {"tool_ids": [], "mcp_ids": [7]},
@@ -122,7 +124,7 @@ async def test_mcp_selection_snapshots_credential_version(monkeypatch):
 
 
 async def test_extension_selection_rejects_agent_allowlist_bypass(monkeypatch):
-    monkeypatch.setattr(completions.es, "list_for_user", lambda *_args, **_kwargs: _return([]))
+    monkeypatch.setattr(chat_admission.es, "list_for_user", lambda *_args, **_kwargs: _return([]))
 
     with pytest.raises(HTTPException, match="allowlist"):
         await completions._resolve_extension_selection(
@@ -138,7 +140,7 @@ async def _ok_precheck(user_id, project_id=None):
 
 
 def test_input_asset_failures_map_to_client_validation_error():
-    assert completions._run_error(durable_runs.DurableRunInputError("input asset is not ready")).status_code == 422
+    assert completions._run_error(durable_errors.DurableRunInputError("input asset is not ready")).status_code == 422
 
 
 def _conv():
@@ -166,9 +168,9 @@ async def _patch_text_execution(monkeypatch):
     )
     monkeypatch.setattr(cs, "add_message", lambda *args, **kwargs: _return({"id": 1}))
     monkeypatch.setattr(ps, "resolve_model", lambda *args, **kwargs: _return(_resolved()))
-    monkeypatch.setattr(durable_runs, "existing_run_for_intent", lambda *args, **kwargs: _return(None))
-    monkeypatch.setattr(completions.ms, "active_contents_for_run", lambda *args, **kwargs: _return([]))
-    monkeypatch.setattr(completions.ws, "get_instructions_for_run", lambda *args, **kwargs: _return(None))
+    monkeypatch.setattr(admission, "existing_run_for_intent", lambda *args, **kwargs: _return(None))
+    monkeypatch.setattr(chat_admission.ms, "active_contents_for_run", lambda *args, **kwargs: _return([]))
+    monkeypatch.setattr(chat_admission.ws, "get_instructions_for_run", lambda *args, **kwargs: _return(None))
 
 
 async def _return(value):
@@ -382,9 +384,9 @@ class TestExecutionCapabilityGate:
             raise AssertionError("memory store must not be queried")
 
         monkeypatch.setattr(
-            completions.ws, "get_instructions_for_run", lambda *_args, **_kwargs: _return("workspace rule")
+            chat_admission.ws, "get_instructions_for_run", lambda *_args, **_kwargs: _return("workspace rule")
         )
-        monkeypatch.setattr(completions.ms, "active_contents_for_run", fail_memory_lookup)
+        monkeypatch.setattr(chat_admission.ms, "active_contents_for_run", fail_memory_lookup)
 
         workspace, memories = await completions._load_context({"workspace_id": 7}, "u1", "p1", include_memory=False)
 
@@ -449,8 +451,8 @@ class TestExecutionCapabilityGate:
             "model_name": "advisor-model",
             "config_version_hash": "a" * 64,
         }
-        monkeypatch.setattr(completions.ps, "get_active_provider_route", lambda provider_id: _return(search_route))
-        monkeypatch.setattr(completions.ps, "resolve_model_by_id", lambda model_id: _return(advisor_route))
+        monkeypatch.setattr(chat_admission.ps, "get_active_provider_route", lambda provider_id: _return(search_route))
+        monkeypatch.setattr(chat_admission.ps, "resolve_model_by_id", lambda model_id: _return(advisor_route))
 
         routes = await completions._resolve_feature_routes(
             ChatFeatureOptions(
@@ -462,7 +464,7 @@ class TestExecutionCapabilityGate:
         assert routes == {"search": search_route, "advisor": advisor_route}
 
     async def test_rejects_unavailable_selected_feature_route(self, monkeypatch):
-        monkeypatch.setattr(completions.ps, "get_active_provider_route", lambda provider_id: _return(None))
+        monkeypatch.setattr(chat_admission.ps, "get_active_provider_route", lambda provider_id: _return(None))
         with pytest.raises(HTTPException, match="selected web search provider"):
             await completions._resolve_feature_routes(
                 ChatFeatureOptions(web_search={"enabled": True, "provider_id": 7})
@@ -475,8 +477,8 @@ class TestExecutionCapabilityGate:
             captured.update(kwargs)
             return ["사용자는 Python을 선호합니다."]
 
-        monkeypatch.setattr(completions.ws, "get_instructions_for_run", lambda *_args, **_kwargs: _return(None))
-        monkeypatch.setattr(completions.ms, "active_contents_for_run", load_memory)
+        monkeypatch.setattr(chat_admission.ws, "get_instructions_for_run", lambda *_args, **_kwargs: _return(None))
+        monkeypatch.setattr(chat_admission.ms, "active_contents_for_run", load_memory)
 
         workspace, memories = await completions._load_context({"workspace_id": None}, "u1", "p1", include_memory=True)
 
@@ -495,7 +497,7 @@ class TestActiveRunRecovery:
             cancel_url="/api/v1/chat/runs/run-active/cancel",
         )
         monkeypatch.setattr(
-            durable_runs,
+            queries,
             "active_run_descriptors",
             lambda **_kwargs: _return([descriptor]),
         )
@@ -514,7 +516,7 @@ class TestActiveRunRecovery:
             cancel_url="/api/v1/chat/runs/run-active/cancel",
         )
         monkeypatch.setattr(
-            durable_runs,
+            queries,
             "active_run_descriptors_for_owner",
             lambda **_kwargs: _return([descriptor]),
         )
@@ -539,7 +541,7 @@ class TestCanonicalCompletionRequests:
             raise credit.QuotaExceeded("quota exhausted")
 
         monkeypatch.setattr(credit, "precheck", reject)
-        monkeypatch.setattr(durable_runs, "existing_run_for_intent", lambda **_kwargs: _return(None))
+        monkeypatch.setattr(admission, "existing_run_for_intent", lambda **_kwargs: _return(None))
         monkeypatch.setattr(completions, "_load_owned_conv", lambda *_args, **_kwargs: _return({}))
         monkeypatch.setattr(
             cs, "get_active_path", lambda *_args, **_kwargs: _return({"active_leaf_id": None, "messages": []})
@@ -560,7 +562,7 @@ class TestCanonicalCompletionRequests:
                 cancel_url="/api/v1/chat/runs/run-1/cancel",
             )
 
-        monkeypatch.setattr(durable_runs, "create_persistent_run", create_persistent_run)
+        monkeypatch.setattr(admission, "create_persistent_run", create_persistent_run)
         response = await client.post(
             f"{_BASE}/c1/completions",
             headers=_HEADERS,
@@ -581,7 +583,7 @@ class TestCanonicalCompletionRequests:
         seen = {}
         settings = completions.get_settings().model_copy(update={"chat_execution_protocol_version": 2})
         monkeypatch.setattr(completions, "get_settings", lambda: settings)
-        monkeypatch.setattr(durable_runs, "_require_supported_execution_protocol_version", lambda _version: None)
+        monkeypatch.setattr(common, "_require_supported_execution_protocol_version", lambda _version: None)
         monkeypatch.setattr(
             completions,
             "_resolve_agent",
@@ -616,7 +618,7 @@ class TestCanonicalCompletionRequests:
                 cancel_url="/api/v1/chat/runs/run-policy/cancel",
             )
 
-        monkeypatch.setattr(durable_runs, "create_persistent_run", create_persistent_run)
+        monkeypatch.setattr(admission, "create_persistent_run", create_persistent_run)
         response = await client.post(f"{_BASE}/c1/completions", headers=_HEADERS, json=_request(agent_id="9"))
 
         assert response.status_code == 202
@@ -633,7 +635,7 @@ class TestCanonicalCompletionRequests:
             events_url="/api/v1/chat/runs/run-existing/events",
             cancel_url="/api/v1/chat/runs/run-existing/cancel",
         )
-        monkeypatch.setattr(durable_runs, "existing_run_for_intent", lambda *args, **kwargs: _return(existing))
+        monkeypatch.setattr(admission, "existing_run_for_intent", lambda *args, **kwargs: _return(existing))
         monkeypatch.setattr(completions, "get_settings", lambda: SimpleNamespace(chat_execution_protocol_version=2))
 
         async def unavailable_model(*_args, **_kwargs):
@@ -684,7 +686,7 @@ class TestCanonicalCompletionRequests:
                 cancel_url="/api/v1/chat/runs/run-image/cancel",
             )
 
-        monkeypatch.setattr(durable_runs, "create_persistent_run", create_persistent_run)
+        monkeypatch.setattr(admission, "create_persistent_run", create_persistent_run)
         response = await client.post(
             f"{_BASE}/c1/completions",
             headers=_HEADERS,
@@ -762,8 +764,8 @@ class TestRetryFailedRun:
 
             return lambda: FakeSession()
 
-        monkeypatch.setattr(durable_runs, "existing_run_for_intent", lambda *args, **kwargs: _return(None))
-        monkeypatch.setattr(durable_runs, "_factory", fake_factory)
+        monkeypatch.setattr(admission, "existing_run_for_intent", lambda *args, **kwargs: _return(None))
+        monkeypatch.setattr(common, "_factory", fake_factory)
         monkeypatch.setattr(
             completions,
             "_resolve_agent",
@@ -789,7 +791,7 @@ class TestRetryFailedRun:
                 return [{"id": 3, "name": "skill-3", "instructions": "skill-3-instructions"}]
             return []
 
-        monkeypatch.setattr(completions.es, "list_for_user", fake_list_for_user)
+        monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list_for_user)
         monkeypatch.setattr(
             cs,
             "path_ending_at",
@@ -810,7 +812,7 @@ class TestRetryFailedRun:
                 cancel_url="/cancel",
             )
 
-        monkeypatch.setattr(durable_runs, "create_run", fake_create_run)
+        monkeypatch.setattr(admission, "create_run", fake_create_run)
 
         response = await client.post(f"{_BASE}/c1/runs/run-source-1/retry", headers=_HEADERS)
 
@@ -834,12 +836,12 @@ class TestRetryFailedRun:
             assert client_request_id == _HEADERS["Idempotency-Key"]
             return created_descriptor
 
-        monkeypatch.setattr(durable_runs, "existing_run_for_intent", fake_existing)
+        monkeypatch.setattr(admission, "existing_run_for_intent", fake_existing)
 
         async def unexpected_db_lookup(*args, **kwargs):
             raise AssertionError("a replayed retry with the same idempotency key must not query DB for the source run")
 
-        monkeypatch.setattr(durable_runs, "_factory", unexpected_db_lookup)
+        monkeypatch.setattr(common, "_factory", unexpected_db_lookup)
 
         response = await client.post(f"{_BASE}/c1/runs/run-source-1/retry", headers=_HEADERS)
 
@@ -857,7 +859,7 @@ class TestRetryFailedRun:
         async def unexpected_create(*args, **kwargs):
             raise AssertionError("create_run must not be called when credit precheck raises QuotaExceeded")
 
-        monkeypatch.setattr(durable_runs, "create_run", unexpected_create)
+        monkeypatch.setattr(admission, "create_run", unexpected_create)
 
         response = await client.post(f"{_BASE}/c1/runs/run-source-1/retry", headers=_HEADERS)
 
@@ -869,7 +871,7 @@ class TestCanonicalTempCompletion:
     async def test_temp_completion_creates_thread_and_descriptor(self, client, monkeypatch):
         monkeypatch.setattr(credit, "precheck", _ok_precheck)
         monkeypatch.setattr(ps, "resolve_model", lambda *args, **kwargs: _return(_resolved()))
-        monkeypatch.setattr(durable_runs, "existing_run_for_intent", lambda **_kwargs: _return(None))
+        monkeypatch.setattr(admission, "existing_run_for_intent", lambda **_kwargs: _return(None))
         seen = {}
 
         async def create_temp_run(**kwargs):
@@ -882,7 +884,7 @@ class TestCanonicalTempCompletion:
                 cancel_url="/api/v1/chat/runs/run-temp/cancel",
             )
 
-        monkeypatch.setattr(durable_runs, "create_temp_run", create_temp_run)
+        monkeypatch.setattr(admission, "create_temp_run", create_temp_run)
         response = await client.post(
             "/api/v1/chat/temp-completions",
             headers=_HEADERS,

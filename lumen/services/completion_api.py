@@ -17,7 +17,8 @@ from typing import Any
 
 from lumen.config import get_settings
 from lumen.services import credit, litellm_client
-from lumen.services import provider_store as ps
+from lumen.services.providers import errors
+from lumen.services.providers import routing as ps
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ async def resolve(model: str) -> dict:
         raise CompletionError(400, "model 이 필요합니다")
     try:
         resolved = await ps.resolve_model(model)
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise CompletionError(503, "일시적으로 사용할 수 없습니다") from exc
     if resolved is None:
         raise CompletionError(404, f"모델을 찾을 수 없습니다: {model}")

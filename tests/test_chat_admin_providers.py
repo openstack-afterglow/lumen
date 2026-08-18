@@ -10,7 +10,8 @@ from decimal import Decimal
 
 import pytest
 
-from lumen.services import provider_store as ps
+from lumen.services.providers import errors, pricing
+from lumen.services.providers import repository as ps
 
 _PROVIDERS_URL = "/api/v1/chat/admin/providers"
 _MODELS_URL = "/api/v1/chat/admin/models"
@@ -81,7 +82,7 @@ class TestProviderCrud:
 
     async def test_update_not_found_404(self, admin_client, monkeypatch):
         async def fake_update(provider_id, patch):
-            raise ps.ProviderNotFoundError("없음")
+            raise errors.ProviderNotFoundError("없음")
 
         monkeypatch.setattr(ps, "update_provider", fake_update)
         resp = await admin_client.patch(f"{_PROVIDERS_URL}/999", json={"is_active": False})
@@ -89,7 +90,7 @@ class TestProviderCrud:
 
     async def test_update_active_executor_route_is_conflict(self, admin_client, monkeypatch):
         async def fake_update(provider_id, patch):
-            raise ps.ActiveRunConfigurationConflict("run active")
+            raise errors.ActiveRunConfigurationConflict("run active")
 
         monkeypatch.setattr(ps, "update_provider", fake_update)
         resp = await admin_client.patch(f"{_PROVIDERS_URL}/1", json={"is_active": False})
@@ -97,7 +98,7 @@ class TestProviderCrud:
 
     async def test_create_validation_400(self, admin_client, monkeypatch):
         async def fake_create(**kwargs):
-            raise ps.ProviderValidationError("중복")
+            raise errors.ProviderValidationError("중복")
 
         monkeypatch.setattr(ps, "create_provider", fake_create)
         resp = await admin_client.post(_PROVIDERS_URL, json={"name": "dup"})
@@ -105,7 +106,7 @@ class TestProviderCrud:
 
     async def test_storage_unavailable_503(self, admin_client, monkeypatch):
         async def fake_list():
-            raise ps.ChatStorageUnavailable("DB down")
+            raise errors.ChatStorageUnavailable("DB down")
 
         monkeypatch.setattr(ps, "list_providers", fake_list)
         resp = await admin_client.get(_PROVIDERS_URL)
@@ -134,7 +135,7 @@ class TestModelCrud:
 
     async def test_create_model_bad_provider_400(self, admin_client, monkeypatch):
         async def fake_create(**kwargs):
-            raise ps.ProviderValidationError("프로바이더 없음")
+            raise errors.ProviderValidationError("프로바이더 없음")
 
         monkeypatch.setattr(ps, "create_model", fake_create)
         resp = await admin_client.post(_MODELS_URL, json={"provider_id": 999, "model_name": "x"})
@@ -172,7 +173,7 @@ class TestTitleModel:
 
     async def test_set_title_model_not_found_404(self, admin_client, monkeypatch):
         async def fake_set(model_id):
-            raise ps.ProviderNotFoundError("모델 없음")
+            raise errors.ProviderNotFoundError("모델 없음")
 
         monkeypatch.setattr(ps, "set_title_model", fake_set)
         resp = await admin_client.put(self._URL, json={"model_id": 999})
@@ -270,9 +271,9 @@ class TestModelPricingContract:
         assert resp.status_code == 422
 
     def test_store_conversion_preserves_or_rejects_precision(self):
-        assert ps._per_token_price(Decimal("2"), "price") == Decimal("0.0000020000")
-        with pytest.raises(ps.ProviderValidationError):
-            ps._per_token_price(Decimal("0.00004"), "price")
+        assert pricing._per_token_price(Decimal("2"), "price") == Decimal("0.0000020000")
+        with pytest.raises(errors.ProviderValidationError):
+            pricing._per_token_price(Decimal("0.00004"), "price")
 
     async def test_update_rejects_mixed_null_price_pair(self, admin_client):
         response = await admin_client.patch(

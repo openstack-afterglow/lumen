@@ -1,1 +1,2 @@
 001-baseline|001_baseline.sql|693661bb1bc0f896fd2c0d72423164996c69af44ecabf668d01806ba38752cbd
+002-api-key-scopes-and-run-source|002_api_key_scopes_and_run_source.sql|ba470c9eb6fa16f6157720b74392ebf321756ce170b01fa64b3bfa15ecd38d91

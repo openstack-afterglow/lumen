@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from lumen.services import provider_store as ps
 from lumen.services.advisor import AdvisorError, ask_selected_advisor
+from lumen.services.providers import routing as ps
 
 
 async def test_advisor_uses_only_selected_model_and_bounded_visible_history(monkeypatch):

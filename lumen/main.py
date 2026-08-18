@@ -1,4 +1,6 @@
 """Lumen FastAPI service application entrypoint."""
+# Router imports intentionally follow application construction to avoid import-time cycles.
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -7,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
 
 from lumen.cache import close_cache
@@ -181,6 +184,24 @@ for router, tag in (
     (compat_anthropic.router, "Anthropic Compat"),
 ):
     app.include_router(router, prefix="/v1", tags=[tag], dependencies=[Depends(require_chat_api_host)])
+
+
+def custom_openapi() -> dict:
+    """Document API-key compatibility schemes without changing native route semantics."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
+    security_schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
+    security_schemes.setdefault("APIKeyBearer", {"type": "http", "scheme": "bearer"})
+    security_schemes.setdefault("XApiKey", {"type": "apiKey", "in": "header", "name": "x-api-key"})
+    api_key_security = [{"APIKeyBearer": []}, {"XApiKey": []}]
+    for path, method in (("/v1/chat/completions", "post"), ("/v1/messages", "post"), ("/v1/models", "get")):
+        schema["paths"][path][method]["security"] = api_key_security
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
 
 
 def run() -> None:

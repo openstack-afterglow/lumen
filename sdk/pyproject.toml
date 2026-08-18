@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "OpenStack SDK extension for the Lumen API"
 requires-python = ">=3.12"
 dependencies = [
+    "httpx>=0.28.1",
     "openstacksdk>=3.3",
 ]
 

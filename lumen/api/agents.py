@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from lumen.auth import get_token_info
 from lumen.services import agent_store as ags
@@ -26,9 +26,17 @@ class AgentCreate(BaseModel):
     params: dict | None = None
     mcp_ids: list[int] | None = None
     tool_ids: list[int] | None = None
+    skill_ids: list[int] | None = None
     visibility: str = Field(default="private")
 
     model_config = {"protected_namespaces": ()}
+
+    @field_validator("mcp_ids", "tool_ids", "skill_ids")
+    @classmethod
+    def ids_must_be_unique_positive(cls, value: list[int] | None) -> list[int] | None:
+        if value is not None and (len(set(value)) != len(value) or any(item < 1 for item in value)):
+            raise ValueError("extension IDs must be unique positive ids")
+        return value
 
 
 class AgentUpdate(BaseModel):
@@ -40,9 +48,17 @@ class AgentUpdate(BaseModel):
     params: dict | None = None
     mcp_ids: list[int] | None = None
     tool_ids: list[int] | None = None
+    skill_ids: list[int] | None = None
     visibility: str | None = None
 
     model_config = {"protected_namespaces": ()}
+
+    @field_validator("mcp_ids", "tool_ids", "skill_ids")
+    @classmethod
+    def ids_must_be_unique_positive(cls, value: list[int] | None) -> list[int] | None:
+        if value is not None and (len(set(value)) != len(value) or any(item < 1 for item in value)):
+            raise ValueError("extension IDs must be unique positive ids")
+        return value
 
 
 def _map_error(exc: Exception) -> HTTPException:

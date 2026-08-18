@@ -10,11 +10,25 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from lumen import auth as deps
+from lumen.api import completions
+from lumen.models.chat_contracts import ChatFeatureOptions, TextPart
 from lumen.services import api_key_store as aks
 
 _USER_KEYS = "/api/v1/chat/api-keys"
+
+
+def _request(**headers: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [(key.replace("_", "-").lower().encode(), value.encode()) for key, value in headers.items()],
+        }
+    )
 
 
 class TestStorePureLogic:
@@ -33,11 +47,18 @@ class TestStorePureLogic:
             is_active=True,
             last_used_at=None,
             created_at=None,
+            scopes=["models:read"],
             revoked_at=None,
         )
         pub = aks._public(row)
         assert "key_hash" not in pub and "key" not in pub
         assert pub["key_prefix"] == "sk-afgl-AbCd"
+
+    def test_scope_validation_fails_closed(self):
+        assert aks._valid_scopes([]) is None
+        assert aks._valid_scopes(["not-a-scope"]) is None
+        assert aks._valid_scopes(["models:read", "models:read"]) is None
+        assert aks._valid_scopes(list(aks.DEFAULT_API_KEY_SCOPES)) == aks.DEFAULT_API_KEY_SCOPES
 
     async def test_verify_rejects_non_prefix(self):
         assert await aks.verify_key("") is None
@@ -68,7 +89,12 @@ class TestApiKeyAuthDependency:
     async def test_valid_bearer_sets_token_info(self, monkeypatch):
         async def fake_verify(raw):
             assert raw == "sk-afgl-good"
-            return {"user_id": "u1", "project_id": "p1", "api_key_id": 7}
+            return {
+                "user_id": "u1",
+                "project_id": "p1",
+                "api_key_id": 7,
+                "scopes": ("models:read",),
+            }
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
         req = SimpleNamespace(state=SimpleNamespace())
@@ -82,7 +108,12 @@ class TestApiKeyAuthDependency:
     async def test_valid_x_api_key_header(self, monkeypatch):
         async def fake_verify(raw):
             assert raw == "sk-afgl-viakey"
-            return {"user_id": "u1", "project_id": "p1", "api_key_id": 9}
+            return {
+                "user_id": "u1",
+                "project_id": "p1",
+                "api_key_id": 9,
+                "scopes": ("models:read",),
+            }
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
         req = SimpleNamespace(state=SimpleNamespace())
@@ -90,10 +121,105 @@ class TestApiKeyAuthDependency:
         assert info["api_key_id"] == 9
 
 
+class TestPrincipalDependency:
+    async def test_api_key_principal_enforces_owner_project(self, monkeypatch):
+        async def fake_verify(raw):
+            assert raw == "sk-afgl-key"
+            return {
+                "user_id": "u1",
+                "project_id": "p1",
+                "api_key_id": 7,
+                "scopes": ("models:read",),
+            }
+
+        monkeypatch.setattr(aks, "verify_key", fake_verify)
+        principal = await deps.get_principal(_request(authorization="Bearer sk-afgl-key"))
+        assert principal["auth_type"] == "api_key"
+        assert principal["project_id"] == "p1"
+        assert principal["roles"] == []
+        with pytest.raises(HTTPException, match="API 키 프로젝트와 X-Project-Id가 일치하지 않습니다") as exc_info:
+            await deps.get_principal(_request(x_api_key="sk-afgl-key", x_project_id="other"))
+        assert exc_info.value.status_code == 403
+
+    async def test_multiple_credentials_are_rejected(self):
+        with pytest.raises(HTTPException, match="여러 인증 credential을 동시에 보낼 수 없습니다") as exc_info:
+            await deps.get_principal(_request(x_api_key="sk-afgl-key", x_auth_token="ks-token"))
+        assert exc_info.value.status_code == 400
+
+    async def test_missing_scope_is_reported_in_sorted_order(self):
+        dependency = deps.require_scopes("native:runs:write", "native:conversations:write")
+        with pytest.raises(HTTPException, match="native:conversations:write, native:runs:write") as exc_info:
+            await dependency(
+                {
+                    "auth_type": "api_key",
+                    "user_id": "u1",
+                    "project_id": "p1",
+                    "api_key_id": 7,
+                    "scopes": (),
+                    "source": "api",
+                    "roles": [],
+                    "is_system_admin": False,
+                }
+            )
+        assert exc_info.value.status_code == 403
+
+    def test_native_defaults_require_memory_and_tool_scopes(self):
+        with pytest.raises(
+            HTTPException, match="native:memory:read, native:memory:write, native:tools:execute"
+        ) as exc_info:
+            completions._require_native_admission_scopes(
+                {
+                    "auth_type": "api_key",
+                    "user_id": "u1",
+                    "project_id": "p1",
+                    "api_key_id": 7,
+                    "scopes": (),
+                    "source": "api",
+                    "roles": [],
+                    "is_system_admin": False,
+                },
+                ChatFeatureOptions(),
+                parts=[TextPart(type="text", text="hello")],
+                execution_mode="chat",
+                skill_ids=[],
+                agent=None,
+                extension_selection={"tools": [], "mcp": []},
+            )
+        assert exc_info.value.status_code == 403
+
+    def test_native_api_key_rejects_non_text_input(self):
+        with pytest.raises(HTTPException, match="text chat만 지원합니다") as exc_info:
+            completions._require_native_admission_scopes(
+                {
+                    "auth_type": "api_key",
+                    "user_id": "u1",
+                    "project_id": "p1",
+                    "api_key_id": 7,
+                    "scopes": ("native:memory:read", "native:memory:write", "native:tools:execute"),
+                    "source": "api",
+                    "roles": [],
+                    "is_system_admin": False,
+                },
+                ChatFeatureOptions(),
+                parts=[SimpleNamespace(type="image")],
+                execution_mode="chat",
+                skill_ids=[],
+                agent=None,
+                extension_selection={"tools": [], "mcp": []},
+            )
+        assert exc_info.value.status_code == 403
+
+
 class TestRouter:
     async def test_create_returns_plaintext_once(self, client, monkeypatch):
-        async def fake_create(user_id, project_id, name):
-            return {"id": 1, "name": name, "key_prefix": "sk-afgl-AbCd", "key": "sk-afgl-FULLSECRET"}
+        async def fake_create(user_id, project_id, name, scopes):
+            return {
+                "id": 1,
+                "name": name,
+                "key_prefix": "sk-afgl-AbCd",
+                "scopes": scopes,
+                "key": "sk-afgl-FULLSECRET",
+            }
 
         monkeypatch.setattr(aks, "create_key", fake_create)
         resp = await client.post(_USER_KEYS, json={"name": "my key"})

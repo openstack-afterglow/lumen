@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from sqlalchemy import func, select
 
 from lumen.db import get_session_factory, is_db_available
+from lumen.models.chat_contracts import UsageRecord, UsageRecordPage
 from lumen.models.chat_db import ChatUsageLog, UserWallet
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ _SUMS = (
 )
 
 
-async def user_usage_summary(user_id: str, project_id: str = "") -> dict:
+async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int | None = None) -> dict:
     """본인 누적/이번달 사용량 + 월 쿼터. 실패 시 빈 요약(found=False).
 
     project_id 인자는 하위호환용으로 받되 사용하지 않는다(사용량은 user_id 기준, 프로젝트 무관).
@@ -55,6 +56,8 @@ async def user_usage_summary(user_id: str, project_id: str = "") -> dict:
     try:
         month_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         base = [ChatUsageLog.user_id == user_id, ChatUsageLog.source != "system"]
+        if api_key_id is not None:
+            base.append(ChatUsageLog.api_key_id == api_key_id)
         async with factory() as session:
             total = (await session.execute(select(*_SUMS).where(*base))).one()
             month = (await session.execute(select(*_SUMS).where(*base, ChatUsageLog.created_at >= month_start))).one()
@@ -94,3 +97,59 @@ async def user_usage_summary(user_id: str, project_id: str = "") -> dict:
     except Exception:
         logger.warning("빌트인 채팅 사용량 집계 실패", exc_info=True)
         return dict(_EMPTY)
+
+
+async def list_usage_records(
+    *,
+    user_id: str,
+    api_key_id: int | None,
+    source: str | None,
+    before_id: int | None,
+    limit: int,
+) -> UsageRecordPage:
+    """Return a cursor page of user-safe usage ledger fields, excluding system rows."""
+    if not is_db_available() or (factory := get_session_factory()) is None:
+        return UsageRecordPage(records=[])
+    predicates = [ChatUsageLog.user_id == user_id, ChatUsageLog.source.in_(("web", "api"))]
+    if api_key_id is not None:
+        predicates.append(ChatUsageLog.api_key_id == api_key_id)
+    if source is not None:
+        predicates.append(ChatUsageLog.source == source)
+    if before_id is not None:
+        predicates.append(ChatUsageLog.id < before_id)
+    try:
+        async with factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(ChatUsageLog).where(*predicates).order_by(ChatUsageLog.id.desc()).limit(limit + 1)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    except Exception:
+        logger.warning("사용량 원장 조회 실패", exc_info=True)
+        return UsageRecordPage(records=[])
+    next_before_id = rows[limit - 1].id if len(rows) > limit else None
+    return UsageRecordPage(
+        records=[
+            UsageRecord(
+                id=row.id,
+                created_at=row.created_at,
+                model_name=row.model_name,
+                provider=row.provider,
+                prompt_tokens=row.prompt_tokens,
+                completion_tokens=row.completion_tokens,
+                total_tokens=row.prompt_tokens + row.completion_tokens,
+                credited_cost=format(row.credited_cost, "f"),
+                source=row.source,
+                api_key_id=row.api_key_id,
+                conversation_id=row.conversation_id,
+                run_id=row.run_id,
+                pricing_status=row.pricing_status,
+            )
+            for row in rows[:limit]
+        ],
+        next_before_id=next_before_id,
+    )

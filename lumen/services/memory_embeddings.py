@@ -5,7 +5,7 @@ from __future__ import annotations
 import litellm
 
 from lumen.config import get_settings
-from lumen.services import provider_store
+from lumen.services.providers import routing as provider_store
 
 
 class EmbeddingUnavailable(RuntimeError):

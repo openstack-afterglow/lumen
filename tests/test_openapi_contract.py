@@ -10,7 +10,7 @@ from lumen.config import Settings
 from lumen.main import HealthResponse, RootDiscoveryResponse, VersionDiscoveryResponse, app, lifespan
 from lumen.models.chat_contracts import ChatRunDescriptor
 from lumen.models.chat_runs import ChatRun
-from lumen.services.durable_runs import descriptor
+from lumen.services.durable_runs.common import descriptor
 
 
 class TestOpenAPIContract:
@@ -27,9 +27,14 @@ class TestOpenAPIContract:
         assert "APIKeyBearer" in schemes
         assert "XApiKey" in schemes
 
-        # Verify Keystone endpoints have KeystoneToken OR KeystoneBearer alternatives
+        # Native routes accept Keystone or scoped API-key principals.
         conv_path = schema["paths"]["/v1/conversations"]["get"]
-        assert conv_path["security"] == [{"KeystoneToken": []}, {"KeystoneBearer": []}]
+        assert conv_path["security"] == [
+            {"KeystoneToken": []},
+            {"KeystoneBearer": []},
+            {"APIKeyBearer": []},
+            {"XApiKey": []},
+        ]
 
         # Verify AI compat endpoints have APIKeyBearer OR XApiKey alternatives
         compat_models_path = schema["paths"]["/v1/models"]["get"]

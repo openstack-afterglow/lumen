@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_agent_platform import ChatCodeWorkspace, ChatGitCredential
 from lumen.models.chat_db import ChatConversation
@@ -26,7 +27,6 @@ from lumen.services.code_workspace_store import (
     normalize_git_host,
     validate_workspace_source,
 )
-from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 
 _WORKSPACE_TTL = timedelta(days=7)
 

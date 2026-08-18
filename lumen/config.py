@@ -7,10 +7,10 @@ import tomllib
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from urllib.parse import urlsplit
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 

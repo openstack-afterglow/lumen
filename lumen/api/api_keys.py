@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from lumen.auth import get_token_info
 from lumen.services import api_key_store as aks
@@ -15,8 +17,37 @@ from lumen.services import api_key_store as aks
 router = APIRouter()
 
 
+ApiKeyScope = Literal[
+    "models:read",
+    "compat:completions:write",
+    "native:conversations:read",
+    "native:conversations:write",
+    "native:runs:read",
+    "native:runs:write",
+    "native:extensions:read",
+    "native:extensions:write",
+    "native:tools:execute",
+    "native:memory:read",
+    "native:memory:write",
+    "native:agents:use",
+    "usage:read",
+]
+
+
 class ApiKeyCreateBody(BaseModel):
     name: str | None = Field(default="", max_length=100)
+    scopes: list[ApiKeyScope] = Field(
+        default_factory=lambda: list(aks.DEFAULT_API_KEY_SCOPES),
+        min_length=1,
+        max_length=len(aks.API_KEY_SCOPES),
+    )
+
+    @field_validator("scopes")
+    @classmethod
+    def scopes_must_be_unique(cls, scopes: list[ApiKeyScope]) -> list[ApiKeyScope]:
+        if len(scopes) != len(set(scopes)):
+            raise ValueError("scope는 중복될 수 없습니다")
+        return scopes
 
 
 def _http(exc: Exception) -> HTTPException:
@@ -43,7 +74,7 @@ async def list_api_keys(token_info: dict = Depends(get_token_info)):
 async def create_api_key(body: ApiKeyCreateBody, token_info: dict = Depends(get_token_info)):
     """새 API 키 발급 — 응답의 `key` 는 평문(1회만 노출, 이후 조회 불가)."""
     try:
-        return await aks.create_key(token_info["user_id"], token_info["project_id"], body.name or "")
+        return await aks.create_key(token_info["user_id"], token_info["project_id"], body.name or "", list(body.scopes))
     except _EXC as exc:
         raise _http(exc) from exc
 

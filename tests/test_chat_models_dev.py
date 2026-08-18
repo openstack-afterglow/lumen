@@ -7,7 +7,8 @@ import json
 import pytest
 
 from lumen.services import models_dev
-from lumen.services import provider_store as ps
+from lumen.services.providers import errors, pricing
+from lumen.services.providers import repository as ps
 
 _BASE = "/api/v1/chat/admin/models/pricing/models-dev"
 
@@ -53,7 +54,7 @@ class TestModelsDevCatalog:
         assert model["price_available"] is True
         assert model["unsupported_price_fields"] == ["cost.cache_read", "cost.reasoning", "cost.tiers"]
         raw_cost = _catalog().providers["openai"].models["openai/gpt-test"].cost
-        assert ps._json_decimal_strings(raw_cost)["input"] == "2"
+        assert pricing._json_decimal_strings(raw_cost)["input"] == "2"
 
     def test_capabilities_parsed_and_exposed(self):
         catalog = models_dev.parse_catalog(
@@ -341,7 +342,7 @@ class TestModelsDevAdminRoutes:
             return _catalog()
 
         async def fake_import(**kwargs):
-            raise ps.ModelsDevImportConflictError("remap")
+            raise errors.ModelsDevImportConflictError("remap")
 
         monkeypatch.setattr(models_dev, "get_catalog", fake_catalog)
         monkeypatch.setattr(ps, "import_models_dev_prices", fake_import)

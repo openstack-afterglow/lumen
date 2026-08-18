@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from lumen.services import litellm_client
-from lumen.services import provider_store as ps
+from lumen.services.providers import routing as ps
 
 _MAX_VISIBLE_MESSAGES = 12
 _MAX_VISIBLE_CHARS = 12_000
