@@ -22,6 +22,7 @@ class AvailableModel(BaseModel):
     model_name: str
     display_name: str
     provider: str | None = None
+    provider_api_key_configured: bool
     # 유효 능력(vision/reasoning/tool_call/attachment/modalities/reasoning_options/context_limit).
     # 키·가격은 미포함이지만 능력은 배지·게이팅용으로 노출.
     capabilities: dict | None = None
@@ -35,18 +36,20 @@ async def list_available_models(token_info: dict = Depends(require_scopes("model
     """사용자용 활성 모델 카탈로그(키·가격 미포함, provider명·능력 포함). 저장소 장애 시 빈 목록(graceful)."""
     try:
         models = await repository.list_models(active_only=True)
-        providers = {p["id"]: p["name"] for p in await repository.list_providers()}
+        providers = {p["id"]: p for p in await repository.list_providers()}
     except errors.ChatStorageUnavailable:
         return []
     result = []
     for m in models:
         caps = m.get("effective_capabilities") or {}
+        provider = providers.get(m["provider_id"])
         result.append(
             {
                 "id": m["id"],
                 "model_name": m["model_name"],
                 "display_name": m.get("display_name") or m["model_name"],
-                "provider": providers.get(m["provider_id"]),
+                "provider": provider.get("name") if provider else None,
+                "provider_api_key_configured": bool(provider and provider.get("has_api_key")),
                 "capabilities": caps or None,
                 "context_limit": caps.get("context_limit") if isinstance(caps, dict) else None,
             }

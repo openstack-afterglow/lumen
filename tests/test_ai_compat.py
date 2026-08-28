@@ -3,6 +3,8 @@
 completion_api 코어와 api_key_store.verify_key 를 monkeypatch 해 실제 litellm/DB 없이 검증한다.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from lumen.api.compat import anthropic as an
@@ -112,6 +114,51 @@ class TestAnthropicTranslate:
         assert out[0]["function"]["name"] == "f" and out[0]["type"] == "function"
 
 
+class TestCompletionCoreContract:
+    async def test_failed_primary_billing_reuses_event_id_for_fallback(self, monkeypatch):
+        async def fake_provider_stream(*_args, **_kwargs):
+            async def chunks():
+                yield SimpleNamespace(
+                    usage=None,
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content="partial", reasoning_content=None, tool_calls=None),
+                            finish_reason="stop",
+                        )
+                    ],
+                )
+
+            return chunks()
+
+        event_ids = []
+
+        async def fake_bill(*_args, event_id, **_kwargs):
+            event_ids.append(event_id)
+            if len(event_ids) == 1:
+                raise RuntimeError("first billing attempt failed")
+            return 1, 1, 0.0
+
+        monkeypatch.setattr(core.litellm_client, "acompletion_stream", fake_provider_stream)
+        monkeypatch.setattr(core, "_bill", fake_bill)
+
+        events = []
+        with pytest.raises(RuntimeError, match="first billing attempt failed"):
+            async for event in core.complete_stream(
+                resolved={"model_name": "test-model", "margin_multiplier": 1},
+                messages=[{"role": "user", "content": "hello"}],
+                user_id="u1",
+                project_id="p1",
+                api_key_id=7,
+                max_tokens=32,
+                temperature=None,
+            ):
+                events.append(event)
+
+        assert events[0]["type"] == "delta"
+        assert len(event_ids) == 2
+        assert event_ids[0] == event_ids[1]
+
+
 # ── 엔드포인트 ────────────────────────────────────────────────────────────────
 @pytest.fixture
 def _auth(monkeypatch):
@@ -136,7 +183,7 @@ def _core(monkeypatch):
     async def fake_resolve(model):
         return {"model_name": model, "provider_name": "openai"}
 
-    async def fake_precheck(u, p):
+    async def fake_precheck(u, p, api_key_id=None):
         return None
 
     async def fake_once(**kw):
@@ -207,15 +254,128 @@ class TestOpenAIEndpoint:
         resp = await client.get("/v1/models", headers=_H)
         assert resp.status_code == 200 and resp.json()["data"][0]["id"] == "gpt-4o"
 
+    async def test_forwards_api_key_id_to_precheck(self, client, _auth, monkeypatch):
+        calls = []
+
+        async def fake_precheck(user_id, project_id, api_key_id=None):
+            calls.append((user_id, project_id, api_key_id))
+
+        async def fake_resolve(model):
+            return {"model_name": model, "provider_name": "openai"}
+
+        async def fake_once(**kw):
+            return {
+                "model": "gpt-4o",
+                "content": "ok",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "credited_cost": 0,
+                "tool_calls": None,
+                "finish_reason": "stop",
+            }
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(core, "complete_once", fake_once)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 200
+        assert len(calls) == 1
+        assert calls[0] == ("u1", "p1", 7)
+
+    async def test_key_quota_exceeded_returns_429_before_provider(self, client, _auth, monkeypatch):
+        async def quota_precheck(user_id, project_id, api_key_id=None):
+            raise core.CompletionError(429, "API 키 월 사용 한도를 초과했습니다")
+
+        async def forbidden_provider(**kw):
+            raise AssertionError("provider complete_once/complete_stream must not be called")
+
+        async def fake_resolve(model):
+            return {"model_name": model, "provider_name": "openai"}
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", quota_precheck)
+        monkeypatch.setattr(core, "complete_once", forbidden_provider)
+        monkeypatch.setattr(core, "complete_stream", forbidden_provider)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 429
+        assert "API 키 월 사용 한도를 초과했습니다" in resp.json()["detail"]["error"]["message"]
+
+        resp_stream = await client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp_stream.status_code == 429
+        assert "API 키 월 사용 한도를 초과했습니다" in resp_stream.json()["detail"]["error"]["message"]
+
+    async def test_openai_tool_choice_forwarded(self, client, _auth, monkeypatch):
+        received_extra = {}
+
+        async def fake_resolve(model):
+            return {"model_name": model, "provider_name": "openai"}
+
+        async def fake_acompletion(*args, **kw):
+            nonlocal received_extra
+            received_extra = kw.get("extra") or {}
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None), finish_reason="stop")],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            )
+
+        async def fake_precheck(*_args, **_kwargs):
+            return None
+
+        async def fake_bill(*_args, **_kwargs):
+            return 1, 1, 0.0
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr("lumen.services.completion_api.litellm_client.acompletion", fake_acompletion)
+        monkeypatch.setattr(core, "_bill", fake_bill)
+
+        tc = {"type": "function", "function": {"name": "get_weather"}}
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tool_choice": tc,
+                "unsupported_field": True,
+            },
+            headers=_H,
+        )
+        assert resp.status_code == 200
+        assert received_extra.get("tool_choice") == tc
+
 
 class TestDiscoveryAndHostGate:
     async def test_discovery_public(self, client):
         resp = await client.get("/v1/compat")
         assert resp.status_code == 200
         body = resp.json()
-        assert set(body["formats"]) == {"openai", "anthropic"}
+        assert body["version"] == "1.0.0"
+        assert body["contract_version"] == "1.0.0"
+        assert set(body["formats"]) == {"openai", "anthropic", "lumen_native"}
         assert "/v1/chat/completions" in body["endpoints"]["openai"]["chat_completions"]
         assert "/v1/messages" in body["endpoints"]["anthropic"]["messages"]
+        assert "/v1/conversations" in body["endpoints"]["native"]["conversations"]
+        assert body["profiles"]["openai_stateless"]["sdk_base_url"].endswith("/v1")
+        assert not body["profiles"]["anthropic_stateless"]["sdk_base_url"].endswith("/v1")
+        assert not body["profiles"]["lumen_native"]["sdk_base_url"].endswith("/v1")
+        assert "openapi" in body["links"]
+        assert "health" in body["links"]
+        assert "host_gate" in body
+        assert " (" not in body["models_endpoint"]
 
     async def test_blocked_host_404(self, client, monkeypatch):
         from types import SimpleNamespace
@@ -273,3 +433,133 @@ class TestAnthropicEndpoint:
         assert "event: message_start" in text
         assert "content_block_delta" in text
         assert "event: message_stop" in text
+
+    async def test_forwards_api_key_id_to_precheck(self, client, _auth, monkeypatch):
+        calls = []
+
+        async def fake_precheck(user_id, project_id, api_key_id=None):
+            calls.append((user_id, project_id, api_key_id))
+
+        async def fake_resolve(model):
+            return {"model_name": model, "provider_name": "openai"}
+
+        async def fake_once(**kw):
+            return {
+                "model": "claude",
+                "content": "ok",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "credited_cost": 0,
+                "tool_calls": None,
+                "finish_reason": "stop",
+            }
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(core, "complete_once", fake_once)
+
+        resp = await client.post(
+            "/v1/messages",
+            json={"model": "claude", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 200
+        assert len(calls) == 1
+        assert calls[0] == ("u1", "p1", 7)
+
+    async def test_key_quota_exceeded_returns_429_before_provider(self, client, _auth, monkeypatch):
+        async def quota_precheck(user_id, project_id, api_key_id=None):
+            raise core.CompletionError(429, "API 키 월 사용 한도를 초과했습니다")
+
+        async def forbidden_provider(**kw):
+            raise AssertionError("provider complete_once/complete_stream must not be called")
+
+        async def fake_resolve(model):
+            return {"model_name": model, "provider_name": "openai"}
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", quota_precheck)
+        monkeypatch.setattr(core, "complete_once", forbidden_provider)
+        monkeypatch.setattr(core, "complete_stream", forbidden_provider)
+
+        resp = await client.post(
+            "/v1/messages",
+            json={"model": "claude", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 429
+        assert "API 키 월 사용 한도를 초과했습니다" in resp.json()["detail"]["error"]["message"]
+
+        resp_stream = await client.post(
+            "/v1/messages",
+            json={"model": "claude", "stream": True, "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp_stream.status_code == 429
+        assert "API 키 월 사용 한도를 초과했습니다" in resp_stream.json()["detail"]["error"]["message"]
+
+    async def test_anthropic_tool_choice_conversion(self, client, _auth, monkeypatch):
+        received_kw = {}
+
+        async def fake_resolve(model):
+            return {"model_name": model, "provider_name": "anthropic"}
+
+        async def fake_once(**kw):
+            nonlocal received_kw
+            received_kw = kw
+            return {
+                "model": "claude-3-5-sonnet",
+                "content": "ok",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "credited_cost": 0,
+                "tool_calls": None,
+                "finish_reason": "stop",
+            }
+
+        async def fake_precheck(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(core, "complete_once", fake_once)
+
+        # Test tool choice conversion cases
+        cases = [
+            ({"type": "auto"}, "auto"),
+            ({"type": "any"}, "required"),
+            ({"type": "none"}, "none"),
+            ({"type": "tool", "name": "get_weather"}, {"type": "function", "function": {"name": "get_weather"}}),
+        ]
+        for input_tc, expected_tc in cases:
+            resp = await client.post(
+                "/v1/messages",
+                json={"model": "claude", "messages": [{"role": "user", "content": "hi"}], "tool_choice": input_tc},
+                headers=_H,
+            )
+            assert resp.status_code == 200
+            assert received_kw["tool_choice"] == expected_tc
+
+    async def test_malformed_anthropic_tool_choice_returns_422(self, client, _auth, monkeypatch):
+        async def fake_resolve(model):
+            return {"model_name": model, "provider_name": "anthropic"}
+
+        async def fake_precheck(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+
+        bad_choices = [
+            {"type": "tool"},  # missing name
+            {"type": "invalid_type"},
+            123,
+        ]
+        for bad_tc in bad_choices:
+            resp = await client.post(
+                "/v1/messages",
+                json={"model": "claude", "messages": [{"role": "user", "content": "hi"}], "tool_choice": bad_tc},
+                headers=_H,
+            )
+            assert resp.status_code == 422
+            assert resp.json()["detail"]["type"] == "error"

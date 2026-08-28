@@ -8,6 +8,7 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.services.capabilities import litellm_capabilities, normalize_capabilities
 from lumen.services.litellm_client import effective_prices_per_million
 
+from .credentials import api_key_source
 from .errors import ProviderValidationError
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
@@ -63,12 +64,15 @@ def _json_decimal_strings(value):
 
 def _provider_public(row: LlmProvider) -> dict:
     """관리자 응답용 공개 dict — api_key 평문/암호문 절대 미포함."""
+    source = api_key_source(row)
     return {
         "id": row.id,
         "name": row.name,
         "provider_type": row.provider_type,
         "api_base": row.api_base,
-        "has_api_key": bool(row.encrypted_api_key),
+        "has_api_key": source is not None,
+        "api_key_source": source,
+        "api_key_env": row.api_key_env,
         "is_active": row.is_active,
         "margin_multiplier": float(row.margin_multiplier),
         "models_dev_provider_id": row.models_dev_provider_id,

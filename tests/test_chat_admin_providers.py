@@ -2,7 +2,7 @@
 
 DB 없이 provider_store 서비스 함수를 monkeypatch 하여 라우터 계약만 검증:
 - require_admin 게이트(비관리자 403)
-- api_key 응답 마스킹(has_api_key 만, 평문/암호문 미노출)
+- api_key 응답 마스킹과 non-secret 설정 상태(`has_api_key`, `api_key_source`)
 - 예외 → HTTP 상태 매핑(404/400/503)
 """
 
@@ -24,6 +24,7 @@ def _public_provider(**over) -> dict:
         "provider_type": "openai",
         "api_base": None,
         "has_api_key": True,
+        "api_key_source": "database",
         "is_active": True,
         "margin_multiplier": 1.0,
         "created_at": "2026-01-01T00:00:00+00:00",
@@ -68,6 +69,39 @@ class TestProviderCrud:
         assert "api_key" not in body
         assert "encrypted_api_key" not in body
         assert body["has_api_key"] is True
+
+    async def test_create_configures_environment_credential_reference(self, admin_client, monkeypatch):
+        captured = {}
+
+        async def fake_create(**kwargs):
+            captured.update(kwargs)
+            return _public_provider(
+                name=kwargs["name"],
+                api_key_env=kwargs["api_key_env"],
+                has_api_key=False,
+                api_key_source=None,
+            )
+
+        monkeypatch.setattr(ps, "create_provider", fake_create)
+        response = await admin_client.post(
+            _PROVIDERS_URL,
+            json={"name": "openai", "api_key_env": "OPENAI_API_KEY"},
+        )
+
+        assert response.status_code == 201
+        assert captured["api_key_env"] == "OPENAI_API_KEY"
+        assert response.json()["api_key_env"] == "OPENAI_API_KEY"
+        assert response.json()["has_api_key"] is False
+        assert response.json()["api_key_source"] is None
+        assert "api_key" not in response.json()
+
+    async def test_create_rejects_lumen_setting_as_environment_credential(self, admin_client):
+        response = await admin_client.post(
+            _PROVIDERS_URL,
+            json={"name": "unsafe", "api_key_env": "LUMEN_ENCRYPTION_KEY"},
+        )
+
+        assert response.status_code == 422
 
     async def test_list_ok(self, admin_client, monkeypatch):
         async def fake_list():

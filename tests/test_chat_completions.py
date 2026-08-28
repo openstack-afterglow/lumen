@@ -5,6 +5,8 @@ import pytest
 from fastapi import HTTPException
 
 from lumen.api import completions
+from lumen.auth import get_principal
+from lumen.main import app
 from lumen.models.chat_contracts import ChatFeatureOptions, ChatRunDescriptor, UserAssetInputPart
 from lumen.services import capabilities, chat_admission, credit
 from lumen.services import conversation_store as cs
@@ -135,7 +137,7 @@ async def test_extension_selection_rejects_agent_allowlist_bypass(monkeypatch):
         )
 
 
-async def _ok_precheck(user_id, project_id=None):
+async def _ok_precheck(user_id, project_id=None, api_key_id=None):
     return None
 
 
@@ -851,7 +853,7 @@ class TestRetryFailedRun:
     async def test_retry_rejects_quota_exceeded_before_creating_run(self, client, monkeypatch):
         await _patch_text_execution(monkeypatch)
 
-        async def quota_exceeded(user_id, project_id=None):
+        async def quota_exceeded(user_id, project_id=None, api_key_id=None):
             raise credit.QuotaExceeded("월간 사용량 쿼터를 초과했습니다")
 
         monkeypatch.setattr(credit, "precheck", quota_exceeded)
@@ -893,3 +895,154 @@ class TestCanonicalTempCompletion:
         assert response.status_code == 202
         assert seen["temp_thread_id"] is None
         assert seen["request_payload"]["input_messages"] == [{"role": "user", "content": "temporary"}]
+
+
+class TestApiKeyLimitAdmission:
+    async def test_all_native_admission_callsites_forward_api_key_id(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+        recorded = []
+
+        async def spy_precheck(user_id, project_id=None, api_key_id=None):
+            recorded.append((user_id, project_id, api_key_id))
+            raise HTTPException(status_code=418, detail="stop after precheck")
+
+        monkeypatch.setattr(credit, "precheck", spy_precheck)
+        monkeypatch.setattr(admission, "existing_run_for_intent", lambda **_kwargs: _return(None))
+        monkeypatch.setattr(completions, "_load_owned_conv", lambda *_args, **_kwargs: _return({}))
+
+        async def fake_key_principal():
+            return {
+                "auth_type": "api_key",
+                "user_id": "test-user-1",
+                "project_id": "test-project-1",
+                "api_key_id": 42,
+                "scopes": (
+                    "native:conversations:write",
+                    "native:runs:write",
+                    "native:memory:read",
+                    "native:memory:write",
+                    "native:extensions:read",
+                    "native:tools:execute",
+                ),
+                "source": "api",
+                "roles": [],
+                "is_system_admin": False,
+            }
+
+        monkeypatch.setitem(app.dependency_overrides, get_principal, fake_key_principal)
+        recorded.clear()
+
+        resp_create = await client.post(f"{_BASE}/c1/completions", headers=_HEADERS, json=_request())
+        assert resp_create.status_code == 418
+        assert len(recorded) == 1
+        assert recorded[0] == ("test-user-1", "test-project-1", 42)
+
+        monkeypatch.setattr(
+            cs,
+            "find_turn_start_user",
+            lambda *args, **kwargs: _return(
+                {
+                    "id": "msg-1",
+                    "parent_id": None,
+                    "content": "original prompt",
+                    "parts": [{"type": "text", "text": "original prompt"}],
+                }
+            ),
+        )
+        monkeypatch.setattr(cs, "path_ending_at", lambda *args, **kwargs: _return([]))
+        resp_retry = await client.post(f"{_BASE}/c1/runs/run-source-1/retry", headers=_HEADERS)
+        assert resp_retry.status_code == 418
+        assert len(recorded) == 2
+        assert recorded[1] == ("test-user-1", "test-project-1", 42)
+        resp_temp = await client.post(
+            "/api/v1/chat/temp-completions",
+            headers=_HEADERS,
+            json={"parts": [{"type": "text", "text": "temporary"}], "model_id": "gpt-3.5-turbo", "features": {}},
+        )
+        assert resp_temp.status_code == 418
+
+        resp_regen = await client.post(
+            f"{_BASE}/c1/messages/1/regenerate",
+            headers=_HEADERS,
+            json={"model_id": "gpt-3.5-turbo", "features": {}},
+        )
+        assert resp_regen.status_code == 418
+        assert len(recorded) == 4
+        assert recorded[3] == ("test-user-1", "test-project-1", 42)
+
+    async def test_idempotent_replay_bypasses_credit_precheck(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+
+        async def unexpected_precheck(*args, **kwargs):
+            raise AssertionError("credit.precheck must NOT be called on idempotent replay")
+
+        existing_desc = ChatRunDescriptor(
+            run_id="run-existing-1",
+            conversation_id="c1",
+            status="queued",
+            events_url="/api/v1/chat/runs/run-existing-1/events",
+            cancel_url="/api/v1/chat/runs/run-existing-1/cancel",
+        )
+
+        monkeypatch.setattr(credit, "precheck", unexpected_precheck)
+        monkeypatch.setattr(admission, "existing_run_for_intent", lambda **_kwargs: _return(existing_desc))
+        monkeypatch.setattr(completions, "_load_owned_conv", lambda *_args, **_kwargs: _return({}))
+        monkeypatch.setattr(
+            cs,
+            "find_turn_start_user",
+            lambda *args, **kwargs: _return({"id": 1, "parts": [{"type": "text", "text": "hi"}]}),
+        )
+
+        resp_create = await client.post(f"{_BASE}/c1/completions", headers=_HEADERS, json=_request())
+        assert resp_create.status_code == 202
+        assert resp_create.json()["run_id"] == "run-existing-1"
+
+        resp_retry = await client.post(f"{_BASE}/c1/runs/run-source-1/retry", headers=_HEADERS)
+        assert resp_retry.status_code == 202
+        assert resp_retry.json()["run_id"] == "run-existing-1"
+
+        resp_temp = await client.post(
+            "/api/v1/chat/temp-completions",
+            headers=_HEADERS,
+            json={"parts": [{"type": "text", "text": "temporary"}], "model_id": "gpt-3.5-turbo", "features": {}},
+        )
+        assert resp_temp.status_code == 202
+        assert resp_temp.json()["run_id"] == "run-existing-1"
+
+        resp_regen = await client.post(
+            f"{_BASE}/c1/messages/1/regenerate",
+            headers=_HEADERS,
+            json={"model_id": "gpt-3.5-turbo", "features": {}},
+        )
+        assert resp_regen.status_code == 202
+        assert resp_regen.json()["run_id"] == "run-existing-1"
+
+    async def test_malformed_idempotency_key_returns_422(self, client):
+        bad_headers = {"Idempotency-Key": "invalid-uuid"}
+        resp1 = await client.post(f"{_BASE}/c1/completions", headers=bad_headers, json=_request())
+        assert resp1.status_code == 422
+        resp2 = await client.post(
+            "/api/v1/chat/temp-completions",
+            headers=bad_headers,
+            json={"parts": [{"type": "text", "text": "temp"}], "model_id": "gpt-3.5-turbo", "features": {}},
+        )
+        assert resp2.status_code == 422
+        resp3 = await client.post(
+            f"{_BASE}/c1/messages/1/regenerate",
+            headers=bad_headers,
+            json={"model_id": "gpt-3.5-turbo", "features": {}},
+        )
+        assert resp3.status_code == 422
+        resp4 = await client.post(f"{_BASE}/c1/runs/r1/retry", headers=bad_headers)
+        assert resp4.status_code == 422
+
+    async def test_admission_fallback_raises_input_error_for_invalid_uuid(self):
+        with pytest.raises(durable_errors.DurableRunInputError) as exc_info:
+            await admission.existing_run_for_intent(
+                project_id="p1",
+                user_id="u1",
+                client_request_id="not-a-uuid",
+                intent={},
+                conversation_id="c1",
+            )
+        assert "Idempotency-Key must be a UUID" in str(exc_info.value)

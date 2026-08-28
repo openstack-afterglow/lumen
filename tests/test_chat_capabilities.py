@@ -1,6 +1,7 @@
 from decimal import Decimal
 from types import SimpleNamespace
 
+import lumen.services.providers.credentials as provider_credentials
 import lumen.services.providers.pricing as provider_pricing
 import lumen.services.providers.routing as provider_store
 from lumen.services.capabilities import litellm_capabilities, normalize_capabilities
@@ -196,11 +197,7 @@ def test_resolved_model_uses_a_secret_keyed_config_version_hash(monkeypatch):
         margin_multiplier="1.25",
     )
     decrypted_key = {"value": "first-secret"}
-    monkeypatch.setattr(
-        provider_store,
-        "decrypt_llm_provider_key",
-        lambda _: decrypted_key["value"],
-    )
+    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: decrypted_key["value"])
     monkeypatch.setattr(provider_store, "derive_encryption_subkey", lambda _: b"test-hmac-key")
 
     first = _resolved_model(model, provider)
@@ -223,7 +220,7 @@ def test_resolved_provider_uses_secret_keyed_config_version_hash(monkeypatch):
         margin_multiplier="1.25",
     )
     decrypted_key = {"value": "first-secret"}
-    monkeypatch.setattr(provider_store, "decrypt_llm_provider_key", lambda _: decrypted_key["value"])
+    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: decrypted_key["value"])
     monkeypatch.setattr(provider_store, "derive_encryption_subkey", lambda _: b"test-hmac-key")
 
     first = _resolved_provider(provider)

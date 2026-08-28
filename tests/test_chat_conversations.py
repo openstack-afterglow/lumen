@@ -157,7 +157,7 @@ class TestAvailableModels:
             ]
 
         async def fake_providers():
-            return [{"id": 1, "name": "openai"}]
+            return [{"id": 1, "name": "openai", "has_api_key": False}]
 
         monkeypatch.setattr(repository, "list_models", fake_models)
         monkeypatch.setattr(repository, "list_providers", fake_providers)
@@ -170,6 +170,7 @@ class TestAvailableModels:
         assert body[0]["provider"] == "openai"
         assert body[0]["capabilities"] == {"vision": True, "reasoning": False, "context_limit": 128000}
         assert body[0]["context_limit"] == 128000
+        assert body[0]["provider_api_key_configured"] is False
         assert "input_price" not in body[0]
         assert "api_key" not in body[0]
         assert body[0]["id"] == 1

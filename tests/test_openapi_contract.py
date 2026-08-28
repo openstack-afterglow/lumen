@@ -26,6 +26,8 @@ class TestOpenAPIContract:
         assert "KeystoneBearer" in schemes
         assert "APIKeyBearer" in schemes
         assert "XApiKey" in schemes
+        assert "description" in schemes["APIKeyBearer"]
+        assert "description" in schemes["XApiKey"]
 
         # Native routes accept Keystone or scoped API-key principals.
         conv_path = schema["paths"]["/v1/conversations"]["get"]
@@ -75,6 +77,57 @@ class TestOpenAPIContract:
         assert resp_health.status_code == 200
         health_data = HealthResponse.model_validate(resp_health.json())
         assert health_data.status == "ok"
+
+    def test_openapi_contract_version_and_profiles(self):
+        schema = app.openapi()
+        assert schema.get("x-contract-version") == "1.0.0"
+        profiles = schema.get("x-profiles", {})
+        assert "openai_stateless" in profiles
+        assert "anthropic_stateless" in profiles
+        assert "lumen_native" in profiles
+
+    def test_openapi_vendor_extensions_scopes_and_sse(self):
+        schema = app.openapi()
+        openai_op = schema["paths"]["/v1/chat/completions"]["post"]
+        assert openai_op["x-required-api-key-scopes"] == ["compat:completions:write"]
+        assert "text/event-stream" in openai_op["responses"]["200"]["content"]
+
+        native_op = schema["paths"]["/v1/conversations/{conversation_id}/completions"]["post"]
+        assert native_op["x-required-api-key-scopes"] == ["native:conversations:write", "native:runs:write"]
+        assert "features.memory=true" in native_op["x-conditional-api-key-scopes"]
+
+        events_op = schema["paths"]["/v1/runs/{run_id}/events"]["get"]
+        sse_media = events_op["responses"]["200"]["content"]["text/event-stream"]
+        assert sse_media["schema"] == {"type": "string", "format": "event-stream"}
+        assert sse_media["x-event-data-schema"]["$ref"] == "#/components/schemas/ChatRunEvent"
+
+    def test_openapi_typed_response_models(self):
+        schema = app.openapi()
+        schemas = schema["components"]["schemas"]
+        assert "ChatRunEvent" in schemas
+        assert "ChatRunDescriptor" in schemas
+        assert "ChatRunResponse" in schemas
+        assert "OpenAIChatResponse" in schemas
+        assert "AnthropicMessagesResponse" in schemas
+        assert "OpenAIModelListResponse" in schemas
+        assert "UsageRecordPage" in schemas
+        assert "properties" in schemas["OpenAIChatResponse"]
+        assert "properties" in schemas["AnthropicMessagesResponse"]
+
+        def _check_refs(obj: dict | list | str) -> None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k == "$ref" and isinstance(v, str):
+                        assert not v.startswith("#/$defs/"), f"Unresolved $defs ref: {v}"
+                        ref_target = v.replace("#/components/schemas/", "")
+                        assert ref_target in schemas, f"Missing schema for ref: {v}"
+                    else:
+                        _check_refs(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _check_refs(item)
+
+        _check_refs(schema)
 
 
 class TestKeystoneProjectScoping:

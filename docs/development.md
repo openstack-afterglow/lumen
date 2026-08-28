@@ -13,6 +13,11 @@
 
 의존성은 API → application service → runtime/store/model 단방향이다. 상위 계층은 service를 우회하려고 하위 계층의 private owner를 import해서는 안 된다. package `__init__.py`는 docstring만 두며 compatibility re-export를 복원하지 않는다.
 
+### Cross-Service 및 테스트 소유권 경계
+
+- **공개 API 전용 상호작용**: 서비스 간(Cross-service) 테스트는 오직 공개 REST API 및 OpenStack SDK만을 사용해야 하며, Nova, Neutron 등 타 서비스 내부 Python 모듈 import나 타 서비스 DB 직접 접근은 금지된다.
+- **Lumen 시스템 테스트 검증 범위**: Lumen의 `system` 테스트는 Provider 및 Keystone 경계(fake provider / 시드된 인증)에서 멈추며, 실제 OpenStack 자원 프로비저닝 및 종단 간 시나리오는 외부 배포/Afterglow 리포지토리 소관이다.
+
 ## 새 capability checklist
 
 1. `chat_contracts.py`에 public wire contract를 정의하고 검증한다.
@@ -21,7 +26,7 @@
 4. worker execution에서 mutable extension/provider configuration을 재검증한다.
 5. observable lifecycle/tool/usage event를 journal에 기록하고 SSE replay는 read-only로 유지한다.
 6. cost를 `source`, `api_key_id`, `run_id`에 attribution한다. public usage record는 raw cost internal을 제외한다.
-7. real datastore/worker boundary 변경에는 focused unit test와 integration coverage를 추가한다.
+7. 계층별 표준 테스트 CLI(`uv run lumen-test contract|integration|system`)로 변경 사항을 검증하고, real datastore/worker boundary 변경에는 focused unit test와 integration coverage를 추가한다.
 
 ## God-module 회귀 방지
 

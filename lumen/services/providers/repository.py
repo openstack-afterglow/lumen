@@ -11,6 +11,7 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.services.litellm_client import effective_prices_per_million
 from lumen.services.models_dev import ModelsDevCatalog
 
+from .credentials import normalize_api_key_env
 from .errors import (
     ChatStorageUnavailable,
     ModelsDevImportConflictError,
@@ -35,6 +36,7 @@ async def create_provider(
     provider_type: str = "openai",
     api_base: str | None = None,
     api_key: str | None = None,
+    api_key_env: str | None = None,
     margin_multiplier=1.0,
     models_dev_provider_id: str | None = None,
     is_active: bool = True,
@@ -47,6 +49,7 @@ async def create_provider(
         provider_type=(provider_type or "openai").strip(),
         api_base=(api_base or None),
         encrypted_api_key=(encrypt_llm_provider_key(api_key) if api_key else None),
+        api_key_env=normalize_api_key_env(api_key_env),
         margin_multiplier=_to_decimal(margin_multiplier, "margin_multiplier"),
         models_dev_provider_id=(models_dev_provider_id or None),
         is_active=is_active,
@@ -89,6 +92,8 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 row.api_base = patch["api_base"] or None
             if "api_key" in patch:
                 row.encrypted_api_key = encrypt_llm_provider_key(patch["api_key"]) if patch["api_key"] else None
+            if "api_key_env" in patch:
+                row.api_key_env = normalize_api_key_env(patch["api_key_env"])
             if patch.get("margin_multiplier") is not None:
                 row.margin_multiplier = _to_decimal(patch["margin_multiplier"], "margin_multiplier")
             if "models_dev_provider_id" in patch:

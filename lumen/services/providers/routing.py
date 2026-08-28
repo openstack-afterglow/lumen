@@ -10,12 +10,13 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
-from lumen.crypto import decrypt_llm_provider_key, derive_encryption_subkey
+from lumen.crypto import derive_encryption_subkey
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun, ChatRunProvider
 from lumen.services.run_store import NONTERMINAL
 
+from .credentials import resolve_api_key
 from .errors import (
     ActiveRunConfigurationConflict,
     ChatStorageUnavailable,
@@ -174,7 +175,7 @@ async def _lock_mutable_route(
 
 
 def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
-    api_key = decrypt_llm_provider_key(provider.encrypted_api_key) if provider.encrypted_api_key else None
+    api_key = resolve_api_key(provider)
     input_price, output_price, price_source, price_version = _resolved_base_prices(model, provider)
     capabilities, _ = _effective_capabilities(model, provider.provider_type)
     capabilities = _pricing_aware_capabilities(
@@ -227,7 +228,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
 
 def _resolved_provider(provider: LlmProvider) -> dict:
     """Resolve a provider-only execution route (managed search has no model row)."""
-    api_key = decrypt_llm_provider_key(provider.encrypted_api_key) if provider.encrypted_api_key else None
+    api_key = resolve_api_key(provider)
     config_fingerprint = {
         "provider_id": provider.id,
         "provider_name": provider.name,
@@ -444,7 +445,7 @@ async def get_provider_for_discovery(provider_id: int) -> dict | None:
             row = await session.get(LlmProvider, provider_id)
             if row is None:
                 return None
-            api_key = decrypt_llm_provider_key(row.encrypted_api_key) if row.encrypted_api_key else None
+            api_key = resolve_api_key(row)
             return {"provider_type": row.provider_type, "api_base": row.api_base, "api_key": api_key}
     except OperationalError as exc:
         mark_db_unhealthy()

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
@@ -21,6 +22,8 @@ from lumen.auth import Principal, require_scopes
 from lumen.config import get_settings
 from lumen.models.chat_contracts import (
     ChatFeatureOptions,
+    ChatRunDescriptor,
+    ChatRunResponse,
     CompletionRequest,
     RegenerateRequest,
     RunInteractionResponseRequest,
@@ -85,11 +88,15 @@ def _run_error(exc: durable_errors.DurableRunError) -> HTTPException:
     return HTTPException(status_code=503, detail=str(exc))
 
 
-@router.post("/conversations/{conversation_id}/completions", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/conversations/{conversation_id}/completions",
+    response_model=ChatRunDescriptor,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def create_completion(
     conversation_id: str,
     payload: CompletionRequest,
-    idempotency_key: str = Header(...),
+    idempotency_key: UUID = Header(alias="Idempotency-Key"),
     token_info: Principal = Depends(require_scopes("native:conversations:write", "native:runs:write")),
 ):
     """Persist intent and return a descriptor; the worker owns all provider I/O."""
@@ -122,7 +129,7 @@ async def create_completion(
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
             user_id=user_id,
-            client_request_id=idempotency_key,
+            client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
         )
@@ -133,7 +140,7 @@ async def create_completion(
     except cs.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     try:
-        await credit.precheck(user_id, project_id)
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -234,13 +241,14 @@ async def create_completion(
 
 @router.post(
     "/conversations/{conversation_id}/messages/{message_id}/regenerate",
+    response_model=ChatRunDescriptor,
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def regenerate_message(
     conversation_id: str,
     message_id: int,
     payload: RegenerateRequest,
-    idempotency_key: str = Header(...),
+    idempotency_key: UUID = Header(alias="Idempotency-Key"),
     token_info: Principal = Depends(require_scopes("native:conversations:write", "native:runs:write")),
 ):
     project_id = token_info["project_id"]
@@ -274,7 +282,7 @@ async def regenerate_message(
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
             user_id=user_id,
-            client_request_id=idempotency_key,
+            client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
         )
@@ -282,6 +290,12 @@ async def regenerate_message(
             return existing
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
+    try:
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+    except credit.QuotaExceeded as exc:
+        raise HTTPException(status_code=402, detail=str(exc)) from exc
+    except credit.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     execution_protocol_version = _admission_execution_protocol_version()
     resolved = await _resolve_model(payload.model_id)
     feature_routes = await _resolve_feature_routes(payload.features)
@@ -316,7 +330,7 @@ async def regenerate_message(
         return await admission.create_run(
             project_id=project_id,
             user_id=user_id,
-            client_request_id=idempotency_key,
+            client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
             temp_thread_id=None,
@@ -343,12 +357,13 @@ async def regenerate_message(
 
 @router.post(
     "/conversations/{conversation_id}/runs/{run_id}/retry",
+    response_model=ChatRunDescriptor,
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def retry_failed_run(
     conversation_id: str,
     run_id: str,
-    idempotency_key: str = Header(...),
+    idempotency_key: UUID = Header(alias="Idempotency-Key"),
     token_info: Principal = Depends(require_scopes("native:conversations:write", "native:runs:write")),
 ):
     project_id = token_info["project_id"]
@@ -365,7 +380,7 @@ async def retry_failed_run(
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
             user_id=user_id,
-            client_request_id=idempotency_key,
+            client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
         )
@@ -374,7 +389,7 @@ async def retry_failed_run(
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
     try:
-        await credit.precheck(user_id, project_id)
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -497,7 +512,7 @@ async def retry_failed_run(
         return await admission.create_run(
             project_id=project_id,
             user_id=user_id,
-            client_request_id=idempotency_key,
+            client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
             temp_thread_id=None,
@@ -533,10 +548,10 @@ async def retry_failed_run(
         raise _run_error(exc) from exc
 
 
-@router.post("/temp-completions", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/temp-completions", response_model=ChatRunDescriptor, status_code=status.HTTP_202_ACCEPTED)
 async def temp_completion(
     payload: TempCompletionRequest,
-    idempotency_key: str = Header(...),
+    idempotency_key: UUID = Header(alias="Idempotency-Key"),
     token_info: Principal = Depends(require_scopes("native:runs:write")),
 ):
     user_id = token_info["user_id"]
@@ -562,13 +577,13 @@ async def temp_completion(
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
             user_id=user_id,
-            client_request_id=idempotency_key,
+            client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=None,
         )
         if existing is not None:
             return existing
-        await credit.precheck(user_id, project_id)
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
     except credit.QuotaExceeded as exc:
@@ -612,7 +627,7 @@ async def temp_completion(
         return await admission.create_temp_run(
             project_id=project_id,
             user_id=user_id,
-            client_request_id=idempotency_key,
+            client_request_id=str(idempotency_key),
             intent=intent,
             temp_thread_id=payload.temp_thread_id,
             model_name=payload.model_id,
@@ -744,7 +759,7 @@ async def list_active_runs(
     )
 
 
-@router.get("/runs/{run_id}")
+@router.get("/runs/{run_id}", response_model=ChatRunResponse)
 async def get_run(run_id: str, token_info: Principal = Depends(require_scopes("native:runs:read"))):
     try:
         return await queries.owned_run_response(

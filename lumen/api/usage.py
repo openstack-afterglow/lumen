@@ -11,6 +11,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Query
 
 from lumen.auth import Principal, require_scopes
+from lumen.models.chat_contracts import UsageRecordPage
 from lumen.services import stats as stats_service
 from lumen.services.usage import list_usage_records, user_usage_summary
 
@@ -69,7 +70,7 @@ async def get_usage_keys(
     return {"keys": keys}
 
 
-@router.get("/usage/records")
+@router.get("/usage/records", response_model=UsageRecordPage)
 async def get_usage_records(
     limit: int = Query(default=50, ge=1, le=100),
     before_id: int | None = Query(default=None, gt=0),

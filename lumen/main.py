@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -190,13 +191,143 @@ def custom_openapi() -> dict:
     """Document API-key compatibility schemes without changing native route semantics."""
     if app.openapi_schema:
         return app.openapi_schema
+    from lumen.models.chat_contracts import _CHAT_RUN_EVENT
+
     schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
+    schema["x-contract-version"] = "1.0.0"
+    schema["x-profiles"] = {
+        "openai_stateless": "OpenAI-compatible stateless completion (/v1/chat/completions)",
+        "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
+        "lumen_native": "Lumen native durable runs (/v1/conversations/{conversation_id}/completions, /v1/temp-completions, /v1/runs/...)",
+    }
+
     security_schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
-    security_schemes.setdefault("APIKeyBearer", {"type": "http", "scheme": "bearer"})
-    security_schemes.setdefault("XApiKey", {"type": "apiKey", "in": "header", "name": "x-api-key"})
+    for scheme_name, description in (
+        ("KeystoneToken", "Project-scoped Keystone token in X-Auth-Token."),
+        ("KeystoneBearer", "Project-scoped Keystone token in Authorization: Bearer."),
+    ):
+        if scheme_name in security_schemes:
+            security_schemes[scheme_name]["description"] = description
+    security_schemes["APIKeyBearer"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Bearer API key (Authorization: Bearer <key>)",
+    }
+    security_schemes["XApiKey"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+        "description": "API key header (x-api-key: <key>)",
+    }
     api_key_security = [{"APIKeyBearer": []}, {"XApiKey": []}]
     for path, method in (("/v1/chat/completions", "post"), ("/v1/messages", "post"), ("/v1/models", "get")):
-        schema["paths"][path][method]["security"] = api_key_security
+        if path in schema.get("paths", {}) and method in schema["paths"][path]:
+            schema["paths"][path][method]["security"] = api_key_security
+
+    route_scopes: dict[tuple[str, str], list[str]] = {
+        ("/v1/chat/completions", "post"): ["compat:completions:write"],
+        ("/v1/messages", "post"): ["compat:completions:write"],
+        ("/v1/models", "get"): ["models:read"],
+        ("/v1/chat/models", "get"): ["models:read"],
+        ("/v1/capabilities", "get"): ["models:read"],
+        ("/v1/conversations", "post"): ["native:conversations:write"],
+        ("/v1/conversations", "get"): ["native:conversations:read"],
+        ("/v1/conversations/search", "get"): ["native:conversations:read"],
+        ("/v1/conversations/{conversation_id}", "get"): ["native:conversations:read"],
+        ("/v1/conversations/{conversation_id}", "delete"): ["native:conversations:write"],
+        ("/v1/conversations/{conversation_id}/workspace", "patch"): ["native:conversations:write"],
+        ("/v1/conversations/{conversation_id}/messages", "get"): ["native:conversations:read"],
+        ("/v1/conversations/{conversation_id}/active-leaf", "patch"): ["native:conversations:write"],
+        ("/v1/conversations/{conversation_id}/fork", "post"): ["native:conversations:write"],
+        ("/v1/conversations/{conversation_id}/completions", "post"): [
+            "native:conversations:write",
+            "native:runs:write",
+        ],
+        ("/v1/temp-completions", "post"): ["native:runs:write"],
+        ("/v1/conversations/{conversation_id}/messages/{message_id}/regenerate", "post"): [
+            "native:conversations:write",
+            "native:runs:write",
+        ],
+        ("/v1/conversations/{conversation_id}/runs/{run_id}/retry", "post"): [
+            "native:conversations:write",
+            "native:runs:write",
+        ],
+        ("/v1/runs/{run_id}", "get"): ["native:runs:read"],
+        ("/v1/runs/{run_id}/events", "get"): ["native:runs:read"],
+        ("/v1/conversations/{conversation_id}/runs", "get"): ["native:runs:read"],
+        ("/v1/runs", "get"): ["native:runs:read"],
+        ("/v1/temp-threads/{temp_thread_id}", "get"): ["native:runs:read"],
+        ("/v1/runs/{run_id}/cancel", "post"): ["native:runs:write"],
+        ("/v1/runs/{run_id}/approvals/{call_id}", "post"): ["native:runs:write"],
+        ("/v1/runs/{run_id}/interactions/{interaction_id}", "post"): ["native:runs:write"],
+        ("/v1/usage", "get"): ["usage:read"],
+        ("/v1/usage/timeseries", "get"): ["usage:read"],
+        ("/v1/usage/keys", "get"): ["usage:read"],
+        ("/v1/usage/records", "get"): ["usage:read"],
+    }
+    admission_posts = {
+        ("/v1/conversations/{conversation_id}/completions", "post"),
+        ("/v1/conversations/{conversation_id}/messages/{message_id}/regenerate", "post"),
+        ("/v1/conversations/{conversation_id}/runs/{run_id}/retry", "post"),
+        ("/v1/temp-completions", "post"),
+    }
+    conditional_scopes = {
+        "features.memory=true": ["native:memory:read", "native:memory:write"],
+        "tool policy, web search/fetch, or advisor enabled": ["native:tools:execute"],
+        "skill or selected custom/MCP extension": ["native:extensions:read"],
+        "selected custom/MCP extension": ["native:tools:execute"],
+        "agent_id selected": ["native:agents:use"],
+    }
+    for (path, method), scopes in route_scopes.items():
+        if path in schema.get("paths", {}) and method in schema["paths"][path]:
+            op = schema["paths"][path][method]
+            op["x-required-api-key-scopes"] = scopes
+            if (path, method) in admission_posts:
+                op["x-conditional-api-key-scopes"] = conditional_scopes
+    sse_routes = [
+        ("/v1/chat/completions", "post", "OpenAI SSE stream (data: JSON \\n\\n data: [DONE])"),
+        ("/v1/messages", "post", "Anthropic SSE stream (event: <type> \\n data: JSON)"),
+        ("/v1/runs/{run_id}/events", "get", "Native ChatRunEvent journal stream"),
+    ]
+    for path, method, stream_desc in sse_routes:
+        if path in schema.get("paths", {}) and method in schema["paths"][path]:
+            responses = schema["paths"][path][method].setdefault("responses", {})
+            resp_200 = responses.setdefault("200", {"description": "Successful Response"})
+            content = resp_200.setdefault("content", {})
+            if path == "/v1/runs/{run_id}/events":
+                content["text/event-stream"] = {
+                    "schema": {"type": "string", "format": "event-stream"},
+                    "x-event-data-schema": {"$ref": "#/components/schemas/ChatRunEvent"},
+                    "description": stream_desc,
+                }
+            else:
+                content.setdefault(
+                    "text/event-stream",
+                    {
+                        "schema": {"type": "string", "format": "event-stream"},
+                        "description": stream_desc,
+                    },
+                )
+
+    event_schema = _CHAT_RUN_EVENT.json_schema(ref_template="#/components/schemas/{model}")
+    defs = event_schema.pop("$defs", {})
+    components_schemas = schema.setdefault("components", {}).setdefault("schemas", {})
+    for def_name, def_schema in defs.items():
+        components_schemas[def_name] = def_schema
+    components_schemas["ChatRunEvent"] = event_schema
+
+    def _fix_refs(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for k, v in list(obj.items()):
+                if k == "$ref" and isinstance(v, str) and v.startswith("#/$defs/"):
+                    obj[k] = v.replace("#/$defs/", "#/components/schemas/")
+                else:
+                    _fix_refs(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _fix_refs(item)
+
+    _fix_refs(schema)
     app.openapi_schema = schema
     return schema
 

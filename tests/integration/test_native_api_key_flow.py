@@ -10,10 +10,12 @@ from types import SimpleNamespace
 import pytest
 from httpx import ASGITransport, AsyncClient
 from redis.asyncio import Redis
+from sqlalchemy import func, select
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.main import app
 from lumen.models.chat_db import LlmModel, LlmProvider
+from lumen.models.chat_runs import ChatRun
 from lumen.services import api_key_store, graph
 from lumen.services.durable_runs import execution
 
@@ -66,6 +68,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
             project_id,
             "native integration",
             ["models:read", "native:runs:read", "native:runs:write", "native:tools:execute", "usage:read"],
+            None,
         )
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
@@ -81,9 +84,10 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
             assert unknown.status_code == 401
             assert unknown.json()["detail"] == "유효하지 않은 API 키입니다"
 
+            first_idem_key = str(uuid.uuid4())
             admitted = await client.post(
                 "/v1/temp-completions",
-                headers={"X-Api-Key": key["key"], "Idempotency-Key": str(uuid.uuid4())},
+                headers={"X-Api-Key": key["key"], "Idempotency-Key": first_idem_key},
                 json={
                     "parts": [{"type": "text", "text": "run the integration check"}],
                     "model_id": model_name,
@@ -163,5 +167,69 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
             assert record["source"] == "api"
             assert record["api_key_id"] == key["id"]
             assert {"raw_cost", "pricing_snapshot", "usage_components"}.isdisjoint(record)
+
+            owner_project_id = project_id
+
+            def fake_validate_token(token: str, project_id: str = "") -> dict:
+                assert token == "integration-owner-token"
+                return {
+                    "user_id": user_id,
+                    "username": "integration-user",
+                    "project_id": project_id or owner_project_id,
+                    "roles": ["member"],
+                    "is_system_admin": False,
+                }
+
+            monkeypatch.setattr("lumen.auth.validate_token", fake_validate_token)
+
+            owner_headers = {"X-Auth-Token": "integration-owner-token"}
+            api_keys_res = await client.get("/v1/api-keys", headers=owner_headers)
+            assert api_keys_res.status_code == 200, api_keys_res.text
+            found_key = next(item for item in api_keys_res.json() if item["id"] == key["id"])
+            assert found_key["month_credited_cost"] == record["credited_cost"]
+
+            patch_res = await client.patch(
+                f"/v1/api-keys/{key['id']}/limits",
+                headers=owner_headers,
+                json={"monthly_credit_limit": record["credited_cost"]},
+            )
+            assert patch_res.status_code == 200, patch_res.text
+            updated_key = patch_res.json()
+            assert updated_key["owner_monthly_credit_limit"] == record["credited_cost"]
+            assert updated_key["effective_monthly_credit_limit"] == record["credited_cost"]
+
+            async with factory() as session:
+                runs_before = (await session.execute(select(func.count(ChatRun.id)))).scalar_one()
+
+            provider_calls_before = provider_call
+
+            blocked = await client.post(
+                "/v1/temp-completions",
+                headers={"X-Api-Key": key["key"], "Idempotency-Key": str(uuid.uuid4())},
+                json={
+                    "parts": [{"type": "text", "text": "should be blocked by limit"}],
+                    "model_id": model_name,
+                    "features": {"memory": False, "tool_policy": {"mode": "agent_default"}},
+                },
+            )
+            assert blocked.status_code == 402, blocked.text
+            assert blocked.json()["detail"] == "API 키 월 사용 한도를 초과했습니다"
+
+            async with factory() as session:
+                runs_after = (await session.execute(select(func.count(ChatRun.id)))).scalar_one()
+            assert runs_after == runs_before
+            assert provider_call == provider_calls_before
+
+            replayed = await client.post(
+                "/v1/temp-completions",
+                headers={"X-Api-Key": key["key"], "Idempotency-Key": first_idem_key},
+                json={
+                    "parts": [{"type": "text", "text": "run the integration check"}],
+                    "model_id": model_name,
+                    "features": {"memory": False, "tool_policy": {"mode": "agent_default"}},
+                },
+            )
+            assert replayed.status_code == 202, replayed.text
+            assert replayed.json()["run_id"] == run_id
     finally:
         await close_db()

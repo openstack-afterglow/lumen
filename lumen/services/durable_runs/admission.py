@@ -44,7 +44,7 @@ async def existing_run_for_intent(
     try:
         uuid.UUID(client_request_id)
     except ValueError as exc:
-        raise DurableRunError("Idempotency-Key must be a UUID") from exc
+        raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     factory = _factory()
     async with factory() as session:
         existing = (
@@ -206,7 +206,7 @@ async def create_persistent_run(
     try:
         uuid.UUID(client_request_id)
     except ValueError as exc:
-        raise DurableRunError("Idempotency-Key must be a UUID") from exc
+        raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
     request_payload = {
         **request_payload,
@@ -361,7 +361,7 @@ async def create_run(
     try:
         uuid.UUID(client_request_id)
     except ValueError as exc:
-        raise DurableRunError("Idempotency-Key must be a UUID") from exc
+        raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
@@ -495,7 +495,7 @@ async def create_temp_run(
     try:
         uuid.UUID(client_request_id)
     except ValueError as exc:
-        raise DurableRunError("Idempotency-Key must be a UUID") from exc
+        raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)

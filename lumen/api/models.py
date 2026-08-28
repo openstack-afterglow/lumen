@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from lumen.auth import require_admin
 from lumen.services import model_discovery, models_dev
-from lumen.services.providers import errors, repository
+from lumen.services.providers import credentials, errors, repository
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
@@ -26,8 +26,14 @@ class ProviderCreateRequest(BaseModel):
     provider_type: str = Field(default="openai", max_length=40)  # litellm custom_llm_provider
     api_base: str | None = Field(default=None, max_length=255)
     api_key: str | None = Field(default=None, max_length=500)
+    api_key_env: str | None = Field(default=None, max_length=128)
     margin_multiplier: float = Field(default=1.0, ge=0)
     is_active: bool = True
+
+    @field_validator("api_key_env")
+    @classmethod
+    def validate_api_key_env(cls, value: str | None) -> str | None:
+        return credentials.normalize_api_key_env(value)
 
 
 class ProviderUpdateRequest(BaseModel):
@@ -35,8 +41,14 @@ class ProviderUpdateRequest(BaseModel):
     provider_type: str | None = Field(default=None, max_length=40)
     api_base: str | None = Field(default=None, max_length=255)
     api_key: str | None = Field(default=None, max_length=500)
+    api_key_env: str | None = Field(default=None, max_length=128)
     margin_multiplier: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
+
+    @field_validator("api_key_env")
+    @classmethod
+    def validate_api_key_env(cls, value: str | None) -> str | None:
+        return credentials.normalize_api_key_env(value)
 
 
 class ProviderResponse(BaseModel):
@@ -45,6 +57,8 @@ class ProviderResponse(BaseModel):
     provider_type: str
     api_base: str | None
     has_api_key: bool
+    api_key_source: str | None = None
+    api_key_env: str | None = None
     is_active: bool
     margin_multiplier: float
     created_at: str | None

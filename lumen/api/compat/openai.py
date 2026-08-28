@@ -36,6 +36,45 @@ class OpenAIChatRequest(BaseModel):
     model_config = {"extra": "allow"}  # 미지원 OpenAI 파라미터는 무시(호환성)
 
 
+class OpenAIChatChoiceMessage(BaseModel):
+    role: str = "assistant"
+    content: str | None = None
+    tool_calls: list[dict] | None = None
+
+
+class OpenAIChatChoice(BaseModel):
+    index: int = 0
+    message: OpenAIChatChoiceMessage
+    finish_reason: str = "stop"
+
+
+class OpenAIUsage(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class OpenAIChatResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: list[OpenAIChatChoice]
+    usage: OpenAIUsage
+
+
+class OpenAIModelItem(BaseModel):
+    id: str
+    object: str = "model"
+    created: int = 0
+    owned_by: str = "afterglow"
+
+
+class OpenAIModelListResponse(BaseModel):
+    object: str = "list"
+    data: list[OpenAIModelItem]
+
+
 # ── 순수 변환 함수 (단위 테스트 대상) ──────────────────────────────────────
 def openai_error(status_code: int, message: str) -> dict:
     return {"error": {"message": message, "type": "invalid_request_error" if status_code < 500 else "api_error"}}
@@ -104,7 +143,12 @@ def models_list(models: list[dict]) -> dict:
     return {
         "object": "list",
         "data": [
-            {"id": m["model_name"], "object": "model", "created": 0, "owned_by": m.get("provider_name") or "afterglow"}
+            {
+                "id": m["model_name"],
+                "object": "model",
+                "created": 0,
+                "owned_by": m.get("provider_name") or "afterglow",
+            }
             for m in models
         ],
     }
@@ -115,7 +159,11 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-@router.post("/chat/completions", openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]})
+@router.post(
+    "/chat/completions",
+    response_model=OpenAIChatResponse,
+    openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
+)
 async def chat_completions(
     body: OpenAIChatRequest, token_info: dict = Depends(require_api_key_scopes("compat:completions:write"))
 ):
@@ -123,7 +171,7 @@ async def chat_completions(
     api_key_id = token_info.get("api_key_id")
     try:
         resolved = await core.resolve(body.model)
-        await core.precheck(user_id, project_id)
+        await core.precheck(user_id, project_id, api_key_id=api_key_id)
     except core.CompletionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=openai_error(exc.status_code, exc.message)) from exc
 
@@ -141,6 +189,7 @@ async def chat_completions(
                 max_tokens=body.max_tokens,
                 temperature=body.temperature,
                 tools=body.tools,
+                tool_choice=body.tool_choice,
             )
         except core.CompletionError as exc:
             raise HTTPException(status_code=exc.status_code, detail=openai_error(exc.status_code, exc.message)) from exc
@@ -158,6 +207,7 @@ async def chat_completions(
             max_tokens=body.max_tokens,
             temperature=body.temperature,
             tools=body.tools,
+            tool_choice=body.tool_choice,
         ):
             if ev["type"] == "delta":
                 yield _sse(chunk_dict(ev, cmpl_id=cmpl_id, created=created, model=resolved["model_name"]))
@@ -171,7 +221,11 @@ async def chat_completions(
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-@router.get("/models", openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]})
+@router.get(
+    "/models",
+    response_model=OpenAIModelListResponse,
+    openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
+)
 async def list_models(token_info: dict = Depends(require_api_key_scopes("models:read"))):
     try:
         models = await repository.list_models(active_only=True)

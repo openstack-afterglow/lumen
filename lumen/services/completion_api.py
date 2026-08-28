@@ -47,12 +47,12 @@ async def resolve(model: str) -> dict:
     return resolved
 
 
-async def precheck(user_id: str, project_id: str) -> None:
+async def precheck(user_id: str, project_id: str, api_key_id: int | None = None) -> None:
     """쿼터 fail-closed. 초과 429, 저장소 장애 503."""
     try:
-        await credit.precheck(user_id, project_id)
+        await credit.precheck(user_id, project_id, api_key_id=api_key_id)
     except credit.QuotaExceeded as exc:
-        raise CompletionError(429, "월 사용 한도를 초과했습니다") from exc
+        raise CompletionError(429, str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
         raise CompletionError(503, "일시적으로 사용할 수 없습니다") from exc
 
@@ -141,8 +141,12 @@ async def complete_once(
     max_tokens: int | None,
     temperature: float | None,
     tools: list[dict] | None = None,
+    tool_choice: Any = None,
 ) -> dict:
     """비스트리밍 완료 — 전체 응답 반환 + 과금. tool_calls 는 릴레이(서버 미실행)."""
+    extra_kwargs: dict[str, Any] = {}
+    if tool_choice is not None:
+        extra_kwargs["tool_choice"] = tool_choice
     resp = await litellm_client.acompletion(
         resolved["model_name"],
         messages,
@@ -152,6 +156,7 @@ async def complete_once(
         max_tokens=clamp_max_tokens(max_tokens),
         temperature=temperature,
         tools=tools,
+        extra=extra_kwargs or None,
     )
     choice = resp.choices[0]
     msg = choice.message
@@ -189,6 +194,7 @@ async def complete_stream(
     max_tokens: int | None,
     temperature: float | None,
     tools: list[dict] | None = None,
+    tool_choice: Any = None,
 ) -> AsyncIterator[dict]:
     """스트리밍 완료 — 정규화 델타 yield 후 최종 done. 종료 시 과금(정확히 1회).
 
@@ -202,6 +208,9 @@ async def complete_stream(
     finish_reason = "stop"
     charged = False
     event_id = str(uuid.uuid4())  # 요청당 1개 — 정상/finally 재과금 모두 재사용(멱등, 이중과금 방지)
+    extra_kwargs: dict[str, Any] = {}
+    if tool_choice is not None:
+        extra_kwargs["tool_choice"] = tool_choice
     try:
         gen = await litellm_client.acompletion_stream(
             resolved["model_name"],
@@ -212,6 +221,7 @@ async def complete_stream(
             max_tokens=clamp_max_tokens(max_tokens),
             temperature=temperature,
             tools=tools,
+            extra=extra_kwargs or None,
             reasoning_effort=_reasoning_effort(None),
         )
         async for chunk in gen:
@@ -268,7 +278,14 @@ async def complete_stream(
         if not charged and text:
             try:
                 await _bill(
-                    resolved, messages, text, final_usage, user_id=user_id, project_id=project_id, api_key_id=api_key_id
+                    resolved,
+                    messages,
+                    text,
+                    final_usage,
+                    event_id=event_id,
+                    user_id=user_id,
+                    project_id=project_id,
+                    api_key_id=api_key_id,
                 )
             except Exception:
                 logger.warning("API 스트림 종료 후 과금 실패", exc_info=True)
