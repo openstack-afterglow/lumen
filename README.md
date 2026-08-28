@@ -15,6 +15,20 @@ uv run lumen-worker
 
 `lumen-migrate`는 API와 worker보다 먼저 실행한다. Dockerfile은 migration을 자동 실행하지 않는다. 설정은 [`lumen.conf.example`](lumen.conf.example)을 복사해 secret manager/환경변수로 완성한다.
 
+### GHCR 컨테이너 이미지
+
+GitHub Container Registry(GHCR)에서 API와 Worker 이미지를 공개 배포한다:
+
+- API: `ghcr.io/openstack-afterglow/lumen-api`
+- Worker: `ghcr.io/openstack-afterglow/lumen-worker`
+
+`main`은 `latest`, `dev`는 `dev`, Git 태그 `v1.2.3`은 이미지 태그 `1.2.3`으로 게시된다. 모든 게시에는 소스 커밋별 `sha-<short-sha>` 태그도 생성된다.
+
+```bash
+docker pull ghcr.io/openstack-afterglow/lumen-api:latest
+docker pull ghcr.io/openstack-afterglow/lumen-worker:latest
+```
+
 ### 독립형 컨테이너 API + Console
 
 Afterglow/Keystone 없이도 Compose stack만으로 OpenAI 호환 API와 browser Console을 실행할 수 있다:

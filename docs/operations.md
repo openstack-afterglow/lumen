@@ -33,6 +33,35 @@ Worker lease는 45초다. run이 `running`이 아니거나 lease owner/expiry가
 
 적용된 SQL migration/checksum은 immutable이다. 유지보수 cutover는 API/worker stop → backup/DB readiness → `lumen-migrate --apply` → API/worker start 순서다. 적용 뒤 동일 command를 다시 실행해 pending migration이 없는지 확인한다. rolling mixed-version deployment는 지원 전제가 아니다.
 
+## Container 이미지 빌드 및 GHCR 배포
+
+Lumen은 GitHub Actions 파이프라인(`.github/workflows/docker-build.yml`)을 통해 Docker 이미지를 자동으로 빌드하고 GitHub Container Registry(GHCR)에 게시한다.
+
+### 이미지 및 Dockerfile 타겟
+- **API 이미지 (`lumen-api` 타겟)**: `ghcr.io/openstack-afterglow/lumen-api`
+- **Worker 이미지 (`lumen-worker` 타겟)**: `ghcr.io/openstack-afterglow/lumen-worker`
+
+### 게시 트리거 및 태그 규칙
+게시 작업(`build-and-push`)은 재사용 가능한 CI 워크플로우(`ci.yml`) 검증 성공을 전제로 실행된다.
+- **PR (`pull_request`)**: `main` 및 `dev` 브랜치 대상 PR은 빌드 검증만 수행하고 GHCR 로그인 및 푸시는 진행하지 않는다 (`push: false`).
+- **`dev` 브랜치 푸시**: CI 성공 후 `dev` 태그 및 `sha-<hash>` 태그로 GHCR에 게시된다.
+- **`main` 브랜치 푸시**: CI 성공 후 `latest` 태그 및 `sha-<hash>` 태그로 GHCR에 게시된다.
+- **버전 태그 푸시 (`v*`)**: 유효한 시맨틱 버전 Git 태그 `v1.2.3`은 이미지 태그 `1.2.3` 및 `sha-<hash>`로 게시된다.
+- **수동 실행 (`workflow_dispatch`)**: 선택한 ref의 `sha-<hash>` 태그를 게시한다. `dev` 또는 `main`을 선택하면 해당 브랜치 태그도 함께 갱신한다.
+
+### 아키텍처 및 캐시 설정
+- **두 플랫폼 지원**: QEMU (`docker/setup-qemu-action@v4`)와 Buildx (`docker/setup-buildx-action@v4`)를 사용해 `linux/amd64` 및 `linux/arm64` 멀티 아키텍처 이미지를 빌드한다.
+- **GHA BuildKit 캐시**: 타겟별 독립 캐시 스코프(`type=gha,scope=lumen-api`, `type=gha,scope=lumen-worker`)를 적용하여 타겟 간 캐시 충돌을 방지한다.
+
+### 권한 및 인증 사전 요구사항
+- **GHA 작업 권한**: 빌드 및 게시 작업에 `contents: read` 및 `packages: write` 권한이 지정되어 있다.
+- **인증 동작**: 푸시 이벤트에서만 `docker/login-action@v4`를 통해 `GITHUB_TOKEN`으로 GHCR에 자동 로그인한다. PR 이벤트에서는 로그인을 건너뛴다.
+- **비공개 패키지 인증**: 비공개 이미지 조회가 필요한 환경에서는 `read:packages` 스코프가 포함된 개인용 액세스 토큰(PAT)으로 `docker login ghcr.io` 인증을 수행한다 (인증 정보나 PAT 값을 코드/문서에 직접 포함하지 않는다).
+
+### 운용 및 배포 순서 (Migration 전제)
+- Dockerfile 타겟(`lumen-api`, `lumen-worker`)은 DB 마이그레이션을 자동 실행하지 않는다.
+- 새 이미지 버전 롤아웃 전에 반드시 마이그레이션 단계(직접 실행 시 `uv run lumen-migrate --apply`, 컨테이너 실행 시 `lumen-migrate --apply`)를 완료한 후 API 및 Worker 컨테이너를 배포해야 한다.
+
 ## 보존, backup, restore
 
 Temporary thread payload는 30일 뒤 purge 대상이다. terminal run/usage ledger는 accounting record다. SSE cursor는 `Last-Event-ID` 또는 `after_seq`로 replay하며 retention 밖 cursor는 410이다.
