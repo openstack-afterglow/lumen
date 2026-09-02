@@ -9,6 +9,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
+from lumen.config import get_settings
+
 router = APIRouter()
 
 
@@ -106,7 +108,7 @@ class CompatDiscoveryResponse(BaseModel):
 
 @router.get("/compat", response_model=CompatDiscoveryResponse)
 async def discovery(request: Request) -> CompatDiscoveryResponse:
-    origin = str(request.base_url).rstrip("/")
+    origin = (get_settings().public_api_base or str(request.base_url)).rstrip("/")
     return CompatDiscoveryResponse(
         version="1.0.0",
         contract_version="1.0.0",

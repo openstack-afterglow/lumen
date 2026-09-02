@@ -1,14 +1,14 @@
 ---
 # Lumen kolla role defaults
 
-lumen_image_tag: "0.1.2"
+lumen_image_tag: "0.1.3"
 lumen_image_namespace: "ghcr.io/openstack-afterglow"
 lumen_api_image: "{{ lumen_image_namespace }}/lumen-api"
 lumen_worker_image: "{{ lumen_image_namespace }}/lumen-worker"
 
 lumen_source_mode: "{{ enable_lumen_source_build | default(enable_source_build | default(lumen_dev_mode | default(false))) | bool }}"
 lumen_source_repo: "https://github.com/openstack-afterglow/lumen.git"
-lumen_source_version: "452ba5a18c977648f35710d4d5e9001f6d97b6f2"
+lumen_source_version: "d67f41ab762e33440bd33f3ad64d4ceb5219b53d"
 lumen_source_dir: "{{ lumen_source_checkout_path | default('/opt/afterglow/src/lumen') }}"
 lumen_api_image_ref: "{{ 'afterglow-local/lumen-api:' ~ (lumen_source_version | truncate(12, True, '')) if (lumen_source_mode | bool) else (lumen_api_image ~ ':' ~ lumen_image_tag) }}"
 lumen_worker_image_ref: "{{ 'afterglow-local/lumen-worker:' ~ (lumen_source_version | truncate(12, True, '')) if (lumen_source_mode | bool) else (lumen_worker_image ~ ':' ~ lumen_image_tag) }}"
@@ -43,6 +43,7 @@ lumen_keystone_interface: "{{ openstack_interface | default('internal') }}"
 lumen_service_project_name: "lumen-service"
 lumen_external_url: "{{ public_protocol | default('https') }}://{{ kolla_external_fqdn | default('localhost') }}:{{ lumen_api_port }}"
 lumen_public_endpoint_url: "{{ lumen_external_url }}"
+lumen_public_api_base: "{{ lumen_public_endpoint_url }}"
 lumen_internal_endpoint_url: "{{ internal_protocol | default('http') }}://{{ kolla_internal_fqdn | default(kolla_internal_vip_address) }}:{{ lumen_api_port }}"
 lumen_admin_endpoint_url: "{{ lumen_internal_endpoint_url }}"
 
