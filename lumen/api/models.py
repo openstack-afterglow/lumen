@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from lumen.auth import require_admin
 from lumen.services import model_discovery, models_dev
-from lumen.services import provider_store as ps
+from lumen.services.providers import credentials, errors, repository
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
@@ -26,8 +26,14 @@ class ProviderCreateRequest(BaseModel):
     provider_type: str = Field(default="openai", max_length=40)  # litellm custom_llm_provider
     api_base: str | None = Field(default=None, max_length=255)
     api_key: str | None = Field(default=None, max_length=500)
+    api_key_env: str | None = Field(default=None, max_length=128)
     margin_multiplier: float = Field(default=1.0, ge=0)
     is_active: bool = True
+
+    @field_validator("api_key_env")
+    @classmethod
+    def validate_api_key_env(cls, value: str | None) -> str | None:
+        return credentials.normalize_api_key_env(value)
 
 
 class ProviderUpdateRequest(BaseModel):
@@ -35,8 +41,14 @@ class ProviderUpdateRequest(BaseModel):
     provider_type: str | None = Field(default=None, max_length=40)
     api_base: str | None = Field(default=None, max_length=255)
     api_key: str | None = Field(default=None, max_length=500)
+    api_key_env: str | None = Field(default=None, max_length=128)
     margin_multiplier: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
+
+    @field_validator("api_key_env")
+    @classmethod
+    def validate_api_key_env(cls, value: str | None) -> str | None:
+        return credentials.normalize_api_key_env(value)
 
 
 class ProviderResponse(BaseModel):
@@ -45,6 +57,8 @@ class ProviderResponse(BaseModel):
     provider_type: str
     api_base: str | None
     has_api_key: bool
+    api_key_source: str | None = None
+    api_key_env: str | None = None
     is_active: bool
     margin_multiplier: float
     created_at: str | None
@@ -196,44 +210,44 @@ def _map_storage(exc: Exception) -> HTTPException:
 @router.get("/admin/providers", response_model=list[ProviderResponse])
 async def list_providers():
     try:
-        return await ps.list_providers()
-    except ps.ChatStorageUnavailable as exc:
+        return await repository.list_providers()
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
 @router.post("/admin/providers", response_model=ProviderResponse, status_code=201)
 async def create_provider(payload: ProviderCreateRequest):
     try:
-        return await ps.create_provider(**payload.model_dump())
-    except ps.ProviderValidationError as exc:
+        return await repository.create_provider(**payload.model_dump())
+    except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
 @router.patch("/admin/providers/{provider_id}", response_model=ProviderResponse)
 async def update_provider(provider_id: int, payload: ProviderUpdateRequest):
     try:
-        return await ps.update_provider(provider_id, payload.model_dump(exclude_unset=True))
-    except ps.ProviderNotFoundError as exc:
+        return await repository.update_provider(provider_id, payload.model_dump(exclude_unset=True))
+    except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ps.ActiveRunConfigurationConflict as exc:
+    except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ps.ProviderValidationError as exc:
+    except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
 @router.delete("/admin/providers/{provider_id}", status_code=204)
 async def delete_provider(provider_id: int):
     try:
-        await ps.delete_provider(provider_id)
-    except ps.ProviderNotFoundError as exc:
+        await repository.delete_provider(provider_id)
+    except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ps.ActiveRunConfigurationConflict as exc:
+    except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
@@ -242,9 +256,9 @@ async def available_models(provider_id: int):
     """프로바이더 API(또는 litellm 정적 목록)에서 사용 가능한 모델 id 목록을 조회. 등록 전 선택/필터용."""
     try:
         return await model_discovery.discover_models(provider_id)
-    except ps.ProviderNotFoundError as exc:
+    except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
@@ -254,8 +268,8 @@ async def available_models(provider_id: int):
 @router.get("/admin/models", response_model=list[ModelResponse])
 async def list_models(active_only: bool = False):
     try:
-        return await ps.list_models(active_only=active_only)
-    except ps.ChatStorageUnavailable as exc:
+        return await repository.list_models(active_only=active_only)
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
@@ -265,13 +279,13 @@ async def list_models_dev_providers(
     refresh: bool = False,
 ):
     try:
-        registered_providers = await ps.list_providers()
+        registered_providers = await repository.list_providers()
         current_provider = next(
             (provider for provider in registered_providers if provider["id"] == local_provider_id),
             None,
         )
         if current_provider is None:
-            raise ps.ProviderNotFoundError(f"프로바이더 {local_provider_id} 를 찾을 수 없습니다")
+            raise errors.ProviderNotFoundError(f"프로바이더 {local_provider_id} 를 찾을 수 없습니다")
         catalog = await models_dev.get_catalog(refresh=refresh)
         current_provider_matches = models_dev.matching_provider_ids(catalog, current_provider)
         providers = models_dev.registered_provider_list(
@@ -281,9 +295,9 @@ async def list_models_dev_providers(
         )
     except models_dev.ModelsDevCatalogError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except ps.ProviderNotFoundError as exc:
+    except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
     return {
         "source_url": catalog.source_url,
@@ -310,7 +324,7 @@ async def get_models_dev_provider(models_dev_provider_id: str, refresh: bool = F
 async def import_models_dev_prices(payload: ModelsDevImportRequest):
     try:
         catalog = await models_dev.get_catalog()
-        return await ps.import_models_dev_prices(
+        return await repository.import_models_dev_prices(
             local_provider_id=payload.local_provider_id,
             models_dev_provider_id=payload.models_dev_provider_id,
             selections=[selection.model_dump() for selection in payload.selections],
@@ -318,15 +332,15 @@ async def import_models_dev_prices(payload: ModelsDevImportRequest):
         )
     except models_dev.ModelsDevCatalogError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except ps.ProviderNotFoundError as exc:
+    except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ps.ModelsDevImportConflictError as exc:
+    except errors.ModelsDevImportConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ps.ActiveRunConfigurationConflict as exc:
+    except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ps.ProviderValidationError as exc:
+    except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
@@ -334,10 +348,10 @@ async def import_models_dev_prices(payload: ModelsDevImportRequest):
 async def set_title_model(payload: TitleModelRequest):
     """대화 제목 자동 요약에 쓸 모델 1개를 지정(또는 해제). 요약 호출 비용은 시스템 부담."""
     try:
-        await ps.set_title_model(payload.model_id)
-    except ps.ProviderNotFoundError as exc:
+        await repository.set_title_model(payload.model_id)
+    except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
@@ -345,44 +359,44 @@ async def set_title_model(payload: TitleModelRequest):
 async def set_memory_model(payload: MemoryModelRequest):
     """채팅 후 사용자 메모리 자동 추출에 쓸 초소형 모델 1개 지정(또는 해제). 추출 비용은 시스템 부담."""
     try:
-        await ps.set_memory_model(payload.model_id)
-    except ps.ProviderNotFoundError as exc:
+        await repository.set_memory_model(payload.model_id)
+    except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
 @router.post("/admin/models", response_model=ModelResponse, status_code=201)
 async def create_model(payload: ModelCreateRequest):
     try:
-        return await ps.create_model(**payload.model_dump())
-    except ps.ProviderValidationError as exc:
+        return await repository.create_model(**payload.model_dump())
+    except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
 @router.patch("/admin/models/{model_id}", response_model=ModelResponse)
 async def update_model(model_id: int, payload: ModelUpdateRequest):
     try:
-        return await ps.update_model(model_id, payload.model_dump(exclude_unset=True))
-    except ps.ProviderNotFoundError as exc:
+        return await repository.update_model(model_id, payload.model_dump(exclude_unset=True))
+    except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ps.ActiveRunConfigurationConflict as exc:
+    except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ps.ProviderValidationError as exc:
+    except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
 
 @router.delete("/admin/models/{model_id}", status_code=204)
 async def delete_model(model_id: int):
     try:
-        await ps.delete_model(model_id)
-    except ps.ProviderNotFoundError as exc:
+        await repository.delete_model(model_id)
+    except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ps.ActiveRunConfigurationConflict as exc:
+    except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ps.ChatStorageUnavailable as exc:
+    except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc

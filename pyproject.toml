@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lumen"
-version = "0.1.0"
+version = "0.1.1"
 description = "Afterglow Lumen durable chat, LLM, and agent service"
 requires-python = ">=3.12"
 dependencies = [
@@ -53,6 +53,9 @@ dev = [
 lumen-api = "lumen.main:run"
 lumen-worker = "lumen.worker:main"
 lumen-migrate = "lumen.scripts.migrate:main"
+lumen-seed-local = "lumen.scripts.seed_local:main"
+lumen-local-connection = "lumen.scripts.show_connection:main"
+lumen-test = "lumen.scripts.test_layers:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true
@@ -64,6 +67,8 @@ packages = ["lumen"]
 asyncio_mode = "auto"
 markers = [
     "crypto: encryption-domain unit tests",
+    "integration: MariaDB/Redis가 필요한 end-to-end tests",
+    "system: real process stack system tests",
 ]
 
 [tool.ruff]

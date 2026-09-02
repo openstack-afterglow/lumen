@@ -9,9 +9,10 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from lumen.auth import get_token_info
-from lumen.services import capabilities, provider_store
+from lumen.auth import require_scopes
+from lumen.services import capabilities
 from lumen.services import conversation_store as cs
+from lumen.services.providers import errors, repository, routing
 
 router = APIRouter()
 
@@ -21,6 +22,7 @@ class AvailableModel(BaseModel):
     model_name: str
     display_name: str
     provider: str | None = None
+    provider_api_key_configured: bool
     # 유효 능력(vision/reasoning/tool_call/attachment/modalities/reasoning_options/context_limit).
     # 키·가격은 미포함이지만 능력은 배지·게이팅용으로 노출.
     capabilities: dict | None = None
@@ -30,22 +32,24 @@ class AvailableModel(BaseModel):
 
 
 @router.get("/chat/models", response_model=list[AvailableModel])
-async def list_available_models(token_info: dict = Depends(get_token_info)):
+async def list_available_models(token_info: dict = Depends(require_scopes("models:read"))):
     """사용자용 활성 모델 카탈로그(키·가격 미포함, provider명·능력 포함). 저장소 장애 시 빈 목록(graceful)."""
     try:
-        models = await provider_store.list_models(active_only=True)
-        providers = {p["id"]: p["name"] for p in await provider_store.list_providers()}
-    except provider_store.ChatStorageUnavailable:
+        models = await repository.list_models(active_only=True)
+        providers = {p["id"]: p for p in await repository.list_providers()}
+    except errors.ChatStorageUnavailable:
         return []
     result = []
     for m in models:
         caps = m.get("effective_capabilities") or {}
+        provider = providers.get(m["provider_id"])
         result.append(
             {
                 "id": m["id"],
                 "model_name": m["model_name"],
                 "display_name": m.get("display_name") or m["model_name"],
-                "provider": providers.get(m["provider_id"]),
+                "provider": provider.get("name") if provider else None,
+                "provider_api_key_configured": bool(provider and provider.get("has_api_key")),
                 "capabilities": caps or None,
                 "context_limit": caps.get("context_limit") if isinstance(caps, dict) else None,
             }
@@ -54,12 +58,14 @@ async def list_available_models(token_info: dict = Depends(get_token_info)):
 
 
 @router.get("/capabilities")
-async def get_chat_capabilities(model_id: int = Query(..., ge=1), token_info: dict = Depends(get_token_info)):
+async def get_chat_capabilities(
+    model_id: int = Query(..., ge=1), token_info: dict = Depends(require_scopes("models:read"))
+):
     """Expose selected-model and deployment runtime gates without secrets."""
     del token_info
     try:
-        resolved = await provider_store.resolve_model_by_id(model_id)
-    except provider_store.ChatStorageUnavailable as exc:
+        resolved = await routing.resolve_model_by_id(model_id)
+    except errors.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail="chat model configuration is unavailable") from exc
     if resolved is None:
         raise HTTPException(status_code=404, detail="chat model not found")
@@ -158,7 +164,9 @@ def _map_error(exc: Exception) -> HTTPException:
 
 
 @router.post("/conversations", response_model=ConversationResponse, status_code=201)
-async def create_conversation(payload: ConversationCreateRequest, token_info: dict = Depends(get_token_info)):
+async def create_conversation(
+    payload: ConversationCreateRequest, token_info: dict = Depends(require_scopes("native:conversations:write"))
+):
     try:
         return await cs.create_conversation(
             project_id=token_info["project_id"],
@@ -173,7 +181,9 @@ async def create_conversation(payload: ConversationCreateRequest, token_info: di
 
 @router.patch("/conversations/{conversation_id}/workspace", response_model=ConversationResponse)
 async def set_conversation_workspace(
-    conversation_id: str, payload: WorkspaceAssignRequest, token_info: dict = Depends(get_token_info)
+    conversation_id: str,
+    payload: WorkspaceAssignRequest,
+    token_info: dict = Depends(require_scopes("native:conversations:write")),
 ):
     """대화를 프로젝트(workspace)에 배정하거나 해제(None)."""
     try:
@@ -194,7 +204,9 @@ async def set_conversation_workspace(
 
 
 @router.get("/conversations", response_model=list[ConversationResponse])
-async def list_conversations(limit: int = 50, offset: int = 0, token_info: dict = Depends(get_token_info)):
+async def list_conversations(
+    limit: int = 50, offset: int = 0, token_info: dict = Depends(require_scopes("native:conversations:read"))
+):
     try:
         return await cs.list_conversations(
             user_id=token_info["user_id"], project_id=token_info["project_id"], limit=limit, offset=offset
@@ -207,7 +219,7 @@ async def list_conversations(limit: int = 50, offset: int = 0, token_info: dict 
 async def search_conversations(
     q: str = Query(default="", max_length=200),
     limit: int = Query(default=20, ge=1, le=50),
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(require_scopes("native:conversations:read")),
 ):
     try:
         return await cs.search_conversations(
@@ -221,7 +233,9 @@ async def search_conversations(
 
 
 @router.get("/conversations/{conversation_id}", response_model=ConversationResponse)
-async def get_conversation(conversation_id: str, token_info: dict = Depends(get_token_info)):
+async def get_conversation(
+    conversation_id: str, token_info: dict = Depends(require_scopes("native:conversations:read"))
+):
     try:
         return await cs.get_conversation(
             conversation_id, user_id=token_info["user_id"], project_id=token_info["project_id"]
@@ -231,7 +245,9 @@ async def get_conversation(conversation_id: str, token_info: dict = Depends(get_
 
 
 @router.delete("/conversations/{conversation_id}", status_code=204)
-async def delete_conversation(conversation_id: str, token_info: dict = Depends(get_token_info)):
+async def delete_conversation(
+    conversation_id: str, token_info: dict = Depends(require_scopes("native:conversations:write"))
+):
     try:
         await cs.delete_conversation(
             conversation_id, user_id=token_info["user_id"], project_id=token_info["project_id"]
@@ -245,7 +261,7 @@ async def list_messages(
     conversation_id: str,
     before_id: int | None = Query(default=None, gt=0),
     limit: int = Query(default=40, ge=1, le=100),
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(require_scopes("native:conversations:read")),
 ):
     """Return a bounded active-branch page; before_id anchors the next ancestor page."""
     try:
@@ -261,7 +277,11 @@ async def list_messages(
 
 
 @router.patch("/conversations/{conversation_id}/active-leaf", response_model=ConversationResponse)
-async def set_active_leaf(conversation_id: str, payload: ActiveLeafRequest, token_info: dict = Depends(get_token_info)):
+async def set_active_leaf(
+    conversation_id: str,
+    payload: ActiveLeafRequest,
+    token_info: dict = Depends(require_scopes("native:conversations:write")),
+):
     """형제 버전 전환 — 활성 리프를 지정 메시지로 이동."""
     try:
         return await cs.set_active_leaf(
@@ -275,7 +295,9 @@ async def set_active_leaf(conversation_id: str, payload: ActiveLeafRequest, toke
 
 
 @router.post("/conversations/{conversation_id}/fork", response_model=ConversationResponse, status_code=201)
-async def fork_conversation(conversation_id: str, payload: ForkRequest, token_info: dict = Depends(get_token_info)):
+async def fork_conversation(
+    conversation_id: str, payload: ForkRequest, token_info: dict = Depends(require_scopes("native:conversations:write"))
+):
     """지정 메시지까지의 경로를 새 대화로 복사(분기). 소유자 동일, 원본 독립."""
     try:
         return await cs.fork_conversation(

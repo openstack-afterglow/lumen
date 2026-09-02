@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from lumen.auth import get_api_key_info
+from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
 
 router = APIRouter()
@@ -33,6 +33,65 @@ class AnthropicMessagesRequest(BaseModel):
     tool_choice: Any = None
 
     model_config = {"extra": "allow"}
+
+
+class AnthropicUsage(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class AnthropicMessagesResponse(BaseModel):
+    id: str
+    type: str = "message"
+    role: str = "assistant"
+    model: str
+    content: list[dict[str, Any]]
+    stop_reason: str | None = "end_turn"
+    stop_sequence: str | None = None
+    usage: AnthropicUsage
+
+
+def _convert_anthropic_tool_choice(tool_choice: Any) -> Any:
+    """Convert Anthropic tool_choice to OpenAI/LiteLLM tool_choice format.
+
+    Supported Anthropic choices:
+      - {"type": "auto"} -> "auto"
+      - {"type": "any"} -> "required"
+      - {"type": "none"} -> "none"
+      - {"type": "tool", "name": "..."} -> {"type": "function", "function": {"name": "..."}}
+      - "auto" -> "auto", "any" -> "required", "none" -> "none"
+
+    Raises CompletionError(422, ...) on malformed choice.
+    """
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        tc_lower = tool_choice.lower()
+        if tc_lower == "auto":
+            return "auto"
+        if tc_lower == "any":
+            return "required"
+        if tc_lower == "none":
+            return "none"
+        raise core.CompletionError(422, f"Invalid tool_choice string option: {tool_choice!r}")
+    if isinstance(tool_choice, dict):
+        tc_type = tool_choice.get("type")
+        if not isinstance(tc_type, str):
+            raise core.CompletionError(422, "tool_choice dict must contain a string 'type'")
+        tc_type_lower = tc_type.lower()
+        if tc_type_lower == "auto":
+            return "auto"
+        if tc_type_lower == "any":
+            return "required"
+        if tc_type_lower == "none":
+            return "none"
+        if tc_type_lower == "tool":
+            name = tool_choice.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise core.CompletionError(422, "tool_choice with type='tool' requires a non-empty string 'name'")
+            return {"type": "function", "function": {"name": name}}
+        raise core.CompletionError(422, f"Unsupported Anthropic tool_choice type: {tc_type!r}")
+    raise core.CompletionError(422, "tool_choice must be a dict or string")
 
 
 # ── 순수 변환 함수 (단위 테스트 대상) ──────────────────────────────────────
@@ -177,15 +236,22 @@ def _event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-@router.post("/messages")
-async def messages(body: AnthropicMessagesRequest, token_info: dict = Depends(get_api_key_info)):
+@router.post(
+    "/messages",
+    response_model=AnthropicMessagesResponse,
+    openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
+)
+async def messages(
+    body: AnthropicMessagesRequest, token_info: dict = Depends(require_api_key_scopes("compat:completions:write"))
+):
     user_id, project_id = token_info["user_id"], token_info["project_id"]
     api_key_id = token_info.get("api_key_id")
     internal = to_internal_messages(body)
     tools = _anthropic_tools_to_openai(body.tools)
     try:
+        tool_choice = _convert_anthropic_tool_choice(body.tool_choice)
         resolved = await core.resolve(body.model)
-        await core.precheck(user_id, project_id)
+        await core.precheck(user_id, project_id, api_key_id=api_key_id)
     except core.CompletionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=anthropic_error(exc.status_code, exc.message)) from exc
 
@@ -202,6 +268,7 @@ async def messages(body: AnthropicMessagesRequest, token_info: dict = Depends(ge
                 max_tokens=body.max_tokens,
                 temperature=body.temperature,
                 tools=tools,
+                tool_choice=tool_choice,
             )
         except core.CompletionError as exc:
             raise HTTPException(
@@ -243,6 +310,7 @@ async def messages(body: AnthropicMessagesRequest, token_info: dict = Depends(ge
             max_tokens=body.max_tokens,
             temperature=body.temperature,
             tools=tools,
+            tool_choice=tool_choice,
         ):
             if ev["type"] == "delta":
                 if ev.get("content"):

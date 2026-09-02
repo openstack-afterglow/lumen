@@ -17,12 +17,13 @@ from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.config import get_settings
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
-from lumen.models.chat_db import ChatUsageLog, UserWallet
+from lumen.models.chat_db import ChatApiKey, ChatUsageLog, UserWallet
+from lumen.services.api_key_store import calculate_effective_limit
 from lumen.services.litellm_client import UsageCost
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,9 @@ async def _get_or_create_wallet(session, user_id: str, project_id: str | None) -
     return wallet
 
 
-async def precheck(user_id: str, project_id: str | None = None) -> None:
+async def precheck(
+    user_id: str, project_id: str | None = None, api_key_id: int | None = None
+) -> None:
     """월 쿼터 초과 시 QuotaExceeded. DB 장애 시 ChatStorageUnavailable(fail-closed).
 
     max_quota_monthly == 0 은 '무제한'으로 해석(설정 default_monthly_quota=0 대응).
@@ -136,8 +139,63 @@ async def precheck(user_id: str, project_id: str | None = None) -> None:
                 and wallet.used_quota_this_month >= wallet.max_quota_monthly
             ):
                 raise QuotaExceeded("월 사용 한도를 초과했습니다")
+
+            if api_key_id is not None:
+                key_row = await session.get(ChatApiKey, api_key_id)
+                if key_row is None or key_row.owner_user_id != user_id:
+                    raise ChatStorageUnavailable("chat DB 오류")
+                if project_id is not None and key_row.owner_project_id != project_id:
+                    raise ChatStorageUnavailable("chat DB 오류")
+                if not key_row.is_active or key_row.revoked_at is not None:
+                    raise ChatStorageUnavailable("chat DB 오류")
+
+                owner_lim = key_row.owner_monthly_credit_limit
+                admin_lim = key_row.admin_monthly_credit_limit
+
+                if owner_lim is not None:
+                    if not isinstance(owner_lim, Decimal):
+                        try:
+                            owner_lim = Decimal(str(owner_lim))
+                        except Exception as exc:
+                            raise ChatStorageUnavailable("chat DB 오류") from exc
+                    if not owner_lim.is_finite() or owner_lim <= 0:
+                        raise ChatStorageUnavailable("chat DB 오류")
+
+                if admin_lim is not None:
+                    if not isinstance(admin_lim, Decimal):
+                        try:
+                            admin_lim = Decimal(str(admin_lim))
+                        except Exception as exc:
+                            raise ChatStorageUnavailable("chat DB 오류") from exc
+                    if not admin_lim.is_finite() or admin_lim <= 0:
+                        raise ChatStorageUnavailable("chat DB 오류")
+
+                sys_quota = None
+                if wallet.max_quota_monthly is not None:
+                    try:
+                        sys_quota = Decimal(str(wallet.max_quota_monthly))
+                        if not sys_quota.is_finite():
+                            raise ChatStorageUnavailable("chat DB 오류")
+                    except Exception as exc:
+                        raise ChatStorageUnavailable("chat DB 오류") from exc
+                effective_limit = calculate_effective_limit(owner_lim, admin_lim, sys_quota)
+
+                if effective_limit is not None:
+                    month_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                    stmt = select(func.coalesce(func.sum(ChatUsageLog.credited_cost), Decimal("0"))).where(
+                        ChatUsageLog.api_key_id == api_key_id,
+                        ChatUsageLog.source == "api",
+                        ChatUsageLog.created_at >= month_start,
+                    )
+                    month_usage = (await session.execute(stmt)).scalar_one()
+                    if month_usage >= effective_limit:
+                        raise QuotaExceeded("API 키 월 사용 한도를 초과했습니다")
+    except (QuotaExceeded, ChatStorageUnavailable):
+        raise
     except OperationalError as exc:
         mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+    except Exception as exc:
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
@@ -157,6 +215,7 @@ async def apply_usage_in_transaction(
     conversation_id: str | None = None,
     source: str = "web",
     api_key_id: int | None = None,
+    run_id: str | None = None,
     charge_wallet: bool = True,
     usage_components: list[dict[str, Any]] | None = None,
 ) -> Decimal:
@@ -189,6 +248,7 @@ async def apply_usage_in_transaction(
             api_key_id=api_key_id,
             pricing_status=usage_cost.pricing_status,
             pricing_snapshot=pricing_snapshot,
+            run_id=run_id,
             usage_components=usage_components,
         )
     )
@@ -219,6 +279,7 @@ async def apply_usage(
     conversation_id: str | None = None,
     source: str = "web",
     api_key_id: int | None = None,
+    run_id: str | None = None,
     charge_wallet: bool = True,
 ) -> Decimal:
     factory = _require_db()
@@ -242,6 +303,7 @@ async def apply_usage(
                         source=source,
                         api_key_id=api_key_id,
                         charge_wallet=charge_wallet,
+                        run_id=run_id,
                     )
             except IntegrityError as exc:
                 await session.rollback()

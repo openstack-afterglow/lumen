@@ -1,7 +1,8 @@
 """Version-2 policy-aware tool dispatch.
 
-This module is deliberately not imported by the v1 graph.  It is activated only by
-an execution-protocol-v2 worker once checkpoint/pause semantics are deployed.
+``graph.py`` imports this module but calls it only for
+``execution_protocol_version=2`` bindings. Those runs require the encrypted
+PostgreSQL checkpointer that provides v2 pause/resume semantics.
 """
 
 from __future__ import annotations

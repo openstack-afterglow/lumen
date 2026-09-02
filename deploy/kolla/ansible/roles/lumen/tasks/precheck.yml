@@ -1,0 +1,105 @@
+---
+- name: Precheck | Verify enable_lumen is set
+  ansible.builtin.assert:
+    that:
+      - enable_lumen is defined
+    fail_msg: "enable_lumen must be set in globals.yml"
+  run_once: true
+  tags: precheck
+
+- name: Precheck | Verify stock Kolla Valkey dependency
+  ansible.builtin.assert:
+    that:
+      - enable_valkey | default(false) | bool
+      - groups.get('valkey', []) | length > 0
+      - valkey_master_password is defined and valkey_master_password | length > 0
+    fail_msg: "Deploy stock Kolla Valkey before enabling lumen; no plugin Redis fallback exists"
+  run_once: true
+  tags: precheck
+  when: enable_lumen | default(false) | bool
+
+- name: Precheck | Check required Lumen secrets
+  ansible.builtin.assert:
+    that:
+      - lumen_database_password is defined and lumen_database_password | length > 0
+      - lumen_keystone_password is defined and lumen_keystone_password | length > 0
+      - lumen_encryption_key is defined and lumen_encryption_key is regex('^[0-9a-fA-F]{64}$')
+    fail_msg: "Lumen DB/Keystone secrets must be set, and lumen_encryption_key must be exactly 64 hexadecimal characters"
+  tags: precheck
+  when: enable_lumen | bool
+
+- name: Precheck | Validate Lumen public route hostname
+  ansible.builtin.assert:
+    that:
+      - lumen_public_haproxy_fqdn is match('^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$')
+      - (lumen_public_endpoint_url | regex_replace('/$', '')) == ('https://' ~ lumen_public_haproxy_fqdn)
+    fail_msg: "lumen_public_endpoint_url must be the HTTPS origin for lumen_public_haproxy_fqdn"
+  run_once: true
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_public_haproxy_enabled | bool
+
+- name: Precheck | Verify Lumen PostgreSQL mode
+  ansible.builtin.assert:
+    that:
+      - lumen_postgres_mode in ['bundled', 'external']
+    fail_msg: "lumen_postgres_mode must be either 'bundled' or 'external'"
+  tags: precheck
+  when: enable_lumen | bool
+
+- name: Precheck | Verify bundled Lumen PostgreSQL configuration
+  ansible.builtin.assert:
+    that:
+      - lumen_postgres_password is defined and lumen_postgres_password | length > 0
+    fail_msg: "lumen_postgres_password must be set when lumen_postgres_mode is bundled"
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_enable_checkpointer | bool
+    - lumen_postgres_mode == 'bundled'
+
+- name: Precheck | Verify external Lumen PostgreSQL URL
+  ansible.builtin.assert:
+    that:
+      - lumen_external_postgres_url is defined and lumen_external_postgres_url | length > 0
+      - lumen_external_postgres_url is match('^postgres(ql)?://\\S+$')
+    fail_msg: "lumen_external_postgres_url must be a postgresql:// or postgres:// URL when lumen_postgres_mode is external"
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_enable_checkpointer | bool
+    - lumen_postgres_mode == 'external'
+
+- name: Precheck | Verify Lumen pgvector memory URL if enabled
+  ansible.builtin.assert:
+    that:
+      - lumen_memory_pgvector_url is defined and lumen_memory_pgvector_url | length > 0
+      - lumen_memory_pgvector_url is match('^postgres(ql)?://\\S+$')
+    fail_msg: "lumen_memory_pgvector_url must be a postgresql:// or postgres:// URL when lumen_enable_pgvector is true"
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_enable_pgvector | bool
+
+- name: Precheck | Verify Lumen API image accessibility
+  become: true
+  ansible.builtin.command:
+    cmd: "docker manifest inspect {{ lumen_api_image }}:{{ lumen_image_tag }}"
+  register: lumen_image_check
+  failed_when: false
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ groups['lumen'] | first }}"
+  tags: precheck
+  when: enable_lumen | bool
+
+- name: Precheck | Warn if Lumen API image is inaccessible
+  ansible.builtin.debug:
+    msg: "WARNING: Cannot access {{ lumen_api_image }}:{{ lumen_image_tag }}. Ensure registry credentials are configured."
+  when:
+    - enable_lumen | bool
+    - lumen_image_check is defined
+    - lumen_image_check.rc != 0
+  run_once: true
+  tags: precheck

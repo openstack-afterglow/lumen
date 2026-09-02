@@ -1,0 +1,23 @@
+---
+- name: Include precheck tasks
+  ansible.builtin.include_tasks: precheck.yml
+
+- name: Include source build tasks
+  ansible.builtin.include_tasks: source_build.yml
+  when: lumen_source_mode | default(false) | bool
+
+- name: Include config tasks
+  ansible.builtin.include_tasks: config.yml
+
+- name: Include precondition tasks
+  ansible.builtin.include_tasks: preconditions.yml
+  when: lumen_run_preconditions | default(true) | bool
+
+- name: Include postgres precondition tasks
+  ansible.builtin.include_tasks: preconditions_postgres.yml
+
+- name: Include bootstrap service tasks
+  ansible.builtin.include_tasks: bootstrap_service.yml
+
+- name: Include start tasks
+  ansible.builtin.include_tasks: start.yml

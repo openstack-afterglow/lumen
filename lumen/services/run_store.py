@@ -10,9 +10,9 @@ from typing import Any
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_contracts import ChatRunEvent, validate_chat_run_event
 from lumen.models.chat_runs import ChatRun, ChatRunEventRow, ChatRunSegment
-from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 
 
 class RunStoreError(RuntimeError):

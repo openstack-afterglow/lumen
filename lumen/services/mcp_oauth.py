@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.config import get_settings, is_development_loopback_http_url
+from lumen.crypto import decrypt_llm_provider_key, encrypt_llm_provider_key
 from lumen.db import get_session_factory, mark_db_unhealthy
 from lumen.models.chat_db import ChatMcpOAuthConnection, ChatMcpOAuthRequest, ChatMcpServer
 from lumen.services import ssrf
@@ -32,7 +33,6 @@ from lumen.services.extensions_store import (
     ExtensionSecretUnavailable,
     _clean_oauth_scopes,
 )
-from lumen.crypto import decrypt_llm_provider_key, encrypt_llm_provider_key
 
 logger = logging.getLogger(__name__)
 

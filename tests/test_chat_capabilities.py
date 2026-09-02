@@ -1,14 +1,12 @@
 from decimal import Decimal
 from types import SimpleNamespace
 
-import lumen.services.provider_store as provider_store
+import lumen.services.providers.credentials as provider_credentials
+import lumen.services.providers.pricing as provider_pricing
+import lumen.services.providers.routing as provider_store
 from lumen.services.capabilities import litellm_capabilities, normalize_capabilities
-from lumen.services.provider_store import (
-    _model_public,
-    _pricing_aware_capabilities,
-    _resolved_model,
-    _resolved_provider,
-)
+from lumen.services.providers.pricing import _model_public, _pricing_aware_capabilities
+from lumen.services.providers.routing import _resolved_model, _resolved_provider
 
 
 def _model(*, metadata: dict, input_price: str | None = "0.000001", output_price: str | None = "0.000002"):
@@ -199,11 +197,7 @@ def test_resolved_model_uses_a_secret_keyed_config_version_hash(monkeypatch):
         margin_multiplier="1.25",
     )
     decrypted_key = {"value": "first-secret"}
-    monkeypatch.setattr(
-        provider_store,
-        "decrypt_llm_provider_key",
-        lambda _: decrypted_key["value"],
-    )
+    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: decrypted_key["value"])
     monkeypatch.setattr(provider_store, "derive_encryption_subkey", lambda _: b"test-hmac-key")
 
     first = _resolved_model(model, provider)
@@ -226,7 +220,7 @@ def test_resolved_provider_uses_secret_keyed_config_version_hash(monkeypatch):
         margin_multiplier="1.25",
     )
     decrypted_key = {"value": "first-secret"}
-    monkeypatch.setattr(provider_store, "decrypt_llm_provider_key", lambda _: decrypted_key["value"])
+    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: decrypted_key["value"])
     monkeypatch.setattr(provider_store, "derive_encryption_subkey", lambda _: b"test-hmac-key")
 
     first = _resolved_provider(provider)
@@ -260,7 +254,7 @@ def test_resolved_model_gates_litellm_fallback_prices(monkeypatch):
         is_active=True,
     )
     monkeypatch.setattr(
-        provider_store,
+        provider_pricing,
         "effective_prices_per_million",
         lambda *_: (Decimal("1"), Decimal("2")),
     )

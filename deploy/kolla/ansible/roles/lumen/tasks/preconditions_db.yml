@@ -1,0 +1,31 @@
+---
+- name: DB | Create Lumen database
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: mysql_db
+    module_args:
+      login_host: "{{ lumen_database_address }}"
+      login_port: "{{ lumen_database_port }}"
+      login_user: "{{ lumen_database_admin_user }}"
+      login_password: "{{ lumen_database_admin_password }}"
+      name: "{{ lumen_database_name }}"
+  run_once: true
+  delegate_to: "{{ groups['lumen'][0] }}"
+
+- name: DB | Create Lumen database user
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: mysql_user
+    module_args:
+      login_host: "{{ lumen_database_address }}"
+      login_port: "{{ lumen_database_port }}"
+      login_user: "{{ lumen_database_admin_user }}"
+      login_password: "{{ lumen_database_admin_password }}"
+      name: "{{ lumen_database_user }}"
+      password: "{{ lumen_database_password }}"
+      host: "%"
+      priv: "{{ lumen_database_name }}.*:ALL"
+      state: present
+  run_once: true
+  delegate_to: "{{ groups['lumen'][0] }}"
+  no_log: true

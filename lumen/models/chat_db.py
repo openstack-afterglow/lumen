@@ -6,7 +6,6 @@
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from uuid import uuid4
 
 from sqlalchemy import (
     BIGINT,
@@ -42,8 +41,10 @@ class LlmProvider(Base):
     # litellm custom_llm_provider (openai|anthropic|gemini|vertex_ai|azure|bedrock|ollama|...)
     provider_type: Mapped[str] = mapped_column(VARCHAR(40), nullable=False, default="openai")
     api_base: Mapped[str | None] = mapped_column(VARCHAR(255))
-    # AES-256-GCM(k3s_kubeconfig_encryption_key, 도메인 llm_provider_key) 암호화 상태로 저장
+    # AES-256-GCM(lumen_encryption_key, 도메인 llm_provider_key) 암호화 상태로 저장
     encrypted_api_key: Mapped[str | None] = mapped_column(TEXT)
+    # Optional environment variable name used only when no database key exists.
+    api_key_env: Mapped[str | None] = mapped_column(VARCHAR(128))
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     margin_multiplier: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False, default=Decimal("1.0"))
     # models.dev provider key. Display names are never used for catalog matching.
@@ -205,6 +206,7 @@ class ChatUsageLog(Base):
     __table_args__ = (
         Index("idx_chat_usage_project_created", "project_id", "created_at"),
         Index("idx_chat_usage_user_created", "user_id", "created_at"),
+        Index("idx_chat_usage_api_key_created", "api_key_id", "created_at"),
     )
 
 
@@ -327,6 +329,9 @@ class ChatApiKey(Base):
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False, default="")
     key_prefix: Mapped[str] = mapped_column(VARCHAR(24), nullable=False)  # 표시용(시크릿 아님)
     key_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)  # SHA-256 hex
+    scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    owner_monthly_credit_limit: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    admin_monthly_credit_limit: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -336,6 +341,14 @@ class ChatApiKey(Base):
 
     __table_args__ = (
         UniqueConstraint("key_hash", name="uq_chat_api_keys_hash"),
+        CheckConstraint(
+            "owner_monthly_credit_limit IS NULL OR owner_monthly_credit_limit > 0",
+            name="chk_chat_api_keys_owner_monthly_credit_limit",
+        ),
+        CheckConstraint(
+            "admin_monthly_credit_limit IS NULL OR admin_monthly_credit_limit > 0",
+            name="chk_chat_api_keys_admin_monthly_credit_limit",
+        ),
         Index("idx_chat_api_keys_owner", "owner_user_id", "owner_project_id"),
     )
 

@@ -7,42 +7,192 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
 
-@router.get("")
-@router.get("/")
-async def discovery(request: Request) -> dict:
-    base = str(request.base_url).rstrip("/")
-    return {
-        "service": "Afterglow Chat API",
-        "description": "OpenAI / Anthropic 호환 채팅 API. 발급한 API 키로 외부 SDK에서 연결하세요.",
-        "formats": ["openai", "anthropic"],
-        "authentication": {
-            "scheme": "Bearer",
-            "headers": ["Authorization: Bearer sk-afgl-...", "x-api-key: sk-afgl-..."],
-            "issue": "웹 대시보드 → 채팅 → 설정 → API 키 에서 발급",
+class CompatDiscoveryAuthentication(BaseModel):
+    scheme: str = "Bearer"
+    compat_headers: list[str] = Field(
+        default_factory=lambda: ["Authorization: Bearer sk-afgl-...", "x-api-key: sk-afgl-..."]
+    )
+    compat_alternatives: list[str] = Field(default_factory=lambda: ["Authorization: Bearer", "X-API-Key"])
+    native_auth: str = "Project-scoped Keystone token (Authorization: Bearer ... or X-Auth-Token) 또는 scoped API key"
+    issue: str = "관리 API로 발급하거나 standalone Compose의 lumen-connection manifest를 사용하세요."
+    note: str = (
+        "호환 API(/v1/chat/completions, /v1/messages, /v1/models)에는 API 키가 필수이며 Keystone 토큰은 거부됩니다."
+    )
+
+
+class CompatDiscoveryProfile(BaseModel):
+    name: str
+    chat_completions: str | None = None
+    messages: str | None = None
+    conversations: str | None = None
+    completions: str | None = None
+    temp_completions: str | None = None
+    runs: str | None = None
+    models: str | None = None
+    sdk_base_url: str
+    required_scopes: list[str]
+    conditional_scopes: list[str] | None = None
+    streaming: str
+
+
+class CompatDiscoveryEndpoints(BaseModel):
+    openai: dict[str, str]
+    anthropic: dict[str, str]
+    native: dict[str, str]
+
+
+class CompatDiscoveryLinks(BaseModel):
+    openapi: str
+    health: str
+
+
+class CompatDiscoveryHealth(BaseModel):
+    endpoint: str
+    note: str = (
+        "프로세스 생존 상태(process health)만 나타내며 datastore/worker 준비 상태(readiness)와 분리되어 있습니다."
+    )
+
+
+class CompatDiscoveryIdempotency(BaseModel):
+    header: str = "Idempotency-Key"
+    format: str = "UUID string"
+    behavior: str = (
+        "유효하지 않은 UUID는 422 Unprocessable Entity를 반환하며, 멱등 재조회 성공 시 쿼터 재검사를 우회합니다."
+    )
+
+
+class CompatDiscoverySSE(BaseModel):
+    openai: str = "data: { ... } \\n\\n data: [DONE]"
+    anthropic: str = "event: message_start \\n data: { ... } \\n\\n"
+    native: str = "event: <ChatRunEvent.type> \\n data: ChatRunEvent JSON"
+    error_note: str = (
+        "Compat streams report post-handshake failures as in-band SSE errors; "
+        "native durable failures use the terminal run.failed event."
+    )
+
+
+class CompatDiscoveryHostGate(BaseModel):
+    gated_routes: list[str] = Field(
+        default_factory=lambda: ["/v1/compat", "/v1/chat/completions", "/v1/messages", "/v1/models"]
+    )
+    behavior: str = "chat_api_hosts 설정을 통해 허용된 Host 헤더 요청만 통과하며 미허용 시 404로 응답합니다."
+
+
+class CompatDiscoveryResponse(BaseModel):
+    version: str = "1.0.0"
+    contract_version: str = "1.0.0"
+    service: str = "Lumen AI API"
+    description: str = (
+        "OpenAI / Anthropic 호환 및 Lumen 네이티브 영속 대화 API. 발급한 API 키로 외부 SDK 또는 웹에서 연결하세요."
+    )
+    formats: list[str] = Field(default_factory=lambda: ["openai", "anthropic", "lumen_native"])
+    profiles: dict[str, CompatDiscoveryProfile]
+    links: CompatDiscoveryLinks
+    health: CompatDiscoveryHealth
+    authentication: CompatDiscoveryAuthentication
+    endpoints: CompatDiscoveryEndpoints
+    models_endpoint: str
+    features: list[str]
+    notes: list[str]
+    idempotency: CompatDiscoveryIdempotency
+    sse: CompatDiscoverySSE
+    host_gate: CompatDiscoveryHostGate
+
+
+@router.get("/compat", response_model=CompatDiscoveryResponse)
+async def discovery(request: Request) -> CompatDiscoveryResponse:
+    origin = str(request.base_url).rstrip("/")
+    return CompatDiscoveryResponse(
+        version="1.0.0",
+        contract_version="1.0.0",
+        service="Lumen AI API",
+        description="OpenAI / Anthropic 호환 및 Lumen 네이티브 영속 대화 API. 발급한 API 키로 외부 SDK 또는 웹에서 연결하세요.",
+        formats=["openai", "anthropic", "lumen_native"],
+        profiles={
+            "openai_stateless": CompatDiscoveryProfile(
+                name="OpenAI-compatible stateless completion",
+                chat_completions=f"{origin}/v1/chat/completions",
+                models=f"{origin}/v1/models",
+                sdk_base_url=f"{origin}/v1",
+                required_scopes=["compat:completions:write", "models:read"],
+                streaming="text/event-stream (data: JSON)",
+            ),
+            "anthropic_stateless": CompatDiscoveryProfile(
+                name="Anthropic-compatible stateless completion",
+                messages=f"{origin}/v1/messages",
+                models=f"{origin}/v1/models",
+                sdk_base_url=origin,
+                required_scopes=["compat:completions:write", "models:read"],
+                streaming="text/event-stream (event: <type>\\ndata: JSON)",
+            ),
+            "lumen_native": CompatDiscoveryProfile(
+                name="Lumen native durable runs",
+                conversations=f"{origin}/v1/conversations",
+                completions=f"{origin}/v1/conversations/{{conversation_id}}/completions",
+                temp_completions=f"{origin}/v1/temp-completions",
+                runs=f"{origin}/v1/runs",
+                sdk_base_url=origin,
+                required_scopes=[
+                    "native:conversations:read",
+                    "native:conversations:write",
+                    "native:runs:read",
+                    "native:runs:write",
+                    "models:read",
+                ],
+                conditional_scopes=[
+                    "native:memory:read",
+                    "native:memory:write",
+                    "native:tools:execute",
+                    "native:extensions:read",
+                    "native:agents:use",
+                ],
+                streaming="text/event-stream (event: <ChatRunEvent.type>\\ndata: ChatRunEvent JSON)",
+            ),
         },
-        "endpoints": {
-            "openai": {
-                "chat_completions": f"{base}/v1/chat/completions",
-                "models": f"{base}/v1/models",
-                "sdk_base_url": f"{base}/v1",
+        links=CompatDiscoveryLinks(
+            openapi=f"{origin}/openapi.json",
+            health=f"{origin}/v1/health",
+        ),
+        health=CompatDiscoveryHealth(
+            endpoint=f"{origin}/v1/health",
+            note="프로세스 생존 상태(process health)만 나타내며 datastore/worker 준비 상태(readiness)와 분리되어 있습니다.",
+        ),
+        authentication=CompatDiscoveryAuthentication(),
+        endpoints=CompatDiscoveryEndpoints(
+            openai={
+                "chat_completions": f"{origin}/v1/chat/completions",
+                "models": f"{origin}/v1/models",
+                "sdk_base_url": f"{origin}/v1",
             },
-            "anthropic": {
-                "messages": f"{base}/v1/messages",
-                "sdk_base_url": base,
+            anthropic={
+                "messages": f"{origin}/v1/messages",
+                "sdk_base_url": origin,
             },
-        },
-        "models_endpoint": f"{base}/v1/models  (API 키 필요 — 사용 가능한 모델 목록)",
-        "features": [
+            native={
+                "conversations": f"{origin}/v1/conversations",
+                "temp_completions": f"{origin}/v1/temp-completions",
+                "runs": f"{origin}/v1/runs",
+                "sdk_base_url": origin,
+            },
+        ),
+        models_endpoint=f"{origin}/v1/models",
+        features=[
             "stream: true 스트리밍 지원",
-            "tools(function calling) pass-through — 모델이 tool_calls 반환, 클라이언트가 실행",
+            "tools(function calling) pass-through 및 explicit tool_choice 지원",
             "이미지 입력(vision) — vision 지원 모델",
+            "Idempotency-Key UUID 지원 (네이티브 202 멱등 재시도 및 쿼터 재검사 예외)",
         ],
-        "notes": [
+        notes=[
             "사용량은 발급 사용자의 지갑·월 쿼터에서 차감됩니다.",
             "사용량은 웹과 분리된 API 통계(키별)로 집계됩니다.",
+            "FastAPI 호환 API 오류는 {detail: {error: {message, type}}} 또는 {detail: message} 봉투 구조를 사용합니다.",
         ],
-    }
+        idempotency=CompatDiscoveryIdempotency(),
+        sse=CompatDiscoverySSE(),
+        host_gate=CompatDiscoveryHostGate(),
+    )

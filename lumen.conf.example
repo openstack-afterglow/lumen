@@ -1,0 +1,76 @@
+# 환경변수는 이 TOML 값보다 우선한다. 실제 secret을 저장소에 넣지 않는다.
+# LUMEN_CONFIG_FILE로 다른 파일을 지정할 수 있다.
+
+[keystone]
+keystone_auth_url = "https://keystone.example/v3"
+keystone_admin_username = "CHANGE_ME"
+keystone_admin_password = "CHANGE_ME"
+keystone_admin_project = "admin"
+keystone_domain = "Default"
+keystone_region_name = "RegionOne"
+keystone_interface = "internal"
+os_cacert = "/etc/ssl/certs/ca-certificates.crt"
+insecure = false
+frontend_base_url = "https://afterglow.example"
+public_api_base = "https://lumen.example"
+cors_origins = "https://afterglow.example"
+
+[database]
+database_url = "mysql+aiomysql://lumen:CHANGE_ME@mariadb:3306/lumen"
+database_pool_size = 20
+database_max_overflow = 10
+database_connect_timeout = 10
+database_pool_timeout = 30
+database_unhealthy_seconds = 15
+database_auto_create_tables = false
+
+[cache]
+redis_url = "redis://redis:6379/8"
+redis_db_index = 8
+
+[lumen]
+# 정확히 64개의 hex 문자. lumen_encryption_key가 필요하다.
+lumen_encryption_key = "CHANGE_TO_64_HEX_CHARACTERS"
+service_chat_enabled = true
+
+[chat]
+chat_execution_protocol_version = 1
+chat_default_model = ""
+chat_credit_per_usd = 1000.0
+chat_default_monthly_quota = 100000.0
+chat_stream_enabled = true
+chat_api_hosts = "lumen.example"
+chat_reasoning_effort = "auto"
+chat_run_event_retention_hours = 24
+chat_checkpoint_retention_days = 7
+# v2 durable protocol을 사용할 때만 encrypted PostgreSQL checkpointer URL을 설정한다.
+chat_checkpointer_postgres_url = ""
+chat_semantic_memory_enabled = false
+chat_memory_pgvector_url = ""
+chat_memory_embedding_model = ""
+chat_memory_embedding_dimensions = 0
+chat_memory_candidate_limit = 20
+chat_memory_retrieval_token_budget = 1200
+chat_memory_retention_days = 365
+chat_asset_s3_endpoint = ""
+chat_asset_s3_bucket = ""
+chat_asset_s3_access_key = ""
+chat_asset_s3_secret_key = ""
+chat_asset_s3_server_side_encryption = "AES256"
+chat_asset_s3_kms_key_id = ""
+chat_asset_signed_url_ttl_seconds = 300
+chat_clamav_host = ""
+chat_clamav_port = 3310
+chat_sandbox_workspace_url = ""
+chat_sandbox_url = ""
+chat_sandbox_api_key = ""
+chat_sandbox_image_digest = ""
+chat_sandbox_policy_version = ""
+chat_sandbox_egress_allowlist = []
+chat_mcp_oauth_callback_url = ""
+chat_mcp_public_url = ""
+
+[mcp]
+mcp_public_url = ""
+mcp_control_plane_url = ""
+lumen_mcp_service_token = ""

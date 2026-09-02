@@ -2,7 +2,7 @@
 
 DB 없이 provider_store 서비스 함수를 monkeypatch 하여 라우터 계약만 검증:
 - require_admin 게이트(비관리자 403)
-- api_key 응답 마스킹(has_api_key 만, 평문/암호문 미노출)
+- api_key 응답 마스킹과 non-secret 설정 상태(`has_api_key`, `api_key_source`)
 - 예외 → HTTP 상태 매핑(404/400/503)
 """
 
@@ -10,7 +10,8 @@ from decimal import Decimal
 
 import pytest
 
-from lumen.services import provider_store as ps
+from lumen.services.providers import errors, pricing
+from lumen.services.providers import repository as ps
 
 _PROVIDERS_URL = "/api/v1/chat/admin/providers"
 _MODELS_URL = "/api/v1/chat/admin/models"
@@ -23,6 +24,7 @@ def _public_provider(**over) -> dict:
         "provider_type": "openai",
         "api_base": None,
         "has_api_key": True,
+        "api_key_source": "database",
         "is_active": True,
         "margin_multiplier": 1.0,
         "created_at": "2026-01-01T00:00:00+00:00",
@@ -68,6 +70,39 @@ class TestProviderCrud:
         assert "encrypted_api_key" not in body
         assert body["has_api_key"] is True
 
+    async def test_create_configures_environment_credential_reference(self, admin_client, monkeypatch):
+        captured = {}
+
+        async def fake_create(**kwargs):
+            captured.update(kwargs)
+            return _public_provider(
+                name=kwargs["name"],
+                api_key_env=kwargs["api_key_env"],
+                has_api_key=False,
+                api_key_source=None,
+            )
+
+        monkeypatch.setattr(ps, "create_provider", fake_create)
+        response = await admin_client.post(
+            _PROVIDERS_URL,
+            json={"name": "openai", "api_key_env": "OPENAI_API_KEY"},
+        )
+
+        assert response.status_code == 201
+        assert captured["api_key_env"] == "OPENAI_API_KEY"
+        assert response.json()["api_key_env"] == "OPENAI_API_KEY"
+        assert response.json()["has_api_key"] is False
+        assert response.json()["api_key_source"] is None
+        assert "api_key" not in response.json()
+
+    async def test_create_rejects_lumen_setting_as_environment_credential(self, admin_client):
+        response = await admin_client.post(
+            _PROVIDERS_URL,
+            json={"name": "unsafe", "api_key_env": "LUMEN_ENCRYPTION_KEY"},
+        )
+
+        assert response.status_code == 422
+
     async def test_list_ok(self, admin_client, monkeypatch):
         async def fake_list():
             return [_public_provider()]
@@ -81,7 +116,7 @@ class TestProviderCrud:
 
     async def test_update_not_found_404(self, admin_client, monkeypatch):
         async def fake_update(provider_id, patch):
-            raise ps.ProviderNotFoundError("없음")
+            raise errors.ProviderNotFoundError("없음")
 
         monkeypatch.setattr(ps, "update_provider", fake_update)
         resp = await admin_client.patch(f"{_PROVIDERS_URL}/999", json={"is_active": False})
@@ -89,7 +124,7 @@ class TestProviderCrud:
 
     async def test_update_active_executor_route_is_conflict(self, admin_client, monkeypatch):
         async def fake_update(provider_id, patch):
-            raise ps.ActiveRunConfigurationConflict("run active")
+            raise errors.ActiveRunConfigurationConflict("run active")
 
         monkeypatch.setattr(ps, "update_provider", fake_update)
         resp = await admin_client.patch(f"{_PROVIDERS_URL}/1", json={"is_active": False})
@@ -97,7 +132,7 @@ class TestProviderCrud:
 
     async def test_create_validation_400(self, admin_client, monkeypatch):
         async def fake_create(**kwargs):
-            raise ps.ProviderValidationError("중복")
+            raise errors.ProviderValidationError("중복")
 
         monkeypatch.setattr(ps, "create_provider", fake_create)
         resp = await admin_client.post(_PROVIDERS_URL, json={"name": "dup"})
@@ -105,7 +140,7 @@ class TestProviderCrud:
 
     async def test_storage_unavailable_503(self, admin_client, monkeypatch):
         async def fake_list():
-            raise ps.ChatStorageUnavailable("DB down")
+            raise errors.ChatStorageUnavailable("DB down")
 
         monkeypatch.setattr(ps, "list_providers", fake_list)
         resp = await admin_client.get(_PROVIDERS_URL)
@@ -134,7 +169,7 @@ class TestModelCrud:
 
     async def test_create_model_bad_provider_400(self, admin_client, monkeypatch):
         async def fake_create(**kwargs):
-            raise ps.ProviderValidationError("프로바이더 없음")
+            raise errors.ProviderValidationError("프로바이더 없음")
 
         monkeypatch.setattr(ps, "create_model", fake_create)
         resp = await admin_client.post(_MODELS_URL, json={"provider_id": 999, "model_name": "x"})
@@ -172,7 +207,7 @@ class TestTitleModel:
 
     async def test_set_title_model_not_found_404(self, admin_client, monkeypatch):
         async def fake_set(model_id):
-            raise ps.ProviderNotFoundError("모델 없음")
+            raise errors.ProviderNotFoundError("모델 없음")
 
         monkeypatch.setattr(ps, "set_title_model", fake_set)
         resp = await admin_client.put(self._URL, json={"model_id": 999})
@@ -270,9 +305,9 @@ class TestModelPricingContract:
         assert resp.status_code == 422
 
     def test_store_conversion_preserves_or_rejects_precision(self):
-        assert ps._per_token_price(Decimal("2"), "price") == Decimal("0.0000020000")
-        with pytest.raises(ps.ProviderValidationError):
-            ps._per_token_price(Decimal("0.00004"), "price")
+        assert pricing._per_token_price(Decimal("2"), "price") == Decimal("0.0000020000")
+        with pytest.raises(errors.ProviderValidationError):
+            pricing._per_token_price(Decimal("0.00004"), "price")
 
     async def test_update_rejects_mixed_null_price_pair(self, admin_client):
         response = await admin_client.patch(

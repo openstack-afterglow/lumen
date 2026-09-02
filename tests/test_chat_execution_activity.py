@@ -2,8 +2,8 @@ import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from lumen.services import durable_runs
 from lumen.services.conversation_store import _project_run_activity
+from lumen.services.durable_runs import execution
 
 
 class _Payload:
@@ -129,9 +129,9 @@ def test_loaded_tool_names_replays_catalog_results_in_ordinal_order(monkeypatch)
         async def execute(self, _query):
             return SimpleNamespace(scalars=lambda: segments)
 
-    monkeypatch.setattr(durable_runs, "_factory", lambda: lambda: _Session())
-    monkeypatch.setattr(durable_runs, "load_segment_payload", lambda payload: payload)
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: _Session())
+    monkeypatch.setattr(execution, "load_segment_payload", lambda payload: payload)
 
-    names = asyncio.run(durable_runs._DurableExecutionHooks(run_id="run-1", owner="worker-1").loaded_tool_names())
+    names = asyncio.run(execution._DurableExecutionHooks(run_id="run-1", owner="worker-1").loaded_tool_names())
 
     assert names == ["custom__1__weather", "mcp__2__search", "custom__3__alerts"]

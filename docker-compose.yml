@@ -1,0 +1,133 @@
+services:
+  mariadb:
+    image: mariadb:11
+    environment:
+      MYSQL_DATABASE: lumen
+      MYSQL_USER: lumen
+      MYSQL_PASSWORD: lumen
+      MYSQL_ROOT_PASSWORD: local-root-only
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - lumen-mariadb:/var/lib/mysql
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build:
+      context: .
+      target: lumen-runtime
+    command: ["lumen-migrate", "--apply"]
+    environment: &lumen-environment
+      DATABASE_URL: mysql+aiomysql://lumen:lumen@mariadb:3306/lumen
+      REDIS_URL: redis://redis:6379/0
+      # Development-only deterministic key. Replace before exposing a deployment.
+      LUMEN_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      CHAT_API_HOSTS: localhost,127.0.0.1,lumen-api
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  seed-local:
+    build:
+      context: .
+      target: lumen-runtime
+    image: ${COMPOSE_PROJECT_NAME:-lumen}-runtime
+    command: ["lumen-seed-local"]
+    environment:
+      <<: *lumen-environment
+      LUMEN_LOCAL_PROVIDER_API_KEY: ${LUMEN_LOCAL_PROVIDER_API_KEY:-}
+      LUMEN_LOCAL_PROVIDER_NAME: ${LUMEN_LOCAL_PROVIDER_NAME:-local-openai}
+      LUMEN_LOCAL_PROVIDER_TYPE: ${LUMEN_LOCAL_PROVIDER_TYPE:-openai}
+      LUMEN_LOCAL_PROVIDER_BASE_URL: ${LUMEN_LOCAL_PROVIDER_BASE_URL:-}
+      LUMEN_LOCAL_MODEL: ${LUMEN_LOCAL_MODEL:-gpt-4.1-mini}
+      LUMEN_LOCAL_INPUT_PRICE_PER_MILLION: ${LUMEN_LOCAL_INPUT_PRICE_PER_MILLION:-1}
+      LUMEN_LOCAL_OUTPUT_PRICE_PER_MILLION: ${LUMEN_LOCAL_OUTPUT_PRICE_PER_MILLION:-3}
+      LUMEN_LOCAL_SEED_PATH: /seed/api-key
+      LUMEN_LOCAL_CONNECTION_PATH: /seed/connection.json
+      LUMEN_LOCAL_PUBLIC_BASE_URL: ${LUMEN_LOCAL_PUBLIC_BASE_URL:-}
+      LUMEN_LOCAL_CONTAINER_BASE_URL: ${LUMEN_LOCAL_CONTAINER_BASE_URL:-http://lumen-api:8012/v1}
+      LUMEN_API_PORT: ${LUMEN_API_PORT:-8012}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - lumen-seed:/seed
+
+  lumen-connection:
+    profiles: ["tools"]
+    build:
+      context: .
+      target: lumen-runtime
+    image: ${COMPOSE_PROJECT_NAME:-lumen}-runtime
+    command: ["lumen-local-connection"]
+    environment:
+      LUMEN_LOCAL_CONNECTION_PATH: /seed/connection.json
+    volumes:
+      - lumen-seed:/seed:ro
+
+  lumen-api:
+    build:
+      context: .
+      target: lumen-api
+    environment:
+      <<: *lumen-environment
+      LUMEN_LOCAL_PROVIDER_API_KEY: ${LUMEN_LOCAL_PROVIDER_API_KEY:-}
+    depends_on:
+      seed-local:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${LUMEN_API_PORT:-8012}:8012"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8012/v1/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  lumen-worker:
+    build:
+      context: .
+      target: lumen-worker
+    environment:
+      <<: *lumen-environment
+      LUMEN_LOCAL_PROVIDER_API_KEY: ${LUMEN_LOCAL_PROVIDER_API_KEY:-}
+    depends_on:
+      seed-local:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  lumen-console:
+    build:
+      context: .
+      target: lumen-runtime
+    command: ["uvicorn", "lumen_console.app:app", "--host", "0.0.0.0", "--port", "7010"]
+    environment:
+      LUMEN_CONSOLE_DB: /data/users.sqlite
+      LUMEN_CONSOLE_SECURE_COOKIES: "false"
+      LUMEN_CONSOLE_DEFAULT_URL: http://lumen-api:8012
+      LUMEN_CONSOLE_SEED_KEY_FILE: /seed/api-key
+    depends_on:
+      lumen-api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${LUMEN_CONSOLE_PORT:-7010}:7010"
+    volumes:
+      - lumen-console:/data
+      - lumen-seed:/seed:ro
+
+volumes:
+  lumen-mariadb:
+  lumen-console:
+  lumen-seed:

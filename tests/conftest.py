@@ -10,7 +10,7 @@ import fakeredis.aioredis
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from lumen.auth import get_os_conn, require_token
+from lumen.auth import get_os_conn, get_principal, require_token
 from lumen.config import get_settings
 from lumen.main import app
 
@@ -25,9 +25,12 @@ class _LegacyChatPathAdapter:
         if scope["type"] == "http":
             path = scope["path"]
             if path == "/api/v1/chat" or path.startswith("/api/v1/chat/"):
-                rewritten = "/v1/chat/models" if path == "/api/v1/chat/models" else "/v1" + path.removeprefix("/api/v1/chat")
+                rewritten = (
+                    "/v1/chat/models" if path == "/api/v1/chat/models" else "/v1" + path.removeprefix("/api/v1/chat")
+                )
                 scope = {**scope, "path": rewritten, "raw_path": rewritten.encode("ascii")}
         await self.application(scope, receive, send)
+
 
 @pytest.fixture(autouse=True)
 async def _reset_lumen_state(monkeypatch):
@@ -48,6 +51,7 @@ def mock_conn():
     conn._afterglow_user_id = "test-user-123"
     return conn
 
+
 def _token_info(*, is_system_admin: bool) -> dict[str, object]:
     return {
         "token": "test-token",
@@ -64,11 +68,21 @@ async def _client_for(mock_conn, *, is_system_admin: bool):
     async def token_override():
         return _token_info(is_system_admin=is_system_admin)
 
+    async def principal_override():
+        return {
+            **_token_info(is_system_admin=is_system_admin),
+            "auth_type": "keystone",
+            "api_key_id": None,
+            "scopes": (),
+            "source": "web",
+        }
+
     async def conn_override():
         yield mock_conn
 
     app.dependency_overrides[require_token] = token_override
     app.dependency_overrides[get_os_conn] = conn_override
+    app.dependency_overrides[get_principal] = principal_override
     try:
         async with AsyncClient(
             transport=ASGITransport(_LegacyChatPathAdapter(app)),

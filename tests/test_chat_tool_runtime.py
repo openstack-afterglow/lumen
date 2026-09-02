@@ -8,9 +8,11 @@
 import json
 
 from lumen.services import conversation_store as cs
-from lumen.services import ssrf, tool_runtime
+from lumen.services import ssrf
 from lumen.services.agent_protocol import ToolBinding, ToolDefinition
 from lumen.services.agent_protocol import ToolExecutionResult as V2ToolExecutionResult
+from lumen.services.tool_runtime import bindings, contracts, managed, selection
+from lumen.services.tool_runtime import dispatch as tool_runtime
 from lumen.services.tools import ToolContext
 
 _CTX = ToolContext(project_id="p1", user_id="u1")
@@ -67,15 +69,15 @@ class TestSchemas:
         async def fake_load(ctx):
             return [{"name": "weather", "description": "날씨", "params_schema": None}]
 
-        monkeypatch.setattr(tool_runtime, "_load_custom", fake_load)
-        schemas = await tool_runtime.context_tool_schemas(_CTX)
+        monkeypatch.setattr(selection, "_load_custom", fake_load)
+        schemas = await selection.context_tool_schemas(_CTX)
         names = {s["function"]["name"] for s in schemas}
         assert "list_my_conversations" in names  # 내장
         assert "weather" in names  # 커스텀
 
     async def test_graceful_when_storage_fails(self, monkeypatch):
         # _load_custom 내부 예외 → 내장 툴만 (graph 가 죽지 않게)
-        schemas = await tool_runtime.context_tool_schemas(_CTX)  # 실 DB 없음 → graceful
+        schemas = await selection.context_tool_schemas(_CTX)  # 실 DB 없음 → graceful
         names = {s["function"]["name"] for s in schemas}
         assert "list_my_conversations" in names
 
@@ -85,7 +87,7 @@ class TestManagedTools:
         async def no_custom(ctx):
             return []
 
-        monkeypatch.setattr(tool_runtime, "_load_custom", no_custom)
+        monkeypatch.setattr(selection, "_load_custom", no_custom)
         hooks = _ManagedHooks()
         ctx = ToolContext(
             project_id="p1",
@@ -97,13 +99,13 @@ class TestManagedTools:
             },
             managed_fetch={"max_uses": 1},
         )
-        names = {schema["function"]["name"] for schema in await tool_runtime.context_tool_schemas(ctx)}
+        names = {schema["function"]["name"] for schema in await selection.context_tool_schemas(ctx)}
         assert {"managed_web_search", "managed_web_fetch"} <= names
 
         async def fake_search(*args, **kwargs):
-            return [tool_runtime.web_search.SearchCitation(url="https://docs.example/a", title="A", snippet="B")]
+            return [managed.web_search.SearchCitation(url="https://docs.example/a", title="A", snippet="B")]
 
-        monkeypatch.setattr(tool_runtime.web_search, "search_with_route", fake_search)
+        monkeypatch.setattr(managed.web_search, "search_with_route", fake_search)
         result = await tool_runtime.context_execute("managed_web_search", {"query": "docs"}, ctx)
         assert json.loads(result)["sources"][0]["url"] == "https://docs.example/a"
         assert hooks.calls == [("managed_web_search", 2)]
@@ -123,24 +125,24 @@ class TestManagedTools:
         async def unexpected(*args, **kwargs):
             raise AssertionError("provider must not be called after durable limit")
 
-        monkeypatch.setattr(tool_runtime.web_search, "search_with_route", unexpected)
+        monkeypatch.setattr(managed.web_search, "search_with_route", unexpected)
         assert "한도" in await tool_runtime.context_execute("managed_web_search", {"query": "docs"}, ctx)
 
     def test_managed_search_result_is_bounded_for_multibyte_content(self):
-        result = tool_runtime._bounded_search_result(
+        result = managed._bounded_search_result(
             [
-                tool_runtime.web_search.SearchCitation(
+                managed.web_search.SearchCitation(
                     url="https://docs.example/a", title="제목" * 1_000, snippet="한글" * 30_000
                 )
             ]
         )
-        assert len(result.encode("utf-8")) <= tool_runtime._MAX_MANAGED_RESULT_BYTES
+        assert len(result.encode("utf-8")) <= managed._MAX_MANAGED_RESULT_BYTES
 
     async def test_managed_advisor_result_stays_private_from_graph_projection(self, monkeypatch):
         async def no_custom(ctx):
             return []
 
-        monkeypatch.setattr(tool_runtime, "_load_custom", no_custom)
+        monkeypatch.setattr(selection, "_load_custom", no_custom)
         hooks = _ManagedHooks()
         ctx = ToolContext(
             project_id="p1",
@@ -162,8 +164,8 @@ class TestManagedTools:
             assert kwargs["visible_messages"] == [{"role": "user", "content": "visible context"}]
             return _Result()
 
-        monkeypatch.setattr(tool_runtime.advisor, "ask_with_route", fake_advisor)
-        names = {schema["function"]["name"] for schema in await tool_runtime.context_tool_schemas(ctx)}
+        monkeypatch.setattr(managed.advisor, "ask_with_route", fake_advisor)
+        names = {schema["function"]["name"] for schema in await selection.context_tool_schemas(ctx)}
         assert "managed_advisor" in names
         result = await tool_runtime.context_execute_result("managed_advisor", {"goal": "review"}, ctx)
         assert result.content == "private advice"
@@ -184,7 +186,7 @@ class TestDispatch:
         async def fake_load(ctx):
             return []
 
-        monkeypatch.setattr(tool_runtime, "_load_custom", fake_load)
+        monkeypatch.setattr(selection, "_load_custom", fake_load)
         out = await tool_runtime.context_execute("no_such", {}, _CTX)
         assert "알 수 없는" in out
 
@@ -192,7 +194,7 @@ class TestDispatch:
         async def fake_load(ctx):
             return [{"name": "weather", "method": "GET", "url": "https://api.example/w", "timeout_seconds": 5}]
 
-        monkeypatch.setattr(tool_runtime, "_load_custom", fake_load)
+        monkeypatch.setattr(selection, "_load_custom", fake_load)
         monkeypatch.setattr(ssrf, "validate_url", lambda url: url)  # SSRF 통과
         monkeypatch.setattr("httpx.AsyncClient", _Client)
         out = await tool_runtime.context_execute("weather", {"city": "seoul"}, _CTX)
@@ -202,9 +204,7 @@ class TestDispatch:
 
 class TestCustomExecution:
     async def test_ssrf_blocked_returns_safe_string(self, monkeypatch):
-        out = await tool_runtime._execute_custom_http_tool(
-            {"name": "x", "url": "http://169.254.169.254/", "method": "GET"}, {}, _CTX
-        )
+        out = await tool_runtime._execute_custom_http_tool({"name": "x", "url": "http://169.254.169.254/", "method": "GET"}, {}, _CTX)
         assert "허용되지 않은" in out
 
     async def test_http_error_returns_safe_string(self, monkeypatch):
@@ -213,24 +213,20 @@ class TestCustomExecution:
                 raise RuntimeError("connection refused")
 
         monkeypatch.setattr("httpx.AsyncClient", _BadClient)
-        out = await tool_runtime._execute_custom_http_tool(
-            {"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX
-        )
+        out = await tool_runtime._execute_custom_http_tool({"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX)
         assert "오류" in out
 
     async def test_large_http_response_is_not_materialized(self, monkeypatch):
         class _LargeResponse(_Resp):
             async def aiter_bytes(self):
-                yield b"x" * (tool_runtime._MAX_RESPONSE_BYTES + 1)
+                yield b"x" * (selection._MAX_RESPONSE_BYTES + 1)
 
         class _LargeClient(_Client):
             def stream(self, method, url, **kwargs):
                 return _Stream(_LargeResponse())
 
         monkeypatch.setattr("httpx.AsyncClient", _LargeClient)
-        out = await tool_runtime._execute_custom_http_tool(
-            {"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX
-        )
+        out = await tool_runtime._execute_custom_http_tool({"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX)
         assert "허용 크기" in out
 
     async def test_compressed_http_response_is_rejected_before_iteration(self, monkeypatch):
@@ -248,18 +244,16 @@ class TestCustomExecution:
                 return _Stream(_CompressedResponse())
 
         monkeypatch.setattr("httpx.AsyncClient", _CompressedClient)
-        out = await tool_runtime._execute_custom_http_tool(
-            {"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX
-        )
+        out = await tool_runtime._execute_custom_http_tool({"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX)
         assert "압축된" in out
 
 
 class TestSelectionFilter:
     def test_none_all_empty_subset(self):
         items = [{"id": 1}, {"id": 2}, {"id": 3}]
-        assert tool_runtime._selected(items, None) == items  # None=전체
-        assert tool_runtime._selected(items, ()) == []  # 빈=없음
-        assert tool_runtime._selected(items, (1, 3)) == [{"id": 1}, {"id": 3}]  # 부분
+        assert selection._selected(items, None) == items  # None=전체
+        assert selection._selected(items, ()) == []  # 빈=없음
+        assert selection._selected(items, (1, 3)) == [{"id": 1}, {"id": 3}]  # 부분
 
 
 class TestMcpTools:
@@ -275,8 +269,8 @@ class TestMcpTools:
             return [{"name": "search", "description": "d", "input_schema": {"type": "object"}}]
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
-        monkeypatch.setattr(tool_runtime.mcp_client, "list_tools", fake_list_tools)
-        schemas = await tool_runtime.context_tool_schemas(_CTX)
+        monkeypatch.setattr(selection.mcp_client, "list_tools", fake_list_tools)
+        schemas = await selection.context_tool_schemas(_CTX)
         names = {s["function"]["name"] for s in schemas}
         assert "mcp__7__search" in names  # server_id 접두
 
@@ -295,7 +289,7 @@ class TestMcpTools:
             return "결과"
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
-        monkeypatch.setattr(tool_runtime.mcp_client, "call_tool", fake_call_tool)
+        monkeypatch.setattr(selection.mcp_client, "call_tool", fake_call_tool)
         out = await tool_runtime.context_execute("mcp__7__search", {"q": "x"}, _CTX)
         assert out == "결과"
         assert captured == {"server_id": 7, "tool": "search", "args": {"q": "x"}}
@@ -317,7 +311,7 @@ class TestMcpTools:
             return [{"id": 7, "name": "legacy", "transport": "sse", "url": "https://mcp.example/sse"}]
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
-        assert await tool_runtime._load_mcp(_CTX) == []
+        assert await selection._load_mcp(_CTX) == []
 
     async def test_unavailable_mcp_secret_blocks_discovery_without_network_io(self, monkeypatch):
         import lumen.services.extensions_store as es
@@ -329,9 +323,9 @@ class TestMcpTools:
             raise AssertionError("MCP network I/O must not occur")
 
         monkeypatch.setattr(es, "list_for_user", secret_unavailable)
-        monkeypatch.setattr(tool_runtime.mcp_client, "list_tools", unexpected_network_io)
+        monkeypatch.setattr(selection.mcp_client, "list_tools", unexpected_network_io)
 
-        schemas = await tool_runtime.context_tool_schemas(_CTX)
+        schemas = await selection.context_tool_schemas(_CTX)
 
         assert all(not schema["function"]["name"].startswith("mcp__") for schema in schemas)
 
@@ -349,7 +343,7 @@ class TestMcpTools:
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
         monkeypatch.setattr(es, "mcp_credential_versions", rotated_version)
-        monkeypatch.setattr(tool_runtime.mcp_client, "call_tool", unexpected_network_io)
+        monkeypatch.setattr(selection.mcp_client, "call_tool", unexpected_network_io)
 
         output = await tool_runtime.context_execute(
             "mcp__7__search",
@@ -383,7 +377,7 @@ class TestMcpTools:
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
 
-        servers = await tool_runtime._load_mcp(_CTX)
+        servers = await selection._load_mcp(_CTX)
 
         assert servers == [
             {
@@ -420,10 +414,10 @@ class TestMcpTools:
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
         monkeypatch.setattr(oauth, "headers_for_user", no_headers)
-        assert await tool_runtime._load_mcp(_CTX) == []
+        assert await selection._load_mcp(_CTX) == []
 
         monkeypatch.setattr(oauth, "headers_for_user", connected_headers)
-        servers = await tool_runtime._load_mcp(_CTX)
+        servers = await selection._load_mcp(_CTX)
         assert servers[0]["headers"]["Authorization"] == "Bearer user-oauth-token"
 
 
@@ -450,15 +444,15 @@ class TestDeferredToolBinding:
         async def fake_mcp(_ctx):
             return []
 
-        monkeypatch.setattr(tool_runtime, "_load_custom", fake_custom)
-        monkeypatch.setattr(tool_runtime, "_load_mcp", fake_mcp)
+        monkeypatch.setattr(bindings, "_load_custom", fake_custom)
+        monkeypatch.setattr(bindings, "_load_mcp", fake_mcp)
         ctx = ToolContext(
             project_id="p1",
             user_id="u1",
-            binding_session=tool_runtime.ToolBindingSession(),
+            binding_session=contracts.ToolBindingSession(),
         )
 
-        initial = await tool_runtime.context_tool_schemas(ctx)
+        initial = await selection.context_tool_schemas(ctx)
         initial_names = {schema["function"]["name"] for schema in initial}
         assert "list_available_tools" in initial_names
         assert not any(name.startswith("custom__") for name in initial_names)
@@ -472,7 +466,7 @@ class TestDeferredToolBinding:
         assert len(loaded["tools"]) == 3
         assert all(len(item["description"]) <= 280 for item in loaded["tools"])
 
-        loaded_names = {schema["function"]["name"] for schema in await tool_runtime.context_tool_schemas(ctx)}
+        loaded_names = {schema["function"]["name"] for schema in await selection.context_tool_schemas(ctx)}
         assert set(loaded["loaded_tools"]) <= loaded_names
 
     async def test_catalog_loads_safe_mcp_schema_for_natural_language_mcp_query(self, monkeypatch):
@@ -520,13 +514,13 @@ class TestDeferredToolBinding:
                 },
             ]
 
-        monkeypatch.setattr(tool_runtime, "_load_custom", no_custom)
-        monkeypatch.setattr(tool_runtime, "_load_mcp", mcp_server)
-        monkeypatch.setattr(tool_runtime.mcp_client, "list_tools", discovered_tools)
+        monkeypatch.setattr(bindings, "_load_custom", no_custom)
+        monkeypatch.setattr(bindings, "_load_mcp", mcp_server)
+        monkeypatch.setattr(bindings.mcp_client, "list_tools", discovered_tools)
         ctx = ToolContext(
             project_id="p1",
             user_id="u1",
-            binding_session=tool_runtime.ToolBindingSession(),
+            binding_session=contracts.ToolBindingSession(),
         )
 
         result = await tool_runtime.context_execute_result(
@@ -556,7 +550,7 @@ class TestDeferredToolBinding:
         current = dict(original)
 
         async def fake_custom(context):
-            return tool_runtime._frozen_selection([current], context, "tool")
+            return selection._frozen_selection([current], context, "tool")
 
         async def fake_mcp(_ctx):
             return []
@@ -564,22 +558,22 @@ class TestDeferredToolBinding:
         async def unexpected_network(*_args, **_kwargs):
             raise AssertionError("changed extension must not dispatch")
 
-        monkeypatch.setattr(tool_runtime, "_load_custom", fake_custom)
-        monkeypatch.setattr(tool_runtime, "_load_mcp", fake_mcp)
+        monkeypatch.setattr(bindings, "_load_custom", fake_custom)
+        monkeypatch.setattr(bindings, "_load_mcp", fake_mcp)
         monkeypatch.setattr(tool_runtime, "_execute_custom_http_tool", unexpected_network)
         ctx = ToolContext(
             project_id="p1",
             user_id="u1",
             selected_tool_ids=(1,),
             expected_extension_fingerprints=(("tool", 1, es.selection_fingerprint(original)),),
-            binding_session=tool_runtime.ToolBindingSession(),
+            binding_session=contracts.ToolBindingSession(),
         )
-        bindings = await tool_runtime.v2_tool_bindings(
+        bound_bindings = await bindings.v2_tool_bindings(
             ctx,
             extension_load_policy="on_demand",
             include_platform=False,
         )
-        binding = next(iter(bindings.values()))
+        binding = next(iter(bound_bindings.values()))
         current["config_version"] = 2
 
         result = await binding.execute({}, ctx)
@@ -620,11 +614,11 @@ class TestDeferredToolBinding:
                 return {mutation_name: mutation_binding}
             return {}
 
-        monkeypatch.setattr(tool_runtime, "v2_tool_bindings", fake_v2_bindings)
+        monkeypatch.setattr(bindings, "v2_tool_bindings", fake_v2_bindings)
         ctx = ToolContext(
             project_id="p1",
             user_id="u1",
-            binding_session=tool_runtime.ToolBindingSession(),
+            binding_session=contracts.ToolBindingSession(),
         )
 
         catalog_result = await tool_runtime.context_execute_result(
@@ -633,7 +627,7 @@ class TestDeferredToolBinding:
             ctx,
         )
         loaded = json.loads(catalog_result.content)
-        schema_names = {schema["function"]["name"] for schema in await tool_runtime.context_tool_schemas(ctx)}
+        schema_names = {schema["function"]["name"] for schema in await selection.context_tool_schemas(ctx)}
         dispatch_result = await tool_runtime.context_execute_result(mutation_name, {}, ctx)
 
         assert loaded["loaded_tools"] == []
@@ -648,15 +642,15 @@ class TestDeferredToolBinding:
         async def fake_v2_bindings(_ctx, *, include_managed=False, **_kwargs):
             return {mutation_name: object()} if include_managed else {}
 
-        monkeypatch.setattr(tool_runtime, "v2_tool_bindings", fake_v2_bindings)
+        monkeypatch.setattr(bindings, "v2_tool_bindings", fake_v2_bindings)
         ctx = ToolContext(
             project_id="p1",
             user_id="u1",
-            binding_session=tool_runtime.ToolBindingSession(),
+            binding_session=contracts.ToolBindingSession(),
         )
 
         try:
-            await tool_runtime.restore_v2_deferred_bindings(
+            await bindings.restore_v2_deferred_bindings(
                 ctx,
                 ctx.binding_session.legacy_bindings,
                 [mutation_name],

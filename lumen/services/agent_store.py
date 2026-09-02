@@ -12,9 +12,9 @@ import logging
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import OperationalError
 
+from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import ChatAgent
-from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,7 @@ def _public(row: ChatAgent, *, owner_view: bool = False) -> dict:
         "params": row.params or {},
         "mcp_ids": row.mcp_ids or [],
         "tool_ids": row.tool_ids or [],
+        "skill_ids": getattr(row, "skill_ids", None) or [],
         "visibility": row.visibility,
         "cloned_from_id": row.cloned_from_id,
         "clone_count": row.clone_count,
@@ -87,6 +88,14 @@ def _validate(name: str | None, visibility: str | None) -> None:
         raise AgentValidationError("visibility 는 private|public 이어야 합니다")
 
 
+def _validate_ids(value: list | None, label: str) -> list | None:
+    if value is None:
+        return None
+    if len(set(value)) != len(value) or any(not isinstance(item, int) or item < 1 for item in value):
+        raise AgentValidationError(f"{label} IDs must be unique positive ids")
+    return value
+
+
 async def create_agent(
     *,
     owner_user_id: str,
@@ -97,12 +106,16 @@ async def create_agent(
     instructions: str | None = None,
     model_name: str | None = None,
     params: dict | None = None,
-    mcp_ids: list | None = None,
-    tool_ids: list | None = None,
+    mcp_ids: list[int] | None = None,
+    tool_ids: list[int] | None = None,
+    skill_ids: list[int] | None = None,
     visibility: str = "private",
 ) -> dict:
     factory = _require_db()
     _validate(name, visibility)
+    mcp_ids = _validate_ids(mcp_ids, "MCP")
+    tool_ids = _validate_ids(tool_ids, "tool")
+    skill_ids = _validate_ids(skill_ids, "skill")
     row = ChatAgent(
         owner_user_id=owner_user_id,
         project_id=project_id,
@@ -114,6 +127,7 @@ async def create_agent(
         params=(params or None),
         mcp_ids=(mcp_ids or None),
         tool_ids=(tool_ids or None),
+        skill_ids=(skill_ids or None),
         visibility=visibility,
     )
     try:
@@ -207,6 +221,9 @@ async def update_agent(agent_id: int, *, user_id: str, project_id: str, patch: d
     """Update only a caller-owned project agent."""
     factory = _require_db()
     _validate(patch.get("name"), patch.get("visibility"))
+    for field, label in (("mcp_ids", "MCP"), ("tool_ids", "tool"), ("skill_ids", "skill")):
+        if field in patch:
+            _validate_ids(patch[field], label)
     try:
         async with factory() as session, session.begin():
             row = await _load_owned_project(session, agent_id, user_id, project_id)
@@ -226,6 +243,8 @@ async def update_agent(agent_id: int, *, user_id: str, project_id: str, patch: d
                 row.mcp_ids = patch["mcp_ids"] or None
             if "tool_ids" in patch:
                 row.tool_ids = patch["tool_ids"] or None
+            if "skill_ids" in patch:
+                row.skill_ids = patch["skill_ids"] or None
             if patch.get("visibility"):
                 row.visibility = patch["visibility"]
             await session.flush()
@@ -277,6 +296,7 @@ async def clone_agent(agent_id: int, *, user_id: str, project_id: str) -> dict:
                 params=src.params,
                 mcp_ids=None,
                 tool_ids=None,
+                skill_ids=None,
                 delegable_agent_ids=None,
                 visibility="private",
                 cloned_from_id=src.id,
@@ -318,6 +338,7 @@ async def get_agent_for_run(agent_id: int, *, user_id: str, project_id: str) -> 
                 "mcp_ids": row.mcp_ids or [],
                 "role": row.role,
                 "tool_ids": row.tool_ids or [],
+                "skill_ids": row.skill_ids or [],
                 "execution_policy": row.execution_policy or {},
                 "delegable_agent_ids": row.delegable_agent_ids or [],
             }

@@ -16,9 +16,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from lumen.auth import get_api_key_info
+from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
-from lumen.services import provider_store as ps
+from lumen.services.providers import errors, repository
 
 router = APIRouter()
 
@@ -34,6 +34,45 @@ class OpenAIChatRequest(BaseModel):
     stream_options: dict | None = None
 
     model_config = {"extra": "allow"}  # 미지원 OpenAI 파라미터는 무시(호환성)
+
+
+class OpenAIChatChoiceMessage(BaseModel):
+    role: str = "assistant"
+    content: str | None = None
+    tool_calls: list[dict] | None = None
+
+
+class OpenAIChatChoice(BaseModel):
+    index: int = 0
+    message: OpenAIChatChoiceMessage
+    finish_reason: str = "stop"
+
+
+class OpenAIUsage(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class OpenAIChatResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: list[OpenAIChatChoice]
+    usage: OpenAIUsage
+
+
+class OpenAIModelItem(BaseModel):
+    id: str
+    object: str = "model"
+    created: int = 0
+    owned_by: str = "lumen"
+
+
+class OpenAIModelListResponse(BaseModel):
+    object: str = "list"
+    data: list[OpenAIModelItem]
 
 
 # ── 순수 변환 함수 (단위 테스트 대상) ──────────────────────────────────────
@@ -104,7 +143,12 @@ def models_list(models: list[dict]) -> dict:
     return {
         "object": "list",
         "data": [
-            {"id": m["model_name"], "object": "model", "created": 0, "owned_by": m.get("provider_name") or "afterglow"}
+            {
+                "id": m["model_name"],
+                "object": "model",
+                "created": 0,
+                "owned_by": m.get("provider_name") or "lumen",
+            }
             for m in models
         ],
     }
@@ -115,13 +159,19 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-@router.post("/chat/completions")
-async def chat_completions(body: OpenAIChatRequest, token_info: dict = Depends(get_api_key_info)):
+@router.post(
+    "/chat/completions",
+    response_model=OpenAIChatResponse,
+    openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
+)
+async def chat_completions(
+    body: OpenAIChatRequest, token_info: dict = Depends(require_api_key_scopes("compat:completions:write"))
+):
     user_id, project_id = token_info["user_id"], token_info["project_id"]
     api_key_id = token_info.get("api_key_id")
     try:
         resolved = await core.resolve(body.model)
-        await core.precheck(user_id, project_id)
+        await core.precheck(user_id, project_id, api_key_id=api_key_id)
     except core.CompletionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=openai_error(exc.status_code, exc.message)) from exc
 
@@ -139,6 +189,7 @@ async def chat_completions(body: OpenAIChatRequest, token_info: dict = Depends(g
                 max_tokens=body.max_tokens,
                 temperature=body.temperature,
                 tools=body.tools,
+                tool_choice=body.tool_choice,
             )
         except core.CompletionError as exc:
             raise HTTPException(status_code=exc.status_code, detail=openai_error(exc.status_code, exc.message)) from exc
@@ -156,6 +207,7 @@ async def chat_completions(body: OpenAIChatRequest, token_info: dict = Depends(g
             max_tokens=body.max_tokens,
             temperature=body.temperature,
             tools=body.tools,
+            tool_choice=body.tool_choice,
         ):
             if ev["type"] == "delta":
                 yield _sse(chunk_dict(ev, cmpl_id=cmpl_id, created=created, model=resolved["model_name"]))
@@ -169,10 +221,14 @@ async def chat_completions(body: OpenAIChatRequest, token_info: dict = Depends(g
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-@router.get("/models")
-async def list_models(token_info: dict = Depends(get_api_key_info)):
+@router.get(
+    "/models",
+    response_model=OpenAIModelListResponse,
+    openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
+)
+async def list_models(token_info: dict = Depends(require_api_key_scopes("models:read"))):
     try:
-        models = await ps.list_models(active_only=True)
-    except ps.ChatStorageUnavailable:
+        models = await repository.list_models(active_only=True)
+    except errors.ChatStorageUnavailable:
         models = []
     return models_list(models)

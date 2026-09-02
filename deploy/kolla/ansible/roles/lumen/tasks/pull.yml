@@ -1,0 +1,13 @@
+---
+- name: Pull | Pull Lumen images
+  become: true
+  community.docker.docker_image:
+    name: "{{ item.value.image }}"
+    source: pull
+    force_source: true
+  no_log: true
+  loop: "{{ lumen_services | dict2items }}"
+  when:
+    - inventory_hostname in groups['lumen']
+    - item.value.enabled | bool
+    - not (lumen_source_mode | default(false) | bool)

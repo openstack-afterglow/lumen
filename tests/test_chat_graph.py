@@ -12,7 +12,9 @@ import json
 from datetime import UTC, datetime
 
 from lumen.models.chat_contracts import validate_chat_run_event
-from lumen.services import engine, graph, litellm_client, tool_runtime
+from lumen.services import engine, graph, litellm_client
+from lumen.services.tool_runtime import contracts, selection
+from lumen.services.tool_runtime import dispatch as tool_runtime
 
 _MSGS = [{"role": "user", "content": "안녕하세요"}]
 
@@ -288,7 +290,7 @@ class TestGraphStream:
                 raise RuntimeError("Function tools with reasoning_effort are not supported")
             return _aiter([_Chunk("답변")])
 
-        monkeypatch.setattr(tool_runtime, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
         events = [
             ev
@@ -330,7 +332,7 @@ class TestGraphStream:
             async def provider_failed(self, **_payload):
                 raise AssertionError("compatible first request must not fail its durable boundary")
 
-        monkeypatch.setattr(tool_runtime, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
 
         events = [
@@ -359,7 +361,7 @@ class TestGraphStream:
             calls.append(kwargs)
             return _aiter([_Chunk("답변")])
 
-        monkeypatch.setattr(tool_runtime, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
 
         _ = [
@@ -540,7 +542,7 @@ class TestToolLoop:
             captured["name"] = name
             captured["project_id"] = ctx.project_id
             captured["user_id"] = ctx.user_id
-            return tool_runtime.ToolExecutionResult("대화 3개")
+            return contracts.ToolExecutionResult("대화 3개")
 
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
@@ -583,7 +585,7 @@ class TestToolLoop:
             return _aiter(response)
 
         async def fake_execute(*_args):
-            return tool_runtime.ToolExecutionResult("대화 3개")
+            return contracts.ToolExecutionResult("대화 3개")
 
         class Hooks:
             async def provider_started(self, **_payload):
@@ -669,7 +671,7 @@ class TestToolLoop:
             return _aiter(response)
 
         async def fake_execute(*_args):
-            return tool_runtime.ToolExecutionResult("result")
+            return contracts.ToolExecutionResult("result")
 
         class Hooks:
             events: list[tuple[str, dict]] = []
@@ -741,7 +743,7 @@ class TestToolLoop:
             return _aiter(response)
 
         async def fake_execute(*_args):
-            return tool_runtime.ToolExecutionResult("result")
+            return contracts.ToolExecutionResult("result")
 
         class Hooks:
             async def provider_started(self, **_payload):
@@ -869,7 +871,7 @@ class TestToolLoop:
             return _aiter(response)
 
         async def fake_execute(name, _args, _ctx):
-            return tool_runtime.ToolExecutionResult(f"{name} result")
+            return contracts.ToolExecutionResult(f"{name} result")
 
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
@@ -905,7 +907,7 @@ class TestToolLoop:
             return _aiter(response)
 
         async def fake_execute(*_args):
-            return tool_runtime.ToolExecutionResult("private advice", visible=False, warning_code="advisor_call_failed")
+            return contracts.ToolExecutionResult("private advice", visible=False, warning_code="advisor_call_failed")
 
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
@@ -940,7 +942,7 @@ class TestEngineDelegates:
 
         monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(graph.litellm_client, "extract_usage", lambda *_: (9, 3))
-        monkeypatch.setattr(graph.tool_runtime, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(graph.selection, "context_tool_schemas", fake_schemas)
 
         events = [
             event

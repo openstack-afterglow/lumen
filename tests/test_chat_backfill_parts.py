@@ -2,13 +2,13 @@ import json
 
 import pytest
 
+from lumen.crypto import encrypt_chat_content
 from lumen.services.backfill_parts import (
     BackfillPartsError,
     forward_encrypt_parts,
     legacy_to_parts,
     reverse_legacy_projection,
 )
-from lumen.crypto import encrypt_chat_content
 
 
 def test_forward_and_reverse_backfill_preserve_each_legacy_projection():

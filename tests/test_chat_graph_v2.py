@@ -92,7 +92,7 @@ async def test_v2_graph_approves_dynamic_write_effect_before_dispatch(monkeypatc
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
@@ -156,7 +156,7 @@ async def test_v2_replayed_provider_turn_consumes_frozen_turn_budget(monkeypatch
     async def unexpected_provider_call(**_kwargs):
         raise AssertionError("replayed turn exhausted the only model-turn budget")
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", unexpected_provider_call)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
@@ -224,7 +224,7 @@ async def test_v2_graph_stops_before_exceeding_frozen_model_turn_limit(monkeypat
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
@@ -319,7 +319,7 @@ async def test_v2_graph_runs_parallel_safe_reads_four_wide_in_call_order(monkeyp
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
@@ -404,7 +404,7 @@ async def test_v2_graph_interrupts_before_external_mutation_dispatch(monkeypatch
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
@@ -514,7 +514,7 @@ async def test_v2_graph_rejects_pre_interrupt_tool_id_reused_after_approval_resu
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
@@ -621,7 +621,7 @@ async def test_v2_graph_rejects_changed_binding_before_resumed_dispatch(
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
     initial_events = [
@@ -713,7 +713,7 @@ async def test_v2_graph_returns_policy_limit_result_without_dispatching_excess_c
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
     events = [
@@ -798,7 +798,7 @@ async def test_v2_graph_rejects_duplicate_call_ids_before_any_binding_dispatch(m
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
@@ -866,7 +866,7 @@ async def test_v2_graph_rejects_a_tool_call_id_reused_in_a_later_model_turn(monk
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
@@ -929,7 +929,7 @@ async def test_v2_role_effect_ceiling_denies_mutation_before_binding_io(monkeypa
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
@@ -985,7 +985,7 @@ async def test_v2_graph_excludes_on_demand_extension_schemas_from_initial_reques
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
@@ -1048,7 +1048,7 @@ async def test_v2_graph_exposes_no_bindings_or_dispatch_when_tools_disabled(monk
 
         return chunks()
 
-    monkeypatch.setattr(graph.tool_runtime, "v2_builtin_tool_bindings", lambda: {tool_name: binding})
+    monkeypatch.setattr(graph.bindings, "v2_builtin_tool_bindings", lambda: {tool_name: binding})
     monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 

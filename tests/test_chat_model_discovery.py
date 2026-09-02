@@ -3,7 +3,7 @@
 import pytest
 
 from lumen.services import model_discovery
-from lumen.services import provider_store as ps
+from lumen.services.providers import errors
 
 
 class _Resp:
@@ -42,7 +42,7 @@ class TestDiscover:
             return None
 
         monkeypatch.setattr(model_discovery.provider_store, "get_provider_for_discovery", fake_get)
-        with pytest.raises(ps.ProviderNotFoundError):
+        with pytest.raises(errors.ProviderNotFoundError):
             await model_discovery.discover_models(999)
 
     async def test_live_api_success(self, monkeypatch):

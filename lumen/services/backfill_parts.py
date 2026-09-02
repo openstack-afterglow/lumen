@@ -6,9 +6,9 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from lumen.crypto import decrypt_chat_content
 from lumen.models.chat_contracts import ChatParts, validate_chat_parts
 from lumen.services.message_parts import deserialize_parts, serialize_parts
-from lumen.crypto import decrypt_chat_content
 
 
 class BackfillPartsError(ValueError):

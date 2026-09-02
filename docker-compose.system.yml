@@ -1,0 +1,146 @@
+services:
+  mariadb:
+    image: mariadb:11
+    environment:
+      MYSQL_DATABASE: lumen
+      MYSQL_USER: lumen
+      MYSQL_PASSWORD: lumen
+      MYSQL_ROOT_PASSWORD: local-root-only
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "127.0.0.1:${MARIADB_PORT:-33306}:3306"
+    volumes:
+      - system-mariadb:/var/lib/mysql
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-36379}:6379"
+
+  fake-provider:
+    build:
+      context: .
+      target: lumen-test
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    command: ["python", "tests/system/fake_openai.py"]
+    environment:
+      PORT: "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build:
+      context: .
+      target: lumen-runtime
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    command: ["lumen-migrate", "--apply"]
+    environment: &lumen-environment
+      DATABASE_URL: mysql+aiomysql://lumen:lumen@mariadb:3306/lumen
+      REDIS_URL: redis://redis:6379/0
+      LUMEN_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      CHAT_API_HOSTS: localhost,127.0.0.1,lumen-api
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  seed-local:
+    build:
+      context: .
+      target: lumen-runtime
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    command: ["lumen-seed-local"]
+    environment:
+      <<: *lumen-environment
+      LUMEN_LOCAL_PROVIDER_API_KEY: fake-provider-key
+      LUMEN_LOCAL_PROVIDER_NAME: fake-openai
+      LUMEN_LOCAL_PROVIDER_TYPE: openai
+      LUMEN_LOCAL_PROVIDER_BASE_URL: http://fake-provider:8080/v1
+      LUMEN_LOCAL_MODEL: fake-gpt-4
+      LUMEN_LOCAL_INPUT_PRICE_PER_MILLION: "1"
+      LUMEN_LOCAL_OUTPUT_PRICE_PER_MILLION: "3"
+      LUMEN_LOCAL_SEED_PATH: /seed/api-key
+      LUMEN_LOCAL_CONNECTION_PATH: /seed/connection.json
+      LUMEN_LOCAL_PUBLIC_BASE_URL: http://127.0.0.1:8012/v1
+      LUMEN_LOCAL_CONTAINER_BASE_URL: http://lumen-api:8012/v1
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      fake-provider:
+        condition: service_healthy
+    volumes:
+      - system-seed:/seed
+
+  lumen-api:
+    build:
+      context: .
+      target: lumen-api
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    environment:
+      <<: *lumen-environment
+      LUMEN_LOCAL_PROVIDER_API_KEY: fake-provider-key
+    depends_on:
+      seed-local:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8012/v1/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  lumen-worker:
+    build:
+      context: .
+      target: lumen-worker
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    environment:
+      <<: *lumen-environment
+      LUMEN_LOCAL_PROVIDER_API_KEY: fake-provider-key
+    depends_on:
+      seed-local:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  system-tests:
+    build:
+      context: .
+      target: lumen-test
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    command: ["pytest", "-m", "system", "tests/system"]
+    environment:
+      LUMEN_API_BASE_URL: http://lumen-api:8012
+      LUMEN_SEED_KEY_FILE: /seed/api-key
+      LUMEN_CONNECTION_FILE: /seed/connection.json
+      LUMEN_MODEL_NAME: fake-gpt-4
+      PYTEST_ADDOPTS: ${SYSTEM_PYTEST_ADDOPTS:-}
+    depends_on:
+      lumen-api:
+        condition: service_healthy
+      lumen-worker:
+        condition: service_started
+    volumes:
+      - system-seed:/seed:ro
+
+volumes:
+  system-mariadb:
+  system-seed:

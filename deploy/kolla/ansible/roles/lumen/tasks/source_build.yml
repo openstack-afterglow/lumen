@@ -1,0 +1,96 @@
+---
+- name: Source Build | Ensure Lumen source checkout directory exists
+  become: true
+  ansible.builtin.file:
+    path: "{{ lumen_source_dir }}"
+    state: directory
+    mode: "0755"
+  when: inventory_hostname in groups['lumen']
+
+- name: Source Build | Check if existing Git repository exists
+  become: true
+  ansible.builtin.stat:
+    path: "{{ lumen_source_dir }}/.git"
+  register: lumen_git_dir_stat
+  when: inventory_hostname in groups['lumen']
+
+- name: Source Build | Check git status of existing checkout
+  become: true
+  ansible.builtin.command:
+    cmd: "git status --porcelain"
+    chdir: "{{ lumen_source_dir }}"
+  register: lumen_existing_git_status
+  changed_when: false
+  when:
+    - inventory_hostname in groups['lumen']
+    - lumen_git_dir_stat.stat.exists
+
+- name: Source Build | Fail if existing Lumen checkout is dirty
+  ansible.builtin.assert:
+    that:
+      - lumen_existing_git_status.stdout | trim | length == 0
+    fail_msg: "Existing Lumen source checkout at {{ lumen_source_dir }} is dirty (uncommitted changes present)"
+  when:
+    - inventory_hostname in groups['lumen']
+    - lumen_git_dir_stat.stat.exists
+
+- name: Source Build | Check HEAD SHA of existing checkout
+  become: true
+  ansible.builtin.command:
+    cmd: "git rev-parse HEAD"
+    chdir: "{{ lumen_source_dir }}"
+  register: lumen_existing_head_sha
+  changed_when: false
+  when:
+    - inventory_hostname in groups['lumen']
+    - lumen_git_dir_stat.stat.exists
+
+- name: Source Build | Fail if existing Lumen checkout HEAD does not match lumen_source_version
+  ansible.builtin.assert:
+    that:
+      - lumen_existing_head_sha.stdout | trim == lumen_source_version
+    fail_msg: "Existing Lumen checkout HEAD ({{ lumen_existing_head_sha.stdout | default('') }}) does not match required version ({{ lumen_source_version }})"
+  when:
+    - inventory_hostname in groups['lumen']
+    - lumen_git_dir_stat.stat.exists
+
+- name: Source Build | Checkout Lumen source repository when absent
+  become: true
+  ansible.builtin.git:
+    repo: "{{ lumen_source_repo }}"
+    dest: "{{ lumen_source_dir }}"
+    version: "{{ lumen_source_version }}"
+    force: false
+  when:
+    - inventory_hostname in groups['lumen']
+    - not lumen_git_dir_stat.stat.exists
+
+- name: Source Build | Verify checked out HEAD SHA
+  become: true
+  ansible.builtin.command:
+    cmd: "git rev-parse HEAD"
+    chdir: "{{ lumen_source_dir }}"
+  register: lumen_head_sha
+  changed_when: false
+  when: inventory_hostname in groups['lumen']
+
+- name: Source Build | Fail if checked out HEAD does not match lumen_source_version
+  ansible.builtin.assert:
+    that:
+      - lumen_head_sha.stdout | trim == lumen_source_version
+    fail_msg: "Lumen source checkout HEAD ({{ lumen_head_sha.stdout | default('') }}) does not match expected version ({{ lumen_source_version }})"
+  when: inventory_hostname in groups['lumen']
+
+- name: Source Build | Build local Lumen images
+  become: true
+  community.docker.docker_image:
+    name: "afterglow-local/{{ item }}:{{ lumen_source_version | truncate(12, True, '') }}"
+    build:
+      path: "{{ lumen_source_dir }}"
+      target: "{{ item }}"
+    source: build
+    force_source: false
+  loop:
+    - lumen-api
+    - lumen-worker
+  when: inventory_hostname in groups['lumen']

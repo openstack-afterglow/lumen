@@ -1,0 +1,101 @@
+---
+- name: Postgres | Start managed Lumen PostgreSQL container
+  become: true
+  community.docker.docker_container:
+    name: lumen_postgres
+    image: "{{ lumen_postgres_image_ref }}"
+    state: started
+    restart_policy: unless-stopped
+    volumes:
+      - "{{ lumen_postgres_volume }}:/var/lib/postgresql/data"
+    env:
+      POSTGRES_DB: "{{ lumen_postgres_database }}"
+      POSTGRES_USER: "{{ lumen_postgres_user }}"
+      POSTGRES_PASSWORD: "{{ lumen_postgres_password }}"
+    ports:
+      - "{{ lumen_postgres_bind_address }}:{{ lumen_postgres_port }}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U {{ lumen_postgres_user }} -d {{ lumen_postgres_database }}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+  no_log: true
+  run_once: true
+  delegate_to: "{{ groups['lumen'][0] }}"
+  when: lumen_postgres_mode == 'bundled'
+
+- name: Postgres | Wait for managed Lumen PostgreSQL container health
+  become: true
+  community.docker.docker_container_info:
+    name: lumen_postgres
+  register: lumen_postgres_container_info
+  until:
+    - lumen_postgres_container_info.exists
+    - lumen_postgres_container_info.container.State.Health.Status is defined
+    - lumen_postgres_container_info.container.State.Health.Status == 'healthy'
+  retries: 12
+  delay: 5
+  run_once: true
+  delegate_to: "{{ groups['lumen'][0] }}"
+  when: lumen_postgres_mode == 'bundled'
+
+- name: Postgres | Verify authenticated SELECT 1 on managed Lumen PostgreSQL
+  become: true
+  community.docker.docker_container_exec:
+    container: lumen_postgres
+    command: >
+      psql -U {{ lumen_postgres_user }} -d {{ lumen_postgres_database }} -c "SELECT 1;"
+  register: lumen_postgres_select_check
+  failed_when:
+    - lumen_postgres_select_check.rc != 0
+  run_once: true
+  delegate_to: "{{ groups['lumen'][0] }}"
+  when: lumen_postgres_mode == 'bundled'
+
+- name: Postgres | Verify authenticated external Lumen PostgreSQL SELECT 1
+  become: true
+  block:
+    - name: Postgres | Render external PostgreSQL libpq service
+      ansible.builtin.script: render_postgres_service.py
+      environment:
+        LUMEN_EXTERNAL_POSTGRES_URL: "{{ lumen_external_postgres_url }}"
+      register: lumen_external_postgres_service_render
+      changed_when: false
+
+    - name: Postgres | Stage external PostgreSQL libpq service
+      ansible.builtin.copy:
+        content: "{{ (lumen_external_postgres_service_render.stdout | from_json).service }}"
+        dest: /tmp/lumen-external-postgres.conf
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Postgres | Run authenticated external Lumen PostgreSQL SELECT 1
+      community.docker.docker_container:
+        name: lumen_external_postgres_probe
+        image: "{{ lumen_postgres_image_ref }}"
+        command:
+          - psql
+          - -c
+          - "SELECT 1;"
+        env:
+          PGSERVICEFILE: /tmp/lumen-external-postgres.conf
+          PGSERVICE: external
+        volumes:
+          - /tmp/lumen-external-postgres.conf:/tmp/lumen-external-postgres.conf:ro
+        state: started
+        detach: false
+        cleanup: true
+        network_mode: host
+  always:
+    - name: Postgres | Remove external PostgreSQL libpq service
+      ansible.builtin.file:
+        path: /tmp/lumen-external-postgres.conf
+        state: absent
+  no_log: true
+  run_once: true
+  delegate_to: "{{ groups['lumen'][0] }}"
+  when:
+    - lumen_enable_checkpointer | bool
+    - lumen_postgres_mode == 'external'

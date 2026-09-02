@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
 from lumen.config import get_settings
+from lumen.crypto import decrypt_chat_content
 from lumen.db import get_session_factory
 from lumen.models.chat_db import ChatMemory
 from lumen.models.chat_jobs import ChatMemoryOutbox
@@ -16,7 +17,6 @@ from lumen.services.memory_embeddings import embed_maintenance
 from lumen.services.memory_index import MemoryVector
 from lumen.services.memory_store import memory_content_fingerprint
 from lumen.services.semantic_memory import configured_memory_index
-from lumen.crypto import decrypt_chat_content
 
 
 @dataclass(frozen=True)

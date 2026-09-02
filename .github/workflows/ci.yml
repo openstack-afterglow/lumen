@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      lumen_repository:
+        type: string
+        required: false
+        default: ''
+        description: 'Lumen repository to check out'
+      lumen_ref:
+        type: string
+        required: false
+        default: ''
+        description: 'Lumen git ref to check out'
+      afterglow_crypto_ref:
+        type: string
+        required: false
+        default: ''
+        description: 'afterglow-crypto git ref override'
+  workflow_dispatch:
+    inputs:
+      lumen_repository:
+        type: string
+        required: false
+        default: ''
+        description: 'Lumen repository to check out'
+      lumen_ref:
+        type: string
+        required: false
+        default: ''
+        description: 'Lumen git ref to check out'
+      afterglow_crypto_ref:
+        type: string
+        required: false
+        default: ''
+        description: 'afterglow-crypto git ref override'
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  service:
+    name: Service tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.lumen_repository || github.repository }}
+          ref: ${{ inputs.lumen_ref || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - name: Override afterglow-crypto dependency
+        if: ${{ inputs.afterglow_crypto_ref != '' }}
+        env:
+          AFTERGLOW_CRYPTO_REF: ${{ inputs.afterglow_crypto_ref }}
+        run: |
+          uv pip install --python .venv/bin/python --reinstall-package afterglow-crypto --no-deps "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@${AFTERGLOW_CRYPTO_REF}"
+      - run: uv run ruff check lumen tests
+      - run: uv run pytest -m "not integration and not system" tests
+
+  sdk:
+    name: SDK tests and lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.lumen_repository || github.repository }}
+          ref: ${{ inputs.lumen_ref || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - run: uv run pytest
+      - run: uv run ruff check .
+
+
+  kolla:
+    name: Kolla packaging and asset tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.lumen_repository || github.repository }}
+          ref: ${{ inputs.lumen_ref || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - run: uv run pytest tests/test_kolla_assets.py
+
+  integration:
+    name: Datastore integration
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MYSQL_DATABASE: lumen
+          MYSQL_USER: lumen
+          MYSQL_PASSWORD: lumen
+          MYSQL_ROOT_PASSWORD: root
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: mysql+aiomysql://lumen:lumen@127.0.0.1:3306/lumen
+      REDIS_URL: redis://127.0.0.1:6379/0
+      LUMEN_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.lumen_repository || github.repository }}
+          ref: ${{ inputs.lumen_ref || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - name: Override afterglow-crypto dependency
+        if: ${{ inputs.afterglow_crypto_ref != '' }}
+        env:
+          AFTERGLOW_CRYPTO_REF: ${{ inputs.afterglow_crypto_ref }}
+        run: |
+          uv pip install --python .venv/bin/python --reinstall-package afterglow-crypto --no-deps "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@${AFTERGLOW_CRYPTO_REF}"
+      - run: uv run lumen-migrate --apply
+      - run: uv run lumen-migrate --apply
+      - run: uv run pytest -m integration
+
+  system:
+    name: Process-system integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.lumen_repository || github.repository }}
+          ref: ${{ inputs.lumen_ref || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - name: Run system integration tests
+        env:
+          AFTERGLOW_CRYPTO_REF: ${{ inputs.afterglow_crypto_ref }}
+        run: uv run lumen-test system

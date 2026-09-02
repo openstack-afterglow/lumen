@@ -9,18 +9,16 @@ import pytest
 from lumen.scripts import cutover
 
 _BASELINE_MIGRATION = Path(__file__).parents[1] / "lumen" / "migrations" / "001_baseline.sql"
-_AFTERGLOW_DROP_MIGRATION = Path(__file__).parents[3] / "backend" / "migrations" / "075_drop_lumen_tables.sql"
 
 
 def _spec() -> cutover.TableSpec:
     return cutover.TableSpec(name="chat_agents", columns=("id", "metadata"), primary_key=("id",))
 
 
-def test_cutover_and_afterglow_cleanup_cover_exactly_every_lumen_baseline_table():
+def test_cutover_covers_exactly_every_lumen_baseline_table():
     migration_tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS ([a-z_]+)", _BASELINE_MIGRATION.read_text()))
-    dropped_tables = set(re.findall(r"DROP TABLE IF EXISTS ([a-z_]+)", _AFTERGLOW_DROP_MIGRATION.read_text()))
 
-    assert set(cutover._TABLE_NAMES) == migration_tables == dropped_tables
+    assert set(cutover._TABLE_NAMES) == migration_tables
     assert "user_wallets" in cutover._TABLE_NAMES
 
 

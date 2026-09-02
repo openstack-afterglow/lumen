@@ -7,7 +7,7 @@ DB 없이 conversation_store 를 monkeypatch 하여:
 """
 
 from lumen.services import conversation_store as cs
-from lumen.services import provider_store
+from lumen.services.providers import errors, repository
 
 _URL = "/api/v1/chat/conversations"
 
@@ -157,10 +157,10 @@ class TestAvailableModels:
             ]
 
         async def fake_providers():
-            return [{"id": 1, "name": "openai"}]
+            return [{"id": 1, "name": "openai", "has_api_key": False}]
 
-        monkeypatch.setattr(provider_store, "list_models", fake_models)
-        monkeypatch.setattr(provider_store, "list_providers", fake_providers)
+        monkeypatch.setattr(repository, "list_models", fake_models)
+        monkeypatch.setattr(repository, "list_providers", fake_providers)
         resp = await client.get("/api/v1/chat/models")
         assert resp.status_code == 200
         body = resp.json()
@@ -170,15 +170,16 @@ class TestAvailableModels:
         assert body[0]["provider"] == "openai"
         assert body[0]["capabilities"] == {"vision": True, "reasoning": False, "context_limit": 128000}
         assert body[0]["context_limit"] == 128000
+        assert body[0]["provider_api_key_configured"] is False
         assert "input_price" not in body[0]
         assert "api_key" not in body[0]
         assert body[0]["id"] == 1
 
     async def test_graceful_empty_on_storage_unavailable(self, client, monkeypatch):
         async def fake_models(*, active_only=False):
-            raise provider_store.ChatStorageUnavailable("DB down")
+            raise errors.ChatStorageUnavailable("DB down")
 
-        monkeypatch.setattr(provider_store, "list_models", fake_models)
+        monkeypatch.setattr(repository, "list_models", fake_models)
         resp = await client.get("/api/v1/chat/models")
         assert resp.status_code == 200
         assert resp.json() == []

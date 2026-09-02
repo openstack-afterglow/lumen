@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from lumen.services import provider_store as ps
+from lumen.services.providers import routing as ps
 
 
 class _Row:

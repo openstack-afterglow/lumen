@@ -33,6 +33,9 @@ class ChatRun(Base):
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
+    source: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="web")
+    # No FK: API-key revocation must not delete accepted run provenance.
+    api_key_id: Mapped[int | None] = mapped_column(BIGINT)
     agent_id: Mapped[int | None] = mapped_column(BIGINT)
     capability_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
     pricing_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)

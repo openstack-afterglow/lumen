@@ -1,0 +1,8 @@
+---
+- name: Destroy | Stop and remove Lumen containers
+  become: true
+  community.docker.docker_container:
+    name: "{{ item.value.container_name }}"
+    state: absent
+  loop: "{{ lumen_services | dict2items }}"
+  when: inventory_hostname in groups['lumen']

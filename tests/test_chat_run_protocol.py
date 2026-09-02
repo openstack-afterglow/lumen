@@ -8,8 +8,10 @@ from lumen.config import get_settings
 from lumen.models.chat_agent_platform import ChatCodeWorkspace, ChatCommand, ChatRunInteraction
 from lumen.models.chat_contracts import validate_chat_run_event
 from lumen.models.chat_runs import ChatRun, ChatToolApproval
-from lumen.services import durable_runs, execution_protocol, run_store
-from lumen.services.durable_runs import _fingerprint
+from lumen.services import execution_protocol, run_store
+from lumen.services.durable_runs import common, execution, interactions, lifecycle, queries
+from lumen.services.durable_runs import errors as durable_errors
+from lumen.services.durable_runs.common import _fingerprint
 from lumen.services.run_protocol_v2 import transition_allowed
 
 
@@ -53,7 +55,7 @@ def test_v2_run_protocol_models_preserve_v1_default_and_additive_waiting_state_s
 
 def test_v2_approval_hmac_binds_owner_preview_expiry_and_deciding_actor():
     expires_at = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
-    dispatch = durable_runs._approval_dispatch_hmac(
+    dispatch = interactions._approval_dispatch_hmac(
         run_id="run-1",
         owner_user_id="user-1",
         project_id="project-1",
@@ -68,7 +70,7 @@ def test_v2_approval_hmac_binds_owner_preview_expiry_and_deciding_actor():
         preview_fingerprint="c" * 64,
         expires_at=expires_at,
     )
-    assert dispatch != durable_runs._approval_dispatch_hmac(
+    assert dispatch != interactions._approval_dispatch_hmac(
         run_id="run-1",
         owner_user_id="user-2",
         project_id="project-1",
@@ -83,7 +85,7 @@ def test_v2_approval_hmac_binds_owner_preview_expiry_and_deciding_actor():
         preview_fingerprint="d" * 64,
         expires_at=expires_at + timedelta(minutes=1),
     )
-    decision = durable_runs._approval_decision_hmac(
+    decision = interactions._approval_decision_hmac(
         dispatch_hmac=dispatch,
         owner_user_id="user-1",
         project_id="project-1",
@@ -92,7 +94,7 @@ def test_v2_approval_hmac_binds_owner_preview_expiry_and_deciding_actor():
         decided_by_user_id="user-1",
         decided_at=expires_at - timedelta(minutes=1),
     )
-    assert decision != durable_runs._approval_decision_hmac(
+    assert decision != interactions._approval_decision_hmac(
         dispatch_hmac=dispatch,
         owner_user_id="user-1",
         project_id="project-1",
@@ -110,9 +112,9 @@ def test_v2_protocol_is_worker_supported_but_requires_explicit_config_enablement
 
 
 def test_v2_protocol_admission_requires_the_encrypted_checkpointer(monkeypatch):
-    monkeypatch.setattr(durable_runs, "chat_checkpointer", SimpleNamespace(available=False))
-    with pytest.raises(durable_runs.DurableRunInputError, match="encrypted PostgreSQL checkpointer"):
-        durable_runs._require_supported_execution_protocol_version(2)
+    monkeypatch.setattr(common, "chat_checkpointer", SimpleNamespace(available=False))
+    with pytest.raises(durable_errors.DurableRunInputError, match="encrypted PostgreSQL checkpointer"):
+        common._require_supported_execution_protocol_version(2)
 
 
 async def test_v2_run_admission_freezes_lumen_selection_and_overwrites_client_payload(monkeypatch):
@@ -131,7 +133,7 @@ async def test_v2_run_admission_freezes_lumen_selection_and_overwrites_client_pa
         return snapshot
 
     monkeypatch.setattr(mcp_lumen, "selected_lumen_snapshot", selected)
-    payload = await durable_runs._freeze_v2_lumen_snapshot(
+    payload = await common._freeze_v2_lumen_snapshot(
         {"lumen_snapshot": {"client": "forbidden"}},
         user_id="user-1",
         project_id="project-1",
@@ -142,14 +144,14 @@ async def test_v2_run_admission_freezes_lumen_selection_and_overwrites_client_pa
 
 
 def test_v2_run_snapshots_freeze_model_and_tool_limits():
-    payload = durable_runs._freeze_v2_tool_call_limit({}, 2)
+    payload = common._freeze_v2_tool_call_limit({}, 2)
 
     assert payload["v2_max_model_turns"] == 8
     assert payload["v2_max_tool_calls"] == 24
 
 
 def test_v2_run_snapshot_freezes_validated_agent_policy_limits():
-    payload = durable_runs._freeze_v2_tool_call_limit(
+    payload = common._freeze_v2_tool_call_limit(
         {
             "execution_policy": {
                 "allowed_modes": ["chat"],
@@ -173,13 +175,13 @@ def test_v2_run_snapshot_freezes_validated_agent_policy_limits():
 def test_v1_run_payload_does_not_gain_v2_execution_policy_limits():
     payload = {"execution_policy": {"max_model_turns": 1, "max_tool_calls": 1}}
 
-    assert durable_runs._freeze_v2_tool_call_limit(payload, 1) is payload
+    assert common._freeze_v2_tool_call_limit(payload, 1) is payload
     assert "v2_max_model_turns" not in payload
     assert "v2_max_tool_calls" not in payload
 
 
 def test_v2_tool_result_projects_bounded_display_and_artifact_parts():
-    parts = durable_runs._tool_display_parts(
+    parts = common._tool_display_parts(
         {
             "display": [{"type": "code", "code": "print('ok')", "language": "python"}],
             "artifacts": [
@@ -224,12 +226,12 @@ def test_protocol_payload_check_preserves_legacy_v1_and_rejects_mismatches(monke
     v1_run = SimpleNamespace(execution_protocol_version=1)
     v2_run = SimpleNamespace(execution_protocol_version=2)
 
-    assert durable_runs._validate_run_protocol_payload(v1_run, {})
-    assert durable_runs._validate_run_protocol_payload(v1_run, {"execution_protocol_version": 1})
-    assert not durable_runs._validate_run_protocol_payload(v1_run, {"execution_protocol_version": 2})
-    assert not durable_runs._validate_run_protocol_payload(v2_run, {})
-    monkeypatch.setattr(durable_runs, "is_supported", lambda _version: False)
-    assert not durable_runs._validate_run_protocol_payload(v1_run, {})
+    assert common._validate_run_protocol_payload(v1_run, {})
+    assert common._validate_run_protocol_payload(v1_run, {"execution_protocol_version": 1})
+    assert not common._validate_run_protocol_payload(v1_run, {"execution_protocol_version": 2})
+    assert not common._validate_run_protocol_payload(v2_run, {})
+    monkeypatch.setattr(common, "is_supported", lambda _version: False)
+    assert not common._validate_run_protocol_payload(v1_run, {})
 
 
 def test_frozen_run_forwards_only_selected_mcp_credential_versions():
@@ -241,12 +243,12 @@ def test_frozen_run_forwards_only_selected_mcp_credential_versions():
         ]
     }
 
-    assert durable_runs._selected_mcp_credential_versions(snapshot, (8,)) == ((8, 4),)
+    assert common._selected_mcp_credential_versions(snapshot, (8,)) == ((8, 4),)
 
 
 def test_managed_usage_components_use_frozen_component_prices():
 
-    cost, components = durable_runs._managed_usage_components(
+    cost, components = execution._managed_usage_components(
         [
             {
                 "kind": "web_search_requests",
@@ -287,7 +289,7 @@ def test_v2_run_transition_table_preserves_waiting_states():
 
 
 def test_advisor_usage_uses_its_immutable_route_price():
-    cost, components = durable_runs._managed_usage_components(
+    cost, components = execution._managed_usage_components(
         [
             {
                 "kind": "advisor_input_tokens",
@@ -353,7 +355,7 @@ async def test_events_replay_canonical_journal_with_sse_id(client, monkeypatch):
         assert kwargs["after_seq"] == 0
         return [event], True
 
-    monkeypatch.setattr(durable_runs, "owned_events", events)
+    monkeypatch.setattr(queries, "owned_events", events)
     response = await client.get("/api/v1/chat/runs/run-1/events")
 
     assert response.status_code == 200
@@ -373,9 +375,9 @@ async def test_events_reject_mismatched_cursor_sources(client):
 
 async def test_events_return_gone_after_temporary_journal_purge(client, monkeypatch):
     async def events(**kwargs):
-        raise durable_runs.DurableRunCursorExpired("temporary chat event journal has expired")
+        raise durable_errors.DurableRunCursorExpired("temporary chat event journal has expired")
 
-    monkeypatch.setattr(durable_runs, "owned_events", events)
+    monkeypatch.setattr(queries, "owned_events", events)
     response = await client.get("/api/v1/chat/runs/run-1/events", headers={"Last-Event-ID": "run-1:1"})
 
     assert response.status_code == 410
@@ -388,7 +390,7 @@ async def test_cancel_is_owner_scoped_and_idempotent(client, monkeypatch):
         seen.update(kwargs)
         return {"run_id": "run-1", "status": "running"}
 
-    monkeypatch.setattr(durable_runs, "request_cancelled", cancel)
+    monkeypatch.setattr(lifecycle, "request_cancelled", cancel)
     response = await client.post("/api/v1/chat/runs/run-1/cancel")
 
     assert response.status_code == 200
@@ -404,7 +406,7 @@ async def test_approval_decision_is_owner_scoped_and_validated(client, monkeypat
         seen.update(kwargs)
         return {"run_id": "run-1", "call_id": "call-1", "decision": "approve", "status": "approved"}
 
-    monkeypatch.setattr(durable_runs, "resolve_tool_approval", resolve)
+    monkeypatch.setattr(interactions, "resolve_tool_approval", resolve)
     response = await client.post("/api/v1/chat/runs/run-1/approvals/call-1", json={"decision": "approve"})
 
     assert response.status_code == 200
@@ -427,7 +429,7 @@ async def test_interaction_response_is_owner_scoped_and_validated(client, monkey
         seen.update(kwargs)
         return {"run_id": "run-1", "interaction_id": "interaction-1", "status": "answered"}
 
-    monkeypatch.setattr(durable_runs, "resolve_run_interaction", resolve)
+    monkeypatch.setattr(interactions, "resolve_run_interaction", resolve)
     response = await client.post(
         "/api/v1/chat/runs/run-1/interactions/interaction-1",
         json={"response": {"option_ids": ["yes"], "text": None}},

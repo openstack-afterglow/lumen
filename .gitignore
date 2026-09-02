@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.lumen-console/
+local-data/
+dist/
+*.egg-info/
+.hatch/
+.pytest_cache/
+.kolla-venv/
