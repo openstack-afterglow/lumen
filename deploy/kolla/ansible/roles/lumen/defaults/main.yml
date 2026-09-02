@@ -8,7 +8,7 @@ lumen_worker_image: "{{ lumen_image_namespace }}/lumen-worker"
 
 lumen_source_mode: "{{ enable_lumen_source_build | default(enable_source_build | default(lumen_dev_mode | default(false))) | bool }}"
 lumen_source_repo: "https://github.com/openstack-afterglow/lumen.git"
-lumen_source_version: "d082460d8653b07bb9b655acd61f97a5ee69e2a5"
+lumen_source_version: "751ce1e702deb4420a086d8d52054233b2f1b438"
 lumen_source_dir: "{{ lumen_source_checkout_path | default('/opt/afterglow/src/lumen') }}"
 lumen_api_image_ref: "{{ 'afterglow-local/lumen-api:' ~ (lumen_source_version | truncate(12, True, '')) if (lumen_source_mode | bool) else (lumen_api_image ~ ':' ~ lumen_image_tag) }}"
 lumen_worker_image_ref: "{{ 'afterglow-local/lumen-worker:' ~ (lumen_source_version | truncate(12, True, '')) if (lumen_source_mode | bool) else (lumen_worker_image ~ ':' ~ lumen_image_tag) }}"
