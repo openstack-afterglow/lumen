@@ -23,9 +23,8 @@
     that:
       - lumen_database_password is defined and lumen_database_password | length > 0
       - lumen_keystone_password is defined and lumen_keystone_password | length > 0
-      - lumen_encryption_key is defined and lumen_encryption_key | length == 64
-      - (afterglow_kubeconfig_encryption_key is not defined or lumen_encryption_key == afterglow_kubeconfig_encryption_key)
-    fail_msg: "Lumen DB/Keystone secrets must be set, and its encryption key must equal afterglow_kubeconfig_encryption_key when afterglow_kubeconfig_encryption_key is set"
+      - lumen_encryption_key is defined and lumen_encryption_key is regex('^[0-9a-fA-F]{64}$')
+    fail_msg: "Lumen DB/Keystone secrets must be set, and lumen_encryption_key must be exactly 64 hexadecimal characters"
   tags: precheck
   when: enable_lumen | bool
 

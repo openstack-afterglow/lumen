@@ -1,6 +1,6 @@
 # Lumen
 
-Lumen은 Afterglow용 durable agent/LLM 채팅 서버다. OpenAI·Anthropic 호환 completion, native durable run, server-managed tool/skill/memory, provider routing, usage ledger를 제공한다.
+Lumen은 AI-chat 백엔드(LiteLLM, LangGraph/LangChain agent 실행, provider/model/conversation/tool/memory 런타임 및 secret)를 단독 소유하는 채팅 및 에이전트 서비스다. OpenAI·Anthropic 호환 completion, native durable run, server-managed tool/skill/memory, provider routing, usage ledger를 제공한다.
 
 ## 시작
 
@@ -34,13 +34,13 @@ docker pull ghcr.io/openstack-afterglow/lumen-worker:latest
 Lumen은 Kolla-Ansible 서드파티 서비스 역할을 패키징한 Python 휠 (`lumen-kolla`)을 `deploy/kolla`에서 제공한다.
 
 - **패키지 위치**: `deploy/kolla` (Hatch 휠 프로젝트 `lumen-kolla`)
-- **역할 설치 경로**: `pip install lumen_kolla-0.1.0-py3-none-any.whl` 실행 시 Kolla 가상환경의 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
-- **불변 릴리스 및 이미지 태그**: Git 태그 `v0.1.0` 게시 시 불변 휠 아티팩트 (`lumen_kolla-0.1.0-py3-none-any.whl`)와 Docker 이미지 (`ghcr.io/openstack-afterglow/lumen-api:0.1.0`, `ghcr.io/openstack-afterglow/lumen-worker:0.1.0`)가 동기화된 0.1.0 버전으로 게시된다.
+- **역할 설치 경로**: `pip install lumen_kolla-0.1.1-py3-none-any.whl` 실행 시 Kolla 가상환경의 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
+- **불변 릴리스 및 이미지 태그**: Git 태그 `v0.1.1` 게시 시 불변 휠 아티팩트 (`lumen_kolla-0.1.1-py3-none-any.whl`)와 Docker 이미지 (`ghcr.io/openstack-afterglow/lumen-api:0.1.1`, `ghcr.io/openstack-afterglow/lumen-worker:0.1.1`)가 동기화된 0.1.1 버전으로 게시된다.
 - **첫 배포 및 운영자 동기화**: `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 최초 기동하며, 휠 재설치로 패키지 역할을 최신 상태로 동기화한다.
 - **PostgreSQL 전제**: 기본 `lumen_postgres_mode="external"`은 운영자가 `lumen_external_postgres_url`을 secret 설정에 제공해야 한다. 자체 PostgreSQL을 만들려면 `bundled`와 강한 `lumen_postgres_password`를 명시한다.
 - **업그레이드 및 Reconfigure 검증**: `kolla-ansible -i <inventory> reconfigure --tags lumen`은 이미지 pull (`pull.yml`) → 설정 렌더링 (`config.yml`) → DB 마이그레이션 (`bootstrap_service.yml`) → 서비스 기동 (`start.yml`) 순서로 실행되어 API/Worker 서비스가 기동되기 전 마이그레이션과 이미지 갱신을 보장한다.
 
-### 독립형 컨테이너 API + Console
+### 독립형 컨테이너 API + 로컬 Console (개발자/운영자 툴링)
 
 Afterglow/Keystone 없이도 Compose stack만으로 OpenAI 호환 API와 browser Console을 실행할 수 있다:
 
@@ -55,7 +55,7 @@ docker compose run --rm --no-deps -T lumen-connection
 
 출력의 `base_url`과 `api_key`를 OpenAI SDK에 넣으면 `/v1/models`, 비스트리밍/스트리밍 `/v1/chat/completions`, 실제 provider 응답과 token usage를 사용할 수 있다. 같은 Compose network의 다른 container는 `container_base_url`을 사용한다. Browser Console은 `http://127.0.0.1:7010`이다.
 
-Provider key 없이도 stack을 시작해 계정·연결·모델 상태를 확인할 수 있지만 실제 completion은 실행되지 않는다. Console에는 `provider API key 없음`이 표시된다. 상세 사용법과 secret 수명은 [로컬 Console 가이드](docs/local-console.md)를 참고한다.
+Provider key 없이도 stack을 시작해 계정·연결·모델 상태를 확인할 수 있지만 실제 completion은 실행되지 않는다. Console에는 `provider API key 없음`이 표시된다. Console은 Afterglow 제품 프론트엔드가 아닌 localhost 개발자/운영자 툴링(operator tooling)이다. 상세 사용법과 secret 수명은 [로컬 Console 가이드](docs/local-console.md)를 참고한다.
 
 ### 테스트
 

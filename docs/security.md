@@ -8,7 +8,7 @@ Keystone session과 API key는 `Principal`로 정규화된다. API key principal
 
 ## Secret과 암호화
 
-`lumen_encryption_key` 또는 `k3s_kubeconfig_encryption_key`는 정확히 64 hex characters여야 한다. AES-GCM/HKDF domain separation으로 chat content와 provider key를 분리한다. key/credential/provider secret은 API response, journal snapshot, log에 노출하지 않는다. API key는 SHA-256 hash만 저장하고 issuance response에서만 plaintext를 준다. public/admin API key 조회 및 한도 프로젝션에서는 secret 및 hash가 제외되며 모든 한도/사용량 숫자는 고정소수점 문자열 또는 `null`로만 노출된다.
+`lumen_encryption_key`는 정확히 64 hex characters여야 한다. AES-GCM/HKDF domain separation으로 chat content와 provider key를 분리한다. key/credential/provider secret은 API response, journal snapshot, log에 노출하지 않는다. API key는 SHA-256 hash만 저장하고 issuance response에서만 plaintext를 준다. public/admin API key 조회 및 한도 프로젝션에서는 secret 및 hash가 제외되며 모든 한도/사용량 숫자는 고정소수점 문자열 또는 `null`로만 노출된다.
 
 ## Network boundary
 

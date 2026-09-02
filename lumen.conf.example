@@ -29,7 +29,7 @@ redis_url = "redis://redis:6379/8"
 redis_db_index = 8
 
 [lumen]
-# 정확히 64개의 hex 문자. lumen_encryption_key 또는 k3s_kubeconfig_encryption_key 중 하나가 필요하다.
+# 정확히 64개의 hex 문자. lumen_encryption_key가 필요하다.
 lumen_encryption_key = "CHANGE_TO_64_HEX_CHARACTERS"
 service_chat_enabled = true
 

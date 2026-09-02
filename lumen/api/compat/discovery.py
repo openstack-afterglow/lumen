@@ -86,7 +86,7 @@ class CompatDiscoveryHostGate(BaseModel):
 class CompatDiscoveryResponse(BaseModel):
     version: str = "1.0.0"
     contract_version: str = "1.0.0"
-    service: str = "Afterglow Chat API"
+    service: str = "Lumen AI API"
     description: str = (
         "OpenAI / Anthropic 호환 및 Lumen 네이티브 영속 대화 API. 발급한 API 키로 외부 SDK 또는 웹에서 연결하세요."
     )
@@ -110,7 +110,7 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
     return CompatDiscoveryResponse(
         version="1.0.0",
         contract_version="1.0.0",
-        service="Afterglow Chat API",
+        service="Lumen AI API",
         description="OpenAI / Anthropic 호환 및 Lumen 네이티브 영속 대화 API. 발급한 API 키로 외부 SDK 또는 웹에서 연결하세요.",
         formats=["openai", "anthropic", "lumen_native"],
         profiles={

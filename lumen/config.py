@@ -40,8 +40,6 @@ def _config_candidates() -> list[Path]:
         [
             Path("/etc/lumen/lumen.conf"),
             Path("lumen.conf"),
-            Path("/etc/afterglow/afterglow.conf"),
-            Path("afterglow.conf"),
         ]
     )
     return candidates
@@ -113,7 +111,6 @@ class Settings(BaseSettings):
     redis_db_index: int = 8
 
     lumen_encryption_key: str = ""
-    k3s_kubeconfig_encryption_key: str = ""
 
     # Service flags
     service_chat_enabled: bool = True
@@ -179,9 +176,9 @@ class Settings(BaseSettings):
 
     @property
     def get_lumen_encryption_key(self) -> str:
-        key = (self.lumen_encryption_key or self.k3s_kubeconfig_encryption_key).strip()
+        key = self.lumen_encryption_key.strip()
         if not key:
-            raise ValueError("Lumen encryption key is not set (lumen_encryption_key or k3s_kubeconfig_encryption_key)")
+            raise ValueError("Lumen encryption key is not set (lumen_encryption_key)")
         if len(key) != 64 or any(c not in "0123456789abcdefABCDEF" for c in key):
             raise ValueError("Lumen encryption key must be exactly 64 hex characters")
         return key

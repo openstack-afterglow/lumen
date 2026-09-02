@@ -67,7 +67,7 @@ class OpenAIModelItem(BaseModel):
     id: str
     object: str = "model"
     created: int = 0
-    owned_by: str = "afterglow"
+    owned_by: str = "lumen"
 
 
 class OpenAIModelListResponse(BaseModel):
@@ -147,7 +147,7 @@ def models_list(models: list[dict]) -> dict:
                 "id": m["model_name"],
                 "object": "model",
                 "created": 0,
-                "owned_by": m.get("provider_name") or "afterglow",
+                "owned_by": m.get("provider_name") or "lumen",
             }
             for m in models
         ],

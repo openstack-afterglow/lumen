@@ -17,7 +17,7 @@ Dockerfile은 migration을 자동 실행하지 않는다. migration 누락 상�
 | --- | --- | --- |
 | database | `database_url`, pool/connect timeout | URL default 없음; pool 20/overflow 10 |
 | cache | `redis_url`, `redis_db_index` | `redis://localhost:6379/8`, DB 8 |
-| encryption | `lumen_encryption_key` | 64 hex 필수; `k3s_kubeconfig_encryption_key` fallback |
+| encryption | `lumen_encryption_key` | 64 hex 필수 (fallback 없음) |
 | chat | `chat_execution_protocol_version` | 1 또는 2; v2는 checkpointer 필요 |
 | retention | run event/checkpoint/memory retention | 24h / 7d / 365d |
 | optional stores | `chat_checkpointer_postgres_url`, `chat_memory_pgvector_url`, `chat_asset_s3_*` | configured feature에만 필요 |
@@ -68,14 +68,14 @@ Lumen은 GitHub Actions 파이프라인(`.github/workflows/docker-build.yml`)을
 Lumen은 Kolla-Ansible 서드파티 통합을 위한 Python 패키지(`lumen-kolla`)를 `deploy/kolla` Hatch 프로젝트로 자체 보유 및 제공한다.
 
 ### 1. 휠 패키징 및 최초 배포 (First Deploy)
-- **휠 패키지 빌드**: `deploy/kolla`에서 Hatchling 빌드를 통해 `lumen_kolla-0.1.0-py3-none-any.whl` 아티팩트가 생성된다.
-- **Kolla 환경 설치**: Kolla Ansible 가상환경(`python 3.11`)에 `pip install lumen_kolla-0.1.0-py3-none-any.whl`을 수행하면 역할 자산이 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
+- **휠 패키지 빌드**: `deploy/kolla`에서 Hatchling 빌드를 통해 `lumen_kolla-0.1.1-py3-none-any.whl` 아티팩트가 생성된다.
+- **Kolla 환경 설치**: Kolla Ansible 가상환경(`python 3.11`)에 `pip install lumen_kolla-0.1.1-py3-none-any.whl`을 수행하면 역할 자산이 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
 - **최초 배포 명령어**: `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 precheck, config, database/Keystone preconditions, DB migration(`lumen_bootstrap`), container startup을 순차 실행한다.
 - **PostgreSQL 모드 선택**: 기본값 `lumen_postgres_mode="external"`은 `lumen_external_postgres_url`이 반드시 필요하다. 역할이 PostgreSQL을 관리하게 하려면 `/etc/kolla/config/afterglow/globals.yml`에서 `lumen_postgres_mode: "bundled"`를 선택하고 `secrets.yml`에 강한 `lumen_postgres_password`를 제공한다. 둘 중 하나를 명시하지 않은 stock defaults는 precheck에서 fail-closed 한다.
 
 ### 2. 불변 휠/이미지 릴리스 (Immutable Wheel/Image Release)
-- **락스텝 버전 관리**: `lumen.__version__` (`0.1.0`), Kolla 역할 default `lumen_image_tag` (`0.1.0`), `lumen-kolla` 패키지 버전은 엄격히 동기화된다.
-- **기본 이미지 네임스페이스 및 태그**: Lumen 역할 기본값은 `ghcr.io/openstack-afterglow/lumen-api:0.1.0` 및 `ghcr.io/openstack-afterglow/lumen-worker:0.1.0`을 사용하며 Afterglow release tag에 종속되지 않는다. Operator는 exact digest ref override를 그대로 유지할 수 있다.
+- **락스텝 버전 관리**: `lumen.__version__` (`0.1.1`), Kolla 역할 default `lumen_image_tag` (`0.1.1`), `lumen-kolla` 패키지 버전은 엄격히 동기화된다.
+- **기본 이미지 네임스페이스 및 태그**: Lumen 역할 기본값은 `ghcr.io/openstack-afterglow/lumen-api:0.1.1` 및 `ghcr.io/openstack-afterglow/lumen-worker:0.1.1`을 사용하며 Afterglow release tag에 종속되지 않는다. Operator는 exact digest ref override를 그대로 유지할 수 있다.
 - **GitHub Release 워크플로우**: `v*` 태그 푸시 시 `.github/workflows/release-kolla.yml`이 실행되어 태그/버전 락스텝 검증, 휠 빌드, 독립 3.11 venv 설치/삭제 테스트를 거쳐 불변 휠 아티팩트를 GitHub Release에 자동 첨부한다.
 
 ### 3. 운영자 동기화 (Operator Sync)

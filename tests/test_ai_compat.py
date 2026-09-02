@@ -18,7 +18,7 @@ _H = {"Authorization": "Bearer sk-afgl-test"}
 
 @pytest.fixture(autouse=True)
 def _allow_all_hosts(monkeypatch):
-    """host gate 를 기본 '전체 허용'으로 고정 — 실 afterglow.conf 의 api_hosts 설정과 무관하게
+    """host gate 를 기본 '전체 허용'으로 고정 — 실 lumen.conf 의 api_hosts 설정과 무관하게
     결정론적 테스트. 특정 host gate 테스트는 각자 다시 monkeypatch 해 덮어쓴다."""
     from types import SimpleNamespace
 
@@ -65,6 +65,13 @@ class TestOpenAITranslate:
     def test_models_list(self):
         r = oa.models_list([{"model_name": "gpt-4o", "provider_name": "openai"}])
         assert r["object"] == "list" and r["data"][0]["id"] == "gpt-4o"
+        assert r["data"][0]["owned_by"] == "openai"
+
+        fallback_r = oa.models_list([{"model_name": "gpt-4o"}])
+        assert fallback_r["data"][0]["owned_by"] == "lumen"
+
+        item = oa.OpenAIModelItem(id="m1")
+        assert item.owned_by == "lumen"
 
 
 class TestAnthropicTranslate:
@@ -365,6 +372,7 @@ class TestDiscoveryAndHostGate:
         body = resp.json()
         assert body["version"] == "1.0.0"
         assert body["contract_version"] == "1.0.0"
+        assert body["service"] == "Lumen AI API"
         assert set(body["formats"]) == {"openai", "anthropic", "lumen_native"}
         assert "/v1/chat/completions" in body["endpoints"]["openai"]["chat_completions"]
         assert "/v1/messages" in body["endpoints"]["anthropic"]["messages"]

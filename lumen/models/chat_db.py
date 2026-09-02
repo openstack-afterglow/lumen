@@ -41,7 +41,7 @@ class LlmProvider(Base):
     # litellm custom_llm_provider (openai|anthropic|gemini|vertex_ai|azure|bedrock|ollama|...)
     provider_type: Mapped[str] = mapped_column(VARCHAR(40), nullable=False, default="openai")
     api_base: Mapped[str | None] = mapped_column(VARCHAR(255))
-    # AES-256-GCM(k3s_kubeconfig_encryption_key, 도메인 llm_provider_key) 암호화 상태로 저장
+    # AES-256-GCM(lumen_encryption_key, 도메인 llm_provider_key) 암호화 상태로 저장
     encrypted_api_key: Mapped[str | None] = mapped_column(TEXT)
     # Optional environment variable name used only when no database key exists.
     api_key_env: Mapped[str | None] = mapped_column(VARCHAR(128))

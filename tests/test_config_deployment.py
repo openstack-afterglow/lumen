@@ -1,9 +1,12 @@
 """Unit test for Lumen deployment config loading and environment overrides."""
 
 import os
+from pathlib import Path
 from unittest.mock import patch
 
-from lumen.config import _load_toml, get_settings, load_raw_toml
+import pytest
+
+from lumen.config import Settings, _config_candidates, _load_toml, get_settings, load_raw_toml
 
 
 def test_lumen_toml_config_loading(monkeypatch, tmp_path):
@@ -147,3 +150,29 @@ def test_lumen_maps_afterglow_openstack_section(monkeypatch):
     assert settings["keystone_region_name"] == "RegionTwo"
     assert settings["insecure"] is True
     assert settings["os_cacert"] == "/etc/ssl/certs/keystone-ca.pem"
+
+def test_lumen_config_candidates_only_lumen_paths(monkeypatch):
+    monkeypatch.delenv("LUMEN_CONFIG_FILE", raising=False)
+    candidates = _config_candidates()
+    assert candidates == [Path("/etc/lumen/lumen.conf"), Path("lumen.conf")]
+
+    monkeypatch.setenv("LUMEN_CONFIG_FILE", "/custom/lumen.conf")
+    candidates_custom = _config_candidates()
+    assert candidates_custom == [Path("/custom/lumen.conf"), Path("/etc/lumen/lumen.conf"), Path("lumen.conf")]
+
+
+def test_get_lumen_encryption_key_strict_validation():
+    s_valid = Settings(lumen_encryption_key="a" * 64)
+    assert s_valid.get_lumen_encryption_key == "a" * 64
+
+    s_empty = Settings(lumen_encryption_key="")
+    with pytest.raises(ValueError, match=r"Lumen encryption key is not set \(lumen_encryption_key\)"):
+        _ = s_empty.get_lumen_encryption_key
+
+    s_short = Settings(lumen_encryption_key="a" * 63)
+    with pytest.raises(ValueError, match=r"Lumen encryption key must be exactly 64 hex characters"):
+        _ = s_short.get_lumen_encryption_key
+
+    s_non_hex = Settings(lumen_encryption_key="z" * 64)
+    with pytest.raises(ValueError, match=r"Lumen encryption key must be exactly 64 hex characters"):
+        _ = s_non_hex.get_lumen_encryption_key

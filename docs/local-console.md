@@ -1,6 +1,6 @@
 # 로컬 Lumen Console
 
-Odysseus의 단일 `docker compose up` UX를 참고해 Lumen에도 localhost-only browser console을 제공한다. Console은 Lumen API가 아니다. 별도의 SQLite user/session service이며, upstream Lumen credential은 browser session이 유지되는 동안 console process 메모리에만 둔다.
+Lumen은 AI-chat 백엔드(LiteLLM, LangGraph/LangChain agent 실행, provider/model/conversation/tool/memory 런타임 및 secret)를 단독 소유하며, Odysseus의 단일 `docker compose up` UX를 참고해 localhost-only browser console을 제공한다. Console은 Afterglow 제품 프론트엔드가 아니며, localhost 전용 개발자/운영자 툴링(operator tooling)이다. Console은 Lumen API가 아니며 별도의 SQLite user/session service이고, upstream Lumen credential은 browser session이 유지되는 동안 console process 메모리에만 둔다.
 
 ## 실행
 
@@ -85,4 +85,4 @@ Console 없이 Lumen만 실행하려면 `lumen-api`/`lumen-worker`와 필요한 
 - Seed/API/worker 로그와 HTTP discovery endpoint는 생성된 Lumen API key를 반환하지 않는다.
 - `LUMEN_CONSOLE_SECURE_COOKIES=true`는 HTTPS reverse proxy 뒤에서 설정한다.
 - Compose의 encryption key와 MariaDB password는 **local development 전용**이다. 공개 deployment에서는 secret manager의 서로 다른 secret으로 교체한다.
-- Console은 operator convenience용이다. Lumen의 API-key scope, project isolation, durable-run admission을 우회하지 않는다.
+- Console은 localhost 개발자/운영자 툴링(operator convenience)용이다. Lumen의 API-key scope, project isolation, durable-run admission을 우회하지 않는다.
