@@ -6,14 +6,19 @@
     image: "{{ lumen_postgres_image_ref }}"
     state: started
     restart_policy: unless-stopped
+    network_mode: host
+    command:
+      - postgres
+      - -c
+      - "listen_addresses={{ lumen_postgres_bind_address }}"
+      - -c
+      - "port={{ lumen_postgres_port }}"
     volumes:
       - "{{ lumen_postgres_volume }}:/var/lib/postgresql/data"
     env:
       POSTGRES_DB: "{{ lumen_postgres_database }}"
       POSTGRES_USER: "{{ lumen_postgres_user }}"
       POSTGRES_PASSWORD: "{{ lumen_postgres_password }}"
-    ports:
-      - "{{ lumen_postgres_bind_address }}:{{ lumen_postgres_port }}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U {{ lumen_postgres_user }} -d {{ lumen_postgres_database }}"]
       interval: 10s

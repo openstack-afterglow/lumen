@@ -73,14 +73,14 @@ def test_kolla_yaml_and_jinja_validity():
 def test_kolla_package_version_image_tag_lockstep():
     app_version = lumen.__version__
     sdk_init = (REPO_ROOT / "sdk" / "lumen_sdk" / "__init__.py").read_text(encoding="utf-8")
-    assert app_version == "0.1.1"
-    assert '__version__ = "0.1.1"' in sdk_init
+    assert app_version == "0.1.2"
+    assert '__version__ = "0.1.2"' in sdk_init
 
     defaults_yaml = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
 
     assert defaults_yaml["lumen_image_tag"] == app_version
 
-    assert defaults_yaml["lumen_source_version"] == "751ce1e702deb4420a086d8d52054233b2f1b438"
+    assert defaults_yaml["lumen_source_version"] == "452ba5a18c977648f35710d4d5e9001f6d97b6f2"
     defaults_raw = (ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8")
     assert "afterglow_image_tag" not in defaults_raw, "Lumen package default refers to afterglow_image_tag"
     assert defaults_yaml["lumen_encryption_key"] == "", "Lumen encryption key default must be explicit empty string"
@@ -89,6 +89,20 @@ def test_kolla_package_version_image_tag_lockstep():
     assert defaults_yaml["lumen_image_namespace"] == "ghcr.io/openstack-afterglow"
     assert defaults_yaml["lumen_api_image"] == "{{ lumen_image_namespace }}/lumen-api"
     assert defaults_yaml["lumen_worker_image"] == "{{ lumen_image_namespace }}/lumen-worker"
+
+
+def test_bundled_postgres_binds_the_configured_host_interface():
+    tasks = yaml.safe_load((ROLE_DIR / "tasks" / "preconditions_postgres.yml").read_text(encoding="utf-8"))
+    container = tasks[0]["community.docker.docker_container"]
+    assert container["network_mode"] == "host"
+    assert "ports" not in container
+    assert container["command"] == [
+        "postgres",
+        "-c",
+        "listen_addresses={{ lumen_postgres_bind_address }}",
+        "-c",
+        "port={{ lumen_postgres_port }}",
+    ]
 
 
 def test_kolla_precheck_encryption_key_uncoupled():
