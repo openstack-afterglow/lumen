@@ -385,6 +385,17 @@ class TestDiscoveryAndHostGate:
         assert "host_gate" in body
         assert " (" not in body["models_endpoint"]
 
+    async def test_discovery_uses_configured_public_origin(self, client, monkeypatch):
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            "lumen.api.compat.discovery.get_settings",
+            lambda: SimpleNamespace(public_api_base="https://lumen.example"),
+        )
+        body = (await client.get("/v1/compat")).json()
+        assert body["profiles"]["openai_stateless"]["sdk_base_url"] == "https://lumen.example/v1"
+        assert body["profiles"]["lumen_native"]["sdk_base_url"] == "https://lumen.example"
+
     async def test_blocked_host_404(self, client, monkeypatch):
         from types import SimpleNamespace
 

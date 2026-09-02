@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lumen-sdk"
-version = "0.1.2"
+version = "0.1.3"
 description = "OpenStack SDK extension for the Lumen API"
 requires-python = ">=3.12"
 dependencies = [
