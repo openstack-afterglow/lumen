@@ -1,0 +1,31 @@
+---
+- name: Start | Stat Lumen config file
+  become: true
+  ansible.builtin.stat:
+    path: "{{ lumen_config_dir }}/lumen.conf"
+  register: lumen_config_stat
+  when: inventory_hostname in groups['lumen']
+
+- name: Start | Start Lumen containers
+  become: true
+  community.docker.docker_container:
+    name: "{{ item.value.container_name }}"
+    image: "{{ item.value.image }}"
+    pull: "{{ 'never' if (lumen_source_mode | default(false) | bool) else 'always' }}"
+    state: started
+    restart_policy: "{{ item.value.restart_policy | default('unless-stopped') }}"
+    volumes: "{{ item.value.volumes | default([]) }}"
+    env: "{{ item.value.environment | default({}) }}"
+    command: "{{ item.value.command | default(omit) }}"
+    healthcheck: "{{ item.value.healthcheck | default(omit) }}"
+    ports: "{{ item.value.ports | default([]) }}"
+    network_mode: "{{ item.value.network_mode | default(omit) }}"
+    labels:
+      kolla_version: "2025.2"
+      service: lumen
+      config_hash: "{{ lumen_config_stat.stat.checksum | default('') }}"
+  no_log: true
+  loop: "{{ lumen_services | dict2items }}"
+  when:
+    - inventory_hostname in groups['lumen']
+    - item.value.enabled | bool

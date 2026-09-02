@@ -1,0 +1,7 @@
+galaxy_info:
+  role_name: lumen
+  author: openstack-afterglow
+  description: Lumen durable chat and LLM service deployment role for kolla-ansible
+  min_ansible_version: "2.14"
+
+dependencies: []

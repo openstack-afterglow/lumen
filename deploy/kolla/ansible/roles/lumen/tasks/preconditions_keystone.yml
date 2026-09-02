@@ -1,0 +1,24 @@
+---
+- name: Keystone | Register Lumen service, project, and user
+  ansible.builtin.import_role:
+    name: service-ks-register
+  vars:
+    project_name: lumen
+    service_ks_register_auth: "{{ openstack_auth }}"
+    service_ks_register_services:
+      - name: lumen
+        type: lumen
+        description: "Lumen durable chat and LLM service"
+        endpoints:
+          - interface: public
+            url: "{{ lumen_public_endpoint_url }}"
+          - interface: internal
+            url: "{{ lumen_internal_endpoint_url }}"
+          - interface: admin
+            url: "{{ lumen_admin_endpoint_url }}"
+    service_ks_register_users:
+      - project: "{{ lumen_service_project_name }}"
+        user: "{{ lumen_keystone_user }}"
+        password: "{{ lumen_keystone_password }}"
+        role: admin
+  no_log: true

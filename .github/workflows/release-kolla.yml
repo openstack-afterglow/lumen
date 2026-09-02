@@ -1,0 +1,92 @@
+name: Kolla Packaging Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  release-kolla:
+    name: Build & Release Kolla Package
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip build hatchling
+
+      - name: Verify Tag/Version Lockstep
+        shell: bash
+        run: |
+          PYTHON_VER=$(python3 -c "import lumen; print(lumen.__version__)")
+          DEFAULTS_TAG=$(grep -E '^lumen_image_tag:' deploy/kolla/ansible/roles/lumen/defaults/main.yml | awk '{print $2}' | tr -d '"' | tr -d "'")
+
+          echo "App version: ${PYTHON_VER}"
+          echo "Defaults tag: ${DEFAULTS_TAG}"
+
+          if [ "${PYTHON_VER}" != "${DEFAULTS_TAG}" ]; then
+            echo "ERROR: Version mismatch between lumen.__version__ (${PYTHON_VER}) and role defaults lumen_image_tag (${DEFAULTS_TAG})"
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_VER="${GITHUB_REF#refs/tags/v}"
+            echo "Git tag version: ${TAG_VER}"
+            if [ "${PYTHON_VER}" != "${TAG_VER}" ]; then
+              echo "ERROR: Git tag version (${TAG_VER}) does not match package version (${PYTHON_VER})"
+              exit 1
+            fi
+          fi
+
+      - name: Build Lumen Kolla Wheel
+        run: |
+          python -m build deploy/kolla --wheel --outdir dist/kolla
+
+      - name: Verify Clean Python 3.11 Installation & Uninstall
+        shell: bash
+        run: |
+          python3.11 -m venv .kolla-venv
+          .kolla-venv/bin/pip install --upgrade pip
+          .kolla-venv/bin/pip install dist/kolla/lumen_kolla-*.whl
+
+          ROLE_PATH=".kolla-venv/share/kolla-ansible/ansible/roles/lumen/tasks/main.yml"
+          if [ ! -f "${ROLE_PATH}" ]; then
+            echo "ERROR: Installed role asset missing at ${ROLE_PATH}"
+            exit 1
+          fi
+
+          echo "Installed role asset verified at ${ROLE_PATH}"
+
+          .kolla-venv/bin/pip uninstall -y lumen-kolla
+          if [ -f "${ROLE_PATH}" ]; then
+            echo "ERROR: Uninstall left behind role asset ${ROLE_PATH}"
+            exit 1
+          fi
+
+          echo "Clean uninstall verified."
+
+      - name: Upload Kolla Wheel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-kolla-wheel
+          path: dist/kolla/*.whl
+
+      - name: Attach Wheel to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/kolla/*.whl

@@ -1,0 +1,6 @@
+---
+- name: Include database precondition tasks
+  ansible.builtin.import_tasks: preconditions_db.yml
+
+- name: Include Keystone precondition tasks
+  ansible.builtin.import_tasks: preconditions_keystone.yml

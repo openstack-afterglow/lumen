@@ -1,0 +1,23 @@
+---
+- name: HAProxy | Remove disabled Lumen public route destination
+  become: true
+  ansible.builtin.file:
+    path: "{{ node_config_directory }}/haproxy/services.d/lumen-public.cfg"
+    state: absent
+  when: not (lumen_public_haproxy_enabled | bool)
+
+- name: HAProxy | Remove disabled Lumen external frontend map
+  become: true
+  ansible.builtin.blockinfile:
+    path: "{{ node_config_directory }}/haproxy/external-frontend-map"
+    marker: "# {mark} lumen-public"
+    state: absent
+  when: not (lumen_public_haproxy_enabled | bool)
+
+- name: Configure loadbalancer for Lumen
+  ansible.builtin.import_role:
+    name: loadbalancer-config
+  vars:
+    project_name: lumen
+    project_services: "{{ lumen_haproxy_services }}"
+  tags: always

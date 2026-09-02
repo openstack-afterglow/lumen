@@ -3,3 +3,8 @@ __pycache__/
 .venv/
 .lumen-console/
 local-data/
+dist/
+*.egg-info/
+.hatch/
+.pytest_cache/
+.kolla-venv/

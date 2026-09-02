@@ -62,6 +62,30 @@ Lumen은 GitHub Actions 파이프라인(`.github/workflows/docker-build.yml`)을
 - Dockerfile 타겟(`lumen-api`, `lumen-worker`)은 DB 마이그레이션을 자동 실행하지 않는다.
 - 새 이미지 버전 롤아웃 전에 반드시 마이그레이션 단계(직접 실행 시 `uv run lumen-migrate --apply`, 컨테이너 실행 시 `lumen-migrate --apply`)를 완료한 후 API 및 Worker 컨테이너를 배포해야 한다.
 
+
+## Kolla-Ansible 운영 및 불변 휠 릴리스
+
+Lumen은 Kolla-Ansible 서드파티 통합을 위한 Python 패키지(`lumen-kolla`)를 `deploy/kolla` Hatch 프로젝트로 자체 보유 및 제공한다.
+
+### 1. 휠 패키징 및 최초 배포 (First Deploy)
+- **휠 패키지 빌드**: `deploy/kolla`에서 Hatchling 빌드를 통해 `lumen_kolla-0.1.0-py3-none-any.whl` 아티팩트가 생성된다.
+- **Kolla 환경 설치**: Kolla Ansible 가상환경(`python 3.11`)에 `pip install lumen_kolla-0.1.0-py3-none-any.whl`을 수행하면 역할 자산이 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
+- **최초 배포 명령어**: `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 precheck, config, database/Keystone preconditions, DB migration(`lumen_bootstrap`), container startup을 순차 실행한다.
+- **PostgreSQL 모드 선택**: 기본값 `lumen_postgres_mode="external"`은 `lumen_external_postgres_url`이 반드시 필요하다. 역할이 PostgreSQL을 관리하게 하려면 `/etc/kolla/config/afterglow/globals.yml`에서 `lumen_postgres_mode: "bundled"`를 선택하고 `secrets.yml`에 강한 `lumen_postgres_password`를 제공한다. 둘 중 하나를 명시하지 않은 stock defaults는 precheck에서 fail-closed 한다.
+
+### 2. 불변 휠/이미지 릴리스 (Immutable Wheel/Image Release)
+- **락스텝 버전 관리**: `lumen.__version__` (`0.1.0`), Kolla 역할 default `lumen_image_tag` (`0.1.0`), `lumen-kolla` 패키지 버전은 엄격히 동기화된다.
+- **기본 이미지 네임스페이스 및 태그**: Lumen 역할 기본값은 `ghcr.io/openstack-afterglow/lumen-api:0.1.0` 및 `ghcr.io/openstack-afterglow/lumen-worker:0.1.0`을 사용하며 Afterglow release tag에 종속되지 않는다. Operator는 exact digest ref override를 그대로 유지할 수 있다.
+- **GitHub Release 워크플로우**: `v*` 태그 푸시 시 `.github/workflows/release-kolla.yml`이 실행되어 태그/버전 락스텝 검증, 휠 빌드, 독립 3.11 venv 설치/삭제 테스트를 거쳐 불변 휠 아티팩트를 GitHub Release에 자동 첨부한다.
+
+### 3. 운영자 동기화 (Operator Sync)
+- **역할 업데이트**: 새 버전 출시 시 릴리스된 `lumen_kolla-<version>-py3-none-any.whl`을 Kolla venv에 재설치하여 `share/kolla-ansible/ansible/roles/lumen` 자산을 동기화한다.
+
+### 4. Upgrade vs. Reconfigure 동작 및 마이그레이션 보장 (Migration Guarantee)
+- **Reconfigure 명령어 및 순서 (`reconfigure.yml`)**: `kolla-ansible -i <inventory> reconfigure --tags lumen` (`precheck` → `pull` → `config` → `bootstrap_service` (DB migration) → `start`)
+  - Reconfigure 실행 시 최신 갱신 이미지를 먼저 pull하여, `bootstrap_service` 단계의 DB 마이그레이션이 항상 갱신된 최신 이미지 코드로 실행되도록 보장한다.
+- **Upgrade 명령어 및 순서 (`upgrade.yml`)**: `kolla-ansible -i <inventory> upgrade --tags lumen` (`pull` → `config` → `bootstrap_service` (DB migration) → `start`)
+- **마이그레이션 선행 보장**: `deploy`, `upgrade`, `reconfigure` 모두 API 및 Worker 서비스 컨테이너가 시작/재시작(`start.yml`)되기 전에 DB 마이그레이션(`lumen-migrate --apply`)이 완료됨을 보장한다.
 ## 보존, backup, restore
 
 Temporary thread payload는 30일 뒤 purge 대상이다. terminal run/usage ledger는 accounting record다. SSE cursor는 `Last-Event-ID` 또는 `after_seq`로 replay하며 retention 밖 cursor는 410이다.

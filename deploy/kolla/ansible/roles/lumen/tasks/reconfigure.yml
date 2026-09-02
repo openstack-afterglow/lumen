@@ -1,0 +1,15 @@
+---
+- name: Include precheck tasks
+  ansible.builtin.include_tasks: precheck.yml
+
+- name: Include pull tasks
+  ansible.builtin.include_tasks: pull.yml
+
+- name: Include config tasks
+  ansible.builtin.include_tasks: config.yml
+
+- name: Include bootstrap service tasks
+  ansible.builtin.include_tasks: bootstrap_service.yml
+
+- name: Include start tasks
+  ansible.builtin.include_tasks: start.yml
