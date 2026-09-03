@@ -8,5 +8,5 @@
 
 - [x] 2.1 Run focused Kolla assets and full Lumen contract gate
 - [x] 2.2 Obtain independent security review
-- [ ] 2.3 Publish and deploy the Lumen patch release, then confirm scoped reconfigure output is redacted
-- [ ] 2.4 Archive the completed OpenSpec change
+- [x] 2.3 Publish and deploy the Lumen patch release, then confirm scoped reconfigure output is redacted
+- [x] 2.4 Archive the completed OpenSpec change
