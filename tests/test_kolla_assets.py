@@ -73,8 +73,8 @@ def test_kolla_yaml_and_jinja_validity():
 def test_kolla_package_version_image_tag_lockstep():
     app_version = lumen.__version__
     sdk_init = (REPO_ROOT / "sdk" / "lumen_sdk" / "__init__.py").read_text(encoding="utf-8")
-    assert app_version == "0.1.4"
-    assert '__version__ = "0.1.4"' in sdk_init
+    assert app_version == "0.1.5"
+    assert '__version__ = "0.1.5"' in sdk_init
 
     defaults_yaml = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
 
@@ -236,3 +236,62 @@ def test_kolla_wheel_contents():
             assert f"{prefix}tasks/main.yml" in namelist
             assert f"{prefix}tasks/reconfigure.yml" in namelist
             assert f"{prefix}templates/lumen.conf.j2" in namelist
+
+
+def test_kolla_secret_isolation():
+    defaults_file = ROLE_DIR / "defaults" / "main.yml"
+    defaults = yaml.safe_load(defaults_file.read_text(encoding="utf-8"))
+
+    assert "lumen_service_environments" in defaults
+    service_envs = defaults["lumen_service_environments"]
+    services = defaults["lumen_services"]
+
+    container_services = {"lumen-api", "lumen-worker"}
+    assert set(service_envs.keys()) == container_services
+    assert set(services.keys()) == container_services
+
+    for svc_name, svc_def in services.items():
+        assert "environment" not in svc_def, f"Service {svc_name} in lumen_services must not contain 'environment'"
+
+    serialized_services = yaml.dump(services)
+    secret_keys = [
+        "DATABASE_URL",
+        "REDIS_URL",
+        "KEYSTONE_ADMIN_PASSWORD",
+        "LUMEN_ENCRYPTION_KEY",
+        "LUMEN_MCP_SERVICE_TOKEN",
+        "CHAT_CHECKPOINTER_POSTGRES_URL",
+        "CHAT_MEMORY_PGVECTOR_URL",
+        "CHAT_ASSET_S3_ACCESS_KEY",
+        "CHAT_ASSET_S3_SECRET_KEY",
+        "CHAT_SANDBOX_API_KEY",
+    ]
+    for secret_key in secret_keys:
+        assert secret_key not in serialized_services, f"Secret key {secret_key} found in serialized lumen_services"
+
+    for svc_name in container_services:
+        env = service_envs[svc_name]
+        for secret_key in secret_keys:
+            assert secret_key in env, f"Isolated environment for {svc_name} missing {secret_key}"
+
+    start_file = ROLE_DIR / "tasks" / "start.yml"
+    start_tasks = yaml.safe_load(start_file.read_text(encoding="utf-8"))
+    container_start_task = next(
+        (task for task in start_tasks if task.get("name") == "Start | Start Lumen containers"),
+        None,
+    )
+    assert container_start_task is not None, "Container start task not found in start.yml"
+    assert container_start_task.get("no_log") is True, "Start containers task must have no_log: true"
+    docker_container_args = container_start_task.get("community.docker.docker_container", {})
+    assert docker_container_args.get("env") == "{{ lumen_service_environments[item.key] | default({}) }}", (
+        "start.yml container env must reference lumen_service_environments[item.key] | default({})"
+    )
+
+    task_files = list((ROLE_DIR / "tasks").glob("*.yml"))
+    for task_file in task_files:
+        if task_file.name == "start.yml":
+            continue
+        content = task_file.read_text(encoding="utf-8")
+        assert "lumen_service_environments" not in content, (
+            f"Isolated map lumen_service_environments referenced in unexpected task file: {task_file.name}"
+        )

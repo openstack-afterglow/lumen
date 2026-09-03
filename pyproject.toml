@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lumen"
-version = "0.1.4"
+version = "0.1.5"
 description = "Afterglow Lumen durable chat, LLM, and agent service"
 requires-python = ">=3.12"
 dependencies = [
