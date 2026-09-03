@@ -80,7 +80,7 @@ def test_kolla_package_version_image_tag_lockstep():
 
     assert defaults_yaml["lumen_image_tag"] == app_version
 
-    assert defaults_yaml["lumen_source_version"] == "a0ec3b2511eaf5fc2dc4cfc78247945939765044"
+    assert defaults_yaml["lumen_source_version"] == "4ce3275e835559fd922974b89ec524d756d2a6e1"
     defaults_raw = (ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8")
     assert "afterglow_image_tag" not in defaults_raw, "Lumen package default refers to afterglow_image_tag"
     assert defaults_yaml["lumen_encryption_key"] == "", "Lumen encryption key default must be explicit empty string"
