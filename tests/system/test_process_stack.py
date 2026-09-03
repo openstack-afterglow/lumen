@@ -59,6 +59,9 @@ def test_process_stack_temp_completion_e2e() -> None:
         assert models_data.get("object") == "list", "GET /v1/models response must be an OpenAI model list"
         model_ids = {item.get("id") for item in models_data.get("data", [])}
         assert model_name in model_ids, "Generated connection model is absent from GET /v1/models"
+        assert "lumen" in model_ids, "Lumen virtual model is absent from GET /v1/models"
+        lumen_model_item = next((item for item in models_data.get("data", []) if item.get("id") == "lumen"), None)
+        assert lumen_model_item is not None and lumen_model_item.get("owned_by") == "lumen"
 
         # 2. Call non-streaming POST /v1/chat/completions
         chat_payload = {
@@ -132,6 +135,75 @@ def test_process_stack_temp_completion_e2e() -> None:
             f"Expected total_tokens=15 in stream, got {stream_usage.get('total_tokens')}"
         )
 
+        # 3b. Call non-streaming POST /v1/chat/completions with model="lumen" (durable run via worker)
+        chat_payload_lumen = {
+            "model": "lumen",
+            "messages": [{"role": "user", "content": "Hello process stack via lumen virtual model"}],
+            "stream": False,
+        }
+        chat_resp_lumen = client.post(
+            f"{container_base_url}/chat/completions", headers=headers, json=chat_payload_lumen
+        )
+        assert chat_resp_lumen.status_code == 200, (
+            f"POST /v1/chat/completions (model=lumen) failed: {chat_resp_lumen.status_code}"
+        )
+        chat_data_lumen = chat_resp_lumen.json()
+        assert chat_data_lumen.get("model") == "lumen", "Expected model=lumen in response"
+        choices_lumen = chat_data_lumen.get("choices", [])
+        assert len(choices_lumen) == 1, "Expected one choice for model=lumen completion"
+        assert choices_lumen[0].get("message", {}).get("content") == "Hello from fake provider!", (
+            "Unexpected provider response for model=lumen"
+        )
+        usage_lumen = chat_data_lumen.get("usage", {})
+        assert usage_lumen.get("total_tokens") == 15, (
+            f"Expected total_tokens=15 for model=lumen nonstream, got {usage_lumen.get('total_tokens')}"
+        )
+
+        # 3c. Call streaming POST /v1/chat/completions with model="lumen" and include_usage
+        stream_payload_lumen = {
+            "model": "lumen",
+            "messages": [{"role": "user", "content": "Hello streaming process stack via lumen virtual model"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        received_deltas_lumen: list[str] = []
+        stream_usage_lumen = None
+        seen_done_lumen = False
+
+        with client.stream(
+            "POST", f"{container_base_url}/chat/completions", headers=headers, json=stream_payload_lumen
+        ) as stream_resp_lumen:
+            assert stream_resp_lumen.status_code == 200, (
+                f"Streaming POST /v1/chat/completions (model=lumen) failed: {stream_resp_lumen.status_code}"
+            )
+            for line in stream_resp_lumen.iter_lines():
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    seen_done_lumen = True
+                    break
+                chunk = json.loads(data_str)
+
+                for choice in chunk.get("choices", []):
+                    delta = choice.get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        received_deltas_lumen.append(delta["content"])
+
+                if "usage" in chunk and chunk["usage"]:
+                    stream_usage_lumen = chunk["usage"]
+
+        assert seen_done_lumen, "Streaming model=lumen response did not terminate with [DONE]"
+        full_stream_text_lumen = "".join(received_deltas_lumen)
+        assert full_stream_text_lumen == "Hello from fake provider!", (
+            "Unexpected streamed content for model=lumen"
+        )
+        assert stream_usage_lumen is not None, "Streaming model=lumen response missing final usage chunk"
+        assert stream_usage_lumen.get("total_tokens") == 15, (
+            f"Expected total_tokens=15 for model=lumen stream, got {stream_usage_lumen.get('total_tokens')}"
+        )
         # 4. Submit native temp completion
         temp_headers = {
             "Authorization": f"Bearer {api_key}",
@@ -192,4 +264,16 @@ def test_process_stack_temp_completion_e2e() -> None:
         ]
         assert len(compat_records) >= 2, (
             f"Expected at least 2 compat usage records with run_id is None and total_tokens=15, found {len(compat_records)}"
+        )
+        # Assert usage records for model=lumen compat calls (attributed to durable runs with non-null run_id)
+        durable_compat_records = [
+            item
+            for item in records
+            if item.get("source") == "api"
+            and item.get("api_key_id") == api_key_id
+            and item.get("run_id") is not None
+            and item.get("run_id") != run_id
+        ]
+        assert len(durable_compat_records) >= 2, (
+            f"Expected at least 2 durable compat usage records with non-null run_id for model=lumen, found {len(durable_compat_records)}"
         )

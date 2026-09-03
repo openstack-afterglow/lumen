@@ -24,6 +24,8 @@ mcp_control_plane_url = "{{ lumen_mcp_control_plane_url }}"
 public_api_base = "{{ lumen_public_api_base }}"
 
 [chat]
+chat_default_model = "{{ lumen_chat_default_model }}"
+chat_compat_run_timeout_seconds = {{ lumen_chat_compat_run_timeout_seconds }}
 chat_checkpointer_postgres_url = "{{ lumen_checkpointer_postgres_url }}"
 chat_memory_pgvector_url = "{{ lumen_memory_pgvector_url }}"
 chat_asset_s3_endpoint = "{{ lumen_s3_endpoint_url }}"

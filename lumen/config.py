@@ -118,6 +118,7 @@ class Settings(BaseSettings):
     # Chat Settings
     chat_execution_protocol_version: int = 1
     chat_default_model: str = ""
+    chat_compat_run_timeout_seconds: int = 300
     chat_credit_per_usd: float = 1000.0
     chat_default_monthly_quota: float = 100000.0
     chat_stream_enabled: bool = True
@@ -172,6 +173,13 @@ class Settings(BaseSettings):
             return ""
         if not (value.startswith("http://") or value.startswith("https://")):
             raise ValueError("chat_mcp_oauth_callback_url must start with http:// or https://")
+        return value
+
+    @field_validator("chat_compat_run_timeout_seconds")
+    @classmethod
+    def validate_chat_compat_run_timeout_seconds(cls, value: int) -> int:
+        if not (1 <= value <= 3600):
+            raise ValueError("chat_compat_run_timeout_seconds must be between 1 and 3600")
         return value
 
     @property

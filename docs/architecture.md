@@ -1,6 +1,6 @@
 # 아키텍처
 
-Lumen은 direct `/v1` API와 Afterglow BFF가 rewrite하는 `/api/v1/chat/*`의 실행 서버다. compat API는 LiteLLM completion을 stateless로 중계한다. native API는 durable journal에 intent를 기록하고 worker가 실행한다.
+Lumen은 direct `/v1` API와 Afterglow BFF가 rewrite하는 `/api/v1/chat/*`의 실행 서버다. compat API에서 provider model ID 지정 시에는 LiteLLM completion을 stateless로 중계하며, reserved model `lumen` 지정 시에는 `chat_admission` 및 `durable_runs` admission을 통해 `chat_default_model` 기반 durable run으로 worker에서 실행된다. native API는 durable journal에 intent를 기록하고 worker가 실행한다.
 
 ```mermaid
 flowchart LR

@@ -315,7 +315,7 @@ class TestOpenAIEndpoint:
             headers=_H,
         )
         assert resp.status_code == 429
-        assert "API 키 월 사용 한도를 초과했습니다" in resp.json()["detail"]["error"]["message"]
+        assert "API 키 월 사용 한도를 초과했습니다" in (resp.json().get("error") or resp.json().get("detail", {}).get("error", {}))["message"]
 
         resp_stream = await client.post(
             "/v1/chat/completions",
@@ -323,7 +323,7 @@ class TestOpenAIEndpoint:
             headers=_H,
         )
         assert resp_stream.status_code == 429
-        assert "API 키 월 사용 한도를 초과했습니다" in resp_stream.json()["detail"]["error"]["message"]
+        assert "API 키 월 사용 한도를 초과했습니다" in (resp_stream.json().get("error") or resp_stream.json().get("detail", {}).get("error", {}))["message"]
 
     async def test_openai_tool_choice_forwarded(self, client, _auth, monkeypatch):
         received_extra = {}
@@ -364,6 +364,572 @@ class TestOpenAIEndpoint:
         assert resp.status_code == 200
         assert received_extra.get("tool_choice") == tc
 
+class TestOpenAILumenVirtualModel:
+    """Tests for model='lumen' virtual model boundary."""
+
+    async def test_lumen_model_listed_when_default_configured_and_active(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.providers import repository
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+
+        async def fake_list(active_only=False):
+            return [{"model_name": "gpt-4o", "provider_name": "openai"}]
+
+        monkeypatch.setattr(repository, "list_models", fake_list)
+
+        resp = await client.get("/v1/models", headers=_H)
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        lumen_items = [m for m in data if m["id"] == "lumen"]
+        assert len(lumen_items) == 1
+        assert lumen_items[0]["owned_by"] == "lumen"
+
+    async def test_lumen_model_hidden_when_unconfigured_or_inactive(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.providers import repository
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "")
+
+        async def fake_list(active_only=False):
+            return [{"model_name": "gpt-4o", "provider_name": "openai"}]
+
+        monkeypatch.setattr(repository, "list_models", fake_list)
+
+        resp = await client.get("/v1/models", headers=_H)
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        lumen_items = [m for m in data if m["id"] == "lumen"]
+        assert len(lumen_items) == 0
+
+    async def test_lumen_rejects_caller_tools(self, client, _auth, monkeypatch):
+        async def forbidden_core(*args, **kwargs):
+            raise AssertionError("Direct completion_api must not be called for model=lumen")
+
+        monkeypatch.setattr(core, "complete_once", forbidden_core)
+        monkeypatch.setattr(core, "complete_stream", forbidden_core)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "lumen",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "function": {"name": "test"}}],
+            },
+            headers=_H,
+        )
+        assert resp.status_code == 400
+        assert "error" in resp.json()
+        assert "tools" in resp.json()["error"]["message"]
+
+    async def test_lumen_rejects_multimodal_content(self, client, _auth, monkeypatch):
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "lumen",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            },
+            headers=_H,
+        )
+        assert resp.status_code == 400
+        assert "error" in resp.json()
+        assert "Multimodal" in resp.json()["error"]["message"] or "non-string" in resp.json()["error"]["message"]
+
+    async def test_lumen_rejects_tool_messages_and_tool_calls(self, client, _auth, monkeypatch):
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "lumen",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function"}]},
+                ],
+            },
+            headers=_H,
+        )
+        assert resp.status_code == 400
+        assert "error" in resp.json()
+        assert "tool messages and tool_calls" in resp.json()["error"]["message"]
+
+    async def test_lumen_rejects_non_user_final_message(self, client, _auth, monkeypatch):
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "lumen",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi there"},
+                ],
+            },
+            headers=_H,
+        )
+        assert resp.status_code == 400
+        assert "error" in resp.json()
+        assert "user message" in resp.json()["error"]["message"]
+
+    async def test_lumen_normalizes_developer_role(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.durable_runs import admission, queries
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+
+        created_payloads = []
+
+        async def fake_resolve(model):
+            return {
+                "provider_id": 1,
+                "model_id": 1,
+                "provider_name": "openai",
+                "model_name": "gpt-4o",
+                "config_version_hash": "h1",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.002",
+            }
+
+        async def fake_precheck(*args, **kwargs):
+            return None
+
+        async def fake_create_temp_run(**kw):
+            created_payloads.append(kw["request_payload"])
+            return SimpleNamespace(run_id="run-dev-norm")
+
+        async def fake_owned_events(*args, **kwargs):
+            mock_event = SimpleNamespace(
+                seq=1,
+                type="run.completed",
+                payload=SimpleNamespace(model_dump=lambda: {"status": "completed"}),
+            )
+            return [mock_event], True
+
+        async def forbidden_core(*args, **kwargs):
+            raise AssertionError("Direct completion_api must not be called for model=lumen")
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(admission, "create_temp_run", fake_create_temp_run)
+        monkeypatch.setattr(queries, "owned_events", fake_owned_events)
+        monkeypatch.setattr(core, "complete_once", forbidden_core)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "lumen",
+                "messages": [
+                    {"role": "developer", "content": "System prompt"},
+                    {"role": "user", "content": "User prompt"},
+                ],
+            },
+            headers=_H,
+        )
+        assert resp.status_code == 200
+        assert len(created_payloads) == 1
+        msgs = created_payloads[0]["input_messages"]
+        assert msgs[0] == {"role": "system", "content": "System prompt"}
+        assert msgs[1] == {"role": "user", "content": "User prompt"}
+
+    async def test_lumen_nonstream_success_via_durable_run(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.durable_runs import admission, queries
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+
+        async def fake_resolve(model):
+            return {
+                "provider_id": 1,
+                "model_id": 1,
+                "provider_name": "openai",
+                "model_name": "gpt-4o",
+                "config_version_hash": "h1",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.002",
+            }
+
+        async def fake_precheck(*args, **kwargs):
+            return None
+
+        async def fake_create_temp_run(**kw):
+            assert kw["model_name"] == "gpt-4o"
+            assert kw["user_id"] == "u1"
+            assert kw["project_id"] == "p1"
+            assert kw["api_key_id"] == 7
+            return SimpleNamespace(run_id="run-123")
+
+        async def fake_owned_events(*args, **kwargs):
+            events = [
+                SimpleNamespace(
+                    seq=1,
+                    type="part.delta",
+                    payload=SimpleNamespace(model_dump=lambda: {"part_type": "text", "delta": "Hello from "}),
+                ),
+                SimpleNamespace(
+                    seq=2,
+                    type="part.delta",
+                    payload=SimpleNamespace(model_dump=lambda: {"part_type": "text", "delta": "Lumen!"}),
+                ),
+                SimpleNamespace(
+                    seq=3,
+                    type="usage.updated",
+                    payload=SimpleNamespace(model_dump=lambda: {"prompt_tokens": 10, "completion_tokens": 5}),
+                ),
+                SimpleNamespace(
+                    seq=4,
+                    type="run.completed",
+                    payload=SimpleNamespace(model_dump=lambda: {"status": "completed"}),
+                ),
+            ]
+            return events, True
+
+        async def forbidden_core(*args, **kwargs):
+            raise AssertionError("Direct completion_api must not be called for model=lumen")
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(admission, "create_temp_run", fake_create_temp_run)
+        monkeypatch.setattr(queries, "owned_events", fake_owned_events)
+        monkeypatch.setattr(core, "complete_once", forbidden_core)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "lumen", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["model"] == "lumen"
+        assert body["choices"][0]["message"]["content"] == "Hello from Lumen!"
+        assert body["usage"]["prompt_tokens"] == 10
+        assert body["usage"]["completion_tokens"] == 5
+        assert body["usage"]["total_tokens"] == 15
+
+    async def test_lumen_stream_success(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.durable_runs import admission, queries
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+
+        async def fake_resolve(model):
+            return {
+                "provider_id": 1,
+                "model_id": 1,
+                "provider_name": "openai",
+                "model_name": "gpt-4o",
+                "config_version_hash": "h1",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.002",
+            }
+
+        async def fake_precheck(*args, **kwargs):
+            return None
+
+        async def fake_create_temp_run(**kw):
+            return SimpleNamespace(run_id="run-stream")
+
+        async def fake_owned_events(*args, **kwargs):
+            events = [
+                SimpleNamespace(
+                    seq=1,
+                    type="part.delta",
+                    payload=SimpleNamespace(model_dump=lambda: {"part_type": "text", "delta": "Stream text"}),
+                ),
+                SimpleNamespace(
+                    seq=2,
+                    type="usage.updated",
+                    payload=SimpleNamespace(model_dump=lambda: {"prompt_tokens": 4, "completion_tokens": 2}),
+                ),
+                SimpleNamespace(
+                    seq=3,
+                    type="run.completed",
+                    payload=SimpleNamespace(model_dump=lambda: {"status": "completed"}),
+                ),
+            ]
+            return events, True
+
+        async def forbidden_core(*args, **kwargs):
+            raise AssertionError("Direct completion_api must not be called for model=lumen")
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(admission, "create_temp_run", fake_create_temp_run)
+        monkeypatch.setattr(queries, "owned_events", fake_owned_events)
+        monkeypatch.setattr(core, "complete_stream", forbidden_core)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "lumen",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=_H,
+        )
+        assert resp.status_code == 200
+        text = resp.text
+        assert "Stream text" in text
+        assert "data: [DONE]" in text
+
+    async def test_lumen_timeout_cancels_run(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.durable_runs import admission, lifecycle, queries
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+        monkeypatch.setattr(get_settings(), "chat_compat_run_timeout_seconds", 0)  # Immediate timeout
+
+        cancelled_runs = []
+
+        async def fake_resolve(model):
+            return {
+                "provider_id": 1,
+                "model_id": 1,
+                "provider_name": "openai",
+                "model_name": "gpt-4o",
+                "config_version_hash": "h1",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.002",
+            }
+
+        async def fake_precheck(*args, **kwargs):
+            return None
+
+        async def fake_create_temp_run(**kw):
+            return SimpleNamespace(run_id="run-timeout")
+
+        async def fake_owned_events(*args, **kwargs):
+            return [], False
+
+        async def fake_cancel(*, run_id, project_id, user_id):
+            cancelled_runs.append((run_id, project_id, user_id))
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(admission, "create_temp_run", fake_create_temp_run)
+        monkeypatch.setattr(queries, "owned_events", fake_owned_events)
+        monkeypatch.setattr(lifecycle, "request_cancelled", fake_cancel)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "lumen", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 504
+        assert len(cancelled_runs) == 1
+        assert cancelled_runs[0] == ("run-timeout", "p1", "u1")
+
+    async def test_lumen_stream_durable_run_failed(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.durable_runs import admission, queries
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+
+        async def fake_resolve(model):
+            return {
+                "provider_id": 1,
+                "model_id": 1,
+                "provider_name": "openai",
+                "model_name": "gpt-4o",
+                "config_version_hash": "h1",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.002",
+            }
+
+        async def fake_precheck(*args, **kwargs):
+            return None
+
+        async def fake_create_temp_run(**kw):
+            return SimpleNamespace(run_id="run-stream-fail")
+
+        async def fake_owned_events(*args, **kwargs):
+            events = [
+                SimpleNamespace(
+                    seq=1,
+                    type="run.failed",
+                    payload=SimpleNamespace(model_dump=lambda: {"safe_message": "Worker crashed"}),
+                ),
+            ]
+            return events, True
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(admission, "create_temp_run", fake_create_temp_run)
+        monkeypatch.setattr(queries, "owned_events", fake_owned_events)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "lumen", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 200
+        text = resp.text
+        assert "Worker crashed" in text
+        assert "data: [DONE]" not in text
+
+    async def test_provider_passthrough_preservation_for_other_models(self, client, _auth, _core):
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["model"] == "gpt-4o"
+    async def test_lumen_protocol_version_and_snapshot_shapes(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.durable_runs import admission, queries
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+        monkeypatch.setattr(get_settings(), "chat_execution_protocol_version", 1)
+
+        captured_kwargs = {}
+
+        async def fake_resolve(model):
+            return {
+                "provider_id": 1,
+                "model_id": 1,
+                "provider_name": "openai",
+                "model_name": "gpt-4o",
+                "config_version_hash": "h1",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.002",
+            }
+
+        async def fake_precheck(*args, **kwargs):
+            return None
+
+        async def fake_create_temp_run(**kw):
+            nonlocal captured_kwargs
+            captured_kwargs = kw
+            return SimpleNamespace(run_id="run-proto-shape")
+
+        async def fake_owned_events(*args, **kwargs):
+            events = [
+                SimpleNamespace(
+                    seq=1,
+                    type="part.delta",
+                    payload=SimpleNamespace(model_dump=lambda: {"part_type": "text", "delta": "ok"}),
+                ),
+                SimpleNamespace(
+                    seq=2,
+                    type="run.completed",
+                    payload=SimpleNamespace(model_dump=lambda: {"status": "completed"}),
+                ),
+            ]
+            return events, True
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(admission, "create_temp_run", fake_create_temp_run)
+        monkeypatch.setattr(queries, "owned_events", fake_owned_events)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "lumen", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 200
+        assert captured_kwargs["execution_protocol_version"] == 1
+        cap = captured_kwargs["capability_snapshot"]
+        assert cap["execution_protocol_version"] == 1
+        assert cap["extensions"]["tool_ids"] == []
+        assert cap["effective_features"]["tool_policy"]["mode"] == "none"
+
+    async def test_lumen_transcript_boundaries(self, client, _auth, monkeypatch):
+        msgs = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(101)]
+        msgs[-1] = {"role": "user", "content": "final"}
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "lumen", "messages": msgs},
+            headers=_H,
+        )
+        assert resp.status_code == 400
+        assert "Too many messages" in resp.json()["error"]["message"]
+
+    async def test_lumen_validates_max_tokens_and_temperature(self, client, _auth, monkeypatch):
+        resp_neg_tokens = await client.post(
+            "/v1/chat/completions",
+            json={"model": "lumen", "messages": [{"role": "user", "content": "hi"}], "max_tokens": -10},
+            headers=_H,
+        )
+        assert resp_neg_tokens.status_code == 400
+        assert "max_tokens" in resp_neg_tokens.json()["error"]["message"]
+
+        resp_bad_temp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "lumen", "messages": [{"role": "user", "content": "hi"}], "temperature": 3.0},
+            headers=_H,
+        )
+        assert resp_bad_temp.status_code == 400
+        assert "temperature" in resp_bad_temp.json()["error"]["message"]
+
+    async def test_lumen_rejects_default_model_resolving_to_lumen(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "lumen")
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "lumen", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 503
+        assert "cannot be reserved virtual model" in resp.json()["error"]["message"]
+
+    async def test_lumen_durable_run_error_shielding(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.durable_runs import admission
+        from lumen.services.durable_runs import errors as durable_errors
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+
+        async def fake_resolve(model):
+            return {
+                "provider_id": 1,
+                "model_id": 1,
+                "provider_name": "openai",
+                "model_name": "gpt-4o",
+                "config_version_hash": "h1",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.002",
+            }
+
+        async def fake_precheck(*args, **kwargs):
+            return None
+
+        async def fake_create_temp_run(**kw):
+            raise durable_errors.DurableRunError("Internal DB secret state leaked!")
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(admission, "create_temp_run", fake_create_temp_run)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "lumen", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert resp.status_code == 503
+        assert "Internal DB secret state leaked!" not in resp.json()["error"]["message"]
+        assert resp.json()["error"]["message"] == "Service temporarily unavailable"
+
+    async def test_models_list_dedupes_provider_lumen_model(self, client, _auth, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.providers import repository
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+
+        async def fake_list(active_only=False):
+            return [
+                {"model_name": "gpt-4o", "provider_name": "openai"},
+                {"model_name": "lumen", "provider_name": "custom_provider"},
+            ]
+
+        monkeypatch.setattr(repository, "list_models", fake_list)
+
+        resp = await client.get("/v1/models", headers=_H)
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        lumen_items = [m for m in data if m["id"] == "lumen"]
+        assert len(lumen_items) == 1
+        assert lumen_items[0]["owned_by"] == "lumen"
 
 class TestDiscoveryAndHostGate:
     async def test_discovery_public(self, client):
@@ -378,6 +944,7 @@ class TestDiscoveryAndHostGate:
         assert "/v1/messages" in body["endpoints"]["anthropic"]["messages"]
         assert "/v1/conversations" in body["endpoints"]["native"]["conversations"]
         assert body["profiles"]["openai_stateless"]["sdk_base_url"].endswith("/v1")
+        assert body["profiles"]["openai_lumen"]["sdk_base_url"].endswith("/v1")
         assert not body["profiles"]["anthropic_stateless"]["sdk_base_url"].endswith("/v1")
         assert not body["profiles"]["lumen_native"]["sdk_base_url"].endswith("/v1")
         assert "openapi" in body["links"]
@@ -394,6 +961,7 @@ class TestDiscoveryAndHostGate:
         )
         body = (await client.get("/v1/compat")).json()
         assert body["profiles"]["openai_stateless"]["sdk_base_url"] == "https://lumen.example/v1"
+        assert body["profiles"]["openai_lumen"]["sdk_base_url"] == "https://lumen.example/v1"
         assert body["profiles"]["lumen_native"]["sdk_base_url"] == "https://lumen.example"
 
     async def test_blocked_host_404(self, client, monkeypatch):

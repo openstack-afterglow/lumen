@@ -82,7 +82,10 @@ class TestOpenAPIContract:
         schema = app.openapi()
         assert schema.get("x-contract-version") == "1.0.0"
         profiles = schema.get("x-profiles", {})
+        assert "openai_lumen" in profiles
+        assert "durable completion" in profiles["openai_lumen"]
         assert "openai_stateless" in profiles
+        assert "stateless provider" in profiles["openai_stateless"]
         assert "anthropic_stateless" in profiles
         assert "lumen_native" in profiles
 

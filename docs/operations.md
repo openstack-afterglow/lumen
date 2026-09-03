@@ -18,7 +18,7 @@ Dockerfile은 migration을 자동 실행하지 않는다. migration 누락 상�
 | database | `database_url`, pool/connect timeout | URL default 없음; pool 20/overflow 10 |
 | cache | `redis_url`, `redis_db_index` | `redis://localhost:6379/8`, DB 8 |
 | encryption | `lumen_encryption_key` | 64 hex 필수 (fallback 없음) |
-| chat | `chat_execution_protocol_version` | 1 또는 2; v2는 checkpointer 필요 |
+| chat | `chat_default_model`, `chat_compat_run_timeout_seconds`, `chat_execution_protocol_version` | default model (virtual model `lumen` 백엔드), compat run timeout (기본 300초, 1..3600), protocol v1/v2 |
 | retention | run event/checkpoint/memory retention | 24h / 7d / 365d |
 | optional stores | `chat_checkpointer_postgres_url`, `chat_memory_pgvector_url`, `chat_asset_s3_*` | configured feature에만 필요 |
 | TLS/auth | `os_cacert`, `insecure`, Keystone fields | TLS verify 기본 활성; `insecure`는 예외적 개발 설정 |
