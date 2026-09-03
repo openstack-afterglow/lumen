@@ -34,8 +34,8 @@ docker pull ghcr.io/openstack-afterglow/lumen-worker:latest
 Lumen은 Kolla-Ansible 서드파티 서비스 역할을 패키징한 Python 휠 (`lumen-kolla`)을 `deploy/kolla`에서 제공한다.
 
 - **패키지 위치**: `deploy/kolla` (Hatch 휠 프로젝트 `lumen-kolla`)
-- **역할 설치 경로**: `pip install lumen_kolla-0.1.1-py3-none-any.whl` 실행 시 Kolla 가상환경의 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
-- **불변 릴리스 및 이미지 태그**: Git 태그 `v0.1.1` 게시 시 불변 휠 아티팩트 (`lumen_kolla-0.1.1-py3-none-any.whl`)와 Docker 이미지 (`ghcr.io/openstack-afterglow/lumen-api:0.1.1`, `ghcr.io/openstack-afterglow/lumen-worker:0.1.1`)가 동기화된 0.1.1 버전으로 게시된다.
+- **역할 설치 경로**: `pip install lumen_kolla-<version>-py3-none-any.whl` 실행 시 Kolla 가상환경의 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
+- **불변 릴리스 및 이미지 태그**: Git 태그 `v<version>`은 같은 버전의 `lumen_kolla-<version>-py3-none-any.whl`과 `ghcr.io/openstack-afterglow/lumen-{api,worker}:<version>`을 게시한다.
 - **첫 배포 및 운영자 동기화**: `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 최초 기동하며, 휠 재설치로 패키지 역할을 최신 상태로 동기화한다.
 - **PostgreSQL 전제**: 기본 `lumen_postgres_mode="external"`은 운영자가 `lumen_external_postgres_url`을 secret 설정에 제공해야 한다. 자체 PostgreSQL을 만들려면 `bundled`와 강한 `lumen_postgres_password`를 명시한다.
 - **업그레이드 및 Reconfigure 검증**: `kolla-ansible -i <inventory> reconfigure --tags lumen`은 이미지 pull (`pull.yml`) → 설정 렌더링 (`config.yml`) → DB 마이그레이션 (`bootstrap_service.yml`) → 서비스 기동 (`start.yml`) 순서로 실행되어 API/Worker 서비스가 기동되기 전 마이그레이션과 이미지 갱신을 보장한다.
@@ -78,7 +78,7 @@ uv run lumen-test system
 
 | Surface | 용도 | 인증/권한 |
 | --- | --- | --- |
-| OpenAI/Anthropic compat | 단순 stateless completion, caller-owned tools | `models:read`, `compat:completions:write` API key |
+| OpenAI/Anthropic compat | `model="lumen"`: Lumen 백엔드 durable execution (text-only, tools/memory 비활성화); provider model ID: stateless completion | `models:read`, `compat:completions:write` API key |
 | Native `/v1` | durable run, server tool/skill/memory, replay/approval | native least-privilege scope |
 | `lumen_sdk.Client` | direct native API-key transport | 필요한 native scope |
 | `lumen_sdk.register(openstack.Connection)` | Keystone/OpenStack transport | Keystone principal |
@@ -87,15 +87,26 @@ server-managed tool, skill, memory가 필요하면 compat completion이 아니�
 
 ### OpenAI compat
 
+`model="lumen"`을 사용하면 OpenAI SDK를 통해 백엔드 `chat_default_model` 기반의 Lumen durable worker 실행과 직접 대화할 수 있습니다 (text-only, caller tools/memory 비활성화). 특정 provider model ID를 지칭하면 기존 stateless 중계로 동작합니다:
+
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="https://lumen.example/v1", api_key="sk-afgl-...")
-reply = client.chat.completions.create(
+
+# 1. Lumen virtual model (durable worker execution)
+reply_durable = client.chat.completions.create(
+    model="lumen",
+    messages=[{"role": "user", "content": "hello"}],
+)
+print(reply_durable.choices[0].message.content)
+
+# 2. Provider direct model (stateless completion)
+reply_direct = client.chat.completions.create(
     model="provider-model",
     messages=[{"role": "user", "content": "hello"}],
 )
-print(reply.choices[0].message.content)
+print(reply_direct.choices[0].message.content)
 ```
 
 ### Anthropic compat

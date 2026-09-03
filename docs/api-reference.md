@@ -39,9 +39,9 @@ API-key run은 text `execution_mode="chat"`만 허용한다. `memory=true`는 me
 
 Standalone Compose는 `seed-local`이 같은 scope와 native Console scope를 가진 local key를 발급하고 mode `0600` connection manifest에 저장한다. `docker compose run --rm --no-deps -T lumen-connection`을 명시적으로 실행할 때만 `/v1`로 끝나는 host `base_url`, Compose-network `container_base_url`, key, model을 출력한다. 생성 key를 반환하는 HTTP endpoint는 없다.
 
-OpenAI 비스트리밍 completion은 provider content와 `prompt_tokens`, `completion_tokens`, `total_tokens`를 반환한다. 스트리밍 usage는 요청에 `stream_options={"include_usage": true}`를 지정해야 마지막 usage chunk로 반환된다. 두 경로 모두 API-key quota admission과 `source="api"` usage ledger를 거친다.
+OpenAI 비스트리밍/스트리밍 completion에서 `model="lumen"`을 사용하면 서버 설정 `chat_default_model`을 백엔드로 하는 Lumen durable run이 생성되어 worker에서 실행된다. 이 경로는 text-only, tools/memory 비활성 상태로 동작하며 응답 usage는 durable run 원장에 기록된다. `GET /v1/models`는 active `chat_default_model`이 구성되어 있을 때만 `owned_by="lumen"`인 `lumen` 모델을 표출한다. 일반 provider model ID 지정 시에는 기존 direct stateless 중계가 수행된다. 스트리밍 usage는 요청에 `stream_options={"include_usage": true}`를 지정해야 마지막 usage chunk로 반환된다. 모든 경로가 API-key quota admission과 `source="api"` usage ledger를 거친다.
 
-호환 API는 full vendor API parity가 아니며, 처리 대상 필드(`model`, `messages`, `system`, `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`, `stream_options`) 외 벤더 전용 추가 필드는 수용되나 무시된다. `max_tokens`는 생략/0 포함 최대 4096으로 제한된다.
+호환 API는 full vendor API parity가 아니며, OpenAI 호환 오류는 최상위 `{ "error": { "message": ..., "type": ..., "code": ... } }` 구조를 반환한다. 처리 대상 필드(`model`, `messages`, `system`, `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`, `stream_options`) 외 벤더 전용 추가 필드는 수용되나 무시된다. `model="lumen"` 요청은 `tools`, `tool_choice`, non-string/multimodal content 및 0 이하 `max_tokens`를 400 OpenAI error로 거부한다. Provider model direct 요청은 기존 caller-owned tool pass-through를 유지하며 `max_tokens` 생략/0을 4096으로 해석하고 그보다 큰 값은 4096으로 제한한다.
 ## Provider credential 상태
 
 `GET /v1/chat/models`의 각 모델은 secret 없이 `provider_api_key_configured`를 반환한다. `true`는 암호화 DB key 또는 `api_key_env`가 가리키는 비어 있지 않은 환경 변수 중 하나가 현재 API process에 있음을 뜻한다. `false`는 Lumen에 명시적 provider API key가 없다는 뜻이며 provider 도달 가능성이나 keyless provider의 실행 가능성까지 판정하지는 않는다.
@@ -95,4 +95,4 @@ API 키 발급 및 한도 관리는 Keystone token 인증 전용(Keystone-only)�
 
 `GET /v1/health`는 웹 프로세스 liveness만 검사하며(`{"status": "ok"}`), MariaDB/Redis 연결이나 Worker readiness를 보장하지 않는다. Worker 부재 시에도 API 서버는 요청을 수락하고 `queued` 상태로 유지한다.
 
-주요 오류는 unauthenticated/invalid key 401, project mismatch 또는 scope denial 403, invalid request 422, quota 402(native) / 429(compat), idempotency conflict 409, store/config unavailable 503, expired event cursor 410이다. Compat HTTP 에러는 OpenAI `{ "detail": { "error": ... } }`, Anthropic `{ "detail": { "type": "error", ... } }` 구조를 따르며, 호환 스트리밍 failure는 in-band SSE event, Native 스트리밍 실패는 `run.failed` 이벤트로 전달된다.
+주요 오류는 unauthenticated/invalid key 401, project mismatch 또는 scope denial 403, invalid request 422, quota 402(native) / 429(compat), idempotency conflict 409, store/config unavailable 503, expired event cursor 410이다. OpenAI route가 생성하는 HTTP 오류는 최상위 `{ "error": { "message": ..., "type": ..., "code": ... } }`, Anthropic 오류는 `{ "detail": { "type": "error", ... } }` 구조를 사용한다. 호환 스트리밍 failure는 in-band SSE error, Native 스트리밍 실패는 `run.failed` 이벤트로 전달된다.

@@ -36,6 +36,7 @@ service_chat_enabled = true
 [chat]
 chat_execution_protocol_version = 1
 chat_default_model = ""
+chat_compat_run_timeout_seconds = 300
 chat_credit_per_usd = 1000.0
 chat_default_monthly_quota = 100000.0
 chat_stream_enabled = true

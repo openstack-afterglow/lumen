@@ -33,6 +33,8 @@ services:
       # Development-only deterministic key. Replace before exposing a deployment.
       LUMEN_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       CHAT_API_HOSTS: localhost,127.0.0.1,lumen-api
+      CHAT_DEFAULT_MODEL: ${LUMEN_LOCAL_MODEL:-gpt-4.1-mini}
+      CHAT_COMPAT_RUN_TIMEOUT_SECONDS: ${CHAT_COMPAT_RUN_TIMEOUT_SECONDS:-300}
     depends_on:
       mariadb:
         condition: service_healthy

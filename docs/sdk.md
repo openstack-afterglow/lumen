@@ -2,10 +2,11 @@
 
 | 요구 | 선택 |
 | --- | --- |
-| OpenAI/Anthropic 호환, caller-owned tool calls | compat API |
-| durable run, server-managed tool/skill/memory, replay/approval | native `/v1` + `lumen_sdk.Client` 또는 Keystone Proxy |
+| OpenAI SDK로 Lumen durable worker와 text chat | compat API의 `model="lumen"` |
+| OpenAI/Anthropic 형식의 provider-direct, caller-owned tool calls | compat API의 provider model ID |
+| durable conversation, server-managed tool/skill/memory, replay/approval | native `/v1` + `lumen_sdk.Client` 또는 Keystone Proxy |
 
-Compat route에 server-managed feature를 섞지 않는다.
+`model="lumen"` compat route는 첫 단계에서 text-only이며 server-managed tool/memory를 비활성화한다. 해당 기능이 필요하면 Native route를 사용한다.
 
 ## OpenAI / Anthropic compat
 
@@ -16,13 +17,13 @@ from openai import OpenAI
 
 client = OpenAI(base_url="https://lumen.example/v1", api_key="sk-afgl-...")
 response = client.chat.completions.create(
-    model="provider-model",
+    model="lumen",
     messages=[{"role": "user", "content": "hello"}],
 )
 print(response.choices[0].message.content)
 ```
 
-Anthropic client도 deployment의 `/v1/messages` compat surface를 사용한다. Compat는 durable conversation, server-side memory/skill/tool lifecycle을 만들지 않는다.
+`model="lumen"`은 서버의 `chat_default_model`을 사용해 Lumen durable worker에서 실행한다. 특정 provider model ID를 사용하면 기존 stateless provider-direct 경로가 유지된다. Anthropic client도 deployment의 `/v1/messages` stateless surface를 사용한다.
 
 ## Direct API-key client
 

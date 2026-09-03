@@ -196,7 +196,8 @@ def custom_openapi() -> dict:
     schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
     schema["x-contract-version"] = "1.0.0"
     schema["x-profiles"] = {
-        "openai_stateless": "OpenAI-compatible stateless completion (/v1/chat/completions)",
+        "openai_lumen": "OpenAI-compatible Lumen durable completion (/v1/chat/completions, model='lumen')",
+        "openai_stateless": "OpenAI-compatible stateless provider completion (/v1/chat/completions, provider model IDs)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
         "lumen_native": "Lumen native durable runs (/v1/conversations/{conversation_id}/completions, /v1/temp-completions, /v1/runs/...)",
     }

@@ -10,11 +10,11 @@ Lumen은 목적과 권한 수준에 따라 3가지 연동 프로필을 제공합
 
 | 프로필 | 주요 용도 | 주요 엔드포인트 | 인증 및 Scope |
 | --- | --- | --- | --- |
-| **OpenAI Stateless** | 단순 호환 Text/Vision Completion, 클라이언트 주도 Tool Call | `POST /v1/chat/completions`<br>`GET /v1/models` | `models:read`<br>`compat:completions:write` (API Key 전용) |
+| **OpenAI Compatible** | `model="lumen"`: Lumen 백엔드 durable execution (`chat_default_model`, text-only, tools/memory 비활성화); provider model ID: stateless completion | `POST /v1/chat/completions`<br>`GET /v1/models` | `models:read`<br>`compat:completions:write` (API Key 전용) |
 | **Anthropic Stateless** | Claude 메시지 API 호환, 클라이언트 주도 Tool Call | `POST /v1/messages` | `models:read`<br>`compat:completions:write` (API Key 전용) |
 | **Native Durable** | Afterglow 영속 대화, 서버 관리형 Tool/Skill/Memory, Replay, 승인 및 사용량 추적 | `POST /v1/conversations/{id}/completions`<br>`POST /v1/temp-completions`<br>`GET /v1/runs/{id}/events` | Native least-privilege scope (Keystone Token 또는 Scoped API Key) |
 
-> **선택 기준**: 단순 LLM completion 호출 및 독립 툴 실행에는 Stateless 프로필(OpenAI/Anthropic)을 사용하고, 대화 이력 영속화, 서버 관리형 도구/스킬/메모리, 중단-승인(Human-in-the-loop) 및 복구가 필요한 경우 Native Durable 프로필을 사용합니다.
+> **선택 기준**: `model="lumen"`은 OpenAI SDK 포맷으로 백엔드 durable worker 실행과 대화하며, 특정 provider model ID 지칭 시 stateless completion 중계로 동작합니다. 대화 이력 영속화, 서버 관리형 도구/스킬/메모리, 중단-승인(Human-in-the-loop) 및 복구가 필요한 경우 Native Durable 프로필을 사용합니다.
 
 ---
 
@@ -137,23 +137,24 @@ API Key 요청 시 필요한 최소 Scope 정의:
 
 ---
 
-## 6. Stateless 호환 파라미터 및 제약 사항
+## 6. 호환 파라미터 및 제약 사항
 
 Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보장하지 않으며, 다음 명시된 필드만 처리합니다.
 
 ### 6.1 지원 필드 범위
 
 * **OpenAI 호환 (`POST /v1/chat/completions`)**:
-  - `model`: 모델 ID (필수)
+  - `model`: `lumen` virtual model 또는 provider model ID (필수)
   - `messages`: 메시지 목록 (필수)
   - `stream`: 스트리밍 여부 (기본값 `false`)
   - `temperature`: 생성 샘플링 온도
   - `max_tokens`: 최대 생성 토큰 수
-  - `tools`: Function calling 도구 정의 목록
-  - `tool_choice`: 도구 선택 정책 (LiteLLM으로 전달됨)
+  - `tools`: provider model direct 요청에서만 전달되는 Function calling 도구 정의 목록
+  - `tool_choice`: provider model direct 요청에서만 LiteLLM으로 전달되는 도구 선택 정책
   - `stream_options`: `{"include_usage": true}` 지정 시 스트리밍 마지막에 토큰 사용량 chunk 반환
+  - `model="lumen"`은 문자열 content의 `system`/`developer`/`user`/`assistant` transcript만 받고 마지막 `user` message를 요구합니다. Caller tools/tool messages/multimodal content는 400으로 거부하며 Lumen memory/extensions/MCP/tool 실행은 이 첫 단계에서 비활성화됩니다.
 * **Anthropic 호환 (`POST /v1/messages`)**:
-  - `model`: 모델 ID (필수)
+  - `model`: provider 모델 ID (필수)
   - `messages`: 메시지 목록 (필수)
   - `system`: 시스템 프롬프트
   - `max_tokens`: 최대 생성 토큰 수
@@ -166,7 +167,7 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
 ### 6.2 토큰 수 상한 제약 (`max_tokens`)
 
 * Compat Core 및 Native Provider 출력 모두 `max_tokens` 최대값을 **4096**으로 제한합니다.
-* 요청에서 `max_tokens`를 생략하거나 `0`으로 지정하는 경우에도 자동으로 **4096**으로 해석 및 상한 적용됩니다.
+* `model="lumen"`은 0 이하 값을 400으로 거부합니다. Provider model direct 요청은 생략/0을 **4096**으로 해석합니다.
 
 ---
 
@@ -348,15 +349,14 @@ FastAPI 프레임워크 특성에 따라 HTTP 예외 발생 시 반환되는 JSO
 ```typescript
 import { randomUUID } from "node:crypto";
 
-const LUMEN_ORIGIN = process.env.LUMEN_ORIGIN || "http://localhost:8012";
 const LUMEN_API_KEY = process.env.LUMEN_API_KEY;
-const LUMEN_MODEL = process.env.LUMEN_MODEL;
+const LUMEN_PROVIDER_MODEL = process.env.LUMEN_PROVIDER_MODEL;
 
-if (!LUMEN_API_KEY || !LUMEN_MODEL) {
-  throw new Error("LUMEN_API_KEY and LUMEN_MODEL environment variables are required");
+if (!LUMEN_API_KEY) {
+  throw new Error("LUMEN_API_KEY environment variable is required");
 }
 
-// 1. OpenAI 호환 Stateless Completion (OpenAI base_url은 /v1 필수)
+// 1. OpenAI 호환 Lumen Durable Completion (OpenAI base_url은 /v1 필수)
 export async function callOpenAICompat() {
   const response = await fetch(`${LUMEN_ORIGIN}/v1/chat/completions`, {
     method: "POST",
@@ -365,7 +365,7 @@ export async function callOpenAICompat() {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: LUMEN_MODEL,
+      model: "lumen",
       messages: [{ role: "user", content: "Hello Lumen" }],
       max_tokens: 1024,
     }),
@@ -389,7 +389,7 @@ export async function callAnthropicCompat() {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: LUMEN_MODEL,
+      model: LUMEN_PROVIDER_MODEL,
       max_tokens: 1024,
       messages: [{ role: "user", content: "Hello Claude" }],
     }),

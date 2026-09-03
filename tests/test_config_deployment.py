@@ -42,6 +42,8 @@ chat_asset_s3_access_key = "s3-access-key"
 chat_asset_s3_secret_key = "s3-secret-key"
 chat_sandbox_api_key = "sandbox-api-key"
 chat_api_hosts = "api.lumen.example.com"
+chat_default_model = "gpt-4.1-mini"
+chat_compat_run_timeout_seconds = 600
 """
     config_file.write_text(toml_content, encoding="utf-8")
 
@@ -63,6 +65,8 @@ chat_api_hosts = "api.lumen.example.com"
     assert raw["chat_memory_pgvector_url"] == "postgresql://pgvector:pass@postgres:5432/pgvector_db"
     assert raw["chat_sandbox_api_key"] == "sandbox-api-key"
     assert raw["chat_api_hosts"] == "api.lumen.example.com"
+    assert raw["chat_default_model"] == "gpt-4.1-mini"
+    assert raw["chat_compat_run_timeout_seconds"] == 600
 
     settings = get_settings()
     assert settings.keystone_auth_url == "http://10.0.0.10:5000/v3"
@@ -74,6 +78,8 @@ chat_api_hosts = "api.lumen.example.com"
     assert settings.chat_memory_pgvector_url == "postgresql://pgvector:pass@postgres:5432/pgvector_db"
     assert settings.chat_sandbox_api_key == "sandbox-api-key"
     assert settings.chat_api_hosts == "api.lumen.example.com"
+    assert settings.chat_default_model == "gpt-4.1-mini"
+    assert settings.chat_compat_run_timeout_seconds == 600
 
 
 def test_lumen_environment_variable_overrides(monkeypatch):
@@ -176,3 +182,18 @@ def test_get_lumen_encryption_key_strict_validation():
     s_non_hex = Settings(lumen_encryption_key="z" * 64)
     with pytest.raises(ValueError, match=r"Lumen encryption key must be exactly 64 hex characters"):
         _ = s_non_hex.get_lumen_encryption_key
+
+def test_chat_compat_run_timeout_seconds_bounds_validation():
+    """Test chat_compat_run_timeout_seconds validator rejects outside 1..3600."""
+    assert Settings(chat_compat_run_timeout_seconds=1).chat_compat_run_timeout_seconds == 1
+    assert Settings(chat_compat_run_timeout_seconds=3600).chat_compat_run_timeout_seconds == 3600
+    assert Settings(chat_compat_run_timeout_seconds=300).chat_compat_run_timeout_seconds == 300
+
+    with pytest.raises(ValueError, match="must be between 1 and 3600"):
+        Settings(chat_compat_run_timeout_seconds=0)
+
+    with pytest.raises(ValueError, match="must be between 1 and 3600"):
+        Settings(chat_compat_run_timeout_seconds=-10)
+
+    with pytest.raises(ValueError, match="must be between 1 and 3600"):
+        Settings(chat_compat_run_timeout_seconds=3601)

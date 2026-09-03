@@ -1,7 +1,7 @@
 """OpenAI 호환 엔드포인트 — POST /v1/chat/completions, GET /v1/models.
 
-litellm 청크가 이미 OpenAI 포맷이므로 변환은 얇다. 도구는 pass-through(모델 tool_calls 릴레이 →
-클라이언트가 실행 후 재요청). 인증은 API 키(get_api_key_info). stateless — 대화 저장 안 함.
+기존 모델은 LiteLLM/completion_api를 통한 직접 완료를 수행하며, model="lumen"은
+Lumen native durable worker 실행 경계(create_temp_run, 저널 이벤트 투영)로 분기한다.
 """
 
 from __future__ import annotations
@@ -12,12 +12,13 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
+from lumen.services import openai_compat
 from lumen.services.providers import errors, repository
 
 router = APIRouter()
@@ -76,8 +77,16 @@ class OpenAIModelListResponse(BaseModel):
 
 
 # ── 순수 변환 함수 (단위 테스트 대상) ──────────────────────────────────────
-def openai_error(status_code: int, message: str) -> dict:
-    return {"error": {"message": message, "type": "invalid_request_error" if status_code < 500 else "api_error"}}
+def openai_error_dict(message: str, type_: str = "invalid_request_error", code: str | None = None) -> dict:
+    return {"error": {"message": message, "type": type_, "code": code}}
+
+
+def openai_error_response(
+    status_code: int, message: str, type_: str | None = None, code: str | None = None
+) -> JSONResponse:
+    if type_ is None:
+        type_ = "invalid_request_error" if status_code < 500 else "api_error"
+    return JSONResponse(status_code=status_code, content=openai_error_dict(message, type_=type_, code=code))
 
 
 def _completion_id() -> str:
@@ -139,18 +148,33 @@ def usage_chunk(done: dict, *, cmpl_id: str, created: int, model: str) -> dict:
     }
 
 
-def models_list(models: list[dict]) -> dict:
-    return {
-        "object": "list",
-        "data": [
+def models_list(models: list[dict], include_lumen: bool = False) -> dict:
+    data = []
+    if include_lumen:
+        data.append(
             {
-                "id": m["model_name"],
+                "id": openai_compat.VIRTUAL_MODEL_ID,
+                "object": "model",
+                "created": 0,
+                "owned_by": "lumen",
+            }
+        )
+    for m in models:
+        model_name = m.get("model_name", "")
+        # Filter reserved virtual model ID from provider list to prevent duplicates
+        if model_name.strip().lower() == openai_compat.VIRTUAL_MODEL_ID:
+            continue
+        data.append(
+            {
+                "id": model_name,
                 "object": "model",
                 "created": 0,
                 "owned_by": m.get("provider_name") or "lumen",
             }
-            for m in models
-        ],
+        )
+    return {
+        "object": "list",
+        "data": data,
     }
 
 
@@ -165,15 +189,82 @@ def _sse(obj: dict) -> str:
     openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
 )
 async def chat_completions(
-    body: OpenAIChatRequest, token_info: dict = Depends(require_api_key_scopes("compat:completions:write"))
+    request: Request,
+    body: OpenAIChatRequest,
+    token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
     user_id, project_id = token_info["user_id"], token_info["project_id"]
     api_key_id = token_info.get("api_key_id")
+    source = token_info.get("source", "api")
+
+    if openai_compat.is_lumen_virtual_model(body.model):
+        try:
+            normalized_messages, last_user_text, capped_max_tokens, validated_temp = (
+                openai_compat.validate_and_normalize_transcript(
+                    body.messages,
+                    tools=body.tools,
+                    tool_choice=body.tool_choice,
+                    max_tokens=body.max_tokens,
+                    temperature=body.temperature,
+                )
+            )
+            run_id, _resolved_model = await openai_compat.create_lumen_temp_run(
+                normalized_messages=normalized_messages,
+                last_user_text=last_user_text,
+                user_id=user_id,
+                project_id=project_id,
+                api_key_id=api_key_id,
+                source=source,
+                max_tokens=capped_max_tokens,
+                temperature=validated_temp,
+            )
+        except openai_compat.OpenAICompatError as exc:
+            return openai_error_response(exc.status_code, exc.message, type_=exc.type_, code=exc.code)
+
+        cmpl_id, created = f"chatcmpl-lumen-{run_id}", int(time.time())
+
+        if not body.stream:
+            try:
+                result = await openai_compat.execute_lumen_nonstream(
+                    run_id=run_id,
+                    user_id=user_id,
+                    project_id=project_id,
+                    is_disconnected=request.is_disconnected,
+                )
+                return nonstream_response(result, cmpl_id=cmpl_id, created=created)
+            except openai_compat.OpenAICompatError as exc:
+                return openai_error_response(exc.status_code, exc.message, type_=exc.type_, code=exc.code)
+
+        include_usage = bool((body.stream_options or {}).get("include_usage"))
+
+        async def gen() -> AsyncIterator[str]:
+            async for ev in openai_compat.execute_lumen_stream(
+                run_id=run_id,
+                user_id=user_id,
+                project_id=project_id,
+                cmpl_id=cmpl_id,
+                created=created,
+                include_usage=include_usage,
+                is_disconnected=request.is_disconnected,
+            ):
+                if ev["kind"] in {"chunk", "error"}:
+                    yield _sse(ev["data"])
+                elif ev["kind"] == "keepalive":
+                    yield ": keepalive\n\n"
+                elif ev["kind"] == "done":
+                    yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+        )
+
     try:
         resolved = await core.resolve(body.model)
         await core.precheck(user_id, project_id, api_key_id=api_key_id)
     except core.CompletionError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=openai_error(exc.status_code, exc.message)) from exc
+        return openai_error_response(exc.status_code, exc.message)
 
     cmpl_id, created = _completion_id(), int(time.time())
     include_usage = bool((body.stream_options or {}).get("include_usage"))
@@ -192,9 +283,9 @@ async def chat_completions(
                 tool_choice=body.tool_choice,
             )
         except core.CompletionError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=openai_error(exc.status_code, exc.message)) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=openai_error(502, "업스트림 모델 오류")) from exc
+            return openai_error_response(exc.status_code, exc.message)
+        except Exception:
+            return openai_error_response(502, "업스트림 모델 오류")
         return nonstream_response(result, cmpl_id=cmpl_id, created=created)
 
     async def gen() -> AsyncIterator[str]:
@@ -215,7 +306,7 @@ async def chat_completions(
                 if include_usage:
                     yield _sse(usage_chunk(ev, cmpl_id=cmpl_id, created=created, model=resolved["model_name"]))
             elif ev["type"] == "error":
-                yield _sse(openai_error(502, ev.get("message", "오류")))
+                yield _sse(openai_error_dict(ev.get("message", "오류"), type_="api_error"))
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -231,4 +322,5 @@ async def list_models(token_info: dict = Depends(require_api_key_scopes("models:
         models = await repository.list_models(active_only=True)
     except errors.ChatStorageUnavailable:
         models = []
-    return models_list(models)
+    include_lumen = await openai_compat.is_virtual_model_active(models)
+    return models_list(models, include_lumen=include_lumen)
