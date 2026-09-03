@@ -1,14 +1,14 @@
 ---
 # Lumen kolla role defaults
 
-lumen_image_tag: "0.1.4"
+lumen_image_tag: "0.1.5"
 lumen_image_namespace: "ghcr.io/openstack-afterglow"
 lumen_api_image: "{{ lumen_image_namespace }}/lumen-api"
 lumen_worker_image: "{{ lumen_image_namespace }}/lumen-worker"
 
 lumen_source_mode: "{{ enable_lumen_source_build | default(enable_source_build | default(lumen_dev_mode | default(false))) | bool }}"
 lumen_source_repo: "https://github.com/openstack-afterglow/lumen.git"
-lumen_source_version: "a0ec3b2511eaf5fc2dc4cfc78247945939765044"
+lumen_source_version: "4ce3275e835559fd922974b89ec524d756d2a6e1"
 lumen_source_dir: "{{ lumen_source_checkout_path | default('/opt/afterglow/src/lumen') }}"
 lumen_api_image_ref: "{{ 'afterglow-local/lumen-api:' ~ (lumen_source_version | truncate(12, True, '')) if (lumen_source_mode | bool) else (lumen_api_image ~ ':' ~ lumen_image_tag) }}"
 lumen_worker_image_ref: "{{ 'afterglow-local/lumen-worker:' ~ (lumen_source_version | truncate(12, True, '')) if (lumen_source_mode | bool) else (lumen_worker_image ~ ':' ~ lumen_image_tag) }}"
@@ -96,6 +96,46 @@ lumen_chat_api_hosts: ""
 lumen_chat_default_model: ""
 lumen_chat_compat_run_timeout_seconds: 300
 
+lumen_service_environments:
+  lumen-api:
+    LUMEN_CONFIG_FILE: "/etc/lumen/lumen.conf"
+    DATABASE_URL: "{{ lumen_database_url }}"
+    REDIS_URL: "{{ lumen_redis_url }}"
+    KEYSTONE_AUTH_URL: "{{ lumen_keystone_auth_url }}"
+    KEYSTONE_ADMIN_USERNAME: "{{ lumen_keystone_user }}"
+    KEYSTONE_ADMIN_PASSWORD: "{{ lumen_keystone_password }}"
+    KEYSTONE_ADMIN_PROJECT: "{{ lumen_service_project_name }}"
+    KEYSTONE_DOMAIN: "{{ lumen_keystone_user_domain_name }}"
+    KEYSTONE_REGION_NAME: "{{ lumen_keystone_region_name }}"
+    KEYSTONE_INTERFACE: "{{ lumen_keystone_interface }}"
+    LUMEN_ENCRYPTION_KEY: "{{ lumen_encryption_key }}"
+    MCP_CONTROL_PLANE_URL: "{{ lumen_mcp_control_plane_url }}"
+    LUMEN_MCP_SERVICE_TOKEN: "{{ lumen_mcp_service_token }}"
+    CHAT_CHECKPOINTER_POSTGRES_URL: "{{ lumen_checkpointer_postgres_url }}"
+    CHAT_MEMORY_PGVECTOR_URL: "{{ lumen_memory_pgvector_url }}"
+    CHAT_ASSET_S3_ACCESS_KEY: "{{ lumen_s3_access_key }}"
+    CHAT_ASSET_S3_SECRET_KEY: "{{ lumen_s3_secret_key }}"
+    CHAT_SANDBOX_API_KEY: "{{ lumen_sandbox_api_key }}"
+  lumen-worker:
+    LUMEN_CONFIG_FILE: "/etc/lumen/lumen.conf"
+    DATABASE_URL: "{{ lumen_database_url }}"
+    REDIS_URL: "{{ lumen_redis_url }}"
+    KEYSTONE_AUTH_URL: "{{ lumen_keystone_auth_url }}"
+    KEYSTONE_ADMIN_USERNAME: "{{ lumen_keystone_user }}"
+    KEYSTONE_ADMIN_PASSWORD: "{{ lumen_keystone_password }}"
+    KEYSTONE_ADMIN_PROJECT: "{{ lumen_service_project_name }}"
+    KEYSTONE_DOMAIN: "{{ lumen_keystone_user_domain_name }}"
+    KEYSTONE_REGION_NAME: "{{ lumen_keystone_region_name }}"
+    KEYSTONE_INTERFACE: "{{ lumen_keystone_interface }}"
+    LUMEN_ENCRYPTION_KEY: "{{ lumen_encryption_key }}"
+    MCP_CONTROL_PLANE_URL: "{{ lumen_mcp_control_plane_url }}"
+    LUMEN_MCP_SERVICE_TOKEN: "{{ lumen_mcp_service_token }}"
+    CHAT_CHECKPOINTER_POSTGRES_URL: "{{ lumen_checkpointer_postgres_url }}"
+    CHAT_MEMORY_PGVECTOR_URL: "{{ lumen_memory_pgvector_url }}"
+    CHAT_ASSET_S3_ACCESS_KEY: "{{ lumen_s3_access_key }}"
+    CHAT_ASSET_S3_SECRET_KEY: "{{ lumen_s3_secret_key }}"
+    CHAT_SANDBOX_API_KEY: "{{ lumen_sandbox_api_key }}"
+
 lumen_services:
   lumen-api:
     container_name: lumen_api
@@ -108,25 +148,6 @@ lumen_services:
     volumes:
       - "/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro"
       - "kolla_logs:/var/log/kolla/"
-    environment:
-      LUMEN_CONFIG_FILE: "/etc/lumen/lumen.conf"
-      DATABASE_URL: "{{ lumen_database_url }}"
-      REDIS_URL: "{{ lumen_redis_url }}"
-      KEYSTONE_AUTH_URL: "{{ lumen_keystone_auth_url }}"
-      KEYSTONE_ADMIN_USERNAME: "{{ lumen_keystone_user }}"
-      KEYSTONE_ADMIN_PASSWORD: "{{ lumen_keystone_password }}"
-      KEYSTONE_ADMIN_PROJECT: "{{ lumen_service_project_name }}"
-      KEYSTONE_DOMAIN: "{{ lumen_keystone_user_domain_name }}"
-      KEYSTONE_REGION_NAME: "{{ lumen_keystone_region_name }}"
-      KEYSTONE_INTERFACE: "{{ lumen_keystone_interface }}"
-      LUMEN_ENCRYPTION_KEY: "{{ lumen_encryption_key }}"
-      MCP_CONTROL_PLANE_URL: "{{ lumen_mcp_control_plane_url }}"
-      LUMEN_MCP_SERVICE_TOKEN: "{{ lumen_mcp_service_token }}"
-      CHAT_CHECKPOINTER_POSTGRES_URL: "{{ lumen_checkpointer_postgres_url }}"
-      CHAT_MEMORY_PGVECTOR_URL: "{{ lumen_memory_pgvector_url }}"
-      CHAT_ASSET_S3_ACCESS_KEY: "{{ lumen_s3_access_key }}"
-      CHAT_ASSET_S3_SECRET_KEY: "{{ lumen_s3_secret_key }}"
-      CHAT_SANDBOX_API_KEY: "{{ lumen_sandbox_api_key }}"
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://{{ lumen_api_listen_address }}:{{ lumen_api_listen_port }}/v1/health', timeout=5); assert response.status == 200"]
       interval: 30s
@@ -157,26 +178,6 @@ lumen_services:
     volumes:
       - "/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro"
       - "kolla_logs:/var/log/kolla/"
-    environment:
-      LUMEN_CONFIG_FILE: "/etc/lumen/lumen.conf"
-      DATABASE_URL: "{{ lumen_database_url }}"
-      REDIS_URL: "{{ lumen_redis_url }}"
-      KEYSTONE_AUTH_URL: "{{ lumen_keystone_auth_url }}"
-      KEYSTONE_ADMIN_USERNAME: "{{ lumen_keystone_user }}"
-      KEYSTONE_ADMIN_PASSWORD: "{{ lumen_keystone_password }}"
-      KEYSTONE_ADMIN_PROJECT: "{{ lumen_service_project_name }}"
-      KEYSTONE_DOMAIN: "{{ lumen_keystone_user_domain_name }}"
-      KEYSTONE_REGION_NAME: "{{ lumen_keystone_region_name }}"
-      KEYSTONE_INTERFACE: "{{ lumen_keystone_interface }}"
-      LUMEN_ENCRYPTION_KEY: "{{ lumen_encryption_key }}"
-      MCP_CONTROL_PLANE_URL: "{{ lumen_mcp_control_plane_url }}"
-      LUMEN_MCP_SERVICE_TOKEN: "{{ lumen_mcp_service_token }}"
-      CHAT_CHECKPOINTER_POSTGRES_URL: "{{ lumen_checkpointer_postgres_url }}"
-      CHAT_MEMORY_PGVECTOR_URL: "{{ lumen_memory_pgvector_url }}"
-      CHAT_ASSET_S3_ACCESS_KEY: "{{ lumen_s3_access_key }}"
-      CHAT_ASSET_S3_SECRET_KEY: "{{ lumen_s3_secret_key }}"
-      CHAT_SANDBOX_API_KEY: "{{ lumen_sandbox_api_key }}"
-
 lumen_public_haproxy_services:
   lumen-public:
     group: lumen
