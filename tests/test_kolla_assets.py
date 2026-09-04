@@ -73,8 +73,8 @@ def test_kolla_yaml_and_jinja_validity():
 def test_kolla_package_version_image_tag_lockstep():
     app_version = lumen.__version__
     sdk_init = (REPO_ROOT / "sdk" / "lumen_sdk" / "__init__.py").read_text(encoding="utf-8")
-    assert app_version == "0.1.5"
-    assert '__version__ = "0.1.5"' in sdk_init
+    assert app_version == "0.1.6"
+    assert '__version__ = "0.1.6"' in sdk_init
 
     defaults_yaml = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
 

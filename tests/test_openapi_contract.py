@@ -133,20 +133,92 @@ class TestOpenAPIContract:
         _check_refs(schema)
 
 
-class TestKeystoneProjectScoping:
-    def test_unscoped_keystone_token_fails_closed(self, monkeypatch):
-        class FakeToken:
-            def get_token_data(self, sess):
-                return {
-                    "token": {
-                        "user": {"id": "u1", "name": "user1"},
-                        "roles": [{"name": "member"}],
-                        "project": None,
-                        # project missing -> unscoped
-                    }
-                }
+class FakeAccessInfo:
+    def __init__(
+        self,
+        auth_token: str = "effective-token-123",
+        project_id: str | None = "p1",
+        user_id: str = "u1",
+        username: str = "user1",
+        role_names: list[str] | None = None,
+    ):
+        self.auth_token = auth_token
+        self.project_id = project_id
+        self.user_id = user_id
+        self.username = username
+        self.role_names = role_names if role_names is not None else ["member"]
 
-        monkeypatch.setattr("keystoneauth1.identity.v3.Token", lambda **kwargs: FakeToken())
+
+class FakeTokenPlugin:
+    def __init__(self, access_info: FakeAccessInfo | None = None, exc: Exception | None = None):
+        self._access_info = access_info
+        self._exc = exc
+
+    def get_access(self, session):
+        if self._exc:
+            raise self._exc
+        return self._access_info
+
+
+class TestKeystoneProjectScoping:
+    def test_scoped_keystone_token_success_and_rescope(self, monkeypatch):
+        access_info = FakeAccessInfo(
+            auth_token="rescoped-token-789",
+            project_id="proj-456",
+            user_id="usr-123",
+            username="alice",
+            role_names=["member", "admin"],
+        )
+        fake_token = FakeTokenPlugin(access_info=access_info)
+
+        monkeypatch.setattr("keystoneauth1.identity.v3.Token", lambda **kwargs: fake_token)
+        monkeypatch.setattr("keystoneauth1.session.Session", lambda **kwargs: None)
+        monkeypatch.setattr(deps, "_is_system_admin", lambda user_id: False)
+
+        info = deps.validate_token("submitted-raw-token", project_id="proj-456")
+        assert info["user_id"] == "usr-123"
+        assert info["username"] == "alice"
+        assert info["project_id"] == "proj-456"
+        assert info["roles"] == ["member", "admin"]
+        assert info["auth_token"] == "rescoped-token-789"
+
+    async def test_scoped_keystone_token_propagation_in_get_principal_and_require_token(self, monkeypatch):
+        access_info = FakeAccessInfo(
+            auth_token="rescoped-token-999",
+            project_id="proj-777",
+            user_id="usr-555",
+            username="bob",
+            role_names=["member"],
+        )
+        fake_token = FakeTokenPlugin(access_info=access_info)
+
+        monkeypatch.setattr("keystoneauth1.identity.v3.Token", lambda **kwargs: fake_token)
+        monkeypatch.setattr("keystoneauth1.session.Session", lambda **kwargs: None)
+
+        from starlette.requests import Request
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"x-auth-token", b"submitted-token-111"),
+                (b"x-project-id", b"proj-777"),
+            ],
+        })
+
+        principal = await deps.get_principal(request)
+        assert principal["auth_type"] == "keystone"
+        assert principal["user_id"] == "usr-555"
+        assert principal["project_id"] == "proj-777"
+        assert principal["token"] == "rescoped-token-999"
+
+        req_info = await deps.require_token(x_auth_token="submitted-token-111", bearer=None, x_project_id="proj-777")
+        assert req_info["token"] == "rescoped-token-999"
+        assert req_info["project_id"] == "proj-777"
+
+    def test_unscoped_keystone_token_fails_closed(self, monkeypatch):
+        access_info = FakeAccessInfo(auth_token="unscoped-tok", project_id=None)
+        fake_token = FakeTokenPlugin(access_info=access_info)
+
+        monkeypatch.setattr("keystoneauth1.identity.v3.Token", lambda **kwargs: fake_token)
         monkeypatch.setattr("keystoneauth1.session.Session", lambda **kwargs: None)
 
         with pytest.raises(HTTPException) as ei:
@@ -154,11 +226,56 @@ class TestKeystoneProjectScoping:
         assert ei.value.status_code == 401
         assert "Project-scoped" in ei.value.detail
 
+    def test_keystone_token_validation_failure(self, monkeypatch):
+        fake_token = FakeTokenPlugin(exc=Exception("Keystone unauthorized"))
+
+        monkeypatch.setattr("keystoneauth1.identity.v3.Token", lambda **kwargs: fake_token)
+        monkeypatch.setattr("keystoneauth1.session.Session", lambda **kwargs: None)
+
+        with pytest.raises(HTTPException) as ei:
+            deps.validate_token("invalid-token")
+        assert ei.value.status_code == 401
+        assert "유효하지 않거나 만료된 Keystone 토큰입니다" in ei.value.detail
+
+    async def test_api_key_isolation_never_invokes_keystone(self, monkeypatch):
+        def forbidden_keystone(**kwargs):
+            raise AssertionError("Keystone v3.Token should never be instantiated for API key authentication")
+
+        monkeypatch.setattr("keystoneauth1.identity.v3.Token", forbidden_keystone)
+
+        async def fake_verify_key(key: str):
+            if key == "sk-afgl-secret123":
+                return {
+                    "user_id": "api-usr-1",
+                    "project_id": "api-proj-1",
+                    "api_key_id": 42,
+                    "scopes": ("read", "write"),
+                }
+            return None
+
+        monkeypatch.setattr("lumen.services.api_key_store.verify_key", fake_verify_key)
+
+        from starlette.requests import Request
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"authorization", b"Bearer sk-afgl-secret123"),
+                (b"x-project-id", b"api-proj-1"),
+            ],
+        })
+
+        principal = await deps.get_principal(request)
+        assert principal["auth_type"] == "api_key"
+        assert principal["user_id"] == "api-usr-1"
+        assert principal["project_id"] == "api-proj-1"
+        assert principal["api_key_id"] == 42
+        assert principal["scopes"] == ("read", "write")
+
     async def test_keystone_bearer_token_support(self, monkeypatch):
         monkeypatch.setattr(
             deps,
             "validate_token",
-            lambda tok, project_id="": {"user_id": "u1", "project_id": "p1", "token": tok},
+            lambda tok, project_id="": {"user_id": "u1", "project_id": "p1", "auth_token": tok},
         )
         info = await deps.require_token(
             x_auth_token=None,
@@ -167,7 +284,6 @@ class TestKeystoneProjectScoping:
         )
         assert info["token"] == "tok123"
         assert info["project_id"] == "p1"
-
 
 class TestStartupFailurePropagation:
     async def test_checkpointer_failure_returns_false_propagates_on_startup(self, monkeypatch):
