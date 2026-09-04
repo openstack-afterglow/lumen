@@ -3,6 +3,8 @@
 - [x] 1.1 Replace unsupported token-data lookup with AccessInfo validation and projection
 - [x] 1.2 Preserve the effective scoped token through `get_principal` and `require_token`
 - [x] 1.3 Add regression tests for scoped success, rescope token propagation, unscoped rejection, and API-key isolation
+- [x] 1.4 Separate verified Keystone connection scope from system-admin logical target scope
+- [x] 1.5 Add foreign-target system-admin and non-admin rejection regression tests
 
 ## 2. Verification and rollout
 

@@ -1,7 +1,7 @@
 ---
 # Lumen kolla role defaults
 
-lumen_image_tag: "0.1.6"
+lumen_image_tag: "0.1.7"
 lumen_image_namespace: "ghcr.io/openstack-afterglow"
 lumen_api_image: "{{ lumen_image_namespace }}/lumen-api"
 lumen_worker_image: "{{ lumen_image_namespace }}/lumen-worker"

@@ -3,7 +3,7 @@
 from lumen_sdk.client import Client
 from lumen_sdk.service import LumenService
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 
 def register(conn):

@@ -25,6 +25,7 @@ class Principal(TypedDict):
     auth_type: Literal["keystone", "api_key"]
     user_id: str
     project_id: str
+    connection_project_id: NotRequired[str]
     api_key_id: int | None
     scopes: tuple[str, ...]
     source: Literal["web", "api"]
@@ -98,7 +99,7 @@ def _is_system_admin(user_id: str) -> bool:
         return False
 
 
-def validate_token(token: str, project_id: str = "") -> dict:
+def validate_token(token: str, project_id: str = "", target_project_id: str = "") -> dict:
     settings = get_settings()
     from keystoneauth1 import session as ks_session
     from keystoneauth1.identity import v3
@@ -116,18 +117,29 @@ def validate_token(token: str, project_id: str = "") -> dict:
     except Exception as exc:
         raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 Keystone 토큰입니다") from exc
 
-    p_id = auth_ref.project_id or ""
-    if not p_id:
+    conn_p_id = auth_ref.project_id or ""
+    if not conn_p_id:
         raise HTTPException(status_code=401, detail="Project-scoped Keystone token required")
 
     u_id = auth_ref.user_id or ""
     roles = list(auth_ref.role_names or [])
     is_sys_admin = "admin" in roles and _is_system_admin(u_id)
     effective_token = auth_ref.auth_token or token
+    if not isinstance(target_project_id, str):
+        target_project_id = ""
+    target_p = target_project_id.strip()
+    if target_p and target_p != conn_p_id:
+        if not is_sys_admin:
+            raise HTTPException(status_code=403, detail="Target project override requires system admin privileges")
+        logical_p_id = target_p
+    else:
+        logical_p_id = conn_p_id
+
     return {
         "user_id": u_id,
         "username": auth_ref.username or "",
-        "project_id": p_id,
+        "project_id": logical_p_id,
+        "connection_project_id": conn_p_id,
         "roles": roles,
         "is_system_admin": is_sys_admin,
         "auth_token": effective_token,
@@ -139,6 +151,7 @@ def _keystone_principal(info: dict, token: str) -> Principal:
         "auth_type": "keystone",
         "user_id": info["user_id"],
         "project_id": info["project_id"],
+        "connection_project_id": info.get("connection_project_id") or info["project_id"],
         "api_key_id": None,
         "scopes": (),
         "source": "web",
@@ -192,6 +205,9 @@ async def get_principal(
         requested_project = (request.headers.get("X-Project-Id") or "").strip()
         if requested_project and requested_project != info["project_id"]:
             raise HTTPException(status_code=403, detail="API 키 프로젝트와 X-Project-Id가 일치하지 않습니다")
+        requested_target = (request.headers.get("X-Target-Project-Id") or "").strip()
+        if requested_target and requested_target != info["project_id"]:
+            raise HTTPException(status_code=403, detail="API 키 프로젝트와 X-Target-Project-Id가 일치하지 않습니다")
         scopes = info.get("scopes")
         if not isinstance(scopes, tuple) or not scopes:
             raise HTTPException(status_code=401, detail="유효하지 않은 API 키입니다")
@@ -199,6 +215,7 @@ async def get_principal(
             "auth_type": "api_key",
             "user_id": info["user_id"],
             "project_id": info["project_id"],
+            "connection_project_id": info["project_id"],
             "api_key_id": info["api_key_id"],
             "scopes": scopes,
             "source": "api",
@@ -207,9 +224,14 @@ async def get_principal(
         }
     else:
         assert keystone_token is not None
+        x_proj = (request.headers.get("X-Project-Id") or "").strip()
+        x_target_proj = (request.headers.get("X-Target-Project-Id") or "").strip()
         try:
+            val_kwargs = {"project_id": x_proj}
+            if x_target_proj:
+                val_kwargs["target_project_id"] = x_target_proj
             principal = _keystone_principal(
-                validate_token(keystone_token, project_id=request.headers.get("X-Project-Id") or ""),
+                validate_token(keystone_token, **val_kwargs),
                 keystone_token,
             )
         except HTTPException:
@@ -253,22 +275,29 @@ async def require_token(
     x_auth_token: str | None = Security(keystone_token_scheme),
     bearer: HTTPAuthorizationCredentials | None = Security(keystone_bearer_scheme),
     x_project_id: str | None = Header(None, alias="X-Project-Id"),
+    x_target_project_id: str | None = Header(None, alias="X-Target-Project-Id"),
 ) -> dict:
     token = x_auth_token
     if not token and bearer and bearer.credentials:
         token = bearer.credentials.strip()
     if not token:
         raise HTTPException(status_code=401, detail="X-Auth-Token 또는 Bearer 토큰이 필요합니다")
+
+    proj_id = x_project_id if isinstance(x_project_id, str) else ""
+    target_proj_id = x_target_project_id if isinstance(x_target_project_id, str) else ""
+
     try:
-        info = validate_token(token, project_id=x_project_id or "")
+        val_kwargs = {"project_id": proj_id}
+        if target_proj_id.strip():
+            val_kwargs["target_project_id"] = target_proj_id
+        info = validate_token(token, **val_kwargs)
         info["token"] = info.get("auth_token") or token
+        info.setdefault("connection_project_id", info.get("project_id", ""))
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=401, detail="인증 실패")
     return info
-
-
 def get_token_info(token_info: dict = Depends(require_token)) -> dict:
     return token_info
 
@@ -316,6 +345,7 @@ async def get_api_key_info(
         "auth_type": "api_key",
         "user_id": info["user_id"],
         "project_id": info["project_id"],
+        "connection_project_id": info["project_id"],
         "api_key_id": info["api_key_id"],
         "scopes": scopes,
         "source": "api",
@@ -324,7 +354,6 @@ async def get_api_key_info(
     }
     request.state.token_info = principal
     return principal
-
 
 def get_admin_connection_for_project(project_id: str):
     import openstack
@@ -351,7 +380,11 @@ async def get_os_conn(token_info: dict = Depends(require_token)):
 
     settings = get_settings()
     token = token_info.get("token") or ""
-    project_id = token_info.get("project_id") or ""
+    project_id = (
+        token_info.get("connection_project_id")
+        or token_info.get("project_id")
+        or ""
+    )
 
     if not token or not project_id:
         raise HTTPException(status_code=401, detail="OpenStack connection requires a valid user token and project")
@@ -361,7 +394,6 @@ async def get_os_conn(token_info: dict = Depends(require_token)):
         auth_type="token",
         token=token,
         project_id=project_id,
-        user_domain_name=settings.keystone_domain,
         project_domain_name=settings.keystone_domain,
         region_name=settings.keystone_region_name,
         interface=settings.keystone_interface,
