@@ -11,6 +11,17 @@ Lumen SHALL validate submitted Keystone tokens through the supported keystoneaut
 - **WHEN** keystoneauth1 returns an AccessInfo whose `auth_token` differs from the submitted token
 - **THEN** Lumen stores the returned token in the principal and uses it for downstream OpenStack access
 
+### Requirement: Verified system administrators may select a logical project
+Lumen SHALL distinguish the Keystone token’s connection project from an optional logical target project. A differing target SHALL be accepted only after the token is validated in its connection scope and the principal is independently verified as a system administrator.
+
+#### Scenario: System admin targets another project
+- **WHEN** a valid system-admin token is scoped to the `X-Project-Id` connection project and `X-Target-Project-Id` names another logical project
+- **THEN** Lumen preserves the connection-scoped effective token while binding resource ownership to the logical target project
+
+#### Scenario: Non-admin forges another target
+- **WHEN** a valid non-admin token or API key supplies a differing `X-Target-Project-Id`
+- **THEN** Lumen returns HTTP 403 and does not create a principal for that target
+
 ### Requirement: Invalid or unscoped Keystone credentials fail closed
 Lumen SHALL reject missing, invalid, expired, or non-project-scoped Keystone credentials without falling back to API-key or caller-provided identity fields.
 

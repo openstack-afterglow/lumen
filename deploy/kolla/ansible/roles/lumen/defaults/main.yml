@@ -1,14 +1,14 @@
 ---
 # Lumen kolla role defaults
 
-lumen_image_tag: "0.1.6"
+lumen_image_tag: "0.1.7"
 lumen_image_namespace: "ghcr.io/openstack-afterglow"
 lumen_api_image: "{{ lumen_image_namespace }}/lumen-api"
 lumen_worker_image: "{{ lumen_image_namespace }}/lumen-worker"
 
 lumen_source_mode: "{{ enable_lumen_source_build | default(enable_source_build | default(lumen_dev_mode | default(false))) | bool }}"
 lumen_source_repo: "https://github.com/openstack-afterglow/lumen.git"
-lumen_source_version: "05a50bef69a25a2d6b404d5119a8d01b61d5cf42"
+lumen_source_version: "cc01d3d2e09669df4b7110aef0521342d92f4c4a"
 lumen_source_dir: "{{ lumen_source_checkout_path | default('/opt/afterglow/src/lumen') }}"
 lumen_api_image_ref: "{{ 'afterglow-local/lumen-api:' ~ (lumen_source_version | truncate(12, True, '')) if (lumen_source_mode | bool) else (lumen_api_image ~ ':' ~ lumen_image_tag) }}"
 lumen_worker_image_ref: "{{ 'afterglow-local/lumen-worker:' ~ (lumen_source_version | truncate(12, True, '')) if (lumen_source_mode | bool) else (lumen_worker_image ~ ':' ~ lumen_image_tag) }}"

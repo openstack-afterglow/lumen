@@ -8,6 +8,7 @@ Afterglow validates its browser access JWT, recovers a fresh project-scoped Keys
 - Project user, project, role, username, and refreshed scoped token fields from `AccessInfo`.
 - Preserve the returned scoped token in the Lumen principal and downstream OpenStack connection instead of overwriting it with the submitted token.
 - Replace the fake `get_token_data` unit contract with `get_access` regression coverage, including project-scoped success, unscoped fail-closed, and forwarded token preservation.
+- Accept a separate logical target project only when the validated connection-scoped principal is a verified system administrator.
 - Re-run the original Afterglow BFF chat routes against live Lumen after release.
 
 ## Capabilities
@@ -23,5 +24,5 @@ Afterglow validates its browser access JWT, recovers a fresh project-scoped Keys
 
 - `lumen/auth.py` Keystone principal construction
 - Authentication/OpenAPI contract tests
-- Afterglow browser chat BFF behavior (no Afterglow code change expected)
+- Afterglow browser chat BFF credential transformation for system-admin foreign-project access
 - Lumen patch release and live deployment

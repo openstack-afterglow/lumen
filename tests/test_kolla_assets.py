@@ -73,14 +73,14 @@ def test_kolla_yaml_and_jinja_validity():
 def test_kolla_package_version_image_tag_lockstep():
     app_version = lumen.__version__
     sdk_init = (REPO_ROOT / "sdk" / "lumen_sdk" / "__init__.py").read_text(encoding="utf-8")
-    assert app_version == "0.1.6"
-    assert '__version__ = "0.1.6"' in sdk_init
+    assert app_version == "0.1.7"
+    assert '__version__ = "0.1.7"' in sdk_init
 
     defaults_yaml = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
 
     assert defaults_yaml["lumen_image_tag"] == app_version
 
-    assert defaults_yaml["lumen_source_version"] == "05a50bef69a25a2d6b404d5119a8d01b61d5cf42"
+    assert defaults_yaml["lumen_source_version"] == "cc01d3d2e09669df4b7110aef0521342d92f4c4a"
     defaults_raw = (ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8")
     assert "afterglow_image_tag" not in defaults_raw, "Lumen package default refers to afterglow_image_tag"
     assert defaults_yaml["lumen_encryption_key"] == "", "Lumen encryption key default must be explicit empty string"

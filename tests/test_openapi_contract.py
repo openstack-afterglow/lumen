@@ -285,6 +285,162 @@ class TestKeystoneProjectScoping:
         assert info["token"] == "tok123"
         assert info["project_id"] == "p1"
 
+    async def test_system_admin_foreign_target_project_success(self, monkeypatch):
+        access_info = FakeAccessInfo(
+            auth_token="admin-rescoped-tok",
+            project_id="home-proj",
+            user_id="sys-admin-1",
+            username="admin_user",
+            role_names=["admin"],
+        )
+        fake_token = FakeTokenPlugin(access_info=access_info)
+        monkeypatch.setattr("keystoneauth1.identity.v3.Token", lambda **kwargs: fake_token)
+        monkeypatch.setattr("keystoneauth1.session.Session", lambda **kwargs: None)
+        monkeypatch.setattr(deps, "_is_system_admin", lambda user_id: True)
+
+        from starlette.requests import Request
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"x-auth-token", b"admin-home-token"),
+                (b"x-project-id", b"home-proj"),
+                (b"x-target-project-id", b"foreign-proj"),
+            ],
+        })
+
+        principal = await deps.get_principal(request)
+        assert principal["auth_type"] == "keystone"
+        assert principal["user_id"] == "sys-admin-1"
+        assert principal["project_id"] == "foreign-proj"
+        assert principal["connection_project_id"] == "home-proj"
+        assert principal["token"] == "admin-rescoped-tok"
+        assert principal["is_system_admin"] is True
+
+        req_info = await deps.require_token(
+            x_auth_token="admin-home-token",
+            bearer=None,
+            x_project_id="home-proj",
+            x_target_project_id="foreign-proj",
+        )
+        assert req_info["project_id"] == "foreign-proj"
+        assert req_info["connection_project_id"] == "home-proj"
+        assert req_info["token"] == "admin-rescoped-tok"
+
+    async def test_non_admin_foreign_target_project_rejected(self, monkeypatch):
+        access_info = FakeAccessInfo(
+            auth_token="user-tok-123",
+            project_id="home-proj",
+            user_id="regular-user-1",
+            username="user1",
+            role_names=["member"],
+        )
+        fake_token = FakeTokenPlugin(access_info=access_info)
+        monkeypatch.setattr("keystoneauth1.identity.v3.Token", lambda **kwargs: fake_token)
+        monkeypatch.setattr("keystoneauth1.session.Session", lambda **kwargs: None)
+        monkeypatch.setattr(deps, "_is_system_admin", lambda user_id: False)
+
+        from starlette.requests import Request
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"x-auth-token", b"user-home-token"),
+                (b"x-project-id", b"home-proj"),
+                (b"x-target-project-id", b"foreign-proj"),
+            ],
+        })
+
+        with pytest.raises(HTTPException) as ei:
+            await deps.get_principal(request)
+        assert ei.value.status_code == 403
+
+        with pytest.raises(HTTPException) as ei:
+            await deps.require_token(
+                x_auth_token="user-home-token",
+                bearer=None,
+                x_project_id="home-proj",
+                x_target_project_id="foreign-proj",
+            )
+        assert ei.value.status_code == 403
+
+    async def test_system_admin_same_target_project_success(self, monkeypatch):
+        access_info = FakeAccessInfo(
+            auth_token="admin-tok-same",
+            project_id="home-proj",
+            user_id="sys-admin-1",
+            username="admin_user",
+            role_names=["admin"],
+        )
+        fake_token = FakeTokenPlugin(access_info=access_info)
+        monkeypatch.setattr("keystoneauth1.identity.v3.Token", lambda **kwargs: fake_token)
+        monkeypatch.setattr("keystoneauth1.session.Session", lambda **kwargs: None)
+        monkeypatch.setattr(deps, "_is_system_admin", lambda user_id: True)
+
+        from starlette.requests import Request
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"x-auth-token", b"admin-home-token"),
+                (b"x-project-id", b"home-proj"),
+                (b"x-target-project-id", b"home-proj"),
+            ],
+        })
+
+        principal = await deps.get_principal(request)
+        assert principal["project_id"] == "home-proj"
+        assert principal["connection_project_id"] == "home-proj"
+
+    async def test_api_key_target_project_mismatch_rejected(self, monkeypatch):
+        async def fake_verify_key(key: str):
+            if key == "sk-afgl-secret123":
+                return {
+                    "user_id": "api-usr-1",
+                    "project_id": "api-proj-1",
+                    "api_key_id": 42,
+                    "scopes": ("read", "write"),
+                }
+            return None
+
+        monkeypatch.setattr("lumen.services.api_key_store.verify_key", fake_verify_key)
+
+        from starlette.requests import Request
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"authorization", b"Bearer sk-afgl-secret123"),
+                (b"x-target-project-id", b"foreign-proj"),
+            ],
+        })
+
+        with pytest.raises(HTTPException) as ei:
+            await deps.get_principal(request)
+        assert ei.value.status_code == 403
+        assert "API 키 프로젝트와 X-Target-Project-Id가 일치하지 않습니다" in ei.value.detail
+
+    async def test_get_os_conn_uses_connection_project_id(self, monkeypatch):
+        captured_kwargs = {}
+
+        def fake_connect(**kwargs):
+            captured_kwargs.update(kwargs)
+            class FakeConn:
+                def close(self): pass
+            return FakeConn()
+
+        monkeypatch.setattr("openstack.connect", fake_connect)
+
+        token_info = {
+            "token": "effective-ks-token",
+            "project_id": "foreign-logical-proj",
+            "connection_project_id": "home-connection-proj",
+        }
+
+        conn_gen = deps.get_os_conn(token_info=token_info)
+        await conn_gen.__anext__()
+        assert captured_kwargs["project_id"] == "home-connection-proj"
+        assert captured_kwargs["token"] == "effective-ks-token"
+        try:
+            await conn_gen.__anext__()
+        except StopAsyncIteration:
+            pass
 class TestStartupFailurePropagation:
     async def test_checkpointer_failure_returns_false_propagates_on_startup(self, monkeypatch):
         monkeypatch.setattr(
