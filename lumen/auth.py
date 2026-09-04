@@ -110,26 +110,27 @@ def validate_token(token: str, project_id: str = "") -> dict:
     )
     sess = ks_session.Session(auth=auth, verify=settings.verify)
     try:
-        tok_data = auth.get_token_data(sess)
+        auth_ref = auth.get_access(sess)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 Keystone 토큰입니다") from exc
 
-    tok = tok_data.get("token", {})
-    user = tok.get("user") or {}
-    proj = tok.get("project") or {}
-    roles = [r.get("name", "") for r in tok.get("roles", [])]
-
-    u_id = user.get("id", "")
-    p_id = proj.get("id", "")
+    p_id = auth_ref.project_id or ""
     if not p_id:
         raise HTTPException(status_code=401, detail="Project-scoped Keystone token required")
+
+    u_id = auth_ref.user_id or ""
+    roles = list(auth_ref.role_names or [])
     is_sys_admin = "admin" in roles and _is_system_admin(u_id)
+    effective_token = auth_ref.auth_token or token
     return {
         "user_id": u_id,
-        "username": user.get("name", ""),
+        "username": auth_ref.username or "",
         "project_id": p_id,
         "roles": roles,
         "is_system_admin": is_sys_admin,
+        "auth_token": effective_token,
     }
 
 
@@ -143,7 +144,7 @@ def _keystone_principal(info: dict, token: str) -> Principal:
         "source": "web",
         "roles": list(info["roles"]),
         "is_system_admin": bool(info["is_system_admin"]),
-        "token": token,
+        "token": info.get("auth_token") or token,
     }
 
 
@@ -260,7 +261,7 @@ async def require_token(
         raise HTTPException(status_code=401, detail="X-Auth-Token 또는 Bearer 토큰이 필요합니다")
     try:
         info = validate_token(token, project_id=x_project_id or "")
-        info["token"] = token
+        info["token"] = info.get("auth_token") or token
     except HTTPException:
         raise
     except Exception:
