@@ -10,6 +10,6 @@
 
 - [x] 2.1 Run focused authentication tests and full Lumen contract gate
 - [x] 2.2 Obtain independent authentication/security review
-- [ ] 2.3 Publish and deploy the patch release
-- [ ] 2.4 Reproduce the browser chat routes and fresh Keystone token probe successfully
-- [ ] 2.5 Archive the completed OpenSpec change
+- [x] 2.3 Publish and deploy the patch release
+- [x] 2.4 Reproduce the browser chat routes and fresh Keystone token probe successfully
+- [x] 2.5 Archive the completed OpenSpec change
