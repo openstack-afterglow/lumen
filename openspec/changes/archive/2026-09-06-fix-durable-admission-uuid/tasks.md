@@ -8,6 +8,6 @@
 
 - [x] 2.1 Run focused completion and compatibility tests plus the full Lumen gate
 - [x] 2.2 Obtain independent hotfix review
-- [ ] 2.3 Publish and deploy the Lumen patch release
-- [ ] 2.4 Confirm browser native completion and OpenAI-compatible completion succeed
-- [ ] 2.5 Archive the completed OpenSpec change
+- [x] 2.3 Publish and deploy the Lumen patch release
+- [x] 2.4 Confirm browser native completion and OpenAI-compatible completion succeed
+- [x] 2.5 Archive the completed OpenSpec change
