@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from fastapi import HTTPException
 
@@ -67,16 +69,36 @@ class TestOpenAPIContract:
         assert resp_root.status_code == 200
         root_data = RootDiscoveryResponse.model_validate(resp_root.json())
         assert root_data.versions[0].id == "v1.0"
+        root_links = {link.rel: link.href for link in root_data.versions[0].links}
+        assert root_links["models"] == "http://test/v1/models"
 
         resp_v1 = await client.get("/v1/")
         assert resp_v1.status_code == 200
         v1_data = VersionDiscoveryResponse.model_validate(resp_v1.json())
         assert v1_data.version.id == "v1.0"
+        v1_links = {link.rel: link.href for link in v1_data.version.links}
+        assert v1_links["models"] == "http://test/v1/models"
 
         resp_health = await client.get("/v1/health")
         assert resp_health.status_code == 200
         health_data = HealthResponse.model_validate(resp_health.json())
         assert health_data.status == "ok"
+
+    async def test_version_discovery_models_link_uses_configured_public_origin(self, client, monkeypatch):
+        monkeypatch.setattr(
+            "lumen.main.get_settings",
+            lambda: SimpleNamespace(public_api_base="https://lumen.example/base/"),
+        )
+
+        for path in ("/", "/v1/"):
+            response = await client.get(path)
+            assert response.status_code == 200
+            payload = response.json()
+            version = payload["versions"][0] if path == "/" else payload["version"]
+            links = {link["rel"]: link["href"] for link in version["links"]}
+            assert links["models"] == "https://lumen.example/base/v1/models"
+
+
 
     def test_openapi_contract_version_and_profiles(self):
         schema = app.openapi()

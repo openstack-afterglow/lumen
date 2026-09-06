@@ -103,7 +103,7 @@ if origins:
 
 @app.get("/", tags=["Discovery"], response_model=RootDiscoveryResponse)
 async def root_discovery(request: Request):
-    base_url = str(request.base_url).rstrip("/")
+    base_url = (get_settings().public_api_base or str(request.base_url)).rstrip("/")
     return {
         "versions": [
             {
@@ -111,7 +111,10 @@ async def root_discovery(request: Request):
                 "status": "CURRENT",
                 "min_version": "1.0",
                 "version": "1.0",
-                "links": [{"rel": "self", "href": f"{base_url}/v1/"}],
+                "links": [
+                    {"rel": "self", "href": f"{base_url}/v1/"},
+                    {"rel": "models", "href": f"{base_url}/v1/models"},
+                ],
             }
         ]
     }
@@ -119,14 +122,17 @@ async def root_discovery(request: Request):
 
 @app.get("/v1/", tags=["Discovery"], response_model=VersionDiscoveryResponse)
 async def v1_discovery(request: Request):
-    base_url = str(request.base_url).rstrip("/")
+    base_url = (get_settings().public_api_base or str(request.base_url)).rstrip("/")
     return {
         "version": {
             "id": "v1.0",
             "status": "CURRENT",
             "min_version": "1.0",
             "version": "1.0",
-            "links": [{"rel": "self", "href": f"{base_url}/v1/"}],
+            "links": [
+                {"rel": "self", "href": f"{base_url}/v1/"},
+                {"rel": "models", "href": f"{base_url}/v1/models"},
+            ],
         }
     }
 

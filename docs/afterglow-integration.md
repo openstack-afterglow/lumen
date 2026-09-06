@@ -56,6 +56,7 @@ docker compose run --rm --no-deps -T lumen-connection
 
 ### 3.1 디스커버리 엔드포인트
 
+* `GET /` 및 `GET /v1/`: 인증이 필요 없는 서비스/버전 디스커버리 응답입니다. 각 버전의 `links`에 `rel=self`와 `rel=models`를 제공하며, `rel=models`는 OpenAI 형식 `GET /v1/models`를 가리킵니다. 해당 모델 목록을 조회할 때는 `models:read` scope를 가진 API key가 필요합니다.
 * `GET /v1/compat`: 인증이 필요 없는(Public) 외부 API 디스커버리 엔드포인트입니다.
   * 지원 포맷 (`openai`, `anthropic`), SDK별 추천 `sdk_base_url`, 모델 목록 경로를 JSON으로 제공합니다.
 * `GET /openapi.json`: 서버의 런타임 OpenAPI 스펙입니다. 각 엔드포인트별 요구 Scope(`x-required-api-key-scopes`) 및 `ChatRunEvent` 판별 유니온 구조가 기재되어 있습니다.

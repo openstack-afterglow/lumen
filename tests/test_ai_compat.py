@@ -258,8 +258,14 @@ class TestOpenAIEndpoint:
             return [{"model_name": "gpt-4o", "provider_name": "openai"}]
 
         monkeypatch.setattr(repository, "list_models", fake_list)
-        resp = await client.get("/v1/models", headers=_H)
-        assert resp.status_code == 200 and resp.json()["data"][0]["id"] == "gpt-4o"
+        discovery = (await client.get("/v1/")).json()["version"]
+        models_url = next(link["href"] for link in discovery["links"] if link["rel"] == "models")
+        resp = await client.get(models_url, headers=_H)
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "object": "list",
+            "data": [{"id": "gpt-4o", "object": "model", "created": 0, "owned_by": "openai"}],
+        }
 
     async def test_forwards_api_key_id_to_precheck(self, client, _auth, monkeypatch):
         calls = []

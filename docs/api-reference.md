@@ -23,7 +23,7 @@ API-key run은 text `execution_mode="chat"`만 허용한다. `memory=true`는 me
 
 | 그룹 | Route |
 | --- | --- |
-| Discovery/health | `GET /`, `/v1/`, `/v1/health`, compat `GET /v1/compat` |
+| Discovery/health | `GET /`, `/v1/` (both advertise `rel=models` for `/v1/models`), `/v1/health`, compat `GET /v1/compat` |
 | Compat | `GET /v1/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/messages` |
 | Conversations | `POST/GET /v1/conversations`, `GET/DELETE /v1/conversations/{id}`, messages/search/fork/workspace/active-leaf, completion/regenerate/retry/runs subroutes |
 | Native runs | `POST /v1/temp-completions`; `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/events`, `/v1/temp-threads/{id}`; approval/interaction/cancel POST routes |
