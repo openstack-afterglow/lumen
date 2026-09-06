@@ -573,6 +573,8 @@ class TestCanonicalCompletionRequests:
 
         assert response.status_code == 202
         assert response.json()["run_id"] == "run-1"
+        assert seen["client_request_id"] == _HEADERS["Idempotency-Key"]
+        assert isinstance(seen["client_request_id"], str)
         assert seen["request_payload"]["input_messages"][-1] == {"role": "user", "content": "first"}
         assert seen["intent"]["parts"] == [{"type": "text", "text": "first"}]
         assert seen["execution_protocol_version"] == 1

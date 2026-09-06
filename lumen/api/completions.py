@@ -201,7 +201,7 @@ async def create_completion(
         return await admission.create_persistent_run(
             project_id=project_id,
             user_id=user_id,
-            client_request_id=idempotency_key,
+            client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
             model_name=payload.model_id,
