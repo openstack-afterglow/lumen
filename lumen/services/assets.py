@@ -49,6 +49,13 @@ _IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
 _AUDIO_MIMES = {"audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/ogg", "audio/webm"}
 _VIDEO_MIMES = {"video/mp4", "video/webm"}
 _ALLOWED_MIMES = _IMAGE_MIMES | _AUDIO_MIMES | _VIDEO_MIMES | {"application/pdf"}
+_GENERATED_TEXT_MIMES = {
+    "application/json",
+    "text/csv",
+    "text/markdown",
+    "text/plain",
+}
+_ALLOWED_GENERATED_MIMES = _ALLOWED_MIMES | _GENERATED_TEXT_MIMES
 _CONTROL_OR_PATH = re.compile(r"[\x00-\x1f\x7f/\\]+")
 _BUCKET_BASE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _MEDIA_TYPE = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
@@ -233,13 +240,30 @@ async def inspect_file_async(path: Path, *, original_name: str) -> InspectedAsse
 
 
 def inspect_generated_file(path: Path, *, original_name: str, media_type: str) -> InspectedAsset:
-    """Inspect a trusted runtime output without treating it as model input media."""
+    """Inspect bounded runtime output before it enters the scanned asset pipeline."""
     size = path.stat().st_size
     normalized_media_type = media_type.strip().lower()
     if size <= 0 or size > _MAX_GENERATED_FILE_BYTES:
         raise AssetError("생성 파일 크기가 제한을 초과했습니다")
-    if not _MEDIA_TYPE.fullmatch(normalized_media_type):
-        raise AssetError("생성 파일 MIME 형식이 올바르지 않습니다")
+    if not _MEDIA_TYPE.fullmatch(normalized_media_type) or normalized_media_type not in _ALLOWED_GENERATED_MIMES:
+        raise AssetError("지원하지 않는 생성 파일 형식입니다")
+    if normalized_media_type in _ALLOWED_MIMES:
+        inspected = inspect_file(path, original_name=original_name)
+        if inspected.mime_type != normalized_media_type:
+            raise AssetError("생성 파일 형식이 선언된 MIME과 일치하지 않습니다")
+        return inspected
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise AssetError("생성 텍스트 파일이 올바른 UTF-8이 아닙니다") from exc
+    if any(ord(char) < 0x20 and char not in "\t\r\n" for char in text):
+        raise AssetError("생성 텍스트 파일에 허용되지 않는 제어 문자가 있습니다")
+    if normalized_media_type == "application/json":
+        try:
+            json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AssetError("생성 JSON 파일이 올바르지 않습니다") from exc
     with path.open("rb") as source:
         digest = hashlib.file_digest(source, "sha256").hexdigest()
     return InspectedAsset(

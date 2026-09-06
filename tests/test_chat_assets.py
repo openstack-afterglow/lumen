@@ -339,6 +339,30 @@ def test_generated_file_inspection_accepts_bounded_download_only_content(tmp_pat
     assert len(inspected.sha256) == 64
 
 
+@pytest.mark.parametrize(
+    ("media_type", "payload"),
+    [
+        ("application/octet-stream", b"opaque"),
+        ("text/plain", b"\xff\xfe"),
+        ("application/json", b"{not-json}"),
+    ],
+)
+def test_generated_file_inspection_rejects_disallowed_or_invalid_content(
+    tmp_path: Path,
+    media_type: str,
+    payload: bytes,
+):
+    path = tmp_path / "unsafe-output"
+    path.write_bytes(payload)
+
+    with pytest.raises(assets.AssetError):
+        assets.inspect_generated_file(
+            path,
+            original_name="unsafe-output",
+            media_type=media_type,
+        )
+
+
 @pytest.mark.asyncio
 async def test_generated_bytes_use_the_scanned_asset_pipeline_and_remove_temporary_file(monkeypatch):
     captured: dict[str, object] = {}
