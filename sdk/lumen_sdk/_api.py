@@ -45,6 +45,30 @@ class _LumenApiMixin:
     def fork_conversation(self, conversation_id, **attrs):
         return self._json_request("POST", f"/v1/conversations/{_segment(conversation_id)}/fork", body=attrs)
 
+    def preview_conversation_context(self, conversation_id, **attrs):
+        return self._json_request("POST", f"/v1/conversations/{_segment(conversation_id)}/context-preview", body=attrs)
+
+    def compact_conversation(self, conversation_id, idempotency_key: str | None = None, **attrs):
+        ik = idempotency_key or attrs.pop("idempotency_key", None)
+        return self._json_request(
+            "POST",
+            f"/v1/conversations/{_segment(conversation_id)}/compactions",
+            body=attrs,
+            headers={"Idempotency-Key": ik} if ik else None,
+        )
+
+    def preview_temp_context(self, temp_thread_id, **attrs):
+        return self._json_request("POST", f"/v1/temp-threads/{_segment(temp_thread_id)}/context-preview", body=attrs)
+
+    def compact_temp_thread(self, temp_thread_id, idempotency_key: str | None = None, **attrs):
+        ik = idempotency_key or attrs.pop("idempotency_key", None)
+        return self._json_request(
+            "POST",
+            f"/v1/temp-threads/{_segment(temp_thread_id)}/compactions",
+            body=attrs,
+            headers={"Idempotency-Key": ik} if ik else None,
+        )
+
     # -- Completions & Runs ---------------------------------------------
 
     def create_completion(self, conversation_id, idempotency_key: str | None = None, **attrs):
@@ -179,6 +203,9 @@ class _LumenApiMixin:
     def memories(self, **query):
         return self._json_request("GET", "/v1/memories", params=_query(**query))
 
+    def memory_document(self):
+        return self._json_request("GET", "/v1/memories/document")
+
     def create_memory(self, **attrs):
         return self._json_request("POST", "/v1/memories", body=attrs)
 
@@ -232,12 +259,8 @@ class _LumenApiMixin:
     def get_asset(self, asset_id):
         return self._json_request("GET", f"/v1/assets/{_segment(asset_id)}")
 
-    def download_asset(self, asset_id, allow_redirects: bool = False):
-        response = self.request(
-            f"/v1/assets/{_segment(asset_id)}/download", "GET", allow_redirects=allow_redirects, raise_exc=True
-        )
-        if not allow_redirects or response.status_code in (301, 302, 303, 307, 308):
-            return response.headers.get("Location")
+    def download_asset(self, asset_id):
+        response = self.request(f"/v1/assets/{_segment(asset_id)}/download", "GET", raise_exc=True)
         return response.content
 
     def delete_asset(self, asset_id):

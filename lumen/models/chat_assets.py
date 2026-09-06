@@ -21,6 +21,7 @@ class ChatAsset(Base):
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     object_key: Mapped[str] = mapped_column(VARCHAR(255), nullable=False, unique=True)
+    bucket_name: Mapped[str | None] = mapped_column(VARCHAR(63))
     original_name: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
     mime_type: Mapped[str] = mapped_column(VARCHAR(127), nullable=False)
     size_bytes: Mapped[int] = mapped_column(BIGINT, nullable=False)

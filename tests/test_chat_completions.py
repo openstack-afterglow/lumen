@@ -7,8 +7,13 @@ from fastapi import HTTPException
 from lumen.api import completions
 from lumen.auth import get_principal
 from lumen.main import app
-from lumen.models.chat_contracts import ChatFeatureOptions, ChatRunDescriptor, UserAssetInputPart
-from lumen.services import capabilities, chat_admission, credit
+from lumen.models.chat_contracts import (
+    ChatFeatureOptions,
+    ChatRunDescriptor,
+    UserAssetInputPart,
+    validate_user_input_parts,
+)
+from lumen.services import capabilities, chat_admission, context_store, credit
 from lumen.services import conversation_store as cs
 from lumen.services.durable_runs import admission, common, queries
 from lumen.services.durable_runs import errors as durable_errors
@@ -32,7 +37,7 @@ async def test_selected_skills_are_loaded_once_from_owned_active_extensions(monk
         ]
 
     monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
-    instructions, provenance = await completions._load_skill_snapshot(None, [1], "u1", "p1")
+    instructions, provenance = await chat_admission._load_skill_snapshot(None, [1], "u1", "p1")
 
     assert instructions == ["first"]
     assert provenance[0]["id"] == 1
@@ -73,19 +78,21 @@ async def test_extension_selection_expands_omitted_ids_for_default_chat(monkeypa
     monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
     monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", fake_credential_versions)
 
-    no_agent = await completions._resolve_extension_selection(None, ChatFeatureOptions(), user_id="u1", project_id="p1")
+    no_agent = await chat_admission._resolve_extension_selection(
+        None, ChatFeatureOptions(), user_id="u1", project_id="p1"
+    )
     assert [item["id"] for item in no_agent["tools"]] == [7, 8]
     assert [item["id"] for item in no_agent["mcp"]] == [7, 8]
     assert [item["credential_version"] for item in no_agent["mcp"]] == [3, 4]
 
     agent = {"tool_ids": [7], "mcp_ids": []}
-    agent_default = await completions._resolve_extension_selection(
+    agent_default = await chat_admission._resolve_extension_selection(
         agent, ChatFeatureOptions(), user_id="u1", project_id="p1"
     )
     assert [item["id"] for item in agent_default["tools"]] == [7]
     assert agent_default["mcp"] == []
 
-    explicit = await completions._resolve_extension_selection(
+    explicit = await chat_admission._resolve_extension_selection(
         None,
         ChatFeatureOptions(tool_policy={"enabled_tool_ids": [], "enabled_mcp_ids": []}),
         user_id="u1",
@@ -115,7 +122,7 @@ async def test_mcp_selection_snapshots_credential_version(monkeypatch):
     monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
     monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", credential_versions)
 
-    selection = await completions._resolve_extension_selection(
+    selection = await chat_admission._resolve_extension_selection(
         {"tool_ids": [], "mcp_ids": [7]},
         ChatFeatureOptions(),
         user_id="u1",
@@ -129,7 +136,7 @@ async def test_extension_selection_rejects_agent_allowlist_bypass(monkeypatch):
     monkeypatch.setattr(chat_admission.es, "list_for_user", lambda *_args, **_kwargs: _return([]))
 
     with pytest.raises(HTTPException, match="allowlist"):
-        await completions._resolve_extension_selection(
+        await chat_admission._resolve_extension_selection(
             {"tool_ids": [7], "mcp_ids": []},
             ChatFeatureOptions(tool_policy={"enabled_tool_ids": [8]}),
             user_id="u1",
@@ -159,6 +166,7 @@ def _resolved():
         "margin_multiplier": "1",
         "input_price_per_token": "0.000001",
         "output_price_per_token": "0.000002",
+        "capabilities": {"context_limit": 16_000, "max_output_tokens": 4096},
     }
 
 
@@ -168,15 +176,109 @@ async def _patch_text_execution(monkeypatch):
     monkeypatch.setattr(
         cs, "get_active_path", lambda *args, **kwargs: _return({"messages": [], "active_leaf_id": None})
     )
+    monkeypatch.setattr(
+        context_store,
+        "load_context_source",
+        lambda **_kwargs: _return(
+            {
+                "messages": [],
+                "message_ids": [],
+                "source_hashes": [],
+                "active_leaf_id": None,
+                "revision": "rev-empty",
+                "checkpoint_id": None,
+                "checkpoint": None,
+            }
+        ),
+    )
     monkeypatch.setattr(cs, "add_message", lambda *args, **kwargs: _return({"id": 1}))
     monkeypatch.setattr(ps, "resolve_model", lambda *args, **kwargs: _return(_resolved()))
+    monkeypatch.setattr(ps, "resolve_title_model", lambda *args, **kwargs: _return(None))
     monkeypatch.setattr(admission, "existing_run_for_intent", lambda *args, **kwargs: _return(None))
+    monkeypatch.setattr(completions, "_active_context_compaction_run_id", lambda **_kwargs: _return(None))
     monkeypatch.setattr(chat_admission.ms, "active_contents_for_run", lambda *args, **kwargs: _return([]))
+    monkeypatch.setattr(
+        chat_admission,
+        "_resolve_feature_routes",
+        lambda *_args, **_kwargs: _return({}),
+    )
+    monkeypatch.setattr(
+        chat_admission,
+        "_load_skill_snapshot",
+        lambda *_args, **_kwargs: _return(([], [])),
+    )
+    monkeypatch.setattr(
+        chat_admission,
+        "_resolve_extension_selection",
+        lambda *_args, **_kwargs: _return({"tools": [], "mcp": []}),
+    )
+    monkeypatch.setattr(
+        chat_admission,
+        "_preview_tool_schemas",
+        lambda *_args, **_kwargs: _return([]),
+    )
     monkeypatch.setattr(chat_admission.ws, "get_instructions_for_run", lambda *args, **kwargs: _return(None))
 
 
 async def _return(value):
     return value
+
+
+async def test_context_planner_does_not_duplicate_saved_regenerate_input(monkeypatch):
+    monkeypatch.setattr(
+        context_store,
+        "load_context_source",
+        lambda **_kwargs: _return(
+            {
+                "messages": [{"role": "user", "content": "saved turn"}],
+                "message_ids": ["1"],
+                "source_hashes": ["h1"],
+                "active_leaf_id": "1",
+                "revision": "rev-1",
+                "checkpoint_id": None,
+                "checkpoint": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(chat_admission, "_load_owned_conv", lambda *_args, **_kwargs: _return(_conv()))
+    monkeypatch.setattr(chat_admission, "_resolve_model", lambda *_args, **_kwargs: _return(_resolved()))
+    monkeypatch.setattr(
+        chat_admission,
+        "_resolve_extension_selection",
+        lambda *_args, **_kwargs: _return({"tools": [], "mcp": []}),
+    )
+    monkeypatch.setattr(chat_admission, "_resolve_feature_routes", lambda *_args, **_kwargs: _return({}))
+    monkeypatch.setattr(chat_admission, "resolve_summary_route", lambda route: _return(route))
+
+    parts = [{"type": "text", "text": "saved turn"}]
+    features = ChatFeatureOptions(tool_policy={"mode": "none"})
+    planned = await chat_admission.prepare_context_input(
+        user_id="u1",
+        project_id="p1",
+        conversation_id="c1",
+        model_id="gpt-3.5-turbo",
+        parts=validate_user_input_parts(parts),
+        features=features,
+        append_draft=False,
+    )
+    assert planned["input_messages"] == [{"role": "user", "content": "saved turn"}]
+
+
+def test_persisted_canonical_attachment_restores_input_reference():
+    assert completions._user_input_parts_from_message(
+        {
+            "parts": [
+                {
+                    "type": "image",
+                    "asset_id": "asset-1",
+                    "mime_type": "image/png",
+                    "name": "diagram.png",
+                    "width": 640,
+                    "height": 480,
+                }
+            ],
+        }
+    )[0].model_dump(mode="json") == {"type": "image", "asset_id": "asset-1"}
 
 
 class TestRuntimeCapabilities:
@@ -241,8 +343,8 @@ class TestRuntimeCapabilities:
 class TestReasoningEffortValidation:
     def test_auto_and_none_are_supported_for_reasoning_models(self):
         resolved = {"capabilities": {"reasoning": True, "reasoning_options": [{"type": "toggle"}]}}
-        assert completions._validated_reasoning_effort("auto", resolved) == "auto"
-        assert completions._validated_reasoning_effort("none", resolved) == "none"
+        assert chat_admission._validated_reasoning_effort("auto", resolved) == "auto"
+        assert chat_admission._validated_reasoning_effort("none", resolved) == "none"
 
     def test_only_models_dev_effort_values_are_allowed(self):
         resolved = {
@@ -251,29 +353,29 @@ class TestReasoningEffortValidation:
                 "reasoning_options": [{"type": "effort", "values": ["low", "xhigh", "max", "ultra"]}],
             }
         }
-        assert completions._validated_reasoning_effort("ultra", resolved) == "ultra"
+        assert chat_admission._validated_reasoning_effort("ultra", resolved) == "ultra"
         with pytest.raises(HTTPException, match="지원하지 않습니다"):
-            completions._validated_reasoning_effort("high", resolved)
+            chat_admission._validated_reasoning_effort("high", resolved)
 
     def test_unlisted_effort_is_rejected_for_toggle_only_models(self):
         resolved = {"capabilities": {"reasoning": True, "reasoning_options": [{"type": "toggle"}]}}
         with pytest.raises(HTTPException, match="지원하지 않습니다"):
-            completions._validated_reasoning_effort("low", resolved)
+            chat_admission._validated_reasoning_effort("low", resolved)
 
     def test_gpt5_tools_reject_explicit_reasoning_but_allow_auto_or_none(self):
         resolved = {"provider_type": "openai", "model_name": "gpt-5.6-luna"}
         tools_enabled = ChatFeatureOptions()
 
-        completions._validate_tool_reasoning_compatibility("auto", resolved, tools_enabled)
-        completions._validate_tool_reasoning_compatibility("none", resolved, tools_enabled)
+        chat_admission._validate_tool_reasoning_compatibility("auto", resolved, tools_enabled)
+        chat_admission._validate_tool_reasoning_compatibility("none", resolved, tools_enabled)
         with pytest.raises(HTTPException, match="도구 사용과 명시적 추론 강도"):
-            completions._validate_tool_reasoning_compatibility("high", resolved, tools_enabled)
+            chat_admission._validate_tool_reasoning_compatibility("high", resolved, tools_enabled)
 
     def test_gpt5_explicit_reasoning_is_allowed_when_tools_are_disabled(self):
         resolved = {"provider_type": "openai", "model_name": "gpt-5.6-luna"}
         tools_disabled = ChatFeatureOptions(tool_policy={"mode": "none"})
 
-        completions._validate_tool_reasoning_compatibility("high", resolved, tools_disabled)
+        chat_admission._validate_tool_reasoning_compatibility("high", resolved, tools_disabled)
 
 
 class TestExecutionCapabilityGate:
@@ -295,7 +397,7 @@ class TestExecutionCapabilityGate:
         }
 
         with pytest.raises(HTTPException, match="web_search"):
-            completions._require_execution_capability(features, resolved)
+            chat_admission._require_execution_capability(features, resolved)
 
     def test_accepts_priced_managed_web_search_and_fetch(self):
         features = ChatFeatureOptions(
@@ -314,7 +416,7 @@ class TestExecutionCapabilityGate:
             },
         }
 
-        completions._require_execution_capability(features, resolved)
+        chat_admission._require_execution_capability(features, resolved)
 
     def test_accepts_priced_user_selected_advisor_with_function_calling_executor(self):
         features = ChatFeatureOptions(advisor={"enabled": True, "model_id": 9})
@@ -335,7 +437,7 @@ class TestExecutionCapabilityGate:
             }
         }
 
-        completions._require_execution_capability(features, resolved, feature_routes=routes)
+        chat_admission._require_execution_capability(features, resolved, feature_routes=routes)
 
     def test_rejects_managed_feature_when_tools_are_disabled(self):
         features = ChatFeatureOptions(
@@ -354,20 +456,20 @@ class TestExecutionCapabilityGate:
         }
 
         with pytest.raises(HTTPException, match="requires tool execution"):
-            completions._require_execution_capability(features, resolved)
+            chat_admission._require_execution_capability(features, resolved)
 
     def test_accepts_priced_text_when_legacy_override_has_no_canonical_gates(self):
-        completions._require_execution_capability(
+        chat_admission._require_execution_capability(
             ChatFeatureOptions(),
             {"input_price_per_token": "0.000001", "output_price_per_token": "0.000002", "capabilities": {}},
         )
 
     def test_rejects_unpriced_text_execution(self):
         with pytest.raises(HTTPException, match="text"):
-            completions._require_execution_capability(ChatFeatureOptions(), {"capabilities": {}})
+            chat_admission._require_execution_capability(ChatFeatureOptions(), {"capabilities": {}})
 
     def test_accepts_manual_memory_until_semantic_retrieval_is_enabled(self):
-        completions._require_execution_capability(
+        chat_admission._require_execution_capability(
             ChatFeatureOptions(memory=True),
             {"input_price_per_token": "0.000001", "output_price_per_token": "0.000002", "capabilities": {}},
         )
@@ -375,7 +477,7 @@ class TestExecutionCapabilityGate:
     def test_rejects_unavailable_input_modality(self):
         image = UserAssetInputPart(type="image", asset_id="asset-1")
         with pytest.raises(HTTPException, match="image_input"):
-            completions._require_execution_capability(
+            chat_admission._require_execution_capability(
                 ChatFeatureOptions(),
                 {"input_price_per_token": "0.000001", "output_price_per_token": "0.000002", "capabilities": {}},
                 parts=[image],
@@ -390,13 +492,13 @@ class TestExecutionCapabilityGate:
         )
         monkeypatch.setattr(chat_admission.ms, "active_contents_for_run", fail_memory_lookup)
 
-        workspace, memories = await completions._load_context({"workspace_id": 7}, "u1", "p1", include_memory=False)
+        workspace, memories = await chat_admission._load_context({"workspace_id": 7}, "u1", "p1", include_memory=False)
 
         assert workspace == "workspace rule"
         assert memories == []
 
     def test_run_snapshot_excludes_provider_secret(self):
-        capabilities, pricing = completions._run_snapshots(
+        capabilities, pricing = chat_admission._run_snapshots(
             {
                 "model_name": "model-a",
                 "capabilities": {"feature_gates": {}},
@@ -430,6 +532,15 @@ class TestExecutionCapabilityGate:
                     "api_key": "must-not-persist",
                 },
             },
+            summary_route={
+                "provider_id": 5,
+                "provider_name": "summary-provider",
+                "model_id": 6,
+                "model_name": "summary-model",
+                "config_version_hash": "d" * 64,
+                "capabilities": {"context_limit": 4_096},
+                "api_key": "must-not-persist",
+            },
         )
 
         assert "api_key" not in capabilities
@@ -443,6 +554,8 @@ class TestExecutionCapabilityGate:
         assert "must-not-persist" not in json.dumps(capabilities)
         assert pricing["component_prices"]["advisor_input_price_per_token"] == "0.0003"
         assert pricing["component_prices"]["advisor_output_price_per_token"] == "0.0004"
+        assert capabilities["summary_route"]["context_limit"] == 4_096
+        assert capabilities["summary_route"]["model_name"] == "summary-model"
 
     async def test_resolves_only_user_selected_feature_routes(self, monkeypatch):
         search_route = {"provider_id": 7, "provider_name": "search", "config_version_hash": "s" * 64}
@@ -456,7 +569,7 @@ class TestExecutionCapabilityGate:
         monkeypatch.setattr(chat_admission.ps, "get_active_provider_route", lambda provider_id: _return(search_route))
         monkeypatch.setattr(chat_admission.ps, "resolve_model_by_id", lambda model_id: _return(advisor_route))
 
-        routes = await completions._resolve_feature_routes(
+        routes = await chat_admission._resolve_feature_routes(
             ChatFeatureOptions(
                 web_search={"enabled": True, "provider_id": 7},
                 advisor={"enabled": True, "model_id": 9},
@@ -468,7 +581,7 @@ class TestExecutionCapabilityGate:
     async def test_rejects_unavailable_selected_feature_route(self, monkeypatch):
         monkeypatch.setattr(chat_admission.ps, "get_active_provider_route", lambda provider_id: _return(None))
         with pytest.raises(HTTPException, match="selected web search provider"):
-            await completions._resolve_feature_routes(
+            await chat_admission._resolve_feature_routes(
                 ChatFeatureOptions(web_search={"enabled": True, "provider_id": 7})
             )
 
@@ -482,7 +595,9 @@ class TestExecutionCapabilityGate:
         monkeypatch.setattr(chat_admission.ws, "get_instructions_for_run", lambda *_args, **_kwargs: _return(None))
         monkeypatch.setattr(chat_admission.ms, "active_contents_for_run", load_memory)
 
-        workspace, memories = await completions._load_context({"workspace_id": None}, "u1", "p1", include_memory=True)
+        workspace, memories = await chat_admission._load_context(
+            {"workspace_id": None}, "u1", "p1", include_memory=True
+        )
 
         assert workspace is None
         assert memories == ["사용자는 Python을 선호합니다."]
@@ -589,7 +704,7 @@ class TestCanonicalCompletionRequests:
         monkeypatch.setattr(completions, "get_settings", lambda: settings)
         monkeypatch.setattr(common, "_require_supported_execution_protocol_version", lambda _version: None)
         monkeypatch.setattr(
-            completions,
+            chat_admission,
             "_resolve_agent",
             lambda *_args: _return(
                 {
@@ -641,11 +756,6 @@ class TestCanonicalCompletionRequests:
         )
         monkeypatch.setattr(admission, "existing_run_for_intent", lambda *args, **kwargs: _return(existing))
         monkeypatch.setattr(completions, "get_settings", lambda: SimpleNamespace(chat_execution_protocol_version=2))
-
-        async def unavailable_model(*_args, **_kwargs):
-            raise AssertionError("retry must not resolve a mutable model route")
-
-        monkeypatch.setattr(completions, "_resolve_model", unavailable_model)
 
         async def unexpected_message(*_args, **_kwargs):
             raise AssertionError("retry must not create another user message")
@@ -771,7 +881,7 @@ class TestRetryFailedRun:
         monkeypatch.setattr(admission, "existing_run_for_intent", lambda *args, **kwargs: _return(None))
         monkeypatch.setattr(common, "_factory", fake_factory)
         monkeypatch.setattr(
-            completions,
+            chat_admission,
             "_resolve_agent",
             lambda agent_id, user_id, project_id: _return({"id": 7, "instructions": "agent-7"}),
         )
@@ -785,7 +895,7 @@ class TestRetryFailedRun:
             "config_fingerprint": "a" * 64,
         }
         monkeypatch.setattr(
-            completions,
+            chat_admission,
             "_resolve_extension_selection",
             lambda agent, features, *, user_id, project_id: _return({"tools": [], "mcp": [mcp_item]}),
         )
@@ -796,6 +906,16 @@ class TestRetryFailedRun:
             return []
 
         monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list_for_user)
+        monkeypatch.setattr(
+            chat_admission,
+            "_load_skill_snapshot",
+            lambda *_args, **_kwargs: _return(
+                (
+                    ["skill-3-instructions"],
+                    [{"id": 3, "name": "skill-3", "content_hash": "a" * 64}],
+                )
+            ),
+        )
         monkeypatch.setattr(
             cs,
             "path_ending_at",
@@ -873,6 +993,7 @@ class TestRetryFailedRun:
 
 class TestCanonicalTempCompletion:
     async def test_temp_completion_creates_thread_and_descriptor(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
         monkeypatch.setattr(credit, "precheck", _ok_precheck)
         monkeypatch.setattr(ps, "resolve_model", lambda *args, **kwargs: _return(_resolved()))
         monkeypatch.setattr(admission, "existing_run_for_intent", lambda **_kwargs: _return(None))
@@ -1048,3 +1169,326 @@ class TestApiKeyLimitAdmission:
                 conversation_id="c1",
             )
         assert "Idempotency-Key must be a UUID" in str(exc_info.value)
+
+
+class TestContextPreviewRoutes:
+    async def test_conversation_context_preview_returns_200_and_does_not_mutate_db_or_create_run(
+        self, client, monkeypatch
+    ):
+        await _patch_text_execution(monkeypatch)
+        monkeypatch.setattr(
+            context_store,
+            "load_context_source",
+            lambda **kwargs: _return(
+                {
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "message_ids": ["1"],
+                    "source_hashes": ["hash1"],
+                    "active_leaf_id": "1",
+                    "revision": "rev-1",
+                    "checkpoint_id": None,
+                    "checkpoint": None,
+                }
+            ),
+        )
+
+        body = {
+            "model_id": "gpt-3.5-turbo",
+            "features": {},
+            "parts": [{"type": "text", "text": "draft part"}],
+        }
+        resp = await client.post(f"{_BASE}/c1/context-preview", json=body)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["model_name"] == "gpt-3.5-turbo"
+        assert data["context_limit"] == 16000
+        assert data["revision"] == "rev-1"
+        assert data["measurement"] in {"tokenizer", "estimated"}
+        assert "utilization" in data
+
+    async def test_temp_thread_context_preview_returns_200(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+        monkeypatch.setattr(
+            context_store,
+            "load_context_source",
+            lambda **kwargs: _return(
+                {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "message_ids": ["1"],
+                    "source_hashes": ["hash1"],
+                    "active_leaf_id": None,
+                    "revision": "rev-temp-1",
+                    "checkpoint_id": None,
+                    "checkpoint": None,
+                }
+            ),
+        )
+
+        body = {
+            "model_id": "gpt-3.5-turbo",
+            "features": {},
+            "parts": [],
+        }
+        resp = await client.post("/api/v1/chat/temp-threads/t1/context-preview", json=body)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["revision"] == "rev-temp-1"
+
+    async def test_temp_thread_context_preview_rejects_agent_and_code_mode(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+        body = {
+            "model_id": "gpt-3.5-turbo",
+            "features": {},
+            "agent_id": 99,
+        }
+        resp = await client.post("/api/v1/chat/temp-threads/t1/context-preview", json=body)
+        assert resp.status_code == 422
+
+
+class TestCompactionRoutes:
+    async def test_conversation_compaction_returns_202_descriptor_with_compaction_kind(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+        monkeypatch.setattr(
+            context_store,
+            "load_context_source",
+            lambda **kwargs: _return(
+                {
+                    "messages": [
+                        {"role": "user", "content": "turn 1"},
+                        {"role": "assistant", "content": "resp 1"},
+                        {"role": "user", "content": "turn 2"},
+                        {"role": "assistant", "content": "resp 2"},
+                        {"role": "user", "content": "turn 3"},
+                        {"role": "assistant", "content": "resp 3"},
+                    ],
+                    "message_ids": ["1", "2", "3", "4", "5", "6"],
+                    "source_hashes": ["h1", "h2", "h3", "h4", "h5", "h6"],
+                    "active_leaf_id": "6",
+                    "revision": "rev-abc",
+                    "checkpoint_id": None,
+                    "checkpoint": None,
+                }
+            ),
+        )
+
+        desc = ChatRunDescriptor(
+            run_id="run-compact-1",
+            run_kind="compaction",
+            status="queued",
+            events_url="/v1/runs/run-compact-1/events",
+            cancel_url="/v1/runs/run-compact-1/cancel",
+        )
+        monkeypatch.setattr(admission, "create_compaction_run", lambda **kwargs: _return(desc))
+        seen_create: dict = {}
+
+        async def create_compaction_run(**kwargs):
+            seen_create.update(kwargs)
+            return desc
+
+        large_tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "large_schema",
+                "description": "x" * 50_000,
+                "parameters": {"type": "object"},
+            },
+        }
+        resolved = _resolved()
+        resolved["capabilities"]["context_limit"] = 100_000
+        monkeypatch.setattr(ps, "resolve_model", lambda *args, **kwargs: _return(resolved))
+        monkeypatch.setattr(
+            chat_admission,
+            "_preview_tool_schemas",
+            lambda *_args, **_kwargs: _return([large_tool_schema]),
+        )
+        monkeypatch.setattr(admission, "create_compaction_run", create_compaction_run)
+
+        body = {
+            "model_id": "gpt-3.5-turbo",
+            "features": {"tool_policy": {"mode": "agent_default"}},
+            "expected_context_revision": "rev-abc",
+        }
+        resp = await client.post(
+            f"{_BASE}/c1/compactions",
+            headers=_HEADERS,
+            json=body,
+        )
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["run_id"] == "run-compact-1"
+        assert data["run_kind"] == "compaction"
+        assert seen_create["request_payload"]["tool_schemas"] == [large_tool_schema]
+
+    async def test_compaction_idempotency_returns_original_run(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+        desc = ChatRunDescriptor(
+            run_id="run-compact-orig",
+            run_kind="compaction",
+            status="queued",
+            events_url="/v1/runs/run-compact-orig/events",
+            cancel_url="/v1/runs/run-compact-orig/cancel",
+        )
+        monkeypatch.setattr(admission, "existing_run_for_intent", lambda **kwargs: _return(desc))
+
+        body = {
+            "model_id": "gpt-3.5-turbo",
+            "features": {},
+            "expected_context_revision": "any-rev",
+        }
+        resp = await client.post(
+            f"{_BASE}/c1/compactions",
+            headers=_HEADERS,
+            json=body,
+        )
+        assert resp.status_code == 202
+        assert resp.json()["run_id"] == "run-compact-orig"
+
+    async def test_compaction_stale_revision_returns_409(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+        monkeypatch.setattr(
+            context_store,
+            "load_context_source",
+            lambda **kwargs: _return(
+                {
+                    "messages": [
+                        {"role": "user", "content": "turn 1"},
+                        {"role": "assistant", "content": "resp 1"},
+                        {"role": "user", "content": "turn 2"},
+                        {"role": "assistant", "content": "resp 2"},
+                        {"role": "user", "content": "turn 3"},
+                    ],
+                    "message_ids": ["1", "2", "3", "4", "5"],
+                    "source_hashes": ["h1", "h2", "h3", "h4", "h5"],
+                    "active_leaf_id": "5",
+                    "revision": "actual-rev-123",
+                    "checkpoint_id": None,
+                    "checkpoint": None,
+                }
+            ),
+        )
+
+        body = {
+            "model_id": "gpt-3.5-turbo",
+            "features": {},
+            "expected_context_revision": "stale-rev-999",
+        }
+        resp = await client.post(
+            f"{_BASE}/c1/compactions",
+            headers=_HEADERS,
+            json=body,
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "context_revision_changed"
+
+    async def test_compaction_nothing_to_compact_returns_422(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+        monkeypatch.setattr(
+            context_store,
+            "load_context_source",
+            lambda **kwargs: _return(
+                {
+                    "messages": [{"role": "user", "content": "short hello"}],
+                    "message_ids": ["1"],
+                    "source_hashes": ["h1"],
+                    "active_leaf_id": "1",
+                    "revision": "rev-short",
+                    "checkpoint_id": None,
+                    "checkpoint": None,
+                }
+            ),
+        )
+
+        body = {
+            "model_id": "gpt-3.5-turbo",
+            "features": {},
+            "expected_context_revision": "rev-short",
+        }
+        resp = await client.post(
+            f"{_BASE}/c1/compactions",
+            headers=_HEADERS,
+            json=body,
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "nothing_to_compact"
+
+    async def test_compaction_unknown_budget_returns_422(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+        res = _resolved()
+        res["capabilities"]["context_limit"] = None
+        monkeypatch.setattr(ps, "resolve_model", lambda *args, **kwargs: _return(res))
+        monkeypatch.setattr(
+            context_store,
+            "load_context_source",
+            lambda **kwargs: _return(
+                {
+                    "messages": [
+                        {"role": "user", "content": "turn 1"},
+                        {"role": "assistant", "content": "resp 1"},
+                        {"role": "user", "content": "turn 2"},
+                        {"role": "assistant", "content": "resp 2"},
+                        {"role": "user", "content": "turn 3"},
+                    ],
+                    "message_ids": ["1", "2", "3", "4", "5"],
+                    "source_hashes": ["h1", "h2", "h3", "h4", "h5"],
+                    "active_leaf_id": "5",
+                    "revision": "rev-nobudget",
+                    "checkpoint_id": None,
+                    "checkpoint": None,
+                }
+            ),
+        )
+
+        body = {
+            "model_id": "gpt-3.5-turbo",
+            "features": {},
+            "expected_context_revision": "rev-nobudget",
+        }
+        resp = await client.post(
+            f"{_BASE}/c1/compactions",
+            headers=_HEADERS,
+            json=body,
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "context_budget_unavailable"
+
+    async def test_compaction_active_run_conflict_returns_409(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+        monkeypatch.setattr(
+            context_store,
+            "load_context_source",
+            lambda **kwargs: _return(
+                {
+                    "messages": [
+                        {"role": "user", "content": "turn 1"},
+                        {"role": "assistant", "content": "resp 1"},
+                        {"role": "user", "content": "turn 2"},
+                        {"role": "assistant", "content": "resp 2"},
+                        {"role": "user", "content": "turn 3"},
+                    ],
+                    "message_ids": ["1", "2", "3", "4", "5"],
+                    "source_hashes": ["h1", "h2", "h3", "h4", "h5"],
+                    "active_leaf_id": "5",
+                    "revision": "rev-active",
+                    "checkpoint_id": None,
+                    "checkpoint": None,
+                }
+            ),
+        )
+
+        async def active_conflict(**kwargs):
+            raise durable_errors.DurableRunConflict("conversation_run_active")
+
+        monkeypatch.setattr(admission, "create_compaction_run", active_conflict)
+
+        body = {
+            "model_id": "gpt-3.5-turbo",
+            "features": {},
+            "expected_context_revision": "rev-active",
+        }
+        resp = await client.post(
+            f"{_BASE}/c1/compactions",
+            headers=_HEADERS,
+            json=body,
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "conversation_run_active"

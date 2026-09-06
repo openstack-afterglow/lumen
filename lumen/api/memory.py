@@ -43,6 +43,12 @@ class MemoryUpdate(BaseModel):
     category: Literal["interest", "development", "habit", "preference", "general"] | None = None
 
 
+class MemoryDocument(BaseModel):
+    filename: Literal["memory.md"] = "memory.md"
+    content_type: Literal["text/markdown"] = "text/markdown"
+    content: str
+
+
 def _map_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ms.MemoryNotFound):
         return HTTPException(status_code=404, detail=str(exc))
@@ -102,6 +108,19 @@ async def list_memories(token_info: dict = Depends(require_scopes("native:memory
         )
     except ms.ChatStorageUnavailable:
         return []
+
+
+@router.get("/memories/document", response_model=MemoryDocument)
+async def get_memory_document(token_info: dict = Depends(require_scopes("native:memory:read"))):
+    try:
+        memories = await ms.list_memories(
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            **({"include_account": False} if token_info["auth_type"] == "api_key" else {}),
+        )
+    except ms.ChatStorageUnavailable:
+        memories = []
+    return MemoryDocument(content=ms.render_memory_markdown(memories))
 
 
 @router.post("/memories/search")

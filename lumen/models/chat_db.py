@@ -45,6 +45,12 @@ class LlmProvider(Base):
     encrypted_api_key: Mapped[str | None] = mapped_column(TEXT)
     # Optional environment variable name used only when no database key exists.
     api_key_env: Mapped[str | None] = mapped_column(VARCHAR(128))
+    # Subscription credentials are encrypted separately from API keys so execution cannot fall back across auth modes.
+    auth_mode: Mapped[str] = mapped_column(VARCHAR(32), nullable=False, default="api_key")
+    encrypted_subscription_tokens: Mapped[str | None] = mapped_column(TEXT)
+    subscription_status: Mapped[str] = mapped_column(VARCHAR(24), nullable=False, default="disconnected")
+    subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    subscription_generation: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     margin_multiplier: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False, default=Decimal("1.0"))
     # models.dev provider key. Display names are never used for catalog matching.
@@ -54,8 +60,37 @@ class LlmProvider(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
     models: Mapped[list["LlmModel"]] = relationship("LlmModel", back_populates="provider", cascade="all, delete-orphan")
+    auth_attempt: Mapped["LlmProviderAuthAttempt | None"] = relationship(
+        "LlmProviderAuthAttempt",
+        back_populates="provider",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
     __table_args__ = (UniqueConstraint("name", name="uq_llm_providers_name"),)
+
+
+class LlmProviderAuthAttempt(Base):
+    """Single durable device-auth attempt for one provider."""
+
+    __tablename__ = "llm_provider_auth_attempts"
+
+    provider_id: Mapped[int] = mapped_column(
+        BIGINT,
+        ForeignKey("llm_providers.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    id: Mapped[str] = mapped_column(CHAR(36), nullable=False, unique=True)
+    initiated_by_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    initiated_by_project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    provider_generation: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    encrypted_payload: Mapped[str | None] = mapped_column(TEXT)
+    status: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="pending")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    next_poll_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+    provider: Mapped["LlmProvider"] = relationship("LlmProvider", back_populates="auth_attempt")
 
 
 class LlmModel(Base):
@@ -101,6 +136,9 @@ class ChatConversation(Base):
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     # AES-256-GCM(도메인 chat_content) 암호문. 첫 메시지 요약 제목도 채팅 내용이라 암호화. TEXT(암호문 길이).
     title: Mapped[str | None] = mapped_column(TEXT)
+    title_source: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="legacy")
+    title_status: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="idle")
+    title_revision: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
     model_name: Mapped[str | None] = mapped_column(VARCHAR(190))
     # 버전 트리에서 현재 보이는 리프 메시지. 렌더 경로 = active_leaf → parent 역추적.
     active_leaf_id: Mapped[int | None] = mapped_column(BIGINT)
@@ -197,7 +235,7 @@ class ChatUsageLog(Base):
     event_id: Mapped[str | None] = mapped_column(VARCHAR(64), unique=True)
     pricing_status: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="legacy")
     pricing_snapshot: Mapped[dict | None] = mapped_column(JSON)
-    run_id: Mapped[str | None] = mapped_column(CHAR(36), unique=True)
+    run_id: Mapped[str | None] = mapped_column(CHAR(36))
     usage_components: Mapped[dict | None] = mapped_column(JSON)
     provider_reported_cost: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
 
@@ -207,6 +245,7 @@ class ChatUsageLog(Base):
         Index("idx_chat_usage_project_created", "project_id", "created_at"),
         Index("idx_chat_usage_user_created", "user_id", "created_at"),
         Index("idx_chat_usage_api_key_created", "api_key_id", "created_at"),
+        Index("idx_chat_usage_run_id", "run_id"),
     )
 
 
@@ -539,5 +578,3 @@ class ChatMemoryOwnerLock(Base):
     project_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
-
-

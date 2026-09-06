@@ -13,10 +13,10 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from lumen import auth as deps
-from lumen.api import completions
 from lumen.main import app
 from lumen.models.chat_contracts import ChatFeatureOptions, TextPart
 from lumen.services import api_key_store as aks
+from lumen.services import chat_admission
 
 _USER_KEYS = "/api/v1/chat/api-keys"
 
@@ -111,7 +111,9 @@ class TestStorePureLogic:
         # Maximum representable values
         assert aks._validate_monthly_credit_limit(Decimal("9999999999.99999999")) == Decimal("9999999999.99999999")
         assert aks._validate_monthly_credit_limit("9999999999.99999999") == Decimal("9999999999.99999999")
-        assert aks._validate_monthly_credit_limit(Decimal("9999999999.999999990000")) == Decimal("9999999999.999999990000")
+        assert aks._validate_monthly_credit_limit(Decimal("9999999999.999999990000")) == Decimal(
+            "9999999999.999999990000"
+        )
 
         # 1E+10 and 1E+18 overflow
         with pytest.raises(ValueError):
@@ -149,8 +151,10 @@ class TestStorePureLogic:
                 class _BeginCM:
                     async def __aenter__(self):
                         return None
+
                     async def __aexit__(self, exc_type, exc_val, exc_tb):
                         return False
+
                 return _BeginCM()
 
             async def __aenter__(self):
@@ -176,7 +180,7 @@ class TestStorePureLogic:
 
         session = FakeSession(row)
 
-        monkeypatch.setattr(aks, "_require_db", lambda: (lambda: session))
+        monkeypatch.setattr(aks, "_require_db", lambda: lambda: session)
 
         async def fake_quota(s, u):
             return Decimal("1000.0")
@@ -308,7 +312,7 @@ class TestPrincipalDependency:
         with pytest.raises(
             HTTPException, match="native:memory:read, native:memory:write, native:tools:execute"
         ) as exc_info:
-            completions._require_native_admission_scopes(
+            chat_admission._require_native_admission_scopes(
                 {
                     "auth_type": "api_key",
                     "user_id": "u1",
@@ -330,7 +334,7 @@ class TestPrincipalDependency:
 
     def test_native_api_key_rejects_non_text_input(self):
         with pytest.raises(HTTPException, match="text chat만 지원합니다") as exc_info:
-            completions._require_native_admission_scopes(
+            chat_admission._require_native_admission_scopes(
                 {
                     "auth_type": "api_key",
                     "user_id": "u1",
@@ -509,7 +513,9 @@ class TestRouter:
             }
 
         monkeypatch.setattr(aks, "list_keys_admin", fake_list_admin)
-        resp = await admin_client.get("/v1/admin/api-keys?owner_user_id=u-test&owner_project_id=p-test&before_id=10&limit=25")
+        resp = await admin_client.get(
+            "/v1/admin/api-keys?owner_user_id=u-test&owner_project_id=p-test&before_id=10&limit=25"
+        )
         assert resp.status_code == 200
         assert captured == {
             "owner_user_id": "u-test",

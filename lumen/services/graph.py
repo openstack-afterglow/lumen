@@ -473,9 +473,22 @@ def _build_graph(params: dict, ctx: ToolContext):
                         restored,
                         include_managed=False,
                     )
+        round_index = int(state.get("loop_count", 0))
         schemas = (
-            _v2_tool_schemas(v2_bindings) if isinstance(v2_bindings, dict) else await selection.context_tool_schemas(ctx)
+            _v2_tool_schemas(v2_bindings)
+            if isinstance(v2_bindings, dict)
+            else await selection.context_tool_schemas(ctx)
         )
+        prepared_messages = await boundary(
+            "prepare_context",
+            messages=messages,
+            tool_schemas=schemas,
+            round_index=round_index,
+        )
+        if prepared_messages is not None:
+            if not isinstance(prepared_messages, list) or not all(isinstance(item, dict) for item in prepared_messages):
+                raise RuntimeError("context preparation returned invalid messages")
+            messages = prepared_messages
 
         reasoning_effort = None if params["model"] in _REASONING_UNSUPPORTED else params.get("reasoning_effort")
         disable_reasoning_for_tools = bool(schemas) and (
@@ -483,7 +496,6 @@ def _build_graph(params: dict, ctx: ToolContext):
             or _requires_explicit_none_for_tools(params["model"], params.get("custom_llm_provider"), reasoning_effort)
         )
         attempt = 0
-        round_index = int(state.get("loop_count", 0))
 
         async def open_stream(effort, *, disable_reasoning: bool = False):
             nonlocal attempt
@@ -1219,8 +1231,8 @@ async def stream(
     *,
     model: str,
     messages: list[dict],
-    project_id: str,
-    user_id: str,
+    project_id: str | None = None,
+    user_id: str | None = None,
     custom_llm_provider: str | None = None,
     api_base: str | None = None,
     api_key: str | None = None,

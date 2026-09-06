@@ -23,6 +23,12 @@ Dockerfile은 migration을 자동 실행하지 않는다. migration 누락 상�
 | optional stores | `chat_checkpointer_postgres_url`, `chat_memory_pgvector_url`, `chat_asset_s3_*` | configured feature에만 필요 |
 | TLS/auth | `os_cacert`, `insecure`, Keystone fields | TLS verify 기본 활성; `insecure`는 예외적 개발 설정 |
 
+### Chat asset S3 contract
+
+Asset storage uses one service-owned S3 credential across deterministic project buckets. Set `chat_asset_s3_region` explicitly (`default` for the DMSLab Ceph RGW) and select exactly one `chat_asset_s3_server_side_encryption` mode: `none`, `AES256`, or `aws:kms`. Empty and unknown modes keep the asset pipeline unavailable; `aws:kms` also requires `chat_asset_s3_kms_key_id`. Lumen never silently downgrades encryption. Use `none` only when the operator has accepted the deployment's separate at-rest encryption contract.
+
+Ceph RGW clients use SigV4 path-style requests and calculate request/response checksums only when required. Restrict the service credential and network path to Lumen-owned asset buckets; browser and API clients never receive it.
+
 ## Queue, lease, recovery
 
 API는 MariaDB journal에 run을 commit한 뒤 Redis `afterglow:chat:runs`에 best-effort wakeup을 보낸다. Redis는 authoritative queue가 아니다. worker DB polling이 wakeup 유실을 복구한다.

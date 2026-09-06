@@ -8,8 +8,13 @@ can reach private networks. Stdio, commands, and legacy SSE are never accepted.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
+import mimetypes
+import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -24,6 +29,26 @@ _MAX_RESULT_CHARS = 6000
 _MAX_TOOLS_PER_SERVER = 40
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _SERVER_NAME = "remote"
+_MAX_GENERATED_FILES = 20
+_MAX_GENERATED_FILE_BYTES = 5 * 1024 * 1024
+_SAFE_FILE_STEM = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+@dataclass(frozen=True)
+class McpGeneratedFile:
+    """Bounded embedded file returned by a remote MCP tool."""
+
+    name: str
+    media_type: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class McpToolOutput:
+    """Text plus embedded files projected from a LangChain MCP result."""
+
+    text: str
+    files: tuple[McpGeneratedFile, ...]
 
 
 def _safe_http_client(
@@ -85,24 +110,72 @@ def _input_schema(tool: Any) -> dict[str, Any]:
     return {"type": "object", "properties": {}}
 
 
-def _result_to_text(result: Any) -> str:
-    """Extract bounded text from LangChain's text or structured MCP result."""
+def _result_content(result: Any) -> Any:
     if isinstance(result, tuple):
         result = result[0]
-    content = getattr(result, "content", result)
+    return getattr(result, "content", result)
+
+
+def _block_value(block: object, key: str) -> object:
+    return block.get(key) if isinstance(block, dict) else getattr(block, key, None)
+
+
+def _generated_file_name(tool_name: str, index: int, media_type: str, block: object) -> str:
+    supplied = _block_value(block, "name") or _block_value(block, "filename")
+    if isinstance(supplied, str) and supplied.strip():
+        return supplied.strip()[:255]
+    stem = _SAFE_FILE_STEM.sub("-", tool_name).strip(".-") or "mcp-output"
+    extension = mimetypes.guess_extension(media_type, strict=False) or ".bin"
+    return f"{stem[: 240 - len(extension)]}-{index}{extension}"
+
+
+def _result_to_output(result: Any, *, tool_name: str) -> McpToolOutput:
+    """Extract bounded text and embedded base64 files from a LangChain MCP result."""
+    content = _result_content(result)
     if isinstance(content, str):
-        return content[:_MAX_RESULT_CHARS]
-    if isinstance(content, Iterable) and not isinstance(content, (bytes, bytearray, dict)):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and isinstance(block.get("text"), str):
-                parts.append(block["text"])
-            elif isinstance(getattr(block, "text", None), str):
-                parts.append(block.text)
-        return "\n".join(parts)[:_MAX_RESULT_CHARS]
-    return str(content)[:_MAX_RESULT_CHARS]
+        return McpToolOutput(text=content[:_MAX_RESULT_CHARS], files=())
+    if not isinstance(content, Iterable) or isinstance(content, (bytes, bytearray, dict)):
+        return McpToolOutput(text=str(content)[:_MAX_RESULT_CHARS], files=())
+    text_parts: list[str] = []
+    files: list[McpGeneratedFile] = []
+    total_file_bytes = 0
+    for block in content:
+        if isinstance(block, str):
+            text_parts.append(block)
+            continue
+        text = _block_value(block, "text")
+        if isinstance(text, str):
+            text_parts.append(text)
+        block_type = _block_value(block, "type")
+        encoded = _block_value(block, "base64")
+        if block_type not in {"image", "file"} or not isinstance(encoded, str):
+            continue
+        if len(files) >= _MAX_GENERATED_FILES:
+            raise ValueError("MCP tool returned too many embedded files")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("MCP tool returned invalid embedded file data") from exc
+        total_file_bytes += len(data)
+        if not data or len(data) > _MAX_GENERATED_FILE_BYTES or total_file_bytes > _MAX_GENERATED_FILE_BYTES:
+            raise ValueError("MCP tool returned oversized embedded file data")
+        media_type = _block_value(block, "mime_type")
+        normalized_media_type = (
+            media_type.strip().lower() if isinstance(media_type, str) else "application/octet-stream"
+        )
+        files.append(
+            McpGeneratedFile(
+                name=_generated_file_name(tool_name, len(files) + 1, normalized_media_type, block),
+                media_type=normalized_media_type,
+                data=data,
+            )
+        )
+    return McpToolOutput(text="\n".join(text_parts)[:_MAX_RESULT_CHARS], files=tuple(files))
+
+
+def _result_to_text(result: Any) -> str:
+    """Extract bounded text from LangChain's text or structured MCP result."""
+    return _result_to_output(result, tool_name="mcp-output").text
 
 
 async def list_tools(server: dict) -> list[dict]:
@@ -126,15 +199,19 @@ async def list_tools(server: dict) -> list[dict]:
         return []
 
 
-async def call_tool(server: dict, tool_name: str, args: dict) -> str:
+async def call_tool(server: dict, tool_name: str, args: dict) -> str | McpToolOutput:
     """Invoke one LangChain-adapted MCP tool using a fresh hardened session."""
 
-    async def _run() -> str:
+    async def _run() -> str | McpToolOutput:
         tools = await _client(server).get_tools(server_name=_SERVER_NAME)
         tool = next((candidate for candidate in tools if candidate.name == tool_name), None)
         if tool is None:
             raise ValueError("MCP tool is unavailable")
-        return _result_to_text(await tool.ainvoke(args if isinstance(args, dict) else {}))
+        output = _result_to_output(
+            await tool.ainvoke(args if isinstance(args, dict) else {}),
+            tool_name=tool_name,
+        )
+        return output if output.files else output.text
 
     try:
         return await asyncio.wait_for(_run(), timeout=_TIMEOUT_SECONDS)

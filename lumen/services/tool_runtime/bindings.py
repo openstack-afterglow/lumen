@@ -11,7 +11,7 @@ from lumen.services import mcp_adapter as mcp_ledger
 from lumen.services import mcp_adapter as mcp_lumen
 from lumen.services import mcp_adapter as mcp_registry
 from lumen.services import mcp_client
-from lumen.services.agent_protocol import ToolBinding, ToolDefinition
+from lumen.services.agent_protocol import GeneratedToolFile, ToolBinding, ToolDefinition
 from lumen.services.agent_protocol import ToolExecutionResult as V2ToolExecutionResult
 from lumen.services.tools import ToolContext
 
@@ -28,6 +28,19 @@ from .contracts import (
 from .selection import _load_custom, _load_mcp
 
 logger = logging.getLogger(__name__)
+
+
+def _v2_mcp_result(value: str | mcp_client.McpToolOutput) -> V2ToolExecutionResult:
+    if isinstance(value, str):
+        return _v2_result(value)
+    return V2ToolExecutionResult(
+        status="completed",
+        model_content=value.text,
+        display=[TextPart(type="text", text=value.text)] if value.text else [],
+        generated_files=[
+            GeneratedToolFile(data=file.data, name=file.name, media_type=file.media_type) for file in value.files
+        ],
+    )
 
 
 async def _lumen_registry_bindings(ctx: ToolContext) -> tuple[ToolBinding, ...]:
@@ -540,7 +553,7 @@ async def v2_tool_bindings(
                         model_content="The selected MCP server is no longer available.",
                         error_code="extension_unavailable",
                     )
-                return _v2_result(await mcp_client.call_tool(current, method_name, arguments))
+                return _v2_mcp_result(await mcp_client.call_tool(current, method_name, arguments))
 
             add(
                 ToolBinding(

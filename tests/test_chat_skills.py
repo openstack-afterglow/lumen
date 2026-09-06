@@ -13,9 +13,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from lumen.api.completions import _apply_context
 from lumen.models.chat_db import ChatSkill
 from lumen.services import extensions_store as es
+from lumen.services.chat_admission import _apply_context
 
 _VALID_KEY_HEX = "a" * 64
 

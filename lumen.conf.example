@@ -57,7 +57,9 @@ chat_asset_s3_endpoint = ""
 chat_asset_s3_bucket = ""
 chat_asset_s3_access_key = ""
 chat_asset_s3_secret_key = ""
-chat_asset_s3_server_side_encryption = "AES256"
+chat_asset_s3_region = "default"
+# Required when asset storage is enabled: "none", "AES256", or "aws:kms". No implicit downgrade.
+chat_asset_s3_server_side_encryption = ""
 chat_asset_s3_kms_key_id = ""
 chat_asset_signed_url_ttl_seconds = 300
 chat_clamav_host = ""

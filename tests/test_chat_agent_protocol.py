@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from lumen.services.agent_protocol import (
     AgentExecutionPolicy,
+    GeneratedToolFile,
     ToolBinding,
     ToolDefinition,
     ToolExecutionResult,
@@ -112,6 +113,144 @@ async def test_v2_dispatch_validates_before_executing_binding():
     assert invalid.status == "failed"
     assert invalid.error_code == "invalid_tool_arguments"
     assert called is False
+
+
+async def test_v2_dispatch_automatically_persists_generated_files(tmp_path, monkeypatch):
+    generated_path = tmp_path / "report.csv"
+    generated_path.write_text("name,value\nlatency,12\n")
+    captured: dict[str, object] = {}
+
+    async def execute(_arguments, _context):
+        return ToolExecutionResult(
+            status="completed",
+            model_content="Created report.csv",
+            generated_files=[
+                GeneratedToolFile(
+                    path=generated_path,
+                    name="report.csv",
+                    media_type="text/csv",
+                )
+            ],
+        )
+
+    async def create_generated_asset(**kwargs):
+        captured.update(kwargs)
+        return {
+            "id": "asset-1",
+            "name": "report.csv",
+            "mime_type": "text/csv",
+            "size_bytes": 22,
+            "sha256": "a" * 64,
+        }
+
+    binding = ToolBinding(
+        definition=ToolDefinition(
+            name="workspace_report",
+            description="Create a report.",
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            effect="workspace_write",
+            source="workspace",
+        ),
+        execute=execute,
+    )
+    monkeypatch.setattr("lumen.services.agent_runtime_v2.assets.create_generated_asset", create_generated_asset)
+
+    result = await dispatch_tool_call(
+        binding,
+        {},
+        ToolContext(
+            project_id="project-1",
+            user_id="user-1",
+            run_id="run-1",
+            tool_call_id="call-1",
+        ),
+    )
+
+    assert result.status == "completed"
+    assert result.generated_files == []
+    assert result.artifacts[0].asset_id == "asset-1"
+    assert result.artifacts[0].media_type == "text/csv"
+    assert captured == {
+        "path": generated_path,
+        "original_name": "report.csv",
+        "media_type": "text/csv",
+        "user_id": "user-1",
+        "project_id": "project-1",
+        "run_id": "run-1",
+    }
+
+
+async def test_v2_mcp_binding_persists_embedded_file_bytes(monkeypatch):
+    async def load_custom(_ctx):
+        return []
+
+    async def load_mcp(_ctx):
+        return [{"id": 8, "url": "https://mcp.example/api", "name": "reports"}]
+
+    async def list_tools(_server):
+        return [
+            {
+                "name": "render_report",
+                "description": "Render a report.",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ]
+
+    async def call_tool(_server, _tool_name, _arguments):
+        return tool_runtime.mcp_client.McpToolOutput(
+            text="Created report.csv",
+            files=(
+                tool_runtime.mcp_client.McpGeneratedFile(
+                    name="report.csv",
+                    media_type="text/csv",
+                    data=b"name,value\nlatency,12\n",
+                ),
+            ),
+        )
+
+    captured: dict[str, object] = {}
+
+    async def create_generated_asset_bytes(**kwargs):
+        captured.update(kwargs)
+        return {
+            "id": "asset-mcp",
+            "name": "report.csv",
+            "mime_type": "text/csv",
+            "size_bytes": 22,
+            "sha256": "b" * 64,
+        }
+
+    monkeypatch.setattr(tool_runtime, "_load_custom", load_custom)
+    monkeypatch.setattr(tool_runtime, "_load_mcp", load_mcp)
+    monkeypatch.setattr(tool_runtime.mcp_client, "list_tools", list_tools)
+    monkeypatch.setattr(tool_runtime.mcp_client, "call_tool", call_tool)
+    monkeypatch.setattr(
+        "lumen.services.agent_runtime_v2.assets.create_generated_asset_bytes",
+        create_generated_asset_bytes,
+    )
+
+    context = ToolContext(
+        project_id="project-1",
+        user_id="user-1",
+        run_id="run-1",
+        tool_call_id="call-1",
+    )
+    resolved = await tool_runtime.v2_tool_bindings(context)
+    binding = next(binding for binding in resolved.values() if binding.definition.source == "mcp")
+    result = await dispatch_tool_call(binding, {}, context)
+
+    assert result.status == "completed"
+    assert result.model_content == "Created report.csv"
+    assert result.generated_files == []
+    assert result.artifacts[0].asset_id == "asset-mcp"
+    assert captured == {
+        "data": b"name,value\nlatency,12\n",
+        "original_name": "report.csv",
+        "media_type": "text/csv",
+        "user_id": "user-1",
+        "project_id": "project-1",
+        "run_id": "run-1",
+    }
 
 
 def test_v2_builtin_bindings_are_read_only_and_schema_closed():

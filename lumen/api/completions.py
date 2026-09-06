@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from time import monotonic
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -24,7 +25,10 @@ from lumen.models.chat_contracts import (
     ChatFeatureOptions,
     ChatRunDescriptor,
     ChatRunResponse,
+    CompactionRequest,
     CompletionRequest,
+    ContextPreviewRequest,
+    ContextState,
     RegenerateRequest,
     RunInteractionResponseRequest,
     TempCompletionRequest,
@@ -36,30 +40,54 @@ from lumen.models.chat_runs import ChatRun
 from lumen.services import agent_policy, credit
 from lumen.services import conversation_store as cs
 from lumen.services.chat_admission import (
-    _apply_context,
-    _capability_extension_snapshot,
-    _load_context,
     _load_owned_conv,
-    _load_skill_snapshot,
-    _model_input,
-    _require_execution_capability,
-    _require_native_admission_scopes,
-    _resolve_agent,
-    _resolve_extension_selection,
-    _resolve_feature_routes,
-    _resolve_model,
-    _run_snapshots,
-    _validate_tool_reasoning_compatibility,
-    _validated_reasoning_effort,
+    prepare_context_input,
 )
 from lumen.services.durable_runs import admission, common, interactions, lifecycle, queries
 from lumen.services.durable_runs import errors as durable_errors
+from lumen.services.run_store import NONTERMINAL
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _MAX_TOKENS_CAP = 4096
 _MAX_MESSAGE_CHARS = 32000
+
+
+def _active_leaf_fence(value: object) -> int | None:
+    """Normalize context-store's JSON string IDs to the DB integer key type."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail="context_revision_changed") from exc
+
+
+def _user_input_parts_from_message(message: dict) -> list:
+    """Restore API input refs from a persisted canonical message projection."""
+    raw_parts = message.get("parts")
+    if isinstance(raw_parts, list) and raw_parts:
+        converted: list[dict] = []
+        for part in raw_parts:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text" and isinstance(part.get("text"), str):
+                converted.append({"type": "text", "text": part["text"]})
+            elif part_type in {"image", "audio", "video", "document"} and isinstance(part.get("asset_id"), str):
+                converted.append({"type": part_type, "asset_id": part["asset_id"]})
+            elif part_type == "file" and isinstance(part.get("asset_id"), str):
+                mime = str(part.get("mime_type") or "")
+                inferred = "document" if mime == "application/pdf" else mime.partition("/")[0]
+                if inferred in {"image", "audio", "video", "document"}:
+                    converted.append({"type": inferred, "asset_id": part["asset_id"]})
+        if converted:
+            return validate_user_input_parts(converted)
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        return validate_user_input_parts([{"type": "text", "text": content}])
+    raise HTTPException(status_code=422, detail="재시도할 사용자 입력을 찾을 수 없습니다")
 
 
 def _features_payload(features: ChatFeatureOptions) -> dict:
@@ -107,15 +135,15 @@ async def create_completion(
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    conv = await _load_owned_conv(conversation_id, user_id, project_id)
+    await _load_owned_conv(conversation_id, user_id, project_id)
     try:
         path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id)
+        expected_active_leaf_id = _active_leaf_fence(path["active_leaf_id"])
         features = _features_payload(payload.features)
         intent = {
             "endpoint": "completion",
             "conversation_id": conversation_id,
             "parent_id": str(path["active_leaf_id"]) if path["active_leaf_id"] is not None else None,
-            "model_id": payload.model_id,
             "parts": [part.model_dump(mode="json", by_alias=True) for part in payload.parts],
             "features": features,
             "agent_id": payload.agent_id,
@@ -146,9 +174,26 @@ async def create_completion(
     except credit.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     execution_protocol_version = _admission_execution_protocol_version()
-    agent = await _resolve_agent(int(payload.agent_id) if payload.agent_id else None, user_id, project_id)
-    if payload.execution_mode != "chat":
-        raise HTTPException(status_code=422, detail="requested chat execution mode is not available")
+
+    planned = await prepare_context_input(
+        user_id=user_id,
+        project_id=project_id,
+        conversation_id=conversation_id,
+        temp_thread_id=None,
+        model_id=payload.model_id,
+        parts=payload.parts,
+        features=payload.features,
+        agent_id=int(payload.agent_id) if payload.agent_id else None,
+        skill_ids=payload.skill_ids,
+        execution_mode=payload.execution_mode,
+        reasoning_effort=payload.reasoning_effort,
+        code_workspace_id=payload.code_workspace_id,
+        client_timezone=payload.client_timezone,
+        token_info=token_info,
+        is_preview=False,
+    )
+
+    agent = planned["agent"]
     try:
         execution_policy = (
             agent_policy.resolve_execution_policy(agent, execution_mode=payload.execution_mode)
@@ -162,41 +207,13 @@ async def create_completion(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    resolved = await _resolve_model(payload.model_id)
-    extension_selection = await _resolve_extension_selection(
-        agent, payload.features, user_id=user_id, project_id=project_id
-    )
-    _require_native_admission_scopes(
-        token_info,
-        payload.features,
-        parts=payload.parts,
-        execution_mode=payload.execution_mode,
-        skill_ids=payload.skill_ids,
-        agent=agent,
-        extension_selection=extension_selection,
-    )
-    feature_routes = await _resolve_feature_routes(payload.features)
-    _require_execution_capability(payload.features, resolved, parts=payload.parts, feature_routes=feature_routes)
-    reasoning_effort = _validated_reasoning_effort(payload.reasoning_effort, resolved)
-    _validate_tool_reasoning_compatibility(reasoning_effort, resolved, payload.features)
-    skill_instructions, skill_snapshot = await _load_skill_snapshot(agent, payload.skill_ids, user_id, project_id)
-    input_messages = _model_input(path["messages"], extra_user=message_text)
-    workspace_instr, memories = await _load_context(
-        conv,
-        user_id,
-        project_id,
-        include_memory=payload.features.memory,
-        include_account_memory=token_info["auth_type"] != "api_key",
-    )
-    input_messages, temperature, max_tokens = _apply_context(
-        agent, workspace_instr, memories, input_messages, None, None, skill_instructions=skill_instructions
-    )
-    capability_snapshot, pricing_snapshot = _run_snapshots(resolved, features, feature_routes=feature_routes)
+
+    capability_snapshot = dict(planned["capability_snapshot"])
     if execution_policy is not None and direct_effects is not None:
         capability_snapshot["execution_policy"] = execution_policy.model_dump(mode="json")
         capability_snapshot["direct_effects"] = sorted(direct_effects)
-    capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
     capability_snapshot["execution_protocol_version"] = execution_protocol_version
+
     try:
         return await admission.create_persistent_run(
             project_id=project_id,
@@ -210,16 +227,18 @@ async def create_completion(
             user_parts=[part.model_dump(mode="json", by_alias=True) for part in payload.parts],
             client_timezone=payload.client_timezone,
             request_payload={
-                "input_messages": input_messages,
+                "input_messages": planned["input_messages"],
                 "input_parts": [part.model_dump(mode="json", by_alias=True) for part in payload.parts],
                 "features": features,
-                "skill_snapshot": skill_snapshot,
-                "max_tokens": min(max_tokens or _MAX_TOKENS_CAP, _MAX_TOKENS_CAP),
-                "temperature": temperature,
-                "reasoning_effort": reasoning_effort,
+                "skill_snapshot": planned["skill_snapshot"],
+                "max_tokens": planned["max_tokens"],
+                "temperature": planned["temperature"],
+                "reasoning_effort": planned["reasoning_effort"],
                 "client_timezone": payload.client_timezone,
                 "skill_ids": payload.skill_ids,
-                "extension_snapshot": extension_selection,
+                "extension_snapshot": planned["extension_selection"],
+                "context_source": planned["source"],
+                "tool_schemas": planned["tool_schemas"],
                 **(
                     {
                         "execution_policy": execution_policy.model_dump(mode="json"),
@@ -230,10 +249,11 @@ async def create_completion(
                 ),
             },
             capability_snapshot=capability_snapshot,
-            pricing_snapshot=pricing_snapshot,
+            pricing_snapshot=planned["pricing_snapshot"],
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            expected_parent_id=expected_active_leaf_id,
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
@@ -253,7 +273,7 @@ async def regenerate_message(
 ):
     project_id = token_info["project_id"]
     user_id = token_info["user_id"]
-    conv = await _load_owned_conv(conversation_id, user_id, project_id)
+    await _load_owned_conv(conversation_id, user_id, project_id)
     try:
         turn_user = await cs.find_turn_start_user(
             conversation_id, user_id=user_id, project_id=project_id, message_id=message_id
@@ -262,11 +282,10 @@ async def regenerate_message(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if turn_user is None:
         raise HTTPException(status_code=400, detail="재생성할 사용자 턴을 찾을 수 없습니다")
-    source_parts = (
-        validate_user_input_parts(turn_user["parts"])
-        if isinstance(turn_user.get("parts"), list) and turn_user["parts"]
-        else validate_user_input_parts([{"type": "text", "text": turn_user.get("content") or ""}])
-    )
+    try:
+        source_parts = _user_input_parts_from_message(turn_user)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="저장된 사용자 입력이 유효하지 않습니다") from exc
     features = _features_payload(payload.features)
     intent = {
         "endpoint": "regenerate",
@@ -291,41 +310,43 @@ async def regenerate_message(
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
     try:
+        # Regeneration reads the selected user ancestor, but the mutation must
+        # fence the active branch that was visible when this request started.
+        active_path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id)
+        expected_active_leaf_id = _active_leaf_fence(active_path.get("active_leaf_id"))
+    except cs.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
+
+    try:
         await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     execution_protocol_version = _admission_execution_protocol_version()
-    resolved = await _resolve_model(payload.model_id)
-    feature_routes = await _resolve_feature_routes(payload.features)
-    _require_native_admission_scopes(
-        token_info,
-        payload.features,
+    planned = await prepare_context_input(
+        user_id=user_id,
+        project_id=project_id,
+        conversation_id=conversation_id,
+        temp_thread_id=None,
+        leaf_id=turn_user["id"],
+        model_id=payload.model_id,
         parts=source_parts,
-        execution_mode="chat",
+        features=payload.features,
+        agent_id=None,
         skill_ids=[],
-        agent=None,
-        extension_selection={"tools": [], "mcp": []},
+        execution_mode="chat",
+        reasoning_effort=payload.reasoning_effort,
+        code_workspace_id=None,
+        client_timezone=payload.client_timezone,
+        token_info=token_info,
+        is_preview=False,
+        append_draft=False,
     )
-    _require_execution_capability(payload.features, resolved, feature_routes=feature_routes)
-    reasoning_effort = _validated_reasoning_effort(payload.reasoning_effort, resolved)
-    _validate_tool_reasoning_compatibility(reasoning_effort, resolved, payload.features)
-    path_messages = await cs.path_ending_at(
-        conversation_id, user_id=user_id, project_id=project_id, message_id=turn_user["id"]
-    )
-    workspace_instr, memories = await _load_context(
-        conv,
-        user_id,
-        project_id,
-        include_memory=payload.features.memory,
-        include_account_memory=token_info["auth_type"] != "api_key",
-    )
-    input_messages, temperature, max_tokens = _apply_context(
-        None, workspace_instr, memories, _model_input(path_messages), None, None, skill_instructions=[]
-    )
-    capability_snapshot, pricing_snapshot = _run_snapshots(resolved, features, feature_routes=feature_routes)
+
+    capability_snapshot = dict(planned["capability_snapshot"])
     capability_snapshot["execution_protocol_version"] = execution_protocol_version
+
     try:
         return await admission.create_run(
             project_id=project_id,
@@ -338,18 +359,21 @@ async def regenerate_message(
             agent_id=None,
             user_message_id=turn_user["id"],
             request_payload={
-                "input_messages": input_messages,
+                "input_messages": planned["input_messages"],
                 "features": features,
-                "max_tokens": min(max_tokens or _MAX_TOKENS_CAP, _MAX_TOKENS_CAP),
-                "temperature": temperature,
-                "reasoning_effort": reasoning_effort,
+                "max_tokens": planned["max_tokens"],
+                "temperature": planned["temperature"],
+                "reasoning_effort": planned["reasoning_effort"],
                 "client_timezone": payload.client_timezone,
+                "context_source": planned["source"],
+                "tool_schemas": planned["tool_schemas"],
             },
             capability_snapshot=capability_snapshot,
-            pricing_snapshot=pricing_snapshot,
+            pricing_snapshot=planned["pricing_snapshot"],
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            expected_parent_id=expected_active_leaf_id,
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
@@ -368,7 +392,7 @@ async def retry_failed_run(
 ):
     project_id = token_info["project_id"]
     user_id = token_info["user_id"]
-    conv = await _load_owned_conv(conversation_id, user_id, project_id)
+    await _load_owned_conv(conversation_id, user_id, project_id)
 
     intent = {
         "endpoint": "retry",
@@ -422,6 +446,14 @@ async def retry_failed_run(
         raise HTTPException(status_code=400, detail="재시도할 사용자 메시지를 찾을 수 없습니다")
 
     message_id = source_run.user_message_id
+    try:
+        # Retry projects the failed run's saved user turn, but fences the
+        # active leaf observed before planning so a branch switch cannot be
+        # overwritten by a late retry.
+        active_path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id)
+        expected_active_leaf_id = _active_leaf_fence(active_path.get("active_leaf_id"))
+    except cs.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
 
     try:
         raw_payload = cs._dec(source_run.request_payload) if source_run.request_payload else "{}"
@@ -443,21 +475,41 @@ async def retry_failed_run(
         conversation_id, user_id=user_id, project_id=project_id, message_id=message_id
     )
     if isinstance(raw_parts, list) and raw_parts:
-        typed_parts = validate_user_input_parts(raw_parts)
+        try:
+            typed_parts = validate_user_input_parts(raw_parts)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="저장된 사용자 입력이 유효하지 않습니다") from exc
     else:
         target_msg = next((m for m in reversed(path_messages) if m["id"] == message_id), None)
-        if target_msg and target_msg.get("parts"):
-            typed_parts = validate_user_input_parts(target_msg["parts"])
-        elif target_msg and target_msg.get("content"):
-            typed_parts = validate_user_input_parts([{"type": "text", "text": target_msg["content"]}])
-        else:
-            typed_parts = validate_user_input_parts([{"type": "text", "text": ""}])
+        if target_msg is None:
+            raise HTTPException(status_code=422, detail="재시도할 사용자 입력을 찾을 수 없습니다")
+        try:
+            typed_parts = _user_input_parts_from_message(target_msg)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="저장된 사용자 입력이 유효하지 않습니다") from exc
     user_parts = [part.model_dump(mode="json", by_alias=True) for part in typed_parts]
     execution_protocol_version = _admission_execution_protocol_version()
-    agent = await _resolve_agent(agent_id, user_id, project_id)
-    if agent_id and agent is None:
-        raise HTTPException(status_code=404, detail=f"에이전트 {agent_id} 를 찾을 수 없습니다")
+    planned = await prepare_context_input(
+        user_id=user_id,
+        project_id=project_id,
+        conversation_id=conversation_id,
+        temp_thread_id=None,
+        leaf_id=message_id,
+        model_id=model_name,
+        parts=typed_parts,
+        features=features_obj,
+        agent_id=agent_id,
+        skill_ids=skill_ids if isinstance(skill_ids, list) else [],
+        execution_mode=source_run.execution_mode,
+        reasoning_effort=reasoning_effort,
+        code_workspace_id=None,
+        client_timezone=None,
+        token_info=token_info,
+        is_preview=False,
+        append_draft=False,
+    )
 
+    agent = planned["agent"]
     try:
         execution_policy = (
             agent_policy.resolve_execution_policy(agent, execution_mode=source_run.execution_mode)
@@ -471,43 +523,6 @@ async def retry_failed_run(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    resolved = await _resolve_model(model_name)
-    extension_selection = await _resolve_extension_selection(
-        agent, features_obj, user_id=user_id, project_id=project_id
-    )
-    _require_native_admission_scopes(
-        token_info,
-        features_obj,
-        parts=typed_parts,
-        execution_mode=source_run.execution_mode,
-        skill_ids=skill_ids if isinstance(skill_ids, list) else [],
-        agent=agent,
-        extension_selection=extension_selection,
-    )
-    feature_routes = await _resolve_feature_routes(features_obj)
-    _require_execution_capability(features_obj, resolved, parts=typed_parts, feature_routes=feature_routes)
-    reasoning_effort = _validated_reasoning_effort(reasoning_effort, resolved)
-    _validate_tool_reasoning_compatibility(reasoning_effort, resolved, features_obj)
-    skill_instructions, skill_snapshot = await _load_skill_snapshot(agent, skill_ids, user_id, project_id)
-
-    workspace_instr, memories = await _load_context(
-        conv,
-        user_id,
-        project_id,
-        include_memory=features_obj.memory,
-        include_account_memory=token_info["auth_type"] != "api_key",
-    )
-    input_messages, temperature, max_tokens = _apply_context(
-        agent, workspace_instr, memories, _model_input(path_messages), None, None, skill_instructions=skill_instructions
-    )
-    capability_snapshot, pricing_snapshot = _run_snapshots(resolved, features_dict, feature_routes=feature_routes)
-    if execution_policy is not None and direct_effects is not None:
-        capability_snapshot["execution_policy"] = execution_policy.model_dump(mode="json")
-        capability_snapshot["direct_effects"] = sorted(direct_effects)
-    capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
-    capability_snapshot["execution_protocol_version"] = execution_protocol_version
-
     try:
         return await admission.create_run(
             project_id=project_id,
@@ -520,15 +535,17 @@ async def retry_failed_run(
             agent_id=agent.get("id") if agent else None,
             user_message_id=message_id,
             request_payload={
-                "input_messages": input_messages,
+                "input_messages": planned["input_messages"],
                 "input_parts": user_parts,
                 "features": features_dict,
-                "skill_snapshot": skill_snapshot,
-                "max_tokens": min(max_tokens or _MAX_TOKENS_CAP, _MAX_TOKENS_CAP),
-                "temperature": temperature,
-                "reasoning_effort": reasoning_effort,
+                "skill_snapshot": planned["skill_snapshot"],
+                "max_tokens": planned["max_tokens"],
+                "temperature": planned["temperature"],
+                "reasoning_effort": planned["reasoning_effort"],
                 "skill_ids": skill_ids,
-                "extension_snapshot": extension_selection,
+                "extension_snapshot": planned["extension_selection"],
+                "context_source": planned["source"],
+                "tool_schemas": planned["tool_schemas"],
                 **(
                     {
                         "execution_policy": execution_policy.model_dump(mode="json"),
@@ -538,11 +555,12 @@ async def retry_failed_run(
                     else {}
                 ),
             },
-            capability_snapshot=capability_snapshot,
-            pricing_snapshot=pricing_snapshot,
+            capability_snapshot=planned["capability_snapshot"],
+            pricing_snapshot=planned["pricing_snapshot"],
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            expected_parent_id=expected_active_leaf_id,
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
@@ -557,7 +575,7 @@ async def temp_completion(
     user_id = token_info["user_id"]
     project_id = token_info["project_id"]
     try:
-        message_text = text_projection_from_user_input_parts(payload.parts)
+        text_projection_from_user_input_parts(payload.parts)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     features = _features_payload(payload.features)
@@ -591,38 +609,29 @@ async def temp_completion(
     except credit.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     execution_protocol_version = _admission_execution_protocol_version()
-    resolved = await _resolve_model(payload.model_id)
-    if payload.execution_mode != "chat":
-        raise HTTPException(status_code=422, detail="requested chat execution mode is not available")
-    feature_routes = await _resolve_feature_routes(payload.features)
-    extension_selection = await _resolve_extension_selection(
-        None, payload.features, user_id=user_id, project_id=project_id
-    )
-    _require_native_admission_scopes(
-        token_info,
-        payload.features,
+    planned = await prepare_context_input(
+        user_id=user_id,
+        project_id=project_id,
+        conversation_id=None,
+        temp_thread_id=payload.temp_thread_id,
+        model_id=payload.model_id,
         parts=payload.parts,
-        execution_mode=payload.execution_mode,
+        features=payload.features,
+        agent_id=None,
         skill_ids=payload.skill_ids,
-        agent=None,
-        extension_selection=extension_selection,
+        execution_mode=payload.execution_mode,
+        reasoning_effort=payload.reasoning_effort,
+        code_workspace_id=payload.code_workspace_id,
+        client_timezone=None,
+        token_info=token_info,
+        is_preview=False,
+        is_context_operation=False,
+        allow_empty_source=payload.temp_thread_id is None,
     )
-    _require_execution_capability(payload.features, resolved, parts=payload.parts, feature_routes=feature_routes)
-    reasoning_effort = _validated_reasoning_effort(payload.reasoning_effort, resolved)
-    _validate_tool_reasoning_compatibility(reasoning_effort, resolved, payload.features)
-    capability_snapshot, pricing_snapshot = _run_snapshots(resolved, features, feature_routes=feature_routes)
-    capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
+
+    capability_snapshot = dict(planned["capability_snapshot"])
     capability_snapshot["execution_protocol_version"] = execution_protocol_version
-    skill_instructions, skill_snapshot = await _load_skill_snapshot(None, payload.skill_ids, user_id, project_id)
-    input_messages, temperature, max_tokens = _apply_context(
-        None,
-        None,
-        [],
-        [{"role": "user", "content": message_text}],
-        None,
-        None,
-        skill_instructions=skill_instructions,
-    )
+
     try:
         return await admission.create_temp_run(
             project_id=project_id,
@@ -632,18 +641,414 @@ async def temp_completion(
             temp_thread_id=payload.temp_thread_id,
             model_name=payload.model_id,
             request_payload={
-                "input_messages": input_messages,
+                "input_messages": planned["input_messages"],
                 "input_parts": [part.model_dump(mode="json", by_alias=True) for part in payload.parts],
                 "features": features,
-                "max_tokens": min(max_tokens or _MAX_TOKENS_CAP, _MAX_TOKENS_CAP),
-                "temperature": temperature,
-                "reasoning_effort": reasoning_effort,
-                "skill_snapshot": skill_snapshot,
+                "max_tokens": planned["max_tokens"],
+                "temperature": planned["temperature"],
+                "reasoning_effort": planned["reasoning_effort"],
+                "skill_snapshot": planned["skill_snapshot"],
                 "skill_ids": payload.skill_ids,
-                "extension_snapshot": extension_selection,
+                "extension_snapshot": planned["extension_selection"],
+                "context_source": planned["source"],
+                "tool_schemas": planned["tool_schemas"],
             },
             capability_snapshot=capability_snapshot,
-            pricing_snapshot=pricing_snapshot,
+            pricing_snapshot=planned["pricing_snapshot"],
+            execution_protocol_version=execution_protocol_version,
+            source=token_info["source"],
+            api_key_id=token_info["api_key_id"],
+        )
+    except durable_errors.DurableRunError as exc:
+        raise _run_error(exc) from exc
+
+
+async def _active_context_compaction_run_id(
+    *, conversation_id: str | None = None, temp_thread_id: str | None = None
+) -> str | None:
+    if (conversation_id is None) == (temp_thread_id is None):
+        raise ValueError("exactly one context parent is required")
+    try:
+        factory = common._factory()
+        async with factory() as session:
+            query = select(ChatRun.id).where(
+                ChatRun.status.in_(NONTERMINAL),
+                ChatRun.run_kind == "compaction",
+                ChatRun.conversation_id == conversation_id
+                if conversation_id is not None
+                else ChatRun.temp_thread_id == temp_thread_id,
+            )
+            run_id = (await session.execute(query)).scalar_one_or_none()
+    except durable_errors.DurableRunError as exc:
+        raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
+    return str(run_id) if run_id is not None else None
+
+
+@router.post(
+    "/conversations/{conversation_id}/context-preview",
+    response_model=ContextState,
+    status_code=status.HTTP_200_OK,
+)
+async def preview_conversation_context(
+    conversation_id: str,
+    payload: ContextPreviewRequest,
+    token_info: Principal = Depends(require_scopes("native:conversations:read", "models:read")),
+):
+    user_id = token_info["user_id"]
+    project_id = token_info["project_id"]
+    planned = await prepare_context_input(
+        user_id=user_id,
+        project_id=project_id,
+        conversation_id=conversation_id,
+        temp_thread_id=None,
+        model_id=payload.model_id,
+        parts=payload.parts,
+        features=payload.features,
+        agent_id=int(payload.agent_id) if payload.agent_id else None,
+        skill_ids=payload.skill_ids,
+        execution_mode=payload.execution_mode,
+        reasoning_effort=payload.reasoning_effort,
+        code_workspace_id=payload.code_workspace_id,
+        client_timezone=payload.client_timezone,
+        token_info=token_info,
+        is_preview=True,
+        is_context_operation=True,
+    )
+    from lumen.services import context_manager
+
+    resolved = planned["resolved"]
+    capabilities = resolved.get("capabilities") or {}
+    context_limit = capabilities.get("context_limit")
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    source = planned["source"]
+    active_compaction_run_id = await _active_context_compaction_run_id(conversation_id=conversation_id)
+
+    return context_manager.context_state(
+        planned["input_messages"],
+        planned["tool_schemas"],
+        model_name=resolved["model_name"],
+        context_limit=context_limit,
+        output_reserve=output_reserve,
+        revision=source["revision"],
+        checkpoint_id=source.get("checkpoint_id"),
+        active_compaction_run_id=active_compaction_run_id,
+    )
+
+
+@router.post(
+    "/temp-threads/{temp_thread_id}/context-preview",
+    response_model=ContextState,
+    status_code=status.HTTP_200_OK,
+)
+async def preview_temp_context(
+    temp_thread_id: str,
+    payload: ContextPreviewRequest,
+    token_info: Principal = Depends(require_scopes("native:runs:read", "models:read")),
+):
+    user_id = token_info["user_id"]
+    project_id = token_info["project_id"]
+    planned = await prepare_context_input(
+        user_id=user_id,
+        project_id=project_id,
+        conversation_id=None,
+        temp_thread_id=temp_thread_id,
+        model_id=payload.model_id,
+        parts=payload.parts,
+        features=payload.features,
+        agent_id=None,
+        skill_ids=payload.skill_ids,
+        execution_mode=payload.execution_mode,
+        reasoning_effort=payload.reasoning_effort,
+        code_workspace_id=None,
+        client_timezone=payload.client_timezone,
+        token_info=token_info,
+        is_preview=True,
+        is_context_operation=True,
+    )
+    from lumen.services import context_manager
+
+    resolved = planned["resolved"]
+    capabilities = resolved.get("capabilities") or {}
+    context_limit = capabilities.get("context_limit")
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    source = planned["source"]
+    active_compaction_run_id = await _active_context_compaction_run_id(temp_thread_id=temp_thread_id)
+
+    return context_manager.context_state(
+        planned["input_messages"],
+        planned["tool_schemas"],
+        model_name=resolved["model_name"],
+        context_limit=context_limit,
+        output_reserve=output_reserve,
+        revision=source["revision"],
+        checkpoint_id=source.get("checkpoint_id"),
+        active_compaction_run_id=active_compaction_run_id,
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/compactions",
+    response_model=ChatRunDescriptor,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def compact_conversation(
+    conversation_id: str,
+    payload: CompactionRequest,
+    idempotency_key: UUID = Header(alias="Idempotency-Key"),
+    token_info: Principal = Depends(require_scopes("native:conversations:write", "native:runs:write", "models:read")),
+):
+    user_id = token_info["user_id"]
+    project_id = token_info["project_id"]
+    features = _features_payload(payload.features)
+    intent = {
+        "endpoint": "compaction",
+        "conversation_id": conversation_id,
+        "model_id": payload.model_id,
+        "features": features,
+        "reasoning_effort": payload.reasoning_effort,
+        "agent_id": payload.agent_id,
+        "execution_mode": payload.execution_mode,
+        "code_workspace_id": payload.code_workspace_id,
+        "skill_ids": payload.skill_ids,
+        "client_timezone": payload.client_timezone,
+        "expected_context_revision": payload.expected_context_revision,
+    }
+    intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    try:
+        existing = await admission.existing_run_for_intent(
+            project_id=project_id,
+            user_id=user_id,
+            client_request_id=str(idempotency_key),
+            intent=intent,
+            conversation_id=conversation_id,
+        )
+        if existing is not None:
+            return existing
+    except durable_errors.DurableRunError as exc:
+        raise _run_error(exc) from exc
+    except cs.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    try:
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+    except credit.QuotaExceeded as exc:
+        raise HTTPException(status_code=402, detail=str(exc)) from exc
+    except credit.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    planned = await prepare_context_input(
+        user_id=user_id,
+        project_id=project_id,
+        conversation_id=conversation_id,
+        temp_thread_id=None,
+        model_id=payload.model_id,
+        parts=None,
+        features=payload.features,
+        agent_id=int(payload.agent_id) if payload.agent_id else None,
+        skill_ids=payload.skill_ids,
+        execution_mode=payload.execution_mode,
+        reasoning_effort=payload.reasoning_effort,
+        code_workspace_id=payload.code_workspace_id,
+        client_timezone=payload.client_timezone,
+        token_info=token_info,
+        is_preview=False,
+        is_context_operation=True,
+    )
+
+    from lumen.services import context_manager
+
+    resolved = planned["resolved"]
+    capabilities = resolved.get("capabilities") or {}
+    context_limit = capabilities.get("context_limit")
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    source = planned["source"]
+
+    if source.get("revision") != payload.expected_context_revision:
+        raise HTTPException(status_code=409, detail="context_revision_changed")
+
+    state = context_manager.context_state(
+        planned["input_messages"],
+        planned["tool_schemas"],
+        model_name=resolved["model_name"],
+        context_limit=context_limit,
+        output_reserve=output_reserve,
+        revision=source["revision"],
+        checkpoint_id=source.get("checkpoint_id"),
+    )
+
+    if state.input_budget is None or state.reason_code == "context_budget_unavailable":
+        raise HTTPException(status_code=422, detail="context_budget_unavailable")
+    if not state.can_compact:
+        raise HTTPException(status_code=422, detail="nothing_to_compact")
+
+    from lumen.services.litellm_client import count_context_tokens
+
+    retained, _older = context_manager._required_messages(planned["input_messages"])
+    retained_count = count_context_tokens(resolved["model_name"], retained, planned["tool_schemas"]).tokens
+    if retained_count is not None and state.input_budget is not None and retained_count > state.input_budget:
+        raise HTTPException(status_code=422, detail="context_limit_exceeded")
+
+    execution_protocol_version = _admission_execution_protocol_version()
+    try:
+        return await admission.create_compaction_run(
+            project_id=project_id,
+            user_id=user_id,
+            client_request_id=str(idempotency_key),
+            intent=intent,
+            conversation_id=conversation_id,
+            temp_thread_id=None,
+            expected_context_revision=payload.expected_context_revision,
+            model_name=payload.model_id,
+            request_payload={
+                "input_messages": planned["input_messages"],
+                "features": features,
+                "skill_snapshot": planned["skill_snapshot"],
+                "max_tokens": planned["max_tokens"],
+                "temperature": planned["temperature"],
+                "reasoning_effort": planned["reasoning_effort"],
+                "client_timezone": payload.client_timezone,
+                "skill_ids": payload.skill_ids,
+                "extension_snapshot": planned["extension_selection"],
+                "context_source": planned["source"],
+                "tool_schemas": planned["tool_schemas"],
+            },
+            capability_snapshot=planned["capability_snapshot"],
+            pricing_snapshot=planned["pricing_snapshot"],
+            execution_protocol_version=execution_protocol_version,
+            source=token_info["source"],
+            api_key_id=token_info["api_key_id"],
+        )
+    except durable_errors.DurableRunError as exc:
+        raise _run_error(exc) from exc
+
+
+@router.post(
+    "/temp-threads/{temp_thread_id}/compactions",
+    response_model=ChatRunDescriptor,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def compact_temp_thread(
+    temp_thread_id: str,
+    payload: CompactionRequest,
+    idempotency_key: UUID = Header(alias="Idempotency-Key"),
+    token_info: Principal = Depends(require_scopes("native:runs:write", "models:read")),
+):
+    user_id = token_info["user_id"]
+    project_id = token_info["project_id"]
+    features = _features_payload(payload.features)
+    intent = {
+        "endpoint": "temp_compaction",
+        "temp_thread_id": temp_thread_id,
+        "model_id": payload.model_id,
+        "features": features,
+        "reasoning_effort": payload.reasoning_effort,
+        "skill_ids": payload.skill_ids,
+        "execution_mode": payload.execution_mode,
+        "code_workspace_id": payload.code_workspace_id,
+        "client_timezone": payload.client_timezone,
+        "expected_context_revision": payload.expected_context_revision,
+    }
+    intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    try:
+        existing = await admission.existing_run_for_intent(
+            project_id=project_id,
+            user_id=user_id,
+            client_request_id=str(idempotency_key),
+            intent=intent,
+            conversation_id=None,
+        )
+        if existing is not None:
+            return existing
+    except durable_errors.DurableRunError as exc:
+        raise _run_error(exc) from exc
+    except cs.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    try:
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+    except credit.QuotaExceeded as exc:
+        raise HTTPException(status_code=402, detail=str(exc)) from exc
+    except credit.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    planned = await prepare_context_input(
+        user_id=user_id,
+        project_id=project_id,
+        conversation_id=None,
+        temp_thread_id=temp_thread_id,
+        model_id=payload.model_id,
+        parts=None,
+        features=payload.features,
+        agent_id=None,
+        skill_ids=payload.skill_ids,
+        execution_mode=payload.execution_mode,
+        reasoning_effort=payload.reasoning_effort,
+        code_workspace_id=None,
+        client_timezone=payload.client_timezone,
+        token_info=token_info,
+        is_preview=False,
+        is_context_operation=True,
+    )
+
+    from lumen.services import context_manager
+
+    resolved = planned["resolved"]
+    capabilities = resolved.get("capabilities") or {}
+    context_limit = capabilities.get("context_limit")
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    source = planned["source"]
+
+    if source.get("revision") != payload.expected_context_revision:
+        raise HTTPException(status_code=409, detail="context_revision_changed")
+
+    state = context_manager.context_state(
+        planned["input_messages"],
+        planned["tool_schemas"],
+        model_name=resolved["model_name"],
+        context_limit=context_limit,
+        output_reserve=output_reserve,
+        revision=source["revision"],
+        checkpoint_id=source.get("checkpoint_id"),
+    )
+
+    if state.input_budget is None or state.reason_code == "context_budget_unavailable":
+        raise HTTPException(status_code=422, detail="context_budget_unavailable")
+    if not state.can_compact:
+        raise HTTPException(status_code=422, detail="nothing_to_compact")
+
+    from lumen.services.litellm_client import count_context_tokens
+
+    retained, _older = context_manager._required_messages(planned["input_messages"])
+    retained_count = count_context_tokens(resolved["model_name"], retained, planned["tool_schemas"]).tokens
+    if retained_count is not None and state.input_budget is not None and retained_count > state.input_budget:
+        raise HTTPException(status_code=422, detail="context_limit_exceeded")
+
+    execution_protocol_version = _admission_execution_protocol_version()
+    try:
+        return await admission.create_compaction_run(
+            project_id=project_id,
+            user_id=user_id,
+            client_request_id=str(idempotency_key),
+            intent=intent,
+            conversation_id=None,
+            temp_thread_id=temp_thread_id,
+            expected_context_revision=payload.expected_context_revision,
+            model_name=payload.model_id,
+            request_payload={
+                "input_messages": planned["input_messages"],
+                "features": features,
+                "skill_snapshot": planned["skill_snapshot"],
+                "max_tokens": planned["max_tokens"],
+                "temperature": planned["temperature"],
+                "reasoning_effort": planned["reasoning_effort"],
+                "client_timezone": payload.client_timezone,
+                "skill_ids": payload.skill_ids,
+                "extension_snapshot": planned["extension_selection"],
+                "context_source": planned["source"],
+                "tool_schemas": planned["tool_schemas"],
+            },
+            capability_snapshot=planned["capability_snapshot"],
+            pricing_snapshot=planned["pricing_snapshot"],
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
@@ -691,6 +1096,7 @@ async def run_events(
 
     async def generate():
         nonlocal cursor, pending, terminal
+        last_keepalive_at = monotonic()
         while True:
             for event in pending:
                 cursor = event.seq
@@ -698,8 +1104,11 @@ async def run_events(
                 yield f"id: {event.event_id}\nevent: {event.type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
             if terminal:
                 return
-            yield ": keepalive\n\n"
-            await asyncio.sleep(1)
+            now = monotonic()
+            if now - last_keepalive_at >= 10:
+                yield ": keepalive\n\n"
+                last_keepalive_at = now
+            await asyncio.sleep(0.1)
             try:
                 pending, terminal = await queries.owned_events(
                     run_id=run_id,

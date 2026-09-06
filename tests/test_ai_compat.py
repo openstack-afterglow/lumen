@@ -315,7 +315,10 @@ class TestOpenAIEndpoint:
             headers=_H,
         )
         assert resp.status_code == 429
-        assert "API 키 월 사용 한도를 초과했습니다" in (resp.json().get("error") or resp.json().get("detail", {}).get("error", {}))["message"]
+        assert (
+            "API 키 월 사용 한도를 초과했습니다"
+            in (resp.json().get("error") or resp.json().get("detail", {}).get("error", {}))["message"]
+        )
 
         resp_stream = await client.post(
             "/v1/chat/completions",
@@ -323,7 +326,10 @@ class TestOpenAIEndpoint:
             headers=_H,
         )
         assert resp_stream.status_code == 429
-        assert "API 키 월 사용 한도를 초과했습니다" in (resp_stream.json().get("error") or resp_stream.json().get("detail", {}).get("error", {}))["message"]
+        assert (
+            "API 키 월 사용 한도를 초과했습니다"
+            in (resp_stream.json().get("error") or resp_stream.json().get("detail", {}).get("error", {}))["message"]
+        )
 
     async def test_openai_tool_choice_forwarded(self, client, _auth, monkeypatch):
         received_extra = {}
@@ -364,8 +370,21 @@ class TestOpenAIEndpoint:
         assert resp.status_code == 200
         assert received_extra.get("tool_choice") == tc
 
+
 class TestOpenAILumenVirtualModel:
     """Tests for model='lumen' virtual model boundary."""
+
+    @pytest.fixture(autouse=True)
+    def _use_execution_route_for_summary(self, monkeypatch):
+        """Keep virtual-model tests independent of provider-route persistence."""
+
+        async def resolve_summary_route(execution_route):
+            return execution_route
+
+        monkeypatch.setattr(
+            "lumen.services.openai_compat.resolve_summary_route",
+            resolve_summary_route,
+        )
 
     async def test_lumen_model_listed_when_default_configured_and_active(self, client, _auth, monkeypatch):
         from lumen.config import get_settings
@@ -772,6 +791,7 @@ class TestOpenAILumenVirtualModel:
         assert resp.status_code == 200
         body = resp.json()
         assert body["model"] == "gpt-4o"
+
     async def test_lumen_protocol_version_and_snapshot_shapes(self, client, _auth, monkeypatch):
         from lumen.config import get_settings
         from lumen.services.durable_runs import admission, queries
@@ -910,6 +930,44 @@ class TestOpenAILumenVirtualModel:
         assert "Internal DB secret state leaked!" not in resp.json()["error"]["message"]
         assert resp.json()["error"]["message"] == "Service temporarily unavailable"
 
+    async def test_lumen_summary_route_unavailable_uses_openai_error_envelope(self, client, _auth, monkeypatch):
+        from fastapi import HTTPException
+
+        from lumen.config import get_settings
+
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+
+        async def fake_resolve(_model):
+            return {"provider_name": "openai", "model_name": "gpt-4o"}
+
+        async def fake_precheck(*_args, **_kwargs):
+            return None
+
+        async def unavailable_summary_route(_route):
+            raise HTTPException(status_code=503, detail="summary storage unavailable")
+
+        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "precheck", fake_precheck)
+        monkeypatch.setattr(
+            "lumen.services.openai_compat.resolve_summary_route",
+            unavailable_summary_route,
+        )
+
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "lumen", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+
+        assert response.status_code == 503
+        body = response.json()
+        assert "detail" not in body
+        assert body["error"] == {
+            "message": "summary storage unavailable",
+            "type": "api_error",
+            "code": None,
+        }
+
     async def test_models_list_dedupes_provider_lumen_model(self, client, _auth, monkeypatch):
         from lumen.config import get_settings
         from lumen.services.providers import repository
@@ -930,6 +988,7 @@ class TestOpenAILumenVirtualModel:
         lumen_items = [m for m in data if m["id"] == "lumen"]
         assert len(lumen_items) == 1
         assert lumen_items[0]["owned_by"] == "lumen"
+
 
 class TestDiscoveryAndHostGate:
     async def test_discovery_public(self, client):

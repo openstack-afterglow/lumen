@@ -12,7 +12,11 @@ from fastapi import HTTPException
 
 from lumen.auth import Principal, ensure_scopes
 from lumen.config import get_settings
-from lumen.models.chat_contracts import ChatFeatureOptions, UserInputPart
+from lumen.models.chat_contracts import (
+    ChatFeatureOptions,
+    UserInputPart,
+    text_projection_from_user_input_parts,
+)
 from lumen.services import agent_store as ags
 from lumen.services import conversation_store as cs
 from lumen.services import extensions_store as es
@@ -133,9 +137,24 @@ def _feature_route_snapshot(route: dict[str, Any], *, purpose: str) -> dict[str,
     """Copy only immutable non-secret route identity into the plaintext run snapshot."""
     fields = ("provider_id", "provider_name", "config_version_hash")
     snapshot = {field: route[field] for field in fields}
-    if purpose == "advisor":
+    if purpose in {"advisor", "summary"}:
         snapshot.update({"model_id": route["model_id"], "model_name": route["model_name"]})
+    if purpose == "summary":
+        capabilities = route.get("capabilities")
+        context_limit = route.get("context_limit")
+        if context_limit is None and isinstance(capabilities, dict):
+            context_limit = capabilities.get("context_limit")
+        snapshot["context_limit"] = context_limit
     return snapshot
+
+
+async def resolve_summary_route(execution_route: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the dedicated title route once, falling back to the execution route."""
+    try:
+        route = await ps.resolve_title_model()
+    except errors.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return route or execution_route
 
 
 async def _resolve_feature_routes(features: ChatFeatureOptions) -> dict[str, dict[str, Any]]:
@@ -165,8 +184,9 @@ def _run_snapshots(
     features: dict[str, Any],
     *,
     feature_routes: dict[str, dict[str, Any]] | None = None,
+    summary_route: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Persist only immutable, non-secret execution and pricing inputs for a run."""
+    """Persist immutable execution, summary-route, and pricing inputs for a run."""
     price_metadata = resolved.get("price_metadata")
     costs = price_metadata.get("cost", price_metadata) if isinstance(price_metadata, dict) else {}
     component_keys = (
@@ -217,9 +237,21 @@ def _run_snapshots(
         "chat_credit_per_usd": str(get_settings().chat_credit_per_usd),
         "rounding_version": "half_even_v1",
     }
+    if summary_route is not None:
+        capability_snapshot["summary_route"] = _feature_route_snapshot(summary_route, purpose="summary")
+        pricing_snapshot["summary_route"] = {
+            "input_price_per_token": str(summary_route.get("input_price_per_token"))
+            if summary_route.get("input_price_per_token") is not None
+            else None,
+            "output_price_per_token": str(summary_route.get("output_price_per_token"))
+            if summary_route.get("output_price_per_token") is not None
+            else None,
+            "price_source": summary_route.get("price_source"),
+            "price_version": summary_route.get("price_version"),
+            "provider_name": summary_route.get("provider_name"),
+            "model_name": summary_route.get("model_name"),
+        }
     return capability_snapshot, pricing_snapshot
-
-
 
 
 def _model_input(path_messages: list[dict], extra_user: str | None = None) -> list[dict]:
@@ -290,6 +322,9 @@ async def _resolve_extension_selection(
                 "origin": _normalized_origin(item.get("url")),
                 "config_fingerprint": es.selection_fingerprint(item),
             }
+            if kind == "tool":
+                selected_item["description"] = str(item.get("description") or item.get("name") or "Custom HTTP tool")
+                selected_item["params_schema"] = item.get("params_schema")
             if kind == "mcp":
                 selected_item["credential_version"] = credential_versions.get(item_id, 0)
             selected.append(selected_item)
@@ -508,3 +543,229 @@ def _require_native_admission_scopes(
     if agent is not None:
         required.add("native:agents:use")
     ensure_scopes(token_info, *required)
+
+
+def _require_context_read_scopes(
+    token_info: Principal,
+    features: ChatFeatureOptions,
+    *,
+    skill_ids: list[int],
+    agent: dict | None,
+) -> None:
+    """Check read-only context admission scopes without requiring execution or write grants."""
+    if token_info["auth_type"] != "api_key":
+        return
+    required: set[str] = set()
+    if features.tool_policy.mode != "none":
+        required.add("native:extensions:read")
+    if features.memory:
+        required.add("native:memory:read")
+    agent_skill_ids = agent.get("skill_ids") if agent else None
+    if skill_ids or agent_skill_ids:
+        required.add("native:extensions:read")
+    if agent is not None:
+        required.add("native:agents:use")
+    ensure_scopes(token_info, *required)
+
+
+async def _preview_tool_schemas(
+    features: ChatFeatureOptions,
+    extension_selection: dict[str, list[dict[str, object]]],
+) -> list[dict[str, Any]]:
+    """Construct read-only tool schemas for token estimation without tool execution."""
+    if features.tool_policy.mode == "none":
+        return []
+    from lumen.services import tools
+    from lumen.services.tool_runtime import managed
+
+    schemas = list(tools.tool_schemas())
+    for tool in extension_selection.get("tools", []):
+        params = tool.get("params_schema")
+        schemas.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": str(tool.get("name") or f"custom_tool_{tool.get('id')}"),
+                    "description": str(tool.get("description") or tool.get("name") or "Custom HTTP tool"),
+                    "parameters": params if isinstance(params, dict) else {"type": "object", "properties": {}},
+                },
+            }
+        )
+    # MCP schemas are discovered remotely by the executor. Preview must never
+    # perform discovery, so it deliberately counts only the deterministic
+    # built-in/custom schemas rather than pretending an unknown remote schema is
+    # authoritative.
+    if features.web_search.enabled:
+        schemas.append(
+            managed._managed_schema(
+                managed._MANAGED_SEARCH_TOOL, "Search the public web through the selected provider.", "query"
+            )
+        )
+    if features.web_fetch.enabled:
+        schemas.append(
+            managed._managed_schema(managed._MANAGED_FETCH_TOOL, "Fetch a permitted public HTTPS document.", "url")
+        )
+    if features.advisor.enabled:
+        schemas.append(
+            managed._managed_schema(
+                managed._MANAGED_ADVISOR_TOOL, "Ask the selected advisor for private analysis.", "goal"
+            )
+        )
+    return schemas
+
+
+async def prepare_context_input(
+    *,
+    user_id: str,
+    project_id: str,
+    conversation_id: str | None = None,
+    temp_thread_id: str | None = None,
+    leaf_id: int | None = None,
+    model_id: str,
+    parts: list[UserInputPart] | None = None,
+    features: ChatFeatureOptions,
+    agent_id: int | None = None,
+    skill_ids: list[int] | None = None,
+    execution_mode: str = "chat",
+    reasoning_effort: str = "auto",
+    code_workspace_id: str | None = None,
+    client_timezone: str | None = None,
+    token_info: Principal | None = None,
+    is_preview: bool = False,
+    is_context_operation: bool = False,
+    allow_empty_source: bool = False,
+    append_draft: bool = True,
+) -> dict[str, Any]:
+    from lumen.services import context_store
+
+    skill_ids = skill_ids or []
+    parts = parts or []
+    if temp_thread_id is not None:
+        if agent_id is not None or code_workspace_id is not None:
+            raise HTTPException(status_code=422, detail="temporary chats do not support agents or code workspaces")
+        if execution_mode != "chat":
+            raise HTTPException(status_code=422, detail="requested chat execution mode is not available")
+    if execution_mode != "chat":
+        raise HTTPException(status_code=422, detail="requested chat execution mode is not available")
+
+    conv = None
+    if conversation_id is not None:
+        conv = await _load_owned_conv(conversation_id, user_id, project_id)
+
+    if allow_empty_source:
+        if conversation_id is not None or temp_thread_id is not None:
+            raise HTTPException(status_code=422, detail="empty source is only valid for a new temporary chat")
+        source = {
+            "messages": [],
+            "message_ids": [],
+            "source_hashes": [],
+            "active_leaf_id": None,
+            "revision": "temp:new",
+            "checkpoint_id": None,
+            "checkpoint": None,
+        }
+    else:
+        try:
+            source = await context_store.load_context_source(
+                conversation_id=conversation_id,
+                temp_thread_id=temp_thread_id,
+                user_id=user_id,
+                project_id=project_id,
+                leaf_id=leaf_id,
+            )
+        except (cs.ConversationNotFound, LookupError) as exc:
+            raise HTTPException(status_code=404, detail="temporary chat thread was not found") from exc
+        except cs.ConversationForbidden as exc:
+            raise HTTPException(status_code=403, detail="temporary chat thread is not accessible") from exc
+        except cs.ChatStorageUnavailable as exc:
+            raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
+        except ValueError as exc:
+            if temp_thread_id is not None:
+                raise HTTPException(status_code=503, detail="temporary chat history is unavailable") from exc
+            raise HTTPException(status_code=422, detail="context source is invalid") from exc
+
+    agent = await _resolve_agent(agent_id, user_id, project_id)
+    resolved = await _resolve_model(model_id)
+    extension_selection = await _resolve_extension_selection(agent, features, user_id=user_id, project_id=project_id)
+    if token_info is not None:
+        if is_preview or is_context_operation:
+            _require_context_read_scopes(token_info, features, skill_ids=skill_ids, agent=agent)
+        else:
+            _require_native_admission_scopes(
+                token_info,
+                features,
+                parts=parts,
+                execution_mode=execution_mode,
+                skill_ids=skill_ids,
+                agent=agent,
+                extension_selection=extension_selection,
+            )
+
+    feature_routes = await _resolve_feature_routes(features)
+    _require_execution_capability(features, resolved, parts=parts, feature_routes=feature_routes)
+    validated_reasoning_effort = _validated_reasoning_effort(reasoning_effort, resolved)
+    _validate_tool_reasoning_compatibility(validated_reasoning_effort, resolved, features)
+
+    skill_instructions, skill_snapshot = await _load_skill_snapshot(agent, skill_ids, user_id, project_id)
+    draft_text = text_projection_from_user_input_parts(parts) if parts and append_draft else ""
+    base_messages = _model_input(source.get("messages", []), extra_user=draft_text if draft_text else None)
+
+    include_memory = bool(features.memory and conversation_id is not None)
+    include_account = bool(token_info and token_info.get("auth_type") != "api_key") if token_info else True
+    try:
+        workspace_instr, memories = (
+            await _load_context(
+                conv,
+                user_id,
+                project_id,
+                include_memory=include_memory,
+                include_account_memory=include_account,
+            )
+            if conv is not None
+            else (None, [])
+        )
+    except ms.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
+    input_messages, temperature, max_tokens = _apply_context(
+        agent,
+        workspace_instr,
+        memories,
+        base_messages,
+        None,
+        None,
+        skill_instructions=skill_instructions,
+    )
+    effective_max_tokens = min(max_tokens or _MAX_TOKENS_CAP, _MAX_TOKENS_CAP)
+
+    summary_route = await resolve_summary_route(resolved)
+    capability_snapshot, pricing_snapshot = _run_snapshots(
+        resolved,
+        features.model_dump(mode="json", by_alias=True),
+        feature_routes=feature_routes,
+        summary_route=summary_route,
+    )
+    capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
+
+    tool_schemas = await _preview_tool_schemas(features, extension_selection)
+
+    return {
+        "input_messages": input_messages,
+        "input_parts": [part.model_dump(mode="json", by_alias=True) for part in parts],
+        "max_tokens": effective_max_tokens,
+        "temperature": temperature,
+        "reasoning_effort": validated_reasoning_effort,
+        "source": source,
+        "agent": agent,
+        "resolved": resolved,
+        "summary_route": summary_route,
+        "capability_snapshot": capability_snapshot,
+        "pricing_snapshot": pricing_snapshot,
+        "feature_routes": feature_routes,
+        "extension_selection": extension_selection,
+        "skill_snapshot": skill_snapshot,
+        "tool_schemas": tool_schemas,
+        "workspace_instr": workspace_instr,
+        "memories": memories,
+    }

@@ -58,6 +58,42 @@ JSON_METHOD_TABLE = [
         {"message_id": 3},
         None,
     ),
+    (
+        "preview_conversation_context",
+        ("conv-1",),
+        {"model_id": 1},
+        "POST",
+        "/v1/conversations/conv-1/context-preview",
+        {"model_id": 1},
+        None,
+    ),
+    (
+        "compact_conversation",
+        ("conv-1",),
+        {"model_id": 1, "expected_context_revision": "rev-1"},
+        "POST",
+        "/v1/conversations/conv-1/compactions",
+        {"model_id": 1, "expected_context_revision": "rev-1"},
+        None,
+    ),
+    (
+        "preview_temp_context",
+        ("temp-1",),
+        {"model_id": 1},
+        "POST",
+        "/v1/temp-threads/temp-1/context-preview",
+        {"model_id": 1},
+        None,
+    ),
+    (
+        "compact_temp_thread",
+        ("temp-1",),
+        {"model_id": 1, "expected_context_revision": "rev-1"},
+        "POST",
+        "/v1/temp-threads/temp-1/compactions",
+        {"model_id": 1, "expected_context_revision": "rev-1"},
+        None,
+    ),
     # -- Completions & Runs --
     (
         "create_completion",
@@ -123,6 +159,7 @@ JSON_METHOD_TABLE = [
     ("delete_workspace", (1,), {}, "DELETE", "/v1/workspaces/1", None, None),
     # -- Memories --
     ("memories", (), {}, "GET", "/v1/memories", None, None),
+    ("memory_document", (), {}, "GET", "/v1/memories/document", None, None),
     ("create_memory", (), {"content": "mem"}, "POST", "/v1/memories", {"content": "mem"}, None),
     ("search_memories", (), {"query": "mem"}, "POST", "/v1/memories/search", {"query": "mem"}, None),
     ("update_memory", (1,), {"content": "updated"}, "PATCH", "/v1/memories/1", {"content": "updated"}, None),
@@ -333,20 +370,14 @@ def test_upload_asset_sends_files_multipart():
     assert res == {"id": "asset-1"}
 
 
-def test_download_asset_handles_307_contract():
+def test_download_asset_returns_same_origin_streamed_content():
     proxy = Proxy(session=MagicMock(), service_type="lumen")
-    redirect_resp = SimpleNamespace(status_code=307, headers={"Location": "https://s3.example.com/asset-1"})
-    proxy.request = MagicMock(return_value=redirect_resp)
-
-    url = proxy.download_asset("asset-1", allow_redirects=False)
-    proxy.request.assert_called_once_with("/v1/assets/asset-1/download", "GET", allow_redirects=False, raise_exc=True)
-    assert url == "https://s3.example.com/asset-1"
-
     content_resp = SimpleNamespace(status_code=200, content=b"asset-bytes", headers={})
     proxy.request = MagicMock(return_value=content_resp)
 
-    content = proxy.download_asset("asset-1", allow_redirects=True)
-    proxy.request.assert_called_once_with("/v1/assets/asset-1/download", "GET", allow_redirects=True, raise_exc=True)
+    content = proxy.download_asset("asset-1")
+
+    proxy.request.assert_called_once_with("/v1/assets/asset-1/download", "GET", raise_exc=True)
     assert content == b"asset-bytes"
 
 

@@ -50,6 +50,16 @@ class _ToolCallDelta:
         self.function = _ToolFn(name, arguments)
 
 
+class _DummyContextHooks:
+    def __init__(self, prepared=None):
+        self.prepared = prepared
+        self.called = False
+
+    async def prepare_context(self, *, messages, tool_schemas, round_index):
+        self.called = True
+        return self.prepared if self.prepared is not None else messages
+
+
 class _DeltaTC:
     def __init__(self, content=None, tool_calls=None):
         self.content = content
@@ -952,3 +962,22 @@ class TestEngineDelegates:
         ]
         usage = [event for event in events if event["type"] == "usage"][-1]
         assert usage["usage"] == {"prompt_tokens": 9, "completion_tokens": 3}
+
+
+async def test_graph_invokes_prepare_context_hook(monkeypatch):
+    async def fake_stream(*args, **kwargs):
+        assert kwargs["messages"] == [{"role": "user", "content": "compacted prompt"}]
+        return _aiter([_Chunk(content="Hello")])
+
+    monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+    hooks = _DummyContextHooks(prepared=[{"role": "user", "content": "compacted prompt"}])
+    events = [
+        event
+        async for event in graph.stream(
+            model="test-model",
+            messages=[{"role": "user", "content": "raw prompt"}],
+            execution_hooks=hooks,
+        )
+    ]
+    assert hooks.called is True
+    assert any(e["type"] == "token" and e["text"] == "Hello" for e in events)

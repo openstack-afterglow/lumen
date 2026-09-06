@@ -74,6 +74,7 @@ services:
       LUMEN_LOCAL_PROVIDER_BASE_URL: http://fake-provider:8080/v1
       LUMEN_LOCAL_INPUT_PRICE_PER_MILLION: "1"
       LUMEN_LOCAL_MODEL: ${LUMEN_LOCAL_MODEL:-fake-gpt-4}
+      LUMEN_LOCAL_CONTEXT_LIMIT: "16384"
       LUMEN_LOCAL_SEED_PATH: /seed/api-key
       LUMEN_LOCAL_CONNECTION_PATH: /seed/connection.json
       LUMEN_LOCAL_PUBLIC_BASE_URL: http://127.0.0.1:8012/v1

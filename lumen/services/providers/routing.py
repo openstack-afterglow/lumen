@@ -80,6 +80,7 @@ async def lock_execution_routes(
     executor: dict,
     search: dict | None = None,
     advisor: dict | None = None,
+    summary: dict | None = None,
 ) -> None:
     """Lock all run routes in one global order, then verify their immutable hashes."""
     routes: list[tuple[str, dict]] = [("executor", executor)]
@@ -87,6 +88,8 @@ async def lock_execution_routes(
         routes.append(("search", search))
     if advisor is not None:
         routes.append(("advisor", advisor))
+    if summary is not None:
+        routes.append(("summary", summary))
 
     provider_ids: set[int] = set()
     model_routes: list[dict] = []

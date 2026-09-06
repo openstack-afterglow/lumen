@@ -88,7 +88,9 @@ lumen_s3_endpoint_url: ""
 lumen_s3_bucket: "lumen-assets"
 lumen_s3_access_key: ""
 lumen_s3_secret_key: ""
-lumen_s3_region: "us-east-1"
+lumen_s3_region: "default"
+lumen_s3_server_side_encryption: ""
+lumen_s3_kms_key_id: ""
 
 # Lumen Sandbox & External Chat API Hosts
 lumen_sandbox_api_key: ""

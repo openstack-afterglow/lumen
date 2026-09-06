@@ -1,141 +1,252 @@
-"""대화 제목 자동 요약 — 관리자 지정 요약 모델(is_title_model)로 첫 교환을 짧은 제목으로 요약.
+"""Pure first-exchange title generation for the durable title job.
 
-⚠️ 요약 호출 비용은 사용자 크레딧이 아니라 **시스템 부담**이다:
-usage_logs 에 source="system" 으로 원장만 남기고 user_wallet 은 차감하지 않는다(credit.apply_usage
-charge_wallet=False). 사용자의 월 쿼터에 영향을 주지 않는다.
-
-요약 실패(모델 미지정/호출 오류)는 조용히 무시한다 — 제목은 부가 기능이라 대화 자체를 막지 않는다.
+This module deliberately has no database side effects.  The title job owns the
+transaction which persists the generated title and its system usage record.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
 
-from lumen.services import conversation_store as cs
-from lumen.services import credit, litellm_client
-from lumen.services.providers import routing as ps
+from lumen.services import litellm_client
 
 logger = logging.getLogger(__name__)
 
-_TITLE_MAX_TOKENS = 32
+_TITLE_MAX_TOKENS = 512
 _TITLE_MAX_CHARS = 80
+_TITLE_MAX_WORDS = 6
 _TITLE_SYSTEM = (
-    "다음 대화를 6단어 이내의 간결한 제목으로 요약하라. "
-    "대화의 주 언어를 따르고, 따옴표·마침표·부연 설명 없이 제목만 출력하라."
+    "Summarize this first user request and the successful assistant answer as a concise "
+    "conversation title. Use the conversation's primary language. Return only a title, "
+    "at most 6 words and 80 characters, without quotes, punctuation, or explanation."
 )
+_OMISSION = "[…생략…]"
+
+
+@dataclass(frozen=True)
+class TitleResult:
+    title: str
+    prompt_tokens: int
+    completion_tokens: int
+    messages: list[dict[str, Any]]
+    model_name: str
 
 
 def _clean(text: str) -> str:
-    """개행/중복 공백 제거 + 따옴표 정리 + 길이 상한."""
+    """Normalize model output to the public title limits."""
     cleaned = " ".join((text or "").split()).strip().strip("\"'").strip()
-    return cleaned[:_TITLE_MAX_CHARS]
+    # Providers occasionally wrap a valid title in a JSON object despite the
+    # plain-text instruction.  Accept only the title field, never arbitrary
+    # provider metadata or a summary prompt.
+    try:
+        value = json.loads(cleaned)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        value = None
+    if isinstance(value, Mapping) and isinstance(value.get("title"), str):
+        cleaned = " ".join(value["title"].split()).strip().strip("\"'").strip()
+    words = cleaned.split()
+    if len(words) > _TITLE_MAX_WORDS:
+        cleaned = " ".join(words[:_TITLE_MAX_WORDS])
+    return cleaned[:_TITLE_MAX_CHARS].rstrip()
 
 
-def _resp_text(resp) -> str:
+def _resp_text(resp: Any) -> str:
     try:
         choices = getattr(resp, "choices", None)
         if choices is None and isinstance(resp, Mapping):
             choices = resp.get("choices")
         first = choices[0]
-        msg = getattr(first, "message", None)
-        if msg is None and isinstance(first, Mapping):
-            msg = first.get("message")
-        content = getattr(msg, "content", None)
-        if content is None and isinstance(msg, Mapping):
-            content = msg.get("content")
-        return content or ""
-    except Exception:
+        message = getattr(first, "message", None)
+        if message is None and isinstance(first, Mapping):
+            message = first.get("message")
+        content = getattr(message, "content", None)
+        if content is None and isinstance(message, Mapping):
+            content = message.get("content")
+        return content if isinstance(content, str) else ""
+    except (AttributeError, IndexError, KeyError, TypeError):
         return ""
 
 
-def _resp_usage(resp, model: str, messages: list[dict], text: str) -> tuple[int, int]:
+def _resp_usage(resp: Any, model: str, messages: list[dict[str, Any]], text: str) -> tuple[int, int]:
     usage = getattr(resp, "usage", None)
     if usage is None and isinstance(resp, Mapping):
         usage = resp.get("usage")
     return litellm_client.extract_usage(model, messages, text, usage)
 
 
-async def generate_title_if_absent(*, conversation_id: str, project_id: str, user_id: str) -> None:
-    """제목이 없고 요약 모델이 지정돼 있으면 요약·저장(시스템 과금). 모든 실패는 무시."""
-    try:
-        conv = await cs.get_conversation(conversation_id, user_id=user_id, project_id=project_id)
-    except Exception:
-        return
-    if conv.get("title"):
-        return  # 이미 제목 있음(사용자 지정 또는 이전 요약)
+def _route_capabilities(route: Mapping[str, Any]) -> Mapping[str, Any]:
+    capabilities = route.get("capabilities")
+    return capabilities if isinstance(capabilities, Mapping) else {}
 
-    try:
-        resolved = await ps.resolve_title_model()
-    except Exception:
-        logger.warning("제목 요약 모델 조회 실패 conv=%s", conversation_id, exc_info=True)
-        return
-    if resolved is None:
-        return  # 요약 모델 미지정 — 기능 비활성
 
+def _context_limit(route: Mapping[str, Any]) -> int | None:
+    capabilities = _route_capabilities(route)
+    value = capabilities.get("context_limit", route.get("context_limit"))
     try:
-        msgs = await cs.list_messages(conversation_id, user_id=user_id, project_id=project_id, limit=6)
-    except Exception:
-        return
-    convo = [m for m in msgs if m.get("role") in ("user", "assistant") and m.get("content")]
-    if not convo:
-        return
-    excerpt = "\n".join(f"{m['role']}: {str(m['content'])[:500]}" for m in convo[:4])
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _fit_text(model: str, role: str, text: str, token_budget: int) -> str:
+    """Keep role text within a tokenizer budget while preserving both ends."""
+    if token_budget <= 0:
+        return ""
+    original = text or ""
+    if litellm_client.count_tokens(model, messages=[{"role": role, "content": original}]) <= token_budget:
+        return original
+
+    def candidate(keep: int) -> str:
+        if keep <= 0:
+            return _OMISSION
+        front = max(1, (keep * 3) // 4)
+        tail = max(1, keep - front)
+        return f"{original[:front]} {_OMISSION} {original[-tail:]}"
+
+    # Find the largest source-character bound whose marker-inclusive form fits.
+    lo, hi = 0, max(1, len(original))
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if litellm_client.count_tokens(model, messages=[{"role": role, "content": candidate(mid)}]) <= token_budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    fitted = candidate(lo)
+    return (
+        fitted
+        if litellm_client.count_tokens(model, messages=[{"role": role, "content": fitted}]) <= token_budget
+        else ""
+    )
+
+
+def _fit_messages_to_budget(*, model: str, messages: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+    """Fit both exchange roles after reserving system and role framing tokens."""
+    if litellm_client.count_tokens(model, messages=messages) <= budget:
+        return messages
+    system = messages[0]
+    roles = messages[1:]
+    system_tokens = litellm_client.count_tokens(model, messages=[system])
+    if system_tokens > budget:
+        raise ValueError("title context budget exceeded")
+    empty_roles = [system, *({"role": item["role"], "content": ""} for item in roles)]
+    framing_tokens = max(
+        0,
+        litellm_client.count_tokens(model, messages=empty_roles) - system_tokens,
+    )
+    available = max(0, budget - system_tokens - framing_tokens)
+    # Allocate the remaining content budget equally before any role-specific trim.
+    high = available // max(1, len(roles))
+
+    def build(role_budget: int) -> list[dict[str, Any]]:
+        if role_budget <= 0:
+            return [system, *({"role": item["role"], "content": ""} for item in roles)]
+        return [
+            system,
+            *(
+                {
+                    "role": item["role"],
+                    "content": _fit_text(model, item["role"], str(item["content"]), role_budget),
+                }
+                for item in roles
+            ),
+        ]
+
+    candidate = build(high)
+    if litellm_client.count_tokens(model, messages=candidate) <= budget:
+        return candidate
+    # Tokenizer framing can differ from the estimate above.  Validate the actual
+    # complete request and reduce both roles together, retaining the 50/50 split.
+    lo = 0
+    best: list[dict[str, Any]] | None = None
+    while lo <= high:
+        mid = (lo + high) // 2
+        current = build(mid)
+        if litellm_client.count_tokens(model, messages=current) <= budget:
+            best = current
+            lo = mid + 1
+        else:
+            high = mid - 1
+    if best is None:
+        best = build(0)
+        if litellm_client.count_tokens(model, messages=best) > budget:
+            raise ValueError("title context budget exceeded")
+    return best
+
+
+def build_title_messages(*, exchange: Sequence[Mapping[str, Any]], route: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Build the one first-exchange request, truncating only when its window requires it."""
+    model = str(route.get("model_name") or "")
+    roles: list[tuple[str, str]] = []
+    for item in exchange:
+        role = item.get("role")
+        content = item.get("content")
+        if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+            roles.append((str(role), content))
+    # The enqueue snapshot is exactly one user/assistant exchange.  If a caller
+    # supplies extras, retain the first user and its following assistant only.
+    user = next(((r, c) for r, c in roles if r == "user"), None)
+    assistant = next(((r, c) for i, (r, c) in enumerate(roles) if r == "assistant" and i > 0), None)
+    if user is None or assistant is None:
+        return [{"role": "system", "content": _TITLE_SYSTEM}]
     messages = [
         {"role": "system", "content": _TITLE_SYSTEM},
-        {"role": "user", "content": excerpt},
+        {"role": "user", "content": user[1]},
+        {"role": "assistant", "content": assistant[1]},
     ]
-    model = resolved["model_name"]
+    limit = _context_limit(route)
+    if limit is None:
+        return messages
+    # Reserve the title output and standard safety reserve, then account for
+    # system and role framing before splitting the remaining budget 50/50.
+    budget = max(1, limit - _TITLE_MAX_TOKENS - 2048)
+    return _fit_messages_to_budget(model=model, messages=messages, budget=budget)
 
-    try:
-        resp = await litellm_client.acompletion(
-            model,
-            messages,
-            custom_llm_provider=resolved.get("provider_type"),
-            api_base=resolved.get("api_base"),
-            api_key=resolved.get("api_key"),
-            max_tokens=_TITLE_MAX_TOKENS,
-            temperature=0.3,
-        )
-    except Exception:
-        logger.warning("제목 요약 호출 실패 conv=%s model=%s", conversation_id, model, exc_info=True)
-        return
 
-    title = _clean(_resp_text(resp))
+async def generate_title(*, exchange: Sequence[Mapping[str, Any]], route: Mapping[str, Any]) -> TitleResult:
+    """Call the frozen title route once and return title plus observed usage."""
+    model = str(route.get("model_name") or "")
+    if not model:
+        raise ValueError("title model is unavailable")
+    messages = build_title_messages(exchange=exchange, route=route)
+    if len(messages) < 3:
+        raise ValueError("first exchange is incomplete")
+    limit = _context_limit(route)
+    if limit is not None:
+        budget = max(1, limit - _TITLE_MAX_TOKENS - 2048)
+        if litellm_client.count_tokens(model, messages=messages) > budget:
+            raise ValueError("title context budget exceeded")
+    params: dict[str, Any] = {
+        "custom_llm_provider": route.get("provider_type"),
+        "api_base": route.get("api_base"),
+        "api_key": route.get("api_key"),
+        "max_tokens": _TITLE_MAX_TOKENS,
+        "temperature": 0.0,
+    }
+    params = {key: value for key, value in params.items() if value is not None}
+    # none is the least expensive supported reasoning mode.  The wrapper
+    # omits it for providers which do not support reasoning parameters.
+    reasoning_params = getattr(litellm_client, "_reasoning_params", None)
+    if callable(reasoning_params):
+        params.update(reasoning_params(model, "none", route.get("provider_type")))
+    response = await litellm_client.acompletion(model, messages, **params)
+    raw = _resp_text(response)
+    title = _clean(raw)
     if not title:
-        return
+        raise ValueError("title model returned an empty title")
+    prompt_tokens, completion_tokens = _resp_usage(response, model, messages, raw)
+    return TitleResult(
+        title=title,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        messages=messages,
+        model_name=model,
+    )
 
-    try:
-        await cs.update_title(conversation_id, user_id=user_id, project_id=project_id, title=title)
-    except Exception:
-        logger.warning("제목 저장 실패 conv=%s", conversation_id, exc_info=True)
-        return
 
-    # 시스템 부담 과금 — 원장만 기록, 사용자 지갑 미차감.
-    try:
-        pt, ct = _resp_usage(resp, model, messages, title)
-        usage_cost = litellm_client.cost_from_usage(
-            model,
-            pt,
-            ct,
-            input_price_per_token=resolved.get("input_price_per_token"),
-            output_price_per_token=resolved.get("output_price_per_token"),
-            price_source=resolved.get("price_source"),
-            provider_type=resolved.get("provider_type"),
-        )
-        await credit.apply_usage(
-            event_id=f"title:{conversation_id}",
-            user_id=user_id,
-            project_id=project_id,
-            model_name=model,
-            provider=resolved.get("provider_name"),
-            prompt_tokens=pt,
-            completion_tokens=ct,
-            usage_cost=usage_cost,
-            margin_multiplier=resolved["margin_multiplier"],
-            conversation_id=conversation_id,
-            source="system",
-            charge_wallet=False,
-        )
-    except Exception:
-        logger.warning("제목 요약 시스템 과금 기록 실패 conv=%s", conversation_id, exc_info=True)
+# Explicit aliases make the pure boundary easy for callers/tests to discover.
+clean_title = _clean

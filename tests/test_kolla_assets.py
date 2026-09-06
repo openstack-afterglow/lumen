@@ -84,9 +84,14 @@ def test_kolla_package_version_image_tag_lockstep():
     defaults_raw = (ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8")
     assert "afterglow_image_tag" not in defaults_raw, "Lumen package default refers to afterglow_image_tag"
     assert defaults_yaml["lumen_encryption_key"] == "", "Lumen encryption key default must be explicit empty string"
-    assert "afterglow_lumen_mcp_service_token" in defaults_raw, "Lumen default must preserve MCP workload token integration"
+    assert "afterglow_lumen_mcp_service_token" in defaults_raw, (
+        "Lumen default must preserve MCP workload token integration"
+    )
     assert defaults_yaml["lumen_chat_default_model"] == ""
     assert defaults_yaml["lumen_chat_compat_run_timeout_seconds"] == 300
+    assert defaults_yaml["lumen_s3_region"] == "default"
+    assert defaults_yaml["lumen_s3_server_side_encryption"] == ""
+    assert defaults_yaml["lumen_s3_kms_key_id"] == ""
 
     assert defaults_yaml["lumen_image_namespace"] == "ghcr.io/openstack-afterglow"
     assert defaults_yaml["lumen_api_image"] == "{{ lumen_image_namespace }}/lumen-api"
@@ -95,7 +100,10 @@ def test_kolla_package_version_image_tag_lockstep():
     template = (ROLE_DIR / "templates" / "lumen.conf.j2").read_text(encoding="utf-8")
     assert 'public_api_base = "{{ lumen_public_api_base }}"' in template
     assert 'chat_default_model = "{{ lumen_chat_default_model }}"' in template
-    assert 'chat_compat_run_timeout_seconds = {{ lumen_chat_compat_run_timeout_seconds }}' in template
+    assert "chat_compat_run_timeout_seconds = {{ lumen_chat_compat_run_timeout_seconds }}" in template
+    assert 'chat_asset_s3_region = "{{ lumen_s3_region }}"' in template
+    assert 'chat_asset_s3_server_side_encryption = "{{ lumen_s3_server_side_encryption }}"' in template
+    assert 'chat_asset_s3_kms_key_id = "{{ lumen_s3_kms_key_id }}"' in template
 
 
 def test_bundled_postgres_binds_the_configured_host_interface():
@@ -114,8 +122,12 @@ def test_bundled_postgres_binds_the_configured_host_interface():
 
 def test_kolla_precheck_encryption_key_uncoupled():
     precheck_raw = (ROLE_DIR / "tasks" / "precheck.yml").read_text(encoding="utf-8")
-    assert "afterglow_kubeconfig_encryption_key" not in precheck_raw, "Precheck must not couple to afterglow_kubeconfig_encryption_key"
-    assert "lumen_encryption_key is regex('^[0-9a-fA-F]{64}$')" in precheck_raw, "Precheck must require 64 hex characters fail-closed"
+    assert "afterglow_kubeconfig_encryption_key" not in precheck_raw, (
+        "Precheck must not couple to afterglow_kubeconfig_encryption_key"
+    )
+    assert "lumen_encryption_key is regex('^[0-9a-fA-F]{64}$')" in precheck_raw, (
+        "Precheck must require 64 hex characters fail-closed"
+    )
 
 
 def test_kolla_main_tasks_action_validation():
@@ -140,6 +152,7 @@ def test_kolla_main_tasks_action_validation():
         assert action in when_str
     for unhandled in ["stop", "check", "deploy-containers", "config_validate"]:
         assert f"'{unhandled}'" not in when_str
+
 
 def test_kolla_shared_data_metadata():
     pyproject_data = tomllib.loads((KOLLA_DIR / "pyproject.toml").read_text(encoding="utf-8"))
@@ -206,7 +219,9 @@ def test_kolla_reconfigure_refresh_ordering():
 
     pull_idx = included.index("pull.yml")
     bootstrap_idx = included.index("bootstrap_service.yml")
-    assert pull_idx < bootstrap_idx, "Reconfigure must pull refreshed images before running bootstrap_service migrations"
+    assert pull_idx < bootstrap_idx, (
+        "Reconfigure must pull refreshed images before running bootstrap_service migrations"
+    )
 
 
 def test_kolla_wheel_contents():

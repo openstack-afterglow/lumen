@@ -27,8 +27,9 @@ API-key run은 text `execution_mode="chat"`만 허용한다. `memory=true`는 me
 | Compat | `GET /v1/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/messages` |
 | Conversations | `POST/GET /v1/conversations`, `GET/DELETE /v1/conversations/{id}`, messages/search/fork/workspace/active-leaf, completion/regenerate/retry/runs subroutes |
 | Native runs | `POST /v1/temp-completions`; `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/events`, `/v1/temp-threads/{id}`; approval/interaction/cancel POST routes |
+| Context | `POST /v1/conversations/{id}/context-preview`, `/compactions`; equivalent `POST /v1/temp-threads/{id}/context-preview`, `/compactions`. Preview is read-only; compaction requires `Idempotency-Key` and `expected_context_revision`, returns a durable `run_kind="compaction"` descriptor. |
 | Extensions | `GET/POST/PATCH/DELETE /v1/custom-tools`, `/v1/mcp-servers`, `/v1/skills`; OAuth status/disconnect; OAuth start is Keystone-only |
-| Memory/usage | `GET/POST /v1/memories`, search, patch/delete; `GET /v1/usage`, `/keys`, `/timeseries`, `/records` |
+| Memory/usage | `GET/POST /v1/memories`, `GET /v1/memories/document`, search, patch/delete; `GET /v1/usage`, `/keys`, `/timeseries`, `/records` |
 | Keystone-only management | `/v1/api-keys`, `/v1/api-keys/{key_id}/limits`, `/v1/admin/api-keys`, `/v1/admin/api-keys/{key_id}/limits`, `/v1/agents`, `/v1/workspaces`, `/v1/assets`, `/v1/code-workspaces`, `/v1/git-credentials`, `/v1/admin/*` |
 
 ## OpenAI / Anthropic 호환 및 연동 가이드
@@ -86,6 +87,12 @@ API 키 발급 및 한도 관리는 Keystone token 인증 전용(Keystone-only)�
 `POST /v1/temp-completions`와 conversation completion route에는 구문상 유효한 UUID `Idempotency-Key`가 필요하다 (UUIDv4 권장, non-UUID 시 422). 응답은 `run_id`, `status`, `events_url`, `cancel_url`을 담은 202 `ChatRunDescriptor`다. 동일 idempotency key에 다른 intent를 재사용하면 409 conflict가 발생하며, 동일 intent 재전송은 precheck 우회 202 replay다.
 
 `CompletionRequest`/`TempCompletionRequest`는 text/asset `parts`, `model_id`, `features`, `reasoning_effort`, `skill_ids`, execution 설정을 받는다. 기본값은 보안 계약이다. `features.memory=true`, `tool_policy.mode="agent_default"`이므로 해당 scope가 없는 least-privilege key는 `{"memory": false, "tool_policy": {"mode": "none"}}`을 명시해야 한다. Provider 출력 `max_tokens`는 최대 4096으로 제한된다.
+
+## 자동 Asset 저장과 Memory 문서
+
+`POST /v1/assets`로 수신한 파일은 MIME/크기 검사와 ClamAV 검사를 통과한 뒤 요청 principal의 OpenStack project에 대응하는 결정적 S3 bucket에 server-side encryption으로 저장된다. Bucket 이름은 구성된 base와 project ID의 SHA-256 파생값으로 만들며 원문 project ID를 노출하지 않는다. V2 MCP adapter는 LangChain이 반환한 embedded `image`/`file` base64 block을 최대 5 MiB의 생성 파일로 변환하며, 원격 resource URL은 자동 fetch하지 않는다. 생성 파일은 같은 ingestion 경계에서 검사·암호화하고, 완료 결과의 artifact는 clean 상태와 run의 user/project 소유권을 다시 확인한 뒤 `purpose="output"` run asset으로 영속화한다. `GET /v1/assets/{asset_id}/download`는 소유권 확인 후 Lumen이 object body를 직접 stream하므로 browser나 BFF가 project bucket의 CORS 정책 또는 signed URL에 의존하지 않는다.
+
+`features.memory=true`인 영속 top-level run은 성공적으로 완료된 뒤 비동기 extraction job을 예약한다. 구성된 memory model이 만든 유효한 add/update/delete delta만 암호화된 memory source에 적용된다. `GET /v1/memories/document`는 `native:memory:read` scope로 현재 사용자에게 보이는 active account/current-project memory만 `# Memory` Markdown으로 투영한다. 이 문서는 요청 시 메모리에서 생성되며 plaintext DB row나 filesystem copy를 만들지 않는다. `lumen_sdk.Client.memory_document()`가 같은 projection을 반환한다.
 
 ## SSE, 승인, 사용량 및 헬스
 

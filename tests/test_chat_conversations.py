@@ -18,6 +18,9 @@ def _public_conv(**over) -> dict:
         "project_id": "test-project-123",
         "user_id": "test-user-123",
         "title": None,
+        "title_source": "auto",
+        "title_status": "idle",
+        "title_revision": 0,
         "model_name": None,
         "created_at": "2026-01-01T00:00:00+00:00",
         "updated_at": "2026-01-01T00:00:00+00:00",
@@ -200,6 +203,15 @@ class TestForkAndActiveLeaf:
         assert captured["message_id"] == 7
         assert captured["user_id"] == "test-user-123"
         assert captured["project_id"] == "test-project-123"
+
+    async def test_set_active_leaf_returns_409_when_conversation_run_active(self, client, monkeypatch):
+        async def fake_set(conv_id, **kwargs):
+            raise cs.ConversationRunActive("conversation has an active run")
+
+        monkeypatch.setattr(cs, "set_active_leaf", fake_set)
+        resp = await client.patch(f"{_URL}/c1/active-leaf", json={"message_id": 7})
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "conversation_run_active"
 
     async def test_fork_delegates_and_returns_new(self, client, monkeypatch):
         captured = {}

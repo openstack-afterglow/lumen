@@ -11,14 +11,18 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -39,12 +43,16 @@ _MAX_AUDIO_BYTES = 25 * 1024 * 1024
 _MAX_AUDIO_DURATION_MS = 30 * 60 * 1000
 _MAX_VIDEO_BYTES = 100 * 1024 * 1024
 _MAX_VIDEO_DURATION_MS = 10 * 60 * 1000
+_MAX_GENERATED_FILE_BYTES = 5 * 1024 * 1024
 
 _IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
 _AUDIO_MIMES = {"audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/ogg", "audio/webm"}
 _VIDEO_MIMES = {"video/mp4", "video/webm"}
 _ALLOWED_MIMES = _IMAGE_MIMES | _AUDIO_MIMES | _VIDEO_MIMES | {"application/pdf"}
 _CONTROL_OR_PATH = re.compile(r"[\x00-\x1f\x7f/\\]+")
+_BUCKET_BASE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_MEDIA_TYPE = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
+_PROJECT_BUCKET_HASH_LENGTH = 20
 
 
 class AssetError(ValueError):
@@ -64,6 +72,25 @@ class InspectedAsset:
     original_name: str
 
 
+@dataclass
+class AssetDownload:
+    """Owned object stream and immutable response metadata."""
+
+    body: Any
+    name: str
+    mime_type: str
+    size_bytes: int
+
+    async def chunks(self) -> AsyncIterator[bytes]:
+        try:
+            while chunk := await asyncio.to_thread(self.body.read, 64 * 1024):
+                if not isinstance(chunk, bytes):
+                    raise AssetUnavailable("chat asset object storage returned invalid data")
+                yield chunk
+        finally:
+            await asyncio.to_thread(self.body.close)
+
+
 def _require_session_factory():
     if not is_db_available():
         raise ChatStorageUnavailable("chat DB 를 사용할 수 없습니다")
@@ -78,6 +105,18 @@ def _sanitized_name(name: str | None) -> str:
     return (display or "asset")[:255]
 
 
+def project_bucket_name(base: str, project_id: str) -> str:
+    """Return a stable S3 bucket name without exposing the raw project identifier."""
+    prefix = base.strip().lower().strip("-")
+    if not prefix or not _BUCKET_BASE.fullmatch(prefix):
+        raise AssetUnavailable("chat asset bucket base is invalid")
+    prefix = prefix[: 63 - _PROJECT_BUCKET_HASH_LENGTH - 1].rstrip("-")
+    if not prefix:
+        raise AssetUnavailable("chat asset bucket base is invalid")
+    digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:_PROJECT_BUCKET_HASH_LENGTH]
+    return f"{prefix}-{digest}"
+
+
 def _asset_config() -> dict[str, str | int]:
     settings = get_settings()
     endpoint = settings.chat_asset_s3_endpoint.strip()
@@ -85,6 +124,7 @@ def _asset_config() -> dict[str, str | int]:
     access_key = settings.chat_asset_s3_access_key.strip()
     secret_key = settings.chat_asset_s3_secret_key.strip()
     scanner_host = settings.chat_clamav_host.strip()
+    region = settings.chat_asset_s3_region.strip()
     encryption = settings.chat_asset_s3_server_side_encryption.strip()
     try:
         port = int(settings.chat_clamav_port)
@@ -101,10 +141,11 @@ def _asset_config() -> dict[str, str | int]:
         or not bucket
         or not access_key
         or not secret_key
+        or not region
         or not scanner_host
         or not 1 <= port <= 65535
         or not 1 <= ttl <= 3600
-        or encryption not in {"AES256", "aws:kms"}
+        or encryption not in {"none", "AES256", "aws:kms"}
     ):
         raise AssetUnavailable("chat asset storage or scanner is not configured")
     kms_key = settings.chat_asset_s3_kms_key_id.strip()
@@ -115,6 +156,7 @@ def _asset_config() -> dict[str, str | int]:
         "bucket": bucket,
         "access_key": access_key,
         "secret_key": secret_key,
+        "region": region,
         "encryption": encryption,
         "kms_key": kms_key,
         "scanner_host": scanner_host,
@@ -190,6 +232,39 @@ async def inspect_file_async(path: Path, *, original_name: str) -> InspectedAsse
     return await asyncio.to_thread(inspect_file, path, original_name=original_name)
 
 
+def inspect_generated_file(path: Path, *, original_name: str, media_type: str) -> InspectedAsset:
+    """Inspect a trusted runtime output without treating it as model input media."""
+    size = path.stat().st_size
+    normalized_media_type = media_type.strip().lower()
+    if size <= 0 or size > _MAX_GENERATED_FILE_BYTES:
+        raise AssetError("생성 파일 크기가 제한을 초과했습니다")
+    if not _MEDIA_TYPE.fullmatch(normalized_media_type):
+        raise AssetError("생성 파일 MIME 형식이 올바르지 않습니다")
+    with path.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    return InspectedAsset(
+        mime_type=normalized_media_type,
+        size_bytes=size,
+        sha256=digest,
+        metadata={},
+        original_name=_sanitized_name(original_name),
+    )
+
+
+async def inspect_generated_file_async(
+    path: Path,
+    *,
+    original_name: str,
+    media_type: str,
+) -> InspectedAsset:
+    return await asyncio.to_thread(
+        inspect_generated_file,
+        path,
+        original_name=original_name,
+        media_type=media_type,
+    )
+
+
 def _assert_scanner_host(host: str) -> None:
     """The scanner host is operator configuration, but must resolve before upload."""
     try:
@@ -232,23 +307,62 @@ def _s3_client(config: dict[str, str | int]):
         endpoint_url=str(config["endpoint"]),
         aws_access_key_id=str(config["access_key"]),
         aws_secret_access_key=str(config["secret_key"]),
-        config=Config(signature_version="s3v4", retries={"max_attempts": 2, "mode": "standard"}),
+        region_name=str(config["region"]),
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 2, "mode": "standard"},
+            s3={"addressing_style": "path"},
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
     )
 
 
-def _put_object(path: Path, *, config: dict[str, str | int], key: str, asset: InspectedAsset) -> None:
-    params: dict[str, object] = {
-        "ContentType": asset.mime_type,
-        "ServerSideEncryption": str(config["encryption"]),
-    }
+def _client_error_code(exc: ClientError) -> str:
+    error = exc.response.get("Error") if isinstance(exc.response, dict) else None
+    return str(error.get("Code") or "") if isinstance(error, dict) else ""
+
+
+def _ensure_bucket(client, bucket: str) -> None:
+    try:
+        client.head_bucket(Bucket=bucket)
+        return
+    except ClientError as exc:
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status != 404 and _client_error_code(exc) not in {"404", "NoSuchBucket", "NotFound"}:
+            raise AssetUnavailable("chat asset project bucket is unavailable") from exc
+    try:
+        client.create_bucket(Bucket=bucket)
+    except ClientError as exc:
+        if _client_error_code(exc) != "BucketAlreadyOwnedByYou":
+            raise AssetUnavailable("chat asset project bucket could not be created") from exc
+    try:
+        client.head_bucket(Bucket=bucket)
+    except ClientError as exc:
+        raise AssetUnavailable("chat asset project bucket is unavailable") from exc
+
+
+def _put_object(
+    path: Path,
+    *,
+    config: dict[str, str | int],
+    bucket: str,
+    key: str,
+    asset: InspectedAsset,
+) -> None:
+    params: dict[str, object] = {"ContentType": asset.mime_type}
+    if config["encryption"] != "none":
+        params["ServerSideEncryption"] = str(config["encryption"])
     if config["encryption"] == "aws:kms":
         params["SSEKMSKeyId"] = str(config["kms_key"])
+    client = _s3_client(config)
+    _ensure_bucket(client, bucket)
     with path.open("rb") as source:
-        _s3_client(config).upload_fileobj(source, str(config["bucket"]), key, ExtraArgs=params)
+        client.upload_fileobj(source, bucket, key, ExtraArgs=params)
 
 
-def _delete_object(*, config: dict[str, str | int], key: str) -> None:
-    _s3_client(config).delete_object(Bucket=str(config["bucket"]), Key=key)
+def _delete_object(*, config: dict[str, str | int], bucket: str, key: str) -> None:
+    _s3_client(config).delete_object(Bucket=bucket, Key=key)
 
 
 def _row(asset: ChatAsset) -> dict:
@@ -264,10 +378,16 @@ def _row(asset: ChatAsset) -> dict:
     }
 
 
-async def create_uploaded_asset(*, path: Path, original_name: str, user_id: str, project_id: str) -> dict:
+async def _store_inspected_asset(
+    *,
+    path: Path,
+    inspected: InspectedAsset,
+    user_id: str,
+    project_id: str,
+) -> dict:
     config = _asset_config()
-    inspected = await inspect_file_async(path, original_name=original_name)
     factory = _require_session_factory()
+    bucket = project_bucket_name(str(config["bucket"]), project_id)
     asset_id = str(uuid.uuid4())
     key = f"chat-assets/{asset_id}"
     row = ChatAsset(
@@ -277,6 +397,7 @@ async def create_uploaded_asset(*, path: Path, original_name: str, user_id: str,
         object_key=key,
         original_name=inspected.original_name,
         mime_type=inspected.mime_type,
+        bucket_name=bucket,
         size_bytes=inspected.size_bytes,
         sha256=inspected.sha256,
         status="uploading",
@@ -296,9 +417,8 @@ async def create_uploaded_asset(*, path: Path, original_name: str, user_id: str,
         await _set_status(asset_id, status="failed")
         raise
     try:
-        await asyncio.to_thread(_put_object, path, config=config, key=key, asset=inspected)
+        await asyncio.to_thread(_put_object, path, config=config, bucket=bucket, key=key, asset=inspected)
     except Exception as exc:
-        logger.warning("chat asset object upload failed asset_id=%s", asset_id, exc_info=True)
         await _set_status(asset_id, status="failed")
         raise AssetUnavailable("chat asset object storage is unavailable") from exc
     try:
@@ -306,6 +426,115 @@ async def create_uploaded_asset(*, path: Path, original_name: str, user_id: str,
     except Exception:
         # The object is intentionally retained for the cleanup worker if the DB transition fails.
         raise
+
+
+async def create_uploaded_asset(*, path: Path, original_name: str, user_id: str, project_id: str) -> dict:
+    inspected = await inspect_file_async(path, original_name=original_name)
+    return await _store_inspected_asset(
+        path=path,
+        inspected=inspected,
+        user_id=user_id,
+        project_id=project_id,
+    )
+
+
+async def link_output_assets_in_transaction(session, *, run, asset_ids: list[str]) -> None:
+    """Validate and attach canonical output assets inside the caller's run transaction."""
+    unique_ids = list(dict.fromkeys(asset_ids))
+    if not unique_ids:
+        return
+    rows = (
+        (await session.execute(select(ChatAsset).where(ChatAsset.id.in_(unique_ids)).with_for_update())).scalars().all()
+    )
+    by_id = {row.id: row for row in rows}
+    for asset_id in unique_ids:
+        asset = by_id.get(asset_id)
+        if (
+            asset is None
+            or asset.user_id != run.user_id
+            or asset.project_id != run.project_id
+            or asset.status != "clean"
+        ):
+            raise AssetError("tool artifact is not a clean owned asset")
+    existing = set(
+        (
+            await session.execute(
+                select(ChatRunAsset.asset_id).where(
+                    ChatRunAsset.run_id == run.id,
+                    ChatRunAsset.purpose == "output",
+                    ChatRunAsset.asset_id.in_(unique_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for asset_id in unique_ids:
+        if asset_id not in existing:
+            session.add(ChatRunAsset(run_id=run.id, asset_id=asset_id, purpose="output"))
+
+
+async def create_generated_asset(
+    *,
+    path: Path,
+    original_name: str,
+    media_type: str,
+    user_id: str,
+    project_id: str,
+    run_id: str,
+) -> dict:
+    """Ingest a locally generated file and link it to its owned durable run."""
+    inspected = await inspect_generated_file_async(
+        path,
+        original_name=original_name,
+        media_type=media_type,
+    )
+    result = await _store_inspected_asset(
+        path=path,
+        inspected=inspected,
+        user_id=user_id,
+        project_id=project_id,
+    )
+    from lumen.models.chat_runs import ChatRun
+
+    factory = _require_session_factory()
+    try:
+        async with factory() as session, session.begin():
+            run = (
+                await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())
+            ).scalar_one_or_none()
+            if run is None or run.user_id != user_id or run.project_id != project_id:
+                raise AssetError("generated asset run ownership is invalid")
+            await link_output_assets_in_transaction(session, run=run, asset_ids=[result["id"]])
+    except SQLAlchemyError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("generated chat asset을 연결하지 못했습니다") from exc
+    return result
+
+
+async def create_generated_asset_bytes(
+    *,
+    data: bytes,
+    original_name: str,
+    media_type: str,
+    user_id: str,
+    project_id: str,
+    run_id: str,
+) -> dict:
+    """Ingest bounded in-memory output from a supported remote tool adapter."""
+    if not data or len(data) > _MAX_GENERATED_FILE_BYTES:
+        raise AssetError("생성 파일 크기가 제한을 초과했습니다")
+    with tempfile.TemporaryDirectory(prefix="lumen-generated-") as directory:
+        path = Path(directory) / "payload"
+        await asyncio.to_thread(path.write_bytes, data)
+        return await create_generated_asset(
+            path=path,
+            original_name=original_name,
+            media_type=media_type,
+            user_id=user_id,
+            project_id=project_id,
+            run_id=run_id,
+        )
 
 
 async def _owned_asset(*, asset_id: str, user_id: str, project_id: str, lock: bool = False) -> ChatAsset:
@@ -373,15 +602,46 @@ async def signed_download_url(*, asset_id: str, user_id: str, project_id: str) -
     if asset.status != "clean":
         raise AssetError("asset is not available")
     config = _asset_config()
+    bucket = asset.bucket_name or str(config["bucket"])
     try:
         return await asyncio.to_thread(
             _s3_client(config).generate_presigned_url,
             "get_object",
-            Params={"Bucket": str(config["bucket"]), "Key": asset.object_key},
+            Params={"Bucket": bucket, "Key": asset.object_key},
             ExpiresIn=int(config["signed_url_ttl"]),
         )
     except Exception as exc:
         raise AssetUnavailable("chat asset object storage is unavailable") from exc
+
+
+async def open_download(*, asset_id: str, user_id: str, project_id: str) -> AssetDownload:
+    """Open an owned object for same-origin streaming through the authenticated BFF."""
+    asset = await _owned_asset(asset_id=asset_id, user_id=user_id, project_id=project_id)
+    if asset.status != "clean":
+        raise AssetError("asset is not available")
+    config = _asset_config()
+    bucket = asset.bucket_name or str(config["bucket"])
+
+    def get_object():
+        return _s3_client(config).get_object(Bucket=bucket, Key=asset.object_key)
+
+    try:
+        response = await asyncio.to_thread(get_object)
+        body = response["Body"]
+        if not callable(getattr(body, "read", None)) or not callable(getattr(body, "close", None)):
+            raise TypeError("invalid object body")
+        content_length = response.get("ContentLength")
+        if isinstance(content_length, int) and content_length != asset.size_bytes:
+            body.close()
+            raise ValueError("object size mismatch")
+    except Exception as exc:
+        raise AssetUnavailable("chat asset object storage is unavailable") from exc
+    return AssetDownload(
+        body=body,
+        name=asset.original_name,
+        mime_type=asset.mime_type,
+        size_bytes=asset.size_bytes,
+    )
 
 
 async def delete_asset(*, asset_id: str, user_id: str, project_id: str) -> dict:

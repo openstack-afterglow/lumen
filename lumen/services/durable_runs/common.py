@@ -216,6 +216,7 @@ def descriptor(run: ChatRun) -> ChatRunDescriptor:
         run_id=run.id,
         conversation_id=run.conversation_id,
         temp_thread_id=run.temp_thread_id,
+        run_kind=getattr(run, "run_kind", None) or "completion",
         status=run.status,
         events_url=f"/v1/runs/{run.id}/events",
         cancel_url=f"/v1/runs/{run.id}/cancel",

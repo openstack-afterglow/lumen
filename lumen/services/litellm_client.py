@@ -12,6 +12,7 @@ litellm 의 로컬 계산(token_counter/cost_per_token)만 쓰는 함수는 네�
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -33,6 +34,15 @@ class UsageCost:
     pricing_snapshot: dict[str, object]
 
 
+@dataclass(frozen=True)
+class ContextTokenCount:
+    """Context accounting result; ``unknown`` is never presented as zero."""
+
+    tokens: int | None
+    measurement: Literal["tokenizer", "estimated", "unknown"]
+    tokenizer: str | None = None
+
+
 def count_tokens(model: str, *, messages: list[dict] | None = None, text: str | None = None) -> int:
     """litellm.token_counter 로 토큰 수 산출. 실패 시 대략치(4 chars ≈ 1 token) 폴백."""
     try:
@@ -45,6 +55,70 @@ def count_tokens(model: str, *, messages: list[dict] | None = None, text: str | 
         logger.warning("litellm token_counter 실패 model=%s — 대략치 폴백", model, exc_info=True)
         raw = text if text is not None else "".join(str(m.get("content", "")) for m in (messages or []))
         return max(1, len(raw) // 4)
+
+
+def _contains_uncountable_modality(value: object) -> bool:
+    """Reject modalities whose provider representation cannot be measured locally."""
+    if isinstance(value, dict):
+        kind = value.get("type")
+        if kind in {"audio", "video", "file"}:
+            return True
+        return any(_contains_uncountable_modality(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_uncountable_modality(item) for item in value)
+    return False
+
+
+def _contains_multimodal(value: object) -> bool:
+    """Return true for image/provider content whose local count is only an estimate."""
+    if isinstance(value, dict):
+        if value.get("type") in {"image_url", "audio", "video", "file"}:
+            return True
+        return any(_contains_multimodal(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_multimodal(item) for item in value)
+    return False
+
+
+def count_context_tokens(model: str, messages: list[dict], tools: list[dict] | None = None) -> ContextTokenCount:
+    """Count the complete provider context without network-fetching media.
+
+    Unlike :func:`count_tokens`, this API carries measurement provenance and
+    never turns an unsupported modality into a fabricated token count.
+    """
+    tools = tools or []
+    if _contains_uncountable_modality(messages) or _contains_uncountable_modality(tools):
+        return ContextTokenCount(tokens=None, measurement="unknown")
+    multimodal = _contains_multimodal(messages) or _contains_multimodal(tools)
+    try:
+        import litellm
+
+        # True is intentional: LiteLLM otherwise performs a network GET for
+        # image URLs while counting a preview request.
+        count = int(
+            litellm.token_counter(
+                model=model,
+                messages=messages,
+                tools=tools,
+                use_default_image_token_count=True,
+            )
+        )
+        tokenizer = None
+        try:
+            optional = litellm.get_optional_params(model=model)
+            tokenizer = str(optional.get("tokenizer") or "") or None if isinstance(optional, Mapping) else None
+        except Exception:
+            tokenizer = None
+        if multimodal or tokenizer is None:
+            return ContextTokenCount(tokens=max(0, count), measurement="estimated", tokenizer=tokenizer)
+        return ContextTokenCount(tokens=max(0, count), measurement="tokenizer", tokenizer=tokenizer)
+    except Exception:
+        # Plain text can be conservatively estimated; never claim an exact
+        # count after tokenizer/provider-representation failure.
+        raw = json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False, sort_keys=True, default=str)
+        if multimodal:
+            return ContextTokenCount(tokens=None, measurement="unknown")
+        return ContextTokenCount(tokens=max(1, (len(raw) + 3) // 4), measurement="estimated")
 
 
 def _usage_field(usage: Any, key: str) -> int | None:

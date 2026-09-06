@@ -164,6 +164,14 @@ async def seed() -> None:
 
         target_input_price = os.environ.get("LUMEN_LOCAL_INPUT_PRICE_PER_MILLION", "1").strip()
         target_output_price = os.environ.get("LUMEN_LOCAL_OUTPUT_PRICE_PER_MILLION", "3").strip()
+        raw_context_limit = os.environ.get("LUMEN_LOCAL_CONTEXT_LIMIT", "").strip()
+        try:
+            local_context_limit = int(raw_context_limit) if raw_context_limit else None
+        except ValueError as exc:
+            raise RuntimeError("LUMEN_LOCAL_CONTEXT_LIMIT must be a positive integer") from exc
+        if local_context_limit is not None and local_context_limit <= 0:
+            raise RuntimeError("LUMEN_LOCAL_CONTEXT_LIMIT must be a positive integer")
+        target_capabilities = {"context_limit": local_context_limit} if local_context_limit is not None else None
 
         models = await repository.list_models(active_only=False)
         model = next(
@@ -177,19 +185,24 @@ async def seed() -> None:
                 model_name=model_name,
                 input_price_per_million=target_input_price,
                 output_price_per_million=target_output_price,
+                capabilities=target_capabilities,
             )
         else:
             in_differs = _decimal_differs(model.get("input_price_per_million"), target_input_price)
             out_differs = _decimal_differs(model.get("output_price_per_million"), target_output_price)
-
-            if in_differs or out_differs:
-                await repository.update_model(
-                    model["id"],
-                    {
-                        "input_price_per_million": target_input_price,
-                        "output_price_per_million": target_output_price,
-                    },
-                )
+            capabilities_differ = model.get("capabilities") != target_capabilities
+            if in_differs or out_differs or capabilities_differ:
+                patch: dict[str, object] = {}
+                if in_differs or out_differs:
+                    patch.update(
+                        {
+                            "input_price_per_million": target_input_price,
+                            "output_price_per_million": target_output_price,
+                        }
+                    )
+                if capabilities_differ:
+                    patch["capabilities"] = target_capabilities
+                await repository.update_model(model["id"], patch)
 
         raw_key = seed_path.read_text().strip() if seed_path.exists() else ""
         verified = await api_key_store.verify_key(raw_key) if raw_key else None

@@ -28,6 +28,13 @@ logger = logging.getLogger(__name__)
 _MAX_INJECT = 30  # 컨텍스트 주입 시 메모리 개수 상한(비용 방어)
 _SCOPES = frozenset({"account", "project", "workspace"})
 _CATEGORIES = frozenset({"interest", "development", "habit", "preference", "general"})
+_CATEGORY_HEADINGS = (
+    ("preference", "Preferences"),
+    ("development", "Development"),
+    ("habit", "Habits"),
+    ("interest", "Interests"),
+    ("general", "General"),
+)
 
 
 _FINGERPRINT_DOMAIN = b"chat_memory_content_fingerprint"
@@ -108,6 +115,45 @@ def _public(row: ChatMemory) -> dict:
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
     }
+
+
+def render_memory_markdown(memories: list[dict]) -> str:
+    """Render authorized plaintext rows without creating another persistence layer."""
+    groups: dict[str, list[dict]] = {category: [] for category, _heading in _CATEGORY_HEADINGS}
+    for memory in memories:
+        category = memory.get("category")
+        content = memory.get("content")
+        if (
+            category in groups
+            and memory.get("status") == "active"
+            and memory.get("is_active") is True
+            and isinstance(content, str)
+            and content.strip()
+        ):
+            groups[category].append(memory)
+
+    lines = ["# Memory", ""]
+    if not any(groups.values()):
+        return "# Memory\n\nNo active memories have been saved yet.\n"
+
+    for category, heading in _CATEGORY_HEADINGS:
+        entries = groups[category]
+        if not entries:
+            continue
+        lines.extend((f"## {heading}", ""))
+        for memory in sorted(
+            entries,
+            key=lambda item: (
+                str(item.get("scope") or ""),
+                int(item.get("workspace_id") or 0),
+                int(item.get("id") or 0),
+            ),
+        ):
+            content_lines = str(memory["content"]).strip().splitlines()
+            lines.append(f"- {content_lines[0].strip()}")
+            lines.extend(f"  {line.rstrip()}" for line in content_lines[1:])
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _validate_namespace(*, scope: str, project_id: str | None, workspace_id: int | None) -> None:

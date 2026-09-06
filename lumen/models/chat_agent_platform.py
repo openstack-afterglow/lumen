@@ -40,10 +40,17 @@ class ChatContextCheckpoint(Base):
     conversation_id: Mapped[str | None] = mapped_column(
         CHAR(36), ForeignKey("chat_conversations.id", ondelete="SET NULL")
     )
+    temp_thread_id: Mapped[str | None] = mapped_column(CHAR(36), ForeignKey("chat_temp_threads.id", ondelete="CASCADE"))
     source_anchor_message_id: Mapped[int | None] = mapped_column(
         BIGINT, ForeignKey("chat_messages.id", ondelete="SET NULL")
     )
     source_hashes: Mapped[list] = mapped_column(JSON, nullable=False)
+    source_message_ids: Mapped[list | None] = mapped_column(JSON)
+    source_message_count: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    previous_checkpoint_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("chat_context_checkpoints.id", ondelete="SET NULL")
+    )
+    context_metadata: Mapped[dict | None] = mapped_column(JSON)
     summary_ciphertext: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
     token_estimate: Mapped[int] = mapped_column(INT, nullable=False)
     context_limit: Mapped[int] = mapped_column(INT, nullable=False)

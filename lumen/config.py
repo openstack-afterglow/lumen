@@ -33,6 +33,7 @@ def is_development_loopback_http_url(value: str) -> bool:
         and not parsed.fragment
     )
 
+
 def _config_candidates() -> list[Path]:
     configured = os.environ.get("LUMEN_CONFIG_FILE", "").strip()
     candidates = [Path(configured)] if configured else []
@@ -139,7 +140,8 @@ class Settings(BaseSettings):
     chat_asset_s3_bucket: str = ""
     chat_asset_s3_access_key: str = ""
     chat_asset_s3_secret_key: str = ""
-    chat_asset_s3_server_side_encryption: str = "AES256"
+    chat_asset_s3_region: str = "default"
+    chat_asset_s3_server_side_encryption: str = ""
     chat_asset_s3_kms_key_id: str = ""
     chat_asset_signed_url_ttl_seconds: int = 300
     chat_clamav_host: str = ""

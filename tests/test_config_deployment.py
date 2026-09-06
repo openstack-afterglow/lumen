@@ -40,6 +40,9 @@ chat_asset_s3_endpoint = "https://s3.example.com"
 chat_asset_s3_bucket = "lumen-assets"
 chat_asset_s3_access_key = "s3-access-key"
 chat_asset_s3_secret_key = "s3-secret-key"
+chat_asset_s3_region = "default"
+chat_asset_s3_server_side_encryption = "none"
+chat_asset_s3_kms_key_id = ""
 chat_sandbox_api_key = "sandbox-api-key"
 chat_api_hosts = "api.lumen.example.com"
 chat_default_model = "gpt-4.1-mini"
@@ -63,6 +66,8 @@ chat_compat_run_timeout_seconds = 600
     assert raw["lumen_encryption_key"] == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     assert raw["chat_checkpointer_postgres_url"] == "postgresql://checkpointer:pass@postgres:5432/checkpointer_db"
     assert raw["chat_memory_pgvector_url"] == "postgresql://pgvector:pass@postgres:5432/pgvector_db"
+    assert raw["chat_asset_s3_region"] == "default"
+    assert raw["chat_asset_s3_server_side_encryption"] == "none"
     assert raw["chat_sandbox_api_key"] == "sandbox-api-key"
     assert raw["chat_api_hosts"] == "api.lumen.example.com"
     assert raw["chat_default_model"] == "gpt-4.1-mini"
@@ -76,6 +81,8 @@ chat_compat_run_timeout_seconds = 600
     assert settings.lumen_encryption_key == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     assert settings.chat_checkpointer_postgres_url == "postgresql://checkpointer:pass@postgres:5432/checkpointer_db"
     assert settings.chat_memory_pgvector_url == "postgresql://pgvector:pass@postgres:5432/pgvector_db"
+    assert settings.chat_asset_s3_region == "default"
+    assert settings.chat_asset_s3_server_side_encryption == "none"
     assert settings.chat_sandbox_api_key == "sandbox-api-key"
     assert settings.chat_api_hosts == "api.lumen.example.com"
     assert settings.chat_default_model == "gpt-4.1-mini"
@@ -96,6 +103,9 @@ def test_lumen_environment_variable_overrides(monkeypatch):
     monkeypatch.setenv("CHAT_MEMORY_PGVECTOR_URL", "postgresql://env:env@env-pg:5432/env_pv")
     monkeypatch.setenv("CHAT_ASSET_S3_ACCESS_KEY", "env-s3-ak")
     monkeypatch.setenv("CHAT_ASSET_S3_SECRET_KEY", "env-s3-sk")
+    monkeypatch.setenv("CHAT_ASSET_S3_REGION", "ceph-region")
+    monkeypatch.setenv("CHAT_ASSET_S3_SERVER_SIDE_ENCRYPTION", "aws:kms")
+    monkeypatch.setenv("CHAT_ASSET_S3_KMS_KEY_ID", "asset-key")
     monkeypatch.setenv("CHAT_SANDBOX_API_KEY", "env-sandbox-key")
     monkeypatch.setenv("CHAT_API_HOSTS", "env.lumen.example.com")
     monkeypatch.setenv("MCP_CONTROL_PLANE_URL", "https://afterglow.internal")
@@ -116,6 +126,9 @@ def test_lumen_environment_variable_overrides(monkeypatch):
     assert settings.chat_memory_pgvector_url == "postgresql://env:env@env-pg:5432/env_pv"
     assert settings.chat_asset_s3_access_key == "env-s3-ak"
     assert settings.chat_asset_s3_secret_key == "env-s3-sk"
+    assert settings.chat_asset_s3_region == "ceph-region"
+    assert settings.chat_asset_s3_server_side_encryption == "aws:kms"
+    assert settings.chat_asset_s3_kms_key_id == "asset-key"
     assert settings.chat_sandbox_api_key == "env-sandbox-key"
     assert settings.chat_api_hosts == "env.lumen.example.com"
     assert settings.mcp_control_plane_url == "https://afterglow.internal"
@@ -157,6 +170,7 @@ def test_lumen_maps_afterglow_openstack_section(monkeypatch):
     assert settings["insecure"] is True
     assert settings["os_cacert"] == "/etc/ssl/certs/keystone-ca.pem"
 
+
 def test_lumen_config_candidates_only_lumen_paths(monkeypatch):
     monkeypatch.delenv("LUMEN_CONFIG_FILE", raising=False)
     candidates = _config_candidates()
@@ -182,6 +196,7 @@ def test_get_lumen_encryption_key_strict_validation():
     s_non_hex = Settings(lumen_encryption_key="z" * 64)
     with pytest.raises(ValueError, match=r"Lumen encryption key must be exactly 64 hex characters"):
         _ = s_non_hex.get_lumen_encryption_key
+
 
 def test_chat_compat_run_timeout_seconds_bounds_validation():
     """Test chat_compat_run_timeout_seconds validator rejects outside 1..3600."""

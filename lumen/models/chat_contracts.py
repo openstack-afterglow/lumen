@@ -6,6 +6,7 @@ payloads, credentials, signed URLs, and hidden reasoning are deliberately exclud
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -498,10 +499,9 @@ class _ReasoningEffortRequest(_StrictModel):
         return value
 
 
-class CompletionRequest(_ReasoningEffortRequest):
-    """Canonical client intent; routing, pricing, and tool resolution are server snapshots."""
+class _CompletionSelectionRequest(_ReasoningEffortRequest):
+    """Selection fields shared by completion, preview, and compaction requests."""
 
-    parts: UserInputParts = Field(min_length=1, max_length=MAX_PARTS_PER_MESSAGE)
     model_id: str = Field(min_length=1, max_length=190)
     features: ChatFeatureOptions = Field(default_factory=ChatFeatureOptions)
     agent_id: str | None = Field(default=None, max_length=36)
@@ -517,7 +517,7 @@ class CompletionRequest(_ReasoningEffortRequest):
         return value
 
     @model_validator(mode="after")
-    def validate_execution_mode(self) -> CompletionRequest:
+    def validate_execution_mode(self) -> _CompletionSelectionRequest:
         if self.execution_mode == "chat" and (
             self.code_workspace_id is not None or self.features.tool_policy.workspace_write_mode != "ask"
         ):
@@ -526,10 +526,34 @@ class CompletionRequest(_ReasoningEffortRequest):
             raise ValueError("auto_edit is only available in code mode")
         return self
 
+
+class CompletionRequest(_CompletionSelectionRequest):
+    """Canonical client intent; routing, pricing, and tool resolution are server snapshots."""
+
+    parts: UserInputParts = Field(min_length=1, max_length=MAX_PARTS_PER_MESSAGE)
+
     @field_validator("parts")
     @classmethod
     def validate_parts(cls, value: UserInputParts) -> UserInputParts:
         return validate_user_input_parts([part.model_dump() for part in value])
+
+
+class ContextPreviewRequest(_CompletionSelectionRequest):
+    """Read-only context admission input, including an optional unsaved draft."""
+
+    parts: UserInputParts = Field(default_factory=list, max_length=MAX_PARTS_PER_MESSAGE)
+
+    @field_validator("parts")
+    @classmethod
+    def validate_preview_parts(cls, value: UserInputParts) -> UserInputParts:
+        # Preview permits an empty draft, unlike completion's required user input.
+        return _USER_INPUT_PARTS.validate_python([part.model_dump() for part in value])
+
+
+class CompactionRequest(_CompletionSelectionRequest):
+    """Context compaction admission input, fenced to a saved source revision."""
+
+    expected_context_revision: str = Field(min_length=1, max_length=190)
 
 
 class RegenerateRequest(_ReasoningEffortRequest):
@@ -541,6 +565,7 @@ class ChatRunDescriptor(_StrictModel):
     run_id: str = Field(min_length=1, max_length=36)
     conversation_id: str | None = Field(default=None, max_length=36)
     temp_thread_id: str | None = Field(default=None, max_length=36)
+    run_kind: Literal["completion", "compaction"] = "completion"
     status: Literal[
         "queued",
         "running",
@@ -571,6 +596,7 @@ class ChatRunResponse(_StrictModel):
     ]
     conversation_id: str | None = Field(default=None, max_length=36)
     temp_thread_id: str | None = Field(default=None, max_length=36)
+    run_kind: Literal["completion", "compaction"] = "completion"
     effective_features: dict[str, Any] = Field(default_factory=dict)
     public_history: list[dict[str, Any]] | None = None
     last_seq: int = Field(ge=0)
@@ -654,11 +680,44 @@ class UsageComponent(_StrictModel):
         return _validate_decimal_string(value, allow_negative=kind == "provider_adjustment")
 
 
+class ContextState(_StrictModel):
+    model_name: str = Field(min_length=1, max_length=190)
+    context_limit: int | None = Field(ge=1)
+    output_reserve: int = Field(ge=0)
+    safety_reserve: int = Field(ge=0)
+    input_budget: int | None = Field(ge=0)
+    input_tokens: int | None = Field(ge=0)
+    utilization: float | None = Field(ge=0)
+    measurement: Literal["tokenizer", "estimated", "unknown"]
+    recommendation: Literal["none", "compact", "required", "unavailable"]
+    can_compact: bool
+    reason_code: str | None = Field(max_length=100)
+    revision: str = Field(min_length=1, max_length=190)
+    checkpoint_id: str | None = Field(max_length=36)
+    active_compaction_run_id: str | None = Field(max_length=36)
+
+    @field_validator("utilization")
+    @classmethod
+    def validate_utilization(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("utilization must be finite")
+        return value
+
+
 class RunStartedPayload(_StrictModel):
     conversation_id: str | None = None
     temp_thread_id: str | None = None
     model_name: str = Field(min_length=1, max_length=190)
     effective_features: dict[str, Any]
+    run_kind: Literal["completion", "compaction"] = "completion"
+
+
+class ContextUpdatedPayload(_StrictModel):
+    state: ContextState
+    phase: Literal["ready", "compacting", "compacted", "failed"]
+    cause: Literal["automatic", "manual"] | None
+    before_tokens: int | None = Field(ge=0)
+    after_tokens: int | None = Field(ge=0)
 
 
 class RunStageChangedPayload(_StrictModel):
@@ -835,6 +894,11 @@ class MessageCreatedEvent(_RunEvent):
     payload: MessageCreatedPayload
 
 
+class ContextUpdatedEvent(_RunEvent):
+    type: Literal["context.updated"]
+    payload: ContextUpdatedPayload
+
+
 class PartDeltaEvent(_RunEvent):
     type: Literal["part.delta"]
     payload: PartDeltaPayload
@@ -894,6 +958,7 @@ ChatRunEvent = Annotated[
     RunStartedEvent
     | RunStageChangedEvent
     | RunWarningEvent
+    | ContextUpdatedEvent
     | MessageCreatedEvent
     | PartDeltaEvent
     | PartCompletedEvent

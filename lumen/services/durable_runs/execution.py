@@ -10,9 +10,9 @@ from typing import Any
 from sqlalchemy import select
 
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
-from lumen.models.chat_db import ChatMessage
+from lumen.models.chat_db import ChatConversation, ChatMessage, ChatUsageLog
 from lumen.models.chat_runs import ChatRun, ChatRunSegment, ChatRunTurn, ChatTempThread
-from lumen.services import assets, credit, engine, extensions_store
+from lumen.services import assets, context_manager, context_store, credit, engine, extensions_store, litellm_client
 from lumen.services import conversation_store as cs
 from lumen.services.litellm_client import UsageCost
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
@@ -163,6 +163,18 @@ async def _finish(
 ) -> None:
     factory = _factory()
     async with factory() as session, session.begin():
+        # Lock parent conversation/temp row first, then run row.
+        unlocked_run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id))).scalar_one_or_none()
+        if unlocked_run is None:
+            return
+        if unlocked_run.conversation_id is not None:
+            await session.execute(
+                select(ChatConversation.id).where(ChatConversation.id == unlocked_run.conversation_id).with_for_update()
+            )
+        elif unlocked_run.temp_thread_id is not None:
+            await session.execute(
+                select(ChatTempThread.id).where(ChatTempThread.id == unlocked_run.temp_thread_id).with_for_update()
+            )
         run = (
             await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())
         ).scalar_one_or_none()
@@ -300,7 +312,17 @@ async def _finish(
                 memory_enabled = isinstance(features, dict) and features.get("memory") is True
             except DurableRunError:
                 logger.warning("completed chat run has unreadable memory feature setting run_id=%s", run.id)
-        await enqueue_completed_run_in_transaction(session, run, memory_enabled=memory_enabled)
+        if getattr(run, "run_kind", "completion") == "completion":
+            await enqueue_completed_run_in_transaction(session, run, memory_enabled=memory_enabled)
+            if (
+                status == "completed"
+                and run.run_scope == "persistent"
+                and run.parent_run_id is None
+                and run.conversation_id is not None
+            ):
+                from lumen.services import title_jobs
+
+                await title_jobs.enqueue_completed_run_in_transaction(session, run)
         event_type = {"completed": "run.completed", "failed": "run.failed", "canceled": "run.canceled"}[status]
         payload: dict[str, Any] = {"status": status, "message_id": message_id}
         if status != "completed":
@@ -317,7 +339,10 @@ class _DurableExecutionHooks:
         self.run_id = run_id
         self.owner = owner
         self.active_turn_ordinal: int | None = None
+        self.force_compaction = False
         self.active_message_id: str | None = None
+        self._conversation_id: str | None = None
+        self._temp_thread_id: str | None = None
 
     async def loaded_tool_names(self) -> list[str]:
         """Restore completed deferred bindings after restart or approval resume."""
@@ -350,6 +375,561 @@ class _DurableExecutionHooks:
                     if isinstance(name, str) and name not in loaded:
                         loaded.append(name)
             return loaded
+
+    async def _record_summary_usage(
+        self,
+        *,
+        segment_id: str,
+        usage_payload: dict[str, Any],
+        route: dict[str, Any],
+    ) -> None:
+        """Record one observed summary call with a stable, replay-safe ledger key."""
+        try:
+            prompt_tokens = max(0, int(usage_payload.get("prompt_tokens") or 0))
+            completion_tokens = max(0, int(usage_payload.get("completion_tokens") or 0))
+        except (TypeError, ValueError) as exc:
+            raise DurableRunError("context compaction usage is invalid") from exc
+        factory = _factory()
+        async with factory() as session, session.begin():
+            run = (
+                await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())
+            ).scalar_one()
+            _require_owned_running_lease(run, self.owner)
+            event_id = f"context:{run.id}:{segment_id}"
+            existing = (
+                await session.execute(select(ChatUsageLog.id).where(ChatUsageLog.event_id == event_id).limit(1))
+            ).scalar_one_or_none()
+            if existing is not None:
+                return
+            root_pricing = run.pricing_snapshot if isinstance(run.pricing_snapshot, dict) else {}
+            summary_pricing = root_pricing.get("summary_route")
+            summary_pricing = summary_pricing if isinstance(summary_pricing, dict) else {}
+            pricing = {
+                "input_price_per_token": summary_pricing.get(
+                    "input_price_per_token", route.get("input_price_per_token")
+                ),
+                "output_price_per_token": summary_pricing.get(
+                    "output_price_per_token", route.get("output_price_per_token")
+                ),
+                "price_source": summary_pricing.get("price_source"),
+                "price_version": summary_pricing.get("price_version"),
+            }
+            if pricing["input_price_per_token"] is None or pricing["output_price_per_token"] is None:
+                raise DurableRunError("context compaction pricing is unavailable")
+            usage_cost = credit.usage_cost_from_pricing_snapshot(
+                pricing,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+            components = []
+            for kind, quantity, cost in (
+                ("input_tokens", prompt_tokens, usage_cost.input_cost),
+                ("output_tokens", completion_tokens, usage_cost.output_cost),
+            ):
+                unit_price = cost / quantity if quantity else Decimal("0")
+                components.append(
+                    {
+                        "segment_id": segment_id,
+                        "kind": kind,
+                        "quantity": str(quantity),
+                        "unit": "token",
+                        "unit_price_usd": format(unit_price, "f"),
+                        "cost_usd": format(cost, "f"),
+                        "source": "system",
+                        "model_name": route.get("model_name") or run.model_name,
+                        "metadata": {"operation": "context_compaction"},
+                    }
+                )
+            await credit.apply_usage_in_transaction(
+                session,
+                event_id=event_id,
+                user_id=run.user_id,
+                project_id=run.project_id,
+                model_name=str(route.get("model_name") or run.model_name),
+                provider=route.get("provider_name"),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                usage_cost=usage_cost,
+                margin_multiplier=root_pricing.get("margin_multiplier", "1"),
+                credit_per_usd=root_pricing.get("chat_credit_per_usd"),
+                conversation_id=run.conversation_id,
+                source="system",
+                api_key_id=getattr(run, "api_key_id", None),
+                run_id=str(run.id),
+                charge_wallet=False,
+                usage_components=components,
+            )
+
+    async def _summary_compactor(
+        self,
+        chunks: list[str],
+        *,
+        context: dict[str, Any],
+        route: dict[str, Any],
+        run_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute one fenced summary call, replaying only completed results."""
+        round_index = int(context.get("round", 0))
+        chunk_index = int(context.get("chunk_index", 0))
+        reduce_round = round_index if context.get("phase") == "reduce" else 0
+        ordinal = 100 + round_index * 64 + chunk_index * 4 + reduce_round
+        phase = "reduce" if context.get("phase") == "reduce" else "map"
+        segment_id = f"context:{round_index}:{chunk_index}:{phase}"
+        if await _cancel_requested(self.run_id):
+            raise DurableRunError("context compaction canceled")
+
+        factory = _factory()
+        async with factory() as session:
+            run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id))).scalar_one()
+            await credit.precheck(run.user_id, run.project_id, api_key_id=getattr(run, "api_key_id", None))
+        started = await self._start(
+            segment_id=segment_id,
+            ordinal=ordinal,
+            endpoint="context_compaction",
+            turn_ordinal=round_index,
+        )
+        usage_payload: dict[str, Any] = {}
+        if isinstance(started, dict):
+            payload = started
+            if payload.get("_boundary_abort"):
+                raise DurableRunProviderResultUnknown("context compaction result is indeterminate")
+            usage = payload.pop("_durable_usage", None)
+            if isinstance(usage, dict):
+                usage_payload = usage
+            if isinstance(payload.get("summary"), str) and isinstance(payload.get("title"), str):
+                await self._record_summary_usage(
+                    segment_id=segment_id,
+                    usage_payload=usage_payload,
+                    route=route,
+                )
+                payload.pop("_durable_replay", None)
+                return payload
+            raise DurableRunError("completed context segment has invalid result")
+        if await _cancel_requested(self.run_id):
+            raise DurableRunError("context compaction canceled")
+
+        # provider credentials immediately after the write-ahead fence and
+        # never place the resolved secret in a durable payload.
+        resolved_route = await ps.resolve_model_snapshot(route)
+        if resolved_route is None:
+            await self._fail(
+                segment_id=segment_id,
+                ordinal=ordinal,
+                endpoint="context_compaction",
+                turn_ordinal=round_index,
+            )
+            raise DurableRunError("context compaction route is unavailable")
+        summary_run_context = context.get("run_context")
+        summary_run_context = summary_run_context if isinstance(summary_run_context, dict) else {}
+        system_prompt = str(summary_run_context.get("summary_system_prompt") or context_manager._SUMMARY_SYSTEM)
+        messages = context.get("summary_messages")
+        if not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
+            messages = context_manager._summary_messages(chunks, system_prompt=system_prompt)
+        segment_completed = False
+        try:
+            response = await litellm_client.acompletion(
+                model=resolved_route["model_name"],
+                messages=messages,
+                api_base=resolved_route.get("api_base"),
+                api_key=resolved_route.get("api_key"),
+                custom_llm_provider=resolved_route.get("provider_type"),
+                max_tokens=min(4096, int(run_context.get("summary_output_reserve") or 512)),
+                temperature=0,
+                extra={"response_format": {"type": "json_object"}},
+            )
+            choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+            first = choices[0] if choices else None
+            message = first.get("message") if isinstance(first, dict) else getattr(first, "message", None)
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+            parsed = json.loads(content) if isinstance(content, str) else None
+            if (
+                not isinstance(parsed, dict)
+                or set(parsed) != {"summary", "title"}
+                or not isinstance(parsed["summary"], str)
+                or not isinstance(parsed["title"], str)
+                or not parsed["summary"]
+                or len(parsed["summary"]) > 16_000
+                or len(parsed["title"]) > 80
+            ):
+                raise DurableRunError("context compaction result is invalid")
+            usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+            usage_payload = {
+                "prompt_tokens": int(usage.get("prompt_tokens", 0))
+                if isinstance(usage, dict)
+                else int(getattr(usage, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("completion_tokens", 0))
+                if isinstance(usage, dict)
+                else int(getattr(usage, "completion_tokens", 0) or 0),
+            }
+            await self._complete(
+                segment_id=segment_id,
+                ordinal=ordinal,
+                endpoint="context_compaction",
+                turn_ordinal=round_index,
+                result_payload=parsed,
+                usage_payload=usage_payload,
+            )
+            segment_completed = True
+            await self._record_summary_usage(
+                segment_id=segment_id,
+                usage_payload=usage_payload,
+                route=resolved_route,
+            )
+            return {**parsed, "usage": usage_payload}
+        except BaseException:
+            if not segment_completed:
+                await self._fail(
+                    segment_id=segment_id,
+                    ordinal=ordinal,
+                    endpoint="context_compaction",
+                    turn_ordinal=round_index,
+                )
+            raise
+
+    async def _persist_context_result(
+        self,
+        *,
+        prepared: context_manager.PreparedContext,
+        source: dict[str, Any],
+        tool_schemas: list[dict[str, Any]],
+        model_name: str,
+        context_limit: int,
+        output_reserve: int,
+        revision: str,
+        cause: str,
+    ) -> None:
+        """Atomically apply checkpoint, title, and the public context event."""
+        if not prepared.compacted or not prepared.summary:
+            return
+        prefix_n = len(prepared.source_hashes)
+        raw_ids = source.get("message_ids")
+        if isinstance(raw_ids, list):
+            source_ids = tuple(str(item) for item in raw_ids[:prefix_n])
+        else:
+            source_ids = tuple(prepared.source_message_ids)
+        source_hashes = tuple(prepared.source_hashes)
+        if not source_ids or len(source_ids) != len(source_hashes):
+            raise DurableRunError("context compaction provenance is unavailable")
+        metadata = {
+            "version": 1,
+            "projection_version": 1,
+            "scope": "conversation",
+            "source_revision": revision,
+            "model_name": model_name,
+            "tokenizer": prepared.measurement,
+            "tool_schema_hash": source.get("tool_schema_hash"),
+            "input_budget": prepared.input_budget,
+            "before_tokens": prepared.before_tokens,
+            "after_tokens": prepared.after_tokens,
+            "cause": cause,
+            "active_leaf_id": source.get("active_leaf_id"),
+        }
+        factory = _factory()
+        async with factory() as session, session.begin():
+            # Parent scope is locked before the run, matching admission/_finish.
+            parent = None
+            if self._conversation_id is not None:
+                parent = (
+                    await session.execute(
+                        select(ChatConversation).where(ChatConversation.id == self._conversation_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+            elif self._temp_thread_id is not None:
+                parent = (
+                    await session.execute(
+                        select(ChatTempThread).where(ChatTempThread.id == self._temp_thread_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+            run = (
+                await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())
+            ).scalar_one()
+            _require_owned_running_lease(run, self.owner)
+            if parent is None:
+                raise DurableRunError("context compaction parent is unavailable")
+            if run.conversation_id is not None:
+                metadata["scope"] = "conversation"
+            else:
+                metadata["scope"] = "temp"
+            checkpoint = await context_store.persist_context_checkpoint(
+                session,
+                run=run,
+                source=source,
+                summary=prepared.summary,
+                source_message_ids=source_ids,
+                source_hashes=source_hashes,
+                token_estimate=prepared.after_tokens,
+                context_limit=context_limit,
+                context_metadata=metadata,
+            )
+            if run.conversation_id is not None and prepared.title and parent.title_source != "explicit":
+                parent.title = encrypt_chat_content(prepared.title)
+                parent.title_source = "auto"
+                parent.title_status = "ready"
+                parent.title_revision = int(parent.title_revision or 0) + 1
+            state = context_manager.context_state(
+                prepared.messages,
+                tool_schemas,
+                model_name=model_name,
+                context_limit=context_limit,
+                output_reserve=output_reserve,
+                revision=revision,
+                checkpoint_id=str(checkpoint.id),
+            )
+            await append_event(
+                session,
+                run,
+                _event(
+                    run,
+                    "context.updated",
+                    {
+                        "state": state.model_dump(mode="json"),
+                        "phase": "compacted",
+                        "cause": cause,
+                        "before_tokens": prepared.before_tokens,
+                        "after_tokens": prepared.after_tokens,
+                    },
+                ),
+            )
+
+    async def prepare_context(
+        self,
+        *,
+        messages: list[dict],
+        tool_schemas: list[dict],
+        round_index: int,
+    ) -> list[dict]:
+        """Apply the same budget fence before every provider call."""
+        factory = _factory()
+        async with factory() as session:
+            run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id))).scalar_one()
+            self._conversation_id = run.conversation_id
+            self._temp_thread_id = run.temp_thread_id
+            payload = _payload(run)
+            capabilities = run.capability_snapshot if isinstance(run.capability_snapshot, dict) else {}
+            route_capabilities = capabilities.get("capabilities")
+            route_capabilities = route_capabilities if isinstance(route_capabilities, dict) else capabilities
+            context_limit = route_capabilities.get("context_limit")
+            try:
+                context_limit = int(context_limit) if context_limit is not None else None
+            except (TypeError, ValueError):
+                context_limit = None
+            output_reserve = int(payload.get("max_tokens") or 4096)
+            source = payload.get("context_source") if isinstance(payload.get("context_source"), dict) else {}
+            revision = str(source.get("revision") or f"run:{self.run_id}")
+            state = context_manager.context_state(
+                messages,
+                tool_schemas,
+                model_name=run.model_name,
+                context_limit=context_limit,
+                output_reserve=output_reserve,
+                revision=revision,
+            )
+        if state.measurement == "unknown" or state.input_budget is None:
+            await _append(
+                self.run_id,
+                "run.warning",
+                {
+                    "code": "context_budget_unavailable",
+                    "safe_message": "Context budget is unavailable; automatic compaction was skipped.",
+                },
+                owner=self.owner,
+            )
+            return messages
+        if state.recommendation != "required" and not self.force_compaction:
+            return messages
+        if self._conversation_id is None and self._temp_thread_id is None:
+            if state.input_tokens is None or state.input_tokens > state.input_budget:
+                raise context_manager.ContextLimitExceeded("context_limit_exceeded")
+            return messages
+        route = capabilities.get("summary_route")
+        if not isinstance(route, dict):
+            route = capabilities
+        summary_context_limit: int | None = None
+        if isinstance(route, dict) and route.get("model_name"):
+            try:
+                candidate_limit = route.get("context_limit")
+                summary_context_limit = int(candidate_limit) if candidate_limit is not None else None
+            except (TypeError, ValueError):
+                summary_context_limit = None
+        if summary_context_limit is None or summary_context_limit <= 0:
+            if self.force_compaction:
+                raise context_manager.ContextLimitExceeded(
+                    "context_budget_unavailable", code="context_budget_unavailable"
+                )
+            await _append(
+                self.run_id,
+                "run.warning",
+                {
+                    "code": "context_budget_unavailable",
+                    "safe_message": "Summary context budget is unavailable; automatic compaction was skipped.",
+                },
+                owner=self.owner,
+            )
+            return messages
+        summary_model_name = str(route["model_name"])
+        await _append(
+            self.run_id,
+            "context.updated",
+            {
+                "state": state.model_copy(update={"active_compaction_run_id": self.run_id}).model_dump(mode="json"),
+                "phase": "compacting",
+                "cause": "manual" if self.force_compaction else "automatic",
+                "before_tokens": state.input_tokens,
+                "after_tokens": None,
+            },
+            owner=self.owner,
+        )
+        checkpoint = source.get("checkpoint") if isinstance(source.get("checkpoint"), dict) else {}
+        previous_summary = checkpoint.get("summary") if isinstance(checkpoint.get("summary"), str) else ""
+        checkpoint_raw_prefix_count = (
+            len(checkpoint.get("source_message_ids"))
+            if isinstance(checkpoint.get("source_message_ids"), list)
+            else None
+        )
+
+        async def compact(chunks: list[str], context: dict[str, Any]) -> dict[str, Any]:
+            return await self._summary_compactor(
+                chunks,
+                context=context,
+                route=route,
+                run_context={
+                    "summary_context_limit": summary_context_limit,
+                    "summary_output_reserve": 512,
+                    "summary_token_counter": lambda current, tools: litellm_client.count_context_tokens(
+                        summary_model_name, current, tools
+                    ),
+                    "previous_summary": previous_summary,
+                    "stored_messages": source.get("messages"),
+                    "source_message_ids": source.get("message_ids"),
+                    "source_hashes": source.get("source_hashes"),
+                    "checkpoint_raw_prefix_count": checkpoint_raw_prefix_count,
+                    "summary_projection_count": 1,
+                },
+            )
+
+        try:
+            prepared = await context_manager.prepare_model_messages(
+                messages,
+                tool_schemas,
+                context_limit,
+                output_reserve,
+                {
+                    "summary_context_limit": summary_context_limit,
+                    "summary_output_reserve": 512,
+                    "summary_token_counter": lambda current, tools: litellm_client.count_context_tokens(
+                        summary_model_name, current, tools
+                    ),
+                    "force_compaction": self.force_compaction,
+                    "previous_summary": previous_summary,
+                    "stored_messages": source.get("messages"),
+                    "source_message_ids": source.get("message_ids"),
+                    "source_hashes": source.get("source_hashes"),
+                    "checkpoint_raw_prefix_count": checkpoint_raw_prefix_count,
+                    "summary_projection_count": 1,
+                },
+                token_counter=lambda current, tools: (
+                    context_manager._count_result(
+                        current, tools, lambda m, t: litellm_client.count_context_tokens(run.model_name, m, t)
+                    )[0]
+                    or 0
+                ),
+                compactor=compact,
+            )
+        except context_manager.ContextLimitExceeded:
+            # Automatic compaction may continue once with the unchanged input
+            # only when it is still within budget; known overflow fails closed.
+            if (
+                not self.force_compaction
+                and state.input_budget is not None
+                and state.input_tokens is not None
+                and state.input_tokens <= state.input_budget
+            ):
+                await _append(
+                    self.run_id,
+                    "context.updated",
+                    {
+                        "state": state.model_dump(mode="json"),
+                        "phase": "failed",
+                        "cause": "automatic",
+                        "before_tokens": state.input_tokens,
+                        "after_tokens": state.input_tokens,
+                    },
+                    owner=self.owner,
+                )
+                return messages
+            try:
+                await _append(
+                    self.run_id,
+                    "context.updated",
+                    {
+                        "state": state.model_dump(mode="json"),
+                        "phase": "failed",
+                        "cause": "manual" if self.force_compaction else "automatic",
+                        "before_tokens": state.input_tokens,
+                        "after_tokens": None,
+                    },
+                    owner=self.owner,
+                )
+            except Exception:
+                logger.exception("failed to persist context failure event run_id=%s", self.run_id)
+            raise
+        except Exception as exc:
+            if (
+                not self.force_compaction
+                and state.input_budget is not None
+                and state.input_tokens is not None
+                and state.input_tokens <= state.input_budget
+            ):
+                try:
+                    await _append(
+                        self.run_id,
+                        "context.updated",
+                        {
+                            "state": state.model_dump(mode="json"),
+                            "phase": "failed",
+                            "cause": "automatic",
+                            "before_tokens": state.input_tokens,
+                            "after_tokens": state.input_tokens,
+                        },
+                        owner=self.owner,
+                    )
+                except Exception:
+                    logger.exception("failed to persist context failure event run_id=%s", self.run_id)
+                return messages
+            try:
+                await _append(
+                    self.run_id,
+                    "context.updated",
+                    {
+                        "state": state.model_dump(mode="json"),
+                        "phase": "failed",
+                        "cause": "manual" if self.force_compaction else "automatic",
+                        "before_tokens": state.input_tokens,
+                        "after_tokens": None,
+                    },
+                    owner=self.owner,
+                )
+            except Exception:
+                logger.exception("failed to persist context failure event run_id=%s", self.run_id)
+            if (
+                not self.force_compaction
+                and state.input_budget is not None
+                and state.input_tokens is not None
+                and state.input_tokens > state.input_budget
+            ):
+                raise context_manager.ContextLimitExceeded("context_limit_exceeded") from exc
+            raise
+        await self._persist_context_result(
+            prepared=prepared,
+            source=source,
+            tool_schemas=tool_schemas,
+            model_name=run.model_name,
+            context_limit=context_limit,
+            output_reserve=output_reserve,
+            revision=revision,
+            cause="manual" if self.force_compaction else "automatic",
+        )
+        return prepared.messages
 
     async def _ensure_provider_turn(self, session, run: ChatRun, turn_ordinal: int) -> None:
         turn = (
@@ -459,7 +1039,12 @@ class _DurableExecutionHooks:
                 payload = load_segment_payload(segment.result_payload)
                 if payload is None:
                     raise DurableRunError("completed segment is missing its replay payload")
-                return {**payload, "_durable_replay": True}
+                usage = load_segment_payload(segment.usage_payload)
+                return {
+                    **payload,
+                    "_durable_replay": True,
+                    "_durable_usage": usage if isinstance(usage, dict) else {},
+                }
             if segment.status == "provider_started":
                 fail_unresolved_segment(segment, error_code="provider_result_unknown")
                 return {"_boundary_abort": "provider_result_unknown"}
@@ -483,6 +1068,7 @@ class _DurableExecutionHooks:
         usage_payload: dict[str, Any] | None = None,
         call_id: str | None = None,
         journal_completed: tuple[str, dict[str, Any]] | None = None,
+        output_asset_ids: list[str] | None = None,
     ) -> None:
         factory = _factory()
         async with factory() as session, session.begin():
@@ -501,6 +1087,12 @@ class _DurableExecutionHooks:
             )
             if segment.status == "completed":
                 return
+            if output_asset_ids:
+                await assets.link_output_assets_in_transaction(
+                    session,
+                    run=run,
+                    asset_ids=output_asset_ids,
+                )
             complete_segment_io(segment, result_payload=result_payload, usage_payload=usage_payload)
             if journal_completed is not None:
                 event_type, payload = journal_completed
@@ -632,6 +1224,16 @@ class _DurableExecutionHooks:
         status = _tool_result_status(result_payload.get("status"))
         error_code = _tool_result_error_code(result_payload.get("error_code"))
         display_parts = _tool_display_parts(result_payload, content=content, visible=visible)
+        raw_artifacts = result_payload.get("artifacts")
+        output_asset_ids = (
+            [
+                artifact["asset_id"]
+                for artifact in raw_artifacts
+                if isinstance(artifact, dict) and isinstance(artifact.get("asset_id"), str)
+            ]
+            if isinstance(raw_artifacts, list)
+            else []
+        )
         await self._complete(
             segment_id=f"tool:{round_index}:{tool_index}",
             ordinal=round_index * 1_000 + 500 + tool_index,
@@ -651,6 +1253,7 @@ class _DurableExecutionHooks:
                     "error_code": error_code,
                 },
             ),
+            output_asset_ids=output_asset_ids,
         )
 
     async def tool_failed(
@@ -822,6 +1425,105 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
         pricing_snapshot = run.pricing_snapshot
         existing_message_id = run.assistant_message_id
 
+    if getattr(run, "run_kind", "completion") == "compaction":
+        input_messages = [dict(m) for m in (payload.get("input_messages") or [])]
+        raw_tool_schemas = payload.get("tool_schemas")
+        if not isinstance(raw_tool_schemas, list) or not all(isinstance(schema, dict) for schema in raw_tool_schemas):
+            raise DurableRunError("context compaction tool schema snapshot is unavailable")
+        tool_schemas = [dict(schema) for schema in raw_tool_schemas]
+        # Compaction is a real durable run: keep renewing its lease and honor
+        # cancellation while map/reduce provider calls are in flight.
+        heartbeat_stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+
+        async def heartbeat() -> None:
+            while True:
+                try:
+                    await asyncio.wait_for(heartbeat_stop.wait(), timeout=10)
+                    return
+                except TimeoutError:
+                    try:
+                        renewed = await _renew_lease(run_id, owner)
+                    except Exception:
+                        logger.exception("durable compaction lease renewal failed run_id=%s owner=%s", run_id, owner)
+                        renewed = False
+                    if not renewed:
+                        lease_lost.set()
+                        return
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        hooks = _DurableExecutionHooks(run_id=run_id, owner=owner)
+        hooks.force_compaction = True
+        try:
+            await _set_stage(run_id, "model_request", owner=owner)
+            await hooks.prepare_context(messages=input_messages, tool_schemas=tool_schemas, round_index=0)
+            if lease_lost.is_set():
+                raise DurableRunLeaseLost(f"lease lost for {run_id}")
+            if await _cancel_requested(run_id):
+                await _finish(
+                    run_id,
+                    status="canceled",
+                    message_id=None,
+                    owner=owner,
+                    error_code="canceled",
+                    safe_message="chat run canceled",
+                )
+            else:
+                await _finish(run_id, status="completed", message_id=None, owner=owner)
+        except DurableRunLeaseLost:
+            logger.warning("stopped stale durable compaction run_id=%s owner=%s", run_id, owner)
+        except asyncio.CancelledError:
+            raise
+        except context_manager.ContextLimitExceeded as exc:
+            logger.warning(
+                "durable compaction rejected run_id=%s code=%s",
+                run_id,
+                getattr(exc, "code", "compaction_failed"),
+            )
+            if await _cancel_requested(run_id):
+                await _finish(
+                    run_id,
+                    status="canceled",
+                    message_id=None,
+                    owner=owner,
+                    error_code="canceled",
+                    safe_message="chat run canceled",
+                )
+            else:
+                await _finish(
+                    run_id,
+                    status="failed",
+                    message_id=None,
+                    owner=owner,
+                    error_code=getattr(exc, "code", "compaction_failed"),
+                    safe_message="컨텍스트 압축을 완료하지 못했습니다",
+                )
+        except Exception:
+            logger.exception("manual compaction failed run_id=%s", run_id)
+            if await _cancel_requested(run_id):
+                await _finish(
+                    run_id,
+                    status="canceled",
+                    message_id=None,
+                    owner=owner,
+                    error_code="canceled",
+                    safe_message="chat run canceled",
+                )
+            else:
+                await _finish(
+                    run_id,
+                    status="failed",
+                    message_id=None,
+                    owner=owner,
+                    error_code="compaction_failed",
+                    safe_message="컨텍스트 압축을 완료하지 못했습니다",
+                )
+        finally:
+            heartbeat_stop.set()
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        return True
+
     if conversation_id is not None and existing_message_id is not None:
         # The provider boundary selects the replay turn; never route it through
         # the run's latest assistant message before that boundary runs.
@@ -883,13 +1585,13 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
     text: list[str] = []
     reasoning: list[str] = []
     pending_deltas: dict[str, list[str]] = {"text": [], "reasoning": []}
-    last_delta_flush_at = monotonic()
+    pending_first_at: float | None = None
 
     async def flush_deltas(*, check_cancel: bool = True) -> bool:
         """Persist bounded delta batches without stalling upstream chunk consumption."""
         if lease_lost.is_set():
             raise DurableRunLeaseLost(f"lease lost for {run_id}")
-        nonlocal last_delta_flush_at
+        nonlocal pending_first_at
         if check_cancel and await _cancel_requested(run_id):
             await _finish(
                 run_id,
@@ -918,7 +1620,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
                 {"message_id": message_id, "part_index": part_index, "part_type": part_type, "delta": delta},
                 owner=owner,
             )
-        last_delta_flush_at = monotonic()
+        pending_first_at = None
         return False
 
     async def finalize_current_turn() -> None:
@@ -998,6 +1700,10 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             raise DurableRunLeaseLost(f"lease lost for {run_id}")
 
     response_writing = False
+    engine_iterator = None
+    next_event_task = None
+    lease_lost_wait_task = None
+    deadline_task = None
 
     async def mark_response_writing() -> None:
         nonlocal response_writing
@@ -1070,17 +1776,18 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
         hydrated_turn_ordinal: int | None = None
 
         async def hydrate_replayed_turn() -> None:
-            nonlocal hydrated_turn_ordinal, text, reasoning, pending_deltas, last_delta_flush_at
+            nonlocal hydrated_turn_ordinal, text, reasoning, pending_deltas, pending_first_at
             if execution_hooks.active_turn_ordinal == hydrated_turn_ordinal:
                 return
             projection = await execution_hooks.replay_turn_projection()
             text = [projection["text"]] if projection["text"] else []
             reasoning = [projection["reasoning"]] if projection["reasoning"] else []
             pending_deltas = {"text": [], "reasoning": []}
-            last_delta_flush_at = monotonic()
+            pending_first_at = None
             hydrated_turn_ordinal = execution_hooks.active_turn_ordinal
 
-        async for event in engine.stream(
+        await credit.precheck(user_id, project_id, api_key_id=getattr(run, "api_key_id", None))
+        engine_iterator = engine.stream(
             model=resolved["model_name"],
             max_tool_calls=int(payload.get("v2_max_tool_calls", _V2_DEFAULT_MAX_TOOL_CALLS)),
             max_model_turns=int(payload.get("v2_max_model_turns", _V2_DEFAULT_MAX_MODEL_TURNS)),
@@ -1111,7 +1818,39 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             approval_mode=approval_mode if isinstance(approval_mode, str) else None,
             workspace_write_mode=workspace_write_mode,
             resume=resume,
-        ):
+        ).__aiter__()
+        next_event_task = asyncio.create_task(anext(engine_iterator))
+        lease_lost_wait_task = asyncio.create_task(lease_lost.wait())
+        deadline_task = None
+        while True:
+            ensure_lease()
+            wait_tasks = {next_event_task, lease_lost_wait_task}
+            if pending_first_at is not None:
+                # Use an explicit timer task instead of asyncio.wait's timeout.
+                # This keeps the flush deadline observable even when the
+                # iterator is paused inside provider I/O.
+                remaining = max(0.0, pending_first_at + 0.05 - monotonic())
+                deadline_task = asyncio.create_task(asyncio.sleep(remaining))
+                wait_tasks.add(deadline_task)
+            done, _ = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+            deadline_fired = deadline_task is not None and deadline_task in done
+            if deadline_task is not None and deadline_task not in done:
+                deadline_task.cancel()
+                await asyncio.gather(deadline_task, return_exceptions=True)
+            deadline_task = None
+            if lease_lost_wait_task in done:
+                raise DurableRunLeaseLost(f"lease lost for {run_id}")
+            if deadline_fired and next_event_task not in done:
+                if await flush_deltas():
+                    return True
+                continue
+            try:
+                event = next_event_task.result()
+            except StopAsyncIteration:
+                if await flush_deltas():
+                    return True
+                break
+            next_event_task = asyncio.create_task(anext(engine_iterator))
             ensure_lease()
             active_message_id = execution_hooks.active_message_id
             if active_message_id is not None and active_message_id != message_id:
@@ -1123,6 +1862,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
                 text = []
                 reasoning = []
                 pending_deltas = {"text": [], "reasoning": []}
+                pending_first_at = None
                 hydrated_turn_ordinal = None
                 response_writing = False
             is_durable_replay = event.get("_durable_replay") is True
@@ -1141,6 +1881,8 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
                         raise DurableRunError("provider replay does not extend the committed text projection")
                     token = token[len(existing) :]
                 if token:
+                    if pending_first_at is None:
+                        pending_first_at = monotonic()
                     pending_deltas["text"].append(token)
             elif etype == "reasoning" and event.get("text"):
                 await mark_response_writing()
@@ -1151,6 +1893,8 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
                         raise DurableRunError("provider replay does not extend the committed reasoning projection")
                     reasoning_delta = reasoning_delta[len(existing) :]
                 if reasoning_delta:
+                    if pending_first_at is None:
+                        pending_first_at = monotonic()
                     pending_deltas["reasoning"].append(reasoning_delta)
             else:
                 if await flush_deltas():
@@ -1247,6 +1991,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
                         tool_results.clear()
                         reasoning = []
                         pending_deltas = {"text": [], "reasoning": []}
+                        pending_first_at = None
                         message_id = None
                     await _set_stage(run_id, "model_request", owner=owner)
                     awaiting_model_response = True
@@ -1309,8 +2054,8 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
 
             if (
                 sum(len(chunk) for chunks in pending_deltas.values() for chunk in chunks) >= 128
-                or monotonic() - last_delta_flush_at >= 0.1
-            ) and await flush_deltas():
+                and await flush_deltas()
+            ):
                 return True
 
         if await flush_deltas():
@@ -1455,6 +2200,15 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             error_code="execution_protocol_mismatch",
             safe_message="chat run execution protocol is unavailable",
         )
+    except context_manager.ContextLimitExceeded as exc:
+        await _finish(
+            run_id,
+            status="failed",
+            message_id=message_id,
+            owner=owner,
+            error_code=getattr(exc, "code", "context_limit_exceeded"),
+            safe_message="context input exceeds the configured limit",
+        )
     except Exception:
         try:
             await flush_deltas(check_cancel=False)
@@ -1470,6 +2224,20 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             safe_message="chat provider failed",
         )
     finally:
+        if deadline_task is not None:
+            deadline_task.cancel()
+            await asyncio.gather(deadline_task, return_exceptions=True)
+        if next_event_task is not None:
+            if not next_event_task.done():
+                next_event_task.cancel()
+            await asyncio.gather(next_event_task, return_exceptions=True)
+        if engine_iterator is not None:
+            close_iterator = getattr(engine_iterator, "aclose", None)
+            if close_iterator is not None:
+                await close_iterator()
+        if lease_lost_wait_task is not None:
+            lease_lost_wait_task.cancel()
+            await asyncio.gather(lease_lost_wait_task, return_exceptions=True)
         heartbeat_stop.set()
         heartbeat_task.cancel()
         await asyncio.gather(heartbeat_task, return_exceptions=True)

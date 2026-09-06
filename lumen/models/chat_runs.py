@@ -22,6 +22,7 @@ class ChatRun(Base):
 
     id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
     run_scope: Mapped[str] = mapped_column(VARCHAR(20), nullable=False)
+    run_kind: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="completion")
     conversation_id: Mapped[str | None] = mapped_column(
         CHAR(36), ForeignKey("chat_conversations.id", ondelete="SET NULL")
     )

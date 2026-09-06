@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import RedirectResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from lumen.auth import get_token_info
@@ -75,13 +76,25 @@ async def upload_asset(file: UploadFile = File(...), token_info: dict = Depends(
         await file.close()
 
 
-@router.get("/assets/{asset_id}/download", status_code=307)
+@router.get("/assets/{asset_id}/download")
 async def download_asset(asset_id: UUID, token_info: dict = Depends(get_token_info)):
     try:
-        url = await assets.signed_download_url(
-            asset_id=str(asset_id), user_id=token_info["user_id"], project_id=token_info["project_id"]
+        download = await assets.open_download(
+            asset_id=str(asset_id),
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
         )
-        return RedirectResponse(url=url, status_code=307)
+        encoded_name = quote(download.name, safe="")
+        return StreamingResponse(
+            download.chunks(),
+            media_type=download.mime_type,
+            headers={
+                "Content-Disposition": f"attachment; filename=\"download\"; filename*=UTF-8''{encoded_name}",
+                "Content-Length": str(download.size_bytes),
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
     except Exception as exc:
         raise _map_error(exc) from None
 

@@ -23,7 +23,8 @@ from lumen.models.chat_db import ChatConversation, ChatMessage, ChatWorkspace
 from lumen.models.chat_runs import ChatRun, ChatRunSegment, ChatRunTurn
 from lumen.services.message_parts import deserialize_parts, serialize_parts
 from lumen.services.message_timestamps import message_timestamps
-from lumen.services.run_store import replay_events
+from lumen.services.run_store import NONTERMINAL, replay_events
+from lumen.services.workspace_store import WorkspaceForbidden
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +73,10 @@ class WorkspaceNotFound(LookupError):
     """대상 프로젝트 미존재 — 404."""
 
 
-class WorkspaceForbidden(PermissionError):
-    """대상 프로젝트 소유자 불일치 — 403."""
+class ConversationRunActive(RuntimeError):
+    """A nonterminal durable run owns the conversation's active branch."""
+
+    code = "conversation_run_active"
 
 
 def _require_db():
@@ -102,6 +105,9 @@ def _conv_public(row: ChatConversation) -> dict:
         "project_id": row.project_id,
         "user_id": row.user_id,
         "title": _dec(row.title),
+        "title_source": row.title_source,
+        "title_status": row.title_status,
+        "title_revision": row.title_revision,
         "model_name": row.model_name,
         "workspace_id": row.workspace_id,
         "active_leaf_id": row.active_leaf_id,
@@ -165,11 +171,15 @@ async def create_conversation(
     *, project_id: str, user_id: str, title: str | None, model_name: str | None, workspace_id: int | None = None
 ) -> dict:
     factory = _require_db()
+    title_value = title if title is not None else None
     row = ChatConversation(
         id=str(uuid.uuid4()),
         project_id=project_id,
         user_id=user_id,
-        title=_enc(title or None),
+        title=_enc(title_value),
+        title_source="explicit" if title is not None else "auto",
+        title_status="ready" if title is not None else "idle",
+        title_revision=0,
         model_name=(model_name or None),
         workspace_id=workspace_id,
     )
@@ -822,12 +832,32 @@ async def list_message_tree(
 
 
 async def set_active_leaf(conv_id: str, *, user_id: str, project_id: str, message_id: int) -> dict:
-    """활성 리프를 지정 메시지로 이동(형제 버전 전환). 메시지가 이 대화 소속이어야 함."""
+    """Move the active branch only when no durable run is currently mutating it."""
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
-            conv = await _load_owned(session, conv_id, user_id, project_id)
-            msg = await session.get(ChatMessage, message_id)
+            await _load_owned(session, conv_id, user_id, project_id)
+            conv = (
+                await session.execute(
+                    select(ChatConversation)
+                    .where(
+                        ChatConversation.id == conv_id,
+                        ChatConversation.user_id == user_id,
+                        ChatConversation.project_id == project_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one()
+            active = (
+                await session.execute(
+                    select(ChatRun.id)
+                    .where(ChatRun.conversation_id == conv_id, ChatRun.status.in_(NONTERMINAL))
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if active is not None:
+                raise ConversationRunActive("conversation has an active run")
+            msg = await session.get(ChatMessage, message_id, with_for_update=True)
             if msg is None or msg.conversation_id != conv_id:
                 raise ConversationNotFound(f"메시지 {message_id} 를 대화에서 찾을 수 없습니다")
             conv.active_leaf_id = message_id
@@ -891,13 +921,36 @@ async def fork_conversation(conv_id: str, *, user_id: str, project_id: str, mess
             by_id = {r.id: r for r in rows}
             if message_id not in by_id:
                 raise ConversationNotFound(f"메시지 {message_id} 를 대화에서 찾을 수 없습니다")
-            path = _backtrack(rows, message_id)  # message_id 를 리프로 간주해 역추적
+            path = _backtrack(rows, message_id)
 
+            # A fork has no corresponding title-generation job.  Preserve a
+            # stable title, but never copy a pending reservation/revision that
+            # belongs to the source conversation's first-response job.
+            fork_title = conv.title
+            fork_title_source = conv.title_source
+            fork_title_status = conv.title_status
+            fork_title_revision = int(conv.title_revision or 0)
+            if fork_title_source == "auto":
+                if fork_title:
+                    fork_title_status = "ready"
+                else:
+                    fork_title = None
+                    fork_title_status = "idle"
+                    fork_title_revision = 0
+            elif fork_title_source == "explicit":
+                fork_title_status = "ready"
+                fork_title_revision = 0
+            else:
+                fork_title_status = "ready" if fork_title else "idle"
+                fork_title_revision = 0
             new_conv = ChatConversation(
                 id=str(uuid.uuid4()),
                 project_id=conv.project_id,
                 user_id=user_id,
-                title=conv.title,  # 암호문 그대로 복사
+                title=fork_title,
+                title_source=fork_title_source,
+                title_status=fork_title_status,
+                title_revision=fork_title_revision,
                 model_name=conv.model_name,
                 parent_conversation_id=conv_id,
                 forked_from_message_id=message_id,

@@ -71,7 +71,8 @@ async def _execute_mcp_tool(name: str, args: dict, ctx: ToolContext) -> str:
     server = servers.get(server_id)
     if server is None:
         return "선택되지 않았거나 접근 불가한 MCP 서버입니다."
-    return await mcp_client.call_tool(server, tool_name, args if isinstance(args, dict) else {})
+    result = await mcp_client.call_tool(server, tool_name, args if isinstance(args, dict) else {})
+    return result.text if isinstance(result, mcp_client.McpToolOutput) else result
 
 
 async def context_execute_result(name: str, args: dict, ctx: ToolContext) -> contracts.ToolExecutionResult:
