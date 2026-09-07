@@ -9,8 +9,11 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from lumen.cache import close_cache
@@ -99,6 +102,17 @@ if origins:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+
+@app.exception_handler(RequestValidationError)
+async def provider_request_validation_handler(request: Request, exc: RequestValidationError):
+    if request.url.path == "/v1/admin/providers" or request.url.path.startswith("/v1/admin/providers/"):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "프로바이더 요청 형식이 올바르지 않습니다"},
+            headers={"Cache-Control": "no-store"},
+        )
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.get("/", tags=["Discovery"], response_model=RootDiscoveryResponse)

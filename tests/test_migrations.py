@@ -77,3 +77,21 @@ def test_asset_project_bucket_migration_is_registered_and_additive():
     statements = _statements(MIGRATIONS / migration.relative_path)
 
     assert statements == ["ALTER TABLE chat_assets\n    ADD COLUMN bucket_name VARCHAR(63) NULL AFTER object_key"]
+def test_provider_subscription_migration_is_registered_and_additive():
+    migration = next(item for item in load_manifest() if item.logical_id == "008-provider-subscriptions")
+    statements = _statements(MIGRATIONS / migration.relative_path)
+
+    provider_alter = statements[0]
+    for column in (
+        "auth_mode VARCHAR(32) NOT NULL DEFAULT 'api_key'",
+        "encrypted_subscription_tokens TEXT NULL",
+        "subscription_status VARCHAR(24) NOT NULL DEFAULT 'disconnected'",
+        "subscription_expires_at DATETIME NULL",
+        "subscription_generation BIGINT NOT NULL DEFAULT 0",
+    ):
+        assert f"ADD COLUMN {column}" in provider_alter
+    auth_attempts = statements[1]
+    assert "CREATE TABLE llm_provider_auth_attempts" in auth_attempts
+    assert "PRIMARY KEY (provider_id)" in auth_attempts
+    assert "UNIQUE (id)" in auth_attempts
+    assert "FOREIGN KEY (provider_id) REFERENCES llm_providers(id) ON DELETE CASCADE" in auth_attempts

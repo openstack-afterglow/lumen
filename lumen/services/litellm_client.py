@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
+
+from lumen.services.providers.credentials import ProviderAuthRef, litellm_model_name
+from lumen.services.providers.errors import ProviderSubscriptionError
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +49,13 @@ class ContextTokenCount:
 
 def count_tokens(model: str, *, messages: list[dict] | None = None, text: str | None = None) -> int:
     """litellm.token_counter 로 토큰 수 산출. 실패 시 대략치(4 chars ≈ 1 token) 폴백."""
+    normalized_model = litellm_model_name(model)
     try:
         import litellm
 
         if messages is not None:
-            return int(litellm.token_counter(model=model, messages=messages))
-        return int(litellm.token_counter(model=model, text=text or ""))
+            return int(litellm.token_counter(model=normalized_model, messages=messages))
+        return int(litellm.token_counter(model=normalized_model, text=text or ""))
     except Exception:
         logger.warning("litellm token_counter 실패 model=%s — 대략치 폴백", model, exc_info=True)
         raw = text if text is not None else "".join(str(m.get("content", "")) for m in (messages or []))
@@ -90,14 +95,13 @@ def count_context_tokens(model: str, messages: list[dict], tools: list[dict] | N
     if _contains_uncountable_modality(messages) or _contains_uncountable_modality(tools):
         return ContextTokenCount(tokens=None, measurement="unknown")
     multimodal = _contains_multimodal(messages) or _contains_multimodal(tools)
+    normalized_model = litellm_model_name(model)
     try:
         import litellm
 
-        # True is intentional: LiteLLM otherwise performs a network GET for
-        # image URLs while counting a preview request.
         count = int(
             litellm.token_counter(
-                model=model,
+                model=normalized_model,
                 messages=messages,
                 tools=tools,
                 use_default_image_token_count=True,
@@ -105,7 +109,7 @@ def count_context_tokens(model: str, messages: list[dict], tools: list[dict] | N
         )
         tokenizer = None
         try:
-            optional = litellm.get_optional_params(model=model)
+            optional = litellm.get_optional_params(model=normalized_model)
             tokenizer = str(optional.get("tokenizer") or "") or None if isinstance(optional, Mapping) else None
         except Exception:
             tokenizer = None
@@ -113,8 +117,6 @@ def count_context_tokens(model: str, messages: list[dict], tools: list[dict] | N
             return ContextTokenCount(tokens=max(0, count), measurement="estimated", tokenizer=tokenizer)
         return ContextTokenCount(tokens=max(0, count), measurement="tokenizer", tokenizer=tokenizer)
     except Exception:
-        # Plain text can be conservatively estimated; never claim an exact
-        # count after tokenizer/provider-representation failure.
         raw = json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False, sort_keys=True, default=str)
         if multimodal:
             return ContextTokenCount(tokens=None, measurement="unknown")
@@ -162,16 +164,34 @@ def _as_decimal(value: object) -> Decimal | None:
     return parsed if parsed.is_finite() and parsed >= 0 else None
 
 
+def chatgpt_model_metadata(model_name: str) -> dict[str, Any]:
+    """Read one exact bundled ChatGPT entry without provider/authentication probes."""
+    import litellm
+
+    bare_model = litellm_model_name(model_name)
+    metadata = litellm.model_cost.get(f"chatgpt/{bare_model}")
+    if not isinstance(metadata, dict) or metadata.get("litellm_provider") != "chatgpt":
+        return {}
+    return dict(metadata)
+
+
 def _litellm_component_rates(
     model: str, prompt_tokens: int, completion_tokens: int, provider_type: str | None = None
 ) -> tuple[Decimal | None, Decimal | None]:
+    normalized_model = litellm_model_name(model)
+    if provider_type == "chatgpt" or model.startswith("chatgpt/"):
+        metadata = chatgpt_model_metadata(model)
+        return (
+            _as_decimal(metadata.get("input_cost_per_token")),
+            _as_decimal(metadata.get("output_cost_per_token")),
+        )
     lookup_prompt_tokens = max(1, prompt_tokens)
     lookup_completion_tokens = max(1, completion_tokens)
     try:
         import litellm
 
         kwargs = {
-            "model": model,
+            "model": normalized_model,
             "prompt_tokens": lookup_prompt_tokens,
             "completion_tokens": lookup_completion_tokens,
         }
@@ -295,11 +315,7 @@ _OMIT_EFFORTS = {"", "auto", "off", "disabled", "false"}
 
 
 def _reasoning_params(model: str, effort: str | None, custom_llm_provider: str | None) -> dict[str, Any]:
-    """지원 모델에만 reasoning_effort 를 붙인다(추론 노출). 미지원/비활성/오류 시 {}.
-
-    litellm 이 provider 별 파라미터(Anthropic thinking budget, Gemini thinking, o-series 등)로
-    정규화한다. supports_reasoning 이 false 면 요청에 넣지 않아 비용/동작 변화가 없다.
-    """
+    """Attach reasoning only when side-effect-free metadata or provider probes support it."""
     if effort is None:
         return {}
     normalized = effort.strip().lower()
@@ -307,13 +323,17 @@ def _reasoning_params(model: str, effort: str | None, custom_llm_provider: str |
         return {}
     if normalized != "none" and normalized not in _VALID_EFFORTS:
         return {}
-    try:
-        import litellm
+    normalized_model = litellm_model_name(model)
+    if custom_llm_provider == "chatgpt" or model.startswith("chatgpt/"):
+        supported = bool(chatgpt_model_metadata(model).get("supports_reasoning"))
+    else:
+        try:
+            import litellm
 
-        supported = litellm.supports_reasoning(model=model)
-    except Exception:
-        logger.warning("litellm supports_reasoning 조회 실패 model=%s", model, exc_info=True)
-        return {}
+            supported = bool(litellm.supports_reasoning(model=normalized_model))
+        except Exception:
+            logger.warning("litellm supports_reasoning 조회 실패 model=%s", model, exc_info=True)
+            return {}
     if not supported:
         return {}
     return {"reasoning_effort": normalized}
@@ -349,6 +369,156 @@ def _build_params(
     return params
 
 
+def _subscription_error(error: BaseException) -> ProviderSubscriptionError:
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+    if status_code in {401, 403}:
+        return ProviderSubscriptionError("subscription_auth_required", 502)
+    if status_code == 429:
+        return ProviderSubscriptionError("subscription_rate_limited", 429)
+    if isinstance(status_code, int) and status_code >= 500:
+        return ProviderSubscriptionError("subscription_upstream_unavailable", 503)
+    return ProviderSubscriptionError("subscription_auth_invalid_response", 502)
+
+
+def _requires_subscription_auth(model: str, custom_llm_provider: str | None) -> bool:
+    return custom_llm_provider == "chatgpt" or model.startswith(("chatgpt/", "anthropic-subscription/"))
+
+
+async def _guard_subscription_stream(
+    source: Any,
+    provider_auth: ProviderAuthRef,
+    fingerprint: str | None,
+):
+    from lumen.services.providers import subscriptions
+
+    try:
+        async for chunk in source:
+            yield chunk
+    except ProviderSubscriptionError as error:
+        if error.code == "subscription_auth_required" and isinstance(fingerprint, str):
+            await subscriptions._mark_subscription_credential_rejected(provider_auth, fingerprint)
+        raise
+    except BaseException as error:
+        safe_error = _subscription_error(error)
+        if safe_error.code == "subscription_auth_required" and isinstance(fingerprint, str):
+            await subscriptions._mark_subscription_credential_rejected(provider_auth, fingerprint)
+        raise safe_error from None
+    finally:
+        close = getattr(source, "aclose", None)
+        if callable(close):
+            await close()
+
+
+async def _subscription_completion(
+    model: str,
+    messages: list[dict],
+    *,
+    provider_auth: ProviderAuthRef,
+    stream: bool,
+    max_tokens: int | None,
+    temperature: float | None,
+    custom_llm_provider: str | None,
+    tools: list[dict] | None,
+    extra: dict | None,
+) -> Any:
+    import litellm
+
+    from lumen.services.providers import subscriptions
+    from lumen.services.providers.subscription_logging import SubscriptionLogging
+
+    mode = provider_auth.get("auth_mode")
+    expected_provider = "chatgpt" if mode == "chatgpt_device" else "anthropic"
+    if mode not in {"chatgpt_device", "anthropic_subscription"} or custom_llm_provider != expected_provider:
+        raise ProviderSubscriptionError("subscription_auth_required", 502)
+    credential = await subscriptions.resolve_subscription_credential(provider_auth)
+    fingerprint = credential.get("_fingerprint")
+    optional_params = dict(extra or {})
+    if max_tokens is not None:
+        optional_params["max_tokens"] = max_tokens
+    if temperature is not None:
+        optional_params["temperature"] = temperature
+    if tools:
+        optional_params["tools"] = tools
+
+    try:
+        if mode == "chatgpt_device":
+            from lumen.services.providers.chatgpt_transport import acompletion as chatgpt_acompletion
+
+            result = await chatgpt_acompletion(
+                model,
+                messages,
+                credential=credential,
+                stream=stream,
+                optional_params=optional_params,
+            )
+            if stream:
+                return _guard_subscription_stream(result, provider_auth, fingerprint)
+            return result
+
+        access_token = credential.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise ProviderSubscriptionError("subscription_auth_required", 502)
+        normalized_model = litellm_model_name(model)
+        logging_obj = SubscriptionLogging(
+            model=normalized_model,
+            provider="anthropic",
+            fixed_api_base="https://api.anthropic.com",
+            call_id=str(uuid.uuid4()),
+            stream=stream,
+        )
+        params = _build_params(
+            normalized_model,
+            messages,
+            api_base=None,
+            api_key=None,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            custom_llm_provider="anthropic",
+            tools=tools,
+            extra={
+                key: value
+                for key, value in optional_params.items()
+                if key
+                not in {
+                    "api_base",
+                    "api_key",
+                    "base_url",
+                    "custom_llm_provider",
+                    "litellm_logging_obj",
+                    "model",
+                    "messages",
+                }
+            },
+        )
+        params.update(
+            {
+                "model": normalized_model,
+                "custom_llm_provider": "anthropic",
+                "api_base": "https://api.anthropic.com",
+                "api_key": access_token,
+                "litellm_logging_obj": logging_obj,
+                "stream": stream,
+            }
+        )
+        if stream:
+            params["stream_options"] = {"include_usage": True}
+        result = await litellm.acompletion(**params)
+        if stream:
+            return _guard_subscription_stream(result, provider_auth, fingerprint)
+        return result
+    except ProviderSubscriptionError as error:
+        if error.code == "subscription_auth_required" and isinstance(fingerprint, str):
+            await subscriptions._mark_subscription_credential_rejected(provider_auth, fingerprint)
+        raise
+    except BaseException as error:
+        safe_error = _subscription_error(error)
+        if safe_error.code == "subscription_auth_required" and isinstance(fingerprint, str):
+            await subscriptions._mark_subscription_credential_rejected(provider_auth, fingerprint)
+        raise safe_error from None
+
+
 async def acompletion(
     model: str,
     messages: list[dict],
@@ -360,13 +530,26 @@ async def acompletion(
     custom_llm_provider: str | None = None,
     tools: list[dict] | None = None,
     extra: dict | None = None,
+    provider_auth: ProviderAuthRef | None = None,
 ) -> Any:
     """비스트리밍 litellm 호출."""
+    if provider_auth is not None:
+        return await _subscription_completion(
+            model,
+            messages,
+            provider_auth=provider_auth,
+            stream=False,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            custom_llm_provider=custom_llm_provider,
+            tools=tools,
+            extra=extra,
+        )
+    if _requires_subscription_auth(model, custom_llm_provider):
+        raise ProviderSubscriptionError("subscription_auth_required", 502)
     import litellm
 
-    # 모델별 미지원 파라미터(tools/temperature 등)를 자동 드롭 — 예: gpt-5-search-api 는 tools 미지원.
     litellm.drop_params = True
-
     params = _build_params(
         model,
         messages,
@@ -393,19 +576,27 @@ async def acompletion_stream(
     tools: list[dict] | None = None,
     extra: dict | None = None,
     reasoning_effort: str | None = None,
+    provider_auth: ProviderAuthRef | None = None,
 ) -> Any:
-    """스트리밍 litellm 호출. usage 계측을 위해 include_usage 를 강제한다.
-
-    반환값은 async iterator(청크). 호출부가 청크 델타를 SSE 로 전달하고,
-    마지막 usage 청크를 extract_usage 에 넘겨 과금한다. tools 지정 시 tool_call 델타도 스트리밍된다.
-    reasoning_effort 는 지원 모델에만 붙어 추론(reasoning_content)을 스트리밍시킨다(_reasoning_params).
-    """
+    """스트리밍 litellm 호출. usage 계측을 위해 include_usage 를 강제한다."""
+    merged_extra = {**(extra or {}), **_reasoning_params(model, reasoning_effort, custom_llm_provider)}
+    if provider_auth is not None:
+        return await _subscription_completion(
+            model,
+            messages,
+            provider_auth=provider_auth,
+            stream=True,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            custom_llm_provider=custom_llm_provider,
+            tools=tools,
+            extra=merged_extra or None,
+        )
+    if _requires_subscription_auth(model, custom_llm_provider):
+        raise ProviderSubscriptionError("subscription_auth_required", 502)
     import litellm
 
-    # 모델별 미지원 파라미터(tools/temperature 등)를 자동 드롭 — 예: gpt-5-search-api 는 tools 미지원.
     litellm.drop_params = True
-
-    merged_extra = {**(extra or {}), **_reasoning_params(model, reasoning_effort, custom_llm_provider)}
     params = _build_params(
         model,
         messages,

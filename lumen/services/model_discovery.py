@@ -15,6 +15,7 @@ import logging
 
 from lumen.services.providers import errors
 from lumen.services.providers import routing as provider_store
+from lumen.services.providers.credentials import canonical_subscription_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,17 @@ async def discover_models(provider_id: int) -> dict:
     if prov is None:
         raise errors.ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
 
+    auth_mode = prov.get("auth_mode", "api_key")
+    if auth_mode in {"chatgpt_device", "anthropic_subscription"}:
+        catalog_provider = "chatgpt" if auth_mode == "chatgpt_device" else "anthropic"
+        canonical_models: list[str] = []
+        for candidate in _litellm_static(catalog_provider):
+            try:
+                canonical_models.append(canonical_subscription_model_name(candidate, auth_mode))
+            except errors.ProviderValidationError:
+                continue
+        models = sorted(set(canonical_models))
+        return {"models": models, "source": "litellm" if models else "none"}
     ptype = prov["provider_type"]
     if ptype in _OPENAI_COMPATIBLE:
         live = await _fetch_openai_compatible(ptype, prov["api_base"], prov["api_key"])

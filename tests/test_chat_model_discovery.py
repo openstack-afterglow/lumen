@@ -110,3 +110,47 @@ class TestDiscover:
         out = await model_discovery.discover_models(1)
         assert out["source"] == "litellm"
         assert out["models"] == ["gpt-4o"]
+
+    async def test_chatgpt_subscription_uses_static_canonical_catalog_without_live_auth(self, monkeypatch):
+        async def fake_get(pid):
+            assert pid == 7
+            return {
+                "provider_type": "chatgpt",
+                "auth_mode": "chatgpt_device",
+                "api_base": None,
+                "api_key": None,
+            }
+
+        async def forbidden_fetch(*args, **kwargs):
+            raise AssertionError("subscription discovery must not call a live models endpoint")
+
+        monkeypatch.setattr(model_discovery.provider_store, "get_provider_for_discovery", fake_get)
+        monkeypatch.setattr(model_discovery, "_fetch_openai_compatible", forbidden_fetch)
+        monkeypatch.setattr(
+            model_discovery,
+            "_litellm_static",
+            lambda provider: ["chatgpt/gpt-5.2-codex", "gpt-5.3-codex"] if provider == "chatgpt" else [],
+        )
+
+        out = await model_discovery.discover_models(7)
+
+        assert out == {
+            "models": ["chatgpt/gpt-5.2-codex", "chatgpt/gpt-5.3-codex"],
+            "source": "litellm",
+        }
+
+    async def test_anthropic_subscription_catalog_keeps_distinct_namespace(self, monkeypatch):
+        async def fake_get(_pid):
+            return {
+                "provider_type": "anthropic",
+                "auth_mode": "anthropic_subscription",
+                "api_base": None,
+                "api_key": None,
+            }
+
+        monkeypatch.setattr(model_discovery.provider_store, "get_provider_for_discovery", fake_get)
+        monkeypatch.setattr(model_discovery, "_litellm_static", lambda provider: ["claude-opus-4-1"])
+
+        out = await model_discovery.discover_models(8)
+
+        assert out["models"] == ["anthropic-subscription/claude-opus-4-1"]

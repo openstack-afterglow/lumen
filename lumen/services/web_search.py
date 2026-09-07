@@ -59,6 +59,8 @@ async def search_with_route(
     """Run only the user-selected provider route and normalize its safe citations."""
     if context_size not in _CONTEXT_TOKEN_LIMITS:
         raise ManagedSearchError("unsupported search context size")
+    if route.get("provider_auth") is not None:
+        raise ManagedSearchError("subscription providers do not support managed search")
     try:
         import litellm
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from decimal import Decimal
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 from httpx import ASGITransport, AsyncClient
 from redis.asyncio import Redis
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.main import app
@@ -18,6 +19,8 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun
 from lumen.services import api_key_store, graph
 from lumen.services.durable_runs import execution
+from lumen.services.providers import repository
+from lumen.services.providers.errors import ProviderValidationError
 
 pytestmark = pytest.mark.integration
 
@@ -232,4 +235,57 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
             assert replayed.status_code == 202, replayed.text
             assert replayed.json()["run_id"] == run_id
     finally:
+        await close_db()
+
+
+async def test_subscription_model_namespace_is_unique_under_concurrent_registration():
+    database_url = os.environ["DATABASE_URL"]
+    nonce = uuid.uuid4().hex
+    provider_ids: list[int] = []
+
+    init_db(database_url, pool_size=2, max_overflow=0)
+    factory = get_session_factory()
+    assert factory is not None
+
+    try:
+        async with factory() as session, session.begin():
+            providers = [
+                LlmProvider(
+                    name=f"subscription-provider-{index}-{nonce}",
+                    provider_type="chatgpt",
+                    auth_mode="chatgpt_device",
+                    is_active=True,
+                    margin_multiplier=Decimal("1"),
+                )
+                for index in range(2)
+            ]
+            session.add_all(providers)
+            await session.flush()
+            provider_ids = [provider.id for provider in providers]
+
+        results = await asyncio.gather(
+            *(
+                repository.create_model(
+                    provider_id=provider_id,
+                    model_name=f"gpt-concurrency-{nonce}",
+                    input_price_per_million="0",
+                    output_price_per_million="0",
+                )
+                for provider_id in provider_ids
+            ),
+            return_exceptions=True,
+        )
+
+        created = [result for result in results if isinstance(result, dict)]
+        rejected = [result for result in results if isinstance(result, ProviderValidationError)]
+        assert len(created) == 1
+        assert len(rejected) == 1, [
+            f"{type(result).__name__}: {result}; cause={getattr(result, '__cause__', None)!r}"
+            for result in results
+        ]
+        assert created[0]["model_name"] == f"chatgpt/gpt-concurrency-{nonce}"
+    finally:
+        if provider_ids:
+            async with factory() as session, session.begin():
+                await session.execute(delete(LlmProvider).where(LlmProvider.id.in_(provider_ids)))
         await close_db()

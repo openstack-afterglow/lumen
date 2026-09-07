@@ -29,6 +29,7 @@ from langgraph.types import Command, interrupt
 
 from lumen.services import agent_runtime_v2, litellm_client
 from lumen.services.checkpointer import chat_checkpointer
+from lumen.services.providers.errors import ProviderSubscriptionError
 from lumen.services.tool_runtime import bindings, contracts, dispatch, selection
 from lumen.services.tools import ToolContext
 
@@ -517,6 +518,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                         custom_llm_provider=params.get("custom_llm_provider"),
                         api_base=params.get("api_base"),
                         api_key=params.get("api_key"),
+                        provider_auth=params.get("provider_auth"),
                         max_tokens=params.get("max_tokens"),
                         temperature=params.get("temperature"),
                         reasoning_effort=effort,
@@ -546,10 +548,16 @@ def _build_graph(params: dict, ctx: ToolContext):
             )
             return {"model_failed": True, "pending_tool_calls": []}
         except Exception as exc:
+            if isinstance(exc, ProviderSubscriptionError):
+                writer({"type": "error", "code": exc.code, "message": exc.message})
+                return {"model_failed": True, "pending_tool_calls": []}
             if schemas and _is_tool_reasoning_conflict(exc):
                 logger.warning("tool 요청의 기본 reasoning을 명시적으로 비활성화해 재시도 model=%s", params["model"])
                 try:
                     response, replay_payload = await open_stream(None, disable_reasoning=True)
+                except ProviderSubscriptionError as retry_error:
+                    writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
+                    return {"model_failed": True, "pending_tool_calls": []}
                 except Exception:
                     logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
                     writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
@@ -561,6 +569,9 @@ def _build_graph(params: dict, ctx: ToolContext):
                 )
                 try:
                     response, replay_payload = await open_stream(None)
+                except ProviderSubscriptionError as retry_error:
+                    writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
+                    return {"model_failed": True, "pending_tool_calls": []}
                 except Exception:
                     logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
                     writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
@@ -620,6 +631,19 @@ def _build_graph(params: dict, ctx: ToolContext):
                     usage = _get(chunk, "usage")
                     if usage is not None:
                         final_usage = usage
+            except ProviderSubscriptionError as exc:
+                failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
+                if _abort_code(failure) is not None:
+                    writer(
+                        {
+                            "type": "error",
+                            "code": _abort_code(failure),
+                            "message": "이전 모델 호출 결과를 안전하게 확인할 수 없습니다",
+                        }
+                    )
+                    return {"model_failed": True, "pending_tool_calls": []}
+                writer({"type": "error", "code": exc.code, "message": exc.message})
+                return {"model_failed": True, "pending_tool_calls": []}
             except Exception:
                 logger.warning("litellm 스트림 소비 오류 model=%s", params.get("model"), exc_info=True)
                 failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
@@ -632,7 +656,6 @@ def _build_graph(params: dict, ctx: ToolContext):
                         }
                     )
                     return {"model_failed": True, "pending_tool_calls": []}
-                logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
                 writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
                 return {"model_failed": True, "pending_tool_calls": []}
             tool_calls = _normalize_tool_calls(
@@ -1236,6 +1259,7 @@ async def stream(
     custom_llm_provider: str | None = None,
     api_base: str | None = None,
     api_key: str | None = None,
+    provider_auth: dict | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
     reasoning_effort: str | None = None,
@@ -1266,6 +1290,7 @@ async def stream(
         "custom_llm_provider": custom_llm_provider,
         "api_base": api_base,
         "api_key": api_key,
+        "provider_auth": provider_auth,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "reasoning_effort": reasoning_effort,

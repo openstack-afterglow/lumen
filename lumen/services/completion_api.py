@@ -147,17 +147,21 @@ async def complete_once(
     extra_kwargs: dict[str, Any] = {}
     if tool_choice is not None:
         extra_kwargs["tool_choice"] = tool_choice
-    resp = await litellm_client.acompletion(
-        resolved["model_name"],
-        messages,
-        api_base=resolved.get("api_base"),
-        api_key=resolved.get("api_key"),
-        custom_llm_provider=resolved.get("provider_type"),
-        max_tokens=clamp_max_tokens(max_tokens),
-        temperature=temperature,
-        tools=tools,
-        extra=extra_kwargs or None,
-    )
+    try:
+        resp = await litellm_client.acompletion(
+            resolved["model_name"],
+            messages,
+            api_base=resolved.get("api_base"),
+            api_key=resolved.get("api_key"),
+            custom_llm_provider=resolved.get("provider_type"),
+            max_tokens=clamp_max_tokens(max_tokens),
+            temperature=temperature,
+            tools=tools,
+            extra=extra_kwargs or None,
+            provider_auth=resolved.get("provider_auth"),
+        )
+    except errors.ProviderSubscriptionError as exc:
+        raise CompletionError(exc.status_code, exc.message) from None
     choice = resp.choices[0]
     msg = choice.message
     content = getattr(msg, "content", None) or ""
@@ -223,6 +227,7 @@ async def complete_stream(
             tools=tools,
             extra=extra_kwargs or None,
             reasoning_effort=_reasoning_effort(None),
+            provider_auth=resolved.get("provider_auth"),
         )
         async for chunk in gen:
             u = getattr(chunk, "usage", None)
@@ -249,6 +254,10 @@ async def complete_stream(
                     "tool_calls": tcs,
                     "finish_reason": fr,
                 }
+    except errors.ProviderSubscriptionError as exc:
+        logger.warning("API 구독 스트리밍 실패 model=%s code=%s", resolved.get("model_name"), exc.code)
+        yield {"type": "error", "code": exc.code, "message": exc.message}
+        return
     except Exception:
         logger.warning("API 스트리밍 실패 model=%s", resolved.get("model_name"), exc_info=True)
         yield {"type": "error", "message": "생성 중 오류가 발생했습니다"}

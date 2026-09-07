@@ -8,6 +8,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from lumen.services.execution_protocol import v2_runtime_ready
+from lumen.services.litellm_client import chatgpt_model_metadata
+from lumen.services.providers.credentials import litellm_model_name
 
 _RUNTIME_TOOL_FEATURES = ("mcp", "approval_tools", "code_interpreter", "computer_use", "code_workspace", "child_agents")
 
@@ -148,11 +150,36 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
     LiteLLM cannot infer managed routes or pricing, so those are deliberately
     unavailable rather than guessed.
     """
-    vision = _probe("supports_vision", model_name=model_name, provider_type=provider_type)
-    pdf_input = _probe("supports_pdf_input", model_name=model_name, provider_type=provider_type)
-    reasoning = _probe("supports_reasoning", model_name=model_name, provider_type=provider_type)
-    function_calling = _probe("supports_function_calling", model_name=model_name, provider_type=provider_type)
-    structured_output = _probe("supports_response_schema", model_name=model_name, provider_type=provider_type)
+    normalized_model = litellm_model_name(model_name)
+    is_chatgpt = provider_type == "chatgpt" or model_name.startswith("chatgpt/")
+    metadata = chatgpt_model_metadata(model_name) if is_chatgpt else {}
+    vision = (
+        bool(metadata.get("supports_vision"))
+        if is_chatgpt
+        else _probe("supports_vision", model_name=normalized_model, provider_type=provider_type)
+    )
+    pdf_input = (
+        bool(metadata.get("supports_pdf_input"))
+        if is_chatgpt
+        else _probe("supports_pdf_input", model_name=normalized_model, provider_type=provider_type)
+    )
+    reasoning = (
+        bool(metadata.get("supports_reasoning"))
+        if is_chatgpt
+        else _probe("supports_reasoning", model_name=normalized_model, provider_type=provider_type)
+    )
+    function_calling = (
+        bool(metadata.get("supports_function_calling"))
+        if is_chatgpt
+        else _probe("supports_function_calling", model_name=normalized_model, provider_type=provider_type)
+    )
+    structured_output = (
+        False
+        if is_chatgpt
+        else _probe("supports_response_schema", model_name=normalized_model, provider_type=provider_type)
+    )
+    parallel_function_calling = bool(metadata.get("supports_parallel_function_calling")) if is_chatgpt else False
+    context_limit = metadata.get("max_input_tokens") if isinstance(metadata.get("max_input_tokens"), int) else None
     return {
         # Existing model-admin/UI fields retained until the capability API is cut over.
         "vision": vision,
@@ -161,20 +188,20 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
         "attachment": vision or pdf_input,
         "modalities": None,
         "reasoning_options": [],
-        "context_limit": None,
+        "context_limit": context_limit,
         # Canonical gate contract.
         "streaming": True,
         "function_calling": function_calling,
-        "parallel_function_calling": False,
+        "parallel_function_calling": parallel_function_calling,
         "structured_output": structured_output,
         "web_search": False,
         "web_fetch": False,
         "advisor": False,
-        "responses_api": False,
+        "responses_api": is_chatgpt,
         "mcp": False,
         "code_interpreter": False,
         "computer_use": False,
-        "endpoints": ["chat_completions"],
+        "endpoints": ["responses"] if is_chatgpt else ["chat_completions"],
         "input_modalities": ["text", *(["image"] if vision else []), *(["pdf"] if pdf_input else [])],
         "output_modalities": ["text"],
         "allowed_output_combinations": [["text"]],
@@ -269,6 +296,27 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
             },
         },
     }
+
+
+def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode: str) -> dict[str, Any]:
+    """Apply transport invariants after stored and imported capability overrides."""
+    if auth_mode != "chatgpt_device":
+        return capabilities
+    normalized = dict(capabilities)
+    normalized["structured_output"] = False
+    normalized["responses_api"] = True
+    normalized["endpoints"] = ["responses"]
+    gates = {name: dict(gate) for name, gate in (normalized.get("feature_gates") or {}).items()}
+    structured = gates.get("structured_output", {})
+    structured.update(
+        available=False,
+        mode="none",
+        reason_code="provider_unsupported",
+        pricing_available=False,
+    )
+    gates["structured_output"] = structured
+    normalized["feature_gates"] = gates
+    return normalized
 
 
 def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, Any]) -> dict[str, Any]:

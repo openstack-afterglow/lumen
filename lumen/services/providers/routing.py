@@ -16,7 +16,7 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun, ChatRunProvider
 from lumen.services.run_store import NONTERMINAL
 
-from .credentials import resolve_api_key
+from .credentials import ProviderAuthRef, resolve_api_key
 from .errors import (
     ActiveRunConfigurationConflict,
     ChatStorageUnavailable,
@@ -177,10 +177,27 @@ async def _lock_mutable_route(
     return provider, models
 
 
+def _provider_auth_ref(provider: LlmProvider) -> ProviderAuthRef | None:
+    auth_mode = getattr(provider, "auth_mode", "api_key")
+    if auth_mode not in {"chatgpt_device", "anthropic_subscription"}:
+        return None
+    return {
+        "provider_id": provider.id,
+        "generation": getattr(provider, "subscription_generation", 0),
+        "auth_mode": auth_mode,
+    }
+
+
 def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
+    provider_auth = _provider_auth_ref(provider)
     api_key = resolve_api_key(provider)
+    api_base = provider.api_base if provider_auth is None else None
     input_price, output_price, price_source, price_version = _resolved_base_prices(model, provider)
-    capabilities, _ = _effective_capabilities(model, provider.provider_type)
+    capabilities, _ = _effective_capabilities(
+        model,
+        provider.provider_type,
+        getattr(provider, "auth_mode", "api_key"),
+    )
     capabilities = _pricing_aware_capabilities(
         model,
         capabilities,
@@ -193,7 +210,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
         "provider_active": provider.is_active,
-        "api_base": provider.api_base,
+        "api_base": api_base,
         "model_name": model.model_name,
         "model_active": model.is_active,
         "margin_multiplier": str(provider.margin_multiplier),
@@ -205,6 +222,13 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "capabilities": capabilities,
         "api_key": api_key,
     }
+    if provider_auth is not None:
+        config_fingerprint.update(
+            {
+                "auth_mode": provider.auth_mode,
+                "subscription_generation": provider.subscription_generation,
+            }
+        )
     config_version_hash = hmac.new(
         derive_encryption_subkey(b"chat_provider_config"),
         json.dumps(config_fingerprint, ensure_ascii=False, sort_keys=True, default=str).encode(),
@@ -214,8 +238,9 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "model_name": model.model_name,
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
-        "api_base": provider.api_base,
+        "api_base": api_base,
         "api_key": api_key,
+        "provider_auth": provider_auth,
         "margin_multiplier": Decimal(provider.margin_multiplier),
         "input_price_per_token": input_price,
         "output_price_per_token": output_price,
@@ -231,16 +256,25 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
 
 def _resolved_provider(provider: LlmProvider) -> dict:
     """Resolve a provider-only execution route (managed search has no model row)."""
+    provider_auth = _provider_auth_ref(provider)
     api_key = resolve_api_key(provider)
+    api_base = provider.api_base if provider_auth is None else None
     config_fingerprint = {
         "provider_id": provider.id,
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
         "provider_active": provider.is_active,
-        "api_base": provider.api_base,
+        "api_base": api_base,
         "margin_multiplier": str(provider.margin_multiplier),
         "api_key": api_key,
     }
+    if provider_auth is not None:
+        config_fingerprint.update(
+            {
+                "auth_mode": provider.auth_mode,
+                "subscription_generation": provider.subscription_generation,
+            }
+        )
     config_version_hash = hmac.new(
         derive_encryption_subkey(b"chat_provider_config"),
         json.dumps(config_fingerprint, ensure_ascii=False, sort_keys=True, default=str).encode(),
@@ -249,8 +283,9 @@ def _resolved_provider(provider: LlmProvider) -> dict:
     return {
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
-        "api_base": provider.api_base,
+        "api_base": api_base,
         "api_key": api_key,
+        "provider_auth": provider_auth,
         "margin_multiplier": Decimal(provider.margin_multiplier),
         "provider_id": provider.id,
         "config_version_hash": config_version_hash,
@@ -438,18 +473,20 @@ async def get_active_provider_route(provider_id: int) -> dict | None:
 
 
 async def get_provider_for_discovery(provider_id: int) -> dict | None:
-    """모델 discovery 용 — provider_type/api_base/복호화 api_key. 미존재 시 None.
-
-    ⚠️ 반환 api_key 는 복호화 평문 — 서버 내부 discovery 호출 전용, API 응답 노출 금지.
-    """
+    """Resolve discovery configuration without refreshing subscription credentials."""
     factory = _require_db()
     try:
         async with factory() as session:
             row = await session.get(LlmProvider, provider_id)
             if row is None:
                 return None
-            api_key = resolve_api_key(row)
-            return {"provider_type": row.provider_type, "api_base": row.api_base, "api_key": api_key}
+            provider_auth = _provider_auth_ref(row)
+            return {
+                "provider_type": row.provider_type,
+                "auth_mode": row.auth_mode,
+                "api_base": row.api_base if provider_auth is None else None,
+                "api_key": resolve_api_key(row),
+            }
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc

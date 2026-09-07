@@ -1,11 +1,12 @@
 from decimal import Decimal
 from types import SimpleNamespace
 
+import lumen.services.capabilities as capability_service
 import lumen.services.providers.credentials as provider_credentials
 import lumen.services.providers.pricing as provider_pricing
 import lumen.services.providers.routing as provider_store
 from lumen.services.capabilities import litellm_capabilities, normalize_capabilities
-from lumen.services.providers.pricing import _model_public, _pricing_aware_capabilities
+from lumen.services.providers.pricing import _effective_capabilities, _model_public, _pricing_aware_capabilities
 from lumen.services.providers.routing import _resolved_model, _resolved_provider
 
 
@@ -290,3 +291,31 @@ def test_public_model_marks_unpriced_text_route_unavailable():
     public = _model_public(model, provider_type="openai")
 
     assert public["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is False
+
+
+def test_chatgpt_subscription_capabilities_use_static_metadata_without_provider_probe(monkeypatch):
+    monkeypatch.setattr(
+        capability_service,
+        "_probe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("provider probe is forbidden")),
+    )
+
+    capabilities = litellm_capabilities("chatgpt/gpt-5.2-codex", "chatgpt")
+
+    assert capabilities["responses_api"] is True
+    assert capabilities["endpoints"] == ["responses"]
+    assert capabilities["structured_output"] is False
+
+
+def test_chatgpt_subscription_override_cannot_enable_structured_output():
+    model = SimpleNamespace(
+        model_name="chatgpt/gpt-5.2-codex",
+        capabilities={"structured_output": True, "tools": True},
+        capability_source="override",
+    )
+
+    capabilities, source = _effective_capabilities(model, "chatgpt", "chatgpt_device")
+
+    assert source == "override"
+    assert capabilities["tools"] is True
+    assert capabilities["structured_output"] is False

@@ -11,7 +11,7 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.services.litellm_client import effective_prices_per_million
 from lumen.services.models_dev import ModelsDevCatalog
 
-from .credentials import normalize_api_key_env
+from .credentials import canonical_subscription_model_name, normalize_api_key_env
 from .errors import (
     ChatStorageUnavailable,
     ModelsDevImportConflictError,
@@ -29,6 +29,61 @@ from .pricing import (
 )
 from .routing import _lock_mutable_route, _require_db
 
+_AUTH_MODES = frozenset({"api_key", "chatgpt_device", "anthropic_subscription"})
+
+
+def validate_provider_auth_configuration(
+    *,
+    provider_type: str,
+    auth_mode: str,
+    api_base: str | None,
+    api_key: str | None,
+    api_key_env: str | None,
+) -> None:
+    if auth_mode not in _AUTH_MODES:
+        raise ProviderValidationError("지원하지 않는 provider auth_mode 입니다")
+    if provider_type == "chatgpt" and auth_mode != "chatgpt_device":
+        raise ProviderValidationError("ChatGPT 프로바이더는 구독 device 인증만 지원합니다")
+    if auth_mode == "chatgpt_device" and provider_type != "chatgpt":
+        raise ProviderValidationError("ChatGPT 구독은 provider_type=chatgpt 이어야 합니다")
+    if auth_mode == "anthropic_subscription" and provider_type != "anthropic":
+        raise ProviderValidationError("Claude 구독은 provider_type=anthropic 이어야 합니다")
+    if auth_mode != "api_key" and any(
+        isinstance(value, str) and value.strip() for value in (api_base, api_key, api_key_env)
+    ):
+        raise ProviderValidationError("구독 프로바이더에는 API base/key/environment credential을 설정할 수 없습니다")
+
+
+async def _lock_subscription_namespaces(session) -> dict[int, LlmProvider]:
+    providers = (
+        await session.execute(
+            select(LlmProvider)
+            .where(LlmProvider.auth_mode != "api_key")
+            .order_by(LlmProvider.id)
+            .with_for_update()
+        )
+    ).scalars()
+    return {provider.id: provider for provider in providers}
+
+
+async def _reject_duplicate_subscription_model(
+    session,
+    *,
+    namespace_provider_ids: tuple[int, ...],
+    model_name: str,
+    current_model_id: int | None = None,
+) -> None:
+    if not namespace_provider_ids:
+        return
+    stmt = select(LlmModel.id).where(
+        LlmModel.provider_id.in_(namespace_provider_ids),
+        LlmModel.model_name == model_name,
+    )
+    if current_model_id is not None:
+        stmt = stmt.where(LlmModel.id != current_model_id)
+    if (await session.execute(stmt.limit(1))).scalar_one_or_none() is not None:
+        raise ProviderValidationError("같은 구독 model_name 은 하나의 프로바이더에만 등록할 수 있습니다")
+
 
 async def create_provider(
     *,
@@ -37,6 +92,7 @@ async def create_provider(
     api_base: str | None = None,
     api_key: str | None = None,
     api_key_env: str | None = None,
+    auth_mode: str = "api_key",
     margin_multiplier=1.0,
     models_dev_provider_id: str | None = None,
     is_active: bool = True,
@@ -44,12 +100,24 @@ async def create_provider(
     factory = _require_db()
     if not name or not name.strip():
         raise ProviderValidationError("name 은 필수입니다")
+    normalized_provider_type = (provider_type or "openai").strip()
+    normalized_auth_mode = (auth_mode or "api_key").strip()
+    validate_provider_auth_configuration(
+        provider_type=normalized_provider_type,
+        auth_mode=normalized_auth_mode,
+        api_base=api_base,
+        api_key=api_key,
+        api_key_env=api_key_env,
+    )
     row = LlmProvider(
         name=name.strip(),
-        provider_type=(provider_type or "openai").strip(),
-        api_base=(api_base or None),
-        encrypted_api_key=(encrypt_llm_provider_key(api_key) if api_key else None),
-        api_key_env=normalize_api_key_env(api_key_env),
+        provider_type=normalized_provider_type,
+        api_base=(api_base or None) if normalized_auth_mode == "api_key" else None,
+        encrypted_api_key=(
+            encrypt_llm_provider_key(api_key) if api_key and normalized_auth_mode == "api_key" else None
+        ),
+        api_key_env=normalize_api_key_env(api_key_env) if normalized_auth_mode == "api_key" else None,
+        auth_mode=normalized_auth_mode,
         margin_multiplier=_to_decimal(margin_multiplier, "margin_multiplier"),
         models_dev_provider_id=(models_dev_provider_id or None),
         is_active=is_active,
@@ -84,10 +152,26 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
             row, _ = await _lock_mutable_route(session, provider_id=provider_id)
             if row is None:
                 raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
+            current_auth_mode = getattr(row, "auth_mode", "api_key")
+            target_auth_mode = str(patch.get("auth_mode", current_auth_mode)).strip()
+            target_provider_type = str(patch.get("provider_type", row.provider_type)).strip()
+            if (current_auth_mode != "api_key" or target_auth_mode != "api_key") and (
+                target_auth_mode != current_auth_mode or target_provider_type != row.provider_type
+            ):
+                raise ProviderValidationError("구독 인증 방식 또는 provider_type은 PATCH로 전환할 수 없습니다")
+            validate_provider_auth_configuration(
+                provider_type=target_provider_type,
+                auth_mode=target_auth_mode,
+                api_base=patch.get("api_base", row.api_base),
+                api_key=patch.get("api_key"),
+                api_key_env=patch.get("api_key_env", row.api_key_env),
+            )
             if patch.get("name"):
                 row.name = str(patch["name"]).strip()
             if patch.get("provider_type"):
-                row.provider_type = str(patch["provider_type"]).strip()
+                row.provider_type = target_provider_type
+            if "auth_mode" in patch:
+                row.auth_mode = target_auth_mode
             if "api_base" in patch:
                 row.api_base = patch["api_base"] or None
             if "api_key" in patch:
@@ -139,25 +223,42 @@ async def create_model(
     if not model_name or not model_name.strip():
         raise ProviderValidationError("model_name 은 필수입니다")
     input_price, output_price = _validate_price_pair(input_price_per_million, output_price_per_million)
-    row = LlmModel(
-        provider_id=provider_id,
-        model_name=model_name.strip(),
-        display_name=(display_name or None),
-        input_price=input_price,
-        output_price=output_price,
-        price_source="manual" if input_price is not None else None,
-        capabilities=(capabilities or None),
-        capability_source=("override" if capabilities else None),
-        is_active=is_active,
-    )
     try:
         async with factory() as session, session.begin():
-            provider = await session.get(LlmProvider, provider_id)
+            subscription_providers = await _lock_subscription_namespaces(session)
+            provider = subscription_providers.get(provider_id) or await session.get(LlmProvider, provider_id)
             if provider is None:
                 raise ProviderValidationError(f"프로바이더 {provider_id} 가 존재하지 않습니다")
+            auth_mode = getattr(provider, "auth_mode", "api_key")
+            namespace_provider_ids = tuple(
+                candidate.id
+                for candidate in subscription_providers.values()
+                if candidate.auth_mode == auth_mode
+            )
+            canonical_name = canonical_subscription_model_name(model_name, auth_mode)
+            await _reject_duplicate_subscription_model(
+                session,
+                namespace_provider_ids=namespace_provider_ids,
+                model_name=canonical_name,
+            )
+            row = LlmModel(
+                provider_id=provider_id,
+                model_name=canonical_name,
+                display_name=(display_name or None),
+                input_price=input_price,
+                output_price=output_price,
+                price_source="manual" if input_price is not None else None,
+                capabilities=(capabilities or None),
+                capability_source=("override" if capabilities else None),
+                is_active=is_active,
+            )
             session.add(row)
             await session.flush()
-            return _model_public(row, provider_type=provider.provider_type)
+            return _model_public(
+                row,
+                provider_type=provider.provider_type,
+                auth_mode=auth_mode,
+            )
     except IntegrityError as exc:
         raise ProviderValidationError("프로바이더 내 model_name 이 중복됩니다") from exc
     except OperationalError as exc:
@@ -201,6 +302,7 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
                         effective_output_price_per_million=effective_output,
                         effective_price_source=effective_source,
                         provider_type=provider.provider_type,
+                        auth_mode=getattr(provider, "auth_mode", "api_key"),
                     )
                 )
             return public_models
@@ -217,15 +319,36 @@ async def update_model(model_id: int, patch: dict) -> dict:
         raise ProviderValidationError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
     try:
         async with factory() as session, session.begin():
+            subscription_providers = await _lock_subscription_namespaces(session)
             provider_id = await session.scalar(select(LlmModel.provider_id).where(LlmModel.id == model_id))
             if provider_id is None:
                 raise ProviderNotFoundError(f"모델 {model_id} 를 찾을 수 없습니다")
+            locked_subscription_provider = subscription_providers.get(provider_id)
+            auth_mode = (
+                locked_subscription_provider.auth_mode
+                if locked_subscription_provider is not None
+                else await session.scalar(select(LlmProvider.auth_mode).where(LlmProvider.id == provider_id))
+            )
+            if auth_mode is None:
+                raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
+            namespace_provider_ids = tuple(
+                candidate.id
+                for candidate in subscription_providers.values()
+                if candidate.auth_mode == auth_mode
+            )
             provider, models = await _lock_mutable_route(session, provider_id=provider_id, model_ids={model_id})
             if provider is None:
                 raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
             row = models[0]
             if patch.get("model_name"):
-                row.model_name = str(patch["model_name"]).strip()
+                canonical_name = canonical_subscription_model_name(str(patch["model_name"]), auth_mode)
+                await _reject_duplicate_subscription_model(
+                    session,
+                    namespace_provider_ids=namespace_provider_ids,
+                    model_name=canonical_name,
+                    current_model_id=model_id,
+                )
+                row.model_name = canonical_name
             if "display_name" in patch:
                 row.display_name = patch["display_name"] or None
             if has_input_price:
@@ -237,13 +360,16 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 row.price_source = "manual" if input_price is not None else None
                 row.price_metadata = None
             if "capabilities" in patch:
-                # 관리자 수동 오버라이드 — models.dev import 로 덮이지 않도록 source=override 고정.
                 row.capabilities = patch["capabilities"] or None
                 row.capability_source = "override" if patch["capabilities"] else None
             if patch.get("is_active") is not None:
                 row.is_active = bool(patch["is_active"])
             await session.flush()
-            return _model_public(row, provider_type=provider.provider_type)
+            return _model_public(
+                row,
+                provider_type=provider.provider_type,
+                auth_mode=auth_mode,
+            )
     except IntegrityError as exc:
         raise ProviderValidationError("프로바이더 내 model_name 이 중복됩니다") from exc
     except OperationalError as exc:
@@ -338,7 +464,11 @@ async def import_models_dev_prices(
                 }
             await session.flush()
             return [
-                _model_public(rows_by_id[local_model_id], provider_type=provider.provider_type)
+                _model_public(
+                    rows_by_id[local_model_id],
+                    provider_type=provider.provider_type,
+                    auth_mode=getattr(provider, "auth_mode", "api_key"),
+                )
                 for local_model_id in selected_external
             ]
     except IntegrityError as exc:

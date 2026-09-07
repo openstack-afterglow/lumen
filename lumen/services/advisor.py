@@ -68,16 +68,15 @@ async def ask_with_route(
         {"role": "user", "content": f"Current goal:\n{goal[:_MAX_VISIBLE_CHARS]}"},
     ]
     try:
-        import litellm
-
-        response = await litellm.acompletion(
+        response = await litellm_client.acompletion(
             model=route["model_name"],
             messages=messages,
             custom_llm_provider=route["provider_type"],
             api_base=route.get("api_base"),
             api_key=route.get("api_key"),
+            provider_auth=route.get("provider_auth"),
             max_tokens=_MAX_ADVISOR_TOKENS,
-            stream=False,
+            extra={"stream": False},
         )
     except Exception as exc:
         raise AdvisorError("selected advisor request failed") from exc

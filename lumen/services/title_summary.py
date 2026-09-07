@@ -224,6 +224,7 @@ async def generate_title(*, exchange: Sequence[Mapping[str, Any]], route: Mappin
         "custom_llm_provider": route.get("provider_type"),
         "api_base": route.get("api_base"),
         "api_key": route.get("api_key"),
+        "provider_auth": route.get("provider_auth"),
         "max_tokens": _TITLE_MAX_TOKENS,
         "temperature": 0.0,
     }

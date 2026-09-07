@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from lumen.models.chat_db import LlmModel, LlmProvider
-from lumen.services.capabilities import litellm_capabilities, normalize_capabilities
+from lumen.services.capabilities import (
+    apply_subscription_capability_limits,
+    litellm_capabilities,
+    normalize_capabilities,
+)
 from lumen.services.litellm_client import effective_prices_per_million
 
 from .credentials import api_key_source
@@ -63,16 +68,42 @@ def _json_decimal_strings(value):
 
 
 def _provider_public(row: LlmProvider) -> dict:
-    """관리자 응답용 공개 dict — api_key 평문/암호문 절대 미포함."""
+    """Administrator projection without plaintext or encrypted credential material."""
+    auth_mode = getattr(row, "auth_mode", "api_key")
     source = api_key_source(row)
+    subscription_status = getattr(row, "subscription_status", "disconnected")
+    subscription_expires_at = getattr(row, "subscription_expires_at", None)
+    encrypted_subscription_tokens = getattr(row, "encrypted_subscription_tokens", None)
+    if auth_mode == "api_key":
+        has_credentials = source is not None
+        auth_status = "configured" if has_credentials else "disconnected"
+        auth_expires_at = None
+    else:
+        known_expiry_valid = subscription_expires_at is None or (
+            subscription_expires_at.replace(tzinfo=UTC)
+            if subscription_expires_at.tzinfo is None
+            else subscription_expires_at.astimezone(UTC)
+        ) > datetime.now(UTC)
+        has_credentials = bool(
+            encrypted_subscription_tokens
+            and subscription_status == "configured"
+            and (auth_mode == "chatgpt_device" or known_expiry_valid)
+        )
+        auth_status = subscription_status
+        auth_expires_at = _iso(subscription_expires_at)
+        source = None
     return {
         "id": row.id,
         "name": row.name,
         "provider_type": row.provider_type,
         "api_base": row.api_base,
+        "auth_mode": auth_mode,
+        "has_credentials": has_credentials,
+        "auth_status": auth_status,
+        "auth_expires_at": auth_expires_at,
         "has_api_key": source is not None,
         "api_key_source": source,
-        "api_key_env": row.api_key_env,
+        "api_key_env": row.api_key_env if auth_mode == "api_key" else None,
         "is_active": row.is_active,
         "margin_multiplier": float(row.margin_multiplier),
         "models_dev_provider_id": row.models_dev_provider_id,
@@ -81,12 +112,17 @@ def _provider_public(row: LlmProvider) -> dict:
     }
 
 
-def _effective_capabilities(row: LlmModel, provider_type: str | None) -> tuple[dict, str]:
-    """Stored override/models.dev data wins over fail-closed LiteLLM detection."""
+def _effective_capabilities(
+    row: LlmModel,
+    provider_type: str | None,
+    auth_mode: str = "api_key",
+) -> tuple[dict, str]:
+    """Stored override/models.dev data wins before transport limits are applied."""
     detected = litellm_capabilities(row.model_name, provider_type)
     if row.capabilities:
-        return normalize_capabilities(row.capabilities, detected), (row.capability_source or "override")
-    return detected, "litellm"
+        effective = normalize_capabilities(row.capabilities, detected)
+        return apply_subscription_capability_limits(effective, auth_mode), (row.capability_source or "override")
+    return apply_subscription_capability_limits(detected, auth_mode), "litellm"
 
 
 def _model_public(
@@ -96,8 +132,9 @@ def _model_public(
     effective_output_price_per_million: Decimal | None = None,
     effective_price_source: str | None = None,
     provider_type: str | None = None,
+    auth_mode: str = "api_key",
 ) -> dict:
-    eff_caps, eff_caps_source = _effective_capabilities(row, provider_type)
+    eff_caps, eff_caps_source = _effective_capabilities(row, provider_type, auth_mode)
     effective_input = (
         effective_input_price_per_million / _TOKENS_PER_MILLION
         if effective_input_price_per_million is not None
