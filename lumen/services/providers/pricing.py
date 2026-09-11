@@ -13,6 +13,7 @@ from lumen.services.capabilities import (
 )
 from lumen.services.litellm_client import effective_prices_per_million
 
+from .billing import billing_capability_for
 from .credentials import api_key_source, api_model_name
 from .errors import ProviderValidationError
 
@@ -104,6 +105,7 @@ def _provider_public(row: LlmProvider) -> dict:
         "has_api_key": source is not None,
         "api_key_source": source,
         "api_key_env": row.api_key_env if auth_mode == "api_key" else None,
+        "billing_capability": billing_capability_for(row.provider_type, auth_mode),
         "is_active": row.is_active,
         "margin_multiplier": float(row.margin_multiplier),
         "models_dev_provider_id": row.models_dev_provider_id,

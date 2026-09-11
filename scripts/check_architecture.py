@@ -395,7 +395,7 @@ def _review_block(source_digest: str, summary: str) -> bytes:
     payload = {
         "schema_version": 1,
         "source_sha256": source_digest,
-        "reviewed_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reviewed_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),  # noqa: UP017
         "summary": summary,
     }
     encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")

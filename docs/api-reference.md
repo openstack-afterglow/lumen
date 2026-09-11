@@ -50,6 +50,8 @@ OpenAI 비스트리밍/스트리밍 completion에서 `model="lumen"`을 사용�
 
 관리자 `GET /v1/admin/providers` 응답은 `has_api_key`, `api_key_source`(`database`/`environment`/`null`), `api_key_env`를 반환한다. `api_key_env` 이름만 설정하고 실제 환경 변수가 비어 있으면 `has_api_key=false`, `api_key_source=null`이다. 평문 key와 암호문은 어떤 응답에도 포함되지 않는다.
 
+`GET /v1/admin/providers/{provider_id}/billing`은 관리자 전용으로, inference credential과 동일한 API key로 공식 조회 endpoint가 있는 provider만 secret 없는 결제 snapshot을 반환한다. 현재 지원 범위는 OpenRouter `GET https://openrouter.ai/api/v1/key`의 key limit/remaining 및 일·주·월·누적 사용량과 DeepSeek `GET https://api.deepseek.com/user/balance`의 통화별 총액(`total_balance`)·구매액(`topped_up_balance`)·지급액(`granted_balance`)이다. `GET /v1/admin/providers`의 `billing_capability`가 `null`이면 조회 미지원이다. Lumen은 고정된 HTTPS endpoint만 호출하고 redirect를 따르지 않으며, credential·upstream body·원문 오류를 응답이나 로그에 복제하지 않는다. 조회 실패는 provider 실행 상태와 분리된 `status="unavailable"` 및 안전한 `reason`으로 반환한다.
+
 ## API 키와 월·주간 사용 한도
 
 API 키 발급 및 한도 관리는 Keystone token 인증 전용(Keystone-only)이다. API 키 헤더(Bearer/X-API-Key)로 관리 route 호출 시 401 Unauthorized를 반환한다.
@@ -65,19 +67,21 @@ API 키 발급 및 한도 관리는 Keystone token 인증 전용(Keystone-only)�
 
 ### 관리자 사용자 쿼터 route
 
-- `GET /v1/admin/quotas`: 사용자 지갑 쿼터 목록 (`require_admin`). 선택적 `user_id` query로 한 사용자만 조회한다. 응답은 `{"default_monthly_credit_limit": str, "items": [...]}`이며 각 항목은 `user_id`, `project_id`, `monthly_credit_limit`, `weekly_credit_limit`, `month_credited_cost`, `week_credited_cost`, `is_active`, `updated_at`이다. 지갑이 없는 사용자는 목록에 없고, 그 사용자의 유효 월 한도는 envelope의 `default_monthly_credit_limit`다. 주간 기본값은 항상 무제한이다.
-- `PUT /v1/admin/quotas/{user_id}`: 사용자 지갑 쿼터 설정 (`require_admin`). Body는 두 키가 모두 필수인 nullable `{"monthly_credit_limit": Decimal | null, "weekly_credit_limit": Decimal | null}`이고 `gt=0`, `max_digits=18`, `decimal_places=8`이다. JSON `null`은 무제한(DB `0`)을 뜻하며 지갑이 없으면 생성한다. 관리자가 쿼터를 낮춰도 기존 키 한도를 clamp하지 않고, `effective_*_credit_limit`이 항상 시스템 쿼터를 포함하므로 admission은 즉시 정확하다.
+- `GET /v1/admin/quotas`: 사용자 지갑 쿼터 목록 (`require_admin`). 선택적 `user_id` query로 한 사용자만 조회한다. Envelope은 runtime `default_monthly_credit_limit`, 항상 `null`인 독립 주간 기본값, `credit_policy`(`credit_per_usd`, `usd_per_credit`, formula), `items`를 반환한다. 각 item은 적용 중인 월·주간 한도와 사용량, 관리자 입력값인 `configured_*_credit_limit`, `*_limit_source`(`default`/`user`), `weekly_bound_by_monthly`를 구분한다. 지갑이 없거나 migration 뒤 column이 `NULL`인 사용자는 시스템 기본값을 상속한다.
+- `PUT /v1/admin/quotas/defaults`: 시스템 전체 기본 월 한도를 runtime에서 설정한다. Body는 `{"monthly_credit_limit": Decimal | null}`이고 `null`은 기본 월 한도 무제한이다. 개인 override가 없는 모든 사용자에게 다음 조회/admission부터 적용된다.
+- `PUT /v1/admin/quotas/{user_id}`: 사용자 개인 쿼터 override 설정 (`require_admin`). Body는 두 키가 모두 필수인 nullable `{"monthly_credit_limit": Decimal | null, "weekly_credit_limit": Decimal | null}`이고 positive Decimal은 명시 한도, JSON `null`은 해당 기간 명시적 무제한(DB `0`)이다. 유한 주간 한도가 유한 월 한도보다 크면 409로 거부한다.
+- `DELETE /v1/admin/quotas/{user_id}`: 개인 월·주간 값을 `NULL`로 되돌려 시스템 기본값 상속 상태로 복원한다. 지갑과 immutable usage ledger는 삭제하지 않는다.
 
 ### 응답 포맷과 프로젝션
 
-모든 한도 및 사용량 필드(`owner_monthly_credit_limit`, `admin_monthly_credit_limit`, `system_monthly_credit_limit`, `effective_monthly_credit_limit`, `month_credited_cost`, `owner_weekly_credit_limit`, `system_weekly_credit_limit`, `effective_weekly_credit_limit`, `week_credited_cost`)는 부동소수점 오차를 방지하기 위해 고정소수점 문자열(예: `"100.00000000"`) 또는 `null`로 반환된다. `system_*_credit_limit`의 `"0"`은 시스템 쿼터 무제한이다.
+모든 한도 및 사용량 필드는 부동소수점 오차를 피하도록 고정소수점 문자열(예: `"100.00000000"`) 또는 `null`로 반환된다. 관리자 quota item의 `configured_*_credit_limit=null`은 상속, `"0"`은 명시적 무제한이고, `monthly_credit_limit`/`weekly_credit_limit`은 현재 적용되는 public projection이다. API-key projection의 owner/admin/system/effective 한도도 같은 문자열 규칙을 사용한다.
 
 ### 한도 계산 및 차단 규칙
 
 1. **기간 및 단위**: 월 한도는 UTC 달력월(`created_at >= UTC month start`), 주간 한도는 ISO 주(월요일 `00:00` UTC) 기준이며, 단위는 변경 불가능한 `ChatUsageLog.credited_cost` 원장 합계다. 별도 누적 카운터나 리셋 타임스탬프를 두지 않고 조회/admission 시점에 동적으로 계산한다.
-2. **유효 한도 우선순위**: `effective_monthly_credit_limit = min(owner_monthly, admin_monthly, positive_system_monthly)`이고 `effective_weekly_credit_limit = min(owner_weekly, positive_system_weekly)`이다. `null`은 해당 계층의 한도 없음을 의미하며, 시스템 쿼터 `0`은 시스템 쿼터 제한 없음(unlimited)을 의미한다. 월간과 주간은 독립적으로 공존하며 한쪽만 설정하면 그 기간만 강제된다.
-3. **동적 시스템 쿼터 재계산**: 시스템 쿼터(`UserWallet.max_quota_monthly`/`max_quota_weekly` 또는 기본 쿼터)는 키 데이터베이스 행을 수정하지 않고 요청 시점에 실시간 재계산하여, 시스템 쿼터 변경 시 즉시 반영된다.
-4. **409 Conflict 경계**: 소유자/관리자 월 한도를 positive system monthly quota보다 크게 설정하거나 소유자 월 한도를 관리자 ceiling보다 크게 설정하면 409 Conflict다. 소유자 주간 한도가 `min(positive system weekly, positive system monthly, admin ceiling)`을 넘으면 409 `API 키 주간 한도는 사용자 쿼터를 초과할 수 없습니다`다.
+2. **유효 한도 우선순위**: 사용자 월·주간 값이 `NULL`이면 시스템 정책을 상속하고, 양수는 개인 한도, `0`은 해당 기간 명시적 무제한이다. 월 한도는 runtime singleton 정책(`chat_quota_policies`)이 있으면 그것을, 없으면 `chat_default_monthly_quota`를 기본값으로 사용한다. 주간 기본값은 별도 ceiling 없이 무제한이지만 월 admission 검사는 항상 독립적으로 먼저 실행되므로 주간 무제한이 월 한도를 우회하지 않는다.
+3. **동적 시스템 쿼터 재계산**: 시스템 기본 월 한도와 사용자 상속/override는 API-key 행을 수정하지 않고 요청 시점에 실시간 계산한다. 시스템 기본값 변경이나 개인 reset은 다음 admission에 즉시 반영된다.
+4. **409 Conflict 경계**: 사용자 개인 유한 주간 한도가 개인/상속으로 계산되는 유한 월 한도보다 크면 409다. API key의 owner/admin 한도는 사용자 유효 한도를 넘을 수 없으며, 유한 주간 key 한도도 유한 월 ceiling을 넘으면 409다.
 5. **Admission 검사 및 Quota 오류**: Provider 호출 전 admission gate에서 사용자 월·주간 사용량과 키 월·주간 사용량을 검사한다. 한도 도달/초과 시:
    - 사용자 지갑: 402/429 `월 사용 한도를 초과했습니다` 또는 `주간 사용 한도를 초과했습니다`
    - Native route (`/v1/temp-completions` 등): 402 `API 키 월 사용 한도를 초과했습니다` 또는 `API 키 주간 사용 한도를 초과했습니다`
@@ -89,7 +93,8 @@ API 키 발급 및 한도 관리는 Keystone token 인증 전용(Keystone-only)�
 ### 사용량 Surface 구별
 
 - 당월·당주 키 관리 뷰: `GET /v1/api-keys` 및 `GET /v1/admin/api-keys`는 zero-usage 키를 포함하는 현재 기간 한도/사용량 관리 프로젝션이다.
-- 본인 사용량 요약: `GET /v1/usage/summary`는 `month_credited_cost`, `week_credited_cost`, `quota_used`, `quota_max`, `quota_weekly_max`를 함께 반환한다. `quota_*_max`의 `0`은 무제한이다.
+- 본인 사용량 요약: `GET /v1/usage/summary`는 `month_credited_cost`, `week_credited_cost`, `quota_used`, `quota_max`, `quota_weekly_max`를 함께 반환한다. 독립 주간 ceiling이 없을 때 `quota_weekly_max=0`이지만 월 ceiling은 계속 강제된다.
+- 관리자 사용자 상세: `GET /v1/admin/stats/users/{user_id}`는 `range=7d|30d|90d|1y|all`, 선택적 `source=web|api`, `before_id`, `limit`을 받고 기간 metadata, 전체·모델별·source별 aggregate와 timestamp/token/raw USD/credited cost/API-key attribution을 포함한 immutable ledger page를 반환한다.
 - 이력 및 격리 사용량 Surface: 기존 `GET /v1/usage/keys` (기간별 historical 집계) 및 `GET /v1/usage/records` (현재 키로 격리된 레코드 커서 조회)는 기존 계약을 유지하며 당월 관리 뷰와 구별된다.
 
 ## Native completion

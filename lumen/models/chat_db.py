@@ -249,14 +249,35 @@ class ChatUsageLog(Base):
     )
 
 
+class ChatQuotaPolicy(Base):
+    """Singleton runtime quota defaults. Deployment config remains the bootstrap fallback."""
+
+    __tablename__ = "chat_quota_policies"
+
+    id: Mapped[int] = mapped_column(INT, primary_key=True, default=1, autoincrement=False)
+    default_monthly_credit_limit: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        CheckConstraint("id = 1", name="chk_chat_quota_policies_singleton"),
+        CheckConstraint(
+            "default_monthly_credit_limit >= 0",
+            name="chk_chat_quota_policies_default_monthly",
+        ),
+    )
+
+
 class UserWallet(Base):
     __tablename__ = "user_wallets"
 
     user_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
     project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     balance_credits: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
-    max_quota_monthly: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
-    max_quota_weekly: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
+    # NULL inherits the runtime default; zero is an explicit unlimited override.
+    max_quota_monthly: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True, default=None)
+    # The weekly default is no separate cap; monthly admission remains authoritative.
+    max_quota_weekly: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True, default=None)
     used_quota_this_month: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     reserved_credits: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     quota_period_start: Mapped[date | None] = mapped_column(Date)

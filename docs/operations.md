@@ -39,6 +39,8 @@ Worker lease는 45초다. run이 `running`이 아니거나 lease owner/expiry가
 
 적용된 SQL migration/checksum은 immutable이다. 유지보수 cutover는 API/worker stop → backup/DB readiness → `lumen-migrate --apply` → API/worker start 순서다. 적용 뒤 동일 command를 다시 실행해 pending migration이 없는지 확인한다. rolling mixed-version deployment는 지원 전제가 아니다.
 
+Migration `010_quota_policy_and_inheritance.sql`은 `user_wallets.max_quota_monthly/max_quota_weekly`를 nullable inheritance column으로 전환하고 singleton `chat_quota_policies`를 만든다. 기존 `0` 값은 명시적 무제한으로 보존되므로 자동으로 기본값 상속으로 바뀌지 않는다. 관리자가 해당 사용자를 reset해야 두 column이 `NULL`이 된다. API와 worker가 새 nullable 의미를 함께 사용하므로 이 migration도 mixed-version rolling deployment 없이 적용한다.
+
 ## Container 이미지 빌드 및 GHCR 배포
 
 Lumen은 GitHub Actions 파이프라인(`.github/workflows/docker-build.yml`)을 통해 Docker 이미지를 자동으로 빌드하고 GitHub Container Registry(GHCR)에 게시한다.

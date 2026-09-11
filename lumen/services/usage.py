@@ -14,7 +14,8 @@ from sqlalchemy import func, select
 
 from lumen.db import get_session_factory, is_db_available
 from lumen.models.chat_contracts import UsageRecord, UsageRecordPage
-from lumen.models.chat_db import ChatUsageLog, UserWallet
+from lumen.models.chat_db import ChatUsageLog
+from lumen.services import quota_policy
 from lumen.services.quota_periods import month_start, week_start
 
 logger = logging.getLogger(__name__)
@@ -89,7 +90,7 @@ async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int
                     .group_by(ChatUsageLog.source)
                 )
             ).all()
-            wallet = await session.get(UserWallet, user_id)
+            system_quota = await quota_policy.get_system_quota(session, user_id)
         tc, tp, tct, tcount = total
         mc, mp, mct, mcount = month
         by_source = [
@@ -108,8 +109,8 @@ async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int
             "month_completion_tokens": int(mct or 0),
             "month_request_count": int(mcount or 0),
             "quota_used": float(mc or 0),
-            "quota_max": float(wallet.max_quota_monthly) if wallet else 0.0,
-            "quota_weekly_max": float(wallet.max_quota_weekly) if wallet else 0.0,
+            "quota_max": float(system_quota.monthly),
+            "quota_weekly_max": float(system_quota.weekly),
             "by_source": by_source,
         }
     except Exception:

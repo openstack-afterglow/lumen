@@ -18,11 +18,12 @@ Custom HTTP tool은 SSRF/DNS pinning transport, private/internal address block, 
 
 Admission은 principal scope와 project ownership을 검사하고 immutable request/model/extension snapshot을 journal에 저장한다. Worker는 configuration을 다시 검증한다. key revoke는 이후 HTTP 요청을 401로 만들지만 이미 accepted run은 immutable authorization snapshot으로 완료될 수 있다. 과거 run을 중단하려면 Keystone owner가 cancel endpoint를 호출한다.
 
-API 키 월간 사용 한도는 UTC 달력월 기준 변경 불가능한 `ChatUsageLog.credited_cost` 원장을 모체로 사용하며, `effective = min(owner_limit, admin_limit, positive_system_quota)` 우선순위로 적용된다 (`null`은 해당 계층 한도 없음, system 0은 unlimited). 시스템 쿼터는 수락 시점에 동적 계산되며 409 Conflict로 상위 한도 초과 설정을 방지한다. 사전 admission gate 검사에서 한도 도달 시 native 402, compat 429 오류를 반환한다. 사전 검사 특성상 동시/단일 요청 오버슈트(overshoot)가 발생할 수 있으나 이후 요청은 차단되며, 이미 수락된 run 및 동일 `Idempotency-Key` 재전송은 유효성/멱등성 스냅샷에 따라 정상 수행된다. 당월 관리 뷰 (`GET /v1/api-keys`, `GET /v1/admin/api-keys`)는 zero-usage 키를 포함하며 historical `/v1/usage/keys` 및 현재 키 격리 `/v1/usage/records` surface와 분리된다.
+사용자 월간 한도는 UTC 달력월 기준 immutable `ChatUsageLog.credited_cost` 원장을 모체로 사용한다. `user_wallets.max_quota_* IS NULL`은 시스템 정책 상속, 양수는 개인 override, `0`은 명시적 무제한이고, runtime `chat_quota_policies` singleton이 없을 때만 배포 설정 `chat_default_monthly_quota`를 기본 월 한도로 사용한다. 독립 주간 ceiling이 무제한이어도 월 admission 검사는 항상 먼저 수행되므로 월 한도를 우회하지 않는다. 유한 주간 override가 유한 월 한도보다 크면 409 Conflict다. API-key owner/admin ceiling은 이 사용자 유효 한도와 함께 요청 시점에 동적으로 계산한다. 사전 admission gate에서 한도 도달 시 native 402, compat 429를 반환한다. 동시/단일 요청 오버슈트는 가능하지만 이후 요청은 차단하며, 이미 수락된 run과 동일 `Idempotency-Key` replay는 스냅샷 계약을 따른다. 당월 관리 뷰, historical usage surface, 관리자 사용자 상세 ledger는 서로 구별한다.
 
 ## 운영 점검
 
 - encryption key와 MariaDB backup은 같은 recovery plan으로 보관한다.
 - provider/MCP/Git secret은 secret manager에서 주입한다.
 - logs와 alert payload에 Authorization, API key, tool argument, raw provider response를 넣지 않는다.
+- provider billing 조회는 고정된 공식 HTTPS endpoint만 사용하고 redirect를 따르지 않는다. 응답은 allowlist된 숫자·통화·상태 필드만 projection하며 Authorization, raw upstream body, 원문 오류를 반환하거나 기록하지 않는다.
 - admin network 접근과 user-native API surface를 분리한다.

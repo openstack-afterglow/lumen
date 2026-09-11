@@ -13,14 +13,13 @@ import secrets
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import NamedTuple
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 
-from lumen.config import get_settings
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
-from lumen.models.chat_db import ChatApiKey, ChatUsageLog, UserWallet
+from lumen.models.chat_db import ChatApiKey, ChatUsageLog
+from lumen.services import quota_policy
 from lumen.services.quota_periods import month_start, week_start
 
 logger = logging.getLogger(__name__)
@@ -137,38 +136,15 @@ def calculate_effective_limit(
     return min(candidates) if candidates else None
 
 
-class SystemQuota(NamedTuple):
-    monthly: Decimal
-    weekly: Decimal
+SystemQuota = quota_policy.SystemQuota
 
 
 async def _get_system_quotas_batch(session, user_ids: Iterable[str]) -> dict[str, SystemQuota]:
-    u_set = set(user_ids)
-    if not u_set:
-        return {}
-    default_quota = Decimal(str(get_settings().chat_default_monthly_quota))
-    default = SystemQuota(default_quota, Decimal("0"))
-    res = {uid: default for uid in u_set}
-    stmt = select(
-        UserWallet.user_id,
-        UserWallet.max_quota_monthly,
-        UserWallet.max_quota_weekly,
-    ).where(UserWallet.user_id.in_(u_set))
-    rows = (await session.execute(stmt)).all()
-    for uid, max_monthly, max_weekly in rows:
-        res[uid] = SystemQuota(
-            Decimal(str(max_monthly)) if max_monthly is not None else default_quota,
-            Decimal(str(max_weekly)) if max_weekly is not None else Decimal("0"),
-        )
-    return res
+    return await quota_policy.get_system_quotas_batch(session, user_ids)
 
 
 async def _get_system_quota(session, user_id: str) -> SystemQuota:
-    res = await _get_system_quotas_batch(session, [user_id])
-    return res.get(
-        user_id,
-        SystemQuota(Decimal(str(get_settings().chat_default_monthly_quota)), Decimal("0")),
-    )
+    return await quota_policy.get_system_quota(session, user_id)
 
 
 async def _credited_costs_since_batch(

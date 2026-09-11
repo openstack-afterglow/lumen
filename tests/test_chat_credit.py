@@ -73,6 +73,8 @@ class TestPrecheckFailClosed:
         monkeypatch.setattr("lumen.services.credit.get_session_factory", lambda: None)
         with pytest.raises(credit.ChatStorageUnavailable):
             await credit.precheck("test-user-123", "test-project-123")
+
+
 class TestPrecheckApiKeyLimit:
     """API 키 월 사용량 한도 precheck 테스트."""
 
@@ -142,6 +144,19 @@ class TestPrecheckApiKeyLimit:
 
         await credit.precheck("u1", "p1", api_key_id=None)
         assert len(session.executed_stmts) == 0
+
+    async def test_unlimited_weekly_remains_bounded_by_monthly(self, monkeypatch):
+        wallet = self._make_wallet(
+            max_quota=Decimal("100"),
+            used_quota=Decimal("100"),
+        )
+        wallet.max_quota_weekly = Decimal("0")
+        session = self.FakeSession(wallet=wallet)
+        self._mock_db(monkeypatch, session)
+
+        with pytest.raises(credit.QuotaExceeded, match="월 사용 한도를 초과했습니다"):
+            await credit.precheck("u1", "p1", api_key_id=None)
+        assert session.executed_stmts == []
 
     async def test_weekly_wallet_limit_rejects_from_ledger(self, monkeypatch):
         wallet = self._make_wallet(max_quota=Decimal("100"), used_quota=Decimal("0"))

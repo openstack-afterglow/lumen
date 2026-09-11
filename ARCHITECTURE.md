@@ -19,7 +19,8 @@ Lumen은 LiteLLM provider 실행, LangGraph/LangChain agent runtime, 대화·dur
 | MariaDB journal과 SSE replay | implemented | source-reviewed, test-defined | retention 밖 cursor는 410이며 webhook push는 제공하지 않는다 | `lumen/models/chat_runs.py`, `lumen/services/durable_runs/queries.py`, `lumen/api/completions.py` |
 | OpenAI/Anthropic compatibility | implemented | test-passed (`uv run lumen-test contract`, 2026-09-08) | 공개 model ID는 stateless route이며 다른 provider와 겹치지 않는 고유 모델은 provider 생략 시에도 정상 라우팅되고 중복 ID는 `provider` 없이 409로 거부하며 공급사 전체 API 동등성은 보장하지 않는다 | `lumen/api/compat/openai.py`, `lumen/api/compat/anthropic.py`, `lumen/services/completion_api.py` |
 | OpenAI virtual `model="lumen"` | implemented | source-reviewed, test-defined | text transcript만 허용하며 caller tool, memory, MCP와 native tool 실행은 비활성화된다 | `lumen/api/compat/openai.py`, `lumen/services/openai_compat.py` |
-| Provider/model routing and credentials | implemented | test-passed (`uv run lumen-test contract`, 2026-09-08) | 공개 `api_model_name`/`api_provider`와 내부 LiteLLM route key를 분리하고 provider 설정은 관리자 소유이며 durable 실행 route는 snapshot과 worker 재검증을 거친다 | `lumen/services/providers/repository.py`, `lumen/services/providers/routing.py`, `lumen/services/providers/credentials.py` |
+| Provider/model routing, credentials, billing | implemented | focused tests passed (2026-09-11) | 공개 `api_model_name`/`api_provider`와 내부 LiteLLM route key를 분리한다. OpenRouter key와 DeepSeek balance만 공식 고정 endpoint를 통한 secret-safe billing snapshot을 제공하며 지원하지 않는 provider는 capability가 없다. | `lumen/services/providers/repository.py`, `lumen/services/providers/routing.py`, `lumen/services/providers/credentials.py`, `lumen/services/providers/billing.py` |
+| 사용자 quota policy와 usage ledger | implemented | focused tests passed (2026-09-11) | runtime 기본 월 한도와 개인 상속/override를 분리하고, 주간 무제한이어도 월 ceiling을 강제한다. 관리자 상세은 immutable ledger projection이며 reservation 없는 동시 overshoot 가능성은 유지된다. | `lumen/services/quota_policy.py`, `lumen/services/credit.py`, `lumen/services/stats.py`, `lumen/api/quotas.py`, `lumen/api/stats.py` |
 | Native managed tools, skills, MCP | partial | source-reviewed, test-defined | extension package installer, subagent spawn, sandbox binding, semantic prompt ranking은 schema/policy가 있어도 현재 실행 runtime이 아니다 | `lumen/services/tool_runtime/`, `lumen/services/mcp_adapter.py`, `docs/agent-platform.md` |
 | Memory and semantic store | partial | source-reviewed, test-defined | authoritative memory는 MariaDB이며 PostgreSQL/pgvector는 선택 기능이고 protocol v2에는 encrypted PostgreSQL checkpointer가 필수다 | `lumen/models/chat_db.py`, `lumen/services/semantic_memory.py`, `lumen/services/checkpointer.py` |
 | API-key and Keystone SDK transports | implemented | source-reviewed, test-defined | SDK는 native API surface를 호출하며 provider credentials를 소유하거나 직접 노출하지 않는다 | `sdk/lumen_sdk/client.py`, `sdk/lumen_sdk/proxy.py`, `lumen/auth.py` |
@@ -70,8 +71,9 @@ flowchart LR
 | `lumen/api/compat/anthropic.py` | Anthropic request/response/SSE 변환, 공개 ID/provider 기반 stateless completion | API-key auth → `completion_api` |
 | `lumen/services/completion_api.py` | 공개 route resolve, quota precheck, LiteLLM stateless completion/usage billing | compat → providers/litellm |
 | `lumen/api/api_keys.py`, `lumen/services/api_key_store.py` | owner/admin API-key CRUD, 이름 변경(`PATCH /v1/api-keys/{id}`), 월·주간 owner 한도(`PATCH /v1/api-keys/{id}/limits`)와 effective 한도 projection | Keystone route → MariaDB; 한도 상한은 사용자 지갑 쿼터 |
-| `lumen/api/quotas.py`, `lumen/services/credit.py`, `lumen/services/quota_periods.py` | 관리자 사용자 쿼터 조회/설정(`GET/PUT /v1/admin/quotas`), 월(UTC 1일)·주간(ISO 월요일 UTC) 경계 계산, usage ledger 합계 기반 admission | admin route → MariaDB wallet/usage ledger |
-| `lumen/services/providers/` | provider/model CRUD, 공개 ID projection, Perplexity route encoding, subscription credential policy, immutable route resolution/locking | repository → ORM; compat/worker execution snapshot 소비 |
+| `lumen/api/quotas.py`, `lumen/services/credit.py`, `lumen/services/quota_policy.py`, `lumen/services/quota_periods.py` | runtime 기본 월 quota, 사용자 `NULL` 상속/양수 override/`0` 무제한, reset, 월·주간 ledger admission | admin route → MariaDB policy/wallet/usage ledger |
+| `lumen/api/stats.py`, `lumen/services/stats.py` | 관리자 aggregate와 사용자별 기간·model·web/API·timestamp/token/cost ledger drill-down | admin route → immutable MariaDB usage ledger |
+| `lumen/services/providers/` | provider/model CRUD, 공개 ID projection, route/credential policy, 공식 OpenRouter/DeepSeek billing snapshot | repository/billing → ORM 및 고정 provider HTTPS endpoint; compat/worker snapshot 소비 |
 | `lumen/services/graph.py`, `lumen/services/engine.py` | LangGraph model/tool loop와 normalized stream boundary | durable execution → provider/tool/checkpointer |
 | `lumen/services/tool_runtime/` | binding, frozen selection, schema, managed/custom dispatch | admission snapshot → worker-time revalidation |
 | `lumen/services/mcp_adapter.py` | Afterglow MCP control-plane snapshot/claim bridge | Lumen worker → configured Afterglow endpoint |
@@ -103,7 +105,7 @@ flowchart LR
 
 ## Data and contracts
 
-- **Authoritative MariaDB**: `llm_providers`/`llm_models` catalog, conversations/messages, `chat_runs`/`chat_run_events`/turns/segments/leases, API-key hash·scope·월/주간 owner 한도, `user_wallets`의 월·주간 쿼터(`0` = 무제한), encrypted provider/extension/skill/memory metadata, usage ledger가 정본이다. 주간 사용량은 별도 카운터 없이 `chat_usage_logs` 합계로 계산한다. run input와 secret-bearing content는 encryption boundary를 통과하며 API response에 raw secret을 복제하지 않는다.
+- **Authoritative MariaDB**: `llm_providers`/`llm_models` catalog, conversations/messages, `chat_runs`/`chat_run_events`/turns/segments/leases, API-key hash·scope·owner/admin 한도, `chat_quota_policies` singleton의 runtime 기본 월 한도, `user_wallets`의 nullable 상속/개인 월·주간 quota, encrypted provider/extension/skill/memory metadata와 immutable usage ledger가 정본이다. `NULL`은 정책 상속, 양수는 개인 ceiling, `0`은 명시적 무제한이며, 독립 주간 ceiling이 없어도 월 ledger admission은 계속 강제된다. run input와 secret-bearing content는 encryption boundary를 통과하며 API response에 raw secret을 복제하지 않는다.
 - **Redis cache/queue optimization**: `lumen/cache.py`의 cache와 `afterglow:chat:runs` wakeup은 유실되어도 데이터 정합성을 바꾸지 않는다. Redis가 authoritative durable queue가 아니므로 worker가 DB polling한다.
 - **PostgreSQL boundary**: configured encrypted LangGraph checkpointer는 protocol v2 admission prerequisite이며, `CHAT_MEMORY_PGVECTOR_URL`은 선택 semantic-memory index다. PostgreSQL은 MariaDB run/event/catalog의 대체 정본이 아니다. semantic ranking과 recency prompt hydration도 별도 경로다.
 - **Other stores**: configured S3는 service-owned asset object store이고 ClamAV/sandbox/MCP는 optional external boundary다. asset metadata/ownership은 MariaDB가 보유한다.
@@ -175,9 +177,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e4739292bd6dd8331339dd7c3ea83be905b9dc05fd6328b1217ebc66b46b3e3b",
-  "reviewed_at": "2026-09-11T06:10:12Z",
-  "summary": "No structure impact: restored partial API-key limit PATCH semantics at the existing request/service boundary and added regression coverage."
+  "source_sha256": "627b5028daff6b0f411a8a27f264edcabf09d45e2fa544a97f70b65e89561d6d",
+  "reviewed_at": "2026-09-11T10:29:12Z",
+  "summary": "Quota policy inheritance, admin usage detail, and supported-provider billing endpoints reviewed; documentation and migration topology updated."
 }
 ```
 <!-- architecture-review:end -->

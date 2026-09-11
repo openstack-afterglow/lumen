@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 
 from lumen.auth import require_admin
 from lumen.services import model_discovery, models_dev
-from lumen.services.providers import credentials, errors, repository, subscriptions
+from lumen.services.providers import billing, credentials, errors, repository, subscriptions
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
@@ -98,9 +98,45 @@ class ProviderResponse(BaseModel):
     api_key_env: str | None = None
     is_active: bool
     margin_multiplier: float
+    billing_capability: Literal["openrouter_key", "deepseek_balance"] | None = None
     created_at: str | None
     updated_at: str | None
     models_dev_provider_id: str | None = None
+
+
+class ProviderBillingBalance(BaseModel):
+    currency: str
+    total: Decimal
+    granted: Decimal
+    purchased: Decimal
+
+
+class ProviderBillingResponse(BaseModel):
+    provider_id: int
+    provider_type: str
+    capability: Literal["openrouter_key", "deepseek_balance"] | None
+    status: Literal["available", "unavailable", "unsupported"]
+    reason: (
+        Literal[
+            "billing_endpoint_unsupported",
+            "credential_unavailable",
+            "credential_not_configured",
+            "provider_authorization_failed",
+            "provider_request_failed",
+            "provider_unavailable",
+        ]
+        | None
+    )
+    fetched_at: datetime
+    is_available: bool | None
+    is_free_tier: bool | None
+    limit: Decimal | None
+    remaining: Decimal | None
+    usage_total: Decimal | None
+    usage_daily: Decimal | None
+    usage_weekly: Decimal | None
+    usage_monthly: Decimal | None
+    balances: list[ProviderBillingBalance]
 
 
 class DeviceAuthStartResponse(BaseModel):
@@ -303,6 +339,19 @@ def _map_subscription_error(exc: Exception) -> HTTPException:
 async def list_providers():
     try:
         return await repository.list_providers()
+    except errors.ChatStorageUnavailable as exc:
+        raise _map_storage(exc) from exc
+
+
+@router.get(
+    "/admin/providers/{provider_id}/billing",
+    response_model=ProviderBillingResponse,
+)
+async def get_provider_billing(provider_id: int):
+    try:
+        return await billing.get_provider_billing(provider_id)
+    except errors.ProviderNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
