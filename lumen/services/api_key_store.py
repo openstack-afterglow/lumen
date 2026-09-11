@@ -358,12 +358,13 @@ async def update_owner_limits(
     key_id: int,
     user_id: str,
     project_id: str,
-    monthly_credit_limit: Decimal | None,
-    weekly_credit_limit: Decimal | None,
+    limits: dict[str, Decimal | None],
 ) -> dict:
     """소유자의 키 월간·주간 한도 수정/해제."""
-    monthly = _validate_credit_limit(monthly_credit_limit, label="월")
-    weekly = _validate_credit_limit(weekly_credit_limit, label="주간")
+    monthly_supplied = "monthly_credit_limit" in limits
+    weekly_supplied = "weekly_credit_limit" in limits
+    monthly = _validate_credit_limit(limits["monthly_credit_limit"], label="월") if monthly_supplied else None
+    weekly = _validate_credit_limit(limits["weekly_credit_limit"], label="주간") if weekly_supplied else None
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
@@ -377,15 +378,17 @@ async def update_owner_limits(
                 row.admin_monthly_credit_limit,
                 system,
             )
-            if monthly is not None:
+            if monthly_supplied and monthly is not None:
                 if row.admin_monthly_credit_limit is not None and monthly > row.admin_monthly_credit_limit:
                     raise ApiKeyLimitConflict("API 키 월 한도는 관리자 한도를 초과할 수 없습니다")
                 if system.monthly > 0 and monthly > system.monthly:
                     raise ApiKeyLimitConflict("API 키 월 한도는 시스템 월 쿼터를 초과할 수 없습니다")
-            if weekly is not None and weekly_ceiling is not None and weekly > weekly_ceiling:
+            if weekly_supplied and weekly is not None and weekly_ceiling is not None and weekly > weekly_ceiling:
                 raise ApiKeyLimitConflict("API 키 주간 한도는 사용자 쿼터를 초과할 수 없습니다")
-            row.owner_monthly_credit_limit = monthly
-            row.owner_weekly_credit_limit = weekly
+            if monthly_supplied:
+                row.owner_monthly_credit_limit = monthly
+            if weekly_supplied:
+                row.owner_weekly_credit_limit = weekly
             await session.flush()
             month_usage = await _credited_cost_since(session, row.id, month_start())
             week_usage = await _credited_cost_since(session, row.id, week_start())

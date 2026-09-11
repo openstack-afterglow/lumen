@@ -175,9 +175,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "ae8986d5eedbf037b2bd51fb7026cfe386216b65c1ea26731c59cda32d27ea0a",
-  "reviewed_at": "2026-09-11T05:56:36Z",
-  "summary": "Reviewed accumulated model routing, provider transport, quota administration, usage accounting, documentation, tests, CI, and deployment-facing schema changes."
+  "source_sha256": "e4739292bd6dd8331339dd7c3ea83be905b9dc05fd6328b1217ebc66b46b3e3b",
+  "reviewed_at": "2026-09-11T06:10:12Z",
+  "summary": "No structure impact: restored partial API-key limit PATCH semantics at the existing request/service boundary and added regression coverage."
 }
 ```
 <!-- architecture-review:end -->

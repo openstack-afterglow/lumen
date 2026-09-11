@@ -275,9 +275,64 @@ class TestStorePureLogic:
                 1,
                 "u-owner",
                 "p-owner",
-                None,
-                Decimal("21"),
+                {"weekly_credit_limit": Decimal("21")},
             )
+
+    async def test_update_owner_limits_preserves_omitted_weekly_limit(self, monkeypatch):
+        row = SimpleNamespace(
+            id=1,
+            name="n",
+            key_prefix="sk-afgl-AbCd",
+            is_active=True,
+            last_used_at=None,
+            created_at=None,
+            scopes=["models:read"],
+            revoked_at=None,
+            owner_user_id="u-owner",
+            owner_project_id="p-owner",
+            owner_monthly_credit_limit=None,
+            admin_monthly_credit_limit=None,
+            owner_weekly_credit_limit=Decimal("7"),
+        )
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def begin(self):
+                return self
+
+            async def get(self, model, key_id):
+                return row if key_id == row.id else None
+
+            async def flush(self):
+                return None
+
+        session = FakeSession()
+        monkeypatch.setattr(aks, "_require_db", lambda: lambda: session)
+
+        async def fake_quota(_session, _user_id):
+            return aks.SystemQuota(Decimal("100"), Decimal("20"))
+
+        async def fake_cost(_session, _key_id, _since):
+            return Decimal("0")
+
+        monkeypatch.setattr(aks, "_get_system_quota", fake_quota)
+        monkeypatch.setattr(aks, "_credited_cost_since", fake_cost)
+
+        result = await aks.update_owner_limits(
+            1,
+            "u-owner",
+            "p-owner",
+            {"monthly_credit_limit": Decimal("25")},
+        )
+
+        assert row.owner_monthly_credit_limit == Decimal("25")
+        assert row.owner_weekly_credit_limit == Decimal("7")
+        assert result["owner_weekly_credit_limit"] == "7"
 
     async def test_rename_key_rejects_non_owner(self, monkeypatch):
         row = SimpleNamespace(
@@ -563,22 +618,21 @@ class TestRouter:
             key_id,
             user_id,
             project_id,
-            monthly_credit_limit,
-            weekly_credit_limit,
+            limits,
         ):
             captured.update(
                 key_id=key_id,
                 user_id=user_id,
                 project_id=project_id,
-                monthly=monthly_credit_limit,
-                weekly=weekly_credit_limit,
+                limits=limits,
             )
+            monthly = limits.get("monthly_credit_limit")
             return {
                 "id": key_id,
-                "owner_monthly_credit_limit": str(monthly_credit_limit) if monthly_credit_limit else None,
+                "owner_monthly_credit_limit": str(monthly) if monthly else None,
                 "admin_monthly_credit_limit": None,
                 "system_monthly_credit_limit": "100.0",
-                "effective_monthly_credit_limit": str(monthly_credit_limit) if monthly_credit_limit else "100.0",
+                "effective_monthly_credit_limit": str(monthly) if monthly else "100.0",
                 "month_credited_cost": "0",
             }
 
@@ -589,56 +643,67 @@ class TestRouter:
             json={"monthly_credit_limit": "40.0", "weekly_credit_limit": "10.0"},
         )
         assert resp.status_code == 200
-        assert captured["monthly"] == Decimal("40.0")
-        assert captured["weekly"] == Decimal("10.0")
+        assert captured["limits"] == {
+            "monthly_credit_limit": Decimal("40.0"),
+            "weekly_credit_limit": Decimal("10.0"),
+        }
 
         resp = await client.patch(
             f"{_USER_KEYS}/1/limits",
-            json={"monthly_credit_limit": None, "weekly_credit_limit": None},
+            json={"monthly_credit_limit": "20.0"},
         )
         assert resp.status_code == 200
-        assert captured["monthly"] is None
-        assert captured["weekly"] is None
+        assert captured["limits"] == {"monthly_credit_limit": Decimal("20.0")}
 
-        async def fake_admin_conflict(key_id, user_id, project_id, monthly_credit_limit, weekly_credit_limit):
+        resp = await client.patch(
+            f"{_USER_KEYS}/1/limits",
+            json={"weekly_credit_limit": None},
+        )
+        assert resp.status_code == 200
+        assert captured["limits"] == {"weekly_credit_limit": None}
+
+        resp = await client.patch(f"{_USER_KEYS}/1/limits", json={})
+        assert resp.status_code == 422
+
+        async def fake_admin_conflict(key_id, user_id, project_id, limits):
             raise aks.ApiKeyLimitConflict("API 키 월 한도는 관리자 한도를 초과할 수 없습니다")
 
         monkeypatch.setattr(aks, "update_owner_limits", fake_admin_conflict)
         resp = await client.patch(
             f"{_USER_KEYS}/1/limits",
-            json={"monthly_credit_limit": "200.0", "weekly_credit_limit": None},
+            json={"monthly_credit_limit": "200.0"},
         )
         assert resp.status_code == 409
         assert resp.json()["detail"] == "API 키 월 한도는 관리자 한도를 초과할 수 없습니다"
 
-        async def fake_sys_conflict(key_id, user_id, project_id, monthly_credit_limit, weekly_credit_limit):
+        async def fake_sys_conflict(key_id, user_id, project_id, limits):
             raise aks.ApiKeyLimitConflict("API 키 월 한도는 시스템 월 쿼터를 초과할 수 없습니다")
 
         monkeypatch.setattr(aks, "update_owner_limits", fake_sys_conflict)
         resp = await client.patch(
             f"{_USER_KEYS}/1/limits",
-            json={"monthly_credit_limit": "200.0", "weekly_credit_limit": None},
+            json={"monthly_credit_limit": "200.0"},
         )
         assert resp.status_code == 409
         assert resp.json()["detail"] == "API 키 월 한도는 시스템 월 쿼터를 초과할 수 없습니다"
 
-        async def fake_forbidden(key_id, user_id, project_id, monthly_credit_limit, weekly_credit_limit):
+        async def fake_forbidden(key_id, user_id, project_id, limits):
             raise aks.ApiKeyForbidden("소유자가 아닙니다")
 
         monkeypatch.setattr(aks, "update_owner_limits", fake_forbidden)
         resp = await client.patch(
             f"{_USER_KEYS}/1/limits",
-            json={"monthly_credit_limit": "10.0", "weekly_credit_limit": None},
+            json={"monthly_credit_limit": "10.0"},
         )
         assert resp.status_code == 403
 
-        async def fake_not_found(key_id, user_id, project_id, monthly_credit_limit, weekly_credit_limit):
+        async def fake_not_found(key_id, user_id, project_id, limits):
             raise aks.ApiKeyNotFound("100 를 찾을 수 없습니다")
 
         monkeypatch.setattr(aks, "update_owner_limits", fake_not_found)
         resp = await client.patch(
             f"{_USER_KEYS}/100/limits",
-            json={"monthly_credit_limit": "10.0", "weekly_credit_limit": None},
+            json={"monthly_credit_limit": "10.0"},
         )
         assert resp.status_code == 404
 
