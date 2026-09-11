@@ -13,7 +13,7 @@ from lumen.services.capabilities import (
 )
 from lumen.services.litellm_client import effective_prices_per_million
 
-from .credentials import api_key_source
+from .credentials import api_key_source, api_model_name
 from .errors import ProviderValidationError
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
@@ -135,6 +135,16 @@ def _model_public(
     auth_mode: str = "api_key",
 ) -> dict:
     eff_caps, eff_caps_source = _effective_capabilities(row, provider_type, auth_mode)
+    public_model_name = api_model_name(row.model_name, provider_type or "")
+    display_name = row.display_name
+    if (
+        not display_name
+        or display_name == row.model_name
+        or display_name.startswith("perplexity/perplexity/")
+        or display_name.startswith("gemini/gemini-")
+        or (provider_type == "gemini" and display_name.startswith("gemini/"))
+    ):
+        display_name = public_model_name
     effective_input = (
         effective_input_price_per_million / _TOKENS_PER_MILLION
         if effective_input_price_per_million is not None
@@ -155,7 +165,9 @@ def _model_public(
         "id": row.id,
         "provider_id": row.provider_id,
         "model_name": row.model_name,
-        "display_name": row.display_name,
+        "api_model_name": public_model_name,
+        "api_provider": provider_type,
+        "display_name": display_name,
         "is_active": row.is_active,
         "is_title_model": row.is_title_model,
         "is_memory_model": row.is_memory_model,

@@ -47,6 +47,21 @@ async def resolve(model: str) -> dict:
     return resolved
 
 
+async def resolve_api(model: str, *, provider: str | None = None) -> dict:
+    """Resolve one public compatibility API route, rejecting ambiguous catalogs."""
+    if not model:
+        raise CompletionError(400, "model 이 필요합니다")
+    try:
+        resolved = await ps.resolve_api_model(model, provider=provider)
+    except errors.AmbiguousModelRouteError as exc:
+        raise CompletionError(409, "model_route_ambiguous") from exc
+    except errors.ChatStorageUnavailable as exc:
+        raise CompletionError(503, "일시적으로 사용할 수 없습니다") from exc
+    if resolved is None:
+        raise CompletionError(404, f"모델을 찾을 수 없습니다: {model}")
+    return resolved
+
+
 async def precheck(user_id: str, project_id: str, api_key_id: int | None = None) -> None:
     """쿼터 fail-closed. 초과 429, 저장소 장애 503."""
     try:
@@ -178,7 +193,7 @@ async def complete_once(
         api_key_id=api_key_id,
     )
     return {
-        "model": resolved["model_name"],
+        "model": resolved["api_model_name"],
         "content": content,
         "tool_calls": tool_calls,
         "finish_reason": finish_reason,

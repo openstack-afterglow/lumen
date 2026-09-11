@@ -130,11 +130,25 @@ API Key 요청 시 필요한 최소 Scope 정의:
 
 ## 5. 모델 디스커버리 및 Provider Credential 상태
 
-* `GET /v1/models` (OpenAI 호환 포맷): 표준 OpenAI 모델 리스트 포맷(`id`, `object`, `created`, `owned_by`)을 반환합니다.
-* `GET /v1/chat/models` (Native 상세 포맷): 각 모델 항목별로 `provider_api_key_configured` (`true`/`false`) Boolean 값을 포함하여 반환합니다.
+* `GET /v1/models` (OpenAI 호환 포맷): 표준 필드(`id`, `object`, `created`, `owned_by`)에 더해 같은 공개 ID를 제공하는 활성 provider type의 정렬된 `providers` 배열을 반환합니다. `id`는 SDK가 보내는 공개 `model` 값이며 내부 LiteLLM route key가 아닙니다.
+* `GET /v1/chat/models` (Native 상세 포맷): 각 모델의 공개 `api_model_name`, `api_provider`와 운영용 내부 `model_name`을 분리해 반환하고 `provider_api_key_configured` (`true`/`false`)를 포함합니다.
   * `true`: 해당 모델의 provider API Key가 Lumen 서버에 정상 설정(DB 또는 환경 변수 `api_key_env`)되어 있음.
   * `false`: 명시적인 provider API Key가 등록되지 않음 (`false`인 모델 호출 시 completion 시점에 502/400 오류 발생 가능).
 * Keystone 전용 관리자 엔드포인트 `GET /v1/admin/providers`는 `has_api_key`, `api_key_source`(`database`/`environment`/`null`), `api_key_env` 정보를 제공하며, 보안을 위해 시크릿 값 자체는 어떠한 경우에도 반환하지 않습니다.
+
+### 5.1 공개 모델 ID와 실행 route
+
+호환 API 클라이언트는 `api_model_name`만 `model`로 보내고 필요할 때 `api_provider`를 `provider`로 보냅니다. 다른 provider와 겹치지 않는 고유 모델(예: Perplexity 단독의 `sonar`, `kimi-k3`, `deepseek-v4-flash-0731`)은 `provider`를 생략해도 정상적으로 라우팅됩니다. 동일한 공개 ID가 여러 provider type에 존재하는 경우에만 `provider`를 생략한 completion이 **HTTP 409 Conflict**로 실패합니다. 요청 body의 `provider`는 소문자 provider type이며 OpenAI/Anthropic Python SDK에서는 `extra_body={"provider": "perplexity"}`로 전달할 수 있습니다. 같은 provider type 안에서도 route가 둘 이상이면 선택자가 충분하지 않으므로 409를 유지합니다. Perplexity Agent API 호환 completion은 `web_search` 도구를 자동으로 활성화하여 최신 웹 검색이 필요한 경우 모델이 실시간 검색을 수행합니다.
+
+Perplexity provider는 base URL로 transport를 명시합니다.
+
+| Base URL | 실행 경로 | 내부 route |
+| --- | --- | --- |
+| `https://api.perplexity.ai/v1` | Agent API (`POST /v1/responses`) | 공개 ID에 `perplexity/` transport namespace를 한 번 더 붙인 LiteLLM route |
+| `https://api.perplexity.ai/router` 또는 `/router/v1` | OpenAI 호환 Router | `openai/<공개 ID>` |
+| 기존 `/v1`이 없는 Sonar 설정 | 기존 Chat Completions 호환 경로 | 저장된 legacy route 유지 |
+
+Perplexity `/v1/models`와 `/router/v1/models` discovery 결과는 공개 canonical ID로 등록합니다. 기존 행과 대화 이력은 일괄 변경하지 않으며, projection과 request-time resolver가 legacy route에서도 같은 공개 ID를 계산합니다.
 
 ---
 
@@ -145,7 +159,8 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
 ### 6.1 지원 필드 범위
 
 * **OpenAI 호환 (`POST /v1/chat/completions`)**:
-  - `model`: `lumen` virtual model 또는 provider model ID (필수)
+  - `model`: `lumen` virtual model 또는 공개 provider model ID (필수)
+  - `provider`: 같은 공개 model ID의 route 충돌을 해소하는 선택적 provider type
   - `messages`: 메시지 목록 (필수)
   - `stream`: 스트리밍 여부 (기본값 `false`)
   - `temperature`: 생성 샘플링 온도
@@ -155,7 +170,8 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
   - `stream_options`: `{"include_usage": true}` 지정 시 스트리밍 마지막에 토큰 사용량 chunk 반환
   - `model="lumen"`은 문자열 content의 `system`/`developer`/`user`/`assistant` transcript만 받고 마지막 `user` message를 요구합니다. Caller tools/tool messages/multimodal content는 400으로 거부하며 Lumen memory/extensions/MCP/tool 실행은 이 첫 단계에서 비활성화됩니다.
 * **Anthropic 호환 (`POST /v1/messages`)**:
-  - `model`: provider 모델 ID (필수)
+  - `model`: 공개 provider model ID (필수)
+  - `provider`: 같은 공개 model ID의 route 충돌을 해소하는 선택적 provider type
   - `messages`: 메시지 목록 (필수)
   - `system`: 시스템 프롬프트
   - `max_tokens`: 최대 생성 토큰 수
@@ -163,7 +179,7 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
   - `stream`: 스트리밍 여부 (기본값 `false`)
   - `tools`: 도구 정의 목록
   - `tool_choice`: 도구 선택 정책 (`auto`, `any`, `none`, `tool(name)`)
-* **추가 필드 처리**: 위 명시된 필드 외의 벤더 전용 추가 파라미터는 요청 검증 단계에서 수용(`extra="allow"`)되지만 내부 동작에는 무시됩니다.
+* **추가 필드 처리**: `provider`는 명시적으로 route 선택에 사용합니다. 그 밖의 벤더 전용 추가 파라미터는 요청 검증 단계에서 수용(`extra="allow"`)되지만 내부 동작에는 무시됩니다.
 
 ### 6.2 토큰 수 상한 제약 (`max_tokens`)
 
@@ -282,11 +298,9 @@ FastAPI 프레임워크 특성에 따라 HTTP 예외 발생 시 반환되는 JSO
 * **OpenAI 호환 에러 응답 (`POST /v1/chat/completions`)**:
   ```json
   {
-    "detail": {
-      "error": {
-        "message": "API 키 월 사용 한도를 초과했습니다",
-        "type": "invalid_request_error"
-      }
+    "error": {
+      "message": "API 키 월 사용 한도를 초과했습니다",
+      "type": "invalid_request_error"
     }
   }
   ```

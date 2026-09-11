@@ -17,6 +17,10 @@ class ProviderValidationError(ValueError):
     """입력 검증 실패/제약 위반 — 400."""
 
 
+class AmbiguousModelRouteError(RuntimeError):
+    """More than one active route exposes the requested public model/provider pair."""
+
+
 class ProviderConfigurationChangedError(RuntimeError):
     """Active execution route changed before its durable snapshot was committed."""
 

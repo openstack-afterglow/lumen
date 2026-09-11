@@ -19,8 +19,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
-from lumen.services.providers.credentials import ProviderAuthRef, litellm_model_name
+from lumen.services.providers.credentials import (
+    ProviderAuthRef,
+    api_model_name,
+    litellm_model_name,
+    perplexity_route_model_name,
+)
 from lumen.services.providers.errors import ProviderSubscriptionError
 
 logger = logging.getLogger(__name__)
@@ -519,6 +525,166 @@ async def _subscription_completion(
         raise safe_error from None
 
 
+def _perplexity_mode(model: str, api_base: str | None) -> Literal["router", "agent", "legacy"]:
+    base_path = urlsplit(api_base or "").path.rstrip("/").lower()
+    if base_path.endswith("/router") or base_path.endswith("/router/v1"):
+        return "router"
+    if base_path.endswith("/v1"):
+        return "agent"
+    if model.startswith("perplexity/") and model.count("/") >= 2:
+        return "agent"
+    if "/" in model and not model.startswith("perplexity/"):
+        return "agent"
+    return "legacy"
+
+
+def _perplexity_agent_base(api_base: str | None) -> str:
+    base = (api_base or "https://api.perplexity.ai").rstrip("/")
+    if urlsplit(base).path.lower().endswith("/v1"):
+        return base[:-3]
+    return base
+
+
+def _perplexity_router_base(api_base: str | None) -> str:
+    base = (api_base or "").rstrip("/")
+    if urlsplit(base).path.lower().endswith("/router"):
+        return f"{base}/v1"
+    return base
+
+
+def _perplexity_optional_params(
+    *,
+    stream: bool,
+    max_tokens: int | None,
+    temperature: float | None,
+    tools: list[dict] | None,
+    extra: dict | None,
+) -> dict[str, Any]:
+    blocked = {
+        "api_base",
+        "api_key",
+        "base_url",
+        "custom_llm_provider",
+        "litellm_logging_obj",
+        "messages",
+        "model",
+        "provider",
+        "stream",
+        "stream_options",
+    }
+    optional_params = {key: value for key, value in (extra or {}).items() if key not in blocked}
+    if max_tokens is not None:
+        optional_params["max_tokens"] = max_tokens
+    if temperature is not None:
+        optional_params["temperature"] = temperature
+    if tools:
+        optional_params["tools"] = tools
+    optional_params["stream"] = stream
+    return optional_params
+
+
+async def _perplexity_completion(
+    model: str,
+    messages: list[dict],
+    *,
+    api_base: str | None,
+    api_key: str | None,
+    stream: bool,
+    max_tokens: int | None,
+    temperature: float | None,
+    tools: list[dict] | None,
+    extra: dict | None,
+) -> Any:
+    if not api_key:
+        raise ValueError("perplexity_credentials_missing")
+
+    import litellm
+
+    mode = _perplexity_mode(model, api_base)
+    agent_tools = list(tools or [])
+    if mode == "agent" and not any(
+        isinstance(tool, dict) and tool.get("type") in ("web_search", "web_search_preview")
+        for tool in agent_tools
+    ):
+        agent_tools.append({"type": "web_search"})
+    optional_params = _perplexity_optional_params(
+        stream=stream,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        tools=agent_tools if mode == "agent" else tools,
+        extra=extra,
+    )
+    mode = _perplexity_mode(model, api_base)
+    canonical_model = api_model_name(model, "perplexity")
+    if mode == "router":
+        params = _build_params(
+            f"openai/{canonical_model}",
+            messages,
+            api_base=_perplexity_router_base(api_base),
+            api_key=api_key,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            custom_llm_provider="openai",
+            tools=tools,
+            extra={
+                **{key: value for key, value in optional_params.items() if key != "stream"},
+                "_skip_responses_api_bridge": True,
+            },
+        )
+        if stream:
+            params["stream"] = True
+            params["stream_options"] = {"include_usage": True}
+        return await litellm.acompletion(**params)
+    if mode == "legacy":
+        params = _build_params(
+            model,
+            messages,
+            api_base=api_base,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            custom_llm_provider="perplexity",
+            tools=tools,
+            extra={key: value for key, value in optional_params.items() if key != "stream"},
+        )
+        if stream:
+            params["stream"] = True
+            params["stream_options"] = {"include_usage": True}
+        return await litellm.acompletion(**params)
+
+    from litellm.completion_extras.litellm_responses_transformation.handler import (
+        ResponsesToCompletionBridgeHandler,
+    )
+
+    from lumen.services.providers.subscription_logging import SubscriptionLogging
+
+    routed_model = perplexity_route_model_name(model)
+    fixed_api_base = _perplexity_agent_base(api_base)
+    logging_obj = SubscriptionLogging(
+        model=routed_model,
+        provider="perplexity",
+        fixed_api_base=fixed_api_base,
+        call_id=str(uuid.uuid4()),
+        stream=stream,
+    )
+    return await ResponsesToCompletionBridgeHandler().acompletion(
+        model=routed_model,
+        messages=messages,
+        optional_params=optional_params,
+        litellm_params={
+            "api_base": fixed_api_base,
+            "api_key": api_key,
+            "custom_llm_provider": "perplexity",
+            "no_log": True,
+        },
+        headers={},
+        model_response=litellm.ModelResponse(),
+        logging_obj=logging_obj,
+        custom_llm_provider="perplexity",
+        stream=stream,
+    )
+
+
 async def acompletion(
     model: str,
     messages: list[dict],
@@ -547,6 +713,21 @@ async def acompletion(
         )
     if _requires_subscription_auth(model, custom_llm_provider):
         raise ProviderSubscriptionError("subscription_auth_required", 502)
+    effective_provider = custom_llm_provider or (
+        "perplexity" if model.startswith("perplexity/") or (api_base and "perplexity" in api_base) else None
+    )
+    if effective_provider == "perplexity":
+        return await _perplexity_completion(
+            model,
+            messages,
+            api_base=api_base,
+            api_key=api_key,
+            stream=False,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            tools=tools,
+            extra=extra,
+        )
     import litellm
 
     litellm.drop_params = True
@@ -594,6 +775,21 @@ async def acompletion_stream(
         )
     if _requires_subscription_auth(model, custom_llm_provider):
         raise ProviderSubscriptionError("subscription_auth_required", 502)
+    effective_provider = custom_llm_provider or (
+        "perplexity" if model.startswith("perplexity/") or (api_base and "perplexity" in api_base) else None
+    )
+    if effective_provider == "perplexity":
+        return await _perplexity_completion(
+            model,
+            messages,
+            api_base=api_base,
+            api_key=api_key,
+            stream=True,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            tools=tools,
+            extra=merged_extra or None,
+        )
     import litellm
 
     litellm.drop_params = True

@@ -35,10 +35,21 @@ def _return_url(*, connected: bool, server_id: int | None = None, return_origin:
         or parsed.password
     ):
         return None
-    query = {"mcp_oauth": "connected" if connected else "failed"}
+    query = {
+        "section": "mcp",
+        "mcp_oauth": "connected" if connected else "failed",
+    }
     if server_id is not None:
         query["mcp_server_id"] = str(server_id)
-    return urlunsplit((parsed.scheme, parsed.netloc, f"{parsed.path.rstrip('/')}/dashboard/chat", urlencode(query), ""))
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            f"{parsed.path.rstrip('/')}/dashboard/chat/settings",
+            urlencode(query),
+            "",
+        )
+    )
 
 
 @router.get("/mcp-oauth/callback")

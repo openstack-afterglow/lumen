@@ -15,7 +15,10 @@ import logging
 
 from lumen.services.providers import errors
 from lumen.services.providers import routing as provider_store
-from lumen.services.providers.credentials import canonical_subscription_model_name
+from lumen.services.providers.credentials import (
+    api_model_name,
+    canonical_subscription_model_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,18 +31,38 @@ _DEFAULT_BASES: dict[str, str] = {
     "together_ai": "https://api.together.xyz/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "xai": "https://api.x.ai/v1",
-    "perplexity": "https://api.perplexity.ai",
+    "perplexity": "https://api.perplexity.ai/v1",
     "ollama": "http://localhost:11434/v1",
 }
 # OpenAI 호환 /models 엔드포인트를 노출하는 provider_type
 _OPENAI_COMPATIBLE = set(_DEFAULT_BASES) | {"azure"}
 
 
-async def _fetch_openai_compatible(provider_type: str, api_base: str | None, api_key: str | None) -> list[str]:
-    base = api_base or _DEFAULT_BASES.get(provider_type)
+def _is_perplexity_router_base(api_base: str | None) -> bool:
+    if not api_base:
+        return False
+    path = api_base.rstrip("/").lower()
+    return path.endswith("/router") or path.endswith("/router/v1")
+
+
+def _models_url(provider_type: str, api_base: str | None) -> str | None:
+    base = (api_base or _DEFAULT_BASES.get(provider_type) or "").rstrip("/")
     if not base:
+        return None
+    if provider_type != "perplexity":
+        return f"{base}/models"
+    lowered = base.lower()
+    if lowered.endswith("/router"):
+        return f"{base}/v1/models"
+    if lowered.endswith("/router/v1") or lowered.endswith("/v1"):
+        return f"{base}/models"
+    return f"{base}/v1/models"
+
+
+async def _fetch_openai_compatible(provider_type: str, api_base: str | None, api_key: str | None) -> list[str]:
+    url = _models_url(provider_type, api_base)
+    if url is None:
         return []
-    url = base.rstrip("/") + "/models"
     try:
         import httpx
 
@@ -94,7 +117,21 @@ async def discover_models(provider_id: int) -> dict:
     if ptype in _OPENAI_COMPATIBLE:
         live = await _fetch_openai_compatible(ptype, prov["api_base"], prov["api_key"])
         if live:
-            return {"models": live, "source": "api"}
+            models = [
+                api_model_name(model, "perplexity") if ptype == "perplexity" else model
+                for model in live
+                if not model.startswith("preset/")
+            ]
+            return {"models": sorted(set(models)), "source": "api"}
+        if ptype == "perplexity" and _is_perplexity_router_base(prov["api_base"]):
+            return {"models": [], "source": "none"}
 
     static = _litellm_static(ptype)
-    return {"models": static, "source": "litellm" if static else "none"}
+    if ptype == "perplexity":
+        static = [
+            api_model_name(model, "perplexity")
+            for model in static
+            if not model.startswith("preset/")
+        ]
+    models = sorted(set(static))
+    return {"models": models, "source": "litellm" if models else "none"}

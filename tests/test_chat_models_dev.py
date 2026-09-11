@@ -286,6 +286,8 @@ class TestModelsDevAdminRoutes:
                     "id": 5,
                     "provider_id": 1,
                     "model_name": "gpt-test",
+                    "api_model_name": "gpt-test",
+                    "api_provider": "openai",
                     "display_name": None,
                     "is_active": True,
                     "input_price_per_million": "2",

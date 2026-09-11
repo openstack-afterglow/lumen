@@ -95,3 +95,27 @@ def test_provider_subscription_migration_is_registered_and_additive():
     assert "PRIMARY KEY (provider_id)" in auth_attempts
     assert "UNIQUE (id)" in auth_attempts
     assert "FOREIGN KEY (provider_id) REFERENCES llm_providers(id) ON DELETE CASCADE" in auth_attempts
+
+
+def test_weekly_quota_migration_is_registered():
+    migration = next(
+        item
+        for item in load_manifest()
+        if item.logical_id == "009-weekly-quotas-and-key-limits"
+    )
+    statements = _statements(MIGRATIONS / migration.relative_path)
+
+    assert any(
+        "ADD COLUMN max_quota_weekly NUMERIC(18, 8) NOT NULL DEFAULT 0"
+        in statement
+        for statement in statements
+    )
+    assert any(
+        "ADD COLUMN owner_weekly_credit_limit NUMERIC(18, 8) NULL"
+        in statement
+        for statement in statements
+    )
+    assert any(
+        "chk_chat_api_keys_owner_weekly_credit_limit" in statement
+        for statement in statements
+    )

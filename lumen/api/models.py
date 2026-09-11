@@ -218,6 +218,8 @@ class ModelResponse(BaseModel):
     id: int
     provider_id: int
     model_name: str
+    api_model_name: str
+    api_provider: str
     display_name: str | None
     is_active: bool
     is_title_model: bool = False

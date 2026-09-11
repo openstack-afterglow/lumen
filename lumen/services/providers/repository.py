@@ -11,7 +11,12 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.services.litellm_client import effective_prices_per_million
 from lumen.services.models_dev import ModelsDevCatalog
 
-from .credentials import canonical_subscription_model_name, normalize_api_key_env
+from .credentials import (
+    api_model_name,
+    canonical_subscription_model_name,
+    normalize_api_key_env,
+    perplexity_route_model_name,
+)
 from .errors import (
     ChatStorageUnavailable,
     ModelsDevImportConflictError,
@@ -83,6 +88,21 @@ async def _reject_duplicate_subscription_model(
         stmt = stmt.where(LlmModel.id != current_model_id)
     if (await session.execute(stmt.limit(1))).scalar_one_or_none() is not None:
         raise ProviderValidationError("같은 구독 model_name 은 하나의 프로바이더에만 등록할 수 있습니다")
+
+
+async def _reject_duplicate_perplexity_model(
+    session,
+    *,
+    provider_id: int,
+    api_name: str,
+    current_model_id: int | None = None,
+) -> None:
+    stmt = select(LlmModel).where(LlmModel.provider_id == provider_id).order_by(LlmModel.id)
+    if current_model_id is not None:
+        stmt = stmt.where(LlmModel.id != current_model_id)
+    rows = (await session.execute(stmt)).scalars().all()
+    if any(api_model_name(row.model_name, "perplexity") == api_name for row in rows):
+        raise ProviderValidationError("프로바이더 내 공개 model_name 이 중복됩니다")
 
 
 async def create_provider(
@@ -229,6 +249,12 @@ async def create_model(
             provider = subscription_providers.get(provider_id) or await session.get(LlmProvider, provider_id)
             if provider is None:
                 raise ProviderValidationError(f"프로바이더 {provider_id} 가 존재하지 않습니다")
+            if provider.provider_type == "perplexity" and getattr(provider, "auth_mode", "api_key") == "api_key":
+                provider = (
+                    await session.execute(
+                        select(LlmProvider).where(LlmProvider.id == provider_id).with_for_update()
+                    )
+                ).scalar_one()
             auth_mode = getattr(provider, "auth_mode", "api_key")
             namespace_provider_ids = tuple(
                 candidate.id
@@ -236,6 +262,13 @@ async def create_model(
                 if candidate.auth_mode == auth_mode
             )
             canonical_name = canonical_subscription_model_name(model_name, auth_mode)
+            if provider.provider_type == "perplexity" and auth_mode == "api_key":
+                canonical_name = perplexity_route_model_name(canonical_name)
+                await _reject_duplicate_perplexity_model(
+                    session,
+                    provider_id=provider_id,
+                    api_name=api_model_name(canonical_name, "perplexity"),
+                )
             await _reject_duplicate_subscription_model(
                 session,
                 namespace_provider_ids=namespace_provider_ids,
@@ -342,13 +375,25 @@ async def update_model(model_id: int, patch: dict) -> dict:
             row = models[0]
             if patch.get("model_name"):
                 canonical_name = canonical_subscription_model_name(str(patch["model_name"]), auth_mode)
-                await _reject_duplicate_subscription_model(
-                    session,
-                    namespace_provider_ids=namespace_provider_ids,
-                    model_name=canonical_name,
-                    current_model_id=model_id,
-                )
-                row.model_name = canonical_name
+                if provider.provider_type == "perplexity" and auth_mode == "api_key":
+                    encoded_name = perplexity_route_model_name(canonical_name)
+                    public_name = api_model_name(encoded_name, "perplexity")
+                    await _reject_duplicate_perplexity_model(
+                        session,
+                        provider_id=provider_id,
+                        api_name=public_name,
+                        current_model_id=model_id,
+                    )
+                    if public_name != api_model_name(row.model_name, "perplexity"):
+                        row.model_name = encoded_name
+                else:
+                    await _reject_duplicate_subscription_model(
+                        session,
+                        namespace_provider_ids=namespace_provider_ids,
+                        model_name=canonical_name,
+                        current_model_id=model_id,
+                    )
+                    row.model_name = canonical_name
             if "display_name" in patch:
                 row.display_name = patch["display_name"] or None
             if has_input_price:

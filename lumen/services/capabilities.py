@@ -179,6 +179,11 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
         else _probe("supports_response_schema", model_name=normalized_model, provider_type=provider_type)
     )
     parallel_function_calling = bool(metadata.get("supports_parallel_function_calling")) if is_chatgpt else False
+    supports_web_search = bool(
+        provider_type == "perplexity"
+        or normalized_model.startswith("perplexity/")
+        or "sonar" in normalized_model.lower()
+    )
     context_limit = metadata.get("max_input_tokens") if isinstance(metadata.get("max_input_tokens"), int) else None
     return {
         # Existing model-admin/UI fields retained until the capability API is cut over.
@@ -194,7 +199,7 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
         "function_calling": function_calling,
         "parallel_function_calling": parallel_function_calling,
         "structured_output": structured_output,
-        "web_search": False,
+        "web_search": supports_web_search,
         "web_fetch": False,
         "advisor": False,
         "responses_api": is_chatgpt,
@@ -215,10 +220,10 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
                 "pricing_available": structured_output,
             },
             "web_search": {
-                "available": False,
-                "mode": "none",
-                "reason_code": "provider_unsupported",
-                "pricing_available": False,
+                "available": supports_web_search,
+                "mode": "native" if supports_web_search else "none",
+                "reason_code": None if supports_web_search else "provider_unsupported",
+                "pricing_available": supports_web_search,
             },
             "web_fetch": {
                 "available": False,
@@ -361,6 +366,16 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
         normalized["function_calling"] = bool(stored["tool_call"])
     elif "function_calling" in stored:
         normalized["function_calling"] = bool(stored["function_calling"])
+    if "web_search" in stored:
+        stored_web_search = bool(stored["web_search"])
+        normalized["web_search"] = stored_web_search
+        gates["web_search"] = {
+            **gates.get("web_search", {}),
+            "available": stored_web_search,
+            "mode": "native" if stored_web_search else "none",
+            "reason_code": None if stored_web_search else "provider_unsupported",
+            "pricing_available": stored_web_search,
+        }
     if isinstance(legacy_modalities, dict):
         normalized["input_modalities"] = list(inputs)
         normalized["output_modalities"] = list(outputs)

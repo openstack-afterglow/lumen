@@ -126,6 +126,7 @@ class TestPrecheckApiKeyLimit:
         return SimpleNamespace(
             is_active=is_active,
             max_quota_monthly=max_quota,
+            max_quota_weekly=Decimal("0"),
             used_quota_this_month=used_quota,
             quota_period_start=period_start,
         )
@@ -142,6 +143,35 @@ class TestPrecheckApiKeyLimit:
         await credit.precheck("u1", "p1", api_key_id=None)
         assert len(session.executed_stmts) == 0
 
+    async def test_weekly_wallet_limit_rejects_from_ledger(self, monkeypatch):
+        wallet = self._make_wallet(max_quota=Decimal("100"), used_quota=Decimal("0"))
+        wallet.max_quota_weekly = Decimal("10")
+        session = self.FakeSession(wallet=wallet, month_usage=Decimal("10"))
+        self._mock_db(monkeypatch, session)
+
+        with pytest.raises(credit.QuotaExceeded, match="주간 사용 한도를 초과했습니다"):
+            await credit.precheck("u1", "p1", api_key_id=None)
+        assert len(session.executed_stmts) == 1
+
+    async def test_weekly_api_key_limit_rejects_from_ledger(self, monkeypatch):
+        wallet = self._make_wallet(max_quota=Decimal("100"), used_quota=Decimal("0"))
+        key = SimpleNamespace(
+            id=10,
+            owner_user_id="u1",
+            owner_project_id="p1",
+            is_active=True,
+            revoked_at=None,
+            owner_monthly_credit_limit=None,
+            admin_monthly_credit_limit=None,
+            owner_weekly_credit_limit=Decimal("5"),
+        )
+        session = self.FakeSession(wallet=wallet, key_row=key, month_usage=Decimal("5"))
+        self._mock_db(monkeypatch, session)
+
+        with pytest.raises(credit.QuotaExceeded, match="API 키 주간 사용 한도를 초과했습니다"):
+            await credit.precheck("u1", "p1", api_key_id=10)
+        assert len(session.executed_stmts) == 2
+
     async def test_below_limit_pass(self, monkeypatch):
         wallet = self._make_wallet(max_quota=Decimal("100"), used_quota=Decimal("0"))
         key = SimpleNamespace(
@@ -152,6 +182,7 @@ class TestPrecheckApiKeyLimit:
             revoked_at=None,
             owner_monthly_credit_limit=Decimal("50"),
             admin_monthly_credit_limit=None,
+            owner_weekly_credit_limit=None,
         )
         session = self.FakeSession(wallet=wallet, key_row=key, month_usage=Decimal("49.99"))
         self._mock_db(monkeypatch, session)
@@ -169,6 +200,7 @@ class TestPrecheckApiKeyLimit:
             revoked_at=None,
             owner_monthly_credit_limit=Decimal("50"),
             admin_monthly_credit_limit=None,
+            owner_weekly_credit_limit=None,
         )
 
         session_eq = self.FakeSession(wallet=wallet, key_row=key, month_usage=Decimal("50.00"))
@@ -191,6 +223,7 @@ class TestPrecheckApiKeyLimit:
             revoked_at=None,
             owner_monthly_credit_limit=Decimal("50"),
             admin_monthly_credit_limit=None,
+            owner_weekly_credit_limit=None,
         )
         session = self.FakeSession(wallet=wallet, key_row=key, month_usage=Decimal("10"))
         self._mock_db(monkeypatch, session)
@@ -210,6 +243,7 @@ class TestPrecheckApiKeyLimit:
         wallet = SimpleNamespace(
             is_active=True,
             max_quota_monthly=Decimal("100"),
+            max_quota_weekly=Decimal("0"),
             used_quota_this_month=Decimal("100"),
             quota_period_start=past_start,
         )
@@ -236,6 +270,7 @@ class TestPrecheckApiKeyLimit:
             revoked_at=None,
             owner_monthly_credit_limit=Decimal("50"),
             admin_monthly_credit_limit=None,
+            owner_weekly_credit_limit=None,
         )
         session_bad_user = self.FakeSession(wallet=wallet, key_row=key_bad_user)
         self._mock_db(monkeypatch, session_bad_user)
@@ -250,6 +285,7 @@ class TestPrecheckApiKeyLimit:
             revoked_at=None,
             owner_monthly_credit_limit=Decimal("50"),
             admin_monthly_credit_limit=None,
+            owner_weekly_credit_limit=None,
         )
         session_bad_proj = self.FakeSession(wallet=wallet, key_row=key_bad_proj)
         self._mock_db(monkeypatch, session_bad_proj)
@@ -264,6 +300,7 @@ class TestPrecheckApiKeyLimit:
             revoked_at=datetime.now(UTC),
             owner_monthly_credit_limit=Decimal("50"),
             admin_monthly_credit_limit=None,
+            owner_weekly_credit_limit=None,
         )
         session_revoked = self.FakeSession(wallet=wallet, key_row=key_revoked)
         self._mock_db(monkeypatch, session_revoked)
@@ -295,6 +332,7 @@ class TestPrecheckApiKeyLimit:
                 revoked_at=None,
                 owner_monthly_credit_limit=owner,
                 admin_monthly_credit_limit=admin,
+                owner_weekly_credit_limit=None,
             )
             session = self.FakeSession(wallet=wallet, key_row=key, month_usage=usage)
             self._mock_db(monkeypatch, session)

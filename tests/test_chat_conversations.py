@@ -149,6 +149,8 @@ class TestAvailableModels:
                     "id": 1,
                     "provider_id": 1,
                     "model_name": "gpt-4o",
+                    "api_model_name": "gpt-4o",
+                    "api_provider": "openai",
                     "display_name": "GPT-4o",
                     "is_active": True,
                     "input_price": 0.0000025,
@@ -169,6 +171,8 @@ class TestAvailableModels:
         body = resp.json()
         # 능력·context_limit 노출, 키/가격은 미노출
         assert body[0]["model_name"] == "gpt-4o"
+        assert body[0]["api_model_name"] == "gpt-4o"
+        assert body[0]["api_provider"] == "openai"
         assert body[0]["display_name"] == "GPT-4o"
         assert body[0]["provider"] == "openai"
         assert body[0]["capabilities"] == {"vision": True, "reasoning": False, "context_limit": 128000}

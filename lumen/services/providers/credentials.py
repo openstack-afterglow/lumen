@@ -79,6 +79,57 @@ def litellm_model_name(model_name: str) -> str:
     return normalized
 
 
+def api_model_name(model_name: str, provider_type: str) -> str:
+    """Project a stable external API ID without changing the stored route key."""
+    normalized = str(model_name or "").strip()
+    if provider_type == "perplexity":
+        while normalized.startswith("perplexity/perplexity/"):
+            normalized = normalized[len("perplexity/"):]
+        prefix, separator, remainder = normalized.partition("/")
+        if prefix == "perplexity" and separator and "/" in remainder:
+            return remainder
+        if "/" not in normalized:
+            return f"perplexity/{normalized}" if normalized else normalized
+        return normalized
+    if provider_type == "gemini" or normalized.startswith("gemini/gemini-"):
+        while normalized.startswith("gemini/"):
+            rest = normalized[len("gemini/"):]
+            if not rest:
+                break
+            normalized = rest
+        return normalized
+    return normalized
+
+def short_model_name(model_name: str, provider_type: str | None = None) -> str:
+    """Return a human-friendly shortened model name without redundant provider prefixes."""
+    name = api_model_name(model_name, provider_type or "")
+    if provider_type == "perplexity":
+        while name.startswith("perplexity/"):
+            rest = name[len("perplexity/"):]
+            if not rest:
+                break
+            name = rest
+    elif provider_type == "gemini" or name.startswith("gemini/"):
+        while name.startswith("gemini/"):
+            rest = name[len("gemini/"):]
+            if not rest:
+                break
+            name = rest
+    return name
+
+def perplexity_route_model_name(model_name: str) -> str:
+    """Encode one canonical Perplexity API ID as a LiteLLM transport route."""
+    canonical = api_model_name(model_name, "perplexity")
+    if not canonical or any(not segment for segment in canonical.split("/")) or any(
+        character.isspace() for character in canonical
+    ):
+        raise ProviderValidationError("Perplexity model_name 형식이 올바르지 않습니다")
+    routed = f"perplexity/{canonical}"
+    if len(routed) > 190:
+        raise ProviderValidationError("Perplexity model_name 은 190자 이하여야 합니다")
+    return routed
+
+
 def api_key_source(provider: _ProviderCredential) -> str | None:
     """Return the effective credential source without exposing or decrypting the key."""
     if getattr(provider, "auth_mode", "api_key") != "api_key":

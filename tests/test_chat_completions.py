@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from lumen.services import capabilities, chat_admission, context_store, credit
 from lumen.services import conversation_store as cs
 from lumen.services.durable_runs import admission, common, queries
 from lumen.services.durable_runs import errors as durable_errors
+from lumen.services.providers import repository
 from lumen.services.providers import routing as ps
 
 _BASE = "/api/v1/chat/conversations"
@@ -1019,6 +1021,77 @@ class TestCanonicalTempCompletion:
         assert seen["temp_thread_id"] is None
         assert seen["request_payload"]["input_messages"] == [{"role": "user", "content": "temporary"}]
 
+    async def test_native_completion_with_catalog_model_and_default_features(self, client, monkeypatch):
+        await _patch_text_execution(monkeypatch)
+
+        async def fake_list_models(active_only=True):
+            return [
+                {
+                    "id": 1,
+                    "provider_id": 10,
+                    "model_name": "perplexity/perplexity/sonar",
+                    "api_model_name": "perplexity/sonar",
+                    "api_provider": "perplexity",
+                    "display_name": "sonar",
+                    "effective_capabilities": {"web_search": True, "tool_call": True},
+                    "capabilities": {"web_search": True, "tool_call": True},
+                }
+            ]
+
+        async def fake_list_providers():
+            return [{"id": 10, "name": "Perplexity", "provider_type": "perplexity", "has_api_key": True}]
+
+        monkeypatch.setattr(repository, "list_models", fake_list_models)
+        monkeypatch.setattr(repository, "list_providers", fake_list_providers)
+
+        models_resp = await client.get("/api/v1/chat/models")
+        assert models_resp.status_code == 200
+        catalog_models = models_resp.json()
+        assert len(catalog_models) == 1
+        model_entry = catalog_models[0]
+        assert "provider_id" not in model_entry
+        assert model_entry["capabilities"]["web_search"] is True
+
+        monkeypatch.setattr(
+            ps,
+            "resolve_model",
+            lambda name: _return(
+                {
+                    "model_name": name,
+                    "provider_name": "Perplexity",
+                    "provider_id": 10,
+                    "model_id": 1,
+                    "config_version_hash": "testhash",
+                    "input_price_per_token": Decimal("0"),
+                    "output_price_per_token": Decimal("0"),
+                    "capabilities": {"web_search": True, "tool_call": True},
+                }
+            ),
+        )
+
+        async def fake_create_temp_run(**kwargs):
+            return ChatRunDescriptor(
+                run_id="run-native-search",
+                status="queued",
+                events_url="/api/v1/chat/runs/run-native-search/events",
+                cancel_url="/api/v1/chat/runs/run-native-search/cancel",
+            )
+
+        monkeypatch.setattr(admission, "create_temp_run", fake_create_temp_run)
+
+        response = await client.post(
+            "/api/v1/chat/temp-completions",
+            headers=_HEADERS,
+            json={
+                "parts": [{"type": "text", "text": "What is the latest news?"}],
+                "model_id": model_entry["model_name"],
+                "features": {
+                    "tool_policy": {"mode": "agent_default"},
+                    "web_search": {"enabled": False},
+                },
+            },
+        )
+        assert response.status_code == 202
 
 class TestApiKeyLimitAdmission:
     async def test_all_native_admission_callsites_forward_api_key_id(self, client, monkeypatch):

@@ -63,15 +63,36 @@ class TestOpenAITranslate:
         assert c["choices"][0]["delta"]["content"] == "he"
 
     def test_models_list(self):
-        r = oa.models_list([{"model_name": "gpt-4o", "provider_name": "openai"}])
-        assert r["object"] == "list" and r["data"][0]["id"] == "gpt-4o"
-        assert r["data"][0]["owned_by"] == "openai"
-
-        fallback_r = oa.models_list([{"model_name": "gpt-4o"}])
-        assert fallback_r["data"][0]["owned_by"] == "lumen"
+        r = oa.models_list(
+            [
+                {
+                    "model_name": "perplexity/anthropic/claude-sonnet-4-6",
+                    "api_model_name": "anthropic/claude-sonnet-4-6",
+                    "api_provider": "perplexity",
+                },
+                {
+                    "model_name": "anthropic/claude-sonnet-4-6",
+                    "api_model_name": "anthropic/claude-sonnet-4-6",
+                    "api_provider": "anthropic",
+                },
+            ]
+        )
+        assert r == {
+            "object": "list",
+            "data": [
+                {
+                    "id": "anthropic/claude-sonnet-4-6",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "lumen",
+                    "providers": ["anthropic", "perplexity"],
+                }
+            ],
+        }
 
         item = oa.OpenAIModelItem(id="m1")
         assert item.owned_by == "lumen"
+        assert item.providers == []
 
 
 class TestAnthropicTranslate:
@@ -165,6 +186,34 @@ class TestCompletionCoreContract:
         assert len(event_ids) == 2
         assert event_ids[0] == event_ids[1]
 
+    async def test_public_resolver_maps_ambiguous_missing_and_storage_failures(self, monkeypatch):
+        async def ambiguous(*_args, **_kwargs):
+            raise core.errors.AmbiguousModelRouteError("ambiguous")
+
+        monkeypatch.setattr(core.ps, "resolve_api_model", ambiguous)
+        with pytest.raises(core.CompletionError) as ambiguous_error:
+            await core.resolve_api("anthropic/claude-sonnet-4-6")
+        assert (ambiguous_error.value.status_code, ambiguous_error.value.message) == (
+            409,
+            "model_route_ambiguous",
+        )
+
+        async def missing(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(core.ps, "resolve_api_model", missing)
+        with pytest.raises(core.CompletionError) as missing_error:
+            await core.resolve_api("missing", provider="perplexity")
+        assert missing_error.value.status_code == 404
+
+        async def unavailable(*_args, **_kwargs):
+            raise core.errors.ChatStorageUnavailable("down")
+
+        monkeypatch.setattr(core.ps, "resolve_api_model", unavailable)
+        with pytest.raises(core.CompletionError) as unavailable_error:
+            await core.resolve_api("model")
+        assert unavailable_error.value.status_code == 503
+
 
 # ── 엔드포인트 ────────────────────────────────────────────────────────────────
 @pytest.fixture
@@ -187,15 +236,20 @@ def _auth(monkeypatch):
 
 @pytest.fixture
 def _core(monkeypatch):
-    async def fake_resolve(model):
-        return {"model_name": model, "provider_name": "openai"}
+    async def fake_resolve(model, *, provider=None):
+        return {
+            "model_name": model,
+            "api_model_name": model,
+            "api_provider": provider or "openai",
+            "provider_name": "openai",
+        }
 
     async def fake_precheck(u, p, api_key_id=None):
         return None
 
     async def fake_once(**kw):
         return {
-            "model": kw["resolved"]["model_name"],
+            "model": kw["resolved"]["api_model_name"],
             "content": "hello",
             "tool_calls": None,
             "finish_reason": "stop",
@@ -215,7 +269,7 @@ def _core(monkeypatch):
             "credited_cost": 0.02,
         }
 
-    monkeypatch.setattr(core, "resolve", fake_resolve)
+    monkeypatch.setattr(core, "resolve_api", fake_resolve)
     monkeypatch.setattr(core, "precheck", fake_precheck)
     monkeypatch.setattr(core, "complete_once", fake_once)
     monkeypatch.setattr(core, "complete_stream", fake_stream)
@@ -251,20 +305,126 @@ class TestOpenAIEndpoint:
         assert "chat.completion.chunk" in text
         assert "data: [DONE]" in text
 
+    async def test_provider_selects_route_and_canonicalizes_nonstream_and_stream_models(
+        self, client, _auth, _core, monkeypatch
+    ):
+        calls = []
+        canonical = "openai/gpt-5.6-luna"
+
+        async def resolve(model, *, provider=None):
+            calls.append((model, provider))
+            return {
+                "model_name": f"perplexity/{model}",
+                "api_model_name": model,
+                "api_provider": provider,
+                "provider_name": "Perplexity Agent",
+            }
+
+        monkeypatch.setattr(core, "resolve_api", resolve)
+
+        nonstream = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": canonical,
+                "provider": "perplexity",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=_H,
+        )
+        stream = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": canonical,
+                "provider": "perplexity",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=_H,
+        )
+
+        assert nonstream.status_code == 200
+        assert nonstream.json()["model"] == canonical
+        assert stream.status_code == 200
+        assert f'"model": "{canonical}"' in stream.text
+        assert calls == [(canonical, "perplexity"), (canonical, "perplexity")]
+
+    async def test_provider_validation_and_virtual_model_rejection(self, client, _auth, monkeypatch):
+        async def forbidden_resolve(*_args, **_kwargs):
+            raise AssertionError("virtual model must reject provider before route resolution")
+
+        monkeypatch.setattr(core, "resolve_api", forbidden_resolve)
+        invalid = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4o",
+                "provider": "Perplexity!",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=_H,
+        )
+        virtual = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "lumen",
+                "provider": "perplexity",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=_H,
+        )
+
+        assert invalid.status_code == 422
+        assert virtual.status_code == 400
+        assert virtual.json()["error"]["code"] == "provider_not_supported_for_lumen"
+
+    async def test_provider_stream_error_has_no_success_terminal(self, client, _auth, _core, monkeypatch):
+        async def failed_stream(**_kwargs):
+            yield {"type": "error", "message": "safe upstream failure"}
+
+        monkeypatch.setattr(core, "complete_stream", failed_stream)
+
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "perplexity/sonar",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=_H,
+        )
+
+        assert response.status_code == 200
+        assert "safe upstream failure" in response.text
+        assert "data: [DONE]" not in response.text
+
     async def test_models(self, client, _auth, monkeypatch):
-        from lumen.services.providers import repository
+        from lumen.services.providers import routing
 
-        async def fake_list(active_only=False):
-            return [{"model_name": "gpt-4o", "provider_name": "openai"}]
+        async def fake_list():
+            return [
+                {
+                    "model_name": "gpt-4o",
+                    "api_model_name": "gpt-4o",
+                    "api_provider": "openai",
+                }
+            ]
 
-        monkeypatch.setattr(repository, "list_models", fake_list)
+        monkeypatch.setattr(routing, "list_api_models", fake_list)
         discovery = (await client.get("/v1/")).json()["version"]
         models_url = next(link["href"] for link in discovery["links"] if link["rel"] == "models")
         resp = await client.get(models_url, headers=_H)
         assert resp.status_code == 200
         assert resp.json() == {
             "object": "list",
-            "data": [{"id": "gpt-4o", "object": "model", "created": 0, "owned_by": "openai"}],
+            "data": [
+                {
+                    "id": "gpt-4o",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "lumen",
+                    "providers": ["openai"],
+                }
+            ],
         }
 
     async def test_forwards_api_key_id_to_precheck(self, client, _auth, monkeypatch):
@@ -273,8 +433,13 @@ class TestOpenAIEndpoint:
         async def fake_precheck(user_id, project_id, api_key_id=None):
             calls.append((user_id, project_id, api_key_id))
 
-        async def fake_resolve(model):
-            return {"model_name": model, "provider_name": "openai"}
+        async def fake_resolve(model, *, provider=None):
+            return {
+                "model_name": model,
+                "api_model_name": model,
+                "api_provider": provider or "openai",
+                "provider_name": "openai",
+            }
 
         async def fake_once(**kw):
             return {
@@ -287,7 +452,7 @@ class TestOpenAIEndpoint:
                 "finish_reason": "stop",
             }
 
-        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "resolve_api", fake_resolve)
         monkeypatch.setattr(core, "precheck", fake_precheck)
         monkeypatch.setattr(core, "complete_once", fake_once)
 
@@ -307,10 +472,15 @@ class TestOpenAIEndpoint:
         async def forbidden_provider(**kw):
             raise AssertionError("provider complete_once/complete_stream must not be called")
 
-        async def fake_resolve(model):
-            return {"model_name": model, "provider_name": "openai"}
+        async def fake_resolve(model, *, provider=None):
+            return {
+                "model_name": model,
+                "api_model_name": model,
+                "api_provider": provider or "openai",
+                "provider_name": "openai",
+            }
 
-        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "resolve_api", fake_resolve)
         monkeypatch.setattr(core, "precheck", quota_precheck)
         monkeypatch.setattr(core, "complete_once", forbidden_provider)
         monkeypatch.setattr(core, "complete_stream", forbidden_provider)
@@ -340,8 +510,13 @@ class TestOpenAIEndpoint:
     async def test_openai_tool_choice_forwarded(self, client, _auth, monkeypatch):
         received_extra = {}
 
-        async def fake_resolve(model):
-            return {"model_name": model, "provider_name": "openai"}
+        async def fake_resolve(model, *, provider=None):
+            return {
+                "model_name": model,
+                "api_model_name": model,
+                "api_provider": provider or "openai",
+                "provider_name": "openai",
+            }
 
         async def fake_acompletion(*args, **kw):
             nonlocal received_extra
@@ -357,7 +532,7 @@ class TestOpenAIEndpoint:
         async def fake_bill(*_args, **_kwargs):
             return 1, 1, 0.0
 
-        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "resolve_api", fake_resolve)
         monkeypatch.setattr(core, "precheck", fake_precheck)
         monkeypatch.setattr("lumen.services.completion_api.litellm_client.acompletion", fake_acompletion)
         monkeypatch.setattr(core, "_bill", fake_bill)
@@ -394,14 +569,20 @@ class TestOpenAILumenVirtualModel:
 
     async def test_lumen_model_listed_when_default_configured_and_active(self, client, _auth, monkeypatch):
         from lumen.config import get_settings
-        from lumen.services.providers import repository
+        from lumen.services.providers import routing
 
         monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
 
-        async def fake_list(active_only=False):
-            return [{"model_name": "gpt-4o", "provider_name": "openai"}]
+        async def fake_list():
+            return [
+                {
+                    "model_name": "gpt-4o",
+                    "api_model_name": "gpt-4o",
+                    "api_provider": "openai",
+                }
+            ]
 
-        monkeypatch.setattr(repository, "list_models", fake_list)
+        monkeypatch.setattr(routing, "list_api_models", fake_list)
 
         resp = await client.get("/v1/models", headers=_H)
         assert resp.status_code == 200
@@ -409,17 +590,24 @@ class TestOpenAILumenVirtualModel:
         lumen_items = [m for m in data if m["id"] == "lumen"]
         assert len(lumen_items) == 1
         assert lumen_items[0]["owned_by"] == "lumen"
+        assert lumen_items[0]["providers"] == []
 
     async def test_lumen_model_hidden_when_unconfigured_or_inactive(self, client, _auth, monkeypatch):
         from lumen.config import get_settings
-        from lumen.services.providers import repository
+        from lumen.services.providers import routing
 
         monkeypatch.setattr(get_settings(), "chat_default_model", "")
 
-        async def fake_list(active_only=False):
-            return [{"model_name": "gpt-4o", "provider_name": "openai"}]
+        async def fake_list():
+            return [
+                {
+                    "model_name": "gpt-4o",
+                    "api_model_name": "gpt-4o",
+                    "api_provider": "openai",
+                }
+            ]
 
-        monkeypatch.setattr(repository, "list_models", fake_list)
+        monkeypatch.setattr(routing, "list_api_models", fake_list)
 
         resp = await client.get("/v1/models", headers=_H)
         assert resp.status_code == 200
@@ -976,17 +1164,25 @@ class TestOpenAILumenVirtualModel:
 
     async def test_models_list_dedupes_provider_lumen_model(self, client, _auth, monkeypatch):
         from lumen.config import get_settings
-        from lumen.services.providers import repository
+        from lumen.services.providers import routing
 
         monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
 
-        async def fake_list(active_only=False):
+        async def fake_list():
             return [
-                {"model_name": "gpt-4o", "provider_name": "openai"},
-                {"model_name": "lumen", "provider_name": "custom_provider"},
+                {
+                    "model_name": "gpt-4o",
+                    "api_model_name": "gpt-4o",
+                    "api_provider": "openai",
+                },
+                {
+                    "model_name": "lumen",
+                    "api_model_name": "lumen",
+                    "api_provider": "custom_provider",
+                },
             ]
 
-        monkeypatch.setattr(repository, "list_models", fake_list)
+        monkeypatch.setattr(routing, "list_api_models", fake_list)
 
         resp = await client.get("/v1/models", headers=_H)
         assert resp.status_code == 200
@@ -994,6 +1190,7 @@ class TestOpenAILumenVirtualModel:
         lumen_items = [m for m in data if m["id"] == "lumen"]
         assert len(lumen_items) == 1
         assert lumen_items[0]["owned_by"] == "lumen"
+        assert lumen_items[0]["providers"] == []
 
 
 class TestDiscoveryAndHostGate:
@@ -1086,14 +1283,86 @@ class TestAnthropicEndpoint:
         assert "content_block_delta" in text
         assert "event: message_stop" in text
 
+    async def test_provider_selects_route_and_canonicalizes_anthropic_models(
+        self, client, _auth, _core, monkeypatch
+    ):
+        calls = []
+        canonical = "anthropic/claude-sonnet-4-6"
+
+        async def resolve(model, *, provider=None):
+            calls.append((model, provider))
+            return {
+                "model_name": f"perplexity/{model}",
+                "api_model_name": model,
+                "api_provider": provider,
+                "provider_name": "Perplexity Agent",
+            }
+
+        monkeypatch.setattr(core, "resolve_api", resolve)
+
+        nonstream = await client.post(
+            "/v1/messages",
+            json={
+                "model": canonical,
+                "provider": "perplexity",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=_H,
+        )
+        stream = await client.post(
+            "/v1/messages",
+            json={
+                "model": canonical,
+                "provider": "perplexity",
+                "max_tokens": 128,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=_H,
+        )
+
+        assert nonstream.status_code == 200
+        assert nonstream.json()["model"] == canonical
+        assert stream.status_code == 200
+        assert f'"model": "{canonical}"' in stream.text
+        assert calls == [(canonical, "perplexity"), (canonical, "perplexity")]
+
+    async def test_anthropic_provider_stream_error_has_no_success_terminal(
+        self, client, _auth, _core, monkeypatch
+    ):
+        async def failed_stream(**_kwargs):
+            yield {"type": "error", "message": "safe upstream failure"}
+
+        monkeypatch.setattr(core, "complete_stream", failed_stream)
+
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "anthropic/claude-sonnet-4-6",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=_H,
+        )
+
+        assert response.status_code == 200
+        assert "safe upstream failure" in response.text
+        assert "event: message_stop" not in response.text
+
     async def test_forwards_api_key_id_to_precheck(self, client, _auth, monkeypatch):
         calls = []
 
         async def fake_precheck(user_id, project_id, api_key_id=None):
             calls.append((user_id, project_id, api_key_id))
 
-        async def fake_resolve(model):
-            return {"model_name": model, "provider_name": "openai"}
+        async def fake_resolve(model, *, provider=None):
+            return {
+                "model_name": model,
+                "api_model_name": model,
+                "api_provider": provider or "openai",
+                "provider_name": "openai",
+            }
 
         async def fake_once(**kw):
             return {
@@ -1106,7 +1375,7 @@ class TestAnthropicEndpoint:
                 "finish_reason": "stop",
             }
 
-        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "resolve_api", fake_resolve)
         monkeypatch.setattr(core, "precheck", fake_precheck)
         monkeypatch.setattr(core, "complete_once", fake_once)
 
@@ -1126,10 +1395,15 @@ class TestAnthropicEndpoint:
         async def forbidden_provider(**kw):
             raise AssertionError("provider complete_once/complete_stream must not be called")
 
-        async def fake_resolve(model):
-            return {"model_name": model, "provider_name": "openai"}
+        async def fake_resolve(model, *, provider=None):
+            return {
+                "model_name": model,
+                "api_model_name": model,
+                "api_provider": provider or "openai",
+                "provider_name": "openai",
+            }
 
-        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "resolve_api", fake_resolve)
         monkeypatch.setattr(core, "precheck", quota_precheck)
         monkeypatch.setattr(core, "complete_once", forbidden_provider)
         monkeypatch.setattr(core, "complete_stream", forbidden_provider)
@@ -1153,8 +1427,13 @@ class TestAnthropicEndpoint:
     async def test_anthropic_tool_choice_conversion(self, client, _auth, monkeypatch):
         received_kw = {}
 
-        async def fake_resolve(model):
-            return {"model_name": model, "provider_name": "anthropic"}
+        async def fake_resolve(model, *, provider=None):
+            return {
+                "model_name": model,
+                "api_model_name": model,
+                "api_provider": provider or "anthropic",
+                "provider_name": "anthropic",
+            }
 
         async def fake_once(**kw):
             nonlocal received_kw
@@ -1172,7 +1451,7 @@ class TestAnthropicEndpoint:
         async def fake_precheck(*_args, **_kwargs):
             return None
 
-        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "resolve_api", fake_resolve)
         monkeypatch.setattr(core, "precheck", fake_precheck)
         monkeypatch.setattr(core, "complete_once", fake_once)
 
@@ -1193,13 +1472,18 @@ class TestAnthropicEndpoint:
             assert received_kw["tool_choice"] == expected_tc
 
     async def test_malformed_anthropic_tool_choice_returns_422(self, client, _auth, monkeypatch):
-        async def fake_resolve(model):
-            return {"model_name": model, "provider_name": "anthropic"}
+        async def fake_resolve(model, *, provider=None):
+            return {
+                "model_name": model,
+                "api_model_name": model,
+                "api_provider": provider or "anthropic",
+                "provider_name": "anthropic",
+            }
 
         async def fake_precheck(*_args, **_kwargs):
             return None
 
-        monkeypatch.setattr(core, "resolve", fake_resolve)
+        monkeypatch.setattr(core, "resolve_api", fake_resolve)
         monkeypatch.setattr(core, "precheck", fake_precheck)
 
         bad_choices = [

@@ -52,6 +52,8 @@ jobs:
         with:
           repository: ${{ inputs.lumen_repository || github.repository }}
           ref: ${{ inputs.lumen_ref || github.sha }}
+      - name: Check architecture freshness
+        run: python3 scripts/check_architecture.py
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.12'

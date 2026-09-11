@@ -168,6 +168,7 @@ from lumen.api import (
     chat_extensions_user_router,
     chat_mcp_oauth_router,
     chat_memory_router,
+    chat_quotas_router,
     chat_stats_router,
     chat_usage_router,
     chat_workspaces_router,
@@ -193,6 +194,7 @@ for router, tag in (
     (chat_extensions_user_router, "Chat Extensions"),
     (chat_usage_router, "Chat Usage"),
     (chat_stats_router, "Chat Stats"),
+    (chat_quotas_router, "Chat Quotas"),
     (chat_admin_router, "Chat Administration"),
 ):
     app.include_router(router, prefix="/v1", tags=[tag])

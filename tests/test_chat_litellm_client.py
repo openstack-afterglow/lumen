@@ -7,6 +7,7 @@ litellm 의 로컬 계산(token_counter/cost_per_token)만 사용 — 네트워�
 from decimal import Decimal
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from lumen.services import litellm_client
@@ -400,3 +401,192 @@ def test_chatgpt_subscription_missing_static_prices_remains_unpriced(monkeypatch
         "chatgpt/gpt-5.2-codex",
         "chatgpt",
     ) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_perplexity_requires_explicit_route_credential(monkeypatch):
+    async def forbidden_completion(**_kwargs):
+        raise AssertionError("Perplexity must not use a process-global credential")
+
+    monkeypatch.setattr("litellm.acompletion", forbidden_completion)
+
+    with pytest.raises(ValueError, match="perplexity_credentials_missing"):
+        await litellm_client.acompletion(
+            "perplexity/sonar",
+            [{"role": "user", "content": "hello"}],
+            custom_llm_provider="perplexity",
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "api_base", "expected_model", "expected_base"),
+    (
+        (
+            "perplexity/perplexity/sonar",
+            None,
+            "perplexity/perplexity/sonar",
+            "https://api.perplexity.ai",
+        ),
+        (
+            "perplexity/openai/gpt-5.6-luna",
+            "https://api.perplexity.ai/v1",
+            "perplexity/openai/gpt-5.6-luna",
+            "https://api.perplexity.ai",
+        ),
+        (
+            "perplexity/anthropic/claude-sonnet-4-6",
+            "https://tenant.example/gateway/v1/",
+            "perplexity/anthropic/claude-sonnet-4-6",
+            "https://tenant.example/gateway",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_perplexity_agent_uses_responses_bridge_with_canonical_route(
+    monkeypatch, model, api_base, expected_model, expected_base
+):
+    captured = {}
+
+    async def bridge_completion(self, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[])
+
+    monkeypatch.setattr(
+        "litellm.completion_extras.litellm_responses_transformation.handler."
+        "ResponsesToCompletionBridgeHandler.acompletion",
+        bridge_completion,
+    )
+
+    result = await litellm_client.acompletion(
+        model,
+        [{"role": "user", "content": "hello"}],
+        api_base=api_base,
+        api_key="route-key",
+        custom_llm_provider="perplexity",
+        max_tokens=128,
+        tools=[{"type": "function", "function": {"name": "lookup"}}],
+        extra={"tool_choice": "auto", "provider": "must-not-forward"},
+    )
+
+    assert result.choices == []
+    assert captured["model"] == expected_model
+    assert captured["custom_llm_provider"] == "perplexity"
+    assert captured["litellm_params"] == {
+        "api_base": expected_base,
+        "api_key": "route-key",
+        "custom_llm_provider": "perplexity",
+        "no_log": True,
+    }
+    assert captured["optional_params"]["tool_choice"] == "auto"
+    assert captured["optional_params"]["max_tokens"] == 128
+    assert "provider" not in captured["optional_params"]
+
+
+@pytest.mark.asyncio
+async def test_perplexity_agent_hits_responses_http_boundary_with_public_model(monkeypatch):
+    captured = {}
+
+    class Sender:
+        async def post(self, *, url, headers, **kwargs):
+            captured.update(url=url, headers=headers, body=kwargs.get("json"))
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "id": "resp_test",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "perplexity/sonar",
+                    "output": [
+                        {
+                            "id": "msg_test",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "hello",
+                                    "annotations": [],
+                                    "logprobs": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    "error": None,
+                    "incomplete_details": None,
+                    "instructions": None,
+                    "metadata": {},
+                },
+            )
+
+    sender = Sender()
+    monkeypatch.setattr(
+        "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+        lambda **_kwargs: sender,
+    )
+
+    result = await litellm_client.acompletion(
+        "perplexity/perplexity/sonar",
+        [{"role": "user", "content": "hello"}],
+        api_base="https://api.perplexity.ai/v1",
+        api_key="route-key",
+        custom_llm_provider="perplexity",
+    )
+
+    assert result.choices[0].message.content == "hello"
+    assert captured["url"] == "https://api.perplexity.ai/v1/responses"
+    assert captured["headers"]["Authorization"] == "Bearer route-key"
+    assert captured["body"]["model"] == "perplexity/sonar"
+
+@pytest.mark.asyncio
+async def test_perplexity_router_pins_chat_completions_and_preserves_canonical_model(monkeypatch):
+    captured = {}
+
+    async def completion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[])
+
+    monkeypatch.setattr("litellm.acompletion", completion)
+
+    await litellm_client.acompletion_stream(
+        "perplexity/perplexity/kimi-k3",
+        [{"role": "user", "content": "hello"}],
+        api_base="https://api.perplexity.ai/router",
+        api_key="route-key",
+        custom_llm_provider="perplexity",
+        extra={"provider": "must-not-forward"},
+    )
+
+    assert captured["model"] == "openai/perplexity/kimi-k3"
+    assert captured["api_base"] == "https://api.perplexity.ai/router/v1"
+    assert captured["custom_llm_provider"] == "openai"
+    assert captured["_skip_responses_api_bridge"] is True
+    assert captured["stream"] is True
+    assert captured["stream_options"] == {"include_usage": True}
+    assert "provider" not in captured
+
+
+@pytest.mark.asyncio
+async def test_perplexity_legacy_sonar_keeps_existing_chat_completion_route(monkeypatch):
+    captured = {}
+
+    async def completion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[])
+
+    monkeypatch.setattr("litellm.acompletion", completion)
+
+    await litellm_client.acompletion(
+        "perplexity/sonar",
+        [{"role": "user", "content": "hello"}],
+        api_base=None,
+        api_key="route-key",
+        custom_llm_provider="perplexity",
+    )
+
+    assert captured["model"] == "perplexity/sonar"
+    assert captured["custom_llm_provider"] == "perplexity"
+    assert captured["api_key"] == "route-key"

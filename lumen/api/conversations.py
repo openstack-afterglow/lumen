@@ -22,6 +22,8 @@ router = APIRouter()
 class AvailableModel(BaseModel):
     id: int
     model_name: str
+    api_model_name: str
+    api_provider: str
     display_name: str
     provider: str | None = None
     provider_api_key_configured: bool
@@ -49,7 +51,9 @@ async def list_available_models(token_info: dict = Depends(require_scopes("model
             {
                 "id": m["id"],
                 "model_name": m["model_name"],
-                "display_name": m.get("display_name") or m["model_name"],
+                "api_model_name": m["api_model_name"],
+                "api_provider": m["api_provider"],
+                "display_name": m["display_name"],
                 "provider": provider.get("name") if provider else None,
                 "provider_api_key_configured": bool(provider and provider.get("has_api_key")),
                 "capabilities": caps or None,

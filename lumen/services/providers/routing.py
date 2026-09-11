@@ -16,9 +16,10 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun, ChatRunProvider
 from lumen.services.run_store import NONTERMINAL
 
-from .credentials import ProviderAuthRef, resolve_api_key
+from .credentials import ProviderAuthRef, api_model_name, resolve_api_key, short_model_name
 from .errors import (
     ActiveRunConfigurationConflict,
+    AmbiguousModelRouteError,
     ChatStorageUnavailable,
     ProviderConfigurationChangedError,
     ProviderNotFoundError,
@@ -236,6 +237,8 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
     ).hexdigest()
     return {
         "model_name": model.model_name,
+        "api_model_name": api_model_name(model.model_name, provider.provider_type),
+        "api_provider": provider.provider_type,
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
         "api_base": api_base,
@@ -315,6 +318,134 @@ async def resolve_model(model_name: str) -> dict | None:
                 return None
             model, provider = row
             return _resolved_model(model, provider)
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def resolve_api_model(model_name: str, *, provider: str | None = None) -> dict | None:
+    """Resolve one external API model/provider pair without exposing route encoding."""
+    candidates = {
+        model_name,
+        f"perplexity/{model_name}",
+        f"perplexity/perplexity/{model_name}",
+        f"gemini/{model_name}",
+    }
+    if model_name.startswith("perplexity/"):
+        bare = model_name.removeprefix("perplexity/")
+        candidates.add(bare)
+        candidates.add(f"perplexity/{bare}")
+        candidates.add(f"perplexity/perplexity/{bare}")
+    if model_name.startswith("perplexity/perplexity/"):
+        bare = model_name.removeprefix("perplexity/perplexity/")
+        candidates.add(bare)
+        candidates.add(f"perplexity/{bare}")
+        candidates.add(f"perplexity/perplexity/{bare}")
+    if model_name.startswith("gemini/"):
+        bare = model_name.removeprefix("gemini/")
+        candidates.add(bare)
+        candidates.add(f"gemini/{bare}")
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            stmt = (
+                select(LlmModel, LlmProvider)
+                .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
+                .where(
+                    LlmModel.model_name.in_(candidates),
+                    LlmModel.is_active.is_(True),
+                    LlmProvider.is_active.is_(True),
+                )
+                .order_by(LlmModel.id)
+            )
+            if provider is not None:
+                stmt = stmt.where(LlmProvider.provider_type == provider)
+            rows = (await session.execute(stmt)).all()
+
+            def _row_matches(model_row: LlmModel, provider_row: LlmProvider) -> bool:
+                ptype = provider_row.provider_type
+                api_name = api_model_name(model_row.model_name, ptype)
+                short_name = short_model_name(model_row.model_name, ptype)
+                if model_name in (api_name, short_name, model_row.model_name):
+                    return True
+                if f"perplexity/{model_name}" == api_name:
+                    return True
+                if model_name.removeprefix("perplexity/") in (
+                    short_name,
+                    api_name.removeprefix("perplexity/"),
+                ):
+                    return True
+                if ptype == "gemini" and (
+                    f"gemini/{model_name}" == model_row.model_name
+                    or model_name.removeprefix("gemini/") in (short_name, api_name)
+                ):
+                    return True
+                return False
+
+            matches = [
+                (model, route_provider)
+                for model, route_provider in rows
+                if _row_matches(model, route_provider)
+            ]
+            if not matches:
+                return None
+
+            if provider is None:
+                provider_types = {route_provider.provider_type for _, route_provider in matches}
+                if len(provider_types) > 1:
+                    raise AmbiguousModelRouteError("model route is ambiguous")
+                exact = [
+                    m
+                    for m in matches
+                    if api_model_name(m[0].model_name, m[1].provider_type) == model_name
+                    or short_model_name(m[0].model_name, m[1].provider_type) == model_name
+                    or m[0].model_name == model_name
+                ]
+                if exact:
+                    return _resolved_model(*exact[0])
+                return _resolved_model(*matches[0])
+            else:
+                if len(matches) > 1:
+                    exact = [
+                        m
+                        for m in matches
+                        if api_model_name(m[0].model_name, m[1].provider_type) == model_name
+                        or short_model_name(m[0].model_name, m[1].provider_type) == model_name
+                        or m[0].model_name == model_name
+                    ]
+                    if len(exact) == 1:
+                        return _resolved_model(*exact[0])
+                    raise AmbiguousModelRouteError("model route is ambiguous")
+                return _resolved_model(*matches[0])
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def list_api_models() -> list[dict]:
+    """List active public model identities without decrypting credentials or pricing."""
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            rows = (
+                await session.execute(
+                    select(LlmModel, LlmProvider)
+                    .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
+                    .where(
+                        LlmModel.is_active.is_(True),
+                        LlmProvider.is_active.is_(True),
+                    )
+                    .order_by(LlmModel.id)
+                )
+            ).all()
+            return [
+                {
+                    "model_name": model.model_name,
+                    "api_model_name": api_model_name(model.model_name, provider.provider_type),
+                    "api_provider": provider.provider_type,
+                }
+                for model, provider in rows
+            ]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc

@@ -46,6 +46,12 @@ class ApiKeyCreateBody(BaseModel):
         max_digits=18,
         decimal_places=8,
     )
+    weekly_credit_limit: Decimal | None = Field(
+        default=None,
+        gt=0,
+        max_digits=18,
+        decimal_places=8,
+    )
 
     @field_validator("scopes")
     @classmethod
@@ -62,6 +68,31 @@ class ApiKeyLimitUpdateBody(BaseModel):
         max_digits=18,
         decimal_places=8,
     )
+
+class ApiKeyOwnerLimitUpdateBody(BaseModel):
+    monthly_credit_limit: Decimal | None = Field(
+        ...,
+        gt=0,
+        max_digits=18,
+        decimal_places=8,
+    )
+    weekly_credit_limit: Decimal | None = Field(
+        ...,
+        gt=0,
+        max_digits=18,
+        decimal_places=8,
+    )
+
+
+class ApiKeyUpdateBody(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def name_must_not_be_blank(cls, name: str) -> str:
+        if not name.strip():
+            raise ValueError("이름은 공백일 수 없습니다")
+        return name
 
 def _http(exc: Exception) -> HTTPException:
     if isinstance(exc, aks.ApiKeyLimitConflict):
@@ -94,6 +125,23 @@ async def create_api_key(body: ApiKeyCreateBody, token_info: dict = Depends(get_
             body.name or "",
             list(body.scopes),
             body.monthly_credit_limit,
+            body.weekly_credit_limit,
+        )
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+@router.patch("/api-keys/{key_id}")
+async def update_api_key(
+    key_id: int,
+    body: ApiKeyUpdateBody,
+    token_info: dict = Depends(get_token_info),
+):
+    try:
+        return await aks.rename_key(
+            key_id,
+            token_info["user_id"],
+            token_info["project_id"],
+            body.name,
         )
     except _EXC as exc:
         raise _http(exc) from exc
@@ -110,7 +158,7 @@ async def revoke_api_key(key_id: int, token_info: dict = Depends(get_token_info)
 @router.patch("/api-keys/{key_id}/limits")
 async def update_owner_api_key_limits(
     key_id: int,
-    body: ApiKeyLimitUpdateBody,
+    body: ApiKeyOwnerLimitUpdateBody,
     token_info: dict = Depends(get_token_info),
 ):
     try:
@@ -119,6 +167,7 @@ async def update_owner_api_key_limits(
             token_info["user_id"],
             token_info["project_id"],
             body.monthly_credit_limit,
+            body.weekly_credit_limit,
         )
     except _EXC as exc:
         raise _http(exc) from exc

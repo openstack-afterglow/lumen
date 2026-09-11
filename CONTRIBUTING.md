@@ -45,3 +45,21 @@ HTTP route는 auth/scope, request parsing, HTTP error/SSE만 맡긴다. `chat_ad
 - durable run은 admission snapshot, worker revalidation, journal event, usage provenance를 보존한다.
 - secret/plaintext key/raw provider cost가 response나 log에 새로 노출되지 않는다.
 - focused test, relevant full suite, Ruff를 실행했다.
+
+## Architecture maintenance
+
+작업 전에 루트 [`ARCHITECTURE.md`](ARCHITECTURE.md)를 읽는다. code/config/schema/dependency/deploy/test 변경은 영향받는 root 본문과 상세 문서를 같은 변경에서 갱신한다. 구조 영향이 없는 bugfix/refactor도 최신 review summary에 영향 없음의 이유를 기록한다. source가 문서보다 우선하며, 계획·roadmap·테스트 정의를 구현 또는 실제 통과 증거로 승격하지 않는다.
+
+실제 source와 tests를 검토한 뒤 canonical architecture guard를 stamp하고 완료/commit 전에 다음 명령을 실행한다. 아직 guard가 vendor되지 않은 checkout에서는 parent의 canonical 파일을 먼저 반영한다.
+
+```bash
+python3 scripts/check_architecture.py
+```
+
+staged 제출 범위는 다음으로 확인한다.
+
+```bash
+python3 scripts/check_architecture.py --staged
+```
+
+로컬 hook은 선택적으로 `pre-commit install`로 설치할 수 있으며, 직접 실행하는 위 명령과 CI architecture step이 정합성을 검사한다. review marker에는 credential/token/raw secret을 쓰지 않는다.

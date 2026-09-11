@@ -125,6 +125,98 @@ def test_litellm_model_name_strips_exactly_one_subscription_namespace():
     assert credentials.litellm_model_name("chatgpt/chatgpt/gpt-5") == "chatgpt/chatgpt/gpt-5"
 
 
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    (
+        ("perplexity/perplexity/sonar", "perplexity/sonar"),
+        ("perplexity/sonar", "perplexity/sonar"),
+        ("sonar", "perplexity/sonar"),
+        ("anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
+        ("openai/gpt-5.6-luna", "openai/gpt-5.6-luna"),
+    ),
+)
+def test_perplexity_public_model_name_removes_only_transport_prefix(model_name, expected):
+    assert credentials.api_model_name(model_name, "perplexity") == expected
+
+
+def test_non_perplexity_public_model_name_is_unchanged():
+    assert credentials.api_model_name("anthropic/claude-sonnet-4-6", "anthropic") == (
+        "anthropic/claude-sonnet-4-6"
+    )
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    (
+        ("gemini/gemini-3.1-flash-lite", "gemini-3.1-flash-lite"),
+        ("gemini/gemini-3.8-flash", "gemini-3.8-flash"),
+        ("gemini-3.8-flash", "gemini-3.8-flash"),
+    ),
+)
+def test_gemini_public_model_name_removes_transport_prefix(model_name, expected):
+    assert credentials.api_model_name(model_name, "gemini") == expected
+    assert credentials.short_model_name(model_name, "gemini") == expected
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    (
+        ("perplexity/perplexity/sonar", "perplexity/perplexity/sonar"),
+        ("perplexity/sonar", "perplexity/perplexity/sonar"),
+        ("sonar", "perplexity/perplexity/sonar"),
+        ("anthropic/claude-sonnet-4-6", "perplexity/anthropic/claude-sonnet-4-6"),
+    ),
+)
+def test_perplexity_route_model_name_adds_one_transport_prefix(model_name, expected):
+    assert credentials.perplexity_route_model_name(model_name) == expected
+
+
+@pytest.mark.parametrize("model_name", ("", " ", "perplexity//sonar", "openai/gpt 5"))
+def test_perplexity_route_model_name_rejects_invalid_segments(model_name):
+    with pytest.raises(ProviderValidationError):
+        credentials.perplexity_route_model_name(model_name)
+
+
+def test_perplexity_route_model_name_rejects_database_overflow():
+    with pytest.raises(ProviderValidationError, match="190"):
+        credentials.perplexity_route_model_name("openai/" + ("m" * 184))
+
+
+
+def test_perplexity_public_projection_preserves_route_key_and_custom_label(monkeypatch):
+    monkeypatch.setattr(pricing, "_effective_capabilities", lambda *_args, **_kwargs: ({}, "litellm"))
+    base = {
+        "id": 7,
+        "provider_id": 3,
+        "model_name": "perplexity/perplexity/sonar",
+        "is_active": True,
+        "is_title_model": False,
+        "is_memory_model": False,
+        "input_price": None,
+        "output_price": None,
+        "price_source": None,
+        "price_metadata": None,
+        "capabilities": None,
+        "capability_source": None,
+        "models_dev_model_id": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+    default_label = pricing._model_public(
+        SimpleNamespace(display_name="perplexity/perplexity/sonar", **base),
+        provider_type="perplexity",
+    )
+    custom_label = pricing._model_public(
+        SimpleNamespace(display_name="Sonar Research", **base),
+        provider_type="perplexity",
+    )
+
+    assert default_label["model_name"] == "perplexity/perplexity/sonar"
+    assert default_label["api_model_name"] == "perplexity/sonar"
+    assert default_label["api_provider"] == "perplexity"
+    assert default_label["display_name"] == "perplexity/sonar"
+    assert custom_label["display_name"] == "Sonar Research"
+
 def test_subscription_public_projection_distinguishes_api_key_and_subscription_status(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "environment-key")
     base = {

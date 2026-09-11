@@ -25,6 +25,7 @@ from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import ChatApiKey, ChatUsageLog, UserWallet
 from lumen.services.api_key_store import calculate_effective_limit
 from lumen.services.litellm_client import UsageCost
+from lumen.services.quota_periods import month_start, week_start
 
 logger = logging.getLogger(__name__)
 
@@ -119,12 +120,30 @@ async def _get_or_create_wallet(session, user_id: str, project_id: str | None) -
     return wallet
 
 
-async def precheck(
-    user_id: str, project_id: str | None = None, api_key_id: int | None = None
-) -> None:
-    """월 쿼터 초과 시 QuotaExceeded. DB 장애 시 ChatStorageUnavailable(fail-closed).
+async def _ledger_credited_since(
+    session,
+    *,
+    since: datetime,
+    user_id: str | None = None,
+    api_key_id: int | None = None,
+    api_only: bool = False,
+) -> Decimal:
+    stmt = select(func.coalesce(func.sum(ChatUsageLog.credited_cost), Decimal("0"))).where(
+        ChatUsageLog.created_at >= since
+    )
+    if user_id is not None:
+        stmt = stmt.where(ChatUsageLog.user_id == user_id, ChatUsageLog.source != "system")
+    if api_key_id is not None:
+        stmt = stmt.where(ChatUsageLog.api_key_id == api_key_id)
+    if api_only:
+        stmt = stmt.where(ChatUsageLog.source == "api")
+    return Decimal(str((await session.execute(stmt)).scalar_one()))
 
-    max_quota_monthly == 0 은 '무제한'으로 해석(설정 default_monthly_quota=0 대응).
+
+async def precheck(user_id: str, project_id: str | None = None, api_key_id: int | None = None) -> None:
+    """월간 또는 주간 쿼터 초과 시 QuotaExceeded. DB 장애 시 ChatStorageUnavailable(fail-closed).
+
+    0인 기간 쿼터는 '무제한'으로 해석한다.
     """
     factory = _require_db()
     try:
@@ -139,6 +158,15 @@ async def precheck(
                 and wallet.used_quota_this_month >= wallet.max_quota_monthly
             ):
                 raise QuotaExceeded("월 사용 한도를 초과했습니다")
+            weekly = Decimal(str(wallet.max_quota_weekly))
+            if weekly > 0:
+                week_usage = await _ledger_credited_since(
+                    session,
+                    since=week_start(),
+                    user_id=user_id,
+                )
+                if week_usage >= weekly:
+                    raise QuotaExceeded("주간 사용 한도를 초과했습니다")
 
             if api_key_id is not None:
                 key_row = await session.get(ChatApiKey, api_key_id)
@@ -151,6 +179,7 @@ async def precheck(
 
                 owner_lim = key_row.owner_monthly_credit_limit
                 admin_lim = key_row.admin_monthly_credit_limit
+                owner_weekly = key_row.owner_weekly_credit_limit
 
                 if owner_lim is not None:
                     if not isinstance(owner_lim, Decimal):
@@ -161,6 +190,14 @@ async def precheck(
                     if not owner_lim.is_finite() or owner_lim <= 0:
                         raise ChatStorageUnavailable("chat DB 오류")
 
+                if owner_weekly is not None:
+                    if not isinstance(owner_weekly, Decimal):
+                        try:
+                            owner_weekly = Decimal(str(owner_weekly))
+                        except Exception as exc:
+                            raise ChatStorageUnavailable("chat DB 오류") from exc
+                    if not owner_weekly.is_finite() or owner_weekly <= 0:
+                        raise ChatStorageUnavailable("chat DB 오류")
                 if admin_lim is not None:
                     if not isinstance(admin_lim, Decimal):
                         try:
@@ -181,21 +218,148 @@ async def precheck(
                 effective_limit = calculate_effective_limit(owner_lim, admin_lim, sys_quota)
 
                 if effective_limit is not None:
-                    month_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-                    stmt = select(func.coalesce(func.sum(ChatUsageLog.credited_cost), Decimal("0"))).where(
-                        ChatUsageLog.api_key_id == api_key_id,
-                        ChatUsageLog.source == "api",
-                        ChatUsageLog.created_at >= month_start,
+                    month_usage = await _ledger_credited_since(
+                        session,
+                        since=month_start(),
+                        api_key_id=api_key_id,
+                        api_only=True,
                     )
-                    month_usage = (await session.execute(stmt)).scalar_one()
                     if month_usage >= effective_limit:
                         raise QuotaExceeded("API 키 월 사용 한도를 초과했습니다")
+
+                effective_weekly = calculate_effective_limit(owner_weekly, None, weekly)
+                if effective_weekly is not None:
+                    key_week_usage = await _ledger_credited_since(
+                        session,
+                        since=week_start(),
+                        api_key_id=api_key_id,
+                        api_only=True,
+                    )
+                    if key_week_usage >= effective_weekly:
+                        raise QuotaExceeded("API 키 주간 사용 한도를 초과했습니다")
     except (QuotaExceeded, ChatStorageUnavailable):
         raise
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
     except Exception as exc:
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+def _quota_public(
+    wallet: UserWallet,
+    *,
+    month_used: Decimal,
+    week_used: Decimal,
+) -> dict:
+    monthly = Decimal(str(wallet.max_quota_monthly))
+    weekly = Decimal(str(wallet.max_quota_weekly))
+    return {
+        "user_id": wallet.user_id,
+        "project_id": wallet.project_id,
+        "monthly_credit_limit": None if monthly <= 0 else format(monthly, "f"),
+        "weekly_credit_limit": None if weekly <= 0 else format(weekly, "f"),
+        "month_credited_cost": format(month_used, "f"),
+        "week_credited_cost": format(week_used, "f"),
+        "is_active": wallet.is_active,
+        "updated_at": wallet.updated_at.isoformat() if wallet.updated_at else None,
+    }
+
+
+async def _user_credited_since_batch(
+    session,
+    user_ids: set[str],
+    *,
+    since: datetime,
+) -> dict[str, Decimal]:
+    if not user_ids:
+        return {}
+    stmt = (
+        select(
+            ChatUsageLog.user_id,
+            func.coalesce(func.sum(ChatUsageLog.credited_cost), Decimal("0")),
+        )
+        .where(
+            ChatUsageLog.user_id.in_(user_ids),
+            ChatUsageLog.source != "system",
+            ChatUsageLog.created_at >= since,
+        )
+        .group_by(ChatUsageLog.user_id)
+    )
+    rows = (await session.execute(stmt)).all()
+    return {
+        row_user_id: Decimal(str(total)) for row_user_id, total in rows if row_user_id is not None and total is not None
+    }
+
+
+async def list_user_quotas(user_id: str | None = None) -> dict:
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            stmt = select(UserWallet)
+            if user_id is not None:
+                stmt = stmt.where(UserWallet.user_id == user_id)
+            wallets = (await session.execute(stmt.order_by(UserWallet.user_id))).scalars().all()
+            user_ids = {wallet.user_id for wallet in wallets}
+            month_used = await _user_credited_since_batch(
+                session,
+                user_ids,
+                since=month_start(),
+            )
+            week_used = await _user_credited_since_batch(
+                session,
+                user_ids,
+                since=week_start(),
+            )
+            return {
+                "default_monthly_credit_limit": format(
+                    Decimal(str(get_settings().chat_default_monthly_quota)),
+                    "f",
+                ),
+                "items": [
+                    _quota_public(
+                        wallet,
+                        month_used=month_used.get(wallet.user_id, Decimal("0")),
+                        week_used=week_used.get(wallet.user_id, Decimal("0")),
+                    )
+                    for wallet in wallets
+                ],
+            }
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def set_user_quota(
+    user_id: str,
+    *,
+    monthly_credit_limit: Decimal | None,
+    weekly_credit_limit: Decimal | None,
+) -> dict:
+    factory = _require_db()
+    try:
+        async with factory() as session, session.begin():
+            wallet = await _get_or_create_wallet(session, user_id, None)
+            wallet.max_quota_monthly = monthly_credit_limit if monthly_credit_limit is not None else Decimal("0")
+            wallet.max_quota_weekly = weekly_credit_limit if weekly_credit_limit is not None else Decimal("0")
+            await session.flush()
+            month_used = await _ledger_credited_since(
+                session,
+                since=month_start(),
+                user_id=user_id,
+            )
+            week_used = await _ledger_credited_since(
+                session,
+                since=week_start(),
+                user_id=user_id,
+            )
+            return _quota_public(
+                wallet,
+                month_used=month_used,
+                week_used=week_used,
+            )
+    except OperationalError as exc:
+        mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 

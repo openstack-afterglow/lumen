@@ -256,6 +256,7 @@ class UserWallet(Base):
     project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     balance_credits: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     max_quota_monthly: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
+    max_quota_weekly: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     used_quota_this_month: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     reserved_credits: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     quota_period_start: Mapped[date | None] = mapped_column(Date)
@@ -371,6 +372,7 @@ class ChatApiKey(Base):
     scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     owner_monthly_credit_limit: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
     admin_monthly_credit_limit: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    owner_weekly_credit_limit: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -383,6 +385,10 @@ class ChatApiKey(Base):
         CheckConstraint(
             "owner_monthly_credit_limit IS NULL OR owner_monthly_credit_limit > 0",
             name="chk_chat_api_keys_owner_monthly_credit_limit",
+        ),
+        CheckConstraint(
+            "owner_weekly_credit_limit IS NULL OR owner_weekly_credit_limit > 0",
+            name="chk_chat_api_keys_owner_weekly_credit_limit",
         ),
         CheckConstraint(
             "admin_monthly_credit_limit IS NULL OR admin_monthly_credit_limit > 0",

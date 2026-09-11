@@ -140,8 +140,9 @@ with Client("https://lumen.example", "sk-afgl-...") as client:
 ## 문서
 
 - [문서 안내](docs/index.md)
+- [정본 아키텍처](ARCHITECTURE.md)
+- [아키텍처 상세 안내](docs/architecture.md)
 - [Afterglow 연동 가이드](docs/afterglow-integration.md)
-- [아키텍처](docs/architecture.md)
 - [API](docs/api-reference.md)
 - [SDK](docs/sdk.md)
 - [에이전트 플랫폼](docs/agent-platform.md)
