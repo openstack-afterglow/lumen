@@ -24,6 +24,7 @@ from lumen.services import memory_store as ms
 from lumen.services import workspace_store as ws
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
+from lumen.services.providers.pricing import _has_component_prices
 
 _MAX_TOKENS_CAP = 4096
 _MAX_MESSAGE_CHARS = 32000
@@ -111,7 +112,9 @@ def _require_execution_capability(
     if allowed_combinations and list(features.output_modalities) not in allowed_combinations:
         raise HTTPException(status_code=422, detail="requested chat output combination is not available")
     if features.tool_policy.mode == "none" and (
-        features.web_search.enabled or features.web_fetch.enabled or features.advisor.enabled
+        (features.web_search.enabled and features.web_search.mode == "managed")
+        or features.web_fetch.enabled
+        or features.advisor.enabled
     ):
         raise HTTPException(status_code=422, detail="requested chat capability requires tool execution")
 
@@ -121,14 +124,32 @@ def _require_execution_capability(
                 raise HTTPException(status_code=422, detail="requested chat capability is not available: advisor")
             continue
         gate = _capability_gate(feature, resolved)
+        if feature == "web_search" and features.web_search.mode == "native" and gate.get("mode") != "native":
+            raise HTTPException(
+                status_code=422,
+                detail="requested chat capability is not available: web_search (provider_unsupported)",
+            )
+        if feature == "web_search" and features.web_search.mode == "managed" and gate.get("mode") == "native":
+            # A native model's token price is not the managed search price.
+            # Preserve admission rejection before any chargeable tool work.
+            metadata = resolved.get("price_metadata") or {}
+            costs = metadata.get("cost", metadata) if isinstance(metadata, dict) else {}
+            if not isinstance(costs, dict) or not _has_component_prices(
+                costs,
+                "web_search_request_per_unit",
+                "web_search_context_low_per_unit",
+                "web_search_context_medium_per_unit",
+                "web_search_context_high_per_unit",
+            ):
+                gate.update(pricing_available=False, reason_code="pricing_unavailable")
         if not gate.get("available") or not gate.get("pricing_available"):
             reason = gate.get("reason_code") or "pricing_unavailable"
             raise HTTPException(
                 status_code=422, detail=f"requested chat capability is not available: {feature} ({reason})"
             )
 
-    # Only managed web search/fetch/advisor have an execution path today. Keep
-    # advertised future output modalities fail-closed rather than silently omitting them.
+    # Output generation modalities still lack execution paths. Keep them
+    # fail-closed rather than silently omitting an advertised modality.
     if features.output_modalities != ["text"]:
         raise HTTPException(status_code=422, detail="requested chat capability is not available")
 
@@ -160,7 +181,7 @@ async def resolve_summary_route(execution_route: dict[str, Any]) -> dict[str, An
 async def _resolve_feature_routes(features: ChatFeatureOptions) -> dict[str, dict[str, Any]]:
     """Resolve only user-selected managed routes after idempotency admission."""
     routes: dict[str, dict[str, Any]] = {}
-    if features.web_search.enabled:
+    if features.web_search.enabled and features.web_search.mode == "managed":
         provider_id = features.web_search.provider_id
         if provider_id is None:
             raise HTTPException(status_code=422, detail="web search provider is required")
@@ -535,7 +556,7 @@ def _require_native_admission_scopes(
         required.update(("native:extensions:read", "native:tools:execute"))
     if (
         features.tool_policy.mode != "none"
-        or features.web_search.enabled
+        or (features.web_search.enabled and features.web_search.mode == "managed")
         or features.web_fetch.enabled
         or features.advisor.enabled
     ):
@@ -595,7 +616,7 @@ async def _preview_tool_schemas(
     # perform discovery, so it deliberately counts only the deterministic
     # built-in/custom schemas rather than pretending an unknown remote schema is
     # authoritative.
-    if features.web_search.enabled:
+    if features.web_search.enabled and features.web_search.mode == "managed":
         schemas.append(
             managed._managed_schema(
                 managed._MANAGED_SEARCH_TOOL, "Search the public web through the selected provider.", "query"

@@ -34,6 +34,21 @@ logger = logging.getLogger(__name__)
 _RAW_COST_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
 
+# Exact token rates published by Perplexity Agent API that are absent from the
+# pinned LiteLLM catalog. This is deliberately not a model-family fallback.
+_OFFICIAL_PRICE_PER_MILLION: dict[tuple[str, str], tuple[Decimal, Decimal, str]] = {
+    ("perplexity", "perplexity/sonar"): (
+        Decimal("0.25"),
+        Decimal("2.50"),
+        "perplexity_agent_api_2026-09",
+    ),
+    ("perplexity", "perplexity/glm-5.3"): (
+        Decimal("1.40"),
+        Decimal("4.40"),
+        "perplexity_agent_api_2026-09",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class UsageCost:
@@ -181,10 +196,19 @@ def chatgpt_model_metadata(model_name: str) -> dict[str, Any]:
     return dict(metadata)
 
 
+def _pricing_model_candidates(model: str, provider_type: str | None) -> tuple[str, ...]:
+    normalized_model = litellm_model_name(model)
+    candidates = [normalized_model]
+    if provider_type == "perplexity":
+        canonical_model = api_model_name(normalized_model, "perplexity")
+        if canonical_model not in candidates:
+            candidates.append(canonical_model)
+    return tuple(candidates)
+
+
 def _litellm_component_rates(
     model: str, prompt_tokens: int, completion_tokens: int, provider_type: str | None = None
 ) -> tuple[Decimal | None, Decimal | None]:
-    normalized_model = litellm_model_name(model)
     if provider_type == "chatgpt" or model.startswith("chatgpt/"):
         metadata = chatgpt_model_metadata(model)
         return (
@@ -195,23 +219,55 @@ def _litellm_component_rates(
     lookup_completion_tokens = max(1, completion_tokens)
     try:
         import litellm
-
+    except Exception:
+        logger.warning("litellm cost catalog is unavailable model=%s", model, exc_info=True)
+        return None, None
+    for candidate in _pricing_model_candidates(model, provider_type):
         kwargs = {
-            "model": normalized_model,
+            "model": candidate,
             "prompt_tokens": lookup_prompt_tokens,
             "completion_tokens": lookup_completion_tokens,
         }
         if provider_type:
             kwargs["custom_llm_provider"] = provider_type
-        prompt_cost, completion_cost = litellm.cost_per_token(**kwargs)
-    except Exception:
-        logger.warning("litellm cost_per_token 실패 model=%s", model, exc_info=True)
-        return None, None
-    prompt_total = _as_decimal(prompt_cost)
-    completion_total = _as_decimal(completion_cost)
-    prompt_rate = prompt_total / lookup_prompt_tokens if prompt_total is not None else None
-    completion_rate = completion_total / lookup_completion_tokens if completion_total is not None else None
-    return prompt_rate, completion_rate
+        try:
+            prompt_cost, completion_cost = litellm.cost_per_token(**kwargs)
+        except Exception:
+            continue
+        prompt_total = _as_decimal(prompt_cost)
+        completion_total = _as_decimal(completion_cost)
+        if prompt_total is not None and completion_total is not None:
+            return prompt_total / lookup_prompt_tokens, completion_total / lookup_completion_tokens
+    return None, None
+
+
+def _official_component_rates(
+    model: str, provider_type: str | None, api_base: str | None = None
+) -> tuple[Decimal | None, Decimal | None, str | None]:
+    if provider_type != "perplexity" or _perplexity_mode(model, api_base) != "agent":
+        return None, None, None
+    canonical_model = api_model_name(litellm_model_name(model), "perplexity")
+    published = _OFFICIAL_PRICE_PER_MILLION.get((provider_type, canonical_model))
+    if published is None:
+        return None, None, None
+    input_per_million, output_per_million, source = published
+    return input_per_million / _TOKENS_PER_MILLION, output_per_million / _TOKENS_PER_MILLION, source
+
+
+def _fallback_component_rates(
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    provider_type: str | None = None,
+    api_base: str | None = None,
+) -> tuple[Decimal | None, Decimal | None, str | None]:
+    # Agent Sonar is a different priced product from the legacy Sonar API.
+    # Exact published Agent rates must win over its legacy bundled alias.
+    official_input, official_output, official_source = _official_component_rates(model, provider_type, api_base)
+    if official_input is not None and official_output is not None:
+        return official_input, official_output, official_source
+    input_rate, output_rate = _litellm_component_rates(model, prompt_tokens, completion_tokens, provider_type)
+    return input_rate, output_rate, "litellm" if input_rate is not None or output_rate is not None else None
 
 
 def _component_cost(
@@ -220,17 +276,20 @@ def _component_cost(
     stored_rate: Decimal | None,
     stored_source: str | None,
     fallback_rate: Decimal | None,
+    fallback_source: str | None,
 ) -> tuple[Decimal, Decimal | None, str | None, bool]:
     if stored_rate is not None:
         return stored_rate * tokens, stored_rate, stored_source, True
     if fallback_rate is not None:
-        return fallback_rate * tokens, fallback_rate, "litellm", True
+        return fallback_rate * tokens, fallback_rate, fallback_source, True
     return Decimal("0"), None, None, False
 
 
-def effective_prices_per_million(model: str, provider_type: str | None = None) -> tuple[Decimal | None, Decimal | None]:
-    """Return LiteLLM's bundled base input/output prices for display only."""
-    input_rate, output_rate = _litellm_component_rates(model, 1_000_000, 1_000_000, provider_type)
+def effective_prices_per_million(
+    model: str, provider_type: str | None = None, *, api_base: str | None = None
+) -> tuple[Decimal | None, Decimal | None]:
+    """Return exact token prices for the configured API route, never a family alias."""
+    input_rate, output_rate, _ = _fallback_component_rates(model, 1_000_000, 1_000_000, provider_type, api_base)
 
     def display_price(rate: Decimal | None) -> Decimal | None:
         return (
@@ -240,6 +299,12 @@ def effective_prices_per_million(model: str, provider_type: str | None = None) -
         )
 
     return display_price(input_rate), display_price(output_rate)
+
+
+def official_price_source(model: str, provider_type: str | None = None, *, api_base: str | None = None) -> str | None:
+    """Return provenance for an exact documented route price, never a guessed rate."""
+    _, _, source = _official_component_rates(model, provider_type, api_base)
+    return source
 
 
 def _decimal_string(value: Decimal | None) -> str | None:
@@ -259,22 +324,24 @@ def cost_from_usage(
     """Resolve manual → reviewed models.dev → LiteLLM bundled pricing per component."""
     prompt_tokens = max(0, int(prompt_tokens))
     completion_tokens = max(0, int(completion_tokens))
-    fallback_input, fallback_output = (
-        _litellm_component_rates(model, prompt_tokens, completion_tokens, provider_type)
+    fallback_input, fallback_output, fallback_source = (
+        _fallback_component_rates(model, prompt_tokens, completion_tokens, provider_type)
         if input_price_per_token is None or output_price_per_token is None
-        else (None, None)
+        else (None, None, None)
     )
     input_cost, input_rate, input_source, input_priced = _component_cost(
         tokens=prompt_tokens,
         stored_rate=input_price_per_token,
         stored_source=price_source,
         fallback_rate=fallback_input,
+        fallback_source=fallback_source,
     )
     output_cost, output_rate, output_source, output_priced = _component_cost(
         tokens=completion_tokens,
         stored_rate=output_price_per_token,
         stored_source=price_source,
         fallback_rate=fallback_output,
+        fallback_source=fallback_source,
     )
     priced_components = int(input_priced) + int(output_priced)
     pricing_status: Literal["priced", "partial", "unpriced"]
@@ -343,6 +410,19 @@ def _reasoning_params(model: str, effort: str | None, custom_llm_provider: str |
     if not supported:
         return {}
     return {"reasoning_effort": normalized}
+
+
+def _native_web_search_extra(
+    extra: dict | None, native_web_search: dict[str, Any] | None, custom_llm_provider: str | None
+) -> dict[str, Any] | None:
+    if native_web_search is None:
+        return extra
+    merged = {**(extra or {}), "web_search_options": dict(native_web_search)}
+    # Gemini drops server-side search when mixed with function declarations
+    # unless this LiteLLM transport option is explicit.
+    if custom_llm_provider == "gemini":
+        merged["include_server_side_tool_invocations"] = True
+    return merged
 
 
 def _build_params(
@@ -552,8 +632,96 @@ def _perplexity_router_base(api_base: str | None) -> str:
     return base
 
 
+def _responses_output_item_annotations(items: Any) -> list[dict]:
+    """Collect message-content annotations from Responses output items."""
+    annotations: list[dict] = []
+    for item in items or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            annotations.extend(entry for entry in part.get("annotations") or [] if isinstance(entry, dict))
+    return annotations
+
+
+def _responses_event_annotations(chunk: Any) -> list[dict]:
+    """Read the citation annotations carried by one raw Responses stream event."""
+    event = chunk.get("type") if isinstance(chunk, dict) else getattr(chunk, "type", None)
+    event = getattr(event, "value", event)
+    if event not in (
+        "response.output_text.annotation.added",
+        "response.output_text.done",
+        "response.output_item.done",
+        "response.completed",
+    ):
+        return []
+    if hasattr(chunk, "model_dump"):
+        chunk = chunk.model_dump()
+    if not isinstance(chunk, dict):
+        return []
+    if event == "response.output_text.annotation.added":
+        annotation = chunk.get("annotation")
+        return [annotation] if isinstance(annotation, dict) else []
+    if event == "response.output_text.done":
+        return [entry for entry in chunk.get("annotations") or [] if isinstance(entry, dict)]
+    if event == "response.output_item.done":
+        return _responses_output_item_annotations([chunk.get("item")])
+    if event == "response.completed":
+        response = chunk.get("response")
+        return _responses_output_item_annotations(response.get("output") if isinstance(response, dict) else None)
+    return []
+
+
+_BRIDGE_SUBCLASS: tuple[type, type] | None = None
+
+
+def _citation_preserving_bridge() -> type:
+    """Extend the installed Responses→chat bridge, which drops stream annotations.
+
+    LiteLLM's stream translator maps only text/tool/usage events, so native
+    ``url_citation`` annotations survive the non-stream path but vanish while
+    streaming. Subclassing keeps reasoning, tools, usage and no-log behavior.
+    """
+    global _BRIDGE_SUBCLASS
+    from litellm.completion_extras.litellm_responses_transformation import handler as bridge_handler
+    from litellm.completion_extras.litellm_responses_transformation import transformation as bridge_transformation
+
+    base = bridge_handler.ResponsesToCompletionBridgeHandler
+    if _BRIDGE_SUBCLASS is not None and _BRIDGE_SUBCLASS[0] is base:
+        return _BRIDGE_SUBCLASS[1]
+
+    class _CitationStreamIterator(bridge_transformation.OpenAiResponsesToChatCompletionStreamIterator):
+        def chunk_parser(self, chunk: Any) -> Any:
+            parsed = super().chunk_parser(chunk)
+            annotations = _responses_event_annotations(chunk)
+            if not annotations:
+                return parsed
+            choices = getattr(parsed, "choices", None) or []
+            delta = getattr(choices[0], "delta", None) if choices else None
+            if delta is None:
+                return parsed
+            existing = getattr(delta, "annotations", None) or []
+            delta.annotations = [*existing, *annotations]
+            return parsed
+
+    class _CitationTransformation(bridge_transformation.LiteLLMResponsesTransformationHandler):
+        def get_model_response_iterator(self, streaming_response, sync_stream, json_mode=False):
+            return _CitationStreamIterator(streaming_response, sync_stream, json_mode)
+
+    class _CitationBridgeHandler(base):  # type: ignore[misc, valid-type]
+        def __init__(self) -> None:
+            super().__init__()
+            self.transformation_handler = _CitationTransformation()
+
+    _BRIDGE_SUBCLASS = (base, _CitationBridgeHandler)
+    return _CitationBridgeHandler
+
+
 def _perplexity_optional_params(
     *,
+    mode: Literal["router", "agent", "legacy"],
+    model: str,
     stream: bool,
     max_tokens: int | None,
     temperature: float | None,
@@ -572,6 +740,9 @@ def _perplexity_optional_params(
         "stream",
         "stream_options",
     }
+    if mode == "agent" and model.rsplit("/", 1)[-1].lower().startswith("sonar"):
+        # Sonar searches intrinsically. Do not add a second hosted search tool.
+        blocked.add("web_search_options")
     optional_params = {key: value for key, value in (extra or {}).items() if key not in blocked}
     if max_tokens is not None:
         optional_params["max_tokens"] = max_tokens
@@ -579,6 +750,10 @@ def _perplexity_optional_params(
         optional_params["temperature"] = temperature
     if tools:
         optional_params["tools"] = tools
+    if mode == "agent" and "web_search_options" in optional_params:
+        # LiteLLM maps options in insertion order. Place search after function
+        # tools so its hosted tool is appended rather than overwritten.
+        optional_params["web_search_options"] = optional_params.pop("web_search_options")
     optional_params["stream"] = stream
     return optional_params
 
@@ -601,20 +776,15 @@ async def _perplexity_completion(
     import litellm
 
     mode = _perplexity_mode(model, api_base)
-    agent_tools = list(tools or [])
-    if mode == "agent" and not any(
-        isinstance(tool, dict) and tool.get("type") in ("web_search", "web_search_preview")
-        for tool in agent_tools
-    ):
-        agent_tools.append({"type": "web_search"})
     optional_params = _perplexity_optional_params(
+        mode=mode,
+        model=model,
         stream=stream,
         max_tokens=max_tokens,
         temperature=temperature,
-        tools=agent_tools if mode == "agent" else tools,
+        tools=tools,
         extra=extra,
     )
-    mode = _perplexity_mode(model, api_base)
     canonical_model = api_model_name(model, "perplexity")
     if mode == "router":
         params = _build_params(
@@ -652,9 +822,7 @@ async def _perplexity_completion(
             params["stream_options"] = {"include_usage": True}
         return await litellm.acompletion(**params)
 
-    from litellm.completion_extras.litellm_responses_transformation.handler import (
-        ResponsesToCompletionBridgeHandler,
-    )
+    bridge_handler_cls = _citation_preserving_bridge()
 
     from lumen.services.providers.subscription_logging import SubscriptionLogging
 
@@ -667,7 +835,7 @@ async def _perplexity_completion(
         call_id=str(uuid.uuid4()),
         stream=stream,
     )
-    return await ResponsesToCompletionBridgeHandler().acompletion(
+    return await bridge_handler_cls().acompletion(
         model=routed_model,
         messages=messages,
         optional_params=optional_params,
@@ -695,11 +863,15 @@ async def acompletion(
     temperature: float | None = None,
     custom_llm_provider: str | None = None,
     tools: list[dict] | None = None,
+    native_web_search: dict[str, Any] | None = None,
     extra: dict | None = None,
     provider_auth: ProviderAuthRef | None = None,
 ) -> Any:
     """비스트리밍 litellm 호출."""
+    merged_extra = _native_web_search_extra(extra, native_web_search, custom_llm_provider)
     if provider_auth is not None:
+        if native_web_search is not None:
+            raise ProviderSubscriptionError("subscription_native_web_search_unsupported", 422)
         return await _subscription_completion(
             model,
             messages,
@@ -709,7 +881,7 @@ async def acompletion(
             temperature=temperature,
             custom_llm_provider=custom_llm_provider,
             tools=tools,
-            extra=extra,
+            extra=merged_extra,
         )
     if _requires_subscription_auth(model, custom_llm_provider):
         raise ProviderSubscriptionError("subscription_auth_required", 502)
@@ -726,7 +898,7 @@ async def acompletion(
             max_tokens=max_tokens,
             temperature=temperature,
             tools=tools,
-            extra=extra,
+            extra=merged_extra,
         )
     import litellm
 
@@ -740,7 +912,7 @@ async def acompletion(
         temperature=temperature,
         custom_llm_provider=custom_llm_provider,
         tools=tools,
-        extra=extra,
+        extra=merged_extra,
     )
     return await litellm.acompletion(**params)
 
@@ -755,13 +927,20 @@ async def acompletion_stream(
     temperature: float | None = None,
     custom_llm_provider: str | None = None,
     tools: list[dict] | None = None,
+    native_web_search: dict[str, Any] | None = None,
     extra: dict | None = None,
     reasoning_effort: str | None = None,
     provider_auth: ProviderAuthRef | None = None,
 ) -> Any:
     """스트리밍 litellm 호출. usage 계측을 위해 include_usage 를 강제한다."""
-    merged_extra = {**(extra or {}), **_reasoning_params(model, reasoning_effort, custom_llm_provider)}
+    merged_extra = _native_web_search_extra(
+        {**(extra or {}), **_reasoning_params(model, reasoning_effort, custom_llm_provider)},
+        native_web_search,
+        custom_llm_provider,
+    )
     if provider_auth is not None:
+        if native_web_search is not None:
+            raise ProviderSubscriptionError("subscription_native_web_search_unsupported", 422)
         return await _subscription_completion(
             model,
             messages,
@@ -771,7 +950,7 @@ async def acompletion_stream(
             temperature=temperature,
             custom_llm_provider=custom_llm_provider,
             tools=tools,
-            extra=merged_extra or None,
+            extra=merged_extra,
         )
     if _requires_subscription_auth(model, custom_llm_provider):
         raise ProviderSubscriptionError("subscription_auth_required", 502)

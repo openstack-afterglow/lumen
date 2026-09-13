@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from lumen.crypto import encrypt_llm_provider_key
 from lumen.db import mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
-from lumen.services.litellm_client import effective_prices_per_million
+from lumen.services.litellm_client import effective_prices_per_million, official_price_source
 from lumen.services.models_dev import ModelsDevCatalog
 
 from .credentials import (
@@ -62,10 +62,7 @@ def validate_provider_auth_configuration(
 async def _lock_subscription_namespaces(session) -> dict[int, LlmProvider]:
     providers = (
         await session.execute(
-            select(LlmProvider)
-            .where(LlmProvider.auth_mode != "api_key")
-            .order_by(LlmProvider.id)
-            .with_for_update()
+            select(LlmProvider).where(LlmProvider.auth_mode != "api_key").order_by(LlmProvider.id).with_for_update()
         )
     ).scalars()
     return {provider.id: provider for provider in providers}
@@ -251,15 +248,11 @@ async def create_model(
                 raise ProviderValidationError(f"프로바이더 {provider_id} 가 존재하지 않습니다")
             if provider.provider_type == "perplexity" and getattr(provider, "auth_mode", "api_key") == "api_key":
                 provider = (
-                    await session.execute(
-                        select(LlmProvider).where(LlmProvider.id == provider_id).with_for_update()
-                    )
+                    await session.execute(select(LlmProvider).where(LlmProvider.id == provider_id).with_for_update())
                 ).scalar_one()
             auth_mode = getattr(provider, "auth_mode", "api_key")
             namespace_provider_ids = tuple(
-                candidate.id
-                for candidate in subscription_providers.values()
-                if candidate.auth_mode == auth_mode
+                candidate.id for candidate in subscription_providers.values() if candidate.auth_mode == auth_mode
             )
             canonical_name = canonical_subscription_model_name(model_name, auth_mode)
             if provider.provider_type == "perplexity" and auth_mode == "api_key":
@@ -318,14 +311,21 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
                 fallback_input, fallback_output = (
                     (None, None)
                     if stored_input is not None and stored_output is not None
-                    else effective_prices_per_million(model.model_name, provider.provider_type)
+                    else effective_prices_per_million(
+                        model.model_name, provider.provider_type, api_base=provider.api_base
+                    )
                 )
                 effective_input = stored_input if stored_input is not None else fallback_input
                 effective_output = stored_output if stored_output is not None else fallback_output
                 if stored_input is not None and stored_output is not None:
                     effective_source = model.price_source
                 elif effective_input is not None and effective_output is not None:
-                    effective_source = "litellm" if stored_input is None and stored_output is None else "partial"
+                    effective_source = (
+                        official_price_source(model.model_name, provider.provider_type, api_base=provider.api_base)
+                        or "litellm"
+                        if stored_input is None and stored_output is None
+                        else "partial"
+                    )
                 else:
                     effective_source = "unpriced"
                 public_models.append(
@@ -365,9 +365,7 @@ async def update_model(model_id: int, patch: dict) -> dict:
             if auth_mode is None:
                 raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
             namespace_provider_ids = tuple(
-                candidate.id
-                for candidate in subscription_providers.values()
-                if candidate.auth_mode == auth_mode
+                candidate.id for candidate in subscription_providers.values() if candidate.auth_mode == auth_mode
             )
             provider, models = await _lock_mutable_route(session, provider_id=provider_id, model_ids={model_id})
             if provider is None:

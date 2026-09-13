@@ -306,43 +306,20 @@ async def test_api_route_resolves_gemini_model_with_or_without_provider(provider
     assert res3["model_id"] == 302
     assert res3["api_model_name"] == "gemini-3.8-flash"
 
-def test_capabilities_detects_web_search_for_perplexity_models():
+
+def test_capabilities_detect_exact_native_search_support():
     from lumen.services.capabilities import litellm_capabilities
 
     caps_sonar = litellm_capabilities("sonar", "perplexity")
     assert caps_sonar["web_search"] is True
-    assert caps_sonar["feature_gates"]["web_search"]["available"] is True
+    assert caps_sonar["web_search_required"] is True
+    assert caps_sonar["feature_gates"]["web_search"] == {
+        "available": True,
+        "mode": "native",
+        "reason_code": None,
+        "pricing_available": True,
+    }
 
     caps_deepseek = litellm_capabilities("perplexity/perplexity/deepseek-v4-flash-0731", "perplexity")
-    assert caps_deepseek["web_search"] is True
-    assert caps_deepseek["feature_gates"]["web_search"]["available"] is True
-
-    caps_gpt = litellm_capabilities("gpt-4o", "openai")
-    assert caps_gpt["web_search"] is False
-    assert caps_gpt["feature_gates"]["web_search"]["available"] is False
-
-
-@pytest.mark.asyncio
-async def test_perplexity_agent_auto_enables_web_search_tool(monkeypatch):
-    from lumen.services import litellm_client
-
-    captured = {}
-
-    class FakeBridge:
-        async def acompletion(self, **kwargs):
-            captured.update(kwargs)
-            return {"status": "ok"}
-
-    from litellm.completion_extras.litellm_responses_transformation import handler
-
-    monkeypatch.setattr(handler, "ResponsesToCompletionBridgeHandler", FakeBridge)
-
-    await litellm_client.acompletion(
-        "perplexity/perplexity/deepseek-v4-flash-0731",
-        [{"role": "user", "content": "What is the latest news?"}],
-        api_base="https://api.perplexity.ai/v1",
-        api_key="test-key",
-    )
-
-    tools = captured["optional_params"]["tools"]
-    assert any(t.get("type") == "web_search" for t in tools)
+    assert caps_deepseek["web_search"] is False
+    assert caps_deepseek["feature_gates"]["web_search"]["available"] is False

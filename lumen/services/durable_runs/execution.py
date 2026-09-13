@@ -1386,7 +1386,11 @@ async def _managed_tool_configs(
     routes = capability_snapshot.get("feature_routes")
     routes = routes if isinstance(routes, dict) else {}
     search_options = features.get("web_search")
-    if isinstance(search_options, dict) and search_options.get("enabled") is True:
+    if (
+        isinstance(search_options, dict)
+        and search_options.get("enabled") is True
+        and search_options.get("mode", "managed") == "managed"
+    ):
         route_snapshot = routes.get("search")
         if not isinstance(route_snapshot, dict):
             raise DurableRunError("managed search route snapshot is missing")
@@ -1407,6 +1411,26 @@ async def _managed_tool_configs(
             raise DurableRunError("managed advisor model configuration is unavailable")
         advisor_config = {"route": route, "options": advisor_options}
     return search_config, fetch_config, advisor_config
+
+
+def _native_web_search_options(capability_snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    """Read only frozen native-search options; managed routes are never inferred here."""
+    features = capability_snapshot.get("effective_features")
+    options = features.get("web_search") if isinstance(features, dict) else None
+    if not isinstance(options, dict) or options.get("enabled") is not True or options.get("mode") != "native":
+        return None
+    if options.get("provider_id") is not None:
+        raise DurableRunError("native web search must not contain a provider route")
+    context_size = options.get("context_size")
+    if context_size not in {"low", "medium", "high"}:
+        raise DurableRunError("native web search context size is invalid")
+    native_options: dict[str, Any] = {"search_context_size": context_size}
+    location = options.get("approximate_location")
+    if location is not None:
+        if not isinstance(location, dict) or set(location) != {"city", "country", "region", "timezone"}:
+            raise DurableRunError("native web search location is invalid")
+        native_options["user_location"] = {"type": "approximate", "approximate": dict(location)}
+    return native_options
 
 
 async def execute_queued_run(run_id: str, *, owner: str) -> bool:
@@ -1720,6 +1744,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
         if resolved is None:
             raise DurableRunError("requested model configuration is unavailable")
         managed_search, managed_fetch, managed_advisor = await _managed_tool_configs(payload, capability_snapshot)
+        native_web_search = _native_web_search_options(capability_snapshot)
         extension_snapshot = payload.get("extension_snapshot")
         if extension_snapshot is None:
             selected_tool_ids = _selected_tool_ids(payload.get("features"))
@@ -1812,6 +1837,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             managed_search=managed_search,
             managed_fetch=managed_fetch,
             managed_advisor=managed_advisor,
+            native_web_search=native_web_search,
             run_id=run_id,
             execution_hooks=execution_hooks,
             execution_protocol_version=run.execution_protocol_version,

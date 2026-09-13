@@ -420,6 +420,37 @@ class TestExecutionCapabilityGate:
 
         chat_admission._require_execution_capability(features, resolved)
 
+    def test_accepts_priced_native_search_without_server_tool_execution(self):
+        features = ChatFeatureOptions(web_search={"enabled": True, "mode": "native"}, tool_policy={"mode": "none"})
+        resolved = {
+            "input_price_per_token": "0.000001",
+            "output_price_per_token": "0.000002",
+            "capabilities": {
+                "feature_gates": {
+                    "text": {"available": True, "mode": "native", "pricing_available": True},
+                    "web_search": {"available": True, "mode": "native", "pricing_available": True},
+                }
+            },
+        }
+
+        chat_admission._require_execution_capability(features, resolved)
+
+    def test_rejects_native_search_when_executor_only_has_managed_search(self):
+        features = ChatFeatureOptions(web_search={"enabled": True, "mode": "native"})
+        resolved = {
+            "input_price_per_token": "0.000001",
+            "output_price_per_token": "0.000002",
+            "capabilities": {
+                "feature_gates": {
+                    "text": {"available": True, "pricing_available": True},
+                    "web_search": {"available": True, "mode": "managed", "pricing_available": True},
+                }
+            },
+        }
+
+        with pytest.raises(HTTPException, match="provider_unsupported"):
+            chat_admission._require_execution_capability(features, resolved)
+
     def test_accepts_priced_user_selected_advisor_with_function_calling_executor(self):
         features = ChatFeatureOptions(advisor={"enabled": True, "model_id": 9})
         resolved = {
@@ -1092,6 +1123,7 @@ class TestCanonicalTempCompletion:
             },
         )
         assert response.status_code == 202
+
 
 class TestApiKeyLimitAdmission:
     async def test_all_native_admission_callsites_forward_api_key_id(self, client, monkeypatch):

@@ -20,6 +20,7 @@ Lumen은 LiteLLM provider 실행, LangGraph/LangChain agent runtime, 대화·dur
 | OpenAI/Anthropic compatibility | implemented | test-passed (`uv run lumen-test contract`, 2026-09-08) | 공개 model ID는 stateless route이며 다른 provider와 겹치지 않는 고유 모델은 provider 생략 시에도 정상 라우팅되고 중복 ID는 `provider` 없이 409로 거부하며 공급사 전체 API 동등성은 보장하지 않는다 | `lumen/api/compat/openai.py`, `lumen/api/compat/anthropic.py`, `lumen/services/completion_api.py` |
 | OpenAI virtual `model="lumen"` | implemented | source-reviewed, test-defined | text transcript만 허용하며 caller tool, memory, MCP와 native tool 실행은 비활성화된다 | `lumen/api/compat/openai.py`, `lumen/services/openai_compat.py` |
 | Provider/model routing, credentials, billing | implemented | focused tests passed (2026-09-11) | 공개 `api_model_name`/`api_provider`와 내부 LiteLLM route key를 분리한다. OpenRouter key와 DeepSeek balance만 공식 고정 endpoint를 통한 secret-safe billing snapshot을 제공하며 지원하지 않는 provider는 capability가 없다. | `lumen/services/providers/repository.py`, `lumen/services/providers/routing.py`, `lumen/services/providers/credentials.py`, `lumen/services/providers/billing.py` |
+| Provider-native Web Search and citations | implemented | contract/integration/system gates and real engine smoke passed (2026-09-13) | Native mode is executor-bound; portable options are used only where the API supports them. Agent Sonar retains built-in search without a duplicate hosted tool; explicit Agent hosted search coexists with function tools. Complete exact token prices remain required; native provider request/tool surcharges are outside the existing token-credit calculation. | `lumen/models/chat_contracts.py`, `lumen/services/{capabilities,chat_admission,engine,litellm_client,graph}.py`, `lumen/services/durable_runs/execution.py` |
 | 사용자 quota policy와 usage ledger | implemented | focused tests passed (2026-09-11) | runtime 기본 월 한도와 개인 상속/override를 분리하고, 주간 무제한이어도 월 ceiling을 강제한다. 관리자 상세은 immutable ledger projection이며 reservation 없는 동시 overshoot 가능성은 유지된다. | `lumen/services/quota_policy.py`, `lumen/services/credit.py`, `lumen/services/stats.py`, `lumen/api/quotas.py`, `lumen/api/stats.py` |
 | Native managed tools, skills, MCP | partial | source-reviewed, test-defined | extension package installer, subagent spawn, sandbox binding, semantic prompt ranking은 schema/policy가 있어도 현재 실행 runtime이 아니다 | `lumen/services/tool_runtime/`, `lumen/services/mcp_adapter.py`, `docs/agent-platform.md` |
 | Memory and semantic store | partial | source-reviewed, test-defined | authoritative memory는 MariaDB이며 PostgreSQL/pgvector는 선택 기능이고 protocol v2에는 encrypted PostgreSQL checkpointer가 필수다 | `lumen/models/chat_db.py`, `lumen/services/semantic_memory.py`, `lumen/services/checkpointer.py` |
@@ -27,7 +28,7 @@ Lumen은 LiteLLM provider 실행, LangGraph/LangChain agent runtime, 대화·dur
 | Local Console | partial | source-reviewed, test-defined | Afterglow 제품 UI가 아닌 localhost 개발자/운영자 tooling이며 Lumen auth/scope를 우회하지 않는다 | `lumen_console/app.py`, `docs/local-console.md` |
 | Kolla/Compose deployment | implemented | source-reviewed, test-defined | migration은 API/worker 시작 전에 별도로 적용해야 하며 `/v1/health`는 process health만 의미한다 | `docker-compose.yml`, `deploy/kolla/ansible/roles/lumen/`, `docs/operations.md` |
 
-위 표의 `test-defined`는 해당 경계를 검사하는 테스트 코드와 명령이 정의되어 있다는 뜻이다. 2026-09-08 `uv run lumen-test contract`는 service contract 922건과 SDK 126건을 통과했고 service 1건을 skip·9건을 deselect했다. Perplexity Agent API HTTP sender와 자동 web_search 도구 주입은 합성 응답으로 검증했으며 실제 provider·datastore integration·배포 환경 관찰은 포함하지 않는다.
+위 표의 `test-defined`는 해당 경계를 검사하는 테스트 코드와 명령이 정의되어 있다는 뜻이다. 2026-09-13 `uv run lumen-test contract -q`는 service contract 974건과 SDK 126건을 통과했고 service 1건을 skip·9건을 deselect했다. `uv run lumen-test integration -q`는 일회용 실제 MariaDB/Redis의 2건을 통과했다. Perplexity Agent와 Anthropic의 provider-shaped stream citation, native Search engine 경계는 합성 provider 응답으로 확인했다. 실제 외부 provider 호출이나 운영 배포 검증은 아니다.
 
 ## System context
 
@@ -93,6 +94,8 @@ flowchart LR
 5. worker가 run lease를 소유한 뒤 graph/engine을 호출한다. provider call, tool call, delta, usage, approval/interaction, terminal result를 journal에 기록한다. lease owner/expiry가 맞지 않으면 write를 중단하고 stale recovery가 재시도 또는 fail-closed한다.
 6. `GET /v1/runs/{run_id}/events`는 owner-scoped MariaDB journal을 cursor 이후 읽고, terminal event까지 polling SSE와 keepalive를 제공한다. HTTP request나 SSE 연결은 실행을 취소하거나 실행 lifetime을 소유하지 않는다.
 
+Native Search는 `chat_admission`이 고정한 feature options를 `durable_runs.execution` → `engine.stream` → `graph.stream` → provider transport까지 전달한다. 저장된 capability override나 subscription credential은 실제 native 지원 범위를 늘릴 수 없다. Native 모델의 token 가격이 있어도 managed 검색의 별도 component 가격이 없으면 admission을 거부한다. Perplexity Agent Sonar와 legacy Sonar의 서로 다른 가격은 API base로 구분하고, exact Agent Sonar/GLM-5.3 공식 가격의 provenance를 admission snapshot과 관리자 model projection에 유지한다. Anthropic web-search URL citation과 LiteLLM Responses bridge에서 유실되던 Agent annotation은 canonical durable citation part로 보존한다.
+
 ### Compatibility paths
 
 `POST /v1/chat/completions`에서 `model="lumen"`이면 `lumen/services/openai_compat.py`가 text-only transcript를 검증하고 durable temporary run을 만든다. completion route는 worker/journal 결과를 OpenAI response/SSE로 투영한다. provider model ID를 지정하면 `lumen/services/completion_api.py`가 active provider route와 quota를 resolve하고 LiteLLM을 직접 호출하는 stateless 경로로 처리한다. Anthropic `/v1/messages`는 `lumen/api/compat/anthropic.py`에서 Anthropic blocks를 내부 OpenAI 형식으로 변환한 후 동일한 stateless provider core를 사용한다. 두 compat surface는 API-key 전용이며 native server-managed tool/memory/approval contract를 제공하지 않는다.
@@ -132,7 +135,7 @@ Kolla role(`deploy/kolla/ansible/roles/lumen/`)은 API와 worker를 별도 host-
 
 ## Development and verification
 
-2026-09-08 `uv run lumen-test contract`를 실행해 service contract 880건과 SDK 126건을 통과시켰고 service 1건은 skip·9건은 deselect됐다. 아래 integration/system/live 전제 계층은 실행하지 않았으며 `test-passed`나 `live-verified`로 승격하지 않는다.
+2026-09-13의 최종 source는 `uv run lumen-test contract -q` (service 974 passed, 1 skipped, 9 deselected; SDK 126 passed; 양쪽 Ruff 통과), `uv run lumen-test integration -q` (실제 MariaDB/Redis 2 passed), `uv run lumen-test system -q` (실제 API/worker process와 fake provider 6 passed, 1 skipped)를 통과했다. Skip은 미설정 pgvector integration과 해당 system credential에서 사용할 수 없는 conversation title lifecycle 경로다. 외부 provider 및 운영 배포는 검증하지 않았다.
 
 | 목적 | 명령 | 실제 전제와 경계 |
 | --- | --- | --- |
@@ -177,9 +180,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "627b5028daff6b0f411a8a27f264edcabf09d45e2fa544a97f70b65e89561d6d",
-  "reviewed_at": "2026-09-11T10:29:12Z",
-  "summary": "Quota policy inheritance, admin usage detail, and supported-provider billing endpoints reviewed; documentation and migration topology updated."
+  "source_sha256": "0c865da5ca2d2230250470db2f14a8278b5880bd28bf7779ad2be20e98f31fa8",
+  "reviewed_at": "2026-09-13T09:08:48Z",
+  "summary": "Native/managed 검색 admission과 worker→engine→graph 전달, subscription/stale capability 제한, Anthropic/Responses citation 보존, Perplexity API base별 공식 가격 및 hosted search와 function tool 공존을 검토했다. Contract974+SDK126, integration2, system6(1skip), engine smoke 통과. Native provider 부가요금은 기존 token credit 계약 밖이다."
 }
 ```
 <!-- architecture-review:end -->

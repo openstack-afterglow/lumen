@@ -212,27 +212,35 @@ def _is_http_url(url) -> bool:
 def _extract_citations(chunk, delta, acc: dict[str, dict]) -> None:
     """Normalize provider citations into stable web or document source records."""
 
-    # search_results — rich web sources take precedence over bare URL citations.
-    for item in _get(chunk, "search_results") or []:
-        url = _get(item, "url")
+    def add_web_citation(url, title, snippet, ranges: dict | None = None, *, replace: bool = False) -> None:
         if not _is_http_url(url):
-            continue
-        snippet = _get(item, "snippet")
-        acc[url] = {
+            return
+        record = {
             "source_kind": "web",
             "url": url,
-            "title": _get(item, "title"),
-            "snippet": (snippet[:_CITATION_SNIPPET_CAP] if isinstance(snippet, str) else None),
+            "title": title if isinstance(title, str) else None,
+            "snippet": snippet[:_CITATION_SNIPPET_CAP] if isinstance(snippet, str) else None,
+            **(ranges or {}),
         }
+        existing = acc.get(url)
+        if existing is None or replace:
+            acc[url] = record
+            return
+        # Providers split one source across events (Anthropic sends the result
+        # block first and the cited text later), so fill gaps without clobbering.
+        for key, value in record.items():
+            if value is not None and existing.get(key) is None:
+                existing[key] = value
+
+    # search_results — rich web sources take precedence over bare URL citations.
+    for item in _get(chunk, "search_results") or []:
+        add_web_citation(_get(item, "url"), _get(item, "title"), _get(item, "snippet"), replace=True)
 
     # Bare URL citations, emitted by several OpenAI-compatible providers.
     for citation in _get(chunk, "citations") or []:
         if _is_http_url(citation):
             acc.setdefault(citation, {"source_kind": "web", "url": citation, "title": None, "snippet": None})
 
-    # LiteLLM's Anthropic-unified protocol attaches document citations to a
-    # streaming delta's provider_specific_fields["citation"]. A non-stream
-    # content-block shape is also accepted for replayed/provider test fixtures.
     def add_document_citation(citation: Any) -> None:
         index = _get(citation, "document_index")
         if not isinstance(index, int) or index < 0:
@@ -258,22 +266,45 @@ def _extract_citations(chunk, delta, acc: dict[str, dict]) -> None:
             },
         )
 
-    provider_citation = _get(_get(delta, "provider_specific_fields") or {}, "citation")
+    # LiteLLM's Anthropic-unified protocol carries both document citations
+    # (`char_location`/`page_location`, keyed by document_index) and native
+    # search citations (`web_search_result_location`, keyed by URL) through the
+    # same citation field, so the shape — not the transport — selects the kind.
+    def add_provider_citation(citation: Any) -> None:
+        url = _get(citation, "url")
+        if _is_http_url(url):
+            add_web_citation(url, _get(citation, "title"), _get(citation, "cited_text"))
+            return
+        add_document_citation(citation)
+
+    provider_fields = _get(delta, "provider_specific_fields") or {}
+    provider_citation = _get(provider_fields, "citation")
     if provider_citation is not None:
-        add_document_citation(provider_citation)
+        add_provider_citation(provider_citation)
+    for group in _get(provider_fields, "citations") or []:
+        for citation in group if isinstance(group, list) else [group]:
+            add_provider_citation(citation)
+    # Anthropic server-side search emits its result set as tool-result blocks.
+    for block in _get(provider_fields, "web_search_results") or []:
+        for result in _get(block, "content") or []:
+            add_web_citation(_get(result, "url"), _get(result, "title"), None)
     for content_block in _get(chunk, "content") or []:
         for citation in _get(content_block, "citations") or []:
-            add_document_citation(citation)
+            add_provider_citation(citation)
 
-    # annotations(url_citation) — Gemini/OpenAI
-    for annotation in _get(delta, "annotations") or []:
-        url_citation = _get(annotation, "url_citation") or {}
-        url = _get(url_citation, "url")
-        if _is_http_url(url):
-            acc.setdefault(
-                url,
-                {"source_kind": "web", "url": url, "title": _get(url_citation, "title"), "snippet": None},
-            )
+    # annotations(url_citation) — chat-completions providers (Gemini/OpenAI/Perplexity)
+    # nest the citation, while the installed Responses→chat bridge forwards the flat
+    # Responses annotation unchanged; accept both.
+    for annotation in _get(delta, "annotations") or _get(chunk, "annotations") or []:
+        url_citation = _get(annotation, "url_citation") or annotation
+        start = _get(url_citation, "start_index")
+        end = _get(url_citation, "end_index")
+        ranges = (
+            {"start_index": start, "end_index": end}
+            if isinstance(start, int) and isinstance(end, int) and 0 <= start <= end
+            else {}
+        )
+        add_web_citation(_get(url_citation, "url"), _get(url_citation, "title"), None, ranges)
 
 
 def _managed_tool_citations(tool_name: str, result: str) -> list[dict]:
@@ -522,6 +553,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                         max_tokens=params.get("max_tokens"),
                         temperature=params.get("temperature"),
                         reasoning_effort=effort,
+                        native_web_search=params.get("native_web_search"),
                         extra=provider_extra or None,
                     ),
                     None,
@@ -1271,6 +1303,7 @@ async def stream(
     managed_search: dict[str, Any] | None = None,
     managed_fetch: dict[str, Any] | None = None,
     managed_advisor: dict[str, Any] | None = None,
+    native_web_search: dict[str, Any] | None = None,
     response_format: dict[str, Any] | None = None,
     execution_hooks: object | None = None,
     run_id: str | None = None,
@@ -1302,6 +1335,7 @@ async def stream(
         "max_model_turns": max_model_turns,
         "max_tool_calls": max_tool_calls,
         "allowed_direct_effects": frozenset(allowed_direct_effects) if allowed_direct_effects is not None else None,
+        "native_web_search": native_web_search,
     }
     ctx = ToolContext(
         project_id=project_id,

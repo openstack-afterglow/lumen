@@ -20,6 +20,7 @@ def test_default_feature_options_preserve_manual_memory_without_tools():
     assert ChatFeatureOptions().model_dump(by_alias=True) == {
         "web_search": {
             "enabled": False,
+            "mode": "managed",
             "context_size": "medium",
             "allowed_domains": [],
             "blocked_domains": [],
@@ -43,6 +44,15 @@ def test_default_feature_options_preserve_manual_memory_without_tools():
         "audio_output": None,
         "video_output": None,
     }
+
+
+def test_native_search_requires_no_provider_and_only_portable_options():
+    features = ChatFeatureOptions(web_search={"enabled": True, "mode": "native"})
+    assert features.web_search.provider_id is None
+    with pytest.raises(ValidationError, match="must not set provider_id"):
+        ChatFeatureOptions(web_search={"enabled": True, "mode": "native", "provider_id": 7})
+    with pytest.raises(ValidationError, match="supports only context_size"):
+        ChatFeatureOptions(web_search={"enabled": True, "mode": "native", "allowed_domains": ["docs.example"]})
 
 
 def test_completion_request_accepts_only_iana_client_timezones():

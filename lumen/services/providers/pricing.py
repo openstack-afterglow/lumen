@@ -11,7 +11,7 @@ from lumen.services.capabilities import (
     litellm_capabilities,
     normalize_capabilities,
 )
-from lumen.services.litellm_client import effective_prices_per_million
+from lumen.services.litellm_client import effective_prices_per_million, official_price_source
 
 from .billing import billing_capability_for
 from .credentials import api_key_source, api_model_name
@@ -189,6 +189,20 @@ def _model_public(
     }
 
 
+def _has_component_prices(metadata: dict, *keys: str) -> bool:
+    for key in keys:
+        value = metadata.get(key)
+        if value is None:
+            return False
+        try:
+            price = Decimal(str(value))
+            if not price.is_finite() or price < 0:
+                return False
+        except (InvalidOperation, ValueError, TypeError):
+            return False
+    return True
+
+
 def _pricing_aware_capabilities(
     model: LlmModel,
     capabilities: dict,
@@ -199,40 +213,36 @@ def _pricing_aware_capabilities(
     metadata = model.price_metadata if isinstance(model.price_metadata, dict) else {}
     metadata = metadata.get("cost", metadata) if isinstance(metadata.get("cost", metadata), dict) else {}
 
-    def has_price(*keys: str) -> bool:
-        for key in keys:
-            value = metadata.get(key)
-            if value is None:
-                return False
-            try:
-                if Decimal(str(value)) < 0:
-                    return False
-            except (InvalidOperation, ValueError, TypeError):
-                return False
-        return True
-
     base_priced = (model.input_price if input_price is None else input_price) is not None and (
         model.output_price if output_price is None else output_price
     ) is not None
+    normalized = dict(capabilities)
+    gates = {name: dict(gate) for name, gate in (capabilities.get("feature_gates") or {}).items()}
+    search_gate = gates.get("web_search") or {}
     requirements = {
         "text": base_priced,
         "structured_output": base_priced,
         "memory": True,
-        "web_search": has_price(
-            "web_search_request_per_unit",
-            "web_search_context_low_per_unit",
-            "web_search_context_medium_per_unit",
-            "web_search_context_high_per_unit",
+        # Native providers report their own search work. Price the selected
+        # model's text usage, but never fabricate a managed-search component.
+        "web_search": (
+            base_priced
+            if search_gate.get("mode") == "native"
+            else _has_component_prices(
+                metadata,
+                "web_search_request_per_unit",
+                "web_search_context_low_per_unit",
+                "web_search_context_medium_per_unit",
+                "web_search_context_high_per_unit",
+            )
         ),
-        "web_fetch": has_price("web_fetch_request_per_unit", "web_fetch_context_per_unit"),
-        "image_output": has_price("image_per_unit"),
-        "audio_output": has_price("audio_output_per_second"),
-        "video_output": has_price("video_per_second"),
-        "code_interpreter": has_price("sandbox_per_second"),
-        "computer_use": has_price("sandbox_per_second"),
+        "web_fetch": _has_component_prices(metadata, "web_fetch_request_per_unit", "web_fetch_context_per_unit"),
+        "image_output": _has_component_prices(metadata, "image_per_unit"),
+        "audio_output": _has_component_prices(metadata, "audio_output_per_second"),
+        "video_output": _has_component_prices(metadata, "video_per_second"),
+        "code_interpreter": _has_component_prices(metadata, "sandbox_per_second"),
+        "computer_use": _has_component_prices(metadata, "sandbox_per_second"),
     }
-    normalized = dict(capabilities)
-    gates = {name: dict(gate) for name, gate in (capabilities.get("feature_gates") or {}).items()}
     for feature, gate in gates.items():
         if feature in requirements:
             gate["pricing_available"] = requirements[feature]
@@ -270,16 +280,19 @@ def _resolved_base_prices(
     input_price = Decimal(model.input_price) if model.input_price is not None else None
     output_price = Decimal(model.output_price) if model.output_price is not None else None
     fallback_input, fallback_output = (
-        effective_prices_per_million(model.model_name, provider.provider_type)
+        effective_prices_per_million(model.model_name, provider.provider_type, api_base=provider.api_base)
         if input_price is None or output_price is None
         else (None, None)
+    )
+    fallback_source = (
+        official_price_source(model.model_name, provider.provider_type, api_base=provider.api_base) or "litellm"
     )
     if input_price is None and fallback_input is not None:
         input_price = _per_token_price(fallback_input, "litellm_input_price_per_million")
     if output_price is None and fallback_output is not None:
         output_price = _per_token_price(fallback_output, "litellm_output_price_per_million")
     if input_price is not None and output_price is not None:
-        price_source = model.price_source or "litellm"
+        price_source = model.price_source or fallback_source
     elif input_price is not None or output_price is not None:
         price_source = "partial"
     else:

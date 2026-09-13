@@ -144,6 +144,31 @@ def _probe(name: str, *, model_name: str, provider_type: str | None) -> bool:
         return False
 
 
+_NATIVE_WEB_SEARCH_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "perplexity"})
+
+
+def _is_perplexity_sonar(model_name: str, provider_type: str | None) -> bool:
+    return provider_type == "perplexity" and model_name.rsplit("/", 1)[-1].lower().startswith("sonar")
+
+
+def _native_web_search_available(model_name: str, provider_type: str | None) -> bool:
+    """Accept native search only when this transport can activate LiteLLM's exact capability."""
+    return provider_type in _NATIVE_WEB_SEARCH_PROVIDERS and _probe(
+        "supports_web_search", model_name=model_name, provider_type=provider_type
+    )
+
+
+def _detected_native_web_search_available(detected: dict[str, Any]) -> bool:
+    """Return whether detected capabilities advertise this exact native transport."""
+    gate = (detected.get("feature_gates") or {}).get("web_search")
+    return (
+        bool(detected.get("web_search"))
+        and isinstance(gate, dict)
+        and gate.get("available") is True
+        and gate.get("mode") == "native"
+    )
+
+
 def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str, Any]:
     """Return the legacy display fields plus canonical feature gates.
 
@@ -179,11 +204,8 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
         else _probe("supports_response_schema", model_name=normalized_model, provider_type=provider_type)
     )
     parallel_function_calling = bool(metadata.get("supports_parallel_function_calling")) if is_chatgpt else False
-    supports_web_search = bool(
-        provider_type == "perplexity"
-        or normalized_model.startswith("perplexity/")
-        or "sonar" in normalized_model.lower()
-    )
+    supports_web_search = _native_web_search_available(normalized_model, provider_type)
+    web_search_required = supports_web_search and _is_perplexity_sonar(normalized_model, provider_type)
     context_limit = metadata.get("max_input_tokens") if isinstance(metadata.get("max_input_tokens"), int) else None
     return {
         # Existing model-admin/UI fields retained until the capability API is cut over.
@@ -200,6 +222,7 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
         "parallel_function_calling": parallel_function_calling,
         "structured_output": structured_output,
         "web_search": supports_web_search,
+        "web_search_required": web_search_required,
         "web_fetch": False,
         "advisor": False,
         "responses_api": is_chatgpt,
@@ -305,21 +328,32 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
 
 def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode: str) -> dict[str, Any]:
     """Apply transport invariants after stored and imported capability overrides."""
-    if auth_mode != "chatgpt_device":
+    if auth_mode not in {"chatgpt_device", "anthropic_subscription"}:
         return capabilities
     normalized = dict(capabilities)
-    normalized["structured_output"] = False
-    normalized["responses_api"] = True
-    normalized["endpoints"] = ["responses"]
+    normalized["web_search"] = False
+    normalized["web_search_required"] = False
     gates = {name: dict(gate) for name, gate in (normalized.get("feature_gates") or {}).items()}
-    structured = gates.get("structured_output", {})
-    structured.update(
+    gate = gates.get("web_search", {})
+    gate.update(
         available=False,
         mode="none",
         reason_code="provider_unsupported",
         pricing_available=False,
     )
-    gates["structured_output"] = structured
+    gates["web_search"] = gate
+    if auth_mode == "chatgpt_device":
+        normalized["structured_output"] = False
+        normalized["responses_api"] = True
+        normalized["endpoints"] = ["responses"]
+        gate = gates.get("structured_output", {})
+        gate.update(
+            available=False,
+            mode="none",
+            reason_code="provider_unsupported",
+            pricing_available=False,
+        )
+        gates["structured_output"] = gate
     normalized["feature_gates"] = gates
     return normalized
 
@@ -332,6 +366,7 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
     normalized.update({key: value for key, value in stored.items() if key != "feature_gates"})
     gates = {name: dict(gate) for name, gate in detected["feature_gates"].items()}
     stored_gates = stored.get("feature_gates")
+    stored_web_search_gate = stored_gates.get("web_search") if isinstance(stored_gates, dict) else None
     if isinstance(stored_gates, dict):
         for name, gate in stored_gates.items():
             if isinstance(gate, dict) and name in gates:
@@ -387,5 +422,34 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
                 "mode": "native" if modality in outputs else "none",
                 "reason_code": None if modality in outputs else "provider_unsupported",
             }
+    legacy_web_search_specified = "web_search" in stored
+    stored_native_web_search_gate = (
+        isinstance(stored_web_search_gate, dict) and stored_web_search_gate.get("mode") == "native"
+    )
+    if legacy_web_search_specified or stored_native_web_search_gate:
+        native_available = _detected_native_web_search_available(detected)
+        admin_disabled = (legacy_web_search_specified and not bool(stored["web_search"])) or (
+            stored_native_web_search_gate and stored_web_search_gate.get("available") is False
+        )
+        available = native_available and not admin_disabled
+        gate = gates["web_search"]
+        gates["web_search"] = {
+            **gate,
+            "available": available,
+            "mode": "native" if available else "none",
+            "reason_code": (
+                None
+                if available
+                else (gate.get("reason_code") if admin_disabled and gate.get("reason_code") else "provider_unsupported")
+            ),
+            "pricing_available": bool(gate.get("pricing_available")) and available,
+        }
+        normalized["web_search"] = available
+    web_search_gate = gates["web_search"]
+    normalized["web_search_required"] = (
+        bool(detected.get("web_search_required"))
+        and web_search_gate.get("available") is True
+        and web_search_gate.get("mode") == "native"
+    )
     normalized["feature_gates"] = gates
     return normalized

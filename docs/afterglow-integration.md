@@ -138,7 +138,7 @@ API Key 요청 시 필요한 최소 Scope 정의:
 
 ### 5.1 공개 모델 ID와 실행 route
 
-호환 API 클라이언트는 `api_model_name`만 `model`로 보내고 필요할 때 `api_provider`를 `provider`로 보냅니다. 다른 provider와 겹치지 않는 고유 모델(예: Perplexity 단독의 `sonar`, `kimi-k3`, `deepseek-v4-flash-0731`)은 `provider`를 생략해도 정상적으로 라우팅됩니다. 동일한 공개 ID가 여러 provider type에 존재하는 경우에만 `provider`를 생략한 completion이 **HTTP 409 Conflict**로 실패합니다. 요청 body의 `provider`는 소문자 provider type이며 OpenAI/Anthropic Python SDK에서는 `extra_body={"provider": "perplexity"}`로 전달할 수 있습니다. 같은 provider type 안에서도 route가 둘 이상이면 선택자가 충분하지 않으므로 409를 유지합니다. Perplexity Agent API 호환 completion은 `web_search` 도구를 자동으로 활성화하여 최신 웹 검색이 필요한 경우 모델이 실시간 검색을 수행합니다.
+호환 API 클라이언트는 `api_model_name`만 `model`로 보내고 필요할 때 `api_provider`를 `provider`로 보냅니다. 다른 provider와 겹치지 않는 고유 모델(예: Perplexity 단독의 `sonar`, `kimi-k3`, `deepseek-v4-flash-0731`)은 `provider`를 생략해도 정상적으로 라우팅됩니다. 동일한 공개 ID가 여러 provider type에 존재하는 경우에만 `provider`를 생략한 completion이 **HTTP 409 Conflict**로 실패합니다. 요청 body의 `provider`는 소문자 provider type이며 OpenAI/Anthropic Python SDK에서는 `extra_body={"provider": "perplexity"}`로 전달할 수 있습니다. 같은 provider type 안에서도 route가 둘 이상이면 선택자가 충분하지 않으므로 409를 유지합니다. Perplexity Agent API는 명시적으로 요청한 native search만 tool로 전달하며, 일반 Agent route에 검색 도구를 자동 주입하지 않습니다.
 
 Perplexity provider는 base URL로 transport를 명시합니다.
 
@@ -149,6 +149,16 @@ Perplexity provider는 base URL로 transport를 명시합니다.
 | 기존 `/v1`이 없는 Sonar 설정 | 기존 Chat Completions 호환 경로 | 저장된 legacy route 유지 |
 
 Perplexity `/v1/models`와 `/router/v1/models` discovery 결과는 공개 canonical ID로 등록합니다. 기존 행과 대화 이력은 일괄 변경하지 않으며, projection과 request-time resolver가 legacy route에서도 같은 공개 ID를 계산합니다.
+
+### 5.2 Native와 managed Web Search
+
+Native completion의 `features.web_search`는 실행 소유자를 명시합니다. 기존 서버-managed search는 `{"enabled": true, "mode": "managed", "provider_id": <id>}`이며, 선택된 search provider route와 기존 usage component 가격을 사용합니다. Provider-native search는 `{"enabled": true, "mode": "native", "provider_id": null}`이며 현재 chat model의 frozen executor route만 사용하고 managed provider를 선택하거나 호출하지 않습니다.
+
+Native mode는 provider가 지원하는 경우 `context_size`와 완전한 approximate location (`city`, `country`, `region`, `timezone`)을 LiteLLM mapper로 전달합니다. 도메인 allow/block 및 `max_uses`는 managed mode 전용이므로 native request에서 거부됩니다. `effective_capabilities.feature_gates.web_search`의 `mode="native"`, `available`, `pricing_available`가 opt-in Search 여부를 결정합니다. `capabilities.web_search_required=true`인 Sonar 같은 모델은 이미 항상-on search를 실행하므로 UI는 static active Search로 표시하고 중복 hosted search tool을 주입하지 않습니다. Perplexity Agent의 [공식 hosted web_search tool](https://docs.perplexity.ai/docs/agent-api/tools/web-search)은 별도 opt-in 경로에서 function tool과 함께 보존됩니다. Subscription credential transport는 native search를 advertise하지 않습니다.
+
+Provider가 URL citation 또는 `url_citation` annotation을 반환하면 Lumen은 URL, title, valid inline range를 canonical citation part로 durable run 결과에 저장합니다. 선택 모델의 complete token price가 없으면 admission은 `pricing_unavailable`으로 fail closed 합니다. Native Search는 기존 token 기반 크레딧 계약을 유지하며 provider의 별도 검색 요청/툴 부가요금은 크레딧 계산에 포함하지 않습니다. 따라서 로컬 크레딧 비용을 provider 최종 청구 총액으로 해석하면 안 됩니다. Managed 검색의 별도 usage component 과금은 그대로 유지합니다.
+
+Perplexity fallback은 공개 ID뿐 아니라 실제 API base도 구분합니다. [공식 Agent 모델 가격](https://docs.perplexity.ai/docs/agent-api/models)의 `perplexity/sonar`는 입력 $0.25/M·출력 $2.50/M이며 legacy Sonar API의 $1/M·$1/M과 다릅니다. 같은 문서의 exact `perplexity/glm-5.3` 가격은 $1.40/M·$4.40/M입니다. 수동/검토된 가격은 이 fallback보다 우선하며 미등록 모델 suffix에 가격을 추정하지 않습니다.
 
 ---
 

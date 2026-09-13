@@ -5,14 +5,15 @@ litellm_client.acompletion_stream 을 mock 해 네트워크 없이 검증:
 - 시작 실패/스트리밍 중 오류 시 error 이벤트
 - **툴 루프**: tool_call 델타 → 테넌트 안전 실행(ToolContext) → 툴 결과 반영 후 최종 답변 스트리밍,
   멀티스텝 usage 합산, tool_call SSE 이벤트
-- engine.stream 이 graph.stream 에 위임하는지
 """
 
 import json
 from datetime import UTC, datetime
 
+import httpx
+
 from lumen.models.chat_contracts import validate_chat_run_event
-from lumen.services import engine, graph, litellm_client
+from lumen.services import graph, litellm_client
 from lumen.services.tool_runtime import contracts, selection
 from lumen.services.tool_runtime import dispatch as tool_runtime
 
@@ -189,7 +190,14 @@ class TestGraphStream:
                 search_results=[{"url": "https://a.com", "title": "A", "snippet": "x" * 400}],
             ),
             _CChunk(
-                _CDelta(annotations=[{"type": "url_citation", "url_citation": {"url": "https://b.com", "title": "B"}}])
+                _CDelta(
+                    annotations=[
+                        {
+                            "type": "url_citation",
+                            "url_citation": {"url": "https://b.com", "title": "B", "start_index": 3, "end_index": 7},
+                        }
+                    ]
+                )
             ),
             _CChunk(
                 _CDelta(
@@ -221,6 +229,8 @@ class TestGraphStream:
         assert {i["url"] for i in items if i.get("source_kind") == "web"} == {"https://a.com", "https://b.com"}
         a = next(i for i in items if i.get("url") == "https://a.com")
         assert a["title"] == "A" and len(a["snippet"]) <= 300  # 스니펫 상한
+        b = next(i for i in items if i.get("url") == "https://b.com")
+        assert b["start_index"] == 3 and b["end_index"] == 7
         document = next(i for i in items if i.get("source_kind") == "document")
         assert document == {
             "source_kind": "document",
@@ -233,6 +243,205 @@ class TestGraphStream:
         # citations 는 usage 직전에 나와야 함(최종 답변 저장 타이밍)
         types = [e["type"] for e in events]
         assert types.index("citations") < types.index("usage")
+
+    async def test_anthropic_native_search_citations_become_web_sources(self, monkeypatch):
+        """LiteLLM Anthropic 통합 citation 은 web_search_result_location(URL)과 문서 인용을 함께 싣는다."""
+
+        class _PDelta:
+            def __init__(self, content=None, provider_specific_fields=None):
+                self.content = content
+                self.provider_specific_fields = provider_specific_fields
+                self.annotations = None
+                self.tool_calls = None
+
+        class _PChunk:
+            def __init__(self, delta, usage=None):
+                self.choices = [_ChoiceTC(delta)]
+                self.usage = usage
+
+        chunks = [
+            _PChunk(
+                _PDelta(
+                    provider_specific_fields={
+                        "web_search_results": [
+                            {
+                                "type": "web_search_tool_result",
+                                "tool_use_id": "srvtoolu_1",
+                                "content": [
+                                    {
+                                        "type": "web_search_result",
+                                        "url": "https://news.example/report",
+                                        "title": "Report",
+                                        "encrypted_content": "opaque",
+                                    },
+                                    {"type": "web_search_result", "url": "javascript:alert(1)", "title": "unsafe"},
+                                ],
+                            }
+                        ]
+                    }
+                )
+            ),
+            _PChunk(_PDelta(content="근거 기반 답변")),
+            _PChunk(
+                _PDelta(
+                    provider_specific_fields={
+                        "citation": {
+                            "type": "web_search_result_location",
+                            "url": "https://news.example/report",
+                            "title": "Report",
+                            "cited_text": "인용된 문장 " + "x" * 400,
+                            "encrypted_index": "opaque-index",
+                        }
+                    }
+                )
+            ),
+            _PChunk(
+                _PDelta(
+                    provider_specific_fields={
+                        "citation": {
+                            "type": "char_location",
+                            "cited_text": "문서의 근거",
+                            "document_index": 1,
+                            "document_title": "운영 가이드",
+                            "start_char_index": 4,
+                            "end_char_index": 9,
+                        }
+                    }
+                )
+            ),
+            _PChunk(_PDelta(), usage={"prompt_tokens": 4, "completion_tokens": 6}),
+        ]
+
+        async def fake_stream(**kwargs):
+            return _aiter(chunks)
+
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        events = [
+            ev
+            async for ev in graph.stream(
+                model="claude-sonnet-5",
+                messages=_MSGS,
+                project_id="p1",
+                user_id="u1",
+                custom_llm_provider="anthropic",
+                native_web_search={"search_context_size": "medium"},
+            )
+        ]
+        items = [e for e in events if e["type"] == "citations"][-1]["items"]
+        web = [item for item in items if item["source_kind"] == "web"]
+        assert [item["url"] for item in web] == ["https://news.example/report"]
+        assert web[0]["title"] == "Report"
+        assert len(web[0]["snippet"]) == 300
+        document = next(item for item in items if item["source_kind"] == "document")
+        assert document == {
+            "source_kind": "document",
+            "document_index": 1,
+            "title": "운영 가이드",
+            "snippet": "문서의 근거",
+            "start_index": 4,
+            "end_index": 9,
+        }
+
+    async def test_perplexity_agent_stream_sources_survive_installed_responses_bridge(self, monkeypatch):
+        """실제 설치된 LiteLLM Responses 브리지 SSE → 그래프 정본 citation."""
+
+        annotation = {
+            "type": "url_citation",
+            "url": "https://news.example/seoul",
+            "title": "Seoul weather",
+            "start_index": 0,
+            "end_index": 2,
+        }
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_stream",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "perplexity/sonar",
+                "output": [
+                    {
+                        "id": "msg_1",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "서울", "annotations": [annotation]}],
+                    }
+                ],
+                "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+                "error": None,
+                "incomplete_details": None,
+                "instructions": None,
+                "metadata": {},
+            },
+        }
+        events = [
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "서울",
+            },
+            {
+                "type": "response.output_text.annotation.added",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "annotation_index": 0,
+                "annotation": annotation,
+            },
+            completed,
+        ]
+        body = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+        body += "data: [DONE]\n\n"
+        captured = {}
+
+        class _Sender:
+            async def post(self, *, url, headers, **kwargs):
+                captured.update(url=url, body=kwargs.get("json"))
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    headers={"content-type": "text/event-stream"},
+                    content=body.encode(),
+                )
+
+        sender = _Sender()
+        monkeypatch.setattr(
+            "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+            lambda **_kwargs: sender,
+        )
+
+        stream_events = [
+            ev
+            async for ev in graph.stream(
+                model="perplexity/perplexity/sonar",
+                messages=_MSGS,
+                project_id="p1",
+                user_id="u1",
+                custom_llm_provider="perplexity",
+                api_base="https://api.perplexity.ai/v1",
+                api_key="route-key",
+                native_web_search={"search_context_size": "medium"},
+            )
+        ]
+
+        assert "".join(e["text"] for e in stream_events if e["type"] == "token") == "서울"
+        items = [e for e in stream_events if e["type"] == "citations"][-1]["items"]
+        assert items == [
+            {
+                "source_kind": "web",
+                "url": "https://news.example/seoul",
+                "title": "Seoul weather",
+                "snippet": None,
+                "start_index": 0,
+                "end_index": 2,
+            }
+        ]
+        # Sonar 의 상시 검색 경로에 지원되지 않는 hosted web_search 도구를 주입하지 않는다.
+        assert [tool for tool in captured["body"].get("tools") or [] if tool.get("type") == "web_search"] == []
 
     def test_managed_tool_citations_filter_unsafe_urls_and_bound_snippets(self):
         citations = graph._managed_tool_citations(
@@ -932,17 +1141,7 @@ class TestToolLoop:
         assert captured["messages"][-1]["content"] == "private advice"
 
 
-class TestEngineDelegates:
-    async def test_engine_stream_delegates_to_graph(self, monkeypatch):
-        async def fake_stream(**kwargs):
-            return _aiter([_Chunk("델타")])
-
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-        events = [
-            ev async for ev in engine.stream(model="gpt-3.5-turbo", messages=_MSGS, project_id="p1", user_id="u1")
-        ]
-        assert any(e["type"] == "token" and e["text"] == "델타" for e in events)
-
+class TestUsageEstimation:
     async def test_falls_back_to_token_estimation_when_round_has_no_usage(self, monkeypatch):
         async def fake_stream(**kwargs):
             return _aiter([_Chunk("fallback")])

@@ -4,6 +4,7 @@ litellm 의 로컬 계산(token_counter/cost_per_token)만 사용 — 네트워�
 핵심 회귀 방지: 스트리밍이 usage 를 주지 않아도 과금이 0이 되지 않아야 한다.
 """
 
+import json
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -188,6 +189,32 @@ class TestEffectiveDisplayPrices:
         assert litellm_client.effective_prices_per_million("deepseek-reasoner", "deepseek") == (
             Decimal("0.28"),
             Decimal("0.42"),
+        )
+
+    def test_resolves_canonical_perplexity_agent_prices_without_model_family_fallback(self):
+        assert litellm_client.effective_prices_per_million("perplexity/perplexity/sonar", "perplexity") == (
+            Decimal("0.250000"),
+            Decimal("2.500000"),
+        )
+        assert litellm_client.effective_prices_per_million("perplexity/perplexity/glm-5.3", "perplexity") == (
+            Decimal("1.400000"),
+            Decimal("4.400000"),
+        )
+        assert litellm_client.effective_prices_per_million("perplexity/perplexity/glm-5.3-unlisted", "perplexity") == (
+            None,
+            None,
+        )
+
+    def test_sonar_agent_and_legacy_api_prices_do_not_alias(self):
+        assert litellm_client.effective_prices_per_million(
+            "perplexity/sonar", "perplexity", api_base="https://api.perplexity.ai/v1"
+        ) == (Decimal("0.250000"), Decimal("2.500000"))
+        assert litellm_client.effective_prices_per_million(
+            "perplexity/sonar", "perplexity", api_base="https://api.perplexity.ai"
+        ) == (Decimal("1.000000"), Decimal("1.000000"))
+        assert (
+            litellm_client.official_price_source("perplexity/sonar", "perplexity", api_base="https://api.perplexity.ai")
+            is None
         )
 
 
@@ -541,6 +568,7 @@ async def test_perplexity_agent_hits_responses_http_boundary_with_public_model(m
     assert captured["headers"]["Authorization"] == "Bearer route-key"
     assert captured["body"]["model"] == "perplexity/sonar"
 
+
 @pytest.mark.asyncio
 async def test_perplexity_router_pins_chat_completions_and_preserves_canonical_model(monkeypatch):
     captured = {}
@@ -590,3 +618,177 @@ async def test_perplexity_legacy_sonar_keeps_existing_chat_completion_route(monk
     assert captured["model"] == "perplexity/sonar"
     assert captured["custom_llm_provider"] == "perplexity"
     assert captured["api_key"] == "route-key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "builtin_search"),
+    [("perplexity/perplexity/sonar", True), ("perplexity/openai/gpt-4.1", False)],
+)
+async def test_perplexity_agent_preserves_explicit_search_and_builtin_sonar(monkeypatch, model, builtin_search):
+    """Hosted search coexists with function tools; built-in Sonar adds no duplicate search tool."""
+    captured = {}
+
+    class Sender:
+        async def post(self, *, url, headers, **kwargs):
+            captured.update(url=url, body=kwargs.get("json"))
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "id": "resp_native",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "perplexity/sonar",
+                    "output": [
+                        {
+                            "id": "msg_native",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "서울은 맑습니다",
+                                    "annotations": [
+                                        {
+                                            "type": "url_citation",
+                                            "url": "https://news.example/seoul",
+                                            "title": "Seoul weather",
+                                            "start_index": 0,
+                                            "end_index": 2,
+                                        }
+                                    ],
+                                    "logprobs": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "usage": {"input_tokens": 3, "output_tokens": 5, "total_tokens": 8},
+                    "error": None,
+                    "incomplete_details": None,
+                    "instructions": None,
+                    "metadata": {},
+                },
+            )
+
+    sender = Sender()
+    monkeypatch.setattr(
+        "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+        lambda **_kwargs: sender,
+    )
+
+    result = await litellm_client.acompletion(
+        model,
+        [{"role": "user", "content": "오늘 서울 날씨"}],
+        api_base="https://api.perplexity.ai/v1",
+        api_key="route-key",
+        custom_llm_provider="perplexity",
+        native_web_search={"search_context_size": "medium"},
+        tools=[
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}
+        ],
+    )
+
+    assert "web_search_options" not in captured["body"]
+    assert any(tool.get("type") == "function" and tool.get("name") == "lookup" for tool in captured["body"]["tools"])
+    search_tools = [tool for tool in captured["body"]["tools"] if tool.get("type") == "web_search"]
+    assert search_tools == ([] if builtin_search else [{"type": "web_search", "search_context_size": "medium"}])
+    assert result.choices[0].message.annotations == [
+        {
+            "type": "url_citation",
+            "url": "https://news.example/seoul",
+            "title": "Seoul weather",
+            "start_index": 0,
+            "end_index": 2,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_perplexity_agent_stream_preserves_native_url_citations(monkeypatch):
+    """설치된 브리지는 스트림에서 annotation 을 버리므로 래퍼가 다시 붙여야 한다."""
+    annotation = {
+        "type": "url_citation",
+        "url": "https://news.example/busan",
+        "title": "Busan",
+        "start_index": 2,
+        "end_index": 4,
+    }
+    events = [
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "부산",
+        },
+        {
+            "type": "response.output_text.annotation.added",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "annotation_index": 0,
+            "annotation": annotation,
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_stream",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "perplexity/sonar",
+                "output": [
+                    {
+                        "id": "msg_1",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "부산", "annotations": [annotation]}],
+                    }
+                ],
+                "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
+                "error": None,
+                "incomplete_details": None,
+                "instructions": None,
+                "metadata": {},
+            },
+        },
+    ]
+    body = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+
+    class Sender:
+        async def post(self, *, url, headers, **kwargs):
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                headers={"content-type": "text/event-stream"},
+                content=body.encode(),
+            )
+
+    sender = Sender()
+    monkeypatch.setattr(
+        "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+        lambda **_kwargs: sender,
+    )
+
+    stream = await litellm_client.acompletion_stream(
+        "perplexity/perplexity/sonar",
+        [{"role": "user", "content": "부산 날씨"}],
+        api_base="https://api.perplexity.ai/v1",
+        api_key="route-key",
+        custom_llm_provider="perplexity",
+        native_web_search={"search_context_size": "medium"},
+    )
+    chunks = [chunk async for chunk in stream]
+
+    assert "".join(choice.delta.content or "" for chunk in chunks for choice in chunk.choices) == "부산"
+    streamed_annotations = [
+        entry
+        for chunk in chunks
+        for choice in chunk.choices
+        for entry in (getattr(choice.delta, "annotations", None) or [])
+    ]
+    assert annotation in streamed_annotations

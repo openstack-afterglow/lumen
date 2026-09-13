@@ -280,6 +280,7 @@ def _validate_location(value: dict[str, str] | None) -> dict[str, str] | None:
 
 class WebSearchOptions(_StrictModel):
     enabled: bool = False
+    mode: Literal["managed", "native"] = "managed"
     context_size: Literal["low", "medium", "high"] = "medium"
     allowed_domains: list[str] = Field(default_factory=list, max_length=10)
     blocked_domains: list[str] = Field(default_factory=list, max_length=10)
@@ -289,8 +290,10 @@ class WebSearchOptions(_StrictModel):
 
     @model_validator(mode="after")
     def validate_search_scope(self) -> WebSearchOptions:
-        if self.enabled and self.provider_id is None:
-            raise ValueError("web_search requires provider_id when enabled")
+        if self.mode == "managed" and self.enabled and self.provider_id is None:
+            raise ValueError("managed web_search requires provider_id when enabled")
+        if self.mode == "native" and self.provider_id is not None:
+            raise ValueError("native web_search must not set provider_id")
         self.allowed_domains = _normalize_domains(self.allowed_domains)
         self.blocked_domains = _normalize_domains(self.blocked_domains)
         if any(
@@ -300,6 +303,16 @@ class WebSearchOptions(_StrictModel):
         ):
             raise ValueError("allowed_domains and blocked_domains must not overlap")
         self.approximate_location = _validate_location(self.approximate_location)
+        if self.mode == "native":
+            if self.allowed_domains or self.blocked_domains or self.max_uses != 1:
+                raise ValueError("native web_search supports only context_size and approximate_location")
+            if self.approximate_location is not None and set(self.approximate_location) != {
+                "city",
+                "country",
+                "region",
+                "timezone",
+            }:
+                raise ValueError("native web_search approximate_location requires city, country, region, and timezone")
         return self
 
 
