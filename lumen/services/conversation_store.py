@@ -265,12 +265,15 @@ async def delete_conversation(conv_id: str, *, user_id: str, project_id: str) ->
 
 
 async def update_title(conv_id: str, *, user_id: str, project_id: str, title: str | None) -> dict:
-    """대화 제목 갱신(소유권 검증 + 암호화 저장). 제목 자동 요약 경로용."""
+    """Persist a user-authored title and fence every pending automatic result."""
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
             row = await _load_owned(session, conv_id, user_id, project_id)
             row.title = _enc(title or None)
+            row.title_source = "explicit"
+            row.title_status = "ready"
+            row.title_revision = int(row.title_revision or 0) + 1
             await session.flush()
             return _conv_public(row)
     except OperationalError as exc:

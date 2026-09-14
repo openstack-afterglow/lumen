@@ -33,6 +33,7 @@ class ProviderCreateRequest(BaseModel):
     api_base: str | None = Field(default=None, max_length=255)
     api_key: str | None = Field(default=None, max_length=500)
     api_key_env: str | None = Field(default=None, max_length=128)
+    billing_admin_key: str | None = Field(default=None, max_length=1000)
     margin_multiplier: float = Field(default=1.0, ge=0)
     is_active: bool = True
 
@@ -52,6 +53,7 @@ class ProviderCreateRequest(BaseModel):
                 api_base=self.api_base,
                 api_key=self.api_key,
                 api_key_env=self.api_key_env,
+                billing_admin_key=self.billing_admin_key,
             )
         except errors.ProviderValidationError as exc:
             raise ValueError(str(exc)) from None
@@ -65,6 +67,7 @@ class ProviderUpdateRequest(BaseModel):
     api_base: str | None = Field(default=None, max_length=255)
     api_key: str | None = Field(default=None, max_length=500)
     api_key_env: str | None = Field(default=None, max_length=128)
+    billing_admin_key: str | None = Field(default=None, max_length=1000)
     margin_multiplier: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
 
@@ -78,9 +81,10 @@ class ProviderUpdateRequest(BaseModel):
     @model_validator(mode="after")
     def reject_subscription_secrets(self):
         if self.auth_mode in {"chatgpt_device", "anthropic_subscription"} and any(
-            isinstance(value, str) and value.strip() for value in (self.api_base, self.api_key, self.api_key_env)
+            isinstance(value, str) and value.strip()
+            for value in (self.api_base, self.api_key, self.api_key_env, self.billing_admin_key)
         ):
-            raise ValueError("구독 프로바이더에는 API base/key/environment credential을 설정할 수 없습니다")
+            raise ValueError("구독 프로바이더에는 API base/key/environment/admin credential을 설정할 수 없습니다")
         return self
 
 
@@ -96,9 +100,15 @@ class ProviderResponse(BaseModel):
     has_api_key: bool
     api_key_source: str | None = None
     api_key_env: str | None = None
+    has_billing_admin_key: bool = False
     is_active: bool
     margin_multiplier: float
-    billing_capability: Literal["openrouter_key", "deepseek_balance"] | None = None
+    billing_capability: Literal[
+        "openrouter_key",
+        "deepseek_balance",
+        "openai_admin_usage",
+        "anthropic_admin_usage",
+    ] | None = None
     created_at: str | None
     updated_at: str | None
     models_dev_provider_id: str | None = None
@@ -111,16 +121,71 @@ class ProviderBillingBalance(BaseModel):
     purchased: Decimal
 
 
+class ProviderBillingIntegerPeriods(BaseModel):
+    daily: int
+    weekly: int
+    monthly: int
+    total: int
+
+
+class ProviderBillingDecimalPeriods(BaseModel):
+    daily: Decimal
+    weekly: Decimal
+    monthly: Decimal
+    total: Decimal
+
+
+class ProviderBillingLocalUsage(BaseModel):
+    currency: Literal["USD"]
+    requests: ProviderBillingIntegerPeriods
+    tokens: ProviderBillingIntegerPeriods
+    raw_cost: ProviderBillingDecimalPeriods
+
+
+class ProviderBillingOptionalIntegerPeriods(BaseModel):
+    daily: int | None
+    weekly: int | None
+    monthly: int | None
+    total: int | None
+
+
+class ProviderBillingOptionalDecimalPeriods(BaseModel):
+    daily: Decimal | None
+    weekly: Decimal | None
+    monthly: Decimal | None
+    total: Decimal | None
+
+
+class ProviderBillingProviderUsage(BaseModel):
+    source: Literal["openai_admin_usage", "anthropic_admin_usage"]
+    currency: Literal["USD"]
+    cost: ProviderBillingOptionalDecimalPeriods | None
+    requests: ProviderBillingOptionalIntegerPeriods | None
+    tokens: ProviderBillingOptionalIntegerPeriods | None
+
+
 class ProviderBillingResponse(BaseModel):
     provider_id: int
+    provider_name: str
     provider_type: str
-    capability: Literal["openrouter_key", "deepseek_balance"] | None
+    capability: Literal[
+        "openrouter_key",
+        "deepseek_balance",
+        "openai_admin_usage",
+        "anthropic_admin_usage",
+    ] | None
     status: Literal["available", "unavailable", "unsupported"]
     reason: (
         Literal[
             "billing_endpoint_unsupported",
+            "provider_console_only",
+            "provider_analytics_scope_mismatch",
             "credential_unavailable",
             "credential_not_configured",
+            "admin_credential_unavailable",
+            "admin_credential_not_configured",
+            "admin_credential_rejected",
+            "partial_provider_data",
             "provider_authorization_failed",
             "provider_request_failed",
             "provider_unavailable",
@@ -128,6 +193,11 @@ class ProviderBillingResponse(BaseModel):
         | None
     )
     fetched_at: datetime
+    billing_url: str | None
+    usage_url: str | None
+    has_billing_admin_key: bool
+    local_usage: ProviderBillingLocalUsage
+    provider_usage: ProviderBillingProviderUsage | None
     is_available: bool | None
     is_free_tier: bool | None
     limit: Decimal | None
@@ -344,14 +414,12 @@ async def list_providers():
 
 
 @router.get(
-    "/admin/providers/{provider_id}/billing",
-    response_model=ProviderBillingResponse,
+    "/admin/providers/billing",
+    response_model=list[ProviderBillingResponse],
 )
-async def get_provider_billing(provider_id: int):
+async def list_provider_billing():
     try:
-        return await billing.get_provider_billing(provider_id)
-    except errors.ProviderNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return await billing.list_provider_billing()
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 

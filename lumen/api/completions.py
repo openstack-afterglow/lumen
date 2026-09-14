@@ -239,6 +239,7 @@ async def create_completion(
                 "extension_snapshot": planned["extension_selection"],
                 "context_source": planned["source"],
                 "tool_schemas": planned["tool_schemas"],
+                "context_plan": planned["context_plan"],
                 **(
                     {
                         "execution_policy": execution_policy.model_dump(mode="json"),
@@ -367,6 +368,7 @@ async def regenerate_message(
                 "client_timezone": payload.client_timezone,
                 "context_source": planned["source"],
                 "tool_schemas": planned["tool_schemas"],
+                "context_plan": planned["context_plan"],
             },
             capability_snapshot=capability_snapshot,
             pricing_snapshot=planned["pricing_snapshot"],
@@ -546,6 +548,7 @@ async def retry_failed_run(
                 "extension_snapshot": planned["extension_selection"],
                 "context_source": planned["source"],
                 "tool_schemas": planned["tool_schemas"],
+                "context_plan": planned["context_plan"],
                 **(
                     {
                         "execution_policy": execution_policy.model_dump(mode="json"),
@@ -652,6 +655,7 @@ async def temp_completion(
                 "extension_snapshot": planned["extension_selection"],
                 "context_source": planned["source"],
                 "tool_schemas": planned["tool_schemas"],
+                "context_plan": planned["context_plan"],
             },
             capability_snapshot=capability_snapshot,
             pricing_snapshot=planned["pricing_snapshot"],
@@ -732,6 +736,8 @@ async def preview_conversation_context(
         revision=source["revision"],
         checkpoint_id=source.get("checkpoint_id"),
         active_compaction_run_id=active_compaction_run_id,
+        plan=planned["context_plan"],
+        scope="preview",
     )
 
 
@@ -783,6 +789,8 @@ async def preview_temp_context(
         revision=source["revision"],
         checkpoint_id=source.get("checkpoint_id"),
         active_compaction_run_id=active_compaction_run_id,
+        plan=planned["context_plan"],
+        scope="preview",
     )
 
 
@@ -874,10 +882,12 @@ async def compact_conversation(
         output_reserve=output_reserve,
         revision=source["revision"],
         checkpoint_id=source.get("checkpoint_id"),
+        plan=planned["context_plan"],
+        scope="preview",
     )
 
-    if state.input_budget is None or state.reason_code == "context_budget_unavailable":
-        raise HTTPException(status_code=422, detail="context_budget_unavailable")
+    if state.reason_code in {"context_window_unknown", "token_count_unavailable", "invalid_budget"}:
+        raise HTTPException(status_code=422, detail=state.reason_code)
     if not state.can_compact:
         raise HTTPException(status_code=422, detail="nothing_to_compact")
 
@@ -911,6 +921,7 @@ async def compact_conversation(
                 "extension_snapshot": planned["extension_selection"],
                 "context_source": planned["source"],
                 "tool_schemas": planned["tool_schemas"],
+                "context_plan": planned["context_plan"],
             },
             capability_snapshot=planned["capability_snapshot"],
             pricing_snapshot=planned["pricing_snapshot"],
@@ -1009,10 +1020,12 @@ async def compact_temp_thread(
         output_reserve=output_reserve,
         revision=source["revision"],
         checkpoint_id=source.get("checkpoint_id"),
+        plan=planned["context_plan"],
+        scope="preview",
     )
 
-    if state.input_budget is None or state.reason_code == "context_budget_unavailable":
-        raise HTTPException(status_code=422, detail="context_budget_unavailable")
+    if state.reason_code in {"context_window_unknown", "token_count_unavailable", "invalid_budget"}:
+        raise HTTPException(status_code=422, detail=state.reason_code)
     if not state.can_compact:
         raise HTTPException(status_code=422, detail="nothing_to_compact")
 
@@ -1046,6 +1059,7 @@ async def compact_temp_thread(
                 "extension_snapshot": planned["extension_selection"],
                 "context_source": planned["source"],
                 "tool_schemas": planned["tool_schemas"],
+                "context_plan": planned["context_plan"],
             },
             capability_snapshot=planned["capability_snapshot"],
             pricing_snapshot=planned["pricing_snapshot"],

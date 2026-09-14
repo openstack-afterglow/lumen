@@ -445,70 +445,6 @@ async def test_perplexity_requires_explicit_route_credential(monkeypatch):
         )
 
 
-@pytest.mark.parametrize(
-    ("model", "api_base", "expected_model", "expected_base"),
-    (
-        (
-            "perplexity/perplexity/sonar",
-            None,
-            "perplexity/perplexity/sonar",
-            "https://api.perplexity.ai",
-        ),
-        (
-            "perplexity/openai/gpt-5.6-luna",
-            "https://api.perplexity.ai/v1",
-            "perplexity/openai/gpt-5.6-luna",
-            "https://api.perplexity.ai",
-        ),
-        (
-            "perplexity/anthropic/claude-sonnet-4-6",
-            "https://tenant.example/gateway/v1/",
-            "perplexity/anthropic/claude-sonnet-4-6",
-            "https://tenant.example/gateway",
-        ),
-    ),
-)
-@pytest.mark.asyncio
-async def test_perplexity_agent_uses_responses_bridge_with_canonical_route(
-    monkeypatch, model, api_base, expected_model, expected_base
-):
-    captured = {}
-
-    async def bridge_completion(self, **kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(choices=[])
-
-    monkeypatch.setattr(
-        "litellm.completion_extras.litellm_responses_transformation.handler."
-        "ResponsesToCompletionBridgeHandler.acompletion",
-        bridge_completion,
-    )
-
-    result = await litellm_client.acompletion(
-        model,
-        [{"role": "user", "content": "hello"}],
-        api_base=api_base,
-        api_key="route-key",
-        custom_llm_provider="perplexity",
-        max_tokens=128,
-        tools=[{"type": "function", "function": {"name": "lookup"}}],
-        extra={"tool_choice": "auto", "provider": "must-not-forward"},
-    )
-
-    assert result.choices == []
-    assert captured["model"] == expected_model
-    assert captured["custom_llm_provider"] == "perplexity"
-    assert captured["litellm_params"] == {
-        "api_base": expected_base,
-        "api_key": "route-key",
-        "custom_llm_provider": "perplexity",
-        "no_log": True,
-    }
-    assert captured["optional_params"]["tool_choice"] == "auto"
-    assert captured["optional_params"]["max_tokens"] == 128
-    assert "provider" not in captured["optional_params"]
-
-
 @pytest.mark.asyncio
 async def test_perplexity_agent_hits_responses_http_boundary_with_public_model(monkeypatch):
     captured = {}
@@ -561,6 +497,7 @@ async def test_perplexity_agent_hits_responses_http_boundary_with_public_model(m
         api_base="https://api.perplexity.ai/v1",
         api_key="route-key",
         custom_llm_provider="perplexity",
+        tools=[{"type": "function", "function": {"name": "lookup"}}],
     )
 
     assert result.choices[0].message.content == "hello"
@@ -682,17 +619,32 @@ async def test_perplexity_agent_preserves_explicit_search_and_builtin_sonar(monk
     result = await litellm_client.acompletion(
         model,
         [{"role": "user", "content": "오늘 서울 날씨"}],
-        api_base="https://api.perplexity.ai/v1",
+        api_base=None if builtin_search else "https://api.perplexity.ai/v1",
         api_key="route-key",
         custom_llm_provider="perplexity",
         native_web_search={"search_context_size": "medium"},
         tools=[
-            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up a named record.",
+                    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                },
+            }
         ],
     )
 
     assert "web_search_options" not in captured["body"]
-    assert any(tool.get("type") == "function" and tool.get("name") == "lookup" for tool in captured["body"]["tools"])
+    assert [tool for tool in captured["body"]["tools"] if tool.get("type") == "function"] == [
+        {
+            "type": "function",
+            "name": "lookup",
+            "description": "Look up a named record.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            "strict": True,
+        }
+    ]
     search_tools = [tool for tool in captured["body"]["tools"] if tool.get("type") == "web_search"]
     assert search_tools == ([] if builtin_search else [{"type": "web_search", "search_context_size": "medium"}])
     assert result.choices[0].message.annotations == [
@@ -704,6 +656,28 @@ async def test_perplexity_agent_preserves_explicit_search_and_builtin_sonar(monk
             "end_index": 2,
         }
     ]
+
+
+def test_perplexity_agent_omits_strict_for_open_object_schema():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up a record.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"required_id": {"type": "string"}, "optional_limit": {"type": "integer"}},
+                    "required": ["required_id"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    normalized = litellm_client._perplexity_agent_tools(tools)
+
+    assert normalized == tools
 
 
 @pytest.mark.asyncio

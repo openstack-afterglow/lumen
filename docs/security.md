@@ -8,7 +8,7 @@ Keystone session과 API key는 `Principal`로 정규화된다. API key principal
 
 ## Secret과 암호화
 
-`lumen_encryption_key`는 정확히 64 hex characters여야 한다. AES-GCM/HKDF domain separation으로 chat content와 provider key를 분리한다. key/credential/provider secret은 API response, journal snapshot, log에 노출하지 않는다. API key는 SHA-256 hash만 저장하고 issuance response에서만 plaintext를 준다. public/admin API key 조회 및 한도 프로젝션에서는 secret 및 hash가 제외되며 모든 한도/사용량 숫자는 고정소수점 문자열 또는 `null`로만 노출된다.
+`lumen_encryption_key`는 정확히 64 hex characters여야 한다. AES-GCM/HKDF domain separation으로 chat content, inference provider key, provider billing administrator key를 각각 분리한다. Billing administrator key는 direct OpenAI/Anthropic 조직 보고서 조회에만 사용하고 모델 inference에는 전달하지 않는다. key/credential/provider secret은 API response, journal snapshot, log에 노출하지 않는다. API key는 SHA-256 hash만 저장하고 issuance response에서만 plaintext를 준다. provider projection은 billing key 값 대신 `has_billing_admin_key`만 반환한다. public/admin API key 조회 및 한도 프로젝션에서는 secret 및 hash가 제외되며 모든 한도/사용량 숫자는 고정소수점 문자열 또는 `null`로만 노출된다.
 
 ## Network boundary
 
@@ -25,5 +25,5 @@ Admission은 principal scope와 project ownership을 검사하고 immutable requ
 - encryption key와 MariaDB backup은 같은 recovery plan으로 보관한다.
 - provider/MCP/Git secret은 secret manager에서 주입한다.
 - logs와 alert payload에 Authorization, API key, tool argument, raw provider response를 넣지 않는다.
-- provider billing 조회는 고정된 공식 HTTPS endpoint만 사용하고 redirect를 따르지 않는다. 응답은 allowlist된 숫자·통화·상태 필드만 projection하며 Authorization, raw upstream body, 원문 오류를 반환하거나 기록하지 않는다.
+- provider billing 조회는 provider/capability별 고정된 공식 HTTPS endpoint만 사용하고 redirect를 따르지 않는다. OpenAI/Anthropic 관리자 키는 별도 crypto domain에서 복호화해 organization report 요청에만 쓰며 custom base로 보내지 않는다. 응답은 allowlist된 숫자·통화·상태 필드만 projection하며 Authorization, raw upstream body, 원문 오류를 반환하거나 기록하지 않는다.
 - admin network 접근과 user-native API surface를 분리한다.

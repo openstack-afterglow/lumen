@@ -5,12 +5,13 @@ from __future__ import annotations
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
-from lumen.crypto import encrypt_llm_provider_key
+from lumen.crypto import encrypt_llm_provider_billing_admin_key, encrypt_llm_provider_key
 from lumen.db import mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.services.litellm_client import effective_prices_per_million, official_price_source
 from lumen.services.models_dev import ModelsDevCatalog
 
+from .billing import billing_admin_key_supported, billing_capability_for
 from .credentials import (
     api_model_name,
     canonical_subscription_model_name,
@@ -44,6 +45,7 @@ def validate_provider_auth_configuration(
     api_base: str | None,
     api_key: str | None,
     api_key_env: str | None,
+    billing_admin_key: str | None = None,
 ) -> None:
     if auth_mode not in _AUTH_MODES:
         raise ProviderValidationError("지원하지 않는 provider auth_mode 입니다")
@@ -57,6 +59,8 @@ def validate_provider_auth_configuration(
         isinstance(value, str) and value.strip() for value in (api_base, api_key, api_key_env)
     ):
         raise ProviderValidationError("구독 프로바이더에는 API base/key/environment credential을 설정할 수 없습니다")
+    if billing_admin_key and not billing_admin_key_supported(provider_type, auth_mode, api_base):
+        raise ProviderValidationError("이 프로바이더에는 관리자 결제 키를 설정할 수 없습니다")
 
 
 async def _lock_subscription_namespaces(session) -> dict[int, LlmProvider]:
@@ -110,6 +114,7 @@ async def create_provider(
     api_key: str | None = None,
     api_key_env: str | None = None,
     auth_mode: str = "api_key",
+    billing_admin_key: str | None = None,
     margin_multiplier=1.0,
     models_dev_provider_id: str | None = None,
     is_active: bool = True,
@@ -125,6 +130,7 @@ async def create_provider(
         api_base=api_base,
         api_key=api_key,
         api_key_env=api_key_env,
+        billing_admin_key=billing_admin_key,
     )
     row = LlmProvider(
         name=name.strip(),
@@ -132,6 +138,11 @@ async def create_provider(
         api_base=(api_base or None) if normalized_auth_mode == "api_key" else None,
         encrypted_api_key=(
             encrypt_llm_provider_key(api_key) if api_key and normalized_auth_mode == "api_key" else None
+        ),
+        encrypted_billing_admin_key=(
+            encrypt_llm_provider_billing_admin_key(billing_admin_key)
+            if billing_admin_key and billing_admin_key_supported(normalized_provider_type, normalized_auth_mode, api_base)
+            else None
         ),
         api_key_env=normalize_api_key_env(api_key_env) if normalized_auth_mode == "api_key" else None,
         auth_mode=normalized_auth_mode,
@@ -182,6 +193,13 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 api_base=patch.get("api_base", row.api_base),
                 api_key=patch.get("api_key"),
                 api_key_env=patch.get("api_key_env", row.api_key_env),
+                billing_admin_key=patch.get("billing_admin_key"),
+            )
+            current_billing_capability = billing_capability_for(row.provider_type, current_auth_mode, row.api_base)
+            target_billing_capability = billing_capability_for(
+                target_provider_type,
+                target_auth_mode,
+                patch.get("api_base", row.api_base),
             )
             if patch.get("name"):
                 row.name = str(patch["name"]).strip()
@@ -195,6 +213,14 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 row.encrypted_api_key = encrypt_llm_provider_key(patch["api_key"]) if patch["api_key"] else None
             if "api_key_env" in patch:
                 row.api_key_env = normalize_api_key_env(patch["api_key_env"])
+            if "billing_admin_key" in patch:
+                row.encrypted_billing_admin_key = (
+                    encrypt_llm_provider_billing_admin_key(patch["billing_admin_key"])
+                    if patch["billing_admin_key"]
+                    else None
+                )
+            elif target_billing_capability != current_billing_capability:
+                row.encrypted_billing_admin_key = None
             if patch.get("margin_multiplier") is not None:
                 row.margin_multiplier = _to_decimal(patch["margin_multiplier"], "margin_multiplier")
             if "models_dev_provider_id" in patch:

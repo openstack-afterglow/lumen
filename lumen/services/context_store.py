@@ -18,6 +18,7 @@ from lumen.db import get_session_factory, is_db_available
 from lumen.models.chat_agent_platform import ChatContextCheckpoint
 from lumen.models.chat_db import ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatTempThread
+from lumen.services import context_inspector
 from lumen.services import conversation_store as cs
 
 _ALLOWED_METADATA = {
@@ -230,7 +231,8 @@ async def load_context_source(
                 suffix = messages[prefix_len:]
                 instructions = [m for m in suffix if m.get("role") in {"system", "developer"}]
                 body = [m for m in suffix if m.get("role") not in {"system", "developer"}]
-                messages = [*instructions, {"role": "user", "content": f"[context summary-data]\n{summary}"}, *body]
+                summary_content = f"{context_inspector.SUMMARY_SENTINEL}\n{summary}"
+                messages = [*instructions, {"role": "user", "content": summary_content}, *body]
                 checkpoint_data = {
                     "id": checkpoint_id,
                     "source_message_ids": stored_ids,

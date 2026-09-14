@@ -89,6 +89,11 @@ Lumen 요청 시 다음 3가지 인증 헤더 중 **정확히 1개**만 전달�
 * 인증 헤더 누락 시 **HTTP 401 Unauthorized**.
 * `X-Project-Id` 헤더를 함께 전달할 경우, API Key 소유자의 `project_id`와 일치하지 않으면 **HTTP 403 Forbidden**.
 
+Native와 Keystone-only 인증 dependency는 동기 Keystone 네트워크 검증을 Starlette의
+제한된 threadpool에서 기다립니다. 느린 인증 중에도 API event loop가 다른 요청을
+처리할 수 있지만, token rescope·target project·admin 검증과 인증 실패 응답은 그대로입니다.
+인증 결과 cache나 Keystone 장애 시 허용 경로를 추가하지 않습니다.
+
 ### 4.2 Scope Matrix
 
 API Key 요청 시 필요한 최소 Scope 정의:
@@ -134,7 +139,11 @@ API Key 요청 시 필요한 최소 Scope 정의:
 * `GET /v1/chat/models` (Native 상세 포맷): 각 모델의 공개 `api_model_name`, `api_provider`와 운영용 내부 `model_name`을 분리해 반환하고 `provider_api_key_configured` (`true`/`false`)를 포함합니다.
   * `true`: 해당 모델의 provider API Key가 Lumen 서버에 정상 설정(DB 또는 환경 변수 `api_key_env`)되어 있음.
   * `false`: 명시적인 provider API Key가 등록되지 않음 (`false`인 모델 호출 시 completion 시점에 502/400 오류 발생 가능).
-* Keystone 전용 관리자 엔드포인트 `GET /v1/admin/providers`는 `has_api_key`, `api_key_source`(`database`/`environment`/`null`), `api_key_env` 정보를 제공하며, 보안을 위해 시크릿 값 자체는 어떠한 경우에도 반환하지 않습니다.
+* Keystone 전용 관리자 엔드포인트 `GET /v1/admin/providers`는 `has_api_key`, `api_key_source`(`database`/`environment`/`null`), `api_key_env`, `has_billing_admin_key` 정보를 제공하며 시크릿 값 자체는 반환하지 않습니다. `POST /v1/admin/providers`와 `PATCH /v1/admin/providers/{provider_id}`의 선택적 `billing_admin_key`는 direct OpenAI/Anthropic 조직 report용 별도 administrator credential입니다. Subscription auth, Gemini, Perplexity, custom base에는 설정할 수 없습니다.
+
+* Keystone 전용 `GET /v1/admin/providers/billing`은 모든 configured provider를 한 번에 반환합니다. 각 항목은 Lumen immutable usage ledger의 일·주·월·누적 request/token/raw USD cost를 포함합니다. OpenRouter/DeepSeek는 inference key로 live credit 한도·잔액을 조회합니다. Direct OpenAI/Anthropic은 별도 AES-GCM/HKDF domain에 저장한 administrator key로 공식 organization report를 조회해 현재 UTC 일·주·월 cost/usage를 반환합니다. Gemini는 console-only, Perplexity Enterprise Computer Analytics는 Sonar/API Platform billing과 제품 범위가 달라 해당 analytics API를 호출하지 않습니다. Subscription credential과 custom base에는 오인 가능한 vendor console URL을 반환하지 않습니다. Provider/report별 upstream 실패는 안전한 상태로 격리되어 다른 provider 항목이나 관리자 CRUD를 막지 않습니다.
+
+* Cutover는 Lumen migration `011_provider_billing_admin_key.sql`과 호환 Lumen API를 Afterglow UI보다 먼저 배포합니다. 구 Lumen에서 bulk GET이 동적 provider PATCH route의 `provider_id="billing"`과 충돌해 반환하는 HTTP 405는 credential 오류가 아니라 mixed-version 신호입니다.
 
 ### 5.1 공개 모델 ID와 실행 route
 
@@ -144,7 +153,7 @@ Perplexity provider는 base URL로 transport를 명시합니다.
 
 | Base URL | 실행 경로 | 내부 route |
 | --- | --- | --- |
-| `https://api.perplexity.ai/v1` | Agent API (`POST /v1/responses`) | 공개 ID에 `perplexity/` transport namespace를 한 번 더 붙인 LiteLLM route |
+| `https://api.perplexity.ai/v1` | pinned LiteLLM Responses transport (`POST /v1/responses`; current Agent endpoint compatibility requires live confirmation) | 공개 ID에 `perplexity/` transport namespace를 한 번 더 붙인 LiteLLM route |
 | `https://api.perplexity.ai/router` 또는 `/router/v1` | OpenAI 호환 Router | `openai/<공개 ID>` |
 | 기존 `/v1`이 없는 Sonar 설정 | 기존 Chat Completions 호환 경로 | 저장된 legacy route 유지 |
 
@@ -154,11 +163,44 @@ Perplexity `/v1/models`와 `/router/v1/models` discovery 결과는 공개 canoni
 
 Native completion의 `features.web_search`는 실행 소유자를 명시합니다. 기존 서버-managed search는 `{"enabled": true, "mode": "managed", "provider_id": <id>}`이며, 선택된 search provider route와 기존 usage component 가격을 사용합니다. Provider-native search는 `{"enabled": true, "mode": "native", "provider_id": null}`이며 현재 chat model의 frozen executor route만 사용하고 managed provider를 선택하거나 호출하지 않습니다.
 
-Native mode는 provider가 지원하는 경우 `context_size`와 완전한 approximate location (`city`, `country`, `region`, `timezone`)을 LiteLLM mapper로 전달합니다. 도메인 allow/block 및 `max_uses`는 managed mode 전용이므로 native request에서 거부됩니다. `effective_capabilities.feature_gates.web_search`의 `mode="native"`, `available`, `pricing_available`가 opt-in Search 여부를 결정합니다. `capabilities.web_search_required=true`인 Sonar 같은 모델은 이미 항상-on search를 실행하므로 UI는 static active Search로 표시하고 중복 hosted search tool을 주입하지 않습니다. Perplexity Agent의 [공식 hosted web_search tool](https://docs.perplexity.ai/docs/agent-api/tools/web-search)은 별도 opt-in 경로에서 function tool과 함께 보존됩니다. Subscription credential transport는 native search를 advertise하지 않습니다.
+Native mode는 provider가 지원하는 경우 `context_size`와 완전한 approximate location (`city`, `country`, `region`, `timezone`)을 LiteLLM mapper로 전달합니다. 도메인 allow/block 및 `max_uses`는 managed mode 전용이므로 native request에서 거부됩니다. `effective_capabilities.feature_gates.web_search`의 `mode="native"`, `available`, `pricing_available`는 opt-in 가능성만 결정하며, 검색이 실제 실행되었다는 증거가 아닙니다. `capabilities.web_search_required=true`인 Sonar 같은 모델은 이미 always-on search를 실행하므로 중복 hosted search tool을 주입하지 않습니다. Perplexity Agent의 [공식 hosted `web_search` tool](https://docs.perplexity.ai/docs/agent-api/tools/web-search)은 non-Sonar native opt-in에서 function tool과 함께 전달됩니다. Lumen은 모든 function declaration을 runtime에서 검증하며, `additionalProperties=false`이고 모든 object property가 required인 재귀적으로 closed schema에만 `strict=true`를 붙입니다. pinned LiteLLM bridge가 해당 OpenAI envelope을 Agent의 flat `type`/`name`/`description`/`parameters` wire shape로 변환합니다.
 
-Provider가 URL citation 또는 `url_citation` annotation을 반환하면 Lumen은 URL, title, valid inline range를 canonical citation part로 durable run 결과에 저장합니다. 선택 모델의 complete token price가 없으면 admission은 `pricing_unavailable`으로 fail closed 합니다. Native Search는 기존 token 기반 크레딧 계약을 유지하며 provider의 별도 검색 요청/툴 부가요금은 크레딧 계산에 포함하지 않습니다. 따라서 로컬 크레딧 비용을 provider 최종 청구 총액으로 해석하면 안 됩니다. Managed 검색의 별도 usage component 과금은 그대로 유지합니다.
+Provider가 URL citation 또는 `url_citation` annotation을 반환하면 Lumen은 URL, title, valid inline range를 canonical citation part로 durable run 결과에 저장합니다. 이 durable citation event/part가 실제 native-search source evidence이며, configured capability만으로 source나 search-success projection을 만들지 않습니다. 선택 모델의 complete token price가 없으면 admission은 `pricing_unavailable`으로 fail closed 합니다. Native Search는 기존 token 기반 크레딧 계약을 유지하며 provider의 별도 검색 요청/툴 부가요금은 크레딧 계산에 포함하지 않습니다. 따라서 로컬 크레딧 비용을 provider 최종 청구 총액으로 해석하면 안 됩니다. Managed 검색의 별도 usage component 과금은 그대로 유지합니다.
+
+Perplexity 출처는 LiteLLM Chat Completions의 `citations`, `search_results`, message annotations뿐 아니라 Agent `response.reasoning.search_results`, `response.output_item.added`/`response.output_item.done`의 `type="search_results"`, `response.completed.output`의 search-result item에서도 수집합니다. 메타데이터만 있는 chunk는 `delta.provider_specific_fields.search_results`로 LiteLLM의 빈 delta 제거를 통과하며, 같은 URL의 title/snippet 보강은 이미 받은 inline range를 지우지 않습니다. 실제 provider가 반환하지 않거나 과거에 저장되지 않은 출처는 복원해 만들지 않습니다.
 
 Perplexity fallback은 공개 ID뿐 아니라 실제 API base도 구분합니다. [공식 Agent 모델 가격](https://docs.perplexity.ai/docs/agent-api/models)의 `perplexity/sonar`는 입력 $0.25/M·출력 $2.50/M이며 legacy Sonar API의 $1/M·$1/M과 다릅니다. 같은 문서의 exact `perplexity/glm-5.3` 가격은 $1.40/M·$4.40/M입니다. 수동/검토된 가격은 이 fallback보다 우선하며 미등록 모델 suffix에 가격을 추정하지 않습니다.
+
+### 5.3 Conversation titles and context capacity
+
+첫 완료된 user/assistant 교환의 제목은 frozen summary route를 쓰는 durable title job이 생성합니다. UI는 서버의 `title_status`를 정본으로 사용해야 하며 로컬 대기 시간만으로 `pending`을 `failed`로 바꾸면 안 됩니다. worker는 idle 시 분당 한 번, 기존 job이 없는 active `auto/idle/revision=0` 대화의 완료된 첫 교환을 복구합니다. 빈 대화는 후보에서 제외하고 route/source가 없는 후보는 `unavailable`로 종료하여 뒤 후보를 막지 않습니다. legacy/수동/실패/삭제된 대화와 불확실한 provider 호출은 재실행하지 않습니다. 수동 제목 수정은 source/status와 revision을 원자적으로 갱신하여 늦은 자동 결과를 차단합니다. 로컬 seeded API key는 native conversation read/write scope를 포함하지만 production 인증 정책은 바꾸지 않습니다.
+
+Context preview는 exact LiteLLM `max_input_tokens`와 검토된 override를 사용합니다. 저장 route `perplexity/perplexity/sonar`는 catalog의 `perplexity/sonar`로 조회하며 입력 한도는 128000입니다. 등록되지 않은 GLM-5.3 같은 모델에 가족 모델의 한도나 `max_tokens`를 대입하지 않습니다. 알려진 입력 예산에서는 `input_budget - input_tokens`가 남은 용량이고, `measurement`가 tokenizer/estimated/unknown을 구분합니다.
+
+| Reason code | 의미 |
+| --- | --- |
+| `context_window_unknown` | 신뢰할 수 있는 모델 입력 한도가 없음 |
+| `token_count_unavailable` | 현재 modality/입력을 안전하게 계수할 수 없음 |
+| `invalid_budget` | 응답/안전 reserve 이후 유효한 양수 입력 예산이 없음 |
+| `token_counter_failed` | 텍스트 계수 실패 뒤 길이 기반 추정치를 사용함; 용량을 사용 불가로 만들지 않음 |
+| `context_request_invalid` | 압축 요청 설정이 유효하지 않음 |
+
+저장/임시 대화의 수동 compaction은 앞의 세 unavailable reason을 구분해 HTTP 422 detail로 반환합니다. UI는 요청 오류 시 오래된 용량을 버리고 내부 provider 오류를 그대로 노출하지 않아야 합니다.
+
+`ContextState.breakdown`은 선택 필드이며, 이전에 저장된 durable `context.updated` 이벤트에는 없을 수 있으므로 클라이언트는 부재/`null`을 허용해야 합니다. `scope`는 preview(요청 전 투영)와 request(실제 provider 요청)를 구분합니다. `complete=true`일 때 `components[]`의 `included=true` 항목 토큰 합계가 `input_tokens`와 정확히 일치하며, tokenizer 자체의 framing 비용은 `overhead` component로 분리합니다. 측정 불가능한 재료는 0으로 채우지 않고 `tokens=null`(필요하면 `count=null`)로 남기고 `uncounted[]`에 해당 component id를 넣습니다. `complete=false`면 정확한 잔여 용량을 단정하면 안 됩니다.
+
+| Component | 의미 |
+| --- | --- |
+| `messages` / `system_prompt` / `summary` | 활성 경로 메시지·대화 자체의 지침·압축 요약 투영 |
+| `memory` / `workspace` / `skills` / `agent` | `_apply_context`가 선주입한 system preamble; `items`는 이름/ID만 노출 |
+| `tools` / `mcp_tools` | 실제 요청에 실린 function·MCP 스키마. preview는 MCP 원격 discovery를 하지 않으므로 `included=false`, `count=null`이고 `uncounted`에 포함됩니다 |
+| `deferred_tools` | 최초 요청에 실리지 않는 재료(`load_policy=on_demand` 확장은 `list_available_tools` 이후에만 적재, managed 도구는 현재 어떤 binding 경로에서도 노출되지 않음). 예산에 포함되지 않으므로 `complete`를 떨어뜨리지 않습니다 |
+| `attachments` | 텍스트 투영이 표현하지 못하는 non-text 입력 파트 |
+| `overhead` | 요청 framing/priming 토큰 |
+
+Preview의 tool 스키마 집합은 실행기가 실제로 보내는 집합(내장 도구 + `list_available_tools` 카탈로그 + `preloaded` 확장)과 정확히 일치합니다. 커스텀 도구 이름·스키마는 binding과 동일한 투영(`custom__{id}__{name}_{digest}` + `additionalProperties=false`)을 공유하며, 정규 destination이 없어 binding이 제외하는 확장은 preview에서도 계수하거나 deferred로 제시하지 않습니다.
+
+모델 한도를 알 수 없거나(`context_window_unknown`) 토큰 계수가 불가능해도(`token_count_unavailable`) breakdown은 사라지지 않습니다. 계수가 가능하면 값이 있는 완전한 구성을 그대로 제공하고, 계수가 불가능하면 토큰만 `null`로 비운 뒤 이름·개수를 유지한 채 `complete=false`로 보고합니다. `items[]`는 128개로 제한되지만 `count`는 잘리기 전 실제 총계입니다. request scope에서 모델이 `list_available_tools`로 적재한 도구는 `deferred_tools`에서 제거되어 `tools`/`mcp_tools`로 계수되므로, 같은 도구가 포함과 지연에 동시에 나타나지 않습니다.
 
 ---
 

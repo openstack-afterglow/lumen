@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 from lumen.services.execution_protocol import v2_runtime_ready
 from lumen.services.litellm_client import chatgpt_model_metadata
-from lumen.services.providers.credentials import litellm_model_name
+from lumen.services.providers.credentials import api_model_name, litellm_model_name
 
 _RUNTIME_TOOL_FEATURES = ("mcp", "approval_tools", "code_interpreter", "computer_use", "code_workspace", "child_agents")
 
@@ -169,6 +169,35 @@ def _detected_native_web_search_available(detected: dict[str, Any]) -> bool:
     )
 
 
+def _catalog_context_limit(model_name: str, provider_type: str | None) -> int | None:
+    """Read only an exact LiteLLM catalog input-window entry.
+
+    Stored Perplexity routes retain their transport prefix (for example,
+    ``perplexity/perplexity/sonar``), while LiteLLM's catalog is keyed by the
+    canonical Agent API identifier (``perplexity/sonar``).  Project that one
+    provider-specific alias, but never infer a limit from a model family or a
+    generic ``max_tokens`` field.
+    """
+    normalized = litellm_model_name(model_name)
+    candidates = [normalized]
+    if provider_type == "perplexity":
+        canonical = api_model_name(normalized, "perplexity")
+        if canonical and canonical not in candidates:
+            candidates.append(canonical)
+    try:
+        import litellm
+
+        catalog = getattr(litellm, "model_cost", {})
+        for candidate in candidates:
+            metadata = catalog.get(candidate) if isinstance(catalog, dict) else None
+            value = metadata.get("max_input_tokens") if isinstance(metadata, dict) else None
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+    except Exception:
+        pass
+    return None
+
+
 def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str, Any]:
     """Return the legacy display fields plus canonical feature gates.
 
@@ -206,7 +235,14 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
     parallel_function_calling = bool(metadata.get("supports_parallel_function_calling")) if is_chatgpt else False
     supports_web_search = _native_web_search_available(normalized_model, provider_type)
     web_search_required = supports_web_search and _is_perplexity_sonar(normalized_model, provider_type)
-    context_limit = metadata.get("max_input_tokens") if isinstance(metadata.get("max_input_tokens"), int) else None
+    configured_context_limit = metadata.get("max_input_tokens")
+    context_limit = (
+        configured_context_limit
+        if isinstance(configured_context_limit, int)
+        and not isinstance(configured_context_limit, bool)
+        and configured_context_limit > 0
+        else _catalog_context_limit(normalized_model, provider_type)
+    )
     return {
         # Existing model-admin/UI fields retained until the capability API is cut over.
         "vision": vision,
@@ -364,6 +400,13 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
         return detected
     normalized = dict(detected)
     normalized.update({key: value for key, value in stored.items() if key != "feature_gates"})
+    # ``CapabilitiesInput`` always serializes context_limit, so a stored override that
+    # only changed an unrelated flag carries context_limit=None. Never let that erase an
+    # exact catalog window (for example the Perplexity Agent route perplexity/sonar);
+    # an unknown window stays unknown rather than being fabricated.
+    stored_limit = stored.get("context_limit")
+    if not (isinstance(stored_limit, int) and not isinstance(stored_limit, bool) and stored_limit > 0):
+        normalized["context_limit"] = detected.get("context_limit")
     gates = {name: dict(gate) for name, gate in detected["feature_gates"].items()}
     stored_gates = stored.get("feature_gates")
     stored_web_search_gate = stored_gates.get("web_search") if isinstance(stored_gates, dict) else None

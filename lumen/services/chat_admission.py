@@ -18,6 +18,7 @@ from lumen.models.chat_contracts import (
     text_projection_from_user_input_parts,
 )
 from lumen.services import agent_store as ags
+from lumen.services import context_inspector as inspector
 from lumen.services import conversation_store as cs
 from lumen.services import extensions_store as es
 from lumen.services import memory_store as ms
@@ -25,9 +26,11 @@ from lumen.services import workspace_store as ws
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
 from lumen.services.providers.pricing import _has_component_prices
+from lumen.services.tool_runtime import contracts
 
 _MAX_TOKENS_CAP = 4096
 _MAX_MESSAGE_CHARS = 32000
+_LOAD_POLICIES = ("preloaded", "on_demand")
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +345,13 @@ async def _resolve_extension_selection(
                 "effect": str(item.get("effect") or "external_mutation"),
                 "origin": _normalized_origin(item.get("url")),
                 "config_fingerprint": es.selection_fingerprint(item),
+                # Runtime exposes preloaded extensions in the first provider request and
+                # keeps on_demand ones behind the tool catalog, so context planning must
+                # know the policy without re-reading the extension row.
+                "load_policy": item.get("load_policy") if item.get("load_policy") in _LOAD_POLICIES else "on_demand",
+                # Bindings exclude any extension without a canonical destination, so
+                # context planning must not count or offer one either.
+                "destination_origin": contracts._v2_destination_origin(item.get("url")),
             }
             if kind == "tool":
                 selected_item["description"] = str(item.get("description") or item.get("name") or "Custom HTTP tool")
@@ -589,50 +599,185 @@ def _require_context_read_scopes(
     ensure_scopes(token_info, *required)
 
 
+def _bindable(item: dict[str, object]) -> bool:
+    """Return whether bindings would expose this extension at all."""
+    return isinstance(item.get("id"), int) and bool(item.get("destination_origin"))
+
+
+def _preloaded(item: dict[str, object]) -> bool:
+    return _bindable(item) and item.get("load_policy") != "on_demand"
+
+
+def _deferred(item: dict[str, object]) -> bool:
+    return _bindable(item) and item.get("load_policy") == "on_demand"
+
+
+def custom_tool_schema(item: dict[str, object]) -> dict[str, Any] | None:
+    """Project one selected custom tool exactly as bindings would, or ``None``."""
+    try:
+        function = contracts.custom_tool_function_schema(
+            item["id"], item.get("name"), item.get("description"), item.get("params_schema")
+        )
+    except (TypeError, ValueError):
+        return None
+    return {"type": "function", "function": function}
+
+
+def _managed_tool_names(features: ChatFeatureOptions) -> list[str]:
+    """Name the managed tools this selection asked for.
+
+    ``graph.stream`` always creates a ``ToolBindingSession``, so neither the v1
+    nor the v2 binding path emits managed schemas in the provider request today.
+    They are therefore reported as not-included material instead of being
+    counted as if the model could call them.
+    """
+    from lumen.services.tool_runtime import managed
+
+    names: list[str] = []
+    if features.web_search.enabled and features.web_search.mode == "managed":
+        names.append(managed._MANAGED_SEARCH_TOOL)
+    if features.web_fetch.enabled:
+        names.append(managed._MANAGED_FETCH_TOOL)
+    if features.advisor.enabled:
+        names.append(managed._MANAGED_ADVISOR_TOOL)
+    return names
+
+
 async def _preview_tool_schemas(
     features: ChatFeatureOptions,
     extension_selection: dict[str, list[dict[str, object]]],
 ) -> list[dict[str, Any]]:
-    """Construct read-only tool schemas for token estimation without tool execution."""
+    """Project exactly the schemas the first provider request will carry.
+
+    The executor sends built-in tools, the on-demand tool catalog, and only
+    ``preloaded`` extensions.  ``on_demand`` extensions stay behind
+    ``list_available_tools`` and MCP schemas are discovered remotely, so preview
+    counts neither instead of inflating the budget with material the model will
+    not receive.
+    """
     if features.tool_policy.mode == "none":
         return []
     from lumen.services import tools
-    from lumen.services.tool_runtime import managed
+    from lumen.services.tool_runtime import bindings
 
     schemas = list(tools.tool_schemas())
+    catalog = bindings._catalog_binding({}, include_managed=False).definition
+    schemas.append(
+        {
+            "type": "function",
+            "function": {
+                "name": catalog.name,
+                "description": catalog.description,
+                "parameters": catalog.input_schema,
+            },
+        }
+    )
     for tool in extension_selection.get("tools", []):
-        params = tool.get("params_schema")
-        schemas.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": str(tool.get("name") or f"custom_tool_{tool.get('id')}"),
-                    "description": str(tool.get("description") or tool.get("name") or "Custom HTTP tool"),
-                    "parameters": params if isinstance(params, dict) else {"type": "object", "properties": {}},
-                },
-            }
-        )
-    # MCP schemas are discovered remotely by the executor. Preview must never
-    # perform discovery, so it deliberately counts only the deterministic
-    # built-in/custom schemas rather than pretending an unknown remote schema is
-    # authoritative.
-    if features.web_search.enabled and features.web_search.mode == "managed":
-        schemas.append(
-            managed._managed_schema(
-                managed._MANAGED_SEARCH_TOOL, "Search the public web through the selected provider.", "query"
-            )
-        )
-    if features.web_fetch.enabled:
-        schemas.append(
-            managed._managed_schema(managed._MANAGED_FETCH_TOOL, "Fetch a permitted public HTTPS document.", "url")
-        )
-    if features.advisor.enabled:
-        schemas.append(
-            managed._managed_schema(
-                managed._MANAGED_ADVISOR_TOOL, "Ask the selected advisor for private analysis.", "goal"
-            )
-        )
+        if not _preloaded(tool):
+            continue
+        schema = custom_tool_schema(tool)
+        if schema is not None:
+            schemas.append(schema)
     return schemas
+
+
+def _attachment_label(part: UserInputPart) -> str:
+    """Name one non-text draft part without exposing its content."""
+    identity = getattr(part, "name", None) or getattr(part, "asset_id", None) or ""
+    return f"{part.type}:{identity}" if identity else str(part.type)
+
+
+def _custom_tool_identity(item: dict[str, object]) -> str:
+    """Return the provider tool name bindings would expose for this custom tool."""
+    return contracts._v2_provider_name("custom", int(item["id"]), item.get("name"))
+
+
+def _mcp_tool_prefix(item: dict[str, object]) -> str:
+    """Return the provider name prefix shared by every tool of this MCP server."""
+    return f"mcp__{item['id']}__"
+
+
+def _context_plan(
+    features: ChatFeatureOptions,
+    extension_selection: dict[str, list[dict[str, object]]],
+    *,
+    memories: list[str],
+    workspace_instr: str | None,
+    workspace_id: object,
+    skill_snapshot: list[dict[str, int | str]],
+    agent: dict | None,
+    parts: list[UserInputPart],
+    source: dict[str, Any],
+    message_count: int,
+) -> dict[str, Any]:
+    """Record how this request was assembled, using only bounded safe names.
+
+    The entries mirror ``_apply_context`` exactly: one memory message, one
+    workspace message, one message per skill, then the agent instruction.  Each
+    entry consumes that many leading instruction messages, so the inspector can
+    attribute tokens without inspecting prompt text.
+    """
+    instructions: list[dict[str, Any]] = []
+    if memories:
+        instructions.append(inspector.instruction_plan_entry("memory", slots=1, count=len(memories), items=[]))
+    if workspace_instr:
+        instructions.append(
+            inspector.instruction_plan_entry(
+                "workspace",
+                slots=1,
+                count=1,
+                items=[f"workspace:{workspace_id}"] if workspace_id else [],
+            )
+        )
+    if skill_snapshot:
+        instructions.append(
+            inspector.instruction_plan_entry(
+                "skills",
+                slots=len(skill_snapshot),
+                count=len(skill_snapshot),
+                items=[item.get("name") or f"skill:{item.get('id')}" for item in skill_snapshot],
+            )
+        )
+    if agent and agent.get("instructions"):
+        instructions.append(
+            inspector.instruction_plan_entry(
+                "agent",
+                slots=1,
+                count=1,
+                items=[agent.get("name") or f"agent:{agent.get('id')}"],
+            )
+        )
+    checkpoint = source.get("checkpoint")
+    tools_enabled = features.tool_policy.mode != "none"
+    deferred = (
+        [
+            *(
+                inspector.tool_plan_entry(item.get("name") or item.get("id"), _custom_tool_identity(item))
+                for item in extension_selection.get("tools", [])
+                if _deferred(item)
+            ),
+            *(
+                inspector.tool_plan_entry(f"mcp:{item.get('name') or item.get('id')}", _mcp_tool_prefix(item))
+                for item in extension_selection.get("mcp", [])
+                if _deferred(item)
+            ),
+            *(inspector.tool_plan_entry(name, name) for name in _managed_tool_names(features)),
+        ]
+        if tools_enabled
+        else []
+    )
+    return inspector.build_plan(
+        instructions=instructions,
+        summary_checkpoint_id=(checkpoint or {}).get("id") if isinstance(checkpoint, dict) else None,
+        message_count=message_count,
+        attachments=[_attachment_label(part) for part in parts if part.type != "text"],
+        deferred_tools=deferred,
+        undiscovered_mcp=[
+            inspector.tool_plan_entry(f"mcp:{item.get('name') or item.get('id')}", _mcp_tool_prefix(item))
+            for item in extension_selection.get("mcp", [])
+            if tools_enabled and _preloaded(item)
+        ],
+    )
 
 
 async def prepare_context_input(
@@ -770,6 +915,18 @@ async def prepare_context_input(
     capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
 
     tool_schemas = await _preview_tool_schemas(features, extension_selection)
+    context_plan = _context_plan(
+        features,
+        extension_selection,
+        memories=memories,
+        workspace_instr=workspace_instr,
+        workspace_id=(conv or {}).get("workspace_id"),
+        skill_snapshot=skill_snapshot,
+        agent=agent,
+        parts=parts if append_draft else [],
+        source=source,
+        message_count=len(base_messages),
+    )
 
     return {
         "input_messages": input_messages,
@@ -787,6 +944,7 @@ async def prepare_context_input(
         "extension_selection": extension_selection,
         "skill_snapshot": skill_snapshot,
         "tool_schemas": tool_schemas,
+        "context_plan": context_plan,
         "workspace_instr": workspace_instr,
         "memories": memories,
     }

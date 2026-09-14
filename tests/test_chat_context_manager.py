@@ -74,6 +74,7 @@ async def test_context_token_counter_honesty():
     res = count_context_tokens("gpt-4o", uncountable)
     assert res.measurement == "unknown"
     assert res.tokens is None
+    assert res.reason_code == "token_count_unavailable"
 
 
 async def test_forced_compaction_uses_all_prefixes_for_final_title_context():
@@ -239,3 +240,92 @@ async def test_compaction_reduces_again_when_safe_result_misses_target():
 
     assert reduce_calls == 2
     assert prepared.after_tokens == 1_000
+
+
+async def test_context_state_distinguishes_unknown_limit_counting_and_invalid_budget(monkeypatch):
+    import lumen.services.context_manager as context_manager
+    from lumen.services.litellm_client import ContextTokenCount
+
+    messages = [{"role": "user", "content": "hello"}]
+    monkeypatch.setattr(
+        context_manager,
+        "count_context_tokens",
+        lambda *_args: ContextTokenCount(tokens=12, measurement="estimated"),
+    )
+
+    unknown_limit = context_manager.context_state(
+        messages,
+        [],
+        model_name="perplexity/perplexity/glm-5.3",
+        context_limit=None,
+        output_reserve=512,
+        revision="r1",
+    )
+    assert unknown_limit.reason_code == "context_window_unknown"
+    assert unknown_limit.input_tokens == 12
+    assert unknown_limit.measurement == "estimated"
+    assert unknown_limit.utilization is None
+
+    invalid_budget = context_manager.context_state(
+        messages,
+        [],
+        model_name="perplexity/sonar",
+        context_limit=2_048,
+        output_reserve=512,
+        revision="r2",
+    )
+    assert invalid_budget.reason_code == "invalid_budget"
+    assert invalid_budget.utilization is None
+
+    monkeypatch.setattr(
+        context_manager,
+        "count_context_tokens",
+        lambda *_args: ContextTokenCount(tokens=None, measurement="unknown"),
+    )
+    unavailable_count = context_manager.context_state(
+        messages,
+        [],
+        model_name="perplexity/sonar",
+        context_limit=128_000,
+        output_reserve=512,
+        revision="r3",
+    )
+    assert unavailable_count.reason_code == "token_count_unavailable"
+    assert unavailable_count.input_tokens is None
+    assert unavailable_count.utilization is None
+
+
+async def test_context_counter_failure_keeps_a_text_estimate(monkeypatch):
+    import litellm
+
+    from lumen.services.litellm_client import count_context_tokens
+
+    def unavailable_counter(**_kwargs):
+        raise RuntimeError("tokenizer unavailable")
+
+    monkeypatch.setattr(litellm, "token_counter", unavailable_counter)
+
+    count = count_context_tokens("perplexity/perplexity/sonar", [{"role": "user", "content": "count me"}])
+
+    assert count.measurement == "estimated"
+    assert count.tokens is not None and count.tokens > 0
+    assert count.reason_code == "token_counter_failed"
+
+
+async def test_prepare_context_reports_distinct_unavailable_reason_codes():
+    from lumen.services.litellm_client import ContextTokenCount
+
+    with pytest.raises(ContextLimitExceeded) as invalid_budget:
+        await prepare_model_messages([], [], 2_000, 100, {}, token_counter=_count)
+    assert invalid_budget.value.code == "invalid_budget"
+
+    with pytest.raises(ContextLimitExceeded) as unavailable_count:
+        await prepare_model_messages(
+            [{"role": "user", "content": "hello"}],
+            [],
+            16_000,
+            512,
+            {},
+            token_counter=lambda _messages, _tools: ContextTokenCount(tokens=None, measurement="unknown"),
+        )
+    assert unavailable_count.value.code == "token_count_unavailable"

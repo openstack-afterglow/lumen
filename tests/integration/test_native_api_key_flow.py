@@ -127,7 +127,9 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
                 ],
                 [
                     SimpleNamespace(
-                        choices=[SimpleNamespace(delta=SimpleNamespace(content="integration complete", tool_calls=None))],
+                        choices=[
+                            SimpleNamespace(delta=SimpleNamespace(content="integration complete", tool_calls=None))
+                        ],
                         usage=None,
                     ),
                     SimpleNamespace(
@@ -156,9 +158,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
             events = await client.get(f"/v1/runs/{run_id}/events", headers={"X-Api-Key": key["key"]})
             assert events.status_code == 200, events.text
             event_types = [
-                line.removeprefix("event: ")
-                for line in events.text.splitlines()
-                if line.startswith("event: ")
+                line.removeprefix("event: ") for line in events.text.splitlines() if line.startswith("event: ")
             ]
             assert {"tool.call.started", "tool.call.completed", "usage.updated", "run.completed"} <= set(event_types)
             event_ids = [line.removeprefix("id: ") for line in events.text.splitlines() if line.startswith("id: ")]
@@ -238,6 +238,90 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
         await close_db()
 
 
+async def test_title_recovery_skips_empty_and_unavailable_conversations_without_duplicate_jobs():
+    from datetime import UTC, datetime, timedelta
+
+    from lumen.crypto import encrypt_chat_content
+    from lumen.models.chat_db import ChatConversation, ChatMessage
+    from lumen.models.chat_jobs import ChatJob
+    from lumen.services import title_jobs
+
+    init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
+    factory = get_session_factory()
+    nonce = uuid.uuid4().hex
+    owner = {"user_id": f"recovery-{nonce}", "project_id": f"recovery-{nonce}"}
+    empty_ids = [str(uuid.uuid4()) for _ in range(21)]
+    unavailable_id, recoverable_id = str(uuid.uuid4()), str(uuid.uuid4())
+    now = datetime.now(UTC)
+    try:
+        async with factory() as session, session.begin():
+            session.add_all(
+                [
+                    ChatConversation(id=conv_id, **owner, title_source="auto", created_at=now - timedelta(days=1))
+                    for conv_id in empty_ids
+                ]
+            )
+            for offset, conv_id in enumerate((unavailable_id, recoverable_id)):
+                session.add(
+                    ChatConversation(
+                        id=conv_id, **owner, title_source="auto", created_at=now - timedelta(minutes=20 - offset)
+                    )
+                )
+                await session.flush()
+                user = ChatMessage(
+                    conversation_id=conv_id, role="user", content=encrypt_chat_content("Plan OpenStack HA")
+                )
+                assistant = ChatMessage(
+                    conversation_id=conv_id, role="assistant", content=encrypt_chat_content("Use three controllers")
+                )
+                session.add_all([user, assistant])
+                await session.flush()
+                session.add(
+                    ChatRun(
+                        id=str(uuid.uuid4()),
+                        **owner,
+                        conversation_id=conv_id,
+                        run_scope="persistent",
+                        status="completed",
+                        model_name="title-model",
+                        user_message_id=user.id,
+                        assistant_message_id=assistant.id,
+                        capability_snapshot={"summary_route": {"model_name": "title-model", "provider_type": "openai"}}
+                        if offset
+                        else {},
+                        pricing_snapshot={},
+                        client_request_id=str(uuid.uuid4()),
+                        request_fingerprint=nonce + str(offset),
+                        fingerprint_version=1,
+                    )
+                )
+
+        assert await title_jobs._recover_one() is True
+        assert await title_jobs._recover_one() is True
+        await title_jobs._recover_one()
+        async with factory() as session:
+            unavailable = await session.get(ChatConversation, unavailable_id)
+            recovered = await session.get(ChatConversation, recoverable_id)
+            assert unavailable.title_status == "unavailable"
+            assert recovered.title_status == "pending"
+            assert recovered.title_revision == 1
+            jobs = (
+                (await session.execute(select(ChatJob).where(ChatJob.conversation_id == recoverable_id)))
+                .scalars()
+                .all()
+            )
+            assert len(jobs) == 1
+            assert jobs[0].status == "queued"
+            empty_statuses = (
+                (await session.execute(select(ChatConversation.title_status).where(ChatConversation.id.in_(empty_ids))))
+                .scalars()
+                .all()
+            )
+            assert set(empty_statuses) == {"idle"}
+    finally:
+        await close_db()
+
+
 async def test_subscription_model_namespace_is_unique_under_concurrent_registration():
     database_url = os.environ["DATABASE_URL"]
     nonce = uuid.uuid4().hex
@@ -280,8 +364,7 @@ async def test_subscription_model_namespace_is_unique_under_concurrent_registrat
         rejected = [result for result in results if isinstance(result, ProviderValidationError)]
         assert len(created) == 1
         assert len(rejected) == 1, [
-            f"{type(result).__name__}: {result}; cause={getattr(result, '__cause__', None)!r}"
-            for result in results
+            f"{type(result).__name__}: {result}; cause={getattr(result, '__cause__', None)!r}" for result in results
         ]
         assert created[0]["model_name"] == f"chatgpt/gpt-concurrency-{nonce}"
     finally:

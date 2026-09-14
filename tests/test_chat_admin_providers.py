@@ -70,6 +70,50 @@ class TestProviderCrud:
         assert "encrypted_api_key" not in body
         assert body["has_api_key"] is True
 
+    async def test_create_masks_separate_billing_admin_key(self, admin_client, monkeypatch):
+        captured = {}
+
+        async def fake_create(**kwargs):
+            captured.update(kwargs)
+            return _public_provider(
+                name=kwargs["name"],
+                has_billing_admin_key=bool(kwargs.get("billing_admin_key")),
+            )
+
+        monkeypatch.setattr(ps, "create_provider", fake_create)
+        response = await admin_client.post(
+            _PROVIDERS_URL,
+            json={"name": "openai", "provider_type": "openai", "billing_admin_key": "sk-admin-secret"},
+        )
+
+        assert response.status_code == 201
+        assert captured["billing_admin_key"] == "sk-admin-secret"
+        assert response.json()["has_billing_admin_key"] is True
+        assert "billing_admin_key" not in response.json()
+        assert "sk-admin-secret" not in response.text
+
+    async def test_create_rejects_billing_admin_key_for_unsupported_provider(self, admin_client):
+        response = await admin_client.post(
+            _PROVIDERS_URL,
+            json={"name": "gemini", "provider_type": "gemini", "billing_admin_key": "secret"},
+        )
+
+        assert response.status_code == 422
+
+    async def test_update_forwards_empty_billing_admin_key_for_removal(self, admin_client, monkeypatch):
+        captured = {}
+
+        async def fake_update(provider_id, patch):
+            captured.update({"provider_id": provider_id, "patch": patch})
+            return _public_provider(has_billing_admin_key=False)
+
+        monkeypatch.setattr(ps, "update_provider", fake_update)
+        response = await admin_client.patch(f"{_PROVIDERS_URL}/1", json={"billing_admin_key": ""})
+
+        assert response.status_code == 200
+        assert captured == {"provider_id": 1, "patch": {"billing_admin_key": ""}}
+        assert response.json()["has_billing_admin_key"] is False
+
     async def test_create_configures_environment_credential_reference(self, admin_client, monkeypatch):
         captured = {}
 

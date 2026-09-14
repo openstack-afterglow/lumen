@@ -43,6 +43,8 @@ class LlmProvider(Base):
     api_base: Mapped[str | None] = mapped_column(VARCHAR(255))
     # AES-256-GCM(lumen_encryption_key, 도메인 llm_provider_key) 암호화 상태로 저장
     encrypted_api_key: Mapped[str | None] = mapped_column(TEXT)
+    # Organization billing credentials use a separate HKDF domain and never enter inference execution.
+    encrypted_billing_admin_key: Mapped[str | None] = mapped_column(TEXT)
     # Optional environment variable name used only when no database key exists.
     api_key_env: Mapped[str | None] = mapped_column(VARCHAR(128))
     # Subscription credentials are encrypted separately from API keys so execution cannot fall back across auth modes.

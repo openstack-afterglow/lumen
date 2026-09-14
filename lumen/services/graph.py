@@ -223,18 +223,20 @@ def _extract_citations(chunk, delta, acc: dict[str, dict]) -> None:
             **(ranges or {}),
         }
         existing = acc.get(url)
-        if existing is None or replace:
+        if existing is None:
             acc[url] = record
             return
         # Providers split one source across events (Anthropic sends the result
         # block first and the cited text later), so fill gaps without clobbering.
         for key, value in record.items():
-            if value is not None and existing.get(key) is None:
+            if value is not None and (replace or existing.get(key) is None):
                 existing[key] = value
 
-    # search_results — rich web sources take precedence over bare URL citations.
-    for item in _get(chunk, "search_results") or []:
-        add_web_citation(_get(item, "url"), _get(item, "title"), _get(item, "snippet"), replace=True)
+    # LiteLLM may preserve raw Sonar/Agent results at the response or delta level.
+    provider_fields = _get(delta, "provider_specific_fields") or {}
+    for carrier in (chunk, _get(chunk, "provider_specific_fields"), provider_fields):
+        for item in _get(carrier, "search_results") or []:
+            add_web_citation(_get(item, "url"), _get(item, "title"), _get(item, "snippet"), replace=True)
 
     # Bare URL citations, emitted by several OpenAI-compatible providers.
     for citation in _get(chunk, "citations") or []:
@@ -277,7 +279,6 @@ def _extract_citations(chunk, delta, acc: dict[str, dict]) -> None:
             return
         add_document_citation(citation)
 
-    provider_fields = _get(delta, "provider_specific_fields") or {}
     provider_citation = _get(provider_fields, "citation")
     if provider_citation is not None:
         add_provider_citation(provider_citation)
@@ -1025,8 +1026,10 @@ def _build_graph(params: dict, ctx: ToolContext):
             tool_call_id = call_id_for(tool_call)
             try:
                 arguments = json.loads(tool_call.get("args") or "{}")
+                argument_error = not isinstance(arguments, dict)
             except (json.JSONDecodeError, TypeError):
                 arguments = {}
+                argument_error = True
             source, category = await tool_activity_metadata(tool_call["name"])
             replay_payload = await boundary(
                 "tool_started",
@@ -1056,6 +1059,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                 "arguments": arguments,
                 "source": source,
                 "category": category,
+                "argument_error": argument_error,
                 "replay_payload": replay_payload,
             }
 
@@ -1082,6 +1086,18 @@ def _build_graph(params: dict, ctx: ToolContext):
                     if isinstance(replay_payload.get("error_code"), str)
                     else None,
                     "replayed": True,
+                }
+            if prepared["argument_error"]:
+                return {
+                    "result": "Tool arguments do not match the required schema.",
+                    "visible": True,
+                    "execution_usage": [],
+                    "warning_code": "invalid_tool_arguments",
+                    "display": [],
+                    "artifacts": [],
+                    "result_status": "failed",
+                    "error_code": "invalid_tool_arguments",
+                    "replayed": False,
                 }
             tool_call = prepared["tool_call"]
             try:
@@ -1126,7 +1142,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                     "warning_code": execution_result.warning_code,
                     "display": [],
                     "artifacts": [],
-                    "result_status": "completed",
+                    "result_status": execution_result.status,
                     "error_code": execution_result.warning_code,
                     "replayed": False,
                 }
@@ -1175,7 +1191,10 @@ def _build_graph(params: dict, ctx: ToolContext):
                     },
                 )
             if warning_code:
-                writer({"type": "warning", "code": warning_code, "safe_message": "Advisor request failed."})
+                safe_message = (
+                    "Advisor request failed." if warning_code == "advisor_call_failed" else "Tool call failed."
+                )
+                writer({"type": "warning", "code": warning_code, "safe_message": safe_message})
             tool_result_event = {
                 "type": "tool_result",
                 "tool_call_id": prepared["tool_call_id"],

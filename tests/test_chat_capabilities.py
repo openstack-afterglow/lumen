@@ -43,6 +43,59 @@ def _detected_native_search_capabilities(*, available: bool, required: bool = Fa
     }
 
 
+def test_perplexity_catalog_context_limit_uses_canonical_agent_identifier(monkeypatch):
+    import litellm
+
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {"perplexity/sonar": {"max_input_tokens": 128_000}},
+    )
+    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
+
+    capabilities = litellm_capabilities("perplexity/perplexity/sonar", "perplexity")
+
+    assert capabilities["context_limit"] == 128_000
+
+
+def test_unknown_perplexity_catalog_context_limit_remains_unknown(monkeypatch):
+    import litellm
+
+    monkeypatch.setattr(litellm, "model_cost", {})
+    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
+
+    capabilities = litellm_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
+
+    assert capabilities["context_limit"] is None
+
+
+def test_admin_override_without_a_window_keeps_the_exact_catalog_limit(monkeypatch):
+    """CapabilitiesInput always serializes context_limit, so null must not erase detection."""
+    import litellm
+
+    monkeypatch.setattr(litellm, "model_cost", {"perplexity/sonar": {"max_input_tokens": 128_000}})
+    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
+    detected = litellm_capabilities("perplexity/perplexity/sonar", "perplexity")
+
+    stored_flag_only = normalize_capabilities({"tool_call": False, "context_limit": None}, detected)
+    assert stored_flag_only["context_limit"] == 128_000
+    assert stored_flag_only["function_calling"] is False
+
+    assert normalize_capabilities({"context_limit": 0}, detected)["context_limit"] == 128_000
+    assert normalize_capabilities({"context_limit": "200000"}, detected)["context_limit"] == 128_000
+    assert normalize_capabilities({"context_limit": 64_000}, detected)["context_limit"] == 64_000
+
+
+def test_admin_override_cannot_invent_a_window_for_an_uncatalogued_model(monkeypatch):
+    import litellm
+
+    monkeypatch.setattr(litellm, "model_cost", {})
+    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
+    detected = litellm_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
+
+    assert normalize_capabilities({"tool_call": True, "context_limit": None}, detected)["context_limit"] is None
+
+
 def test_feature_gate_pricing_is_derived_from_model_prices_and_components():
     caps = _pricing_aware_capabilities(
         _model(

@@ -88,18 +88,22 @@ async def context_execute_result(name: str, args: dict, ctx: ToolContext) -> con
                 return contracts.ToolExecutionResult(
                     "Tool arguments do not match the required schema.",
                     warning_code="invalid_tool_arguments",
+                    status="failed",
                 )
             try:
                 result = await binding.execute(safe_args, ctx)
             except Exception:
                 logger.warning("catalog-loaded tool execution failed name=%s", name, exc_info=True)
-                return contracts.ToolExecutionResult("Tool execution failed.", warning_code="tool_execution_failed")
+                return contracts.ToolExecutionResult(
+                    "Tool execution failed.", warning_code="tool_execution_failed", status="failed"
+                )
             components = result.usage_components.get("components", [])
             return contracts.ToolExecutionResult(
                 result.model_content,
                 visible=bool(result.display or result.artifacts),
                 usage=tuple(components) if isinstance(components, list) else (),
                 warning_code=result.error_code,
+                status=result.status,
             )
     if name == managed._MANAGED_SEARCH_TOOL:
         return contracts._visible_result(await managed._execute_managed_search(args, ctx))
@@ -110,7 +114,16 @@ async def context_execute_result(name: str, args: dict, ctx: ToolContext) -> con
     if name.startswith(selection._MCP_PREFIX):
         return contracts._visible_result(await _execute_mcp_tool(name, args, ctx))
     if name in tools._TOOL_BY_NAME:
-        return contracts._visible_result(await tools.execute_tool(name, args, ctx))
+        tool = tools._TOOL_BY_NAME[name]
+        try:
+            safe_args = validate_tool_arguments({**tool.parameters, "additionalProperties": False}, args)
+        except ValueError:
+            return contracts.ToolExecutionResult(
+                "Tool arguments do not match the required schema.",
+                warning_code="invalid_tool_arguments",
+                status="failed",
+            )
+        return contracts._visible_result(await tools.execute_tool(name, safe_args, ctx))
     customs = {tool["name"]: tool for tool in await selection._load_custom(ctx)}
     if name in customs:
         return contracts._visible_result(await _execute_custom_http_tool(customs[name], args, ctx))

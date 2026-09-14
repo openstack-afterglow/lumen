@@ -29,6 +29,9 @@ _KIND = "title_generate"
 _LEASE_SECONDS = 120
 _EXPECTED_REVISION = 1
 
+_RECOVERY_INTERVAL = timedelta(minutes=1)
+_next_recovery_at = datetime.min.replace(tzinfo=UTC)
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -116,7 +119,7 @@ async def _requeue_stored_result(job_id: str, *, owner: str) -> None:
         row.lease_expires_at = None
 
 
-async def enqueue_completed_run_in_transaction(session, run: ChatRun) -> None:
+async def enqueue_completed_run_in_transaction(session, run: ChatRun) -> bool:
     """Reserve the one first-title revision after a successful root completion.
 
     The caller already owns the completion transaction.  All source text is
@@ -131,13 +134,19 @@ async def enqueue_completed_run_in_transaction(session, run: ChatRun) -> None:
         or run.user_message_id is None
         or run.assistant_message_id is None
     ):
-        return
+        return False
     route = _summary_route(run)
     if route is None:
-        return
+        return False
     conversation = await _get_for_update(session, ChatConversation, run.conversation_id)
-    if conversation is None or conversation.title_source != "auto" or int(conversation.title_revision or 0) != 0:
-        return
+    if (
+        conversation is None
+        or conversation.title_source != "auto"
+        or conversation.title is not None
+        or conversation.title_status != "idle"
+        or int(conversation.title_revision or 0) != 0
+    ):
+        return False
     # Locking the parent conversation before the job gives duplicate finishers
     # a single CAS winner; the unique key is retained as a second fence.
     existing = (
@@ -146,7 +155,7 @@ async def enqueue_completed_run_in_transaction(session, run: ChatRun) -> None:
         )
     ).scalar_one_or_none()
     if existing is not None:
-        return
+        return False
     user_message = await session.get(ChatMessage, run.user_message_id)
     assistant_message = await session.get(ChatMessage, run.assistant_message_id)
     if (
@@ -159,11 +168,11 @@ async def enqueue_completed_run_in_transaction(session, run: ChatRun) -> None:
         or user_message.status not in {"complete", "completed"}
         or assistant_message.status not in {"complete", "completed"}
     ):
-        return
+        return False
     user_content = decrypt_chat_content(user_message.content or "")
     assistant_content = decrypt_chat_content(assistant_message.content or "")
     if not user_content.strip() or not assistant_content.strip():
-        return
+        return False
     payload = {
         "conversation_id": run.conversation_id,
         "project_id": run.project_id,
@@ -177,6 +186,7 @@ async def enqueue_completed_run_in_transaction(session, run: ChatRun) -> None:
         "summary_route": route,
         "pricing_snapshot": _summary_prices(run),
     }
+    conversation.title_source = "auto"
     conversation.title_revision = _EXPECTED_REVISION
     conversation.title_status = "pending"
     session.add(
@@ -191,6 +201,60 @@ async def enqueue_completed_run_in_transaction(session, run: ChatRun) -> None:
             idempotency_key=f"title:first:{run.conversation_id}",
         )
     )
+    return True
+
+
+async def _recover_one() -> bool:
+    """Recover a never-reserved first exchange without scanning empty conversations."""
+    from lumen.db import get_session_factory
+
+    factory = get_session_factory()
+    if factory is None:
+        return False
+    completed_root = (
+        ChatRun.status == "completed",
+        ChatRun.run_kind == "completion",
+        ChatRun.run_scope == "persistent",
+        ChatRun.parent_run_id.is_(None),
+        ChatRun.user_message_id.is_not(None),
+        ChatRun.assistant_message_id.is_not(None),
+    )
+    async with factory() as session, session.begin():
+        conversation = (
+            await session.execute(
+                select(ChatConversation)
+                .where(
+                    ChatConversation.title_source == "auto",
+                    ChatConversation.title.is_(None),
+                    ChatConversation.title_status == "idle",
+                    ChatConversation.title_revision == 0,
+                    ChatConversation.lifecycle_status == "active",
+                    ChatConversation.deleted_at.is_(None),
+                    select(ChatRun.id).where(ChatRun.conversation_id == ChatConversation.id, *completed_root).exists(),
+                    ~select(ChatJob.id)
+                    .where(ChatJob.kind == _KIND, ChatJob.conversation_id == ChatConversation.id)
+                    .exists(),
+                )
+                .order_by(ChatConversation.created_at)
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalar_one_or_none()
+        if conversation is None:
+            return False
+        run = (
+            await session.execute(
+                select(ChatRun)
+                .where(ChatRun.conversation_id == conversation.id, *completed_root)
+                .order_by(ChatRun.created_at)
+                .limit(1)
+            )
+        ).scalar_one()
+        if not await enqueue_completed_run_in_transaction(session, run):
+            # Missing route/source text is not a paid retry and must not block
+            # every later eligible conversation on subsequent recovery scans.
+            conversation.title_status = "unavailable"
+        return True
 
 
 async def _claim_one(*, owner: str) -> dict[str, Any] | None:
@@ -430,10 +494,16 @@ def _decimal_or_none(value: object) -> Decimal | None:
 
 
 async def process_one(*, owner: str) -> bool:
-    """Claim and process at most one title job without blocking completions."""
+    """Claim one title job, then periodically recover one never-reserved first exchange."""
+    global _next_recovery_at
+
     claimed = await _claim_one(owner=owner)
     if claimed is None:
-        return False
+        now = _now()
+        if now < _next_recovery_at:
+            return False
+        _next_recovery_at = now + _RECOVERY_INTERVAL
+        return await _recover_one()
     if claimed.get("terminal"):
         return True
     job_id = claimed["job_id"]

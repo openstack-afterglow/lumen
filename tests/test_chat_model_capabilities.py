@@ -27,6 +27,18 @@ class TestEffectiveCapabilities:
         assert eff["function_calling"] is True
         assert eff["feature_gates"]["image_input"]["available"] is True
 
+    def test_manual_context_limit_override_wins_catalog_detection(self):
+        row = _Row(
+            model_name="perplexity/perplexity/sonar",
+            capabilities={"context_limit": 64_000},
+            capability_source="override",
+        )
+
+        capabilities, source = ps._effective_capabilities(row, "perplexity")
+
+        assert source == "override"
+        assert capabilities["context_limit"] == 64_000
+
     def test_models_dev_source_preserved(self):
         caps = {"vision": True}
         row = _Row(capabilities=caps, capability_source="models_dev")

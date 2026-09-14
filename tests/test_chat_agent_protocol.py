@@ -12,7 +12,7 @@ from lumen.services.agent_protocol import (
 from lumen.services.agent_runtime_v2 import dispatch_tool_call
 from lumen.services.tool_runtime import bindings as tool_runtime
 from lumen.services.tool_runtime import dispatch
-from lumen.services.tool_runtime.contracts import v2_builtin_tool_bindings
+from lumen.services.tool_runtime.contracts import ToolBindingSession, v2_builtin_tool_bindings
 from lumen.services.tools import ToolContext
 
 
@@ -112,6 +112,64 @@ async def test_v2_dispatch_validates_before_executing_binding():
 
     assert invalid.status == "failed"
     assert invalid.error_code == "invalid_tool_arguments"
+    assert called is False
+
+
+async def test_legacy_dispatch_preserves_invalid_argument_failure(monkeypatch):
+    called = False
+
+    async def execute(_arguments, _context):
+        nonlocal called
+        called = True
+        return ToolExecutionResult(status="completed", model_content="unexpected")
+
+    binding = ToolBinding(
+        definition=ToolDefinition(
+            name="required_tools",
+            description="Load required tool schemas.",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string", "minLength": 1}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            effect="read",
+            source="builtin",
+        ),
+        execute=execute,
+    )
+
+    async def dynamic_bindings(_context):
+        return {"required_tools": binding}
+
+    monkeypatch.setattr(tool_runtime, "_legacy_dynamic_bindings", dynamic_bindings)
+    result = await dispatch.context_execute_result(
+        "required_tools",
+        {},
+        ToolContext(project_id="project", user_id="user", binding_session=ToolBindingSession()),
+    )
+
+    assert result.status == "failed"
+    assert result.warning_code == "invalid_tool_arguments"
+    assert called is False
+
+async def test_legacy_builtin_rejects_invalid_arguments_before_handler(monkeypatch):
+    called = False
+
+    async def execute_tool(*_args):
+        nonlocal called
+        called = True
+        return "unexpected"
+
+    monkeypatch.setattr(dispatch.tools, "execute_tool", execute_tool)
+    result = await dispatch.context_execute_result(
+        "list_my_conversations",
+        {"untrusted": True},
+        ToolContext(project_id="project", user_id="user"),
+    )
+
+    assert result.status == "failed"
+    assert result.warning_code == "invalid_tool_arguments"
     assert called is False
 
 

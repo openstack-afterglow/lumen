@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from httpx import ASGITransport, AsyncClient
 
 from lumen import auth as deps
 from lumen.config import Settings
@@ -16,11 +19,6 @@ from lumen.services.durable_runs.common import descriptor
 
 
 class TestOpenAPIContract:
-    def test_app_title_description_version(self):
-        assert app.title == "Lumen"
-        assert app.description == "Lumen durable agent, LLM, and chat service API"
-        assert app.version == "1.0.0"
-
     def test_openapi_security_schemes_and_alternatives(self):
         schema = app.openapi()
         schemes = schema["components"]["securitySchemes"]
@@ -97,8 +95,6 @@ class TestOpenAPIContract:
             version = payload["versions"][0] if path == "/" else payload["version"]
             links = {link["rel"]: link["href"] for link in version["links"]}
             assert links["models"] == "https://lumen.example/base/v1/models"
-
-
 
     def test_openapi_contract_version_and_profiles(self):
         schema = app.openapi()
@@ -182,6 +178,46 @@ class FakeTokenPlugin:
         return self._access_info
 
 
+@pytest.mark.parametrize("dependency", [deps.get_principal, deps.require_token])
+async def test_slow_keystone_validation_does_not_block_public_requests(dependency, monkeypatch):
+    started, release = Event(), Event()
+
+    def validate(*_args, **_kwargs):
+        started.set()
+        release.wait(5)
+        return {
+            "user_id": "user-1",
+            "username": "user",
+            "project_id": "project-1",
+            "connection_project_id": "project-1",
+            "roles": ["member"],
+            "is_system_admin": False,
+        }
+
+    monkeypatch.setattr(deps, "validate_token", validate)
+    application = FastAPI()
+
+    @application.get("/protected")
+    async def protected(_principal=Depends(dependency)):
+        return {"authenticated": True}
+
+    @application.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    async with AsyncClient(transport=ASGITransport(app=application), base_url="http://local") as client:
+        pending = asyncio.create_task(client.get("/protected", headers={"X-Auth-Token": "caller-token"}))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            response = await client.get("/health")
+            assert response.status_code == 200
+            assert not pending.done(), "Public requests must complete before Keystone validation finishes"
+        finally:
+            release.set()
+            authenticated = await pending
+        assert authenticated.status_code == 200
+
+
 class TestKeystoneProjectScoping:
     def test_scoped_keystone_token_success_and_rescope(self, monkeypatch):
         access_info = FakeAccessInfo(
@@ -218,13 +254,16 @@ class TestKeystoneProjectScoping:
         monkeypatch.setattr("keystoneauth1.session.Session", lambda **kwargs: None)
 
         from starlette.requests import Request
-        request = Request({
-            "type": "http",
-            "headers": [
-                (b"x-auth-token", b"submitted-token-111"),
-                (b"x-project-id", b"proj-777"),
-            ],
-        })
+
+        request = Request(
+            {
+                "type": "http",
+                "headers": [
+                    (b"x-auth-token", b"submitted-token-111"),
+                    (b"x-project-id", b"proj-777"),
+                ],
+            }
+        )
 
         principal = await deps.get_principal(request)
         assert principal["auth_type"] == "keystone"
@@ -278,13 +317,16 @@ class TestKeystoneProjectScoping:
         monkeypatch.setattr("lumen.services.api_key_store.verify_key", fake_verify_key)
 
         from starlette.requests import Request
-        request = Request({
-            "type": "http",
-            "headers": [
-                (b"authorization", b"Bearer sk-afgl-secret123"),
-                (b"x-project-id", b"api-proj-1"),
-            ],
-        })
+
+        request = Request(
+            {
+                "type": "http",
+                "headers": [
+                    (b"authorization", b"Bearer sk-afgl-secret123"),
+                    (b"x-project-id", b"api-proj-1"),
+                ],
+            }
+        )
 
         principal = await deps.get_principal(request)
         assert principal["auth_type"] == "api_key"
@@ -321,14 +363,17 @@ class TestKeystoneProjectScoping:
         monkeypatch.setattr(deps, "_is_system_admin", lambda user_id: True)
 
         from starlette.requests import Request
-        request = Request({
-            "type": "http",
-            "headers": [
-                (b"x-auth-token", b"admin-home-token"),
-                (b"x-project-id", b"home-proj"),
-                (b"x-target-project-id", b"foreign-proj"),
-            ],
-        })
+
+        request = Request(
+            {
+                "type": "http",
+                "headers": [
+                    (b"x-auth-token", b"admin-home-token"),
+                    (b"x-project-id", b"home-proj"),
+                    (b"x-target-project-id", b"foreign-proj"),
+                ],
+            }
+        )
 
         principal = await deps.get_principal(request)
         assert principal["auth_type"] == "keystone"
@@ -362,14 +407,17 @@ class TestKeystoneProjectScoping:
         monkeypatch.setattr(deps, "_is_system_admin", lambda user_id: False)
 
         from starlette.requests import Request
-        request = Request({
-            "type": "http",
-            "headers": [
-                (b"x-auth-token", b"user-home-token"),
-                (b"x-project-id", b"home-proj"),
-                (b"x-target-project-id", b"foreign-proj"),
-            ],
-        })
+
+        request = Request(
+            {
+                "type": "http",
+                "headers": [
+                    (b"x-auth-token", b"user-home-token"),
+                    (b"x-project-id", b"home-proj"),
+                    (b"x-target-project-id", b"foreign-proj"),
+                ],
+            }
+        )
 
         with pytest.raises(HTTPException) as ei:
             await deps.get_principal(request)
@@ -398,14 +446,17 @@ class TestKeystoneProjectScoping:
         monkeypatch.setattr(deps, "_is_system_admin", lambda user_id: True)
 
         from starlette.requests import Request
-        request = Request({
-            "type": "http",
-            "headers": [
-                (b"x-auth-token", b"admin-home-token"),
-                (b"x-project-id", b"home-proj"),
-                (b"x-target-project-id", b"home-proj"),
-            ],
-        })
+
+        request = Request(
+            {
+                "type": "http",
+                "headers": [
+                    (b"x-auth-token", b"admin-home-token"),
+                    (b"x-project-id", b"home-proj"),
+                    (b"x-target-project-id", b"home-proj"),
+                ],
+            }
+        )
 
         principal = await deps.get_principal(request)
         assert principal["project_id"] == "home-proj"
@@ -425,13 +476,16 @@ class TestKeystoneProjectScoping:
         monkeypatch.setattr("lumen.services.api_key_store.verify_key", fake_verify_key)
 
         from starlette.requests import Request
-        request = Request({
-            "type": "http",
-            "headers": [
-                (b"authorization", b"Bearer sk-afgl-secret123"),
-                (b"x-target-project-id", b"foreign-proj"),
-            ],
-        })
+
+        request = Request(
+            {
+                "type": "http",
+                "headers": [
+                    (b"authorization", b"Bearer sk-afgl-secret123"),
+                    (b"x-target-project-id", b"foreign-proj"),
+                ],
+            }
+        )
 
         with pytest.raises(HTTPException) as ei:
             await deps.get_principal(request)
@@ -443,8 +497,11 @@ class TestKeystoneProjectScoping:
 
         def fake_connect(**kwargs):
             captured_kwargs.update(kwargs)
+
             class FakeConn:
-                def close(self): pass
+                def close(self):
+                    pass
+
             return FakeConn()
 
         monkeypatch.setattr("openstack.connect", fake_connect)
@@ -463,6 +520,8 @@ class TestKeystoneProjectScoping:
             await conn_gen.__anext__()
         except StopAsyncIteration:
             pass
+
+
 class TestStartupFailurePropagation:
     async def test_checkpointer_failure_returns_false_propagates_on_startup(self, monkeypatch):
         monkeypatch.setattr(

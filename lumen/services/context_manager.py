@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from lumen.models.chat_contracts import ContextState
+from lumen.services import context_inspector
 from lumen.services.litellm_client import ContextTokenCount, count_context_tokens
 
 _COMPACTION_RECOMMENDATION = 0.70
@@ -142,28 +143,60 @@ def context_state(
     revision: str,
     checkpoint_id: str | None = None,
     active_compaction_run_id: str | None = None,
+    plan: dict[str, Any] | None = None,
+    scope: str = "preview",
 ) -> ContextState:
     """Build the honest, non-provider-calling context status projection."""
-    budget = ContextBudget(context_limit, max(0, output_reserve))
+    valid_limit = (
+        context_limit
+        if isinstance(context_limit, int) and not isinstance(context_limit, bool) and context_limit > 0
+        else None
+    )
+    valid_reserve = (
+        output_reserve
+        if isinstance(output_reserve, int) and not isinstance(output_reserve, bool) and output_reserve >= 0
+        else None
+    )
+    budget = ContextBudget(valid_limit, valid_reserve if valid_reserve is not None else 0)
     count = count_context_tokens(model_name, messages, tool_schemas)
     input_budget = budget.input_budget
     _retained, older = _required_messages(messages)
-    if input_budget is None or input_budget <= 0 or count.tokens is None:
+    unavailable_reason = (
+        "context_window_unknown"
+        if context_limit is None
+        else "invalid_budget"
+        if valid_limit is None or valid_reserve is None or input_budget is None or input_budget <= 0
+        else "token_count_unavailable"
+        if count.tokens is None
+        else None
+    )
+    if unavailable_reason is not None:
         return ContextState(
             model_name=model_name,
-            context_limit=context_limit,
+            context_limit=valid_limit,
             output_reserve=budget.output_reserve,
             safety_reserve=budget.safety_reserve,
-            input_budget=input_budget,
+            input_budget=input_budget if input_budget is not None and input_budget > 0 else None,
             input_tokens=count.tokens,
             utilization=None,
-            measurement=count.measurement if input_budget is not None else "unknown",
+            measurement=count.measurement,
             recommendation="unavailable",
             can_compact=False,
-            reason_code="context_budget_unavailable",
+            reason_code=unavailable_reason,
             revision=revision,
             checkpoint_id=checkpoint_id,
             active_compaction_run_id=active_compaction_run_id,
+            # An unknown window or an uncountable modality still leaves the
+            # composition inspectable; only the token values are withheld.
+            breakdown=context_inspector.breakdown(
+                messages,
+                tool_schemas,
+                model_name=model_name,
+                plan=plan,
+                scope=scope,
+                input_tokens=count.tokens,
+                measurement=count.measurement,
+            ),
         )
     utilization = count.tokens / input_budget
     recommendation = (
@@ -173,10 +206,10 @@ def context_state(
         if utilization >= _COMPACTION_RECOMMENDATION
         else "none"
     )
-    reason = "context_limit_exceeded" if count.tokens > input_budget and not older else None
+    reason = "context_limit_exceeded" if count.tokens > input_budget and not older else count.reason_code
     return ContextState(
         model_name=model_name,
-        context_limit=context_limit,
+        context_limit=valid_limit,
         output_reserve=budget.output_reserve,
         safety_reserve=budget.safety_reserve,
         input_budget=input_budget,
@@ -189,6 +222,15 @@ def context_state(
         revision=revision,
         checkpoint_id=checkpoint_id,
         active_compaction_run_id=active_compaction_run_id,
+        breakdown=context_inspector.breakdown(
+            messages,
+            tool_schemas,
+            model_name=model_name,
+            plan=plan,
+            scope=scope,
+            input_tokens=count.tokens,
+            measurement=count.measurement,
+        ),
     )
 
 
@@ -327,7 +369,8 @@ def _split_summary_text(
 def _candidate_messages(retained: list[dict[str, Any]], summary: str) -> list[dict[str, Any]]:
     instructions = [m for m in retained if m.get("role") in {"system", "developer"}]
     body = [m for m in retained if m.get("role") not in {"system", "developer"}]
-    return [*instructions, {"role": "user", "content": f"[context summary-data]\n{summary}"}, *body]
+    summary_content = f"{context_inspector.SUMMARY_SENTINEL}\n{summary}"
+    return [*instructions, {"role": "user", "content": summary_content}, *body]
 
 
 def _title_context(retained: list[dict[str, Any]], run_context: dict[str, Any]) -> dict[str, Any]:
@@ -359,16 +402,25 @@ async def prepare_model_messages(
 ) -> PreparedContext:
     """Prepare provider messages, failing closed whenever a known budget is unsafe."""
     budget = ContextBudget(context_limit, effective_max_output_tokens)
-    if context_limit <= 0 or effective_max_output_tokens < 0 or budget.input_budget is None or budget.input_budget <= 0:
-        raise ContextLimitExceeded("context input budget is nonpositive")
+    if (
+        not isinstance(context_limit, int)
+        or isinstance(context_limit, bool)
+        or context_limit <= 0
+        or not isinstance(effective_max_output_tokens, int)
+        or isinstance(effective_max_output_tokens, bool)
+        or effective_max_output_tokens < 0
+        or budget.input_budget is None
+        or budget.input_budget <= 0
+    ):
+        raise ContextLimitExceeded("context input budget is nonpositive", code="invalid_budget")
     before_tokens, measurement = _count_result(messages, tool_schemas, token_counter)
     if before_tokens is None:
-        raise ContextLimitExceeded("context_budget_unavailable", code="context_budget_unavailable")
+        raise ContextLimitExceeded("token_count_unavailable", code="token_count_unavailable")
 
     retained, older = _required_messages(messages)
     required_tokens, _ = _count_result(retained, tool_schemas, token_counter)
     if required_tokens is None:
-        raise ContextLimitExceeded("context_budget_unavailable", code="context_budget_unavailable")
+        raise ContextLimitExceeded("token_count_unavailable", code="token_count_unavailable")
     if required_tokens > budget.input_budget:
         raise ContextLimitExceeded("context_limit_exceeded")
     force = bool(run_context.get("force_compaction"))
@@ -389,21 +441,21 @@ async def prepare_model_messages(
     summary_limit_value = run_context.get("summary_context_limit", context_limit)
     try:
         summary_limit = int(summary_limit_value)
-    except (TypeError, ValueError):
-        raise ContextLimitExceeded("context_budget_unavailable", code="context_budget_unavailable") from None
+    except (TypeError, ValueError, OverflowError):
+        raise ContextLimitExceeded("context_request_invalid", code="context_request_invalid") from None
+    if isinstance(summary_limit_value, bool) or summary_limit <= 0:
+        raise ContextLimitExceeded("context_request_invalid", code="context_request_invalid")
     configured_summary_output = run_context.get("summary_output_reserve")
+    summary_output_value = (
+        configured_summary_output if configured_summary_output is not None else effective_max_output_tokens
+    )
     try:
-        summary_output = min(
-            _MAX_SUMMARY_OUTPUT,
-            max(
-                1,
-                int(
-                    configured_summary_output if configured_summary_output is not None else effective_max_output_tokens
-                ),
-            ),
-        )
-    except (TypeError, ValueError):
-        raise ContextLimitExceeded("context_budget_unavailable", code="context_budget_unavailable") from None
+        summary_output = int(summary_output_value)
+    except (TypeError, ValueError, OverflowError):
+        raise ContextLimitExceeded("context_request_invalid", code="context_request_invalid") from None
+    if isinstance(summary_output_value, bool) or summary_output <= 0:
+        raise ContextLimitExceeded("context_request_invalid", code="context_request_invalid")
+    summary_output = min(_MAX_SUMMARY_OUTPUT, summary_output)
     system_prompt = str(run_context.get("summary_system_prompt") or _SUMMARY_SYSTEM)
     summary_counter = _summary_counter(run_context, token_counter)
     chunks = _chunk_messages(

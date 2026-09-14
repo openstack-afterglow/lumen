@@ -693,6 +693,89 @@ class UsageComponent(_StrictModel):
         return _validate_decimal_string(value, allow_negative=kind == "provider_adjustment")
 
 
+_CONTEXT_COMPONENT_IDS = (
+    "messages",
+    "system_prompt",
+    "workspace",
+    "memory",
+    "skills",
+    "agent",
+    "summary",
+    "attachments",
+    "tools",
+    "mcp_tools",
+    "deferred_tools",
+    "overhead",
+)
+MAX_CONTEXT_COMPONENTS = 64
+MAX_CONTEXT_COMPONENT_ITEMS = 128
+MAX_CONTEXT_ITEM_CHARS = 512
+
+
+class ContextComponent(_StrictModel):
+    """One inspectable slice of the prepared context.
+
+    ``included`` means the component's tokens are part of ``ContextState.input_tokens``.
+    ``tokens``/``count`` stay ``None`` whenever the value is genuinely unknown; they are
+    never zero-filled, and ``items`` carries only bounded names or identifiers.
+    """
+
+    id: Literal[
+        "messages",
+        "system_prompt",
+        "workspace",
+        "memory",
+        "skills",
+        "agent",
+        "summary",
+        "attachments",
+        "tools",
+        "mcp_tools",
+        "deferred_tools",
+        "overhead",
+    ]
+    tokens: int | None = Field(ge=0)
+    measurement: Literal["tokenizer", "estimated", "unknown"]
+    count: int | None = Field(ge=0)
+    included: bool
+    items: list[str] = Field(default_factory=list, max_length=MAX_CONTEXT_COMPONENT_ITEMS)
+
+    @field_validator("items")
+    @classmethod
+    def validate_items(cls, value: list[str]) -> list[str]:
+        if any(len(item) > MAX_CONTEXT_ITEM_CHARS for item in value):
+            raise ValueError("context component items must be bounded names")
+        return value
+
+
+class ContextBreakdown(_StrictModel):
+    """Honest composition of one prepared context.
+
+    ``complete`` is false whenever request material could not be measured, so a client
+    must not present exact free capacity from the component sum alone.
+    """
+
+    scope: Literal["preview", "request"]
+    complete: bool
+    components: list[ContextComponent] = Field(max_length=MAX_CONTEXT_COMPONENTS)
+    uncounted: list[str] = Field(default_factory=list, max_length=MAX_CONTEXT_COMPONENT_ITEMS)
+
+    @field_validator("components")
+    @classmethod
+    def validate_unique_components(cls, value: list[ContextComponent]) -> list[ContextComponent]:
+        identifiers = [component.id for component in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("context components must be unique by id")
+        return value
+
+    @field_validator("uncounted")
+    @classmethod
+    def validate_uncounted(cls, value: list[str]) -> list[str]:
+        if any(item not in _CONTEXT_COMPONENT_IDS for item in value):
+            raise ValueError("uncounted entries must be component ids")
+        return value
+
+
 class ContextState(_StrictModel):
     model_name: str = Field(min_length=1, max_length=190)
     context_limit: int | None = Field(ge=1)
@@ -708,6 +791,8 @@ class ContextState(_StrictModel):
     revision: str = Field(min_length=1, max_length=190)
     checkpoint_id: str | None = Field(max_length=36)
     active_compaction_run_id: str | None = Field(max_length=36)
+    # Optional so durable journal entries written before context inspection stay readable.
+    breakdown: ContextBreakdown | None = None
 
     @field_validator("utilization")
     @classmethod

@@ -11,7 +11,7 @@ from lumen.models.chat_agent_platform import ChatCodeWorkspace, ChatCommand, Cha
 from lumen.models.chat_contracts import validate_chat_run_event
 from lumen.models.chat_db import ChatUsageLog
 from lumen.models.chat_runs import ChatRun, ChatToolApproval
-from lumen.services import context_manager, execution_protocol, run_store
+from lumen.services import context_inspector, context_manager, execution_protocol, run_store
 from lumen.services.durable_runs import common, execution, interactions, lifecycle, queries
 from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.durable_runs.common import _fingerprint
@@ -729,6 +729,96 @@ async def test_parentless_virtual_run_skips_automatic_compaction(monkeypatch):
     )
 
     assert result is messages
+
+
+async def test_runtime_context_event_carries_a_request_scope_breakdown(monkeypatch):
+    """A live run reports the composition of the exact provider request, not the preview."""
+    run = SimpleNamespace(
+        conversation_id="conversation-1",
+        temp_thread_id=None,
+        model_name="gpt-4o-mini",
+        capability_snapshot={
+            "context_limit": 8_000,
+            "summary_route": {"model_name": "gpt-4o-mini", "context_limit": 8_000},
+        },
+    )
+
+    class _Result:
+        def scalar_one(self):
+            return run
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, *_args):
+            return _Result()
+
+    plan = context_inspector.build_plan(
+        instructions=[context_inspector.instruction_plan_entry("workspace", slots=1, count=1, items=["workspace:7"])],
+        summary_checkpoint_id=None,
+        message_count=1,
+        attachments=[],
+        deferred_tools=[
+            context_inspector.tool_plan_entry("catalog_only_tool", "custom__2__catalog_only_tool_abc123abc123"),
+            context_inspector.tool_plan_entry("mcp:GitHub", "mcp__5__"),
+        ],
+        undiscovered_mcp=[context_inspector.tool_plan_entry("mcp:GitHub", "mcp__5__")],
+    )
+    appended: list[tuple[str, dict]] = []
+
+    async def append(_run_id, event_type, payload, **_kwargs):
+        appended.append((event_type, payload))
+
+    async def failing_compaction(*_args, **_kwargs):
+        raise context_manager.ContextLimitExceeded("context_limit_exceeded")
+
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: _Session())
+    monkeypatch.setattr(
+        execution,
+        "_payload",
+        lambda _run: {
+            "max_tokens": 512,
+            "context_plan": plan,
+            "context_source": {"revision": "rev-9"},
+        },
+    )
+    monkeypatch.setattr(execution, "_append", append)
+    monkeypatch.setattr(execution.context_manager, "prepare_model_messages", failing_compaction)
+
+    hooks = execution._DurableExecutionHooks(run_id="run-1", owner="worker-1")
+    hooks.force_compaction = True
+    tool_schemas = [
+        {"type": "function", "function": {"name": "builtin_tool", "description": "d", "parameters": {}}},
+        {"type": "function", "function": {"name": "mcp__5__issues", "description": "d", "parameters": {}}},
+    ]
+    with pytest.raises(context_manager.ContextLimitExceeded):
+        await hooks.prepare_context(
+            messages=[
+                {"role": "system", "content": "workspace rules"},
+                {"role": "user", "content": "a live question"},
+            ],
+            tool_schemas=tool_schemas,
+            round_index=0,
+        )
+
+    events = {event_type: payload for event_type, payload in appended}
+    state = events["context.updated"]["state"]
+    breakdown = state["breakdown"]
+    components = {component["id"]: component for component in breakdown["components"]}
+
+    assert breakdown["scope"] == "request"
+    assert state["revision"] == "rev-9"
+    assert sum(c["tokens"] for c in breakdown["components"] if c["included"]) == state["input_tokens"]
+    assert components["workspace"]["items"] == ["workspace:7"]
+    # Discovered MCP schemas are measured at request time instead of staying unknown.
+    assert components["mcp_tools"]["included"] is True
+    assert components["mcp_tools"]["items"] == ["mcp__5__issues"]
+    assert components["deferred_tools"]["items"] == ["catalog_only_tool"]
+    assert breakdown["complete"] is True
 
 
 async def test_automatic_compaction_warns_when_summary_budget_is_unavailable(monkeypatch):

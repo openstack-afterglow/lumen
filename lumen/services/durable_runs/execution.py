@@ -598,6 +598,7 @@ class _DurableExecutionHooks:
         output_reserve: int,
         revision: str,
         cause: str,
+        plan: dict[str, Any] | None = None,
     ) -> None:
         """Atomically apply checkpoint, title, and the public context event."""
         if not prepared.compacted or not prepared.summary:
@@ -675,6 +676,8 @@ class _DurableExecutionHooks:
                 output_reserve=output_reserve,
                 revision=revision,
                 checkpoint_id=str(checkpoint.id),
+                plan={**plan, "summary_checkpoint_id": str(checkpoint.id)} if plan else None,
+                scope="request",
             )
             await append_event(
                 session,
@@ -717,6 +720,7 @@ class _DurableExecutionHooks:
             output_reserve = int(payload.get("max_tokens") or 4096)
             source = payload.get("context_source") if isinstance(payload.get("context_source"), dict) else {}
             revision = str(source.get("revision") or f"run:{self.run_id}")
+            plan = payload.get("context_plan") if isinstance(payload.get("context_plan"), dict) else None
             state = context_manager.context_state(
                 messages,
                 tool_schemas,
@@ -724,6 +728,8 @@ class _DurableExecutionHooks:
                 context_limit=context_limit,
                 output_reserve=output_reserve,
                 revision=revision,
+                plan=plan,
+                scope="request",
             )
         if state.measurement == "unknown" or state.input_budget is None:
             await _append(
@@ -929,6 +935,7 @@ class _DurableExecutionHooks:
             output_reserve=output_reserve,
             revision=revision,
             cause="manual" if self.force_compaction else "automatic",
+            plan=plan,
         )
         return prepared.messages
 

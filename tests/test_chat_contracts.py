@@ -528,3 +528,68 @@ def test_context_updated_event_is_typed_and_unknown_events_remain_rejected():
                 "payload": {},
             }
         )
+
+
+def test_context_updated_event_round_trips_an_optional_breakdown():
+    """Old journal entries omit breakdown; new ones replay with it."""
+    state = {
+        "model_name": "model",
+        "context_limit": 16_000,
+        "output_reserve": 1_024,
+        "safety_reserve": 2_048,
+        "input_budget": 12_928,
+        "input_tokens": 120,
+        "utilization": 0.01,
+        "measurement": "estimated",
+        "recommendation": "none",
+        "can_compact": False,
+        "reason_code": None,
+        "revision": "rev-1",
+        "checkpoint_id": None,
+        "active_compaction_run_id": None,
+        "breakdown": {
+            "scope": "request",
+            "complete": False,
+            "components": [
+                {
+                    "id": "messages",
+                    "tokens": 120,
+                    "measurement": "estimated",
+                    "count": 4,
+                    "included": True,
+                    "items": [],
+                },
+                {
+                    "id": "mcp_tools",
+                    "tokens": None,
+                    "measurement": "unknown",
+                    "count": None,
+                    "included": False,
+                    "items": ["mcp:GitHub"],
+                },
+            ],
+            "uncounted": ["mcp_tools"],
+        },
+    }
+    event = validate_chat_run_event(
+        {
+            "event_id": "run-1:3",
+            "run_id": "run-1",
+            "seq": 3,
+            "type": "context.updated",
+            "created_at": datetime.now(UTC).isoformat(),
+            "payload": {
+                "state": state,
+                "phase": "compacted",
+                "cause": "manual",
+                "before_tokens": 900,
+                "after_tokens": 120,
+            },
+        }
+    )
+
+    breakdown = event.payload.state.breakdown
+    assert breakdown.scope == "request"
+    assert breakdown.complete is False
+    assert [component.id for component in breakdown.components] == ["messages", "mcp_tools"]
+    assert breakdown.components[1].count is None

@@ -11,6 +11,7 @@ import json
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 
 from lumen.models.chat_contracts import validate_chat_run_event
 from lumen.services import graph, litellm_client
@@ -244,6 +245,27 @@ class TestGraphStream:
         types = [e["type"] for e in events]
         assert types.index("citations") < types.index("usage")
 
+    async def test_native_search_configuration_is_not_source_evidence(self, monkeypatch):
+        """A capability flag never creates durable citations without provider metadata."""
+
+        async def fake_stream(**_kwargs):
+            return _aiter([_ChunkTC(_DeltaTC(content="No provider sources."))])
+
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        events = [
+            event
+            async for event in graph.stream(
+                model="perplexity/sonar",
+                messages=_MSGS,
+                project_id="p1",
+                user_id="u1",
+                custom_llm_provider="perplexity",
+                native_web_search={"search_context_size": "medium"},
+            )
+        ]
+
+        assert not [event for event in events if event["type"] == "citations"]
+
     async def test_anthropic_native_search_citations_become_web_sources(self, monkeypatch):
         """LiteLLM Anthropic 통합 citation 은 web_search_result_location(URL)과 문서 인용을 함께 싣는다."""
 
@@ -342,8 +364,18 @@ class TestGraphStream:
             "end_index": 9,
         }
 
-    async def test_perplexity_agent_stream_sources_survive_installed_responses_bridge(self, monkeypatch):
-        """실제 설치된 LiteLLM Responses 브리지 SSE → 그래프 정본 citation."""
+    @pytest.mark.parametrize(
+        "source_event",
+        [
+            "annotations",
+            "response.reasoning.search_results",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.completed",
+        ],
+    )
+    async def test_perplexity_agent_stream_sources_survive_installed_responses_bridge(self, monkeypatch, source_event):
+        """Actual installed LiteLLM must retain annotations and Perplexity's separate search-result events."""
 
         annotation = {
             "type": "url_citation",
@@ -394,6 +426,29 @@ class TestGraphStream:
             },
             completed,
         ]
+        source = {
+            "id": 1,
+            "url": annotation["url"],
+            "title": annotation["title"],
+            "snippet": "Official weather observation",
+        }
+        if source_event != "annotations":
+            completed["response"]["output"][0]["content"][0]["annotations"] = []
+            source_item = {"type": "search_results", "results": [source]}
+            if source_event == "response.completed":
+                completed["response"]["output"].insert(0, source_item)
+                events = [events[0], completed]
+            else:
+                source_payload = (
+                    {"results": [source]}
+                    if source_event == "response.reasoning.search_results"
+                    else {"item": source_item}
+                )
+                events = [
+                    {"type": source_event, "sequence_number": 1, **source_payload},
+                    events[0],
+                    completed,
+                ]
         body = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
         body += "data: [DONE]\n\n"
         captured = {}
@@ -435,12 +490,14 @@ class TestGraphStream:
                 "source_kind": "web",
                 "url": "https://news.example/seoul",
                 "title": "Seoul weather",
-                "snippet": None,
-                "start_index": 0,
-                "end_index": 2,
+                **(
+                    {"snippet": None, "start_index": 0, "end_index": 2}
+                    if source_event == "annotations"
+                    else {"snippet": source["snippet"]}
+                ),
             }
         ]
-        # Sonar 의 상시 검색 경로에 지원되지 않는 hosted web_search 도구를 주입하지 않는다.
+        # Intrinsic Sonar search must not acquire a duplicate hosted web_search tool.
         assert [tool for tool in captured["body"].get("tools") or [] if tool.get("type") == "web_search"] == []
 
     def test_managed_tool_citations_filter_unsafe_urls_and_bound_snippets(self):
@@ -1139,6 +1196,78 @@ class TestToolLoop:
         assert hidden_result["hidden"] is True
         assert {"type": "warning", "code": "advisor_call_failed", "safe_message": "Advisor request failed."} in events
         assert captured["messages"][-1]["content"] == "private advice"
+
+    async def test_schema_rejection_emits_failed_tool_result(self, monkeypatch):
+        responses = [
+            [_ChunkTC(_DeltaTC(tool_calls=[_ToolCallDelta(0, "required-tools", "list_available_tools", "{}")]))],
+            [_ChunkTC(_DeltaTC(content="I could not load the required tool."))],
+        ]
+        call_index = 0
+        captured: dict[str, object] = {}
+
+        async def fake_stream(**kwargs):
+            nonlocal call_index
+            if call_index == 1:
+                captured["messages"] = kwargs["messages"]
+            stream = responses[call_index]
+            call_index += 1
+            return _aiter(stream)
+
+        async def invalid_arguments(*_args):
+            return contracts.ToolExecutionResult(
+                "Tool arguments do not match the required schema.",
+                warning_code="invalid_tool_arguments",
+                status="failed",
+            )
+
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(tool_runtime, "context_execute_result", invalid_arguments)
+        events = [event async for event in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
+
+        assert {
+            "type": "tool_result",
+            "tool_call_id": "required-tools",
+            "name": "list_available_tools",
+            "content": "Tool arguments do not match the required schema.",
+            "hidden": False,
+            "status": "failed",
+            "display": [],
+            "artifacts": [],
+            "error_code": "invalid_tool_arguments",
+        } in events
+        assert captured["messages"][-1]["content"] == "Tool arguments do not match the required schema."
+
+    async def test_malformed_tool_json_emits_failed_result_without_dispatch(self, monkeypatch):
+        responses = [
+            [_ChunkTC(_DeltaTC(tool_calls=[_ToolCallDelta(0, "invalid-json", "list_available_tools", "{")]))],
+            [_ChunkTC(_DeltaTC(content="I could not load the required tool."))],
+        ]
+        call_index = 0
+
+        async def fake_stream(**_kwargs):
+            nonlocal call_index
+            stream = responses[call_index]
+            call_index += 1
+            return _aiter(stream)
+
+        async def must_not_dispatch(*_args):
+            raise AssertionError("malformed tool JSON must fail before dispatch")
+
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(tool_runtime, "context_execute_result", must_not_dispatch)
+        events = [event async for event in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
+
+        assert {
+            "type": "tool_result",
+            "tool_call_id": "invalid-json",
+            "name": "list_available_tools",
+            "content": "Tool arguments do not match the required schema.",
+            "hidden": False,
+            "status": "failed",
+            "display": [],
+            "artifacts": [],
+            "error_code": "invalid_tool_arguments",
+        } in events
 
 
 class TestUsageEstimation:

@@ -29,7 +29,11 @@ async def test_title_uses_both_first_exchange_messages_and_safe_limits(monkeypat
             {"role": "user", "content": "서비스 배포가 실패했어요"},
             {"role": "assistant", "content": "로그의 이미지 태그와 권한을 확인해 보세요"},
         ],
-        route={"model_name": "gpt-4o-mini", "provider_type": "openai"},
+        route={
+            "model_name": "gpt-4o-mini",
+            "provider_type": "openai",
+            "api_base": "https://provider.example/v1",
+        },
     )
 
     assert result.title == "배포 장애 원인 분석"
@@ -37,6 +41,7 @@ async def test_title_uses_both_first_exchange_messages_and_safe_limits(monkeypat
     assert "배포가 실패" in observed["messages"][1]["content"]
     assert "권한" in observed["messages"][2]["content"]
     assert observed["kwargs"]["max_tokens"] == 512
+    assert observed["kwargs"]["api_base"] == "https://provider.example/v1"
     assert result.prompt_tokens == 12
     assert result.completion_tokens == 4
 

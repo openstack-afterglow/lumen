@@ -48,6 +48,8 @@ def test_normalize_base_url_invalid() -> None:
 
 def test_required_scope_rotation_predicate() -> None:
     assert "compat:completions:write" in _LOCAL_KEY_SCOPES
+    assert "native:conversations:read" in _LOCAL_KEY_SCOPES
+    assert "native:conversations:write" in _LOCAL_KEY_SCOPES
     assert "models:read" in _LOCAL_KEY_SCOPES
 
     # Complete current scopes -> satisfied

@@ -66,6 +66,7 @@ class ContextTokenCount:
     tokens: int | None
     measurement: Literal["tokenizer", "estimated", "unknown"]
     tokenizer: str | None = None
+    reason_code: str | None = None
 
 
 def count_tokens(model: str, *, messages: list[dict] | None = None, text: str | None = None) -> int:
@@ -114,7 +115,7 @@ def count_context_tokens(model: str, messages: list[dict], tools: list[dict] | N
     """
     tools = tools or []
     if _contains_uncountable_modality(messages) or _contains_uncountable_modality(tools):
-        return ContextTokenCount(tokens=None, measurement="unknown")
+        return ContextTokenCount(tokens=None, measurement="unknown", reason_code="token_count_unavailable")
     multimodal = _contains_multimodal(messages) or _contains_multimodal(tools)
     normalized_model = litellm_model_name(model)
     try:
@@ -140,8 +141,12 @@ def count_context_tokens(model: str, messages: list[dict], tools: list[dict] | N
     except Exception:
         raw = json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False, sort_keys=True, default=str)
         if multimodal:
-            return ContextTokenCount(tokens=None, measurement="unknown")
-        return ContextTokenCount(tokens=max(1, (len(raw) + 3) // 4), measurement="estimated")
+            return ContextTokenCount(tokens=None, measurement="unknown", reason_code="token_count_unavailable")
+        return ContextTokenCount(
+            tokens=max(1, (len(raw) + 3) // 4),
+            measurement="estimated",
+            reason_code="token_counter_failed",
+        )
 
 
 def _usage_field(usage: Any, key: str) -> int | None:
@@ -673,6 +678,30 @@ def _responses_event_annotations(chunk: Any) -> list[dict]:
     return []
 
 
+def _responses_event_search_results(chunk: Any) -> list[dict]:
+    """Perplexity returns search sources separately from text annotations."""
+    if hasattr(chunk, "model_dump"):
+        chunk = chunk.model_dump()
+    if not isinstance(chunk, dict):
+        return []
+    event = chunk.get("type")
+    if event == "response.reasoning.search_results":
+        results = chunk.get("results")
+        return [item for item in results if isinstance(item, dict)] if isinstance(results, list) else []
+    if event in {"response.output_item.added", "response.output_item.done"}:
+        items = [chunk.get("item")]
+    elif event == "response.completed":
+        response = chunk.get("response")
+        items = response.get("output") if isinstance(response, dict) else None
+    else:
+        return []
+    results = []
+    for item in items or []:
+        if isinstance(item, dict) and item.get("type") == "search_results" and isinstance(item.get("results"), list):
+            results.extend(source for source in item["results"] if isinstance(source, dict))
+    return results
+
+
 _BRIDGE_SUBCLASS: tuple[type, type] | None = None
 
 
@@ -694,15 +723,19 @@ def _citation_preserving_bridge() -> type:
     class _CitationStreamIterator(bridge_transformation.OpenAiResponsesToChatCompletionStreamIterator):
         def chunk_parser(self, chunk: Any) -> Any:
             parsed = super().chunk_parser(chunk)
-            annotations = _responses_event_annotations(chunk)
-            if not annotations:
-                return parsed
             choices = getattr(parsed, "choices", None) or []
             delta = getattr(choices[0], "delta", None) if choices else None
             if delta is None:
                 return parsed
-            existing = getattr(delta, "annotations", None) or []
-            delta.annotations = [*existing, *annotations]
+            search_results = _responses_event_search_results(chunk)
+            if search_results:
+                # LiteLLM drops empty text chunks unless the delta carries metadata.
+                fields = getattr(delta, "provider_specific_fields", None) or {}
+                delta.provider_specific_fields = {**fields, "search_results": search_results}
+            annotations = _responses_event_annotations(chunk)
+            if annotations:
+                existing = getattr(delta, "annotations", None) or []
+                delta.annotations = [*existing, *annotations]
             return parsed
 
     class _CitationTransformation(bridge_transformation.LiteLLMResponsesTransformationHandler):
@@ -716,6 +749,62 @@ def _citation_preserving_bridge() -> type:
 
     _BRIDGE_SUBCLASS = (base, _CitationBridgeHandler)
     return _CitationBridgeHandler
+
+
+def _strict_compatible_tool_schema(value: object) -> bool:
+    """Return whether a schema satisfies strict function-mode's closed-object subset."""
+    if not isinstance(value, dict):
+        return False
+    kind = value.get("type")
+    if kind == "object":
+        properties = value.get("properties")
+        required = value.get("required", [])
+        if (
+            not isinstance(properties, dict)
+            or not isinstance(required, list)
+            or not all(isinstance(name, str) for name in required)
+            or value.get("additionalProperties") is not False
+            or set(properties) != set(required)
+        ):
+            return False
+        return all(_strict_compatible_tool_schema(property_schema) for property_schema in properties.values())
+    if kind == "array":
+        return _strict_compatible_tool_schema(value.get("items"))
+    return isinstance(kind, str) and kind in {"string", "number", "integer", "boolean", "null"}
+
+
+def _perplexity_agent_tools(tools: list[dict] | None) -> list[dict] | None:
+    """Validate OpenAI declarations before LiteLLM maps them to Responses.
+
+    Lumen stores provider-neutral OpenAI function envelopes. The pinned LiteLLM
+    Responses bridge owns their conversion to Agent's flat function-tool wire
+    shape. Lumen opts into strict mode only for compatible closed schemas and
+    preserves an explicit caller choice. Server dispatch always validates arguments.
+    """
+    if not tools:
+        return None
+    normalized: list[dict] = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            raise ValueError("perplexity agent tools must be OpenAI function declarations")
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            raise ValueError("perplexity agent function declaration is invalid")
+        name = function.get("name")
+        description = function.get("description")
+        parameters = function.get("parameters")
+        if (
+            not isinstance(name, str)
+            or not name
+            or (description is not None and not isinstance(description, str))
+            or (parameters is not None and not isinstance(parameters, dict))
+        ):
+            raise ValueError("perplexity agent function declaration is invalid")
+        function_payload = dict(function)
+        if "strict" not in function_payload and _strict_compatible_tool_schema(parameters):
+            function_payload["strict"] = True
+        normalized.append({"type": "function", "function": function_payload})
+    return normalized
 
 
 def _perplexity_optional_params(
@@ -748,8 +837,9 @@ def _perplexity_optional_params(
         optional_params["max_tokens"] = max_tokens
     if temperature is not None:
         optional_params["temperature"] = temperature
-    if tools:
-        optional_params["tools"] = tools
+    agent_tools = _perplexity_agent_tools(tools) if mode == "agent" else tools
+    if agent_tools:
+        optional_params["tools"] = agent_tools
     if mode == "agent" and "web_search_options" in optional_params:
         # LiteLLM maps options in insertion order. Place search after function
         # tools so its hosted tool is appended rather than overwritten.

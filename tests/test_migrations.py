@@ -121,3 +121,12 @@ def test_quota_policy_migration_is_registered_and_preserves_existing_overrides()
     policy = next(statement for statement in statements if statement.startswith("CREATE TABLE chat_quota_policies"))
     assert "default_monthly_credit_limit NUMERIC(18, 8) NOT NULL" in policy
     assert "chk_chat_quota_policies_singleton" in policy
+
+
+def test_provider_billing_admin_key_migration_is_registered_and_additive():
+    migration = next(item for item in load_manifest() if item.logical_id == "011-provider-billing-admin-key")
+    statements = _statements(MIGRATIONS / migration.relative_path)
+
+    assert statements == [
+        "ALTER TABLE llm_providers\n    ADD COLUMN encrypted_billing_admin_key TEXT NULL AFTER encrypted_api_key"
+    ]

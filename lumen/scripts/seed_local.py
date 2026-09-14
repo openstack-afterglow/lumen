@@ -20,6 +20,8 @@ _LOCAL_PROJECT_ID = "local-console-project"
 _LOCAL_KEY_SCOPES = [
     "models:read",
     "compat:completions:write",
+    "native:conversations:read",
+    "native:conversations:write",
     "native:runs:read",
     "native:runs:write",
     "native:extensions:read",

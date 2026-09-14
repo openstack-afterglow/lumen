@@ -146,6 +146,66 @@ async def test_extension_selection_rejects_agent_allowlist_bypass(monkeypatch):
         )
 
 
+async def test_preview_tool_schemas_match_the_first_provider_request():
+    """Preview must emit the exact schemas bindings would build, not raw admin names."""
+    from lumen.services.tool_runtime import bindings, contracts
+
+    preloaded = {
+        "id": 1,
+        "name": "preloaded tool",
+        "description": "d",
+        "params_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+        "load_policy": "preloaded",
+        "destination_origin": "https://tool.example",
+    }
+    selection = {
+        "tools": [
+            preloaded,
+            {
+                "id": 2,
+                "name": "catalog_only_tool",
+                "description": "d",
+                "params_schema": {},
+                "load_policy": "on_demand",
+                "destination_origin": "https://tool.example",
+            },
+            {
+                "id": 3,
+                "name": "blocked_tool",
+                "description": "d",
+                "params_schema": {},
+                "load_policy": "preloaded",
+                "destination_origin": None,
+            },
+        ],
+        "mcp": [{"id": 5, "name": "GitHub", "load_policy": "preloaded", "destination_origin": "https://mcp.example"}],
+    }
+    features = ChatFeatureOptions(
+        web_search={"enabled": True, "mode": "managed", "provider_id": 7},
+        web_fetch={"enabled": True},
+    )
+
+    schemas = await chat_admission._preview_tool_schemas(features, selection)
+    names = {schema["function"]["name"] for schema in schemas}
+    projected = contracts.custom_tool_function_schema(1, "preloaded tool", "d", preloaded["params_schema"])
+
+    # Identical to the runtime binding projection: mangled provider name and closed schema.
+    assert projected["name"] == "custom__1__preloaded_tool_" + projected["name"].rsplit("_", 1)[1]
+    assert projected["parameters"]["additionalProperties"] is False
+    assert next(schema for schema in schemas if schema["function"]["name"] == projected["name"])["function"] == (
+        projected
+    )
+    assert bindings.custom_tool_function_schema is contracts.custom_tool_function_schema
+    assert "list_available_tools" in names
+    assert projected["name"] in names
+    # On-demand extensions, destination-blocked tools, managed tools, and undiscovered
+    # MCP schemas are never part of the first provider request.
+    assert not any(name.startswith("custom__2__") or name.startswith("custom__3__") for name in names)
+    assert not {"managed_web_search", "managed_web_fetch"} & names
+    assert not any(name.startswith("mcp__") for name in names)
+    assert await chat_admission._preview_tool_schemas(ChatFeatureOptions(tool_policy={"mode": "none"}), selection) == []
+
+
 async def _ok_precheck(user_id, project_id=None, api_key_id=None):
     return None
 
@@ -1277,6 +1337,149 @@ class TestApiKeyLimitAdmission:
 
 
 class TestContextPreviewRoutes:
+    async def test_conversation_context_preview_returns_reconciling_breakdown(self, client, monkeypatch):
+        real_preview_schemas = chat_admission._preview_tool_schemas
+        await _patch_text_execution(monkeypatch)
+        monkeypatch.setattr(chat_admission, "_preview_tool_schemas", real_preview_schemas)
+        monkeypatch.setattr(
+            context_store,
+            "load_context_source",
+            lambda **_kwargs: _return(
+                {
+                    "messages": [
+                        {"role": "user", "content": "first question"},
+                        {"role": "assistant", "content": "first answer"},
+                    ],
+                    "message_ids": ["1", "2"],
+                    "source_hashes": ["hash1", "hash2"],
+                    "active_leaf_id": "2",
+                    "revision": "rev-1",
+                    "checkpoint_id": None,
+                    "checkpoint": None,
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            chat_admission.ws, "get_instructions_for_run", lambda *_args, **_kwargs: _return("workspace rules")
+        )
+        monkeypatch.setattr(
+            chat_admission,
+            "_load_skill_snapshot",
+            lambda *_args, **_kwargs: _return((["skill body"], [{"id": 3, "name": "Docs", "content_hash": "h"}])),
+        )
+        monkeypatch.setattr(
+            chat_admission,
+            "_resolve_extension_selection",
+            lambda *_args, **_kwargs: _return(
+                {
+                    "tools": [
+                        {
+                            "id": 1,
+                            "name": "preloaded_tool",
+                            "description": "always sent",
+                            "params_schema": {"type": "object"},
+                            "effect": "read",
+                            "origin": None,
+                            "config_fingerprint": "f1",
+                            "load_policy": "preloaded",
+                            "destination_origin": "https://tool.example",
+                        },
+                        {
+                            "id": 2,
+                            "name": "catalog_only_tool",
+                            "description": "loaded on demand",
+                            "params_schema": {"type": "object"},
+                            "effect": "read",
+                            "origin": None,
+                            "config_fingerprint": "f2",
+                            "load_policy": "on_demand",
+                            "destination_origin": "https://tool.example",
+                        },
+                    ],
+                    "mcp": [
+                        {
+                            "id": 5,
+                            "name": "GitHub",
+                            "effect": "read",
+                            "origin": None,
+                            "config_fingerprint": "f3",
+                            "load_policy": "preloaded",
+                            "destination_origin": "https://mcp.example",
+                        }
+                    ],
+                }
+            ),
+        )
+
+        resp = await client.post(
+            f"{_BASE}/c1/context-preview",
+            json={"model_id": "gpt-3.5-turbo", "features": {}, "parts": [{"type": "text", "text": "draft"}]},
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        breakdown = data["breakdown"]
+        components = {component["id"]: component for component in breakdown["components"]}
+
+        assert breakdown["scope"] == "preview"
+        assert (
+            sum(component["tokens"] for component in breakdown["components"] if component["included"])
+            == (data["input_tokens"])
+        )
+        assert components["workspace"]["count"] == 1
+        assert components["skills"]["items"] == ["Docs"]
+        assert components["messages"]["count"] == 3
+        # Preloaded extensions are in the first provider request; on-demand ones are not.
+        assert any(name.startswith("custom__1__preloaded_tool_") for name in components["tools"]["items"])
+        assert "list_available_tools" in components["tools"]["items"]
+        assert not any(name.startswith("custom__2__") for name in components["tools"]["items"])
+        assert components["deferred_tools"]["items"] == ["catalog_only_tool"]
+        assert components["deferred_tools"]["included"] is False
+        # Remote MCP schemas are never discovered in preview.
+        assert components["mcp_tools"] == {
+            "id": "mcp_tools",
+            "tokens": None,
+            "measurement": "unknown",
+            "count": None,
+            "included": False,
+            "items": ["mcp:GitHub"],
+        }
+        assert breakdown["uncounted"] == ["mcp_tools"]
+        assert breakdown["complete"] is False
+
+    async def test_context_preview_breakdown_never_leaks_prompt_text(self, client, monkeypatch):
+        real_preview_schemas = chat_admission._preview_tool_schemas
+        await _patch_text_execution(monkeypatch)
+        monkeypatch.setattr(chat_admission, "_preview_tool_schemas", real_preview_schemas)
+        monkeypatch.setattr(
+            chat_admission.ws, "get_instructions_for_run", lambda *_args, **_kwargs: _return("SECRET-WORKSPACE-RULE")
+        )
+        monkeypatch.setattr(
+            context_store,
+            "load_context_source",
+            lambda **_kwargs: _return(
+                {
+                    "messages": [{"role": "user", "content": "SECRET-USER-TURN"}],
+                    "message_ids": ["1"],
+                    "source_hashes": ["hash1"],
+                    "active_leaf_id": "1",
+                    "revision": "rev-1",
+                    "checkpoint_id": None,
+                    "checkpoint": None,
+                }
+            ),
+        )
+
+        resp = await client.post(
+            f"{_BASE}/c1/context-preview",
+            json={"model_id": "gpt-3.5-turbo", "features": {}, "parts": []},
+        )
+
+        assert resp.status_code == 200
+        serialized = json.dumps(resp.json()["breakdown"])
+        assert "SECRET-WORKSPACE-RULE" not in serialized
+        assert "SECRET-USER-TURN" not in serialized
+
     async def test_conversation_context_preview_returns_200_and_does_not_mutate_db_or_create_run(
         self, client, monkeypatch
     ):
@@ -1516,10 +1719,27 @@ class TestCompactionRoutes:
         assert resp.status_code == 422
         assert resp.json()["detail"] == "nothing_to_compact"
 
-    async def test_compaction_unknown_budget_returns_422(self, client, monkeypatch):
+    @pytest.mark.parametrize("path", [f"{_BASE}/c1/compactions", "/api/v1/chat/temp-threads/t1/compactions"])
+    @pytest.mark.parametrize(
+        ("context_limit", "tokens", "reason"),
+        [(None, 12, "context_window_unknown"), (1, 12, "invalid_budget"), (16000, None, "token_count_unavailable")],
+    )
+    async def test_compaction_unavailable_reports_precise_reason(
+        self, client, monkeypatch, path, context_limit, tokens, reason
+    ):
+        from lumen.services import context_manager
+        from lumen.services.litellm_client import ContextTokenCount
+
+        monkeypatch.setattr(
+            context_manager,
+            "count_context_tokens",
+            lambda *_args: ContextTokenCount(
+                tokens=tokens, measurement="estimated" if tokens is not None else "unknown"
+            ),
+        )
         await _patch_text_execution(monkeypatch)
         res = _resolved()
-        res["capabilities"]["context_limit"] = None
+        res["capabilities"]["context_limit"] = context_limit
         monkeypatch.setattr(ps, "resolve_model", lambda *args, **kwargs: _return(res))
         monkeypatch.setattr(
             context_store,
@@ -1549,12 +1769,12 @@ class TestCompactionRoutes:
             "expected_context_revision": "rev-nobudget",
         }
         resp = await client.post(
-            f"{_BASE}/c1/compactions",
+            path,
             headers=_HEADERS,
             json=body,
         )
         assert resp.status_code == 422
-        assert resp.json()["detail"] == "context_budget_unavailable"
+        assert resp.json()["detail"] == reason
 
     async def test_compaction_active_run_conflict_returns_409(self, client, monkeypatch):
         await _patch_text_execution(monkeypatch)

@@ -23,6 +23,7 @@ from .contracts import (
     _v2_effect,
     _v2_provider_name,
     _v2_result,
+    custom_tool_function_schema,
     v2_builtin_tool_bindings,
 )
 from .selection import _load_custom, _load_mcp
@@ -440,13 +441,16 @@ async def v2_tool_bindings(
             logger.warning("custom tool without a canonical destination excluded from v2 bindings id=%s", identifier)
             continue
         try:
+            projection = custom_tool_function_schema(
+                identifier,
+                custom.get("name"),
+                custom.get("description"),
+                custom.get("params_schema"),
+            )
             definition = ToolDefinition(
-                name=_v2_provider_name("custom", identifier, custom.get("name")),
-                description=str(custom.get("description") or custom.get("name") or "Custom HTTP tool"),
-                input_schema={
-                    **(custom.get("params_schema") or {"type": "object", "properties": {}}),
-                    "additionalProperties": False,
-                },
+                name=projection["name"],
+                description=projection["description"],
+                input_schema=projection["parameters"],
                 effect=_v2_effect(custom.get("effect")),
                 source="custom_http",
                 activity_category="커스텀 도구",

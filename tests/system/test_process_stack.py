@@ -711,10 +711,10 @@ def test_process_stack_manual_compaction_and_sentinel_preservation() -> None:
         # 5. Verify no user/assistant message insertion occurred for compaction run
         if is_persistent and conv_id:
             msgs_resp = client.get(f"/v1/conversations/{conv_id}/messages", headers=auth_headers)
-            if msgs_resp.status_code == 200:
-                messages = msgs_resp.json()
-                # Exactly 3 user + 3 assistant messages; compaction did not insert message rows
-                assert len(messages) == 6, f"Expected 6 conversational messages, got {len(messages)}"
+            assert msgs_resp.status_code == 200, msgs_resp.text
+            messages = msgs_resp.json()["messages"]
+            # Exactly 3 user + 3 assistant messages; compaction did not insert message rows.
+            assert len(messages) == 6, f"Expected 6 conversational messages, got {len(messages)}"
 
         # 6. Verify subsequent turn receives preserved sentinels in provider context
         t4_payload: dict[str, Any] = {
@@ -760,19 +760,20 @@ def test_process_stack_title_first_answer_influences_title_no_extra_calls() -> N
     auth_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     with httpx.Client(base_url=api_base_url, timeout=30.0) as client:
-        # Create persistent conversation with auto title
+        # The generated local transport is authorized for the native persistent
+        # conversation lifecycle; a 403 here is a stack defect, not a skip.
         conv_resp = client.post(
             "/v1/conversations",
             headers=auth_headers,
             json={"title": None, "workspace_id": None},
         )
-        if conv_resp.status_code != 201:
-            # If conversation endpoint is unauthorized in this environment, skip gracefully
-            pytest.skip("Conversation endpoint not available for title lifecycle testing")
-
+        assert conv_resp.status_code == 201, (
+            f"Persistent conversation admission failed: {conv_resp.status_code} {conv_resp.text}"
+        )
         conv_id = conv_resp.json()["id"]
         initial_conv = conv_resp.json()
-        assert initial_conv.get("title_source") in ("auto", "legacy")
+        assert initial_conv.get("title_source") == "auto"
+        assert initial_conv.get("title_status") == "idle"
 
         # Turn 1: First user request mentioning Docker deployment
         t1 = client.post(
@@ -800,15 +801,17 @@ def test_process_stack_title_first_answer_influences_title_no_extra_calls() -> N
                 break
             time.sleep(0.5)
 
-        if title_ready:
-            # First answer content influences title (Docker / 배포 reflected)
-            assert any(term in final_title for term in ("Docker", "배포", "요약")), (
-                f"Title was not influenced by exchange content: {final_title}"
-            )
+        assert title_ready, f"Title job did not persist a title: {data}"
+        # The persisted title comes from the title provider's first-exchange
+        # request, not a client-side fallback from the first user message.
+        assert any(term in final_title for term in ("Docker", "배포", "요약")), (
+            f"Title was not influenced by exchange content: {final_title}"
+        )
 
-        # Record title calls count
         stats1 = _get_fake_provider_stats(fake_provider_url)
-        title_count_after_t1 = stats1.get("title_count", 1) if stats1 else 1
+        assert stats1 is not None, "Fake provider statistics are required for title-call proof"
+        title_count_after_t1 = stats1["title_count"]
+        assert title_count_after_t1 == 1
 
         # Turn 2: Follow-up question
         t2 = client.post(
@@ -823,13 +826,13 @@ def test_process_stack_title_first_answer_influences_title_no_extra_calls() -> N
         t2_id = t2.json().get("run_id") or t2.json().get("id")
         _poll_run_until_terminal(client, t2_id, auth_headers)
 
-        # Assert no extra title generation call was issued on ordinary second turn
+        # Assert no extra title generation call was issued on ordinary second turn.
         stats2 = _get_fake_provider_stats(fake_provider_url)
-        if stats2 is not None:
-            title_count_after_t2 = stats2.get("title_count", 0)
-            assert title_count_after_t2 == title_count_after_t1, (
-                f"Ordinary turn issued extra title call: before={title_count_after_t1}, after={title_count_after_t2}"
-            )
+        assert stats2 is not None, "Fake provider statistics are required for title-call proof"
+        title_count_after_t2 = stats2["title_count"]
+        assert title_count_after_t2 == title_count_after_t1, (
+            f"Ordinary turn issued extra title call: before={title_count_after_t1}, after={title_count_after_t2}"
+        )
 
 
 # ============================================================================
