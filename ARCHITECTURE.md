@@ -6,7 +6,7 @@ Lumen은 LiteLLM provider 실행, LangGraph/LangChain agent runtime, 대화·dur
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: `lumen` package `0.2.0` (`pyproject.toml`, `lumen/__init__.py`), `lumen-sdk` `0.2.0` (`sdk/pyproject.toml`), discovery/API contract `1.0.0` (`lumen/api/compat/discovery.py`)
+- 버전: `lumen` package `0.2.1` (`pyproject.toml`, `lumen/__init__.py`), `lumen-sdk` `0.2.1` (`sdk/pyproject.toml`), discovery/API contract `1.0.0` (`lumen/api/compat/discovery.py`)
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 wakeup 최적화일 뿐 queue 정본이 아니다.
@@ -119,7 +119,7 @@ Context capacity resolves exact catalog input windows, including the stored Perp
 - **PostgreSQL boundary**: configured encrypted LangGraph checkpointer는 protocol v2 admission prerequisite이며, `CHAT_MEMORY_PGVECTOR_URL`은 선택 semantic-memory index다. PostgreSQL은 MariaDB run/event/catalog의 대체 정본이 아니다. semantic ranking과 recency prompt hydration도 별도 경로다.
 - **Other stores**: configured S3는 service-owned asset object store이고 ClamAV/sandbox/MCP는 optional external boundary다. asset metadata/ownership은 MariaDB가 보유한다.
 - **Organization usage windows**: OpenAI/Anthropic 조회는 UTC 월 시작과 현재 주 월요일 중 이른 시각부터 가져온 뒤 일·주·월로 따로 집계한다. 월초에도 전월에 속한 이번 주 사용량을 누락하지 않으며 31개 daily bucket 범위를 유지한다. Route·credential·schema 경계는 변경하지 않는다.
-- **API contracts**: native `/v1`은 run descriptor, UUID idempotency, owner-scoped run/event, `Last-Event-ID` 또는 `after_seq` cursor, terminal event를 계약으로 한다. discovery/API contract version은 `1.0.0`; package version `0.2.0`과 SDK package version `0.2.0`은 별개의 release values다.
+- **API contracts**: native `/v1`은 run descriptor, UUID idempotency, owner-scoped run/event, `Last-Event-ID` 또는 `after_seq` cursor, terminal event를 계약으로 한다. discovery/API contract version은 `1.0.0`; package version `0.2.1`과 SDK package version `0.2.1`은 별개의 release values다.
 - **SDK transports**: `lumen_sdk.Client`는 API-key Bearer와 httpx를 사용하고, `lumen_sdk.register(openstack.Connection)`의 `Proxy`는 Keystone/OpenStack SDK session transport를 사용한다. 이 둘은 Lumen API transport이며 provider credential transport가 아니다.
 - **Protocol invariant**: accepted run에는 admission snapshot, pricing/provenance, selected extension/config fingerprint가 있어야 하며 worker가 mutable configuration을 재검증한다. `model="lumen"` bridge는 tools/memory가 없는 text-only 입력만 accepted한다.
 
@@ -188,9 +188,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "de3e2c6f0109fdbae1ebd9a3aaf42bd6f4fe720006911b711a22a6be67eca024",
-  "reviewed_at": "2026-09-14T13:08:53Z",
-  "summary": "Reviewed all pending provider billing, native search/citations, scoped context, title recovery, thread-pooled authentication and migration 011 contracts. Corrected cross-month organization usage lower bounds; 14 billing tests passed, including both providers failing before the fix. Final service/SDK contract and lint passed. No additional route, credential or schema impact from the week-window correction."
+  "source_sha256": "9774b488ad3831153ea6468c0be6bb33a6664f4e0a9ceee08d72ad1fa5f68f98",
+  "reviewed_at": "2026-09-16T17:35:09Z",
+  "summary": "Release v0.2.1 with billing observability and scoped context"
 }
 ```
 <!-- architecture-review:end -->
