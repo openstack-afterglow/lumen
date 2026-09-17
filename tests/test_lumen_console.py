@@ -68,7 +68,6 @@ def test_gateway_proxies_models_and_runs_with_session_scoped_api_key(tmp_path, m
         def json(self) -> object:
             return self._payload
 
-
     class FakeEventStream:
         status_code = 200
 
@@ -79,7 +78,7 @@ def test_gateway_proxies_models_and_runs_with_session_scoped_api_key(tmp_path, m
             return None
 
         async def aiter_raw(self):
-            yield b"id: 8\nevent: part.delta\ndata: {\"payload\":{\"text\":\"done\"}}\n\n"
+            yield b'id: 8\nevent: part.delta\ndata: {"payload":{"text":"done"}}\n\n'
 
     class FakeAsyncClient:
         def __init__(self, **_kwargs):
@@ -100,7 +99,6 @@ def test_gateway_proxies_models_and_runs_with_session_scoped_api_key(tmp_path, m
         def stream(self, method, url, headers):
             requests.append({"method": method, "url": url, "headers": headers})
             return FakeEventStream()
-
 
     monkeypatch.setattr(console_app.httpx, "AsyncClient", FakeAsyncClient)
     client = TestClient(create_app(tmp_path / "console.sqlite"))

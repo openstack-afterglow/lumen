@@ -382,11 +382,7 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None) -> 
                     return True
                 return False
 
-            matches = [
-                (model, route_provider)
-                for model, route_provider in rows
-                if _row_matches(model, route_provider)
-            ]
+            matches = [(model, route_provider) for model, route_provider in rows if _row_matches(model, route_provider)]
             if not matches:
                 return None
 

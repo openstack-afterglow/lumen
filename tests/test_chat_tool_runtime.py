@@ -204,7 +204,9 @@ class TestDispatch:
 
 class TestCustomExecution:
     async def test_ssrf_blocked_returns_safe_string(self, monkeypatch):
-        out = await tool_runtime._execute_custom_http_tool({"name": "x", "url": "http://169.254.169.254/", "method": "GET"}, {}, _CTX)
+        out = await tool_runtime._execute_custom_http_tool(
+            {"name": "x", "url": "http://169.254.169.254/", "method": "GET"}, {}, _CTX
+        )
         assert "허용되지 않은" in out
 
     async def test_http_error_returns_safe_string(self, monkeypatch):
@@ -213,7 +215,9 @@ class TestCustomExecution:
                 raise RuntimeError("connection refused")
 
         monkeypatch.setattr("httpx.AsyncClient", _BadClient)
-        out = await tool_runtime._execute_custom_http_tool({"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX)
+        out = await tool_runtime._execute_custom_http_tool(
+            {"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX
+        )
         assert "오류" in out
 
     async def test_large_http_response_is_not_materialized(self, monkeypatch):
@@ -226,7 +230,9 @@ class TestCustomExecution:
                 return _Stream(_LargeResponse())
 
         monkeypatch.setattr("httpx.AsyncClient", _LargeClient)
-        out = await tool_runtime._execute_custom_http_tool({"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX)
+        out = await tool_runtime._execute_custom_http_tool(
+            {"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX
+        )
         assert "허용 크기" in out
 
     async def test_compressed_http_response_is_rejected_before_iteration(self, monkeypatch):
@@ -244,7 +250,9 @@ class TestCustomExecution:
                 return _Stream(_CompressedResponse())
 
         monkeypatch.setattr("httpx.AsyncClient", _CompressedClient)
-        out = await tool_runtime._execute_custom_http_tool({"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX)
+        out = await tool_runtime._execute_custom_http_tool(
+            {"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX
+        )
         assert "압축된" in out
 
 

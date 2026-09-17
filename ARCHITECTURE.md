@@ -6,7 +6,7 @@ Lumen은 LiteLLM provider 실행, LangGraph/LangChain agent runtime, 대화·dur
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: `lumen` package `0.2.1` (`pyproject.toml`, `lumen/__init__.py`), `lumen-sdk` `0.2.1` (`sdk/pyproject.toml`), discovery/API contract `1.0.0` (`lumen/api/compat/discovery.py`)
+- 버전: root `lumen` package `0.2.2` (`pyproject.toml`, `lumen/__init__.py`), 독립 `lumen-sdk` `0.2.1` (`sdk/pyproject.toml`), discovery/API contract `1.0.0` (`lumen/api/compat/discovery.py`)
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 wakeup 최적화일 뿐 queue 정본이 아니다.
@@ -26,7 +26,7 @@ Lumen은 LiteLLM provider 실행, LangGraph/LangChain agent runtime, 대화·dur
 | Memory and semantic store | partial | source-reviewed, test-defined | authoritative memory는 MariaDB이며 PostgreSQL/pgvector는 선택 기능이고 protocol v2에는 encrypted PostgreSQL checkpointer가 필수다 | `lumen/models/chat_db.py`, `lumen/services/semantic_memory.py`, `lumen/services/checkpointer.py` |
 | API-key and Keystone SDK transports | implemented | source-reviewed, test-defined | SDK는 native API surface를 호출하며 provider credentials를 소유하거나 직접 노출하지 않는다 | `sdk/lumen_sdk/client.py`, `sdk/lumen_sdk/proxy.py`, `lumen/auth.py` |
 | Local Console | partial | source-reviewed, test-defined | Afterglow 제품 UI가 아닌 localhost 개발자/운영자 tooling이며 Lumen auth/scope를 우회하지 않는다 | `lumen_console/app.py`, `docs/local-console.md` |
-| Kolla/Compose deployment | implemented | source-reviewed, test-defined | migration은 API/worker 시작 전에 별도로 적용해야 하며 `/v1/health`는 process health만 의미한다 | `docker-compose.yml`, `deploy/kolla/ansible/roles/lumen/`, `docs/operations.md` |
+| Kolla/Compose deployment | implemented | source-reviewed, test-defined | `lumen` root wheel은 Kolla role shared data를 제공하고, service runtime dependency와 Kolla-Ansible은 각각 `service` extra와 operator environment가 소유한다. migration은 API/worker 시작 전에 별도로 적용해야 하며 `/v1/health`는 process health만 의미한다 | `pyproject.toml`, `docker/Dockerfile`, `docker-compose.yml`, `deploy/kolla/ansible/roles/lumen/`, `docs/operations.md` |
 
 위 표의 `test-defined`는 해당 경계를 검사하는 테스트 코드와 명령이 정의되어 있다는 뜻이다. 2026-09-13 `uv run lumen-test contract -q`는 service contract 974건과 SDK 126건을 통과했고 service 1건을 skip·9건을 deselect했다. `uv run lumen-test integration -q`는 일회용 실제 MariaDB/Redis의 2건을 통과했다. Perplexity Agent와 Anthropic의 provider-shaped stream citation, native Search engine 경계는 합성 provider 응답으로 확인했다. 실제 외부 provider 호출이나 운영 배포 검증은 아니다.
 
@@ -81,7 +81,7 @@ flowchart LR
 | `lumen/models/chat_db.py`, `lumen/models/chat_runs.py` | catalog, conversation, memory, credentials, usage와 run/event/lease ORM | services → MariaDB |
 | `lumen/cache.py`, `lumen/services/checkpointer.py`, `lumen/services/semantic_memory.py` | Redis cache/wakeup, optional PostgreSQL checkpointer/pgvector | optional/optimization 경계 |
 | `sdk/lumen_sdk/client.py`, `sdk/lumen_sdk/proxy.py`, `sdk/lumen_sdk/_api.py` | 동일 native route mixin의 httpx API-key transport와 OpenStack SDK transport | caller → `/v1` |
-| `docker-compose.yml`, `deploy/kolla/ansible/roles/lumen/` | local API/worker/migrate/Console와 Kolla API/worker lifecycle/image/config | operator → service processes |
+| `docker/Dockerfile`, `docker-compose.yml`, `deploy/kolla/ansible/roles/lumen/` | root build context를 유지하는 local API/worker/migrate/Console container stages와 root wheel Kolla role shared data | operator → service processes |
 
 ## Runtime flows
 
@@ -119,15 +119,17 @@ Context capacity resolves exact catalog input windows, including the stored Perp
 - **PostgreSQL boundary**: configured encrypted LangGraph checkpointer는 protocol v2 admission prerequisite이며, `CHAT_MEMORY_PGVECTOR_URL`은 선택 semantic-memory index다. PostgreSQL은 MariaDB run/event/catalog의 대체 정본이 아니다. semantic ranking과 recency prompt hydration도 별도 경로다.
 - **Other stores**: configured S3는 service-owned asset object store이고 ClamAV/sandbox/MCP는 optional external boundary다. asset metadata/ownership은 MariaDB가 보유한다.
 - **Organization usage windows**: OpenAI/Anthropic 조회는 UTC 월 시작과 현재 주 월요일 중 이른 시각부터 가져온 뒤 일·주·월로 따로 집계한다. 월초에도 전월에 속한 이번 주 사용량을 누락하지 않으며 31개 daily bucket 범위를 유지한다. Route·credential·schema 경계는 변경하지 않는다.
-- **API contracts**: native `/v1`은 run descriptor, UUID idempotency, owner-scoped run/event, `Last-Event-ID` 또는 `after_seq` cursor, terminal event를 계약으로 한다. discovery/API contract version은 `1.0.0`; package version `0.2.1`과 SDK package version `0.2.1`은 별개의 release values다.
+- **Package dependency boundary**: root `lumen` distribution has no base runtime dependency and ships Kolla role files as wheel shared data. Service code, service CLI, and root tests require the explicit `service` extra; development adds `dev`. Kolla-Ansible remains an operator-owned dependency, not a Lumen package dependency.
+
+- **API contracts**: native `/v1`은 run descriptor, UUID idempotency, owner-scoped run/event, `Last-Event-ID` 또는 `after_seq` cursor, terminal event를 계약으로 한다. discovery/API contract version은 `1.0.0`; root package version `0.2.2`과 independent SDK package version `0.2.1`은 별개의 release values다.
 - **SDK transports**: `lumen_sdk.Client`는 API-key Bearer와 httpx를 사용하고, `lumen_sdk.register(openstack.Connection)`의 `Proxy`는 Keystone/OpenStack SDK session transport를 사용한다. 이 둘은 Lumen API transport이며 provider credential transport가 아니다.
 - **Protocol invariant**: accepted run에는 admission snapshot, pricing/provenance, selected extension/config fingerprint가 있어야 하며 worker가 mutable configuration을 재검증한다. `model="lumen"` bridge는 tools/memory가 없는 text-only 입력만 accepted한다.
 
 ## Deployment and operations
 
-로컬 Compose(`docker-compose.yml`)는 MariaDB, Redis, migration, idempotent `seed-local`, `lumen-api`, `lumen-worker`, opt-in `lumen-connection`, localhost-only `lumen-console`로 분리된다. API는 기본 `127.0.0.1:8012`, Console은 `127.0.0.1:7010`이며 provider key 없이 stack은 기동할 수 있어도 completion과 administrator usage report는 실행되지 않는다. `lumen-migrate --apply`가 API/worker보다 먼저 실행되어야 하며 Dockerfile은 migration을 자동 실행하지 않는다. `011_provider_billing_admin_key.sql`과 호환 API를 Afterglow UI보다 먼저 배포하며 mixed-version rolling deployment는 지원하지 않는다.
+로컬 Compose(`docker-compose.yml`)는 root context와 `docker/Dockerfile`을 사용해 MariaDB, Redis, migration, idempotent `seed-local`, `lumen-api`, `lumen-worker`, opt-in `lumen-connection`, localhost-only `lumen-console`를 분리한다. API는 기본 `127.0.0.1:8012`, Console은 `127.0.0.1:7010`이며 provider key 없이 stack은 기동할 수 있어도 completion과 administrator usage report는 실행되지 않는다. `lumen-migrate --apply`가 API/worker보다 먼저 실행되어야 하며 `docker/Dockerfile`은 migration을 자동 실행하지 않는다.
 
-Kolla role(`deploy/kolla/ansible/roles/lumen/`)은 API와 worker를 별도 host-network container로 실행하고, MariaDB/Valkey, Keystone, encryption key와 PostgreSQL mode를 operator 설정으로 주입한다. 기본 image tag는 role `lumen_image_tag`와 package release에 맞추고, PostgreSQL은 `external` URL 또는 role-managed `bundled` mode 중 하나다. `deploy`, `upgrade`, `reconfigure`의 bootstrap 단계가 `lumen-migrate --apply`를 API/worker start 전에 실행한다.
+Kolla role(`deploy/kolla/ansible/roles/lumen/`)은 root `lumen` wheel의 shared data로 설치되며 API와 worker를 별도 host-network container로 실행하고, MariaDB/Valkey, Keystone, encryption key와 PostgreSQL mode를 operator 설정으로 주입한다. `lumen_image_tag`는 published runtime image reference이며 root package release와 독립적으로 유지된다. PostgreSQL은 `external` URL 또는 role-managed `bundled` mode 중 하나다. `deploy`, `upgrade`, `reconfigure`의 bootstrap 단계가 `lumen-migrate --apply`를 API/worker start 전에 실행한다.
 
 `GET /v1/health`와 Kolla healthcheck는 process HTTP response만 확인한다. DB/Redis/checkpointer/pgvector readiness와 worker health는 별도 logs/readiness 관측 대상이다. 운영 장애 시 journal stage/terminal event, worker lease/recovery, provider snapshot, migration ledger/checksum을 함께 확인한다. Temporary thread는 30일 retention 대상이고 terminal run/usage는 accounting record다. Backup은 MariaDB journal/credential metadata, configured PostgreSQL state, S3 objects와 별도 encryption key recovery를 일관되게 계획해야 한다.
 
@@ -148,6 +150,7 @@ Kolla role(`deploy/kolla/ansible/roles/lumen/`)은 API와 worker를 별도 host-
 | 목적 | 명령 | 실제 전제와 경계 |
 | --- | --- | --- |
 | architecture freshness | `python3 scripts/check_architecture.py` | parent가 canonical guard를 vendor한 뒤 Python 3와 Git만 필요 |
+| root service install | `uv sync --extra service --extra dev --frozen` | root service/test development dependencies; Kolla-Ansible은 설치하지 않는다 |
 | contract | `uv run lumen-test contract` | MariaDB/Redis/provider/Keystone를 fake 또는 in-process 경계로 둔다 |
 | integration | `uv run lumen-test integration` | MariaDB 11, Redis 7, migrations와 direct worker가 필요하다 |
 | system | `uv run lumen-test system` | Docker Compose process stack, fake OpenAI HTTP provider와 generated local credentials를 사용한다 |
@@ -168,7 +171,7 @@ Kolla role(`deploy/kolla/ansible/roles/lumen/`)은 API와 worker를 별도 host-
 | tool/MCP/skill | `lumen/services/tool_runtime/`, `lumen/services/mcp_adapter.py`, `lumen/services/extensions_store.py` | SSRF/owner/version/fingerprint contract, `docs/agent-platform.md`, tool tests; implementation status must remain honest |
 | memory/checkpointer/assets | `lumen/services/semantic_memory.py`, `checkpointer.py`, `assets.py`, relevant models/migrations | MariaDB authority vs PostgreSQL/S3 optional boundary, migrations, operations/security docs |
 | auth/project scope | `lumen/auth.py`, API dependencies, SDK proxy | Keystone/API-key matrix, target-project invariant, security docs and auth tests |
-| deployment/config | `docker-compose*.yml`, `lumen/config.py`, `deploy/kolla/ansible/roles/lumen/` | migration/bootstrap order, health meaning, image/version metadata, operations docs and Kolla tests |
+| deployment/config | `pyproject.toml`, `docker/Dockerfile`, `docker-compose*.yml`, `lumen/config.py`, `deploy/kolla/ansible/roles/lumen/` | root wheel shared data, service-extra boundary, root build context/stages, migration/bootstrap order, independent image defaults, operations docs and Kolla tests |
 | SDK surface | `sdk/lumen_sdk/{client,proxy,_api}.py`, `sdk/pyproject.toml` | package version, route mixin/transport tests, `docs/sdk.md` and this Code map |
 | bugfix/refactor with no architecture change | actual source and affected tests | root architecture Maintenance marker summary must state why ownership/flow/store contracts are unchanged; still run guard before completion/commit |
 
@@ -188,9 +191,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9774b488ad3831153ea6468c0be6bb33a6664f4e0a9ceee08d72ad1fa5f68f98",
-  "reviewed_at": "2026-09-16T17:35:09Z",
-  "summary": "Release v0.2.1 with billing observability and scoped context"
+  "source_sha256": "8b3b29c83c7bff004ec7cc812bb9e63547d39f5eb420862aed5f267551d4004c",
+  "reviewed_at": "2026-09-17T15:47:43Z",
+  "summary": "Root package migration verified: 1030 unit tests, kolla assets 12, ruff clean; ruff 0.16 formatter normalization applied."
 }
 ```
 <!-- architecture-review:end -->

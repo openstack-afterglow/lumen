@@ -1283,9 +1283,7 @@ class TestAnthropicEndpoint:
         assert "content_block_delta" in text
         assert "event: message_stop" in text
 
-    async def test_provider_selects_route_and_canonicalizes_anthropic_models(
-        self, client, _auth, _core, monkeypatch
-    ):
+    async def test_provider_selects_route_and_canonicalizes_anthropic_models(self, client, _auth, _core, monkeypatch):
         calls = []
         canonical = "anthropic/claude-sonnet-4-6"
 
@@ -1328,9 +1326,7 @@ class TestAnthropicEndpoint:
         assert f'"model": "{canonical}"' in stream.text
         assert calls == [(canonical, "perplexity"), (canonical, "perplexity")]
 
-    async def test_anthropic_provider_stream_error_has_no_success_terminal(
-        self, client, _auth, _core, monkeypatch
-    ):
+    async def test_anthropic_provider_stream_error_has_no_success_terminal(self, client, _auth, _core, monkeypatch):
         async def failed_stream(**_kwargs):
             yield {"type": "error", "message": "safe upstream failure"}
 

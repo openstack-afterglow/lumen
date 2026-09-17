@@ -153,6 +153,7 @@ async def test_legacy_dispatch_preserves_invalid_argument_failure(monkeypatch):
     assert result.warning_code == "invalid_tool_arguments"
     assert called is False
 
+
 async def test_legacy_builtin_rejects_invalid_arguments_before_handler(monkeypatch):
     called = False
 

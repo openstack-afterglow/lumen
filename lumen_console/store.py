@@ -86,7 +86,9 @@ class LocalUserStore:
                 "SELECT id, username, password_salt, password_hash FROM console_users WHERE username = ?",
                 (username.strip(),),
             ).fetchone()
-        if row is None or not hmac.compare_digest(self._password_digest(password, row["password_salt"]), row["password_hash"]):
+        if row is None or not hmac.compare_digest(
+            self._password_digest(password, row["password_salt"]), row["password_hash"]
+        ):
             return None
         return LocalUser(id=int(row["id"]), username=str(row["username"]))
 

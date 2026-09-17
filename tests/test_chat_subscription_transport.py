@@ -180,9 +180,7 @@ def test_stored_chatgpt_config_pins_auth_endpoint_and_request_shape(monkeypatch)
     )
 
     assert not hasattr(config, "authenticator")
-    assert config.get_complete_url("https://evil.example", {}) == (
-        "https://chatgpt.com/backend-api/codex/responses"
-    )
+    assert config.get_complete_url("https://evil.example", {}) == ("https://chatgpt.com/backend-api/codex/responses")
     assert headers["Authorization"] == "Bearer request-token"
     assert headers["ChatGPT-Account-Id"] == "request-account"
     assert headers["session_id"] == "request-session"
@@ -276,7 +274,7 @@ def test_merge_response_choices_preserves_all_text_reasoning_and_tool_calls():
                         {
                             "id": "call-1",
                             "type": "function",
-                            "function": {"name": "one", "arguments": "{\"value\":1}"},
+                            "function": {"name": "one", "arguments": '{"value":1}'},
                         }
                     ],
                 ),
@@ -329,7 +327,7 @@ async def test_acompletion_collects_multi_item_native_stream(monkeypatch):
                     "call_id": "call-1",
                     "type": "function_call",
                     "name": "lookup",
-                    "arguments": "{\"key\":\"value\"}",
+                    "arguments": '{"key":"value"}',
                     "status": "completed",
                 },
             ]
@@ -382,7 +380,7 @@ async def test_acompletion_stream_preserves_single_tool_call_and_closes(monkeypa
         call_id="call-1",
         type="function_call",
         name="lookup",
-        arguments="{\"key\":\"value\"}",
+        arguments='{"key":"value"}',
         status="completed",
     )
     completed_response = _completed_response([tool_finished.model_dump()])
@@ -397,19 +395,19 @@ async def test_acompletion_stream_preserves_single_tool_call_and_closes(monkeypa
                 type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA,
                 item_id="function-1",
                 output_index=0,
-                delta="{\"key\":",
+                delta='{"key":',
             ),
             FunctionCallArgumentsDeltaEvent(
                 type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA,
                 item_id="function-1",
                 output_index=0,
-                delta="\"value\"}",
+                delta='"value"}',
             ),
             FunctionCallArgumentsDoneEvent(
                 type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE,
                 item_id="function-1",
                 output_index=0,
-                arguments="{\"key\":\"value\"}",
+                arguments='{"key":"value"}',
             ),
             OutputItemDoneEvent(
                 type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
@@ -441,18 +439,13 @@ async def test_acompletion_stream_preserves_single_tool_call_and_closes(monkeypa
     )
     chunks = [chunk async for chunk in stream]
     tool_calls = [
-        tool_call
-        for chunk in chunks
-        for choice in chunk.choices
-        for tool_call in (choice.delta.tool_calls or [])
+        tool_call for chunk in chunks for choice in chunk.choices for tool_call in (choice.delta.tool_calls or [])
     ]
 
     assert [call.id for call in tool_calls if call.id] == ["call-1"]
     assert [call.function.name for call in tool_calls if call.function and call.function.name] == ["lookup"]
-    assert "".join(
-        call.function.arguments or ""
-        for call in tool_calls
-        if call.function is not None
-    ) == "{\"key\":\"value\"}"
+    assert (
+        "".join(call.function.arguments or "" for call in tool_calls if call.function is not None) == '{"key":"value"}'
+    )
     assert source.closed is True
     assert source.response.closed is True

@@ -128,10 +128,6 @@ async def discover_models(provider_id: int) -> dict:
 
     static = _litellm_static(ptype)
     if ptype == "perplexity":
-        static = [
-            api_model_name(model, "perplexity")
-            for model in static
-            if not model.startswith("preset/")
-        ]
+        static = [api_model_name(model, "perplexity") for model in static if not model.startswith("preset/")]
     models = sorted(set(static))
     return {"models": models, "source": "litellm" if models else "none"}

@@ -250,10 +250,7 @@ async def begin_device_auth(provider_id: int, *, user_id: str, project_id: str) 
             ).scalar_one_or_none()
             now = _now()
             if attempt is not None and attempt.status == "pending" and not _is_expired(attempt.expires_at):
-                if (
-                    attempt.initiated_by_user_id != user_id
-                    or attempt.initiated_by_project_id != project_id
-                ):
+                if attempt.initiated_by_user_id != user_id or attempt.initiated_by_project_id != project_id:
                     raise ProviderAuthAttemptConflict("다른 관리자가 구독 연결을 진행 중입니다")
                 if attempt.provider_generation != provider.subscription_generation:
                     _terminalize(attempt, "error", _MIN_POLL_INTERVAL_SECONDS)
@@ -592,9 +589,7 @@ async def resolve_subscription_credential(ref: ProviderAuthRef) -> dict:
     try:
         async with factory() as session, session.begin():
             provider = (
-                await session.execute(
-                    select(LlmProvider).where(LlmProvider.id == ref["provider_id"]).with_for_update()
-                )
+                await session.execute(select(LlmProvider).where(LlmProvider.id == ref["provider_id"]).with_for_update())
             ).scalar_one_or_none()
             if (
                 provider is None
@@ -686,9 +681,7 @@ async def _mark_subscription_credential_rejected(ref: ProviderAuthRef, fingerpri
     try:
         async with factory() as session, session.begin():
             provider = (
-                await session.execute(
-                    select(LlmProvider).where(LlmProvider.id == ref["provider_id"]).with_for_update()
-                )
+                await session.execute(select(LlmProvider).where(LlmProvider.id == ref["provider_id"]).with_for_update())
             ).scalar_one_or_none()
             if (
                 provider is None

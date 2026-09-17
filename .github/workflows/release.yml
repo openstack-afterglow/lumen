@@ -1,0 +1,75 @@
+name: Lumen Package Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  release-package:
+    name: Build & Release Lumen Package
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip build hatchling
+
+      - name: Verify Tag/Version Lockstep
+        shell: bash
+        run: |
+          PYTHON_VER=$(python3 -c "import lumen; print(lumen.__version__)")
+          echo "Package version: ${PYTHON_VER}"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_VER="${GITHUB_REF#refs/tags/v}"
+            echo "Git tag version: ${TAG_VER}"
+            if [ "${PYTHON_VER}" != "${TAG_VER}" ]; then
+              echo "ERROR: Git tag version (${TAG_VER}) does not match package version (${PYTHON_VER})"
+              exit 1
+            fi
+          fi
+
+      - name: Build Lumen Wheel
+        run: python -m build --wheel --outdir dist
+
+      - name: Verify Kolla role shared data
+        shell: bash
+        run: |
+          python3.12 -m venv .lumen-venv
+          .lumen-venv/bin/pip install --upgrade pip
+          .lumen-venv/bin/pip install --no-deps dist/lumen-*.whl
+
+          ROLE_PATH=".lumen-venv/share/kolla-ansible/ansible/roles/lumen/tasks/main.yml"
+          if [ ! -f "${ROLE_PATH}" ]; then
+            echo "ERROR: Installed Kolla role asset missing at ${ROLE_PATH}"
+            exit 1
+          fi
+
+          echo "Installed role asset verified at ${ROLE_PATH}"
+
+      - name: Upload Lumen Wheel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-wheel
+          path: dist/lumen-*.whl
+
+      - name: Attach Wheel to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/lumen-*.whl

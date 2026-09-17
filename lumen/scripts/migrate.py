@@ -68,7 +68,9 @@ def load_manifest(path: Path = MANIFEST) -> list[Migration]:
 
 
 def _statements(path: Path) -> list[str]:
-    sql = "\n".join(line for line in path.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("--"))
+    sql = "\n".join(
+        line for line in path.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("--")
+    )
     return [statement.strip() for statement in sql.split(";") if statement.strip()]
 
 

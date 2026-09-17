@@ -285,9 +285,7 @@ async def acompletion(
     optional_params: dict,
 ) -> Any:
     """Execute one ChatGPT subscription request without process-global auth state."""
-    canonical_model = litellm_model_name(
-        canonical_subscription_model_name(model, "chatgpt_device")
-    )
+    canonical_model = litellm_model_name(canonical_subscription_model_name(model, "chatgpt_device"))
     access_token = _credential_value(credential, "access_token")
     account_id = _credential_value(credential, "account_id")
     call_id = str(uuid4())
@@ -330,11 +328,7 @@ async def acompletion(
     except BaseException as error:
         raise _subscription_error(error) from None
 
-    response_params = {
-        key: value
-        for key, value in request_data.items()
-        if key in _RESPONSE_KEYS
-    }
+    response_params = {key: value for key, value in request_data.items() if key in _RESPONSE_KEYS}
     response_params["stream"] = True
     input_items = request_data.get("input")
     if not isinstance(input_items, (str, list)):

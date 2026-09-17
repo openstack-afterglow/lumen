@@ -3,13 +3,13 @@
 ## 개발 환경
 
 ```bash
-uv sync --all-extras --frozen
+uv sync --extra service --extra dev --frozen
 uv run lumen-migrate --apply
 uv run lumen-api
 uv run lumen-worker
 ```
 
-Python 3.12 이상과 `uv`를 사용한다. MariaDB와 Redis가 필요한 변경은 integration 환경에서 검증한다. `lumen.conf` 또는 환경변수로 설정하며, 환경변수가 TOML보다 우선한다.
+Python 3.12 이상과 `uv`를 사용한다. 기본 `lumen` package에는 runtime dependency가 없으므로 service source, tests, service CLI는 항상 `service` extra와 함께 설치한다. MariaDB와 Redis가 필요한 변경은 integration 환경에서 검증한다. `lumen.conf` 또는 환경변수로 설정하며, 환경변수가 TOML보다 우선한다.
 
 ## Migration-first
 

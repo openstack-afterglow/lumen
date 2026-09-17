@@ -29,6 +29,7 @@ services:
   fake-provider:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-test
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
@@ -44,6 +45,7 @@ services:
   migrate:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-runtime
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
@@ -62,6 +64,7 @@ services:
   seed-local:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-runtime
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
@@ -90,6 +93,7 @@ services:
   lumen-api:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-api
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
@@ -110,6 +114,7 @@ services:
   lumen-worker:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-worker
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
@@ -125,6 +130,7 @@ services:
   system-tests:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-test
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}

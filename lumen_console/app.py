@@ -166,7 +166,9 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     async def login(body: CredentialsBody, response: Response) -> dict[str, str]:
         user = store.authenticate(body.username, body.password)
         if user is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="사용자 이름 또는 비밀번호가 올바르지 않습니다")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="사용자 이름 또는 비밀번호가 올바르지 않습니다"
+            )
         set_session(response, store.create_session(user))
         return {"username": user.username}
 
@@ -194,13 +196,17 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         }
 
     @app.put("/api/connection")
-    async def configure_connection(body: ConnectionBody, session_token: str = Depends(current_session)) -> dict[str, str | None]:
+    async def configure_connection(
+        body: ConnectionBody, session_token: str = Depends(current_session)
+    ) -> dict[str, str | None]:
         try:
             base_url = _normalized_base_url(body.base_url)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
         if body.auth_mode == "api_key" and not body.credential.startswith("sk-afgl-"):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="API key must start with sk-afgl-")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="API key must start with sk-afgl-"
+            )
         vault.set(
             session_token,
             LumenConnection(

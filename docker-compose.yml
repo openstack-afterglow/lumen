@@ -25,6 +25,7 @@ services:
   migrate:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-runtime
     command: ["lumen-migrate", "--apply"]
     environment: &lumen-environment
@@ -42,6 +43,7 @@ services:
   seed-local:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-runtime
     image: ${COMPOSE_PROJECT_NAME:-lumen}-runtime
     command: ["lumen-seed-local"]
@@ -69,6 +71,7 @@ services:
     profiles: ["tools"]
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-runtime
     image: ${COMPOSE_PROJECT_NAME:-lumen}-runtime
     command: ["lumen-local-connection"]
@@ -80,6 +83,7 @@ services:
   lumen-api:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-api
     environment:
       <<: *lumen-environment
@@ -100,6 +104,7 @@ services:
   lumen-worker:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-worker
     environment:
       <<: *lumen-environment
@@ -113,6 +118,7 @@ services:
   lumen-console:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: lumen-runtime
     command: ["uvicorn", "lumen_console.app:app", "--host", "0.0.0.0", "--port", "7010"]
     environment:

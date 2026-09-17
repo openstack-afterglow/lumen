@@ -13,6 +13,15 @@ Lumen의 테스트 시스템은 로컬 개발부터 외부 배포 검증까지 �
 
 ---
 
+## 설치
+
+root service test를 실행하기 전에 runtime과 개발 도구를 모두 설치한다.
+
+```bash
+uv sync --extra service --extra dev --frozen
+```
+
+
 ## 로컬 테스트 실행
 
 기본 테스트 실행은 `lumen-test` CLI 명령을 사용합니다.
@@ -72,12 +81,13 @@ uv run pytest -m "not integration and not system" tests
 
 ## CI 게이트 및 재사용 가능한 워크플로우
 
-Lumen GitHub Actions CI (`.github/workflows/ci.yml`)는 다음과 같은 4개 자동화 게이트로 구성되어 있습니다.
+Lumen GitHub Actions CI (`.github/workflows/ci.yml`)는 다음과 같은 5개 자동화 게이트로 구성되어 있습니다.
 
-1. **`service`**: Contract 테스트 (`pytest -m "not integration and not system"`) 및 Ruff 린트 검증.
+1. **`service`**: `service` 및 `dev` extra를 설치한 Contract 테스트 (`pytest -m "not integration and not system"`) 및 Ruff 린트 검증.
 2. **`sdk`**: SDK 패키지 검증 및 Ruff 린트.
-3. **`integration`**: MariaDB 및 Redis 서비스 컨테이너를 띄우고, `lumen-migrate --apply`를 2회 연속 실행하여 마이그레이션 멱등성(migration-twice)을 증명한 후 `pytest -m integration`을 수행.
-4. **`system`**: `lumen-test system`을 호출하여 프로세스 스택 전체의 HTTP 및 독립 실행 검증.
+3. **`kolla`**: root `lumen` wheel의 Kolla role shared-data metadata와 wheel contents를 검증.
+4. **`integration`**: `service` 및 `dev` extra를 설치하고 MariaDB 및 Redis 서비스 컨테이너를 띄운 뒤, `lumen-migrate --apply`를 2회 연속 실행하여 마이그레이션 멱등성(migration-twice)을 증명한 후 `pytest -m integration`을 수행.
+5. **`system`**: `service` 및 `dev` extra를 설치하고 `lumen-test system`을 호출하여 프로세스 스택 전체의 HTTP 및 독립 실행 검증.
 
 ### Reusable Workflow 활용 예시 (Exact Refs)
 

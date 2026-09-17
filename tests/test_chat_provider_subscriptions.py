@@ -388,6 +388,7 @@ async def test_subscription_auth_routes_require_authentication():
         unauthenticated = await raw_client.post("/v1/admin/providers/7/auth/device")
     assert unauthenticated.status_code == 401
 
+
 @pytest.mark.asyncio
 async def test_device_start_route_binds_initiator_and_preserves_no_store(admin_client, monkeypatch):
     calls = []

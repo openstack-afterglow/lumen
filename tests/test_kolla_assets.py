@@ -20,9 +20,8 @@ ROLE_DIR = KOLLA_DIR / "ansible" / "roles" / "lumen"
 
 def test_kolla_required_assets_exist():
     assert KOLLA_DIR.exists()
-    assert (KOLLA_DIR / "pyproject.toml").exists()
-    assert (KOLLA_DIR / "src" / "lumen_kolla" / "__init__.py").exists()
-    assert (KOLLA_DIR / "uv.lock").exists()
+    assert (REPO_ROOT / "pyproject.toml").exists()
+    assert ROLE_DIR.exists()
 
     required_role_files = [
         "defaults/main.yml",
@@ -70,17 +69,18 @@ def test_kolla_yaml_and_jinja_validity():
     assert parsed_ast is not None
 
 
-def test_kolla_package_version_image_tag_lockstep():
-    app_version = lumen.__version__
+def test_kolla_package_and_image_version_contract():
+    assert lumen.__version__ == "0.2.2"
+
     sdk_init = (REPO_ROOT / "sdk" / "lumen_sdk" / "__init__.py").read_text(encoding="utf-8")
-    assert app_version == "0.2.1"
     assert '__version__ = "0.2.1"' in sdk_init
 
     defaults_yaml = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
 
-    assert defaults_yaml["lumen_image_tag"] == app_version
-
+    # The root package revision does not imply a new published runtime image.
+    assert defaults_yaml["lumen_image_tag"] == "0.2.1"
     assert defaults_yaml["lumen_source_version"] == "c561a1550921e49e6516c3e05fa89fee8457352a"
+
     defaults_raw = (ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8")
     assert "afterglow_image_tag" not in defaults_raw, "Lumen package default refers to afterglow_image_tag"
     assert defaults_yaml["lumen_encryption_key"] == "", "Lumen encryption key default must be explicit empty string"
@@ -154,12 +154,12 @@ def test_kolla_main_tasks_action_validation():
         assert f"'{unhandled}'" not in when_str
 
 
-def test_kolla_shared_data_metadata():
-    pyproject_data = tomllib.loads((KOLLA_DIR / "pyproject.toml").read_text(encoding="utf-8"))
+def test_root_package_shared_data_metadata():
+    pyproject_data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     wheel_targets = pyproject_data["tool"]["hatch"]["build"]["targets"]["wheel"]
     shared_data = wheel_targets["shared-data"]
 
-    assert shared_data.get("ansible/roles/lumen") == "share/kolla-ansible/ansible/roles/lumen"
+    assert shared_data.get("deploy/kolla/ansible/roles/lumen") == "share/kolla-ansible/ansible/roles/lumen"
 
 
 def test_kolla_keystone_endpoint_registration():
@@ -224,11 +224,11 @@ def test_kolla_reconfigure_refresh_ordering():
     )
 
 
-def test_kolla_wheel_contents():
+def test_root_wheel_contains_kolla_shared_data():
     with tempfile.TemporaryDirectory() as tmpdir:
         result = subprocess.run(
             ["uv", "build", "--wheel", "--out-dir", tmpdir],
-            cwd=KOLLA_DIR,
+            cwd=REPO_ROOT,
             capture_output=True,
             text=True,
         )
@@ -237,13 +237,13 @@ def test_kolla_wheel_contents():
         wheels = list(Path(tmpdir).glob("*.whl"))
         assert len(wheels) == 1
         wheel_path = wheels[0]
-        assert wheel_path.name == f"lumen_kolla-{lumen.__version__}-py3-none-any.whl"
+        assert wheel_path.name == f"lumen-{lumen.__version__}-py3-none-any.whl"
 
         with zipfile.ZipFile(wheel_path, "r") as zf:
             namelist = zf.namelist()
-            assert "lumen_kolla/__init__.py" in namelist
+            assert "lumen/__init__.py" in namelist
 
-            prefix = f"lumen_kolla-{lumen.__version__}.data/data/share/kolla-ansible/ansible/roles/lumen/"
+            prefix = f"lumen-{lumen.__version__}.data/data/share/kolla-ansible/ansible/roles/lumen/"
             role_files_in_wheel = [name for name in namelist if name.startswith(prefix)]
 
             assert len(role_files_in_wheel) > 0

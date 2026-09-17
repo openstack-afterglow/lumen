@@ -42,8 +42,17 @@ def test_run_integration_success(mock_run: MagicMock) -> None:
     calls = mock_run.call_args_list
     assert len(calls) == 4
     assert calls[0][0][0] == [
-        "docker", "compose", "-f", "docker-compose.system.yml",
-        "up", "-d", "--wait", "--wait-timeout", "120", "mariadb", "redis",
+        "docker",
+        "compose",
+        "-f",
+        "docker-compose.system.yml",
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "120",
+        "mariadb",
+        "redis",
     ]
     assert calls[1][0][0] == ["lumen-migrate", "--apply"]
     assert calls[2][0][0] == ["pytest", "-m", "integration"]
@@ -83,7 +92,15 @@ def test_run_system_success(mock_run: MagicMock) -> None:
     compose = ["docker", "compose", "-f", "docker-compose.system.yml"]
     assert calls[0][0][0] == [*compose, "build", "system-tests"]
     assert calls[1][0][0] == [
-        *compose, "up", "-d", "--build", "--wait", "--wait-timeout", "180", "lumen-api", "lumen-worker",
+        *compose,
+        "up",
+        "-d",
+        "--build",
+        "--wait",
+        "--wait-timeout",
+        "180",
+        "lumen-api",
+        "lumen-worker",
     ]
     assert calls[2][0][0] == [*compose, "run", "--rm", "--no-deps", "system-tests"]
     assert calls[3][0][0] == [*compose, "down", "-v", "--remove-orphans"]

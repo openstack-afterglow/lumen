@@ -48,11 +48,7 @@ def fail(message: str) -> None:
 
 
 def reject_controls(value: str, name: str) -> str:
-    if (
-        not value
-        or value != value.strip()
-        or any(ord(char) < 32 or ord(char) == 127 for char in value)
-    ):
+    if not value or value != value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value):
         fail(f"external PostgreSQL URL has an invalid {name}")
     return value
 
@@ -88,9 +84,7 @@ def main() -> int:
                 fail(f"external PostgreSQL URL has an unsupported query parameter: {key}")
             parameters[key] = reject_controls(value, f"query parameter {key}")
 
-        service = "[external]\n" + "\n".join(
-            f"{key}={value}" for key, value in parameters.items()
-        ) + "\n"
+        service = "[external]\n" + "\n".join(f"{key}={value}" for key, value in parameters.items()) + "\n"
         print(json.dumps({"service": service}))
         return 0
     except (TypeError, ValueError) as error:

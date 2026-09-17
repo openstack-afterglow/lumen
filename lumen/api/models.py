@@ -103,12 +103,15 @@ class ProviderResponse(BaseModel):
     has_billing_admin_key: bool = False
     is_active: bool
     margin_multiplier: float
-    billing_capability: Literal[
-        "openrouter_key",
-        "deepseek_balance",
-        "openai_admin_usage",
-        "anthropic_admin_usage",
-    ] | None = None
+    billing_capability: (
+        Literal[
+            "openrouter_key",
+            "deepseek_balance",
+            "openai_admin_usage",
+            "anthropic_admin_usage",
+        ]
+        | None
+    ) = None
     created_at: str | None
     updated_at: str | None
     models_dev_provider_id: str | None = None
@@ -168,12 +171,15 @@ class ProviderBillingResponse(BaseModel):
     provider_id: int
     provider_name: str
     provider_type: str
-    capability: Literal[
-        "openrouter_key",
-        "deepseek_balance",
-        "openai_admin_usage",
-        "anthropic_admin_usage",
-    ] | None
+    capability: (
+        Literal[
+            "openrouter_key",
+            "deepseek_balance",
+            "openai_admin_usage",
+            "anthropic_admin_usage",
+        ]
+        | None
+    )
     status: Literal["available", "unavailable", "unsupported"]
     reason: (
         Literal[

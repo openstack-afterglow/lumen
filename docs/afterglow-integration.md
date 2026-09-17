@@ -575,6 +575,7 @@ if (require.main === module) {
 import os
 from openai import OpenAI
 
+
 def run_openai_example():
     api_key = os.environ["LUMEN_API_KEY"]
     model = os.environ["LUMEN_MODEL"]
@@ -590,6 +591,7 @@ def run_openai_example():
     )
     print("OpenAI Response:", response.choices[0].message.content)
 
+
 if __name__ == "__main__":
     run_openai_example()
 ```
@@ -598,6 +600,7 @@ if __name__ == "__main__":
 ```python
 import os
 from anthropic import Anthropic
+
 
 def run_anthropic_example():
     api_key = os.environ["LUMEN_API_KEY"]
@@ -614,6 +617,7 @@ def run_anthropic_example():
     )
     print("Anthropic Response:", message.content[0].text)
 
+
 if __name__ == "__main__":
     run_anthropic_example()
 ```
@@ -624,6 +628,7 @@ import os
 from uuid import uuid4
 from lumen_sdk import Client
 
+
 def run_native_sdk_example():
     api_key = os.environ["LUMEN_API_KEY"]
     model = os.environ["LUMEN_MODEL"]
@@ -632,7 +637,7 @@ def run_native_sdk_example():
     # Client의 base_url은 /v1이 없는 Origin 형태여야 함
     with Client(origin, api_key) as client:
         run_desc = client.temp_completion(
-            idempotency_key=str(uuid4()), # UUID 필수
+            idempotency_key=str(uuid4()),  # UUID 필수
             model_id=model,
             parts=[{"type": "text", "text": "Native Run Test"}],
             features={"memory": False, "tool_policy": {"mode": "none"}},
@@ -643,6 +648,7 @@ def run_native_sdk_example():
         # SSE Event Journal Replay 및 수신
         for line in client.run_events(run_desc["run_id"]):
             print("Native Event:", line)
+
 
 if __name__ == "__main__":
     run_native_sdk_example()

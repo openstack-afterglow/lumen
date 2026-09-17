@@ -141,7 +141,8 @@ async def create_provider(
         ),
         encrypted_billing_admin_key=(
             encrypt_llm_provider_billing_admin_key(billing_admin_key)
-            if billing_admin_key and billing_admin_key_supported(normalized_provider_type, normalized_auth_mode, api_base)
+            if billing_admin_key
+            and billing_admin_key_supported(normalized_provider_type, normalized_auth_mode, api_base)
             else None
         ),
         api_key_env=normalize_api_key_env(api_key_env) if normalized_auth_mode == "api_key" else None,

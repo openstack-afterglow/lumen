@@ -26,14 +26,11 @@ def _free_loopback_port() -> str:
 def _compose_env(layer: str) -> dict[str, str]:
     env = os.environ.copy()
     env["COMPOSE_PROJECT_NAME"] = (
-        os.environ.get("LUMEN_TEST_COMPOSE_PROJECT")
-        or f"lumen-{layer}-{os.getpid()}-{secrets.token_hex(4)}"
+        os.environ.get("LUMEN_TEST_COMPOSE_PROJECT") or f"lumen-{layer}-{os.getpid()}-{secrets.token_hex(4)}"
     )
     env["MARIADB_PORT"] = os.environ.get("MARIADB_PORT") or _free_loopback_port()
     env["REDIS_PORT"] = os.environ.get("REDIS_PORT") or _free_loopback_port()
     return env
-
-
 
 
 def run_contract(extra_args: list[str] | None = None) -> int:
@@ -71,8 +68,7 @@ def run_integration(extra_args: list[str] | None = None) -> int:
     redis_port = env["REDIS_PORT"]
 
     env["DATABASE_URL"] = (
-        os.environ.get("LUMEN_TEST_DATABASE_URL")
-        or f"mysql+aiomysql://lumen:lumen@127.0.0.1:{mariadb_port}/lumen"
+        os.environ.get("LUMEN_TEST_DATABASE_URL") or f"mysql+aiomysql://lumen:lumen@127.0.0.1:{mariadb_port}/lumen"
     )
     env["REDIS_URL"] = os.environ.get("LUMEN_TEST_REDIS_URL") or f"redis://127.0.0.1:{redis_port}/0"
     env["LUMEN_ENCRYPTION_KEY"] = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

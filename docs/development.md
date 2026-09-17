@@ -1,5 +1,9 @@
 # 개발 구조
 
+## 설치 경계
+
+root `lumen` package에는 Kolla role shared data만 포함된다. 서비스 실행·runtime import·root test는 `uv sync --extra service --extra dev --frozen`으로 service extra를 설치한 환경에서 수행한다. Kolla-Ansible은 Lumen package dependency가 아니라 operator의 Kolla environment dependency다.
+
 ## 최종 소유권
 
 | 경로 | 소유 책임 |

@@ -140,9 +140,8 @@ def test_perplexity_public_model_name_removes_only_transport_prefix(model_name, 
 
 
 def test_non_perplexity_public_model_name_is_unchanged():
-    assert credentials.api_model_name("anthropic/claude-sonnet-4-6", "anthropic") == (
-        "anthropic/claude-sonnet-4-6"
-    )
+    assert credentials.api_model_name("anthropic/claude-sonnet-4-6", "anthropic") == ("anthropic/claude-sonnet-4-6")
+
 
 @pytest.mark.parametrize(
     ("model_name", "expected"),
@@ -181,7 +180,6 @@ def test_perplexity_route_model_name_rejects_database_overflow():
         credentials.perplexity_route_model_name("openai/" + ("m" * 184))
 
 
-
 def test_perplexity_public_projection_preserves_route_key_and_custom_label(monkeypatch):
     monkeypatch.setattr(pricing, "_effective_capabilities", lambda *_args, **_kwargs: ({}, "litellm"))
     base = {
@@ -216,6 +214,7 @@ def test_perplexity_public_projection_preserves_route_key_and_custom_label(monke
     assert default_label["api_provider"] == "perplexity"
     assert default_label["display_name"] == "perplexity/sonar"
     assert custom_label["display_name"] == "Sonar Research"
+
 
 def test_subscription_public_projection_distinguishes_api_key_and_subscription_status(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "environment-key")

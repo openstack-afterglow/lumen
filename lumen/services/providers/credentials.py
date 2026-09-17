@@ -84,7 +84,7 @@ def api_model_name(model_name: str, provider_type: str) -> str:
     normalized = str(model_name or "").strip()
     if provider_type == "perplexity":
         while normalized.startswith("perplexity/perplexity/"):
-            normalized = normalized[len("perplexity/"):]
+            normalized = normalized[len("perplexity/") :]
         prefix, separator, remainder = normalized.partition("/")
         if prefix == "perplexity" and separator and "/" in remainder:
             return remainder
@@ -93,35 +93,39 @@ def api_model_name(model_name: str, provider_type: str) -> str:
         return normalized
     if provider_type == "gemini" or normalized.startswith("gemini/gemini-"):
         while normalized.startswith("gemini/"):
-            rest = normalized[len("gemini/"):]
+            rest = normalized[len("gemini/") :]
             if not rest:
                 break
             normalized = rest
         return normalized
     return normalized
 
+
 def short_model_name(model_name: str, provider_type: str | None = None) -> str:
     """Return a human-friendly shortened model name without redundant provider prefixes."""
     name = api_model_name(model_name, provider_type or "")
     if provider_type == "perplexity":
         while name.startswith("perplexity/"):
-            rest = name[len("perplexity/"):]
+            rest = name[len("perplexity/") :]
             if not rest:
                 break
             name = rest
     elif provider_type == "gemini" or name.startswith("gemini/"):
         while name.startswith("gemini/"):
-            rest = name[len("gemini/"):]
+            rest = name[len("gemini/") :]
             if not rest:
                 break
             name = rest
     return name
 
+
 def perplexity_route_model_name(model_name: str) -> str:
     """Encode one canonical Perplexity API ID as a LiteLLM transport route."""
     canonical = api_model_name(model_name, "perplexity")
-    if not canonical or any(not segment for segment in canonical.split("/")) or any(
-        character.isspace() for character in canonical
+    if (
+        not canonical
+        or any(not segment for segment in canonical.split("/"))
+        or any(character.isspace() for character in canonical)
     ):
         raise ProviderValidationError("Perplexity model_name 형식이 올바르지 않습니다")
     routed = f"perplexity/{canonical}"

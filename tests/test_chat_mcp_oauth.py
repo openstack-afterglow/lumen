@@ -485,8 +485,7 @@ class TestMcpOAuthRoutes:
 
         assert response.status_code == 303
         assert (
-            response.headers["location"]
-            == "http://localhost:3080/dashboard/chat/settings?section=mcp&mcp_oauth=failed"
+            response.headers["location"] == "http://localhost:3080/dashboard/chat/settings?section=mcp&mcp_oauth=failed"
         )
 
     async def test_owner_can_read_and_disconnect_oauth(self, client, monkeypatch):
