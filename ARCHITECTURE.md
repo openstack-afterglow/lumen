@@ -191,9 +191,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "8b3b29c83c7bff004ec7cc812bb9e63547d39f5eb420862aed5f267551d4004c",
-  "reviewed_at": "2026-09-17T15:47:43Z",
-  "summary": "Root package migration verified: 1030 unit tests, kolla assets 12, ruff clean; ruff 0.16 formatter normalization applied."
+  "source_sha256": "811291a75464bde10702261f99b8f9a74aefa1e2a4e6e8ae5f82aabf3a850a9e",
+  "reviewed_at": "2026-09-18T23:20:02Z",
+  "summary": "Relax requires-python to >=3.11 for Kolla control node compatibility; bump afterglow-crypto service pin to the matching >=3.11 commit"
 }
 ```
 <!-- architecture-review:end -->
