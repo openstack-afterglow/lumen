@@ -29,6 +29,7 @@ from langgraph.types import Command, interrupt
 
 from lumen.services import agent_runtime_v2, litellm_client
 from lumen.services.checkpointer import chat_checkpointer
+from lumen.services.providers.errors import ProviderSubscriptionError
 from lumen.services.tool_runtime import bindings, contracts, dispatch, selection
 from lumen.services.tools import ToolContext
 
@@ -211,27 +212,37 @@ def _is_http_url(url) -> bool:
 def _extract_citations(chunk, delta, acc: dict[str, dict]) -> None:
     """Normalize provider citations into stable web or document source records."""
 
-    # search_results — rich web sources take precedence over bare URL citations.
-    for item in _get(chunk, "search_results") or []:
-        url = _get(item, "url")
+    def add_web_citation(url, title, snippet, ranges: dict | None = None, *, replace: bool = False) -> None:
         if not _is_http_url(url):
-            continue
-        snippet = _get(item, "snippet")
-        acc[url] = {
+            return
+        record = {
             "source_kind": "web",
             "url": url,
-            "title": _get(item, "title"),
-            "snippet": (snippet[:_CITATION_SNIPPET_CAP] if isinstance(snippet, str) else None),
+            "title": title if isinstance(title, str) else None,
+            "snippet": snippet[:_CITATION_SNIPPET_CAP] if isinstance(snippet, str) else None,
+            **(ranges or {}),
         }
+        existing = acc.get(url)
+        if existing is None:
+            acc[url] = record
+            return
+        # Providers split one source across events (Anthropic sends the result
+        # block first and the cited text later), so fill gaps without clobbering.
+        for key, value in record.items():
+            if value is not None and (replace or existing.get(key) is None):
+                existing[key] = value
+
+    # LiteLLM may preserve raw Sonar/Agent results at the response or delta level.
+    provider_fields = _get(delta, "provider_specific_fields") or {}
+    for carrier in (chunk, _get(chunk, "provider_specific_fields"), provider_fields):
+        for item in _get(carrier, "search_results") or []:
+            add_web_citation(_get(item, "url"), _get(item, "title"), _get(item, "snippet"), replace=True)
 
     # Bare URL citations, emitted by several OpenAI-compatible providers.
     for citation in _get(chunk, "citations") or []:
         if _is_http_url(citation):
             acc.setdefault(citation, {"source_kind": "web", "url": citation, "title": None, "snippet": None})
 
-    # LiteLLM's Anthropic-unified protocol attaches document citations to a
-    # streaming delta's provider_specific_fields["citation"]. A non-stream
-    # content-block shape is also accepted for replayed/provider test fixtures.
     def add_document_citation(citation: Any) -> None:
         index = _get(citation, "document_index")
         if not isinstance(index, int) or index < 0:
@@ -257,22 +268,44 @@ def _extract_citations(chunk, delta, acc: dict[str, dict]) -> None:
             },
         )
 
-    provider_citation = _get(_get(delta, "provider_specific_fields") or {}, "citation")
+    # LiteLLM's Anthropic-unified protocol carries both document citations
+    # (`char_location`/`page_location`, keyed by document_index) and native
+    # search citations (`web_search_result_location`, keyed by URL) through the
+    # same citation field, so the shape — not the transport — selects the kind.
+    def add_provider_citation(citation: Any) -> None:
+        url = _get(citation, "url")
+        if _is_http_url(url):
+            add_web_citation(url, _get(citation, "title"), _get(citation, "cited_text"))
+            return
+        add_document_citation(citation)
+
+    provider_citation = _get(provider_fields, "citation")
     if provider_citation is not None:
-        add_document_citation(provider_citation)
+        add_provider_citation(provider_citation)
+    for group in _get(provider_fields, "citations") or []:
+        for citation in group if isinstance(group, list) else [group]:
+            add_provider_citation(citation)
+    # Anthropic server-side search emits its result set as tool-result blocks.
+    for block in _get(provider_fields, "web_search_results") or []:
+        for result in _get(block, "content") or []:
+            add_web_citation(_get(result, "url"), _get(result, "title"), None)
     for content_block in _get(chunk, "content") or []:
         for citation in _get(content_block, "citations") or []:
-            add_document_citation(citation)
+            add_provider_citation(citation)
 
-    # annotations(url_citation) — Gemini/OpenAI
-    for annotation in _get(delta, "annotations") or []:
-        url_citation = _get(annotation, "url_citation") or {}
-        url = _get(url_citation, "url")
-        if _is_http_url(url):
-            acc.setdefault(
-                url,
-                {"source_kind": "web", "url": url, "title": _get(url_citation, "title"), "snippet": None},
-            )
+    # annotations(url_citation) — chat-completions providers (Gemini/OpenAI/Perplexity)
+    # nest the citation, while the installed Responses→chat bridge forwards the flat
+    # Responses annotation unchanged; accept both.
+    for annotation in _get(delta, "annotations") or _get(chunk, "annotations") or []:
+        url_citation = _get(annotation, "url_citation") or annotation
+        start = _get(url_citation, "start_index")
+        end = _get(url_citation, "end_index")
+        ranges = (
+            {"start_index": start, "end_index": end}
+            if isinstance(start, int) and isinstance(end, int) and 0 <= start <= end
+            else {}
+        )
+        add_web_citation(_get(url_citation, "url"), _get(url_citation, "title"), None, ranges)
 
 
 def _managed_tool_citations(tool_name: str, result: str) -> list[dict]:
@@ -473,9 +506,22 @@ def _build_graph(params: dict, ctx: ToolContext):
                         restored,
                         include_managed=False,
                     )
+        round_index = int(state.get("loop_count", 0))
         schemas = (
-            _v2_tool_schemas(v2_bindings) if isinstance(v2_bindings, dict) else await selection.context_tool_schemas(ctx)
+            _v2_tool_schemas(v2_bindings)
+            if isinstance(v2_bindings, dict)
+            else await selection.context_tool_schemas(ctx)
         )
+        prepared_messages = await boundary(
+            "prepare_context",
+            messages=messages,
+            tool_schemas=schemas,
+            round_index=round_index,
+        )
+        if prepared_messages is not None:
+            if not isinstance(prepared_messages, list) or not all(isinstance(item, dict) for item in prepared_messages):
+                raise RuntimeError("context preparation returned invalid messages")
+            messages = prepared_messages
 
         reasoning_effort = None if params["model"] in _REASONING_UNSUPPORTED else params.get("reasoning_effort")
         disable_reasoning_for_tools = bool(schemas) and (
@@ -483,7 +529,6 @@ def _build_graph(params: dict, ctx: ToolContext):
             or _requires_explicit_none_for_tools(params["model"], params.get("custom_llm_provider"), reasoning_effort)
         )
         attempt = 0
-        round_index = int(state.get("loop_count", 0))
 
         async def open_stream(effort, *, disable_reasoning: bool = False):
             nonlocal attempt
@@ -505,9 +550,11 @@ def _build_graph(params: dict, ctx: ToolContext):
                         custom_llm_provider=params.get("custom_llm_provider"),
                         api_base=params.get("api_base"),
                         api_key=params.get("api_key"),
+                        provider_auth=params.get("provider_auth"),
                         max_tokens=params.get("max_tokens"),
                         temperature=params.get("temperature"),
                         reasoning_effort=effort,
+                        native_web_search=params.get("native_web_search"),
                         extra=provider_extra or None,
                     ),
                     None,
@@ -534,10 +581,16 @@ def _build_graph(params: dict, ctx: ToolContext):
             )
             return {"model_failed": True, "pending_tool_calls": []}
         except Exception as exc:
+            if isinstance(exc, ProviderSubscriptionError):
+                writer({"type": "error", "code": exc.code, "message": exc.message})
+                return {"model_failed": True, "pending_tool_calls": []}
             if schemas and _is_tool_reasoning_conflict(exc):
                 logger.warning("tool 요청의 기본 reasoning을 명시적으로 비활성화해 재시도 model=%s", params["model"])
                 try:
                     response, replay_payload = await open_stream(None, disable_reasoning=True)
+                except ProviderSubscriptionError as retry_error:
+                    writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
+                    return {"model_failed": True, "pending_tool_calls": []}
                 except Exception:
                     logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
                     writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
@@ -549,6 +602,9 @@ def _build_graph(params: dict, ctx: ToolContext):
                 )
                 try:
                     response, replay_payload = await open_stream(None)
+                except ProviderSubscriptionError as retry_error:
+                    writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
+                    return {"model_failed": True, "pending_tool_calls": []}
                 except Exception:
                     logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
                     writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
@@ -608,6 +664,19 @@ def _build_graph(params: dict, ctx: ToolContext):
                     usage = _get(chunk, "usage")
                     if usage is not None:
                         final_usage = usage
+            except ProviderSubscriptionError as exc:
+                failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
+                if _abort_code(failure) is not None:
+                    writer(
+                        {
+                            "type": "error",
+                            "code": _abort_code(failure),
+                            "message": "이전 모델 호출 결과를 안전하게 확인할 수 없습니다",
+                        }
+                    )
+                    return {"model_failed": True, "pending_tool_calls": []}
+                writer({"type": "error", "code": exc.code, "message": exc.message})
+                return {"model_failed": True, "pending_tool_calls": []}
             except Exception:
                 logger.warning("litellm 스트림 소비 오류 model=%s", params.get("model"), exc_info=True)
                 failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
@@ -620,7 +689,6 @@ def _build_graph(params: dict, ctx: ToolContext):
                         }
                     )
                     return {"model_failed": True, "pending_tool_calls": []}
-                logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
                 writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
                 return {"model_failed": True, "pending_tool_calls": []}
             tool_calls = _normalize_tool_calls(
@@ -958,8 +1026,10 @@ def _build_graph(params: dict, ctx: ToolContext):
             tool_call_id = call_id_for(tool_call)
             try:
                 arguments = json.loads(tool_call.get("args") or "{}")
+                argument_error = not isinstance(arguments, dict)
             except (json.JSONDecodeError, TypeError):
                 arguments = {}
+                argument_error = True
             source, category = await tool_activity_metadata(tool_call["name"])
             replay_payload = await boundary(
                 "tool_started",
@@ -989,6 +1059,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                 "arguments": arguments,
                 "source": source,
                 "category": category,
+                "argument_error": argument_error,
                 "replay_payload": replay_payload,
             }
 
@@ -1015,6 +1086,18 @@ def _build_graph(params: dict, ctx: ToolContext):
                     if isinstance(replay_payload.get("error_code"), str)
                     else None,
                     "replayed": True,
+                }
+            if prepared["argument_error"]:
+                return {
+                    "result": "Tool arguments do not match the required schema.",
+                    "visible": True,
+                    "execution_usage": [],
+                    "warning_code": "invalid_tool_arguments",
+                    "display": [],
+                    "artifacts": [],
+                    "result_status": "failed",
+                    "error_code": "invalid_tool_arguments",
+                    "replayed": False,
                 }
             tool_call = prepared["tool_call"]
             try:
@@ -1059,7 +1142,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                     "warning_code": execution_result.warning_code,
                     "display": [],
                     "artifacts": [],
-                    "result_status": "completed",
+                    "result_status": execution_result.status,
                     "error_code": execution_result.warning_code,
                     "replayed": False,
                 }
@@ -1108,7 +1191,10 @@ def _build_graph(params: dict, ctx: ToolContext):
                     },
                 )
             if warning_code:
-                writer({"type": "warning", "code": warning_code, "safe_message": "Advisor request failed."})
+                safe_message = (
+                    "Advisor request failed." if warning_code == "advisor_call_failed" else "Tool call failed."
+                )
+                writer({"type": "warning", "code": warning_code, "safe_message": safe_message})
             tool_result_event = {
                 "type": "tool_result",
                 "tool_call_id": prepared["tool_call_id"],
@@ -1219,11 +1305,12 @@ async def stream(
     *,
     model: str,
     messages: list[dict],
-    project_id: str,
-    user_id: str,
+    project_id: str | None = None,
+    user_id: str | None = None,
     custom_llm_provider: str | None = None,
     api_base: str | None = None,
     api_key: str | None = None,
+    provider_auth: dict | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
     reasoning_effort: str | None = None,
@@ -1235,6 +1322,7 @@ async def stream(
     managed_search: dict[str, Any] | None = None,
     managed_fetch: dict[str, Any] | None = None,
     managed_advisor: dict[str, Any] | None = None,
+    native_web_search: dict[str, Any] | None = None,
     response_format: dict[str, Any] | None = None,
     execution_hooks: object | None = None,
     run_id: str | None = None,
@@ -1254,6 +1342,7 @@ async def stream(
         "custom_llm_provider": custom_llm_provider,
         "api_base": api_base,
         "api_key": api_key,
+        "provider_auth": provider_auth,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "reasoning_effort": reasoning_effort,
@@ -1265,6 +1354,7 @@ async def stream(
         "max_model_turns": max_model_turns,
         "max_tool_calls": max_tool_calls,
         "allowed_direct_effects": frozenset(allowed_direct_effects) if allowed_direct_effects is not None else None,
+        "native_web_search": native_web_search,
     }
     ctx = ToolContext(
         project_id=project_id,

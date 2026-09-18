@@ -11,7 +11,7 @@ from lumen.services import mcp_adapter as mcp_ledger
 from lumen.services import mcp_adapter as mcp_lumen
 from lumen.services import mcp_adapter as mcp_registry
 from lumen.services import mcp_client
-from lumen.services.agent_protocol import ToolBinding, ToolDefinition
+from lumen.services.agent_protocol import GeneratedToolFile, ToolBinding, ToolDefinition
 from lumen.services.agent_protocol import ToolExecutionResult as V2ToolExecutionResult
 from lumen.services.tools import ToolContext
 
@@ -23,11 +23,25 @@ from .contracts import (
     _v2_effect,
     _v2_provider_name,
     _v2_result,
+    custom_tool_function_schema,
     v2_builtin_tool_bindings,
 )
 from .selection import _load_custom, _load_mcp
 
 logger = logging.getLogger(__name__)
+
+
+def _v2_mcp_result(value: str | mcp_client.McpToolOutput) -> V2ToolExecutionResult:
+    if isinstance(value, str):
+        return _v2_result(value)
+    return V2ToolExecutionResult(
+        status="completed",
+        model_content=value.text,
+        display=[TextPart(type="text", text=value.text)] if value.text else [],
+        generated_files=[
+            GeneratedToolFile(data=file.data, name=file.name, media_type=file.media_type) for file in value.files
+        ],
+    )
 
 
 async def _lumen_registry_bindings(ctx: ToolContext) -> tuple[ToolBinding, ...]:
@@ -427,13 +441,16 @@ async def v2_tool_bindings(
             logger.warning("custom tool without a canonical destination excluded from v2 bindings id=%s", identifier)
             continue
         try:
+            projection = custom_tool_function_schema(
+                identifier,
+                custom.get("name"),
+                custom.get("description"),
+                custom.get("params_schema"),
+            )
             definition = ToolDefinition(
-                name=_v2_provider_name("custom", identifier, custom.get("name")),
-                description=str(custom.get("description") or custom.get("name") or "Custom HTTP tool"),
-                input_schema={
-                    **(custom.get("params_schema") or {"type": "object", "properties": {}}),
-                    "additionalProperties": False,
-                },
+                name=projection["name"],
+                description=projection["description"],
+                input_schema=projection["parameters"],
                 effect=_v2_effect(custom.get("effect")),
                 source="custom_http",
                 activity_category="커스텀 도구",
@@ -540,7 +557,7 @@ async def v2_tool_bindings(
                         model_content="The selected MCP server is no longer available.",
                         error_code="extension_unavailable",
                     )
-                return _v2_result(await mcp_client.call_tool(current, method_name, arguments))
+                return _v2_mcp_result(await mcp_client.call_tool(current, method_name, arguments))
 
             add(
                 ToolBinding(

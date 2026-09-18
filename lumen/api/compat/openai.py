@@ -19,13 +19,19 @@ from pydantic import BaseModel, Field
 from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
 from lumen.services import openai_compat
-from lumen.services.providers import errors, repository
+from lumen.services.providers import errors, routing
 
 router = APIRouter()
 
 
 class OpenAIChatRequest(BaseModel):
     model: str = Field(..., max_length=190)
+    provider: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=40,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
     messages: list[dict] = Field(..., min_length=1)
     stream: bool = False
     temperature: float | None = None
@@ -69,6 +75,7 @@ class OpenAIModelItem(BaseModel):
     object: str = "model"
     created: int = 0
     owned_by: str = "lumen"
+    providers: list[str] = Field(default_factory=list)
 
 
 class OpenAIModelListResponse(BaseModel):
@@ -157,21 +164,30 @@ def models_list(models: list[dict], include_lumen: bool = False) -> dict:
                 "object": "model",
                 "created": 0,
                 "owned_by": "lumen",
+                "providers": [],
             }
         )
-    for m in models:
-        model_name = m.get("model_name", "")
-        # Filter reserved virtual model ID from provider list to prevent duplicates
-        if model_name.strip().lower() == openai_compat.VIRTUAL_MODEL_ID:
+    by_public_id: dict[str, dict] = {}
+    for model in models:
+        public_name = model["api_model_name"]
+        if public_name.strip().lower() == openai_compat.VIRTUAL_MODEL_ID:
             continue
-        data.append(
-            {
-                "id": model_name,
+        item = by_public_id.get(public_name)
+        if item is None:
+            item = {
+                "id": public_name,
                 "object": "model",
                 "created": 0,
-                "owned_by": m.get("provider_name") or "lumen",
+                "owned_by": "lumen",
+                "providers": [],
             }
-        )
+            by_public_id[public_name] = item
+            data.append(item)
+        provider = model["api_provider"]
+        if provider not in item["providers"]:
+            item["providers"].append(provider)
+    for item in data:
+        item["providers"].sort()
     return {
         "object": "list",
         "data": data,
@@ -198,6 +214,12 @@ async def chat_completions(
     source = token_info.get("source", "api")
 
     if openai_compat.is_lumen_virtual_model(body.model):
+        if body.provider is not None:
+            return openai_error_response(
+                400,
+                "provider is not supported for model=lumen",
+                code="provider_not_supported_for_lumen",
+            )
         try:
             normalized_messages, last_user_text, capped_max_tokens, validated_temp = (
                 openai_compat.validate_and_normalize_transcript(
@@ -261,7 +283,7 @@ async def chat_completions(
         )
 
     try:
-        resolved = await core.resolve(body.model)
+        resolved = await core.resolve_api(body.model, provider=body.provider)
         await core.precheck(user_id, project_id, api_key_id=api_key_id)
     except core.CompletionError as exc:
         return openai_error_response(exc.status_code, exc.message)
@@ -301,12 +323,13 @@ async def chat_completions(
             tool_choice=body.tool_choice,
         ):
             if ev["type"] == "delta":
-                yield _sse(chunk_dict(ev, cmpl_id=cmpl_id, created=created, model=resolved["model_name"]))
+                yield _sse(chunk_dict(ev, cmpl_id=cmpl_id, created=created, model=resolved["api_model_name"]))
             elif ev["type"] == "done":
                 if include_usage:
-                    yield _sse(usage_chunk(ev, cmpl_id=cmpl_id, created=created, model=resolved["model_name"]))
+                    yield _sse(usage_chunk(ev, cmpl_id=cmpl_id, created=created, model=resolved["api_model_name"]))
             elif ev["type"] == "error":
                 yield _sse(openai_error_dict(ev.get("message", "오류"), type_="api_error"))
+                return
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -319,7 +342,7 @@ async def chat_completions(
 )
 async def list_models(token_info: dict = Depends(require_api_key_scopes("models:read"))):
     try:
-        models = await repository.list_models(active_only=True)
+        models = await routing.list_api_models()
     except errors.ChatStorageUnavailable:
         models = []
     include_lumen = await openai_compat.is_virtual_model_active(models)

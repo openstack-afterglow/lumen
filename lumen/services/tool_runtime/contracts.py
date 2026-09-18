@@ -28,7 +28,7 @@ class ToolBindingSession:
 class ToolExecutionResult:
     """Internal tool result; `visible=False` keeps content out of message parts and SSE."""
 
-    __slots__ = ("content", "usage", "visible", "warning_code")
+    __slots__ = ("content", "usage", "visible", "warning_code", "status")
 
     def __init__(
         self,
@@ -37,11 +37,15 @@ class ToolExecutionResult:
         visible: bool = True,
         usage: tuple[dict[str, object], ...] = (),
         warning_code: str | None = None,
+        status: str = "completed",
     ) -> None:
+        if status not in {"completed", "failed", "denied", "canceled"}:
+            raise ValueError("tool execution status is invalid")
         self.content = content
         self.visible = visible
         self.usage = usage
         self.warning_code = warning_code
+        self.status = status
 
 
 _MANAGED_ADVISOR_TOOL = "managed_advisor"
@@ -92,6 +96,26 @@ def _v2_provider_name(prefix: str, identifier: int, name: object) -> str:
     return f"{prefix}__{identifier}__{normalized[:96]}_{digest}"[:128]
 
 
+def custom_tool_function_schema(
+    identifier: int, name: object, description: object, params_schema: object
+) -> dict[str, object]:
+    """Project one custom HTTP tool into the exact provider function schema.
+
+    Binding construction and read-only context preview share this projection so
+    a preview budget never counts a name or schema shape the provider request
+    does not carry.  Invalid schema material raises, matching the binding path
+    that excludes the tool instead of sending a malformed declaration.
+    """
+    return {
+        "name": _v2_provider_name("custom", identifier, name),
+        "description": str(description or name or "Custom HTTP tool"),
+        "parameters": {
+            **(params_schema or {"type": "object", "properties": {}}),
+            "additionalProperties": False,
+        },
+    }
+
+
 def _v2_effect(value: object) -> str:
     return value if value in {"read", "workspace_write", "process", "external_mutation"} else "external_mutation"
 
@@ -116,7 +140,7 @@ def _v2_result(value: str | ToolExecutionResult) -> V2ToolExecutionResult:
     legacy = _visible_result(value)
     model_content = legacy.content[:8_192]
     return V2ToolExecutionResult(
-        status="completed",
+        status=legacy.status,
         model_content=model_content,
         display=[TextPart(type="text", text=model_content)] if legacy.visible and model_content else [],
         usage_components={"components": list(legacy.usage)},

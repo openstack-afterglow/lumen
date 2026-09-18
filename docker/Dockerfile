@@ -13,11 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock LICENSE ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --extra service --no-dev --no-install-project
 
 COPY lumen/ ./lumen/
 COPY lumen_console/ ./lumen_console/
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --extra service --no-dev
 RUN if [ -n "$AFTERGLOW_CRYPTO_REF" ]; then \
     uv pip install --python /app/.venv/bin/python --reinstall-package afterglow-crypto --no-deps "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@$AFTERGLOW_CRYPTO_REF"; \
     fi
@@ -26,10 +26,11 @@ FROM lumen-builder AS lumen-test-builder
 ARG AFTERGLOW_CRYPTO_REF=""
 
 COPY tests/ ./tests/
-RUN uv sync --frozen --all-extras
+RUN uv sync --frozen --extra service --extra dev
 RUN if [ -n "$AFTERGLOW_CRYPTO_REF" ]; then \
     uv pip install --python /app/.venv/bin/python --reinstall-package afterglow-crypto --no-deps "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@$AFTERGLOW_CRYPTO_REF"; \
     fi
+
 FROM python:3.12-slim AS lumen-runtime
 
 WORKDIR /app

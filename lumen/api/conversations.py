@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -20,6 +22,8 @@ router = APIRouter()
 class AvailableModel(BaseModel):
     id: int
     model_name: str
+    api_model_name: str
+    api_provider: str
     display_name: str
     provider: str | None = None
     provider_api_key_configured: bool
@@ -47,7 +51,9 @@ async def list_available_models(token_info: dict = Depends(require_scopes("model
             {
                 "id": m["id"],
                 "model_name": m["model_name"],
-                "display_name": m.get("display_name") or m["model_name"],
+                "api_model_name": m["api_model_name"],
+                "api_provider": m["api_provider"],
+                "display_name": m["display_name"],
                 "provider": provider.get("name") if provider else None,
                 "provider_api_key_configured": bool(provider and provider.get("has_api_key")),
                 "capabilities": caps or None,
@@ -95,6 +101,9 @@ class ConversationResponse(BaseModel):
     project_id: str
     user_id: str
     title: str | None
+    title_source: Literal["legacy", "auto", "explicit"]
+    title_status: Literal["idle", "pending", "ready", "failed", "unavailable"]
+    title_revision: int
     model_name: str | None
     workspace_id: int | None = None
     active_leaf_id: int | None = None
@@ -160,6 +169,8 @@ def _map_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, (cs.ConversationForbidden, cs.WorkspaceForbidden)):
         return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, cs.ConversationRunActive):
+        return HTTPException(status_code=409, detail=cs.ConversationRunActive.code)
     return HTTPException(status_code=503, detail=str(exc))
 
 
@@ -290,7 +301,12 @@ async def set_active_leaf(
             project_id=token_info["project_id"],
             message_id=payload.message_id,
         )
-    except (cs.ConversationNotFound, cs.ConversationForbidden, cs.ChatStorageUnavailable) as exc:
+    except (
+        cs.ConversationNotFound,
+        cs.ConversationForbidden,
+        cs.ConversationRunActive,
+        cs.ChatStorageUnavailable,
+    ) as exc:
         raise _map_error(exc) from exc
 
 

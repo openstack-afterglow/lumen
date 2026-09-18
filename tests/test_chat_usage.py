@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 
 import lumen.api.usage as usage_mod
 from lumen.main import app
+from lumen.services import usage as usage_service
 
 
 @pytest.mark.asyncio
@@ -15,6 +16,11 @@ async def test_get_chat_usage_unauthenticated():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         resp = await ac.get("/v1/usage")
     assert resp.status_code == 401
+
+
+def test_empty_usage_summary_exposes_weekly_contract():
+    assert usage_service._EMPTY["week_credited_cost"] == 0.0
+    assert usage_service._EMPTY["quota_weekly_max"] == 0.0
 
 
 @pytest.mark.asyncio

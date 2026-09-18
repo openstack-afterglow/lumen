@@ -10,20 +10,21 @@
 
 ## OpenAI / Anthropic compat
 
-기본 key scope는 `models:read`, `compat:completions:write`다. endpoint와 host policy는 server deployment 설정을 따른다.
+기본 key scope는 `models:read`, `compat:completions:write`다. endpoint와 host policy는 server deployment 설정을 따른다. `GET /v1/models`의 공개 `id`를 `model`로 보내며, 같은 ID가 여러 provider에 있으면 응답의 `providers` 중 하나를 `extra_body={"provider": "..."}`로 명시한다.
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="https://lumen.example/v1", api_key="sk-afgl-...")
 response = client.chat.completions.create(
-    model="lumen",
+    model="perplexity/sonar",
     messages=[{"role": "user", "content": "hello"}],
+    extra_body={"provider": "perplexity"},
 )
 print(response.choices[0].message.content)
 ```
 
-`model="lumen"`은 서버의 `chat_default_model`을 사용해 Lumen durable worker에서 실행한다. 특정 provider model ID를 사용하면 기존 stateless provider-direct 경로가 유지된다. Anthropic client도 deployment의 `/v1/messages` stateless surface를 사용한다.
+`model="lumen"`은 서버의 `chat_default_model`을 사용해 Lumen durable worker에서 실행한다. 특정 공개 provider model ID를 사용하면 stateless provider-direct 경로가 유지된다. `provider`는 공개 ID가 충돌할 때만 필요하며 내부 `model_name`/LiteLLM route를 SDK에 보내지 않는다. Anthropic client도 deployment의 `/v1/messages` stateless surface와 동일한 `extra_body` 선택자를 사용한다.
 
 ## Direct API-key client
 

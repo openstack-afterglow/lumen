@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
+from fastapi import HTTPException
+
 from lumen.config import get_settings
 from lumen.models.chat_contracts import ChatFeatureOptions, ToolPolicy
 from lumen.services import completion_api as core
-from lumen.services.chat_admission import _capability_extension_snapshot, _run_snapshots
+from lumen.services.chat_admission import (
+    _capability_extension_snapshot,
+    _run_snapshots,
+    resolve_summary_route,
+)
+from lumen.services.context_manager import ContextBudget
 from lumen.services.durable_runs import admission, lifecycle, queries
 from lumen.services.durable_runs.common import _require_supported_execution_protocol_version
 from lumen.services.durable_runs.errors import DurableRunError
+from lumen.services.litellm_client import count_context_tokens
 from lumen.services.providers import repository
 
 logger = logging.getLogger(__name__)
@@ -138,7 +148,9 @@ def validate_and_normalize_transcript(
             )
 
         if len(content) > _MAX_MESSAGE_CHARS:
-            raise OpenAICompatError(400, f"Message content exceeds maximum allowed length of {_MAX_MESSAGE_CHARS} characters")
+            raise OpenAICompatError(
+                400, f"Message content exceeds maximum allowed length of {_MAX_MESSAGE_CHARS} characters"
+            )
 
         total_chars += len(content)
 
@@ -146,7 +158,9 @@ def validate_and_normalize_transcript(
         normalized_messages.append({"role": norm_role, "content": content})
 
     if total_chars > _MAX_TOTAL_CHARS:
-        raise OpenAICompatError(400, f"Total transcript content exceeds maximum allowed length of {_MAX_TOTAL_CHARS} characters")
+        raise OpenAICompatError(
+            400, f"Total transcript content exceeds maximum allowed length of {_MAX_TOTAL_CHARS} characters"
+        )
 
     last_msg = normalized_messages[-1]
     if last_msg["role"] != "user" or not last_msg["content"].strip():
@@ -181,10 +195,42 @@ async def create_lumen_temp_run(
 
     features_obj = ChatFeatureOptions(memory=False, tool_policy=ToolPolicy(mode="none"))
     features = features_obj.model_dump(mode="json", by_alias=True)
-
-    capability_snapshot, pricing_snapshot = _run_snapshots(resolved, features, feature_routes={})
+    try:
+        summary_route = await resolve_summary_route(resolved)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else "Summary model route is unavailable"
+        raise OpenAICompatError(exc.status_code, detail) from exc
+    capability_snapshot, pricing_snapshot = _run_snapshots(
+        resolved, features, feature_routes={}, summary_route=summary_route
+    )
     capability_snapshot["extensions"] = _capability_extension_snapshot({"tools": [], "mcp": []})
     capability_snapshot["execution_protocol_version"] = protocol_version
+
+    effective_output_tokens = min(max_tokens or _MAX_TOKENS_CAP, _MAX_TOKENS_CAP)
+    capabilities = resolved.get("capabilities") or {}
+    context_limit = capabilities.get("context_limit")
+    if context_limit is not None:
+        budget = ContextBudget(context_limit, effective_output_tokens)
+        token_count = count_context_tokens(resolved["model_name"], normalized_messages, None)
+        if (
+            token_count.tokens is not None
+            and budget.input_budget is not None
+            and token_count.tokens > budget.input_budget
+        ):
+            raise OpenAICompatError(400, "Context length exceeded for model 'lumen'")
+
+    source_revision = hashlib.sha256(
+        json.dumps(normalized_messages, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+    context_source = {
+        "messages": normalized_messages,
+        "message_ids": [],
+        "source_hashes": [],
+        "active_leaf_id": None,
+        "revision": source_revision,
+        "checkpoint_id": None,
+        "checkpoint": None,
+    }
 
     client_request_id = str(uuid.uuid4())
     intent = {"model": VIRTUAL_MODEL_ID, "messages": normalized_messages}
@@ -202,10 +248,11 @@ async def create_lumen_temp_run(
                 "input_messages": normalized_messages,
                 "input_parts": input_parts,
                 "features": features,
-                "max_tokens": max_tokens or _MAX_TOKENS_CAP,
+                "max_tokens": effective_output_tokens,
                 "temperature": temperature,
                 "reasoning_effort": "auto",
                 "extension_snapshot": {"tools": [], "mcp": []},
+                "context_source": context_source,
             },
             capability_snapshot=capability_snapshot,
             pricing_snapshot=pricing_snapshot,
@@ -249,7 +296,9 @@ async def execute_lumen_nonstream(
 
             elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > timeout_seconds:
-                raise OpenAICompatError(504, "Request timed out waiting for virtual model execution", type_="timeout_error")
+                raise OpenAICompatError(
+                    504, "Request timed out waiting for virtual model execution", type_="timeout_error"
+                )
 
             try:
                 events, terminal = await queries.owned_events(
@@ -399,9 +448,7 @@ async def execute_lumen_stream(
                                     "object": "chat.completion.chunk",
                                     "created": created,
                                     "model": VIRTUAL_MODEL_ID,
-                                    "choices": [
-                                        {"index": 0, "delta": {"content": delta_text}, "finish_reason": None}
-                                    ],
+                                    "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
                                 },
                             }
                 elif event_type == "usage.updated":

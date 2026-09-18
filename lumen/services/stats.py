@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from sqlalchemy import case, func, select
 
@@ -20,7 +21,7 @@ from lumen.models.chat_db import ChatApiKey, ChatUsageLog
 
 logger = logging.getLogger(__name__)
 
-_RANGE_DAYS = {"30d": 30, "90d": 90, "1y": 365}
+_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
 
 # 시간버킷 — MySQL DATE_FORMAT 기반. 세밀한 버킷은 분을 하한으로 내린다.
 _BUCKET_FMT = {"hour": "%Y-%m-%d %H:00:00", "day": "%Y-%m-%d", "month": "%Y-%m"}
@@ -229,6 +230,185 @@ async def by_user(
     except Exception:
         logger.warning("채팅 통계 by_user 집계 실패", exc_info=True)
         return []
+
+
+async def user_detail(
+    user_id: str,
+    *,
+    range_key: str = "30d",
+    source: str | None = None,
+    before_id: int | None = None,
+    limit: int = 50,
+) -> dict:
+    """Return one user's ledger plus model/source aggregates for admin monitoring."""
+    now = datetime.now(UTC)
+    cutoff = _cutoff(range_key)
+    empty = {
+        "user_id": user_id,
+        "range": range_key,
+        "period_start": cutoff.isoformat() if cutoff else None,
+        "period_end": now.isoformat(),
+        "overview": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "credited_cost": "0",
+            "raw_cost": "0",
+            "request_count": 0,
+        },
+        "by_model": [],
+        "by_source": [],
+        "records": [],
+        "next_before_id": None,
+    }
+    factory = _factory()
+    if factory is None:
+        return empty
+    aggregate_conds = [
+        *_base_conds(range_key, None),
+        ChatUsageLog.user_id == user_id,
+        ChatUsageLog.source.in_(("web", "api")),
+    ]
+    if source in {"web", "api"}:
+        aggregate_conds.append(ChatUsageLog.source == source)
+    page_conds = list(aggregate_conds)
+    if before_id is not None:
+        page_conds.append(ChatUsageLog.id < before_id)
+    page_limit = min(max(limit, 1), 200)
+    try:
+        async with factory() as session:
+            totals = (
+                await session.execute(
+                    select(
+                        func.coalesce(func.sum(ChatUsageLog.prompt_tokens), 0),
+                        func.coalesce(func.sum(ChatUsageLog.completion_tokens), 0),
+                        func.coalesce(func.sum(ChatUsageLog.credited_cost), 0),
+                        func.coalesce(func.sum(ChatUsageLog.raw_cost), 0),
+                        func.count(ChatUsageLog.id),
+                    ).where(*aggregate_conds)
+                )
+            ).one()
+            model_rows = (
+                await session.execute(
+                    select(
+                        ChatUsageLog.model_name,
+                        ChatUsageLog.provider,
+                        func.coalesce(func.sum(ChatUsageLog.prompt_tokens), 0),
+                        func.coalesce(func.sum(ChatUsageLog.completion_tokens), 0),
+                        func.coalesce(func.sum(ChatUsageLog.credited_cost), 0),
+                        func.coalesce(func.sum(ChatUsageLog.raw_cost), 0),
+                        func.count(ChatUsageLog.id),
+                    )
+                    .where(*aggregate_conds)
+                    .group_by(ChatUsageLog.model_name, ChatUsageLog.provider)
+                    .order_by(func.sum(ChatUsageLog.prompt_tokens + ChatUsageLog.completion_tokens).desc())
+                )
+            ).all()
+            source_rows = (
+                await session.execute(
+                    select(
+                        ChatUsageLog.source,
+                        func.coalesce(func.sum(ChatUsageLog.prompt_tokens), 0),
+                        func.coalesce(func.sum(ChatUsageLog.completion_tokens), 0),
+                        func.coalesce(func.sum(ChatUsageLog.credited_cost), 0),
+                        func.coalesce(func.sum(ChatUsageLog.raw_cost), 0),
+                        func.count(ChatUsageLog.id),
+                    )
+                    .where(*aggregate_conds)
+                    .group_by(ChatUsageLog.source)
+                )
+            ).all()
+            ledger_rows = (
+                (
+                    await session.execute(
+                        select(ChatUsageLog).where(*page_conds).order_by(ChatUsageLog.id.desc()).limit(page_limit + 1)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        prompt, completion, credited, raw, requests = totals
+        visible_rows = ledger_rows[:page_limit]
+        return {
+            **empty,
+            "overview": {
+                "prompt_tokens": int(prompt or 0),
+                "completion_tokens": int(completion or 0),
+                "total_tokens": int(prompt or 0) + int(completion or 0),
+                "credited_cost": format(Decimal(str(credited or 0)), "f"),
+                "raw_cost": format(Decimal(str(raw or 0)), "f"),
+                "request_count": int(requests or 0),
+            },
+            "by_model": [
+                {
+                    "model_name": model_name,
+                    "provider": provider,
+                    "prompt_tokens": int(model_prompt or 0),
+                    "completion_tokens": int(model_completion or 0),
+                    "total_tokens": int(model_prompt or 0) + int(model_completion or 0),
+                    "credited_cost": format(
+                        Decimal(str(model_credited or 0)),
+                        "f",
+                    ),
+                    "raw_cost": format(Decimal(str(model_raw or 0)), "f"),
+                    "request_count": int(model_requests or 0),
+                }
+                for (
+                    model_name,
+                    provider,
+                    model_prompt,
+                    model_completion,
+                    model_credited,
+                    model_raw,
+                    model_requests,
+                ) in model_rows
+            ],
+            "by_source": [
+                {
+                    "source": row_source,
+                    "prompt_tokens": int(source_prompt or 0),
+                    "completion_tokens": int(source_completion or 0),
+                    "total_tokens": int(source_prompt or 0) + int(source_completion or 0),
+                    "credited_cost": format(
+                        Decimal(str(source_credited or 0)),
+                        "f",
+                    ),
+                    "raw_cost": format(Decimal(str(source_raw or 0)), "f"),
+                    "request_count": int(source_requests or 0),
+                }
+                for (
+                    row_source,
+                    source_prompt,
+                    source_completion,
+                    source_credited,
+                    source_raw,
+                    source_requests,
+                ) in source_rows
+            ],
+            "records": [
+                {
+                    "id": row.id,
+                    "created_at": row.created_at.isoformat(),
+                    "model_name": row.model_name,
+                    "provider": row.provider,
+                    "prompt_tokens": row.prompt_tokens,
+                    "completion_tokens": row.completion_tokens,
+                    "total_tokens": row.prompt_tokens + row.completion_tokens,
+                    "credited_cost": format(row.credited_cost, "f"),
+                    "raw_cost": format(row.raw_cost, "f"),
+                    "source": row.source,
+                    "api_key_id": row.api_key_id,
+                    "conversation_id": row.conversation_id,
+                    "run_id": row.run_id,
+                    "pricing_status": row.pricing_status,
+                }
+                for row in visible_rows
+            ],
+            "next_before_id": (visible_rows[-1].id if len(ledger_rows) > page_limit else None),
+        }
+    except Exception:
+        logger.warning("채팅 사용자 상세 통계 집계 실패", exc_info=True)
+        return empty
 
 
 async def timeseries(

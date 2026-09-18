@@ -182,6 +182,54 @@ def test_memory_content_fingerprint_is_keyed(monkeypatch):
     assert ms.memory_content_fingerprint("yes") != ms.memory_content_fingerprint("no")
 
 
+def test_render_memory_markdown_groups_only_active_visible_rows():
+    document = ms.render_memory_markdown(
+        [
+            {
+                "id": 3,
+                "scope": "project",
+                "workspace_id": None,
+                "category": "development",
+                "content": "Uses Python\nwith type hints",
+                "status": "active",
+                "is_active": True,
+            },
+            {
+                "id": 2,
+                "scope": "account",
+                "workspace_id": None,
+                "category": "preference",
+                "content": "Prefers concise answers",
+                "status": "active",
+                "is_active": True,
+            },
+            {
+                "id": 4,
+                "scope": "project",
+                "workspace_id": None,
+                "category": "general",
+                "content": "Do not disclose",
+                "status": "deleted",
+                "is_active": False,
+            },
+        ]
+    )
+
+    assert document == (
+        "# Memory\n\n"
+        "## Preferences\n\n"
+        "- Prefers concise answers\n\n"
+        "## Development\n\n"
+        "- Uses Python\n"
+        "  with type hints\n"
+    )
+    assert "Do not disclose" not in document
+
+
+def test_render_memory_markdown_has_explicit_empty_state():
+    assert ms.render_memory_markdown([]) == "# Memory\n\nNo active memories have been saved yet.\n"
+
+
 class TestCrud:
     async def test_create_injects_user(self, client, monkeypatch):
         captured = {}
@@ -320,6 +368,37 @@ class TestCrud:
         resp = await client.get(_URL)
         assert resp.status_code == 200
         assert resp.json() == []
+
+    async def test_document_projects_current_visible_memories(self, client, monkeypatch):
+        captured = {}
+
+        async def fake_list(**kwargs):
+            captured.update(kwargs)
+            return [
+                {
+                    "id": 1,
+                    "scope": "project",
+                    "workspace_id": None,
+                    "category": "preference",
+                    "content": "Prefers Korean",
+                    "status": "active",
+                    "is_active": True,
+                }
+            ]
+
+        monkeypatch.setattr(ms, "list_memories", fake_list)
+        response = await client.get(f"{_URL}/document")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "filename": "memory.md",
+            "content_type": "text/markdown",
+            "content": "# Memory\n\n## Preferences\n\n- Prefers Korean\n",
+        }
+        assert captured == {
+            "user_id": "test-user-123",
+            "project_id": "test-project-123",
+        }
 
     async def test_update_forbidden_403(self, client, monkeypatch):
         async def fake_update(mid, **kwargs):

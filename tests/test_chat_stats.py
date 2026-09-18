@@ -125,6 +125,67 @@ class TestStatsUsers:
         assert resp.json()["users"][0]["user_id"] == "u1"
         assert captured == {"rng": "90d", "pid": "p9", "limit": 50, "offset": 100}
 
+    async def test_user_detail_forwards_period_source_and_cursor(
+        self,
+        admin_client,
+        monkeypatch,
+    ):
+        captured = {}
+
+        async def fake_detail(user_id, *, range_key, source, before_id, limit):
+            captured.update(
+                user_id=user_id,
+                range_key=range_key,
+                source=source,
+                before_id=before_id,
+                limit=limit,
+            )
+            return {
+                "user_id": user_id,
+                "range": range_key,
+                "period_start": None,
+                "period_end": "2026-09-11T00:00:00+00:00",
+                "overview": {"total_tokens": 3},
+                "by_model": [{"model_name": "gpt-5", "total_tokens": 3}],
+                "by_source": [{"source": source, "total_tokens": 3}],
+                "records": [
+                    {
+                        "id": 9,
+                        "created_at": "2026-09-11T00:00:00+00:00",
+                        "model_name": "gpt-5",
+                        "provider": "openai",
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "total_tokens": 3,
+                        "credited_cost": "1.5",
+                        "raw_cost": "0.0015",
+                        "source": source,
+                        "api_key_id": None,
+                        "conversation_id": None,
+                        "run_id": None,
+                        "pricing_status": "priced",
+                    }
+                ],
+                "next_before_id": 8,
+            }
+
+        monkeypatch.setattr(stats_service, "user_detail", fake_detail)
+        response = await admin_client.get(f"{_URL}/users/u1?range=7d&source=api&before_id=10&limit=25")
+
+        assert response.status_code == 200
+        assert response.json()["records"][0]["raw_cost"] == "0.0015"
+        assert captured == {
+            "user_id": "u1",
+            "range_key": "7d",
+            "source": "api",
+            "before_id": 10,
+            "limit": 25,
+        }
+
+    async def test_user_detail_forbidden_for_non_admin(self, non_admin_client):
+        response = await non_admin_client.get(f"{_URL}/users/u1")
+        assert response.status_code == 403
+
 
 class TestAccessPathStats:
     async def test_bundle_includes_timeseries_and_by_api_key(self, admin_client, monkeypatch):

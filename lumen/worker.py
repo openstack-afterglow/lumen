@@ -36,6 +36,20 @@ async def _next_run_ids() -> list[str]:
     return await queued_run_ids(limit=4)
 
 
+async def _title_processor_loop(processor, *, owner: str) -> None:
+    """Continuously drain title jobs independently of long-running completions."""
+    while True:
+        try:
+            worked = await processor(owner=owner)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("durable title generation job failed")
+            worked = False
+        if not worked:
+            await asyncio.sleep(0.5)
+
+
 async def serve() -> None:
     settings = get_settings()
     if not settings.database_url:
@@ -56,6 +70,7 @@ async def serve() -> None:
     from lumen.services.memory_jobs import process_one as process_memory_extraction
     from lumen.services.memory_outbox import process_one as process_memory_outbox
     from lumen.services.semantic_memory import semantic_memory_available, setup_semantic_memory
+    from lumen.services.title_jobs import process_one as process_title_generation
 
     if settings.chat_semantic_memory_enabled:
         try:
@@ -71,6 +86,7 @@ async def serve() -> None:
     next_workspace_reconcile_at = 0.0
     next_input_expiry_at = 0.0
     memory_job_task: asyncio.Task[None] | None = None
+    title_job_task: asyncio.Task[None] | None = None
 
     async def execute(run_id: str) -> None:
         async with semaphore:
@@ -84,6 +100,9 @@ async def serve() -> None:
             await process_memory_extraction(owner=owner)
         except Exception:
             logger.exception("durable memory extraction job failed")
+
+    async def generate_title() -> None:
+        await _title_processor_loop(process_title_generation, owner=owner)
 
     try:
         while True:
@@ -122,6 +141,8 @@ async def serve() -> None:
                 next_memory_outbox_at = now + 0.5
             if memory_job_task is None or memory_job_task.done():
                 memory_job_task = asyncio.create_task(extract_memory())
+            if title_job_task is None or title_job_task.done():
+                title_job_task = asyncio.create_task(generate_title())
             try:
                 recovered_run_ids = await recover_stale_runs(owner=owner)
             except Exception:
@@ -136,6 +157,9 @@ async def serve() -> None:
         if memory_job_task is not None:
             memory_job_task.cancel()
             await asyncio.gather(memory_job_task, return_exceptions=True)
+        if title_job_task is not None:
+            title_job_task.cancel()
+            await asyncio.gather(title_job_task, return_exceptions=True)
         from lumen.db import close_db
 
         await chat_checkpointer.close()

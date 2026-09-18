@@ -62,6 +62,19 @@ class TestLlmProviderKeyCrypto:
         with pytest.raises(Exception):
             decrypt_chat_content(ciphertext)
 
+    def test_billing_admin_key_has_independent_crypto_domain(self, valid_key):
+        from lumen.crypto import (
+            decrypt_llm_provider_billing_admin_key,
+            decrypt_llm_provider_key,
+            encrypt_llm_provider_billing_admin_key,
+        )
+
+        ciphertext = encrypt_llm_provider_billing_admin_key("sk-admin-secret")
+
+        assert decrypt_llm_provider_billing_admin_key(ciphertext) == "sk-admin-secret"
+        with pytest.raises(Exception):
+            decrypt_llm_provider_key(ciphertext)
+
     def test_domain_separation_reverse(self, valid_key):
         """A chat-content ciphertext cannot decrypt through Lumen provider-key crypto."""
         from lumen.crypto import decrypt_llm_provider_key, encrypt_chat_content

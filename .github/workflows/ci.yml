@@ -52,11 +52,13 @@ jobs:
         with:
           repository: ${{ inputs.lumen_repository || github.repository }}
           ref: ${{ inputs.lumen_ref || github.sha }}
+      - name: Check architecture freshness
+        run: python3 scripts/check_architecture.py
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.12'
           enable-cache: true
-      - run: uv sync --all-extras --frozen
+      - run: uv sync --extra service --extra dev --frozen
       - name: Override afterglow-crypto dependency
         if: ${{ inputs.afterglow_crypto_ref != '' }}
         env:
@@ -81,7 +83,7 @@ jobs:
         with:
           python-version: '3.12'
           enable-cache: true
-      - run: uv sync --all-extras --frozen
+      - run: uv sync --extra dev --frozen
       - run: uv run pytest
       - run: uv run ruff check .
 
@@ -98,8 +100,10 @@ jobs:
         with:
           python-version: '3.12'
           enable-cache: true
-      - run: uv sync --all-extras --frozen
-      - run: uv run pytest tests/test_kolla_assets.py
+      - name: Kolla asset packaging tests
+        run: |
+          uv sync --extra service --extra dev --frozen
+          uv run pytest tests/test_kolla_assets.py
 
   integration:
     name: Datastore integration
@@ -133,7 +137,7 @@ jobs:
         with:
           python-version: '3.12'
           enable-cache: true
-      - run: uv sync --all-extras --frozen
+      - run: uv sync --extra service --extra dev --frozen
       - name: Override afterglow-crypto dependency
         if: ${{ inputs.afterglow_crypto_ref != '' }}
         env:
@@ -156,7 +160,7 @@ jobs:
         with:
           python-version: '3.12'
           enable-cache: true
-      - run: uv sync --all-extras --frozen
+      - run: uv sync --extra service --extra dev --frozen
       - name: Run system integration tests
         env:
           AFTERGLOW_CRYPTO_REF: ${{ inputs.afterglow_crypto_ref }}

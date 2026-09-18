@@ -5,14 +5,16 @@ litellm_client.acompletion_stream 을 mock 해 네트워크 없이 검증:
 - 시작 실패/스트리밍 중 오류 시 error 이벤트
 - **툴 루프**: tool_call 델타 → 테넌트 안전 실행(ToolContext) → 툴 결과 반영 후 최종 답변 스트리밍,
   멀티스텝 usage 합산, tool_call SSE 이벤트
-- engine.stream 이 graph.stream 에 위임하는지
 """
 
 import json
 from datetime import UTC, datetime
 
+import httpx
+import pytest
+
 from lumen.models.chat_contracts import validate_chat_run_event
-from lumen.services import engine, graph, litellm_client
+from lumen.services import graph, litellm_client
 from lumen.services.tool_runtime import contracts, selection
 from lumen.services.tool_runtime import dispatch as tool_runtime
 
@@ -48,6 +50,16 @@ class _ToolCallDelta:
         self.index = index
         self.id = id
         self.function = _ToolFn(name, arguments)
+
+
+class _DummyContextHooks:
+    def __init__(self, prepared=None):
+        self.prepared = prepared
+        self.called = False
+
+    async def prepare_context(self, *, messages, tool_schemas, round_index):
+        self.called = True
+        return self.prepared if self.prepared is not None else messages
 
 
 class _DeltaTC:
@@ -179,7 +191,14 @@ class TestGraphStream:
                 search_results=[{"url": "https://a.com", "title": "A", "snippet": "x" * 400}],
             ),
             _CChunk(
-                _CDelta(annotations=[{"type": "url_citation", "url_citation": {"url": "https://b.com", "title": "B"}}])
+                _CDelta(
+                    annotations=[
+                        {
+                            "type": "url_citation",
+                            "url_citation": {"url": "https://b.com", "title": "B", "start_index": 3, "end_index": 7},
+                        }
+                    ]
+                )
             ),
             _CChunk(
                 _CDelta(
@@ -211,6 +230,8 @@ class TestGraphStream:
         assert {i["url"] for i in items if i.get("source_kind") == "web"} == {"https://a.com", "https://b.com"}
         a = next(i for i in items if i.get("url") == "https://a.com")
         assert a["title"] == "A" and len(a["snippet"]) <= 300  # 스니펫 상한
+        b = next(i for i in items if i.get("url") == "https://b.com")
+        assert b["start_index"] == 3 and b["end_index"] == 7
         document = next(i for i in items if i.get("source_kind") == "document")
         assert document == {
             "source_kind": "document",
@@ -223,6 +244,261 @@ class TestGraphStream:
         # citations 는 usage 직전에 나와야 함(최종 답변 저장 타이밍)
         types = [e["type"] for e in events]
         assert types.index("citations") < types.index("usage")
+
+    async def test_native_search_configuration_is_not_source_evidence(self, monkeypatch):
+        """A capability flag never creates durable citations without provider metadata."""
+
+        async def fake_stream(**_kwargs):
+            return _aiter([_ChunkTC(_DeltaTC(content="No provider sources."))])
+
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        events = [
+            event
+            async for event in graph.stream(
+                model="perplexity/sonar",
+                messages=_MSGS,
+                project_id="p1",
+                user_id="u1",
+                custom_llm_provider="perplexity",
+                native_web_search={"search_context_size": "medium"},
+            )
+        ]
+
+        assert not [event for event in events if event["type"] == "citations"]
+
+    async def test_anthropic_native_search_citations_become_web_sources(self, monkeypatch):
+        """LiteLLM Anthropic 통합 citation 은 web_search_result_location(URL)과 문서 인용을 함께 싣는다."""
+
+        class _PDelta:
+            def __init__(self, content=None, provider_specific_fields=None):
+                self.content = content
+                self.provider_specific_fields = provider_specific_fields
+                self.annotations = None
+                self.tool_calls = None
+
+        class _PChunk:
+            def __init__(self, delta, usage=None):
+                self.choices = [_ChoiceTC(delta)]
+                self.usage = usage
+
+        chunks = [
+            _PChunk(
+                _PDelta(
+                    provider_specific_fields={
+                        "web_search_results": [
+                            {
+                                "type": "web_search_tool_result",
+                                "tool_use_id": "srvtoolu_1",
+                                "content": [
+                                    {
+                                        "type": "web_search_result",
+                                        "url": "https://news.example/report",
+                                        "title": "Report",
+                                        "encrypted_content": "opaque",
+                                    },
+                                    {"type": "web_search_result", "url": "javascript:alert(1)", "title": "unsafe"},
+                                ],
+                            }
+                        ]
+                    }
+                )
+            ),
+            _PChunk(_PDelta(content="근거 기반 답변")),
+            _PChunk(
+                _PDelta(
+                    provider_specific_fields={
+                        "citation": {
+                            "type": "web_search_result_location",
+                            "url": "https://news.example/report",
+                            "title": "Report",
+                            "cited_text": "인용된 문장 " + "x" * 400,
+                            "encrypted_index": "opaque-index",
+                        }
+                    }
+                )
+            ),
+            _PChunk(
+                _PDelta(
+                    provider_specific_fields={
+                        "citation": {
+                            "type": "char_location",
+                            "cited_text": "문서의 근거",
+                            "document_index": 1,
+                            "document_title": "운영 가이드",
+                            "start_char_index": 4,
+                            "end_char_index": 9,
+                        }
+                    }
+                )
+            ),
+            _PChunk(_PDelta(), usage={"prompt_tokens": 4, "completion_tokens": 6}),
+        ]
+
+        async def fake_stream(**kwargs):
+            return _aiter(chunks)
+
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        events = [
+            ev
+            async for ev in graph.stream(
+                model="claude-sonnet-5",
+                messages=_MSGS,
+                project_id="p1",
+                user_id="u1",
+                custom_llm_provider="anthropic",
+                native_web_search={"search_context_size": "medium"},
+            )
+        ]
+        items = [e for e in events if e["type"] == "citations"][-1]["items"]
+        web = [item for item in items if item["source_kind"] == "web"]
+        assert [item["url"] for item in web] == ["https://news.example/report"]
+        assert web[0]["title"] == "Report"
+        assert len(web[0]["snippet"]) == 300
+        document = next(item for item in items if item["source_kind"] == "document")
+        assert document == {
+            "source_kind": "document",
+            "document_index": 1,
+            "title": "운영 가이드",
+            "snippet": "문서의 근거",
+            "start_index": 4,
+            "end_index": 9,
+        }
+
+    @pytest.mark.parametrize(
+        "source_event",
+        [
+            "annotations",
+            "response.reasoning.search_results",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.completed",
+        ],
+    )
+    async def test_perplexity_agent_stream_sources_survive_installed_responses_bridge(self, monkeypatch, source_event):
+        """Actual installed LiteLLM must retain annotations and Perplexity's separate search-result events."""
+
+        annotation = {
+            "type": "url_citation",
+            "url": "https://news.example/seoul",
+            "title": "Seoul weather",
+            "start_index": 0,
+            "end_index": 2,
+        }
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_stream",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "perplexity/sonar",
+                "output": [
+                    {
+                        "id": "msg_1",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "서울", "annotations": [annotation]}],
+                    }
+                ],
+                "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+                "error": None,
+                "incomplete_details": None,
+                "instructions": None,
+                "metadata": {},
+            },
+        }
+        events = [
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "서울",
+            },
+            {
+                "type": "response.output_text.annotation.added",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "annotation_index": 0,
+                "annotation": annotation,
+            },
+            completed,
+        ]
+        source = {
+            "id": 1,
+            "url": annotation["url"],
+            "title": annotation["title"],
+            "snippet": "Official weather observation",
+        }
+        if source_event != "annotations":
+            completed["response"]["output"][0]["content"][0]["annotations"] = []
+            source_item = {"type": "search_results", "results": [source]}
+            if source_event == "response.completed":
+                completed["response"]["output"].insert(0, source_item)
+                events = [events[0], completed]
+            else:
+                source_payload = (
+                    {"results": [source]}
+                    if source_event == "response.reasoning.search_results"
+                    else {"item": source_item}
+                )
+                events = [
+                    {"type": source_event, "sequence_number": 1, **source_payload},
+                    events[0],
+                    completed,
+                ]
+        body = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+        body += "data: [DONE]\n\n"
+        captured = {}
+
+        class _Sender:
+            async def post(self, *, url, headers, **kwargs):
+                captured.update(url=url, body=kwargs.get("json"))
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    headers={"content-type": "text/event-stream"},
+                    content=body.encode(),
+                )
+
+        sender = _Sender()
+        monkeypatch.setattr(
+            "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+            lambda **_kwargs: sender,
+        )
+
+        stream_events = [
+            ev
+            async for ev in graph.stream(
+                model="perplexity/perplexity/sonar",
+                messages=_MSGS,
+                project_id="p1",
+                user_id="u1",
+                custom_llm_provider="perplexity",
+                api_base="https://api.perplexity.ai/v1",
+                api_key="route-key",
+                native_web_search={"search_context_size": "medium"},
+            )
+        ]
+
+        assert "".join(e["text"] for e in stream_events if e["type"] == "token") == "서울"
+        items = [e for e in stream_events if e["type"] == "citations"][-1]["items"]
+        assert items == [
+            {
+                "source_kind": "web",
+                "url": "https://news.example/seoul",
+                "title": "Seoul weather",
+                **(
+                    {"snippet": None, "start_index": 0, "end_index": 2}
+                    if source_event == "annotations"
+                    else {"snippet": source["snippet"]}
+                ),
+            }
+        ]
+        # Intrinsic Sonar search must not acquire a duplicate hosted web_search tool.
+        assert [tool for tool in captured["body"].get("tools") or [] if tool.get("type") == "web_search"] == []
 
     def test_managed_tool_citations_filter_unsafe_urls_and_bound_snippets(self):
         citations = graph._managed_tool_citations(
@@ -921,18 +1197,80 @@ class TestToolLoop:
         assert {"type": "warning", "code": "advisor_call_failed", "safe_message": "Advisor request failed."} in events
         assert captured["messages"][-1]["content"] == "private advice"
 
+    async def test_schema_rejection_emits_failed_tool_result(self, monkeypatch):
+        responses = [
+            [_ChunkTC(_DeltaTC(tool_calls=[_ToolCallDelta(0, "required-tools", "list_available_tools", "{}")]))],
+            [_ChunkTC(_DeltaTC(content="I could not load the required tool."))],
+        ]
+        call_index = 0
+        captured: dict[str, object] = {}
 
-class TestEngineDelegates:
-    async def test_engine_stream_delegates_to_graph(self, monkeypatch):
         async def fake_stream(**kwargs):
-            return _aiter([_Chunk("델타")])
+            nonlocal call_index
+            if call_index == 1:
+                captured["messages"] = kwargs["messages"]
+            stream = responses[call_index]
+            call_index += 1
+            return _aiter(stream)
+
+        async def invalid_arguments(*_args):
+            return contracts.ToolExecutionResult(
+                "Tool arguments do not match the required schema.",
+                warning_code="invalid_tool_arguments",
+                status="failed",
+            )
 
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-        events = [
-            ev async for ev in engine.stream(model="gpt-3.5-turbo", messages=_MSGS, project_id="p1", user_id="u1")
-        ]
-        assert any(e["type"] == "token" and e["text"] == "델타" for e in events)
+        monkeypatch.setattr(tool_runtime, "context_execute_result", invalid_arguments)
+        events = [event async for event in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
 
+        assert {
+            "type": "tool_result",
+            "tool_call_id": "required-tools",
+            "name": "list_available_tools",
+            "content": "Tool arguments do not match the required schema.",
+            "hidden": False,
+            "status": "failed",
+            "display": [],
+            "artifacts": [],
+            "error_code": "invalid_tool_arguments",
+        } in events
+        assert captured["messages"][-1]["content"] == "Tool arguments do not match the required schema."
+
+    async def test_malformed_tool_json_emits_failed_result_without_dispatch(self, monkeypatch):
+        responses = [
+            [_ChunkTC(_DeltaTC(tool_calls=[_ToolCallDelta(0, "invalid-json", "list_available_tools", "{")]))],
+            [_ChunkTC(_DeltaTC(content="I could not load the required tool."))],
+        ]
+        call_index = 0
+
+        async def fake_stream(**_kwargs):
+            nonlocal call_index
+            stream = responses[call_index]
+            call_index += 1
+            return _aiter(stream)
+
+        async def must_not_dispatch(*_args):
+            raise AssertionError("malformed tool JSON must fail before dispatch")
+
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(tool_runtime, "context_execute_result", must_not_dispatch)
+        events = [event async for event in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
+
+        assert {
+            "type": "tool_result",
+            "tool_call_id": "invalid-json",
+            "name": "list_available_tools",
+            "content": "Tool arguments do not match the required schema.",
+            "hidden": False,
+            "status": "failed",
+            "display": [],
+            "artifacts": [],
+            "error_code": "invalid_tool_arguments",
+        } in events
+
+
+class TestUsageEstimation:
     async def test_falls_back_to_token_estimation_when_round_has_no_usage(self, monkeypatch):
         async def fake_stream(**kwargs):
             return _aiter([_Chunk("fallback")])
@@ -952,3 +1290,22 @@ class TestEngineDelegates:
         ]
         usage = [event for event in events if event["type"] == "usage"][-1]
         assert usage["usage"] == {"prompt_tokens": 9, "completion_tokens": 3}
+
+
+async def test_graph_invokes_prepare_context_hook(monkeypatch):
+    async def fake_stream(*args, **kwargs):
+        assert kwargs["messages"] == [{"role": "user", "content": "compacted prompt"}]
+        return _aiter([_Chunk(content="Hello")])
+
+    monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+    hooks = _DummyContextHooks(prepared=[{"role": "user", "content": "compacted prompt"}])
+    events = [
+        event
+        async for event in graph.stream(
+            model="test-model",
+            messages=[{"role": "user", "content": "raw prompt"}],
+            execution_hooks=hooks,
+        )
+    ]
+    assert hooks.called is True
+    assert any(e["type"] == "token" and e["text"] == "Hello" for e in events)

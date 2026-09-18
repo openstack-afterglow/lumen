@@ -16,9 +16,10 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun, ChatRunProvider
 from lumen.services.run_store import NONTERMINAL
 
-from .credentials import resolve_api_key
+from .credentials import ProviderAuthRef, api_model_name, resolve_api_key, short_model_name
 from .errors import (
     ActiveRunConfigurationConflict,
+    AmbiguousModelRouteError,
     ChatStorageUnavailable,
     ProviderConfigurationChangedError,
     ProviderNotFoundError,
@@ -80,6 +81,7 @@ async def lock_execution_routes(
     executor: dict,
     search: dict | None = None,
     advisor: dict | None = None,
+    summary: dict | None = None,
 ) -> None:
     """Lock all run routes in one global order, then verify their immutable hashes."""
     routes: list[tuple[str, dict]] = [("executor", executor)]
@@ -87,6 +89,8 @@ async def lock_execution_routes(
         routes.append(("search", search))
     if advisor is not None:
         routes.append(("advisor", advisor))
+    if summary is not None:
+        routes.append(("summary", summary))
 
     provider_ids: set[int] = set()
     model_routes: list[dict] = []
@@ -174,10 +178,27 @@ async def _lock_mutable_route(
     return provider, models
 
 
+def _provider_auth_ref(provider: LlmProvider) -> ProviderAuthRef | None:
+    auth_mode = getattr(provider, "auth_mode", "api_key")
+    if auth_mode not in {"chatgpt_device", "anthropic_subscription"}:
+        return None
+    return {
+        "provider_id": provider.id,
+        "generation": getattr(provider, "subscription_generation", 0),
+        "auth_mode": auth_mode,
+    }
+
+
 def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
+    provider_auth = _provider_auth_ref(provider)
     api_key = resolve_api_key(provider)
+    api_base = provider.api_base if provider_auth is None else None
     input_price, output_price, price_source, price_version = _resolved_base_prices(model, provider)
-    capabilities, _ = _effective_capabilities(model, provider.provider_type)
+    capabilities, _ = _effective_capabilities(
+        model,
+        provider.provider_type,
+        getattr(provider, "auth_mode", "api_key"),
+    )
     capabilities = _pricing_aware_capabilities(
         model,
         capabilities,
@@ -190,7 +211,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
         "provider_active": provider.is_active,
-        "api_base": provider.api_base,
+        "api_base": api_base,
         "model_name": model.model_name,
         "model_active": model.is_active,
         "margin_multiplier": str(provider.margin_multiplier),
@@ -202,6 +223,13 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "capabilities": capabilities,
         "api_key": api_key,
     }
+    if provider_auth is not None:
+        config_fingerprint.update(
+            {
+                "auth_mode": provider.auth_mode,
+                "subscription_generation": provider.subscription_generation,
+            }
+        )
     config_version_hash = hmac.new(
         derive_encryption_subkey(b"chat_provider_config"),
         json.dumps(config_fingerprint, ensure_ascii=False, sort_keys=True, default=str).encode(),
@@ -209,10 +237,13 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
     ).hexdigest()
     return {
         "model_name": model.model_name,
+        "api_model_name": api_model_name(model.model_name, provider.provider_type),
+        "api_provider": provider.provider_type,
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
-        "api_base": provider.api_base,
+        "api_base": api_base,
         "api_key": api_key,
+        "provider_auth": provider_auth,
         "margin_multiplier": Decimal(provider.margin_multiplier),
         "input_price_per_token": input_price,
         "output_price_per_token": output_price,
@@ -228,16 +259,25 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
 
 def _resolved_provider(provider: LlmProvider) -> dict:
     """Resolve a provider-only execution route (managed search has no model row)."""
+    provider_auth = _provider_auth_ref(provider)
     api_key = resolve_api_key(provider)
+    api_base = provider.api_base if provider_auth is None else None
     config_fingerprint = {
         "provider_id": provider.id,
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
         "provider_active": provider.is_active,
-        "api_base": provider.api_base,
+        "api_base": api_base,
         "margin_multiplier": str(provider.margin_multiplier),
         "api_key": api_key,
     }
+    if provider_auth is not None:
+        config_fingerprint.update(
+            {
+                "auth_mode": provider.auth_mode,
+                "subscription_generation": provider.subscription_generation,
+            }
+        )
     config_version_hash = hmac.new(
         derive_encryption_subkey(b"chat_provider_config"),
         json.dumps(config_fingerprint, ensure_ascii=False, sort_keys=True, default=str).encode(),
@@ -246,8 +286,9 @@ def _resolved_provider(provider: LlmProvider) -> dict:
     return {
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
-        "api_base": provider.api_base,
+        "api_base": api_base,
         "api_key": api_key,
+        "provider_auth": provider_auth,
         "margin_multiplier": Decimal(provider.margin_multiplier),
         "provider_id": provider.id,
         "config_version_hash": config_version_hash,
@@ -277,6 +318,130 @@ async def resolve_model(model_name: str) -> dict | None:
                 return None
             model, provider = row
             return _resolved_model(model, provider)
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def resolve_api_model(model_name: str, *, provider: str | None = None) -> dict | None:
+    """Resolve one external API model/provider pair without exposing route encoding."""
+    candidates = {
+        model_name,
+        f"perplexity/{model_name}",
+        f"perplexity/perplexity/{model_name}",
+        f"gemini/{model_name}",
+    }
+    if model_name.startswith("perplexity/"):
+        bare = model_name.removeprefix("perplexity/")
+        candidates.add(bare)
+        candidates.add(f"perplexity/{bare}")
+        candidates.add(f"perplexity/perplexity/{bare}")
+    if model_name.startswith("perplexity/perplexity/"):
+        bare = model_name.removeprefix("perplexity/perplexity/")
+        candidates.add(bare)
+        candidates.add(f"perplexity/{bare}")
+        candidates.add(f"perplexity/perplexity/{bare}")
+    if model_name.startswith("gemini/"):
+        bare = model_name.removeprefix("gemini/")
+        candidates.add(bare)
+        candidates.add(f"gemini/{bare}")
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            stmt = (
+                select(LlmModel, LlmProvider)
+                .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
+                .where(
+                    LlmModel.model_name.in_(candidates),
+                    LlmModel.is_active.is_(True),
+                    LlmProvider.is_active.is_(True),
+                )
+                .order_by(LlmModel.id)
+            )
+            if provider is not None:
+                stmt = stmt.where(LlmProvider.provider_type == provider)
+            rows = (await session.execute(stmt)).all()
+
+            def _row_matches(model_row: LlmModel, provider_row: LlmProvider) -> bool:
+                ptype = provider_row.provider_type
+                api_name = api_model_name(model_row.model_name, ptype)
+                short_name = short_model_name(model_row.model_name, ptype)
+                if model_name in (api_name, short_name, model_row.model_name):
+                    return True
+                if f"perplexity/{model_name}" == api_name:
+                    return True
+                if model_name.removeprefix("perplexity/") in (
+                    short_name,
+                    api_name.removeprefix("perplexity/"),
+                ):
+                    return True
+                if ptype == "gemini" and (
+                    f"gemini/{model_name}" == model_row.model_name
+                    or model_name.removeprefix("gemini/") in (short_name, api_name)
+                ):
+                    return True
+                return False
+
+            matches = [(model, route_provider) for model, route_provider in rows if _row_matches(model, route_provider)]
+            if not matches:
+                return None
+
+            if provider is None:
+                provider_types = {route_provider.provider_type for _, route_provider in matches}
+                if len(provider_types) > 1:
+                    raise AmbiguousModelRouteError("model route is ambiguous")
+                exact = [
+                    m
+                    for m in matches
+                    if api_model_name(m[0].model_name, m[1].provider_type) == model_name
+                    or short_model_name(m[0].model_name, m[1].provider_type) == model_name
+                    or m[0].model_name == model_name
+                ]
+                if exact:
+                    return _resolved_model(*exact[0])
+                return _resolved_model(*matches[0])
+            else:
+                if len(matches) > 1:
+                    exact = [
+                        m
+                        for m in matches
+                        if api_model_name(m[0].model_name, m[1].provider_type) == model_name
+                        or short_model_name(m[0].model_name, m[1].provider_type) == model_name
+                        or m[0].model_name == model_name
+                    ]
+                    if len(exact) == 1:
+                        return _resolved_model(*exact[0])
+                    raise AmbiguousModelRouteError("model route is ambiguous")
+                return _resolved_model(*matches[0])
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def list_api_models() -> list[dict]:
+    """List active public model identities without decrypting credentials or pricing."""
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            rows = (
+                await session.execute(
+                    select(LlmModel, LlmProvider)
+                    .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
+                    .where(
+                        LlmModel.is_active.is_(True),
+                        LlmProvider.is_active.is_(True),
+                    )
+                    .order_by(LlmModel.id)
+                )
+            ).all()
+            return [
+                {
+                    "model_name": model.model_name,
+                    "api_model_name": api_model_name(model.model_name, provider.provider_type),
+                    "api_provider": provider.provider_type,
+                }
+                for model, provider in rows
+            ]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
@@ -435,18 +600,20 @@ async def get_active_provider_route(provider_id: int) -> dict | None:
 
 
 async def get_provider_for_discovery(provider_id: int) -> dict | None:
-    """모델 discovery 용 — provider_type/api_base/복호화 api_key. 미존재 시 None.
-
-    ⚠️ 반환 api_key 는 복호화 평문 — 서버 내부 discovery 호출 전용, API 응답 노출 금지.
-    """
+    """Resolve discovery configuration without refreshing subscription credentials."""
     factory = _require_db()
     try:
         async with factory() as session:
             row = await session.get(LlmProvider, provider_id)
             if row is None:
                 return None
-            api_key = resolve_api_key(row)
-            return {"provider_type": row.provider_type, "api_base": row.api_base, "api_key": api_key}
+            provider_auth = _provider_auth_ref(row)
+            return {
+                "provider_type": row.provider_type,
+                "auth_mode": row.auth_mode,
+                "api_base": row.api_base if provider_auth is None else None,
+                "api_key": resolve_api_key(row),
+            }
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc

@@ -8,6 +8,7 @@ from typing import Literal, NotRequired, TypedDict
 
 from fastapi import Depends, Header, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from starlette.concurrency import run_in_threadpool
 
 from lumen.config import get_settings
 
@@ -231,7 +232,7 @@ async def get_principal(
             if x_target_proj:
                 val_kwargs["target_project_id"] = x_target_proj
             principal = _keystone_principal(
-                validate_token(keystone_token, **val_kwargs),
+                await run_in_threadpool(validate_token, keystone_token, **val_kwargs),
                 keystone_token,
             )
         except HTTPException:
@@ -290,7 +291,7 @@ async def require_token(
         val_kwargs = {"project_id": proj_id}
         if target_proj_id.strip():
             val_kwargs["target_project_id"] = target_proj_id
-        info = validate_token(token, **val_kwargs)
+        info = await run_in_threadpool(validate_token, token, **val_kwargs)
         info["token"] = info.get("auth_token") or token
         info.setdefault("connection_project_id", info.get("project_id", ""))
     except HTTPException:
@@ -298,6 +299,8 @@ async def require_token(
     except Exception:
         raise HTTPException(status_code=401, detail="인증 실패")
     return info
+
+
 def get_token_info(token_info: dict = Depends(require_token)) -> dict:
     return token_info
 
@@ -355,6 +358,7 @@ async def get_api_key_info(
     request.state.token_info = principal
     return principal
 
+
 def get_admin_connection_for_project(project_id: str):
     import openstack
 
@@ -380,11 +384,7 @@ async def get_os_conn(token_info: dict = Depends(require_token)):
 
     settings = get_settings()
     token = token_info.get("token") or ""
-    project_id = (
-        token_info.get("connection_project_id")
-        or token_info.get("project_id")
-        or ""
-    )
+    project_id = token_info.get("connection_project_id") or token_info.get("project_id") or ""
 
     if not token or not project_id:
         raise HTTPException(status_code=401, detail="OpenStack connection requires a valid user token and project")

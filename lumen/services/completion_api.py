@@ -47,6 +47,21 @@ async def resolve(model: str) -> dict:
     return resolved
 
 
+async def resolve_api(model: str, *, provider: str | None = None) -> dict:
+    """Resolve one public compatibility API route, rejecting ambiguous catalogs."""
+    if not model:
+        raise CompletionError(400, "model 이 필요합니다")
+    try:
+        resolved = await ps.resolve_api_model(model, provider=provider)
+    except errors.AmbiguousModelRouteError as exc:
+        raise CompletionError(409, "model_route_ambiguous") from exc
+    except errors.ChatStorageUnavailable as exc:
+        raise CompletionError(503, "일시적으로 사용할 수 없습니다") from exc
+    if resolved is None:
+        raise CompletionError(404, f"모델을 찾을 수 없습니다: {model}")
+    return resolved
+
+
 async def precheck(user_id: str, project_id: str, api_key_id: int | None = None) -> None:
     """쿼터 fail-closed. 초과 429, 저장소 장애 503."""
     try:
@@ -147,17 +162,21 @@ async def complete_once(
     extra_kwargs: dict[str, Any] = {}
     if tool_choice is not None:
         extra_kwargs["tool_choice"] = tool_choice
-    resp = await litellm_client.acompletion(
-        resolved["model_name"],
-        messages,
-        api_base=resolved.get("api_base"),
-        api_key=resolved.get("api_key"),
-        custom_llm_provider=resolved.get("provider_type"),
-        max_tokens=clamp_max_tokens(max_tokens),
-        temperature=temperature,
-        tools=tools,
-        extra=extra_kwargs or None,
-    )
+    try:
+        resp = await litellm_client.acompletion(
+            resolved["model_name"],
+            messages,
+            api_base=resolved.get("api_base"),
+            api_key=resolved.get("api_key"),
+            custom_llm_provider=resolved.get("provider_type"),
+            max_tokens=clamp_max_tokens(max_tokens),
+            temperature=temperature,
+            tools=tools,
+            extra=extra_kwargs or None,
+            provider_auth=resolved.get("provider_auth"),
+        )
+    except errors.ProviderSubscriptionError as exc:
+        raise CompletionError(exc.status_code, exc.message) from None
     choice = resp.choices[0]
     msg = choice.message
     content = getattr(msg, "content", None) or ""
@@ -174,7 +193,7 @@ async def complete_once(
         api_key_id=api_key_id,
     )
     return {
-        "model": resolved["model_name"],
+        "model": resolved["api_model_name"],
         "content": content,
         "tool_calls": tool_calls,
         "finish_reason": finish_reason,
@@ -223,6 +242,7 @@ async def complete_stream(
             tools=tools,
             extra=extra_kwargs or None,
             reasoning_effort=_reasoning_effort(None),
+            provider_auth=resolved.get("provider_auth"),
         )
         async for chunk in gen:
             u = getattr(chunk, "usage", None)
@@ -249,6 +269,10 @@ async def complete_stream(
                     "tool_calls": tcs,
                     "finish_reason": fr,
                 }
+    except errors.ProviderSubscriptionError as exc:
+        logger.warning("API 구독 스트리밍 실패 model=%s code=%s", resolved.get("model_name"), exc.code)
+        yield {"type": "error", "code": exc.code, "message": exc.message}
+        return
     except Exception:
         logger.warning("API 스트리밍 실패 model=%s", resolved.get("model_name"), exc_info=True)
         yield {"type": "error", "message": "생성 중 오류가 발생했습니다"}

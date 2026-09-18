@@ -24,6 +24,12 @@ router = APIRouter()
 
 class AnthropicMessagesRequest(BaseModel):
     model: str = Field(..., max_length=190)
+    provider: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=40,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
     messages: list[dict] = Field(..., min_length=1)
     system: Any = None  # str 또는 [{type:text,text}]
     max_tokens: int | None = None
@@ -250,7 +256,7 @@ async def messages(
     tools = _anthropic_tools_to_openai(body.tools)
     try:
         tool_choice = _convert_anthropic_tool_choice(body.tool_choice)
-        resolved = await core.resolve(body.model)
+        resolved = await core.resolve_api(body.model, provider=body.provider)
         await core.precheck(user_id, project_id, api_key_id=api_key_id)
     except core.CompletionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=anthropic_error(exc.status_code, exc.message)) from exc
@@ -279,7 +285,7 @@ async def messages(
         return nonstream_response(result, msg_id=msg_id)
 
     async def gen() -> AsyncIterator[str]:
-        model = resolved["model_name"]
+        model = resolved["api_model_name"]
         yield _event(
             "message_start",
             {
@@ -327,6 +333,7 @@ async def messages(
                 out_tokens = ev["completion_tokens"]
             elif ev["type"] == "error":
                 yield _event("error", anthropic_error(502, ev.get("message", "오류")))
+                return
         yield _event("content_block_stop", {"type": "content_block_stop", "index": 0})
         # 누적된 tool_use 블록(있으면) 방출
         stop_reason = "end_turn"

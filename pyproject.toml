@@ -4,10 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lumen"
-version = "0.1.8"
+version = "0.2.2"
 description = "Afterglow Lumen durable chat, LLM, and agent service"
 requires-python = ">=3.12"
-dependencies = [
+dependencies = []
+
+[project.optional-dependencies]
+service = [
     "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@aee36e8ea173e486f443fa816de4e6397d11cff2",
     "fastapi==0.125.0",
     "uvicorn[standard]==0.39.0",
@@ -40,14 +43,15 @@ dependencies = [
     "langchain-mcp-adapters==0.3.1",
 ]
 
-[project.optional-dependencies]
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24",
-    "httpx>=0.28.1",
     "fakeredis[lua]>=2.21",
     "ruff>=0.7.0",
 ]
+
+[tool.hatch.build.targets.wheel.shared-data]
+"deploy/kolla/ansible/roles/lumen" = "share/kolla-ansible/ansible/roles/lumen"
 
 [project.scripts]
 lumen-api = "lumen.main:run"

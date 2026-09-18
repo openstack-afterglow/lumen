@@ -5,7 +5,10 @@ from pydantic import ValidationError
 
 from lumen.models.chat_contracts import (
     ChatFeatureOptions,
+    CompactionRequest,
     CompletionRequest,
+    ContextPreviewRequest,
+    ContextState,
     UsageComponent,
     validate_chat_parts,
     validate_chat_run_event,
@@ -17,6 +20,7 @@ def test_default_feature_options_preserve_manual_memory_without_tools():
     assert ChatFeatureOptions().model_dump(by_alias=True) == {
         "web_search": {
             "enabled": False,
+            "mode": "managed",
             "context_size": "medium",
             "allowed_domains": [],
             "blocked_domains": [],
@@ -40,6 +44,15 @@ def test_default_feature_options_preserve_manual_memory_without_tools():
         "audio_output": None,
         "video_output": None,
     }
+
+
+def test_native_search_requires_no_provider_and_only_portable_options():
+    features = ChatFeatureOptions(web_search={"enabled": True, "mode": "native"})
+    assert features.web_search.provider_id is None
+    with pytest.raises(ValidationError, match="must not set provider_id"):
+        ChatFeatureOptions(web_search={"enabled": True, "mode": "native", "provider_id": 7})
+    with pytest.raises(ValidationError, match="supports only context_size"):
+        ChatFeatureOptions(web_search={"enabled": True, "mode": "native", "allowed_domains": ["docs.example"]})
 
 
 def test_completion_request_accepts_only_iana_client_timezones():
@@ -236,6 +249,7 @@ def test_run_event_requires_monotonic_opaque_cursor_and_typed_payload():
         }
     )
     assert event.type == "run.started"
+    assert event.payload.run_kind == "completion"
     with pytest.raises(ValidationError, match="event_id"):
         validate_chat_run_event(
             {
@@ -428,3 +442,154 @@ def test_text_execution_boundary_never_silently_drops_asset_parts():
     )
     with pytest.raises(UnsupportedInputPartError, match="image"):
         text_from_user_input_parts([{"type": "image", "asset_id": "asset-1"}])
+
+
+def test_context_state_rejects_unsafe_numeric_values_and_unknown_fields():
+    base = {
+        "model_name": "model",
+        "context_limit": 16_000,
+        "output_reserve": 4_096,
+        "safety_reserve": 2_048,
+        "input_budget": 9_856,
+        "input_tokens": 8_000,
+        "utilization": 0.81,
+        "measurement": "tokenizer",
+        "recommendation": "required",
+        "can_compact": True,
+        "reason_code": None,
+        "revision": "rev-1",
+        "checkpoint_id": None,
+        "active_compaction_run_id": None,
+    }
+    assert ContextState(**base).utilization == 0.81
+    with pytest.raises(ValidationError):
+        ContextState(**{**base, "utilization": float("nan")})
+    with pytest.raises(ValidationError):
+        ContextState(**{**base, "input_tokens": -1})
+    with pytest.raises(ValidationError):
+        ContextState(**{**base, "unexpected": True})
+
+
+def test_context_requests_share_selection_validation_and_bound_preview_parts():
+    preview = ContextPreviewRequest(model_id="model", parts=[])
+    assert preview.parts == []
+    with pytest.raises(ValidationError):
+        ContextPreviewRequest(model_id="model", parts=[{"type": "text", "text": "x"}] * 33)
+    with pytest.raises(ValidationError):
+        ContextPreviewRequest(model_id="model", features={"tool_policy": {"workspace_write_mode": "auto_edit"}})
+    request = CompactionRequest(model_id="model", expected_context_revision="rev-1")
+    assert request.expected_context_revision == "rev-1"
+    with pytest.raises(ValidationError):
+        CompactionRequest(model_id="model")
+
+
+def test_context_updated_event_is_typed_and_unknown_events_remain_rejected():
+    state = {
+        "model_name": "model",
+        "context_limit": None,
+        "output_reserve": 0,
+        "safety_reserve": 2_048,
+        "input_budget": None,
+        "input_tokens": None,
+        "utilization": None,
+        "measurement": "unknown",
+        "recommendation": "unavailable",
+        "can_compact": False,
+        "reason_code": "context_budget_unavailable",
+        "revision": "rev-1",
+        "checkpoint_id": None,
+        "active_compaction_run_id": None,
+    }
+    event = validate_chat_run_event(
+        {
+            "event_id": "run-1:1",
+            "run_id": "run-1",
+            "seq": 1,
+            "type": "context.updated",
+            "created_at": datetime.now(UTC).isoformat(),
+            "payload": {
+                "state": state,
+                "phase": "ready",
+                "cause": None,
+                "before_tokens": None,
+                "after_tokens": None,
+            },
+        }
+    )
+    assert event.payload.state.measurement == "unknown"
+    with pytest.raises(ValidationError):
+        validate_chat_run_event(
+            {
+                "event_id": "run-1:2",
+                "run_id": "run-1",
+                "seq": 2,
+                "type": "future.event",
+                "created_at": datetime.now(UTC).isoformat(),
+                "payload": {},
+            }
+        )
+
+
+def test_context_updated_event_round_trips_an_optional_breakdown():
+    """Old journal entries omit breakdown; new ones replay with it."""
+    state = {
+        "model_name": "model",
+        "context_limit": 16_000,
+        "output_reserve": 1_024,
+        "safety_reserve": 2_048,
+        "input_budget": 12_928,
+        "input_tokens": 120,
+        "utilization": 0.01,
+        "measurement": "estimated",
+        "recommendation": "none",
+        "can_compact": False,
+        "reason_code": None,
+        "revision": "rev-1",
+        "checkpoint_id": None,
+        "active_compaction_run_id": None,
+        "breakdown": {
+            "scope": "request",
+            "complete": False,
+            "components": [
+                {
+                    "id": "messages",
+                    "tokens": 120,
+                    "measurement": "estimated",
+                    "count": 4,
+                    "included": True,
+                    "items": [],
+                },
+                {
+                    "id": "mcp_tools",
+                    "tokens": None,
+                    "measurement": "unknown",
+                    "count": None,
+                    "included": False,
+                    "items": ["mcp:GitHub"],
+                },
+            ],
+            "uncounted": ["mcp_tools"],
+        },
+    }
+    event = validate_chat_run_event(
+        {
+            "event_id": "run-1:3",
+            "run_id": "run-1",
+            "seq": 3,
+            "type": "context.updated",
+            "created_at": datetime.now(UTC).isoformat(),
+            "payload": {
+                "state": state,
+                "phase": "compacted",
+                "cause": "manual",
+                "before_tokens": 900,
+                "after_tokens": 120,
+            },
+        }
+    )
+
+    breakdown = event.payload.state.breakdown
+    assert breakdown.scope == "request"
+    assert breakdown.complete is False
+    assert [component.id for component in breakdown.components] == ["messages", "mcp_tools"]
+    assert breakdown.components[1].count is None

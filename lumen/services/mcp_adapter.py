@@ -234,7 +234,11 @@ async def dispatch(context: ConsumerCloudContext, entry: RegistryEntry, argument
     try:
         return await _bridge_post(
             "/execute",
-            {"snapshot": snapshot_payload(context.principal.snapshot), "name": entry.name, "arguments": arguments.model_dump()},
+            {
+                "snapshot": snapshot_payload(context.principal.snapshot),
+                "name": entry.name,
+                "arguments": arguments.model_dump(),
+            },
         )
     except McpLumenAuthorityError as exc:
         raise McpInvocationError("Cloud control-plane call was denied or is unavailable") from exc
@@ -252,7 +256,9 @@ async def record_read_invocation(*args: Any, **kwargs: Any) -> None:
     del args, kwargs
 
 
-async def claim_mutation(principal: Principal, *, entry: RegistryEntry, arguments: dict[str, Any], idempotency_key: str, **_: Any) -> ClaimResult:
+async def claim_mutation(
+    principal: Principal, *, entry: RegistryEntry, arguments: dict[str, Any], idempotency_key: str, **_: Any
+) -> ClaimResult:
     try:
         result = await _bridge_post(
             "/execute",
@@ -282,11 +288,17 @@ async def complete_mutation(*args: Any, **kwargs: Any) -> None:
     del args, kwargs
 
 
-async def build_mutation_preview(context: ConsumerCloudContext, entry: RegistryEntry, arguments: _ParsedArguments) -> dict[str, Any]:
+async def build_mutation_preview(
+    context: ConsumerCloudContext, entry: RegistryEntry, arguments: _ParsedArguments
+) -> dict[str, Any]:
     try:
         return await _bridge_post(
             "/preview",
-            {"snapshot": snapshot_payload(context.principal.snapshot), "name": entry.name, "arguments": arguments.model_dump()},
+            {
+                "snapshot": snapshot_payload(context.principal.snapshot),
+                "name": entry.name,
+                "arguments": arguments.model_dump(),
+            },
         )
     except McpLumenAuthorityError as exc:
         raise McpInvocationError("Cloud mutation preview is unavailable") from exc

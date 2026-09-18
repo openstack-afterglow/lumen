@@ -1,7 +1,7 @@
 ---
 # Lumen kolla role defaults
 
-lumen_image_tag: "0.1.8"
+lumen_image_tag: "0.2.1"
 lumen_image_namespace: "ghcr.io/openstack-afterglow"
 lumen_api_image: "{{ lumen_image_namespace }}/lumen-api"
 lumen_worker_image: "{{ lumen_image_namespace }}/lumen-worker"
@@ -88,7 +88,9 @@ lumen_s3_endpoint_url: ""
 lumen_s3_bucket: "lumen-assets"
 lumen_s3_access_key: ""
 lumen_s3_secret_key: ""
-lumen_s3_region: "us-east-1"
+lumen_s3_region: "default"
+lumen_s3_server_side_encryption: ""
+lumen_s3_kms_key_id: ""
 
 # Lumen Sandbox & External Chat API Hosts
 lumen_sandbox_api_key: ""

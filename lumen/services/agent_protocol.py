@@ -9,10 +9,11 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from lumen.models.chat_contracts import FilePart, TextPart
 
@@ -75,6 +76,21 @@ class ToolBinding:
     load_policy: Literal["preloaded", "on_demand"] | None = None
 
 
+class GeneratedToolFile(_StrictModel):
+    """Server-local or embedded output that dispatch persists before exposing a reference."""
+
+    path: Path | None = None
+    data: bytes | None = Field(default=None, max_length=5 * 1024 * 1024)
+    name: str = Field(min_length=1, max_length=255)
+    media_type: str = Field(min_length=1, max_length=127)
+
+    @model_validator(mode="after")
+    def validate_single_source(self) -> GeneratedToolFile:
+        if (self.path is None) == (self.data is None):
+            raise ValueError("generated file requires exactly one content source")
+        return self
+
+
 class ToolArtifactRef(_StrictModel):
     asset_id: str = Field(min_length=1, max_length=36)
     kind: str = Field(min_length=1, max_length=64)
@@ -89,6 +105,7 @@ class ToolExecutionResult(_StrictModel):
     model_content: str = Field(default="", max_length=MAX_TOOL_MODEL_CONTENT_CHARS)
     display: list[ToolDisplayPart] = Field(default_factory=list, max_length=MAX_TOOL_DISPLAY_PARTS)
     artifacts: list[ToolArtifactRef] = Field(default_factory=list, max_length=20)
+    generated_files: list[GeneratedToolFile] = Field(default_factory=list, max_length=20, exclude=True)
     usage_components: dict[str, Any] = Field(default_factory=dict)
     error_code: str | None = Field(default=None, max_length=100)
     retryable: bool = False

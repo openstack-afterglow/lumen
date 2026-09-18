@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -70,3 +71,201 @@ def test_lumen_setting_names_cannot_be_provider_credential_sources(monkeypatch):
     )
     with pytest.raises(ProviderValidationError, match="Lumen 설정"):
         credentials.normalize_api_key_env("LUMEN_ENCRYPTION_KEY")
+
+
+def test_subscription_provider_never_uses_api_key_or_environment_fallback(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
+    provider = SimpleNamespace(
+        auth_mode="chatgpt_device",
+        encrypted_api_key="legacy-ciphertext",
+        api_key_env="OPENAI_API_KEY",
+    )
+
+    assert credentials.api_key_source(provider) is None
+    assert credentials.resolve_api_key(provider) is None
+
+
+@pytest.mark.parametrize(
+    ("auth_mode", "model_name", "expected"),
+    (
+        ("chatgpt_device", "gpt-5.2-codex", "chatgpt/gpt-5.2-codex"),
+        ("chatgpt_device", "chatgpt/gpt-5.2-codex", "chatgpt/gpt-5.2-codex"),
+        ("anthropic_subscription", "claude-opus-4-1", "anthropic-subscription/claude-opus-4-1"),
+        (
+            "anthropic_subscription",
+            "anthropic-subscription/claude-opus-4-1",
+            "anthropic-subscription/claude-opus-4-1",
+        ),
+        ("api_key", "anthropic/claude-opus-4-1", "anthropic/claude-opus-4-1"),
+    ),
+)
+def test_subscription_model_names_are_canonical(auth_mode, model_name, expected):
+    assert credentials.canonical_subscription_model_name(model_name, auth_mode) == expected
+
+
+@pytest.mark.parametrize(
+    ("auth_mode", "model_name"),
+    (
+        ("chatgpt_device", "anthropic/claude-opus-4-1"),
+        ("chatgpt_device", "chatgpt/chatgpt/gpt-5"),
+        ("anthropic_subscription", "chatgpt/gpt-5"),
+        ("api_key", "chatgpt/gpt-5"),
+        ("api_key", "anthropic-subscription/claude-opus-4-1"),
+    ),
+)
+def test_foreign_or_double_subscription_model_prefixes_are_rejected(auth_mode, model_name):
+    with pytest.raises(ProviderValidationError):
+        credentials.canonical_subscription_model_name(model_name, auth_mode)
+
+
+def test_litellm_model_name_strips_exactly_one_subscription_namespace():
+    assert credentials.litellm_model_name("chatgpt/gpt-5.2-codex") == "gpt-5.2-codex"
+    assert credentials.litellm_model_name("anthropic-subscription/claude-opus-4-1") == "claude-opus-4-1"
+    assert credentials.litellm_model_name("anthropic/claude-opus-4-1") == "anthropic/claude-opus-4-1"
+    assert credentials.litellm_model_name("chatgpt/chatgpt/gpt-5") == "chatgpt/chatgpt/gpt-5"
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    (
+        ("perplexity/perplexity/sonar", "perplexity/sonar"),
+        ("perplexity/sonar", "perplexity/sonar"),
+        ("sonar", "perplexity/sonar"),
+        ("anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
+        ("openai/gpt-5.6-luna", "openai/gpt-5.6-luna"),
+    ),
+)
+def test_perplexity_public_model_name_removes_only_transport_prefix(model_name, expected):
+    assert credentials.api_model_name(model_name, "perplexity") == expected
+
+
+def test_non_perplexity_public_model_name_is_unchanged():
+    assert credentials.api_model_name("anthropic/claude-sonnet-4-6", "anthropic") == ("anthropic/claude-sonnet-4-6")
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    (
+        ("gemini/gemini-3.1-flash-lite", "gemini-3.1-flash-lite"),
+        ("gemini/gemini-3.8-flash", "gemini-3.8-flash"),
+        ("gemini-3.8-flash", "gemini-3.8-flash"),
+    ),
+)
+def test_gemini_public_model_name_removes_transport_prefix(model_name, expected):
+    assert credentials.api_model_name(model_name, "gemini") == expected
+    assert credentials.short_model_name(model_name, "gemini") == expected
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    (
+        ("perplexity/perplexity/sonar", "perplexity/perplexity/sonar"),
+        ("perplexity/sonar", "perplexity/perplexity/sonar"),
+        ("sonar", "perplexity/perplexity/sonar"),
+        ("anthropic/claude-sonnet-4-6", "perplexity/anthropic/claude-sonnet-4-6"),
+    ),
+)
+def test_perplexity_route_model_name_adds_one_transport_prefix(model_name, expected):
+    assert credentials.perplexity_route_model_name(model_name) == expected
+
+
+@pytest.mark.parametrize("model_name", ("", " ", "perplexity//sonar", "openai/gpt 5"))
+def test_perplexity_route_model_name_rejects_invalid_segments(model_name):
+    with pytest.raises(ProviderValidationError):
+        credentials.perplexity_route_model_name(model_name)
+
+
+def test_perplexity_route_model_name_rejects_database_overflow():
+    with pytest.raises(ProviderValidationError, match="190"):
+        credentials.perplexity_route_model_name("openai/" + ("m" * 184))
+
+
+def test_perplexity_public_projection_preserves_route_key_and_custom_label(monkeypatch):
+    monkeypatch.setattr(pricing, "_effective_capabilities", lambda *_args, **_kwargs: ({}, "litellm"))
+    base = {
+        "id": 7,
+        "provider_id": 3,
+        "model_name": "perplexity/perplexity/sonar",
+        "is_active": True,
+        "is_title_model": False,
+        "is_memory_model": False,
+        "input_price": None,
+        "output_price": None,
+        "price_source": None,
+        "price_metadata": None,
+        "capabilities": None,
+        "capability_source": None,
+        "models_dev_model_id": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+    default_label = pricing._model_public(
+        SimpleNamespace(display_name="perplexity/perplexity/sonar", **base),
+        provider_type="perplexity",
+    )
+    custom_label = pricing._model_public(
+        SimpleNamespace(display_name="Sonar Research", **base),
+        provider_type="perplexity",
+    )
+
+    assert default_label["model_name"] == "perplexity/perplexity/sonar"
+    assert default_label["api_model_name"] == "perplexity/sonar"
+    assert default_label["api_provider"] == "perplexity"
+    assert default_label["display_name"] == "perplexity/sonar"
+    assert custom_label["display_name"] == "Sonar Research"
+
+
+def test_subscription_public_projection_distinguishes_api_key_and_subscription_status(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-key")
+    base = {
+        "id": 1,
+        "name": "provider",
+        "provider_type": "openai",
+        "api_base": None,
+        "encrypted_api_key": None,
+        "api_key_env": "OPENAI_API_KEY",
+        "encrypted_subscription_tokens": None,
+        "subscription_status": "disconnected",
+        "subscription_expires_at": None,
+        "subscription_generation": 0,
+        "is_active": True,
+        "margin_multiplier": Decimal("1"),
+        "models_dev_provider_id": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+    api_key = pricing._provider_public(SimpleNamespace(auth_mode="api_key", **base))
+    chatgpt = pricing._provider_public(
+        SimpleNamespace(
+            **{
+                **base,
+                "provider_type": "chatgpt",
+                "api_key_env": None,
+                "auth_mode": "chatgpt_device",
+                "encrypted_subscription_tokens": "ciphertext",
+                "subscription_status": "configured",
+                "subscription_expires_at": datetime.now(UTC) - timedelta(hours=1),
+            }
+        )
+    )
+    claude_expired = pricing._provider_public(
+        SimpleNamespace(
+            **{
+                **base,
+                "provider_type": "anthropic",
+                "api_key_env": None,
+                "auth_mode": "anthropic_subscription",
+                "encrypted_subscription_tokens": "ciphertext",
+                "subscription_status": "configured",
+                "subscription_expires_at": datetime.now(UTC) - timedelta(hours=1),
+            }
+        )
+    )
+
+    assert api_key["has_credentials"] is True
+    assert api_key["has_api_key"] is True
+    assert chatgpt["has_credentials"] is True
+    assert chatgpt["has_api_key"] is False
+    assert claude_expired["has_credentials"] is False
+    assert claude_expired["auth_status"] == "configured"

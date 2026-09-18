@@ -6,6 +6,7 @@ payloads, credentials, signed URLs, and hidden reasoning are deliberately exclud
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -279,6 +280,7 @@ def _validate_location(value: dict[str, str] | None) -> dict[str, str] | None:
 
 class WebSearchOptions(_StrictModel):
     enabled: bool = False
+    mode: Literal["managed", "native"] = "managed"
     context_size: Literal["low", "medium", "high"] = "medium"
     allowed_domains: list[str] = Field(default_factory=list, max_length=10)
     blocked_domains: list[str] = Field(default_factory=list, max_length=10)
@@ -288,8 +290,10 @@ class WebSearchOptions(_StrictModel):
 
     @model_validator(mode="after")
     def validate_search_scope(self) -> WebSearchOptions:
-        if self.enabled and self.provider_id is None:
-            raise ValueError("web_search requires provider_id when enabled")
+        if self.mode == "managed" and self.enabled and self.provider_id is None:
+            raise ValueError("managed web_search requires provider_id when enabled")
+        if self.mode == "native" and self.provider_id is not None:
+            raise ValueError("native web_search must not set provider_id")
         self.allowed_domains = _normalize_domains(self.allowed_domains)
         self.blocked_domains = _normalize_domains(self.blocked_domains)
         if any(
@@ -299,6 +303,16 @@ class WebSearchOptions(_StrictModel):
         ):
             raise ValueError("allowed_domains and blocked_domains must not overlap")
         self.approximate_location = _validate_location(self.approximate_location)
+        if self.mode == "native":
+            if self.allowed_domains or self.blocked_domains or self.max_uses != 1:
+                raise ValueError("native web_search supports only context_size and approximate_location")
+            if self.approximate_location is not None and set(self.approximate_location) != {
+                "city",
+                "country",
+                "region",
+                "timezone",
+            }:
+                raise ValueError("native web_search approximate_location requires city, country, region, and timezone")
         return self
 
 
@@ -498,10 +512,9 @@ class _ReasoningEffortRequest(_StrictModel):
         return value
 
 
-class CompletionRequest(_ReasoningEffortRequest):
-    """Canonical client intent; routing, pricing, and tool resolution are server snapshots."""
+class _CompletionSelectionRequest(_ReasoningEffortRequest):
+    """Selection fields shared by completion, preview, and compaction requests."""
 
-    parts: UserInputParts = Field(min_length=1, max_length=MAX_PARTS_PER_MESSAGE)
     model_id: str = Field(min_length=1, max_length=190)
     features: ChatFeatureOptions = Field(default_factory=ChatFeatureOptions)
     agent_id: str | None = Field(default=None, max_length=36)
@@ -517,7 +530,7 @@ class CompletionRequest(_ReasoningEffortRequest):
         return value
 
     @model_validator(mode="after")
-    def validate_execution_mode(self) -> CompletionRequest:
+    def validate_execution_mode(self) -> _CompletionSelectionRequest:
         if self.execution_mode == "chat" and (
             self.code_workspace_id is not None or self.features.tool_policy.workspace_write_mode != "ask"
         ):
@@ -526,10 +539,34 @@ class CompletionRequest(_ReasoningEffortRequest):
             raise ValueError("auto_edit is only available in code mode")
         return self
 
+
+class CompletionRequest(_CompletionSelectionRequest):
+    """Canonical client intent; routing, pricing, and tool resolution are server snapshots."""
+
+    parts: UserInputParts = Field(min_length=1, max_length=MAX_PARTS_PER_MESSAGE)
+
     @field_validator("parts")
     @classmethod
     def validate_parts(cls, value: UserInputParts) -> UserInputParts:
         return validate_user_input_parts([part.model_dump() for part in value])
+
+
+class ContextPreviewRequest(_CompletionSelectionRequest):
+    """Read-only context admission input, including an optional unsaved draft."""
+
+    parts: UserInputParts = Field(default_factory=list, max_length=MAX_PARTS_PER_MESSAGE)
+
+    @field_validator("parts")
+    @classmethod
+    def validate_preview_parts(cls, value: UserInputParts) -> UserInputParts:
+        # Preview permits an empty draft, unlike completion's required user input.
+        return _USER_INPUT_PARTS.validate_python([part.model_dump() for part in value])
+
+
+class CompactionRequest(_CompletionSelectionRequest):
+    """Context compaction admission input, fenced to a saved source revision."""
+
+    expected_context_revision: str = Field(min_length=1, max_length=190)
 
 
 class RegenerateRequest(_ReasoningEffortRequest):
@@ -541,6 +578,7 @@ class ChatRunDescriptor(_StrictModel):
     run_id: str = Field(min_length=1, max_length=36)
     conversation_id: str | None = Field(default=None, max_length=36)
     temp_thread_id: str | None = Field(default=None, max_length=36)
+    run_kind: Literal["completion", "compaction"] = "completion"
     status: Literal[
         "queued",
         "running",
@@ -571,6 +609,7 @@ class ChatRunResponse(_StrictModel):
     ]
     conversation_id: str | None = Field(default=None, max_length=36)
     temp_thread_id: str | None = Field(default=None, max_length=36)
+    run_kind: Literal["completion", "compaction"] = "completion"
     effective_features: dict[str, Any] = Field(default_factory=dict)
     public_history: list[dict[str, Any]] | None = None
     last_seq: int = Field(ge=0)
@@ -654,11 +693,129 @@ class UsageComponent(_StrictModel):
         return _validate_decimal_string(value, allow_negative=kind == "provider_adjustment")
 
 
+_CONTEXT_COMPONENT_IDS = (
+    "messages",
+    "system_prompt",
+    "workspace",
+    "memory",
+    "skills",
+    "agent",
+    "summary",
+    "attachments",
+    "tools",
+    "mcp_tools",
+    "deferred_tools",
+    "overhead",
+)
+MAX_CONTEXT_COMPONENTS = 64
+MAX_CONTEXT_COMPONENT_ITEMS = 128
+MAX_CONTEXT_ITEM_CHARS = 512
+
+
+class ContextComponent(_StrictModel):
+    """One inspectable slice of the prepared context.
+
+    ``included`` means the component's tokens are part of ``ContextState.input_tokens``.
+    ``tokens``/``count`` stay ``None`` whenever the value is genuinely unknown; they are
+    never zero-filled, and ``items`` carries only bounded names or identifiers.
+    """
+
+    id: Literal[
+        "messages",
+        "system_prompt",
+        "workspace",
+        "memory",
+        "skills",
+        "agent",
+        "summary",
+        "attachments",
+        "tools",
+        "mcp_tools",
+        "deferred_tools",
+        "overhead",
+    ]
+    tokens: int | None = Field(ge=0)
+    measurement: Literal["tokenizer", "estimated", "unknown"]
+    count: int | None = Field(ge=0)
+    included: bool
+    items: list[str] = Field(default_factory=list, max_length=MAX_CONTEXT_COMPONENT_ITEMS)
+
+    @field_validator("items")
+    @classmethod
+    def validate_items(cls, value: list[str]) -> list[str]:
+        if any(len(item) > MAX_CONTEXT_ITEM_CHARS for item in value):
+            raise ValueError("context component items must be bounded names")
+        return value
+
+
+class ContextBreakdown(_StrictModel):
+    """Honest composition of one prepared context.
+
+    ``complete`` is false whenever request material could not be measured, so a client
+    must not present exact free capacity from the component sum alone.
+    """
+
+    scope: Literal["preview", "request"]
+    complete: bool
+    components: list[ContextComponent] = Field(max_length=MAX_CONTEXT_COMPONENTS)
+    uncounted: list[str] = Field(default_factory=list, max_length=MAX_CONTEXT_COMPONENT_ITEMS)
+
+    @field_validator("components")
+    @classmethod
+    def validate_unique_components(cls, value: list[ContextComponent]) -> list[ContextComponent]:
+        identifiers = [component.id for component in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("context components must be unique by id")
+        return value
+
+    @field_validator("uncounted")
+    @classmethod
+    def validate_uncounted(cls, value: list[str]) -> list[str]:
+        if any(item not in _CONTEXT_COMPONENT_IDS for item in value):
+            raise ValueError("uncounted entries must be component ids")
+        return value
+
+
+class ContextState(_StrictModel):
+    model_name: str = Field(min_length=1, max_length=190)
+    context_limit: int | None = Field(ge=1)
+    output_reserve: int = Field(ge=0)
+    safety_reserve: int = Field(ge=0)
+    input_budget: int | None = Field(ge=0)
+    input_tokens: int | None = Field(ge=0)
+    utilization: float | None = Field(ge=0)
+    measurement: Literal["tokenizer", "estimated", "unknown"]
+    recommendation: Literal["none", "compact", "required", "unavailable"]
+    can_compact: bool
+    reason_code: str | None = Field(max_length=100)
+    revision: str = Field(min_length=1, max_length=190)
+    checkpoint_id: str | None = Field(max_length=36)
+    active_compaction_run_id: str | None = Field(max_length=36)
+    # Optional so durable journal entries written before context inspection stay readable.
+    breakdown: ContextBreakdown | None = None
+
+    @field_validator("utilization")
+    @classmethod
+    def validate_utilization(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("utilization must be finite")
+        return value
+
+
 class RunStartedPayload(_StrictModel):
     conversation_id: str | None = None
     temp_thread_id: str | None = None
     model_name: str = Field(min_length=1, max_length=190)
     effective_features: dict[str, Any]
+    run_kind: Literal["completion", "compaction"] = "completion"
+
+
+class ContextUpdatedPayload(_StrictModel):
+    state: ContextState
+    phase: Literal["ready", "compacting", "compacted", "failed"]
+    cause: Literal["automatic", "manual"] | None
+    before_tokens: int | None = Field(ge=0)
+    after_tokens: int | None = Field(ge=0)
 
 
 class RunStageChangedPayload(_StrictModel):
@@ -835,6 +992,11 @@ class MessageCreatedEvent(_RunEvent):
     payload: MessageCreatedPayload
 
 
+class ContextUpdatedEvent(_RunEvent):
+    type: Literal["context.updated"]
+    payload: ContextUpdatedPayload
+
+
 class PartDeltaEvent(_RunEvent):
     type: Literal["part.delta"]
     payload: PartDeltaPayload
@@ -894,6 +1056,7 @@ ChatRunEvent = Annotated[
     RunStartedEvent
     | RunStageChangedEvent
     | RunWarningEvent
+    | ContextUpdatedEvent
     | MessageCreatedEvent
     | PartDeltaEvent
     | PartCompletedEvent

@@ -48,6 +48,8 @@ def test_normalize_base_url_invalid() -> None:
 
 def test_required_scope_rotation_predicate() -> None:
     assert "compat:completions:write" in _LOCAL_KEY_SCOPES
+    assert "native:conversations:read" in _LOCAL_KEY_SCOPES
+    assert "native:conversations:write" in _LOCAL_KEY_SCOPES
     assert "models:read" in _LOCAL_KEY_SCOPES
 
     # Complete current scopes -> satisfied
@@ -244,6 +246,7 @@ async def test_seed_reconciles_provider_and_model_when_fields_differ(
     monkeypatch.setenv("LUMEN_LOCAL_PROVIDER_BASE_URL", "http://new-provider-base:8000")
     monkeypatch.setenv("LUMEN_LOCAL_INPUT_PRICE_PER_MILLION", "5")
     monkeypatch.setenv("LUMEN_LOCAL_OUTPUT_PRICE_PER_MILLION", "15")
+    monkeypatch.setenv("LUMEN_LOCAL_CONTEXT_LIMIT", "4096")
 
     fake_provider = {
         "id": 1,
@@ -258,13 +261,19 @@ async def test_seed_reconciles_provider_and_model_when_fields_differ(
         "model_name": "gpt-4.1-mini",
         "input_price_per_million": "1.00000000",
         "output_price_per_million": "3.00000000",
+        "capabilities": {"context_limit": 2048},
     }
 
     mock_list_providers = AsyncMock(return_value=[fake_provider])
     mock_update_provider = AsyncMock(return_value={**fake_provider, "api_base": "http://new-provider-base:8000"})
     mock_list_models = AsyncMock(return_value=[fake_model])
     mock_update_model = AsyncMock(
-        return_value={**fake_model, "input_price_per_million": "5", "output_price_per_million": "15"}
+        return_value={
+            **fake_model,
+            "input_price_per_million": "5",
+            "output_price_per_million": "15",
+            "capabilities": {"context_limit": 4096},
+        }
     )
     mock_verify_key = AsyncMock(return_value=None)
     mock_create_key = AsyncMock(return_value={"key": "sk-afgl-new-key-123"})
@@ -284,7 +293,14 @@ async def test_seed_reconciles_provider_and_model_when_fields_differ(
     await seed()
 
     mock_update_provider.assert_called_once_with(1, {"api_base": "http://new-provider-base:8000"})
-    mock_update_model.assert_called_once_with(10, {"input_price_per_million": "5", "output_price_per_million": "15"})
+    mock_update_model.assert_called_once_with(
+        10,
+        {
+            "input_price_per_million": "5",
+            "output_price_per_million": "15",
+            "capabilities": {"context_limit": 4096},
+        },
+    )
     assert conn_file.exists()
     manifest = json.loads(conn_file.read_text())
     assert manifest["api_key"] == "sk-afgl-new-key-123"

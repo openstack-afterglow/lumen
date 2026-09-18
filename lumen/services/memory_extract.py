@@ -204,6 +204,7 @@ async def generate_memory_if_applicable(
             custom_llm_provider=resolved.get("provider_type"),
             api_base=resolved.get("api_base"),
             api_key=resolved.get("api_key"),
+            provider_auth=resolved.get("provider_auth"),
             max_tokens=_MAX_TOKENS,
             temperature=0.2,
         )

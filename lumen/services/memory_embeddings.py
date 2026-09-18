@@ -16,6 +16,8 @@ async def embed_with_route(*, route: dict, text: str, dimensions: int) -> list[f
     """Embed with a caller-owned immutable route; callers own pricing and snapshot policy."""
     if not text.strip() or dimensions <= 0:
         raise EmbeddingUnavailable("semantic memory embedding route is unavailable")
+    if route.get("provider_auth") is not None:
+        raise EmbeddingUnavailable("subscription providers do not support embeddings")
     try:
         response = await litellm.aembedding(
             model=route["model_name"],

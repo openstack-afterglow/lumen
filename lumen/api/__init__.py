@@ -6,6 +6,7 @@
 _ROUTERS = {
     "chat_usage_router": ".usage",
     "chat_stats_router": ".stats",
+    "chat_quotas_router": ".quotas",
     "chat_agents_router": ".agents",
     "chat_workspaces_router": ".workspaces",
     "chat_code_workspaces_router": ".code_workspaces",

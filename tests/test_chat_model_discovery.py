@@ -57,17 +57,30 @@ class TestDiscover:
         assert "gpt-4o" in out["models"]
         assert "gpt-4o-mini" in out["models"]
 
-    async def test_perplexity_uses_its_default_models_endpoint(self, monkeypatch):
+    async def test_perplexity_agent_discovery_uses_v1_catalog_and_canonical_ids(self, monkeypatch):
         import httpx
 
         seen = {}
+
+        async def fake_get(_pid):
+            return {
+                "provider_type": "perplexity",
+                "api_base": None,
+                "api_key": "pplx-key",
+            }
 
         class _Response:
             status_code = 200
 
             @staticmethod
             def json():
-                return {"data": [{"id": "sonar-pro"}]}
+                return {
+                    "data": [
+                        {"id": "sonar"},
+                        {"id": "anthropic/claude-sonnet-4-6"},
+                        {"id": "preset/research"},
+                    ]
+                }
 
         class _Client:
             async def __aenter__(self):
@@ -80,14 +93,64 @@ class TestDiscover:
                 seen.update(url=url, headers=headers)
                 return _Response()
 
+        monkeypatch.setattr(model_discovery.provider_store, "get_provider_for_discovery", fake_get)
         monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: _Client())
 
-        out = await model_discovery._fetch_openai_compatible("perplexity", None, "pplx-key")
+        out = await model_discovery.discover_models(1)
 
-        assert out == ["sonar-pro"]
+        assert out == {
+            "models": ["anthropic/claude-sonnet-4-6", "perplexity/sonar"],
+            "source": "api",
+        }
         assert seen == {
-            "url": "https://api.perplexity.ai/models",
+            "url": "https://api.perplexity.ai/v1/models",
             "headers": {"Authorization": "Bearer pplx-key"},
+        }
+
+    @pytest.mark.parametrize(
+        ("api_base", "expected_url"),
+        (
+            ("https://api.perplexity.ai", "https://api.perplexity.ai/v1/models"),
+            ("https://api.perplexity.ai/v1", "https://api.perplexity.ai/v1/models"),
+            ("https://api.perplexity.ai/router", "https://api.perplexity.ai/router/v1/models"),
+            ("https://api.perplexity.ai/router/v1", "https://api.perplexity.ai/router/v1/models"),
+        ),
+    )
+    async def test_perplexity_discovery_keeps_agent_and_router_catalogs_separate(
+        self, monkeypatch, api_base, expected_url
+    ):
+        seen = {}
+
+        async def fake_get(_pid):
+            return {
+                "provider_type": "perplexity",
+                "api_base": api_base,
+                "api_key": "pplx-key",
+            }
+
+        async def fake_fetch(provider_type, received_base, api_key):
+            seen.update(provider_type=provider_type, api_base=received_base, api_key=api_key)
+            assert model_discovery._models_url(provider_type, received_base) == expected_url
+            return []
+
+        monkeypatch.setattr(model_discovery.provider_store, "get_provider_for_discovery", fake_get)
+        monkeypatch.setattr(model_discovery, "_fetch_openai_compatible", fake_fetch)
+        monkeypatch.setattr(
+            model_discovery,
+            "_litellm_static",
+            lambda _provider: ["perplexity/perplexity/sonar", "perplexity/sonar", "preset/hidden"],
+        )
+
+        out = await model_discovery.discover_models(1)
+
+        if "/router" in api_base:
+            assert out == {"models": [], "source": "none"}
+        else:
+            assert out == {"models": ["perplexity/sonar"], "source": "litellm"}
+        assert seen == {
+            "provider_type": "perplexity",
+            "api_base": api_base,
+            "api_key": "pplx-key",
         }
 
     async def test_non_openai_uses_litellm(self, monkeypatch):
@@ -110,3 +173,47 @@ class TestDiscover:
         out = await model_discovery.discover_models(1)
         assert out["source"] == "litellm"
         assert out["models"] == ["gpt-4o"]
+
+    async def test_chatgpt_subscription_uses_static_canonical_catalog_without_live_auth(self, monkeypatch):
+        async def fake_get(pid):
+            assert pid == 7
+            return {
+                "provider_type": "chatgpt",
+                "auth_mode": "chatgpt_device",
+                "api_base": None,
+                "api_key": None,
+            }
+
+        async def forbidden_fetch(*args, **kwargs):
+            raise AssertionError("subscription discovery must not call a live models endpoint")
+
+        monkeypatch.setattr(model_discovery.provider_store, "get_provider_for_discovery", fake_get)
+        monkeypatch.setattr(model_discovery, "_fetch_openai_compatible", forbidden_fetch)
+        monkeypatch.setattr(
+            model_discovery,
+            "_litellm_static",
+            lambda provider: ["chatgpt/gpt-5.2-codex", "gpt-5.3-codex"] if provider == "chatgpt" else [],
+        )
+
+        out = await model_discovery.discover_models(7)
+
+        assert out == {
+            "models": ["chatgpt/gpt-5.2-codex", "chatgpt/gpt-5.3-codex"],
+            "source": "litellm",
+        }
+
+    async def test_anthropic_subscription_catalog_keeps_distinct_namespace(self, monkeypatch):
+        async def fake_get(_pid):
+            return {
+                "provider_type": "anthropic",
+                "auth_mode": "anthropic_subscription",
+                "api_base": None,
+                "api_key": None,
+            }
+
+        monkeypatch.setattr(model_discovery.provider_store, "get_provider_for_discovery", fake_get)
+        monkeypatch.setattr(model_discovery, "_litellm_static", lambda provider: ["claude-opus-4-1"])
+
+        out = await model_discovery.discover_models(8)
+
+        assert out["models"] == ["anthropic-subscription/claude-opus-4-1"]

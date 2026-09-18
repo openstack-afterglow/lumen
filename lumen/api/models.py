@@ -6,49 +6,86 @@
 
 from __future__ import annotations
 
+import re
+from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, field_validator, model_validator
+from fastapi import APIRouter, Depends, HTTPException, Response
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 from lumen.auth import require_admin
 from lumen.services import model_discovery, models_dev
-from lumen.services.providers import credentials, errors, repository
+from lumen.services.providers import billing, credentials, errors, repository, subscriptions
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
 router = APIRouter(dependencies=[Depends(require_admin)])
+_NO_STORE = {"Cache-Control": "no-store"}
+_CLAUDE_SUBSCRIPTION_TOKEN = re.compile(r"sk-ant-oat[A-Za-z0-9._-]*\Z")
 
 
 # --- 프로바이더 ---
 class ProviderCreateRequest(BaseModel):
     name: str = Field(..., max_length=100)
     provider_type: str = Field(default="openai", max_length=40)  # litellm custom_llm_provider
+    auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"] = "api_key"
     api_base: str | None = Field(default=None, max_length=255)
     api_key: str | None = Field(default=None, max_length=500)
     api_key_env: str | None = Field(default=None, max_length=128)
+    billing_admin_key: str | None = Field(default=None, max_length=1000)
     margin_multiplier: float = Field(default=1.0, ge=0)
     is_active: bool = True
+
+    model_config = {"extra": "forbid"}
 
     @field_validator("api_key_env")
     @classmethod
     def validate_api_key_env(cls, value: str | None) -> str | None:
         return credentials.normalize_api_key_env(value)
+
+    @model_validator(mode="after")
+    def validate_auth_configuration(self):
+        try:
+            repository.validate_provider_auth_configuration(
+                provider_type=self.provider_type.strip(),
+                auth_mode=self.auth_mode,
+                api_base=self.api_base,
+                api_key=self.api_key,
+                api_key_env=self.api_key_env,
+                billing_admin_key=self.billing_admin_key,
+            )
+        except errors.ProviderValidationError as exc:
+            raise ValueError(str(exc)) from None
+        return self
 
 
 class ProviderUpdateRequest(BaseModel):
     name: str | None = Field(default=None, max_length=100)
     provider_type: str | None = Field(default=None, max_length=40)
+    auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"] | None = None
     api_base: str | None = Field(default=None, max_length=255)
     api_key: str | None = Field(default=None, max_length=500)
     api_key_env: str | None = Field(default=None, max_length=128)
+    billing_admin_key: str | None = Field(default=None, max_length=1000)
     margin_multiplier: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
+
+    model_config = {"extra": "forbid"}
 
     @field_validator("api_key_env")
     @classmethod
     def validate_api_key_env(cls, value: str | None) -> str | None:
         return credentials.normalize_api_key_env(value)
+
+    @model_validator(mode="after")
+    def reject_subscription_secrets(self):
+        if self.auth_mode in {"chatgpt_device", "anthropic_subscription"} and any(
+            isinstance(value, str) and value.strip()
+            for value in (self.api_base, self.api_key, self.api_key_env, self.billing_admin_key)
+        ):
+            raise ValueError("구독 프로바이더에는 API base/key/environment/admin credential을 설정할 수 없습니다")
+        return self
 
 
 class ProviderResponse(BaseModel):
@@ -56,14 +93,157 @@ class ProviderResponse(BaseModel):
     name: str
     provider_type: str
     api_base: str | None
+    auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"] = "api_key"
+    has_credentials: bool = False
+    auth_status: Literal["disconnected", "configured", "reauth_required"] = "disconnected"
+    auth_expires_at: str | None = None
     has_api_key: bool
     api_key_source: str | None = None
     api_key_env: str | None = None
+    has_billing_admin_key: bool = False
     is_active: bool
     margin_multiplier: float
+    billing_capability: (
+        Literal[
+            "openrouter_key",
+            "deepseek_balance",
+            "openai_admin_usage",
+            "anthropic_admin_usage",
+        ]
+        | None
+    ) = None
     created_at: str | None
     updated_at: str | None
     models_dev_provider_id: str | None = None
+
+
+class ProviderBillingBalance(BaseModel):
+    currency: str
+    total: Decimal
+    granted: Decimal
+    purchased: Decimal
+
+
+class ProviderBillingIntegerPeriods(BaseModel):
+    daily: int
+    weekly: int
+    monthly: int
+    total: int
+
+
+class ProviderBillingDecimalPeriods(BaseModel):
+    daily: Decimal
+    weekly: Decimal
+    monthly: Decimal
+    total: Decimal
+
+
+class ProviderBillingLocalUsage(BaseModel):
+    currency: Literal["USD"]
+    requests: ProviderBillingIntegerPeriods
+    tokens: ProviderBillingIntegerPeriods
+    raw_cost: ProviderBillingDecimalPeriods
+
+
+class ProviderBillingOptionalIntegerPeriods(BaseModel):
+    daily: int | None
+    weekly: int | None
+    monthly: int | None
+    total: int | None
+
+
+class ProviderBillingOptionalDecimalPeriods(BaseModel):
+    daily: Decimal | None
+    weekly: Decimal | None
+    monthly: Decimal | None
+    total: Decimal | None
+
+
+class ProviderBillingProviderUsage(BaseModel):
+    source: Literal["openai_admin_usage", "anthropic_admin_usage"]
+    currency: Literal["USD"]
+    cost: ProviderBillingOptionalDecimalPeriods | None
+    requests: ProviderBillingOptionalIntegerPeriods | None
+    tokens: ProviderBillingOptionalIntegerPeriods | None
+
+
+class ProviderBillingResponse(BaseModel):
+    provider_id: int
+    provider_name: str
+    provider_type: str
+    capability: (
+        Literal[
+            "openrouter_key",
+            "deepseek_balance",
+            "openai_admin_usage",
+            "anthropic_admin_usage",
+        ]
+        | None
+    )
+    status: Literal["available", "unavailable", "unsupported"]
+    reason: (
+        Literal[
+            "billing_endpoint_unsupported",
+            "provider_console_only",
+            "provider_analytics_scope_mismatch",
+            "credential_unavailable",
+            "credential_not_configured",
+            "admin_credential_unavailable",
+            "admin_credential_not_configured",
+            "admin_credential_rejected",
+            "partial_provider_data",
+            "provider_authorization_failed",
+            "provider_request_failed",
+            "provider_unavailable",
+        ]
+        | None
+    )
+    fetched_at: datetime
+    billing_url: str | None
+    usage_url: str | None
+    has_billing_admin_key: bool
+    local_usage: ProviderBillingLocalUsage
+    provider_usage: ProviderBillingProviderUsage | None
+    is_available: bool | None
+    is_free_tier: bool | None
+    limit: Decimal | None
+    remaining: Decimal | None
+    usage_total: Decimal | None
+    usage_daily: Decimal | None
+    usage_weekly: Decimal | None
+    usage_monthly: Decimal | None
+    balances: list[ProviderBillingBalance]
+
+
+class DeviceAuthStartResponse(BaseModel):
+    attempt_id: str
+    status: Literal["pending"]
+    verification_uri: str
+    user_code: str
+    expires_at: str
+    interval_seconds: int
+
+
+class DeviceAuthStatusResponse(BaseModel):
+    attempt_id: str
+    status: Literal["pending", "connected", "cancelled", "expired", "error"]
+    expires_at: str
+    interval_seconds: int
+
+
+class SubscriptionTokenRequest(BaseModel):
+    token: SecretStr
+    expires_at: datetime | None = None
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("token")
+    @classmethod
+    def validate_token(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value()
+        if not 16 <= len(raw) <= 8192 or _CLAUDE_SUBSCRIPTION_TOKEN.fullmatch(raw) is None:
+            raise ValueError("Claude 구독 token 형식이 올바르지 않습니다")
+        return value
 
 
 # --- 모델 ---
@@ -150,6 +330,8 @@ class ModelResponse(BaseModel):
     id: int
     provider_id: int
     model_name: str
+    api_model_name: str
+    api_provider: str
     display_name: str | None
     is_active: bool
     is_title_model: bool = False
@@ -204,6 +386,28 @@ def _map_storage(exc: Exception) -> HTTPException:
     return HTTPException(status_code=503, detail=str(exc))
 
 
+def _map_subscription_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, errors.ProviderNotFoundError):
+        status_code = 404
+        detail: object = str(exc)
+    elif isinstance(exc, (errors.ActiveRunConfigurationConflict, errors.ProviderAuthAttemptConflict)):
+        status_code = 409
+        detail = str(exc)
+    elif isinstance(exc, errors.ProviderConfigurationChangedError):
+        status_code = 409
+        detail = "프로바이더 인증 설정이 변경되었습니다"
+    elif isinstance(exc, errors.ProviderValidationError):
+        status_code = 400
+        detail = str(exc)
+    elif isinstance(exc, errors.ProviderSubscriptionError):
+        status_code = exc.status_code
+        detail = {"code": exc.code, "message": exc.message}
+    else:
+        status_code = 503
+        detail = "구독 인증 저장소를 사용할 수 없습니다"
+    return HTTPException(status_code=status_code, detail=detail, headers=_NO_STORE)
+
+
 # ---------------------------------------------------------------------------
 # 프로바이더 엔드포인트
 # ---------------------------------------------------------------------------
@@ -211,6 +415,17 @@ def _map_storage(exc: Exception) -> HTTPException:
 async def list_providers():
     try:
         return await repository.list_providers()
+    except errors.ChatStorageUnavailable as exc:
+        raise _map_storage(exc) from exc
+
+
+@router.get(
+    "/admin/providers/billing",
+    response_model=list[ProviderBillingResponse],
+)
+async def list_provider_billing():
+    try:
+        return await billing.list_provider_billing()
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
@@ -237,6 +452,130 @@ async def update_provider(provider_id: int, payload: ProviderUpdateRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
+
+
+@router.post(
+    "/admin/providers/{provider_id}/auth/device",
+    response_model=DeviceAuthStartResponse,
+    status_code=201,
+)
+async def begin_provider_device_auth(
+    provider_id: int,
+    response: Response,
+    admin_info: dict = Depends(require_admin),
+):
+    try:
+        result = await subscriptions.begin_device_auth(
+            provider_id,
+            user_id=admin_info["user_id"],
+            project_id=admin_info["project_id"],
+        )
+        created = bool(result.pop("_created", False))
+        response.status_code = 201 if created else 200
+        response.headers.update(_NO_STORE)
+        return result
+    except (
+        errors.ActiveRunConfigurationConflict,
+        errors.ChatStorageUnavailable,
+        errors.ProviderAuthAttemptConflict,
+        errors.ProviderConfigurationChangedError,
+        errors.ProviderNotFoundError,
+        errors.ProviderSubscriptionError,
+        errors.ProviderValidationError,
+    ) as exc:
+        raise _map_subscription_error(exc) from None
+
+
+@router.post(
+    "/admin/providers/{provider_id}/auth/device/{attempt_id}/poll",
+    response_model=DeviceAuthStatusResponse,
+)
+async def poll_provider_device_auth(
+    provider_id: int,
+    attempt_id: str,
+    response: Response,
+    admin_info: dict = Depends(require_admin),
+):
+    try:
+        result = await subscriptions.poll_device_auth(
+            provider_id,
+            attempt_id,
+            user_id=admin_info["user_id"],
+            project_id=admin_info["project_id"],
+        )
+        response.headers.update(_NO_STORE)
+        return result
+    except (
+        errors.ActiveRunConfigurationConflict,
+        errors.ChatStorageUnavailable,
+        errors.ProviderConfigurationChangedError,
+        errors.ProviderNotFoundError,
+        errors.ProviderSubscriptionError,
+        errors.ProviderValidationError,
+    ) as exc:
+        raise _map_subscription_error(exc) from None
+
+
+@router.delete("/admin/providers/{provider_id}/auth/device/{attempt_id}", status_code=204)
+async def cancel_provider_device_auth(
+    provider_id: int,
+    attempt_id: str,
+    admin_info: dict = Depends(require_admin),
+):
+    try:
+        await subscriptions.cancel_device_auth(
+            provider_id,
+            attempt_id,
+            user_id=admin_info["user_id"],
+            project_id=admin_info["project_id"],
+        )
+    except (
+        errors.ActiveRunConfigurationConflict,
+        errors.ChatStorageUnavailable,
+        errors.ProviderNotFoundError,
+        errors.ProviderSubscriptionError,
+        errors.ProviderValidationError,
+    ) as exc:
+        raise _map_subscription_error(exc) from None
+    return Response(status_code=204, headers=_NO_STORE)
+
+
+@router.put("/admin/providers/{provider_id}/auth/token", response_model=ProviderResponse)
+async def set_provider_subscription_token(
+    provider_id: int,
+    payload: SubscriptionTokenRequest,
+    response: Response,
+):
+    try:
+        result = await subscriptions.set_subscription_token(
+            provider_id,
+            token=payload.token.get_secret_value(),
+            expires_at=payload.expires_at,
+        )
+        response.headers.update(_NO_STORE)
+        return result
+    except (
+        errors.ActiveRunConfigurationConflict,
+        errors.ChatStorageUnavailable,
+        errors.ProviderNotFoundError,
+        errors.ProviderValidationError,
+    ) as exc:
+        raise _map_subscription_error(exc) from None
+
+
+@router.delete("/admin/providers/{provider_id}/auth", status_code=204)
+async def disconnect_provider_subscription(provider_id: int):
+    try:
+        await subscriptions.disconnect_subscription(provider_id)
+    except (
+        errors.ActiveRunConfigurationConflict,
+        errors.ChatStorageUnavailable,
+        errors.ProviderNotFoundError,
+        errors.ProviderSubscriptionError,
+        errors.ProviderValidationError,
+    ) as exc:
+        raise _map_subscription_error(exc) from None
+    return Response(status_code=204, headers=_NO_STORE)
 
 
 @router.delete("/admin/providers/{provider_id}", status_code=204)

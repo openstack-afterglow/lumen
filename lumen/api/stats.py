@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 
 from lumen.auth import get_os_conn, require_admin
 from lumen.services import stats as stats_service
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(dependencies=[Depends(require_admin)])
 
-_RANGES = ("30d", "90d", "1y", "all")
+_RANGES = ("7d", "30d", "90d", "1y", "all")
 _BUCKETS = ("5m", "15m", "hour", "day", "month")
 
 
@@ -128,3 +128,21 @@ async def get_stats_users(
         conn, user_ids={row["user_id"] for row in users if row.get("user_id")}, project_ids=set()
     )
     return {"users": [{**row, "user_name": user_names.get(row["user_id"])} for row in users]}
+
+
+@router.get("/admin/stats/users/{user_id}")
+async def get_user_stats_detail(
+    user_id: str = Path(min_length=1, max_length=64),
+    range: str = Query(default="30d"),
+    source: Literal["web", "api"] | None = Query(default=None),
+    before_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """Detailed, cursor-paged usage ledger and aggregates for one user."""
+    return await stats_service.user_detail(
+        user_id,
+        range_key=_norm_range(range),
+        source=source,
+        before_id=before_id,
+        limit=limit,
+    )

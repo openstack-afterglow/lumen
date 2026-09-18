@@ -6,7 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from lumen.services import conversation_store as cs
 from lumen.services import memory_jobs as jobs
+from lumen.services import title_jobs
 
 pytestmark = pytest.mark.asyncio
 
@@ -238,3 +240,294 @@ async def test_post_apply_crash_rolls_back_the_memory_and_completion_transaction
 
     assert state == {"rolled_back": True, "applied": True}
     assert session.job.status == "running"
+
+
+async def test_title_enqueue_persists_first_exchange_for_untitled_auto_conversation(monkeypatch):
+    payloads = []
+    conversation = SimpleNamespace(
+        id="conversation-1",
+        title=None,
+        title_source="auto",
+        title_status="idle",
+        title_revision=0,
+    )
+    messages = {
+        11: SimpleNamespace(
+            conversation_id="conversation-1", role="user", status="completed", content="첫 사용자 질문"
+        ),
+        12: SimpleNamespace(conversation_id="conversation-1", role="assistant", status="completed", content="첫 답변"),
+    }
+
+    class Session:
+        def __init__(self):
+            self.added = []
+
+        async def get(self, model, key, **_kwargs):
+            if model is title_jobs.ChatConversation:
+                return conversation
+            assert model is title_jobs.ChatMessage
+            return messages[key]
+
+        async def execute(self, _statement):
+            return _Result(None)
+
+        def add(self, row):
+            self.added.append(row)
+
+    monkeypatch.setattr(title_jobs, "decrypt_chat_content", lambda text: text)
+    monkeypatch.setattr(title_jobs, "_enc_payload", lambda value: payloads.append(value) or "encrypted-payload")
+    run = SimpleNamespace(
+        id="run-1",
+        status="completed",
+        run_kind="completion",
+        run_scope="persistent",
+        parent_run_id=None,
+        conversation_id="conversation-1",
+        user_message_id=11,
+        assistant_message_id=12,
+        project_id="project-1",
+        user_id="user-1",
+        capability_snapshot={
+            "summary_route": {
+                "provider_id": 3,
+                "model_id": 4,
+                "model_name": "title-model",
+                "config_version_hash": "a" * 64,
+            }
+        },
+        pricing_snapshot={"summary_route": {"provider_name": "title-provider"}},
+    )
+
+    session = Session()
+    assert await title_jobs.enqueue_completed_run_in_transaction(session, run) is True
+    assert conversation.title_source == "auto"
+    assert (conversation.title_status, conversation.title_revision) == ("pending", 1)
+    assert len(session.added) == 1
+    assert session.added[0].idempotency_key == "title:first:conversation-1"
+    assert payloads == [
+        {
+            "conversation_id": "conversation-1",
+            "project_id": "project-1",
+            "user_id": "user-1",
+            "run_id": "run-1",
+            "expected_title_revision": 1,
+            "exchange": [
+                {"role": "user", "content": "첫 사용자 질문"},
+                {"role": "assistant", "content": "첫 답변"},
+            ],
+            "summary_route": {
+                "provider_id": 3,
+                "model_id": 4,
+                "model_name": "title-model",
+                "config_version_hash": "a" * 64,
+            },
+            "pricing_snapshot": {"provider_name": "title-provider"},
+        }
+    ]
+
+
+async def test_manual_title_update_fences_pending_title_result(monkeypatch):
+    conversation = SimpleNamespace(title="auto title", title_source="auto", title_status="pending", title_revision=1)
+
+    class Session:
+        def begin(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def flush(self):
+            return None
+
+    session = Session()
+
+    async def owned(*_args, **_kwargs):
+        return conversation
+
+    monkeypatch.setattr(cs, "_require_db", lambda: lambda: session)
+    monkeypatch.setattr(cs, "_load_owned", owned)
+    monkeypatch.setattr(cs, "_enc", lambda value: f"encrypted:{value}" if value else None)
+    monkeypatch.setattr(cs, "_conv_public", lambda row: {"title": row.title, "title_source": row.title_source})
+
+    result = await cs.update_title("conversation-1", user_id="user-1", project_id="project-1", title="직접 입력 제목")
+
+    assert result == {"title": "encrypted:직접 입력 제목", "title_source": "explicit"}
+    assert conversation.title_status == "ready"
+    assert conversation.title_revision == 2
+
+
+async def test_title_provider_started_expiry_never_replays_provider(monkeypatch):
+    calls = []
+
+    async def fake_claim(*, owner):
+        return {"terminal": True}
+
+    async def forbidden_generate(**_kwargs):
+        calls.append(True)
+        raise AssertionError("provider must not be called after provider-started lease expiry")
+
+    monkeypatch.setattr(title_jobs, "_claim_one", fake_claim)
+    monkeypatch.setattr(title_jobs.title_summary, "generate_title", forbidden_generate)
+
+    assert await title_jobs.process_one(owner="worker-1") is True
+    assert calls == []
+
+
+async def test_title_completed_result_replays_without_provider(monkeypatch):
+    applied = []
+    payload = {
+        "expected_title_revision": 1,
+        "exchange": [{"role": "user", "content": "질문"}, {"role": "assistant", "content": "답변"}],
+    }
+    claimed = {
+        "job_id": "job-1",
+        "run_id": "run-1",
+        "conversation_id": "conversation-1",
+        "owner": "worker-1",
+        "payload": payload,
+        "replay": True,
+        "attempts": 1,
+    }
+
+    async def fake_claim(*, owner):
+        assert owner == "worker-1"
+        return claimed
+
+    async def fake_apply(job):
+        applied.append(job["job_id"])
+        return True
+
+    async def forbidden_generate(**_kwargs):
+        raise AssertionError("completed durable result must be replayed")
+
+    monkeypatch.setattr(title_jobs, "_claim_one", fake_claim)
+    monkeypatch.setattr(title_jobs, "_apply_result", fake_apply)
+    monkeypatch.setattr(title_jobs.title_summary, "generate_title", forbidden_generate)
+
+    assert await title_jobs.process_one(owner="worker-1") is True
+    assert applied == ["job-1"]
+
+
+async def test_title_late_result_after_manual_edit_records_usage_but_does_not_overwrite(monkeypatch):
+    payload = {
+        "conversation_id": "conversation-1",
+        "project_id": "project-1",
+        "user_id": "user-1",
+        "run_id": "run-1",
+        "expected_title_revision": 1,
+        "summary_route": {"model_name": "title-model", "provider_name": "provider"},
+        "pricing_snapshot": {"input_price_per_token": "0", "output_price_per_token": "0", "margin_multiplier": "1"},
+        "result": {"title": "오래된 제목", "prompt_tokens": 3, "completion_tokens": 2, "model_name": "title-model"},
+    }
+
+    class Session:
+        def __init__(self):
+            self.job = SimpleNamespace(
+                id="job-1",
+                conversation_id="conversation-1",
+                status="running",
+                lease_owner="worker-1",
+                lease_expires_at=object(),
+                payload="encrypted",
+                progress=None,
+                error_code=None,
+            )
+            self.conversation = SimpleNamespace(
+                id="conversation-1",
+                title="직접 입력 제목",
+                title_source="explicit",
+                title_status="ready",
+                title_revision=2,
+            )
+
+        def begin(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, model, _key, **_kwargs):
+            if model is title_jobs.ChatJob:
+                return self.job
+            return self.conversation
+
+        async def execute(self, _statement):
+            return _Result(None)
+
+    session = Session()
+    monkeypatch.setattr("lumen.db.get_session_factory", lambda: lambda: session)
+    monkeypatch.setattr(title_jobs, "_json_load", lambda _ciphertext: payload)
+    monkeypatch.setattr(title_jobs.litellm_client, "cost_from_usage", lambda *_args, **_kwargs: object())
+    usage = []
+
+    async def fake_apply_usage(_session, **kwargs):
+        usage.append(kwargs["event_id"])
+        return 0
+
+    monkeypatch.setattr(title_jobs.credit, "apply_usage_in_transaction", fake_apply_usage)
+    assert (
+        await title_jobs._apply_result({"job_id": "job-1", "owner": "worker-1", "payload": payload, "replay": True})
+        is True
+    )
+    assert session.conversation.title == "직접 입력 제목"
+    assert session.job.status == "completed"
+    assert usage == ["title:conversation-1:1"]
+
+
+async def test_title_apply_failure_requeues_stored_result_without_provider_retry(monkeypatch):
+    claimed = {
+        "job_id": "job-1",
+        "owner": "worker-1",
+        "payload": {
+            "expected_title_revision": 1,
+            "user_id": "user-1",
+            "project_id": "project-1",
+            "exchange": [{"role": "user", "content": "질문"}, {"role": "assistant", "content": "답변"}],
+            "summary_route": {"model_name": "title-model"},
+        },
+        "replay": False,
+        "attempts": 1,
+    }
+    provider_calls = []
+    requeued = []
+
+    async def fake_claim(*, owner):
+        assert owner == "worker-1"
+        return claimed
+
+    async def fake_precheck(*_args):
+        return None
+
+    async def fake_started(*_args, **_kwargs):
+        return None
+
+    async def fake_generate(**_kwargs):
+        provider_calls.append(True)
+        return SimpleNamespace(title="제목", prompt_tokens=2, completion_tokens=1, model_name="title-model")
+
+    async def fake_store(*_args):
+        return None
+
+    async def failing_apply(*_args, **_kwargs):
+        raise RuntimeError("apply transaction rolled back")
+
+    async def fake_requeue(job_id, *, owner):
+        requeued.append((job_id, owner))
+
+    monkeypatch.setattr(title_jobs, "_claim_one", fake_claim)
+    monkeypatch.setattr(title_jobs.credit, "precheck", fake_precheck)
+    monkeypatch.setattr(title_jobs, "_mark_provider_started", fake_started)
+    monkeypatch.setattr(title_jobs.title_summary, "generate_title", fake_generate)
+    monkeypatch.setattr(title_jobs, "_store_result", fake_store)
+    monkeypatch.setattr(title_jobs, "_apply_result", failing_apply)
+    monkeypatch.setattr(title_jobs, "_requeue_stored_result", fake_requeue)
+
+    assert await title_jobs.process_one(owner="worker-1") is True
+    assert provider_calls == [True]
+    assert requeued == [("job-1", "worker-1")]

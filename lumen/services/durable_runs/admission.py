@@ -2,7 +2,7 @@
 
 import json
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import select
 
@@ -25,7 +25,6 @@ from .common import (
     _freeze_v2_tool_call_limit,
     _now,
     _require_supported_execution_protocol_version,
-    _temporary_history_messages,
     descriptor,
     wake_run,
 )
@@ -76,33 +75,17 @@ def _add_run_providers(session, run: ChatRun, capability_snapshot: dict[str, Any
             config_version_hash=capability_snapshot["config_version_hash"],
         )
     )
-    routes = capability_snapshot.get("feature_routes")
-    if not isinstance(routes, dict):
-        return
-    search = routes.get("search")
-    if isinstance(search, dict):
+    summary = capability_snapshot.get("summary_route")
+    if isinstance(summary, dict):
         session.add(
             ChatRunProvider(
                 run_id=run.id,
-                purpose="search",
-                provider_id=search["provider_id"],
-                model_id=None,
-                provider_label=search["provider_name"],
-                model_label="managed-search",
-                config_version_hash=search["config_version_hash"],
-            )
-        )
-    advisor = routes.get("advisor")
-    if isinstance(advisor, dict):
-        session.add(
-            ChatRunProvider(
-                run_id=run.id,
-                purpose="advisor",
-                provider_id=advisor["provider_id"],
-                model_id=advisor["model_id"],
-                provider_label=advisor["provider_name"],
-                model_label=advisor["model_name"],
-                config_version_hash=advisor["config_version_hash"],
+                purpose="summary",
+                provider_id=summary["provider_id"],
+                model_id=summary["model_id"],
+                provider_label=summary["provider_name"],
+                model_label=summary["model_name"],
+                config_version_hash=summary["config_version_hash"],
             )
         )
 
@@ -120,12 +103,14 @@ async def _lock_run_configurations(
     routes = routes if isinstance(routes, dict) else {}
     search = routes.get("search")
     advisor = routes.get("advisor")
+    summary = capability_snapshot.get("summary_route")
     try:
         await ps.lock_execution_routes(
             session,
             executor=capability_snapshot,
             search=search if isinstance(search, dict) else None,
             advisor=advisor if isinstance(advisor, dict) else None,
+            summary=summary if isinstance(summary, dict) else None,
         )
     except ps.ProviderConfigurationChangedError as exc:
         raise DurableRunConflict("provider_configuration_changed") from exc
@@ -139,23 +124,55 @@ _ASSET_MIME_PREFIXES = {
 }
 
 
-async def _bind_user_assets(
+def _asset_metadata_int(metadata: dict[str, Any], key: str, *, minimum: int) -> int:
+    try:
+        return max(minimum, int(metadata.get(key) or minimum))
+    except (TypeError, ValueError, OverflowError):
+        return minimum
+
+
+def _canonical_asset_part(part, asset: ChatAsset) -> dict[str, Any]:
+    """Project an input asset reference into the durable canonical part shape."""
+    metadata = asset.media_metadata if isinstance(asset.media_metadata, dict) else {}
+    base: dict[str, Any] = {
+        "type": part.type,
+        "asset_id": asset.id,
+        "mime_type": asset.mime_type,
+        "name": asset.original_name,
+    }
+    if part.type == "image":
+        base.update(
+            width=_asset_metadata_int(metadata, "width", minimum=1),
+            height=_asset_metadata_int(metadata, "height", minimum=1),
+        )
+    elif part.type == "audio":
+        base["duration_ms"] = _asset_metadata_int(metadata, "duration_ms", minimum=0)
+    elif part.type == "video":
+        base.update(
+            duration_ms=_asset_metadata_int(metadata, "duration_ms", minimum=0),
+            width=_asset_metadata_int(metadata, "width", minimum=1),
+            height=_asset_metadata_int(metadata, "height", minimum=1),
+        )
+    elif part.type == "document":
+        base["page_count"] = _asset_metadata_int(metadata, "page_count", minimum=1)
+    return base
+
+
+async def _canonical_user_parts(
     session,
     *,
     parts: list[dict[str, Any]],
-    message_id: int | None,
-    run_id: str,
     user_id: str,
     project_id: str,
-) -> None:
-    """Lock and bind clean, owned assets before the run can enter the queue."""
+) -> list[dict[str, Any]]:
+    """Validate input references and return encrypted-message-compatible parts."""
     try:
         parsed = validate_user_input_parts(parts)
     except (TypeError, ValueError) as exc:
-        raise DurableRunInputError("input asset parts are invalid") from exc
+        raise DurableRunInputError("input parts are invalid") from exc
     requested = [(index, part) for index, part in enumerate(parsed) if part.type != "text"]
     if not requested:
-        return
+        return [{"type": "text", "text": part.text} for part in parsed]
     asset_ids = [part.asset_id for _, part in requested]
     if len(set(asset_ids)) != len(asset_ids):
         raise DurableRunInputError("an input asset may appear only once")
@@ -163,7 +180,11 @@ async def _bind_user_assets(
         (await session.execute(select(ChatAsset).where(ChatAsset.id.in_(asset_ids)).with_for_update())).scalars().all()
     )
     by_id = {row.id: row for row in rows}
-    for index, part in requested:
+    canonical: list[dict[str, Any]] = []
+    for part in parsed:
+        if part.type == "text":
+            canonical.append({"type": "text", "text": part.text})
+            continue
         asset = by_id.get(part.asset_id)
         if asset is None:
             raise DurableRunInputError("input asset was not found")
@@ -174,9 +195,28 @@ async def _bind_user_assets(
         prefixes = _ASSET_MIME_PREFIXES[part.type]
         if not asset.mime_type.startswith(prefixes):
             raise DurableRunInputError("input asset type does not match its detected media type")
-        session.add(ChatRunAsset(run_id=run_id, asset_id=asset.id, purpose="input"))
+        canonical.append(_canonical_asset_part(part, asset))
+    return canonical
+
+
+async def _bind_user_assets(
+    session,
+    *,
+    parts: list[dict[str, Any]],
+    message_id: int | None,
+    run_id: str,
+    user_id: str,
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Bind owned input assets and return the canonical parts persisted for the message."""
+    canonical = await _canonical_user_parts(session, parts=parts, user_id=user_id, project_id=project_id)
+    for index, part in enumerate(canonical):
+        if part["type"] == "text":
+            continue
+        session.add(ChatRunAsset(run_id=run_id, asset_id=part["asset_id"], purpose="input"))
         if message_id is not None:
-            session.add(ChatMessageAsset(message_id=message_id, asset_id=asset.id, part_index=index))
+            session.add(ChatMessageAsset(message_id=message_id, asset_id=part["asset_id"], part_index=index))
+    return canonical
 
 
 async def create_persistent_run(
@@ -195,8 +235,10 @@ async def create_persistent_run(
     pricing_snapshot: dict[str, Any],
     client_timezone: str | None = None,
     execution_protocol_version: int = 1,
+    run_kind: Literal["completion", "compaction"] = "completion",
     source: str = "web",
     api_key_id: int | None = None,
+    expected_parent_id: int | None = None,
 ) -> ChatRunDescriptor:
     """Atomically create the user turn, run, and first journal event.
 
@@ -223,6 +265,20 @@ async def create_persistent_run(
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        conversation = (
+            await session.execute(
+                select(ChatConversation)
+                .where(
+                    ChatConversation.id == conversation_id,
+                    ChatConversation.project_id == project_id,
+                    ChatConversation.user_id == user_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if conversation is None:
+            raise DurableRunNotFound("conversation was not found")
+
         existing = (
             await session.execute(
                 select(ChatRun)
@@ -238,21 +294,7 @@ async def create_persistent_run(
             if existing.request_fingerprint != fingerprint:
                 raise DurableRunConflict("idempotency_key_reused_with_different_intent")
             return descriptor(existing)
-        await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
 
-        conversation = (
-            await session.execute(
-                select(ChatConversation)
-                .where(
-                    ChatConversation.id == conversation_id,
-                    ChatConversation.project_id == project_id,
-                    ChatConversation.user_id == user_id,
-                )
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if conversation is None:
-            raise DurableRunNotFound("conversation was not found")
         active = (
             await session.execute(
                 select(ChatRun.id)
@@ -263,15 +305,22 @@ async def create_persistent_run(
         if active is not None:
             raise DurableRunConflict("conversation_run_active")
 
+        if conversation.active_leaf_id != expected_parent_id:
+            raise DurableRunConflict("context_revision_changed")
+        await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
+
+        # Build and persist the canonical user row before constructing the
+        # durable run. Asset rows are bound to the preallocated run ID in the
+        # same transaction, so no accepted run can lack its input ownership.
         created_at, created_at_local, created_timezone = message_timestamps(client_timezone)
         user_message = ChatMessage(
             conversation_id=conversation_id,
             role="user",
             parent_id=conversation.active_leaf_id,
-            content=encrypt_chat_content(user_content),
-            parts=serialize_parts(user_parts),
-            parts_version=1,
+            content=encrypt_chat_content(user_content) if user_content else None,
             status="complete",
+            token_prompt=0,
+            token_completion=0,
             created_at=created_at,
             created_at_local=created_at_local,
             created_timezone=created_timezone,
@@ -280,8 +329,18 @@ async def create_persistent_run(
         await session.flush()
         conversation.active_leaf_id = user_message.id
 
+        canonical_parts = await _canonical_user_parts(session, parts=user_parts, user_id=user_id, project_id=project_id)
+        user_message.parts = serialize_parts(canonical_parts)
+        user_message.parts_version = 1
+        run_id = str(uuid.uuid4())
+        for index, part in enumerate(canonical_parts):
+            if part["type"] == "text":
+                continue
+            session.add(ChatRunAsset(run_id=run_id, asset_id=part["asset_id"], purpose="input"))
+            session.add(ChatMessageAsset(message_id=user_message.id, asset_id=part["asset_id"], part_index=index))
+
         run = ChatRun(
-            id=str(uuid.uuid4()),
+            id=run_id,
             run_scope="persistent",
             conversation_id=conversation_id,
             user_message_id=user_message.id,
@@ -301,19 +360,12 @@ async def create_persistent_run(
             request_fingerprint=fingerprint,
             fingerprint_version=1,
             last_seq=0,
+            run_kind=run_kind,
             current_ordinal=0,
             status="queued",
         )
         _add_run_providers(session, run, capability_snapshot)
         session.add(run)
-        await _bind_user_assets(
-            session,
-            parts=user_parts,
-            message_id=user_message.id,
-            run_id=run.id,
-            user_id=user_id,
-            project_id=project_id,
-        )
         await append_event(
             session,
             run,
@@ -325,6 +377,7 @@ async def create_persistent_run(
                     "temp_thread_id": None,
                     "model_name": model_name,
                     "effective_features": request_payload["features"],
+                    "run_kind": run_kind,
                 },
             ),
         )
@@ -347,17 +400,14 @@ async def create_run(
     user_message_id: int | None,
     request_payload: dict[str, Any],
     capability_snapshot: dict[str, Any],
-    pricing_snapshot: dict[str, Any],
+    pricing_snapshot: dict[str, Any] | None = None,
     execution_protocol_version: int = 1,
+    run_kind: Literal["completion", "compaction"] = "completion",
     source: str = "web",
     api_key_id: int | None = None,
+    expected_parent_id: int | None = None,
 ) -> ChatRunDescriptor:
-    """Create/reuse one owner-scoped run and its first durable event.
-
-    The fingerprint contains only client intent.  Resolution snapshots are persisted
-    separately in the encrypted worker payload so a lost POST response remains
-    idempotent across configuration changes.
-    """
+    """Create/reuse one owner-scoped run and its first durable event."""
     try:
         uuid.UUID(client_request_id)
     except ValueError as exc:
@@ -374,6 +424,38 @@ async def create_run(
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        conv = None
+        thread = None
+        if conversation_id is not None:
+            conv = (
+                await session.execute(
+                    select(ChatConversation)
+                    .where(
+                        ChatConversation.id == conversation_id,
+                        ChatConversation.project_id == project_id,
+                        ChatConversation.user_id == user_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if conv is None:
+                raise DurableRunNotFound("conversation was not found")
+        elif temp_thread_id is not None:
+            thread = (
+                await session.execute(
+                    select(ChatTempThread)
+                    .where(
+                        ChatTempThread.id == temp_thread_id,
+                        ChatTempThread.project_id == project_id,
+                        ChatTempThread.user_id == user_id,
+                        ChatTempThread.expires_at > _now(),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if thread is None:
+                raise DurableRunNotFound("temporary chat thread was not found")
+
         existing = (
             await session.execute(
                 select(ChatRun)
@@ -390,7 +472,6 @@ async def create_run(
                 raise DurableRunConflict("idempotency_key_reused_with_different_intent")
             return descriptor(existing)
 
-        await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
         if conversation_id is not None:
             active = (
                 await session.execute(
@@ -401,22 +482,9 @@ async def create_run(
             ).scalar_one_or_none()
             if active is not None:
                 raise DurableRunConflict("conversation_run_active")
-        if temp_thread_id is not None:
-            thread = (
-                await session.execute(
-                    select(ChatTempThread)
-                    .where(
-                        ChatTempThread.id == temp_thread_id,
-                        ChatTempThread.project_id == project_id,
-                        ChatTempThread.user_id == user_id,
-                        ChatTempThread.expires_at > _now(),
-                    )
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if thread is None:
-                raise DurableRunNotFound("temporary chat thread was not found")
-        if temp_thread_id is not None:
+            if conv.active_leaf_id != expected_parent_id:
+                raise DurableRunConflict("context_revision_changed")
+        elif temp_thread_id is not None:
             active = (
                 await session.execute(
                     select(ChatRun.id)
@@ -427,6 +495,7 @@ async def create_run(
             if active is not None:
                 raise DurableRunConflict("conversation_run_active")
 
+        await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="persistent" if conversation_id else "temp",
@@ -450,6 +519,7 @@ async def create_run(
             fingerprint_version=1,
             last_seq=0,
             current_ordinal=0,
+            run_kind=run_kind,
             status="queued",
         )
         session.add(run)
@@ -467,6 +537,7 @@ async def create_run(
                     "temp_thread_id": temp_thread_id,
                     "model_name": model_name,
                     "effective_features": request_payload["features"],
+                    "run_kind": run_kind,
                 },
             ),
         )
@@ -488,6 +559,7 @@ async def create_temp_run(
     capability_snapshot: dict[str, Any],
     pricing_snapshot: dict[str, Any],
     execution_protocol_version: int = 1,
+    run_kind: Literal["completion", "compaction"] = "completion",
     source: str = "web",
     api_key_id: int | None = None,
 ) -> ChatRunDescriptor:
@@ -558,13 +630,6 @@ async def create_temp_run(
         ).scalar_one_or_none()
         if active is not None:
             raise DurableRunConflict("conversation_run_active")
-        current_messages = request_payload.get("input_messages")
-        if not isinstance(current_messages, list) or not current_messages:
-            raise DurableRunError("temporary chat request payload is invalid")
-        request_payload = {
-            **request_payload,
-            "input_messages": [*_temporary_history_messages(thread.history), *current_messages],
-        }
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="temp",
@@ -585,6 +650,7 @@ async def create_temp_run(
             fingerprint_version=1,
             last_seq=0,
             current_ordinal=0,
+            run_kind=run_kind,
             status="queued",
         )
         session.add(run)
@@ -612,6 +678,7 @@ async def create_temp_run(
                     "temp_thread_id": thread.id,
                     "model_name": model_name,
                     "effective_features": request_payload["features"],
+                    "run_kind": run_kind,
                 },
             ),
         )
@@ -634,3 +701,168 @@ async def create_temp_thread(*, project_id: str, user_id: str) -> ChatTempThread
         session.add(row)
         await session.flush()
         return row
+
+
+async def create_compaction_run(
+    *,
+    project_id: str,
+    user_id: str,
+    client_request_id: str,
+    intent: dict[str, Any],
+    conversation_id: str | None = None,
+    temp_thread_id: str | None = None,
+    expected_context_revision: str,
+    model_name: str,
+    request_payload: dict[str, Any],
+    capability_snapshot: dict[str, Any],
+    pricing_snapshot: dict[str, Any],
+    execution_protocol_version: int = 1,
+    source: str = "web",
+    api_key_id: int | None = None,
+) -> ChatRunDescriptor:
+    """Admit a manual compaction run with strict parent->run->checkpoint locking and revision fence."""
+    try:
+        uuid.UUID(client_request_id)
+    except ValueError as exc:
+        raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
+    if (conversation_id is None and temp_thread_id is None) or (
+        conversation_id is not None and temp_thread_id is not None
+    ):
+        raise DurableRunInputError("compaction requires exactly one parent conversation or temp thread")
+
+    _require_supported_execution_protocol_version(execution_protocol_version)
+    request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
+    fingerprint = _fingerprint(intent)
+    factory = _factory()
+    async with factory() as session, session.begin():
+        conv = None
+        thread = None
+        if conversation_id is not None:
+            conv = (
+                await session.execute(
+                    select(ChatConversation)
+                    .where(
+                        ChatConversation.id == conversation_id,
+                        ChatConversation.project_id == project_id,
+                        ChatConversation.user_id == user_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if conv is None:
+                raise DurableRunNotFound("conversation was not found")
+        else:
+            thread = (
+                await session.execute(
+                    select(ChatTempThread)
+                    .where(
+                        ChatTempThread.id == temp_thread_id,
+                        ChatTempThread.project_id == project_id,
+                        ChatTempThread.user_id == user_id,
+                        ChatTempThread.expires_at > _now(),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if thread is None:
+                raise DurableRunNotFound("temporary chat thread was not found")
+
+        existing = (
+            await session.execute(
+                select(ChatRun)
+                .where(
+                    ChatRun.project_id == project_id,
+                    ChatRun.user_id == user_id,
+                    ChatRun.client_request_id == client_request_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if existing.request_fingerprint != fingerprint:
+                raise DurableRunConflict("idempotency_key_reused_with_different_intent")
+            return descriptor(existing)
+
+        if conversation_id is not None:
+            active = (
+                await session.execute(
+                    select(ChatRun.id)
+                    .where(ChatRun.conversation_id == conversation_id, ChatRun.status.in_(NONTERMINAL))
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if active is not None:
+                raise DurableRunConflict("conversation_run_active")
+        else:
+            active = (
+                await session.execute(
+                    select(ChatRun.id)
+                    .where(ChatRun.temp_thread_id == temp_thread_id, ChatRun.status.in_(NONTERMINAL))
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if active is not None:
+                raise DurableRunConflict("conversation_run_active")
+        from lumen.services import context_store
+
+        current_source = await context_store.load_context_source(
+            conversation_id=conversation_id,
+            temp_thread_id=temp_thread_id,
+            user_id=user_id,
+            project_id=project_id,
+            session=session,
+        )
+        if current_source.get("revision") != expected_context_revision:
+            raise DurableRunConflict("context_revision_changed")
+
+        await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
+
+        run = ChatRun(
+            id=str(uuid.uuid4()),
+            run_scope="persistent" if conversation_id else "temp",
+            conversation_id=conversation_id,
+            temp_thread_id=temp_thread_id,
+            user_message_id=None,
+            assistant_message_id=None,
+            project_id=project_id,
+            user_id=user_id,
+            model_name=model_name,
+            source=source,
+            api_key_id=api_key_id,
+            execution_protocol_version=execution_protocol_version,
+            capability_snapshot=capability_snapshot,
+            pricing_snapshot=pricing_snapshot,
+            request_payload=encrypt_chat_content(
+                json.dumps(request_payload, ensure_ascii=False, separators=(",", ":"))
+            ),
+            client_request_id=client_request_id,
+            request_fingerprint=fingerprint,
+            fingerprint_version=1,
+            last_seq=0,
+            current_ordinal=0,
+            run_kind="compaction",
+            status="queued",
+        )
+        session.add(run)
+        _add_run_providers(session, run, capability_snapshot)
+        if temp_thread_id is not None:
+            thread.active_run_id = run.id
+        await append_event(
+            session,
+            run,
+            _event(
+                run,
+                "run.started",
+                {
+                    "conversation_id": conversation_id,
+                    "temp_thread_id": temp_thread_id,
+                    "model_name": model_name,
+                    "effective_features": request_payload.get("features", {}),
+                    "run_kind": "compaction",
+                },
+            ),
+        )
+        await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+        created = descriptor(run)
+    await wake_run(created.run_id)
+    return created

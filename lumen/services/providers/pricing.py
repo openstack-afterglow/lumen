@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from lumen.models.chat_db import LlmModel, LlmProvider
-from lumen.services.capabilities import litellm_capabilities, normalize_capabilities
-from lumen.services.litellm_client import effective_prices_per_million
+from lumen.services.capabilities import (
+    apply_subscription_capability_limits,
+    litellm_capabilities,
+    normalize_capabilities,
+)
+from lumen.services.litellm_client import effective_prices_per_million, official_price_source
 
-from .credentials import api_key_source
+from .billing import billing_capability_for
+from .credentials import api_key_source, api_model_name
 from .errors import ProviderValidationError
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
@@ -63,16 +69,44 @@ def _json_decimal_strings(value):
 
 
 def _provider_public(row: LlmProvider) -> dict:
-    """관리자 응답용 공개 dict — api_key 평문/암호문 절대 미포함."""
+    """Administrator projection without plaintext or encrypted credential material."""
+    auth_mode = getattr(row, "auth_mode", "api_key")
     source = api_key_source(row)
+    subscription_status = getattr(row, "subscription_status", "disconnected")
+    subscription_expires_at = getattr(row, "subscription_expires_at", None)
+    encrypted_subscription_tokens = getattr(row, "encrypted_subscription_tokens", None)
+    if auth_mode == "api_key":
+        has_credentials = source is not None
+        auth_status = "configured" if has_credentials else "disconnected"
+        auth_expires_at = None
+    else:
+        known_expiry_valid = subscription_expires_at is None or (
+            subscription_expires_at.replace(tzinfo=UTC)
+            if subscription_expires_at.tzinfo is None
+            else subscription_expires_at.astimezone(UTC)
+        ) > datetime.now(UTC)
+        has_credentials = bool(
+            encrypted_subscription_tokens
+            and subscription_status == "configured"
+            and (auth_mode == "chatgpt_device" or known_expiry_valid)
+        )
+        auth_status = subscription_status
+        auth_expires_at = _iso(subscription_expires_at)
+        source = None
     return {
         "id": row.id,
         "name": row.name,
         "provider_type": row.provider_type,
         "api_base": row.api_base,
+        "auth_mode": auth_mode,
+        "has_credentials": has_credentials,
+        "auth_status": auth_status,
+        "auth_expires_at": auth_expires_at,
         "has_api_key": source is not None,
         "api_key_source": source,
-        "api_key_env": row.api_key_env,
+        "api_key_env": row.api_key_env if auth_mode == "api_key" else None,
+        "has_billing_admin_key": bool(getattr(row, "encrypted_billing_admin_key", None)),
+        "billing_capability": billing_capability_for(row.provider_type, auth_mode, row.api_base),
         "is_active": row.is_active,
         "margin_multiplier": float(row.margin_multiplier),
         "models_dev_provider_id": row.models_dev_provider_id,
@@ -81,12 +115,17 @@ def _provider_public(row: LlmProvider) -> dict:
     }
 
 
-def _effective_capabilities(row: LlmModel, provider_type: str | None) -> tuple[dict, str]:
-    """Stored override/models.dev data wins over fail-closed LiteLLM detection."""
+def _effective_capabilities(
+    row: LlmModel,
+    provider_type: str | None,
+    auth_mode: str = "api_key",
+) -> tuple[dict, str]:
+    """Stored override/models.dev data wins before transport limits are applied."""
     detected = litellm_capabilities(row.model_name, provider_type)
     if row.capabilities:
-        return normalize_capabilities(row.capabilities, detected), (row.capability_source or "override")
-    return detected, "litellm"
+        effective = normalize_capabilities(row.capabilities, detected)
+        return apply_subscription_capability_limits(effective, auth_mode), (row.capability_source or "override")
+    return apply_subscription_capability_limits(detected, auth_mode), "litellm"
 
 
 def _model_public(
@@ -96,8 +135,19 @@ def _model_public(
     effective_output_price_per_million: Decimal | None = None,
     effective_price_source: str | None = None,
     provider_type: str | None = None,
+    auth_mode: str = "api_key",
 ) -> dict:
-    eff_caps, eff_caps_source = _effective_capabilities(row, provider_type)
+    eff_caps, eff_caps_source = _effective_capabilities(row, provider_type, auth_mode)
+    public_model_name = api_model_name(row.model_name, provider_type or "")
+    display_name = row.display_name
+    if (
+        not display_name
+        or display_name == row.model_name
+        or display_name.startswith("perplexity/perplexity/")
+        or display_name.startswith("gemini/gemini-")
+        or (provider_type == "gemini" and display_name.startswith("gemini/"))
+    ):
+        display_name = public_model_name
     effective_input = (
         effective_input_price_per_million / _TOKENS_PER_MILLION
         if effective_input_price_per_million is not None
@@ -118,7 +168,9 @@ def _model_public(
         "id": row.id,
         "provider_id": row.provider_id,
         "model_name": row.model_name,
-        "display_name": row.display_name,
+        "api_model_name": public_model_name,
+        "api_provider": provider_type,
+        "display_name": display_name,
         "is_active": row.is_active,
         "is_title_model": row.is_title_model,
         "is_memory_model": row.is_memory_model,
@@ -138,6 +190,20 @@ def _model_public(
     }
 
 
+def _has_component_prices(metadata: dict, *keys: str) -> bool:
+    for key in keys:
+        value = metadata.get(key)
+        if value is None:
+            return False
+        try:
+            price = Decimal(str(value))
+            if not price.is_finite() or price < 0:
+                return False
+        except (InvalidOperation, ValueError, TypeError):
+            return False
+    return True
+
+
 def _pricing_aware_capabilities(
     model: LlmModel,
     capabilities: dict,
@@ -148,40 +214,36 @@ def _pricing_aware_capabilities(
     metadata = model.price_metadata if isinstance(model.price_metadata, dict) else {}
     metadata = metadata.get("cost", metadata) if isinstance(metadata.get("cost", metadata), dict) else {}
 
-    def has_price(*keys: str) -> bool:
-        for key in keys:
-            value = metadata.get(key)
-            if value is None:
-                return False
-            try:
-                if Decimal(str(value)) < 0:
-                    return False
-            except (InvalidOperation, ValueError, TypeError):
-                return False
-        return True
-
     base_priced = (model.input_price if input_price is None else input_price) is not None and (
         model.output_price if output_price is None else output_price
     ) is not None
+    normalized = dict(capabilities)
+    gates = {name: dict(gate) for name, gate in (capabilities.get("feature_gates") or {}).items()}
+    search_gate = gates.get("web_search") or {}
     requirements = {
         "text": base_priced,
         "structured_output": base_priced,
         "memory": True,
-        "web_search": has_price(
-            "web_search_request_per_unit",
-            "web_search_context_low_per_unit",
-            "web_search_context_medium_per_unit",
-            "web_search_context_high_per_unit",
+        # Native providers report their own search work. Price the selected
+        # model's text usage, but never fabricate a managed-search component.
+        "web_search": (
+            base_priced
+            if search_gate.get("mode") == "native"
+            else _has_component_prices(
+                metadata,
+                "web_search_request_per_unit",
+                "web_search_context_low_per_unit",
+                "web_search_context_medium_per_unit",
+                "web_search_context_high_per_unit",
+            )
         ),
-        "web_fetch": has_price("web_fetch_request_per_unit", "web_fetch_context_per_unit"),
-        "image_output": has_price("image_per_unit"),
-        "audio_output": has_price("audio_output_per_second"),
-        "video_output": has_price("video_per_second"),
-        "code_interpreter": has_price("sandbox_per_second"),
-        "computer_use": has_price("sandbox_per_second"),
+        "web_fetch": _has_component_prices(metadata, "web_fetch_request_per_unit", "web_fetch_context_per_unit"),
+        "image_output": _has_component_prices(metadata, "image_per_unit"),
+        "audio_output": _has_component_prices(metadata, "audio_output_per_second"),
+        "video_output": _has_component_prices(metadata, "video_per_second"),
+        "code_interpreter": _has_component_prices(metadata, "sandbox_per_second"),
+        "computer_use": _has_component_prices(metadata, "sandbox_per_second"),
     }
-    normalized = dict(capabilities)
-    gates = {name: dict(gate) for name, gate in (capabilities.get("feature_gates") or {}).items()}
     for feature, gate in gates.items():
         if feature in requirements:
             gate["pricing_available"] = requirements[feature]
@@ -219,16 +281,19 @@ def _resolved_base_prices(
     input_price = Decimal(model.input_price) if model.input_price is not None else None
     output_price = Decimal(model.output_price) if model.output_price is not None else None
     fallback_input, fallback_output = (
-        effective_prices_per_million(model.model_name, provider.provider_type)
+        effective_prices_per_million(model.model_name, provider.provider_type, api_base=provider.api_base)
         if input_price is None or output_price is None
         else (None, None)
+    )
+    fallback_source = (
+        official_price_source(model.model_name, provider.provider_type, api_base=provider.api_base) or "litellm"
     )
     if input_price is None and fallback_input is not None:
         input_price = _per_token_price(fallback_input, "litellm_input_price_per_million")
     if output_price is None and fallback_output is not None:
         output_price = _per_token_price(fallback_output, "litellm_output_price_per_million")
     if input_price is not None and output_price is not None:
-        price_source = model.price_source or "litellm"
+        price_source = model.price_source or fallback_source
     elif input_price is not None or output_price is not None:
         price_source = "partial"
     else:

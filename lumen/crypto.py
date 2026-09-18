@@ -11,6 +11,7 @@ from lumen.config import get_settings
 _logger = logging.getLogger(__name__)
 
 _DOMAIN_LLM_PROVIDER_KEY = b"llm_provider_key"
+_DOMAIN_LLM_PROVIDER_BILLING_ADMIN_KEY = b"llm_provider_billing_admin_key"
 _DOMAIN_CHAT_CONTENT = b"chat_content"
 
 _V3_PREFIX = aesgcm._V3_PREFIX
@@ -34,6 +35,14 @@ def encrypt_llm_provider_key(plaintext: str) -> str:
 
 def decrypt_llm_provider_key(ciphertext_b64: str) -> str:
     return aesgcm.decrypt(_get_key(), _DOMAIN_LLM_PROVIDER_KEY, ciphertext_b64)
+
+
+def encrypt_llm_provider_billing_admin_key(plaintext: str) -> str:
+    return aesgcm.encrypt(_get_key(), _DOMAIN_LLM_PROVIDER_BILLING_ADMIN_KEY, plaintext)
+
+
+def decrypt_llm_provider_billing_admin_key(ciphertext_b64: str) -> str:
+    return aesgcm.decrypt(_get_key(), _DOMAIN_LLM_PROVIDER_BILLING_ADMIN_KEY, ciphertext_b64)
 
 
 def encrypt_chat_content(plaintext: str) -> str:

@@ -4,16 +4,16 @@ Lumen은 AI-chat 백엔드(LiteLLM, LangGraph/LangChain agent 실행, provider/m
 
 ## 시작
 
-직접 실행 요구사항은 Python 3.12 이상, `uv`, MariaDB, Redis다. 독립형 Compose 실행은 Docker만 필요하다.
+직접 실행 요구사항은 Python 3.12 이상, `uv`, MariaDB, Redis다. 독립형 Compose 실행은 Docker만 필요하다. 기본 `lumen` 패키지는 Kolla 역할 shared data만 제공하므로 서비스 CLI와 runtime import에는 `service` extra가 필요하다.
 
 ```bash
-uv sync --all-extras --frozen
+uv sync --extra service --frozen
 uv run lumen-migrate --apply
 uv run lumen-api
 uv run lumen-worker
 ```
 
-`lumen-migrate`는 API와 worker보다 먼저 실행한다. Dockerfile은 migration을 자동 실행하지 않는다. 설정은 [`lumen.conf.example`](lumen.conf.example)을 복사해 secret manager/환경변수로 완성한다.
+개발·테스트 도구까지 설치하려면 `uv sync --extra service --extra dev --frozen`을 사용한다. `lumen-migrate`는 API와 worker보다 먼저 실행한다. `docker/Dockerfile`은 migration을 자동 실행하지 않는다. 설정은 [`lumen.conf.example`](lumen.conf.example)을 복사해 secret manager/환경변수로 완성한다.
 
 ### GHCR 컨테이너 이미지
 
@@ -29,14 +29,14 @@ docker pull ghcr.io/openstack-afterglow/lumen-api:latest
 docker pull ghcr.io/openstack-afterglow/lumen-worker:latest
 ```
 
-### Kolla-Ansible 배포 및 패키징
+### Kolla-Ansible 배포 패키지
 
-Lumen은 Kolla-Ansible 서드파티 서비스 역할을 패키징한 Python 휠 (`lumen-kolla`)을 `deploy/kolla`에서 제공한다.
+루트 `lumen` 휠은 Kolla-Ansible 서드파티 서비스 역할을 shared data로 함께 제공한다. Ansible 및 Kolla-Ansible은 base package와 `service` extra에 포함하지 않으므로 Kolla 환경이 별도로 소유한다.
 
-- **패키지 위치**: `deploy/kolla` (Hatch 휠 프로젝트 `lumen-kolla`)
-- **역할 설치 경로**: `pip install lumen_kolla-<version>-py3-none-any.whl` 실행 시 Kolla 가상환경의 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
-- **불변 릴리스 및 이미지 태그**: Git 태그 `v<version>`은 같은 버전의 `lumen_kolla-<version>-py3-none-any.whl`과 `ghcr.io/openstack-afterglow/lumen-{api,worker}:<version>`을 게시한다.
-- **첫 배포 및 운영자 동기화**: `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 최초 기동하며, 휠 재설치로 패키지 역할을 최신 상태로 동기화한다.
+- **휠 빌드**: `uv build --wheel`로 `lumen-<version>-py3-none-any.whl`을 생성한다.
+- **역할 설치 경로**: `pip install --no-deps lumen-<version>-py3-none-any.whl`은 Kolla 환경의 `share/kolla-ansible/ansible/roles/lumen`에 역할 자산을 설치한다.
+- **독립된 이미지 기본값**: root package release는 기존 `lumen_image_tag`를 변경하지 않는다. 새 runtime image를 게시한 release에서만 operator가 image tag를 갱신한다.
+- **첫 배포 및 운영자 동기화**: `kolla-ansible -i <inventory> deploy --tags lumen`으로 최초 기동하며, root wheel 재설치로 패키지 역할을 동기화한다.
 - **PostgreSQL 전제**: 기본 `lumen_postgres_mode="external"`은 운영자가 `lumen_external_postgres_url`을 secret 설정에 제공해야 한다. 자체 PostgreSQL을 만들려면 `bundled`와 강한 `lumen_postgres_password`를 명시한다.
 - **업그레이드 및 Reconfigure 검증**: `kolla-ansible -i <inventory> reconfigure --tags lumen`은 이미지 pull (`pull.yml`) → 설정 렌더링 (`config.yml`) → DB 마이그레이션 (`bootstrap_service.yml`) → 서비스 기동 (`start.yml`) 순서로 실행되어 API/Worker 서비스가 기동되기 전 마이그레이션과 이미지 갱신을 보장한다.
 
@@ -140,8 +140,9 @@ with Client("https://lumen.example", "sk-afgl-...") as client:
 ## 문서
 
 - [문서 안내](docs/index.md)
+- [정본 아키텍처](ARCHITECTURE.md)
+- [아키텍처 상세 안내](docs/architecture.md)
 - [Afterglow 연동 가이드](docs/afterglow-integration.md)
-- [아키텍처](docs/architecture.md)
 - [API](docs/api-reference.md)
 - [SDK](docs/sdk.md)
 - [에이전트 플랫폼](docs/agent-platform.md)

@@ -9,8 +9,11 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from lumen.cache import close_cache
@@ -101,9 +104,20 @@ if origins:
     )
 
 
+@app.exception_handler(RequestValidationError)
+async def provider_request_validation_handler(request: Request, exc: RequestValidationError):
+    if request.url.path == "/v1/admin/providers" or request.url.path.startswith("/v1/admin/providers/"):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "프로바이더 요청 형식이 올바르지 않습니다"},
+            headers={"Cache-Control": "no-store"},
+        )
+    return await request_validation_exception_handler(request, exc)
+
+
 @app.get("/", tags=["Discovery"], response_model=RootDiscoveryResponse)
 async def root_discovery(request: Request):
-    base_url = str(request.base_url).rstrip("/")
+    base_url = (get_settings().public_api_base or str(request.base_url)).rstrip("/")
     return {
         "versions": [
             {
@@ -111,7 +125,10 @@ async def root_discovery(request: Request):
                 "status": "CURRENT",
                 "min_version": "1.0",
                 "version": "1.0",
-                "links": [{"rel": "self", "href": f"{base_url}/v1/"}],
+                "links": [
+                    {"rel": "self", "href": f"{base_url}/v1/"},
+                    {"rel": "models", "href": f"{base_url}/v1/models"},
+                ],
             }
         ]
     }
@@ -119,14 +136,17 @@ async def root_discovery(request: Request):
 
 @app.get("/v1/", tags=["Discovery"], response_model=VersionDiscoveryResponse)
 async def v1_discovery(request: Request):
-    base_url = str(request.base_url).rstrip("/")
+    base_url = (get_settings().public_api_base or str(request.base_url)).rstrip("/")
     return {
         "version": {
             "id": "v1.0",
             "status": "CURRENT",
             "min_version": "1.0",
             "version": "1.0",
-            "links": [{"rel": "self", "href": f"{base_url}/v1/"}],
+            "links": [
+                {"rel": "self", "href": f"{base_url}/v1/"},
+                {"rel": "models", "href": f"{base_url}/v1/models"},
+            ],
         }
     }
 
@@ -148,6 +168,7 @@ from lumen.api import (
     chat_extensions_user_router,
     chat_mcp_oauth_router,
     chat_memory_router,
+    chat_quotas_router,
     chat_stats_router,
     chat_usage_router,
     chat_workspaces_router,
@@ -173,6 +194,7 @@ for router, tag in (
     (chat_extensions_user_router, "Chat Extensions"),
     (chat_usage_router, "Chat Usage"),
     (chat_stats_router, "Chat Stats"),
+    (chat_quotas_router, "Chat Quotas"),
     (chat_admin_router, "Chat Administration"),
 ):
     app.include_router(router, prefix="/v1", tags=[tag])

@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from lumen.auth import get_token_info, require_admin
 from lumen.services import api_key_store as aks
@@ -46,6 +46,12 @@ class ApiKeyCreateBody(BaseModel):
         max_digits=18,
         decimal_places=8,
     )
+    weekly_credit_limit: Decimal | None = Field(
+        default=None,
+        gt=0,
+        max_digits=18,
+        decimal_places=8,
+    )
 
     @field_validator("scopes")
     @classmethod
@@ -63,6 +69,39 @@ class ApiKeyLimitUpdateBody(BaseModel):
         decimal_places=8,
     )
 
+
+class ApiKeyOwnerLimitUpdateBody(BaseModel):
+    monthly_credit_limit: Decimal | None = Field(
+        default=None,
+        gt=0,
+        max_digits=18,
+        decimal_places=8,
+    )
+    weekly_credit_limit: Decimal | None = Field(
+        default=None,
+        gt=0,
+        max_digits=18,
+        decimal_places=8,
+    )
+
+    @model_validator(mode="after")
+    def require_limit(self):
+        if not self.model_fields_set:
+            raise ValueError("변경할 API 키 한도를 하나 이상 지정해야 합니다")
+        return self
+
+
+class ApiKeyUpdateBody(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def name_must_not_be_blank(cls, name: str) -> str:
+        if not name.strip():
+            raise ValueError("이름은 공백일 수 없습니다")
+        return name
+
+
 def _http(exc: Exception) -> HTTPException:
     if isinstance(exc, aks.ApiKeyLimitConflict):
         return HTTPException(status_code=409, detail=str(exc))
@@ -74,6 +113,7 @@ def _http(exc: Exception) -> HTTPException:
 
 
 _EXC = (aks.ApiKeyLimitConflict, aks.ApiKeyNotFound, aks.ApiKeyForbidden, aks.ApiKeyStorageUnavailable)
+
 
 @router.get("/api-keys")
 async def list_api_keys(token_info: dict = Depends(get_token_info)):
@@ -94,6 +134,24 @@ async def create_api_key(body: ApiKeyCreateBody, token_info: dict = Depends(get_
             body.name or "",
             list(body.scopes),
             body.monthly_credit_limit,
+            body.weekly_credit_limit,
+        )
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@router.patch("/api-keys/{key_id}")
+async def update_api_key(
+    key_id: int,
+    body: ApiKeyUpdateBody,
+    token_info: dict = Depends(get_token_info),
+):
+    try:
+        return await aks.rename_key(
+            key_id,
+            token_info["user_id"],
+            token_info["project_id"],
+            body.name,
         )
     except _EXC as exc:
         raise _http(exc) from exc
@@ -110,7 +168,7 @@ async def revoke_api_key(key_id: int, token_info: dict = Depends(get_token_info)
 @router.patch("/api-keys/{key_id}/limits")
 async def update_owner_api_key_limits(
     key_id: int,
-    body: ApiKeyLimitUpdateBody,
+    body: ApiKeyOwnerLimitUpdateBody,
     token_info: dict = Depends(get_token_info),
 ):
     try:
@@ -118,7 +176,7 @@ async def update_owner_api_key_limits(
             key_id,
             token_info["user_id"],
             token_info["project_id"],
-            body.monthly_credit_limit,
+            body.model_dump(exclude_unset=True),
         )
     except _EXC as exc:
         raise _http(exc) from exc

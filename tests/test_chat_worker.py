@@ -90,3 +90,59 @@ async def test_worker_sweeps_expired_v2_inputs_without_client_reconnect(monkeypa
         await chat_worker.serve()
 
     assert sweeps == [1]
+
+
+async def test_worker_dispatches_independent_title_job_task(monkeypatch):
+    import asyncio
+
+    fake = _FakeCheckpointer()
+    monkeypatch.setattr(
+        chat_worker,
+        "get_settings",
+        lambda: SimpleNamespace(
+            database_url="mysql+aiomysql://test",
+            database_pool_size=1,
+            database_max_overflow=0,
+            database_connect_timeout=10,
+            database_pool_timeout=10,
+            database_unhealthy_seconds=15,
+            chat_checkpointer_postgres_url=None,
+            chat_semantic_memory_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(chat_worker, "init_db", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(checkpointer, "chat_checkpointer", fake)
+    called = []
+
+    async def fake_title_processor(*, owner):
+        called.append(owner)
+        return False
+
+    async def stop_worker():
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("lumen.services.title_jobs.process_one", fake_title_processor)
+    monkeypatch.setattr(chat_worker, "_next_run_ids", stop_worker)
+    monkeypatch.setattr("lumen.db.close_db", stop_worker)
+
+    with pytest.raises(asyncio.CancelledError):
+        await chat_worker.serve()
+
+    assert called
+
+
+async def test_title_processor_loop_keeps_draining_until_cancelled():
+    import asyncio
+
+    calls = []
+
+    async def processor(*, owner):
+        calls.append(owner)
+        if len(calls) == 1:
+            return True
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await chat_worker._title_processor_loop(processor, owner="worker-1")
+
+    assert calls == ["worker-1", "worker-1"]

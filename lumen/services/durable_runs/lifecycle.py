@@ -181,6 +181,7 @@ async def request_cancelled(*, run_id: str, project_id: str, user_id: str) -> Ch
             status=run.status,
             conversation_id=run.conversation_id,
             temp_thread_id=run.temp_thread_id,
+            run_kind=getattr(run, "run_kind", None) or "completion",
             effective_features=(run.capability_snapshot or {}).get("effective_features", {}),
             last_seq=run.last_seq,
             terminal=run.status not in NONTERMINAL,

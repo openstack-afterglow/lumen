@@ -22,7 +22,7 @@ Memory CRUD는 account/project/workspace scope를 가진다. API key는 자기 p
 
 ## 승인과 protocol
 
-v1은 legacy model/tool loop이며 v2는 binding protocol, effect policy, approval/interaction resume를 쓴다. v2는 encrypted PostgreSQL checkpointer가 필요하다. Durable run journal은 tool call started/completed, part delta/completed, usage, terminal event를 저장해 SSE가 replay한다.
+v1은 legacy model/tool loop이며 v2는 binding protocol, effect policy, approval/interaction resume를 쓴다. v2는 encrypted PostgreSQL checkpointer가 필요하다. Frozen JSON Schema validation runs before either runtime dispatches a model tool call. A schema rejection is emitted and journaled as `tool.call.completed` with `status="failed"` and `error_code="invalid_tool_arguments"`; it is never projected as a completed task, although the model may receive the failed result and continue the run. Durable run journal은 tool call started/completed, part delta/completed, usage, terminal event를 저장해 SSE가 replay한다.
 
 ## 구현 상태
 

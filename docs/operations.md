@@ -2,12 +2,14 @@
 
 ## 기동과 readiness
 
+source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra service --frozen`으로 runtime dependency를 설치한다.
+
 1. MariaDB와 Redis를 ready 상태로 만든다. configured feature라면 PostgreSQL checkpointer/pgvector, S3, ClamAV, sandbox, MCP endpoint도 준비한다.
 2. API와 worker를 멈춘 뒤 `uv run lumen-migrate --apply`를 실행한다.
 3. `uv run lumen-api`를 실행하고 `/v1/health`와 DB connection을 확인한다.
 4. `uv run lumen-worker`를 하나 이상 실행한다.
 
-Dockerfile은 migration을 자동 실행하지 않는다. migration 누락 상태로 새 API/worker를 기동하지 않는다.
+`docker/Dockerfile`은 migration을 자동 실행하지 않는다. migration 누락 상태로 새 API/worker를 기동하지 않는다.
 
 ## 설정
 
@@ -23,6 +25,12 @@ Dockerfile은 migration을 자동 실행하지 않는다. migration 누락 상�
 | optional stores | `chat_checkpointer_postgres_url`, `chat_memory_pgvector_url`, `chat_asset_s3_*` | configured feature에만 필요 |
 | TLS/auth | `os_cacert`, `insecure`, Keystone fields | TLS verify 기본 활성; `insecure`는 예외적 개발 설정 |
 
+### Chat asset S3 contract
+
+Asset storage uses one service-owned S3 credential across deterministic project buckets. Set `chat_asset_s3_region` explicitly (`default` for the DMSLab Ceph RGW) and select exactly one `chat_asset_s3_server_side_encryption` mode: `none`, `AES256`, or `aws:kms`. Empty and unknown modes keep the asset pipeline unavailable; `aws:kms` also requires `chat_asset_s3_kms_key_id`. Lumen never silently downgrades encryption. Use `none` only when the operator has accepted the deployment's separate at-rest encryption contract.
+
+Ceph RGW clients use SigV4 path-style requests and calculate request/response checksums only when required. Restrict the service credential and network path to Lumen-owned asset buckets; browser and API clients never receive it.
+
 ## Queue, lease, recovery
 
 API는 MariaDB journal에 run을 commit한 뒤 Redis `afterglow:chat:runs`에 best-effort wakeup을 보낸다. Redis는 authoritative queue가 아니다. worker DB polling이 wakeup 유실을 복구한다.
@@ -33,11 +41,17 @@ Worker lease는 45초다. run이 `running`이 아니거나 lease owner/expiry가
 
 적용된 SQL migration/checksum은 immutable이다. 유지보수 cutover는 API/worker stop → backup/DB readiness → `lumen-migrate --apply` → API/worker start 순서다. 적용 뒤 동일 command를 다시 실행해 pending migration이 없는지 확인한다. rolling mixed-version deployment는 지원 전제가 아니다.
 
+Migration `010_quota_policy_and_inheritance.sql`은 `user_wallets.max_quota_monthly/max_quota_weekly`를 nullable inheritance column으로 전환하고 singleton `chat_quota_policies`를 만든다. 기존 `0` 값은 명시적 무제한으로 보존되므로 자동으로 기본값 상속으로 바뀌지 않는다. 관리자가 해당 사용자를 reset해야 두 column이 `NULL`이 된다. API와 worker가 새 nullable 의미를 함께 사용하므로 이 migration도 mixed-version rolling deployment 없이 적용한다.
+
+Migration `011_provider_billing_admin_key.sql`은 `llm_providers.encrypted_billing_admin_key` nullable column을 추가한다. Direct OpenAI/Anthropic 조직 보고서 연동을 배포할 때는 Lumen API/worker를 중지하고 migration을 먼저 적용한 뒤 호환되는 Lumen API와 Afterglow UI를 순서대로 배포한다. 구 Lumen에서 Afterglow의 bulk `GET /admin/providers/billing`을 호출하면 동적 provider PATCH route와 충돌해 405가 나타날 수 있으므로 mixed-version 상태를 정상 기능으로 해석하지 않는다.
+
+공식 OpenAI/Anthropic 조직 보고서는 UTC 월 시작과 이번 주 월요일 중 이른 시각부터 조회한다. 현재 일·주·월 projection은 각 기간의 시작으로 다시 필터링하므로 월초 주간 합계에는 전월 일자가 포함되지만 월간 합계에는 포함되지 않는다. 로컬 ledger와 upstream 보고서의 서로 다른 집계 범위는 계속 구분한다.
+
 ## Container 이미지 빌드 및 GHCR 배포
 
 Lumen은 GitHub Actions 파이프라인(`.github/workflows/docker-build.yml`)을 통해 Docker 이미지를 자동으로 빌드하고 GitHub Container Registry(GHCR)에 게시한다.
 
-### 이미지 및 Dockerfile 타겟
+### 이미지 및 `docker/Dockerfile` 타겟
 - **API 이미지 (`lumen-api` 타겟)**: `ghcr.io/openstack-afterglow/lumen-api`
 - **Worker 이미지 (`lumen-worker` 타겟)**: `ghcr.io/openstack-afterglow/lumen-worker`
 
@@ -59,29 +73,29 @@ Lumen은 GitHub Actions 파이프라인(`.github/workflows/docker-build.yml`)을
 - **비공개 패키지 인증**: 비공개 이미지 조회가 필요한 환경에서는 `read:packages` 스코프가 포함된 개인용 액세스 토큰(PAT)으로 `docker login ghcr.io` 인증을 수행한다 (인증 정보나 PAT 값을 코드/문서에 직접 포함하지 않는다).
 
 ### 운용 및 배포 순서 (Migration 전제)
-- Dockerfile 타겟(`lumen-api`, `lumen-worker`)은 DB 마이그레이션을 자동 실행하지 않는다.
+- `docker/Dockerfile` 타겟(`lumen-api`, `lumen-worker`)은 DB 마이그레이션을 자동 실행하지 않는다.
 - 새 이미지 버전 롤아웃 전에 반드시 마이그레이션 단계(직접 실행 시 `uv run lumen-migrate --apply`, 컨테이너 실행 시 `lumen-migrate --apply`)를 완료한 후 API 및 Worker 컨테이너를 배포해야 한다.
 
 
-## Kolla-Ansible 운영 및 불변 휠 릴리스
+## Kolla-Ansible 운영과 root wheel
 
-Lumen은 Kolla-Ansible 서드파티 통합을 위한 Python 패키지(`lumen-kolla`)를 `deploy/kolla` Hatch 프로젝트로 자체 보유 및 제공한다.
+Lumen의 root `lumen` wheel은 Kolla 역할을 shared data로 포함한다. Kolla-Ansible은 package dependency가 아니라 Kolla operator environment가 제공한다.
 
-### 1. 휠 패키징 및 최초 배포 (First Deploy)
-- **휠 패키지 빌드**: `deploy/kolla`에서 Hatchling 빌드를 통해 `lumen_kolla-0.1.1-py3-none-any.whl` 아티팩트가 생성된다.
-- **Kolla 환경 설치**: Kolla Ansible 가상환경(`python 3.11`)에 `pip install lumen_kolla-0.1.1-py3-none-any.whl`을 수행하면 역할 자산이 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
+### 1. 휠 패키징 및 최초 배포
+- **휠 빌드**: repository root에서 `uv build --wheel`로 `lumen-<release-version>-py3-none-any.whl` 아티팩트를 생성한다.
+- **Kolla 환경 설치**: Kolla Ansible environment에 `pip install --no-deps lumen-<release-version>-py3-none-any.whl`을 수행하면 역할 자산이 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
 - **최초 배포 명령어**: `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 precheck, config, database/Keystone preconditions, DB migration(`lumen_bootstrap`), container startup을 순차 실행한다.
 - **PostgreSQL 모드 선택**: 기본값 `lumen_postgres_mode="external"`은 `lumen_external_postgres_url`이 반드시 필요하다. 역할이 PostgreSQL을 관리하게 하려면 `/etc/kolla/config/afterglow/globals.yml`에서 `lumen_postgres_mode: "bundled"`를 선택하고 `secrets.yml`에 강한 `lumen_postgres_password`를 제공한다. 둘 중 하나를 명시하지 않은 stock defaults는 precheck에서 fail-closed 한다.
 
-### 2. 불변 휠/이미지 릴리스 (Immutable Wheel/Image Release)
-- **락스텝 버전 관리**: `lumen.__version__` (`0.1.1`), Kolla 역할 default `lumen_image_tag` (`0.1.1`), `lumen-kolla` 패키지 버전은 엄격히 동기화된다.
-- **기본 이미지 네임스페이스 및 태그**: Lumen 역할 기본값은 `ghcr.io/openstack-afterglow/lumen-api:0.1.1` 및 `ghcr.io/openstack-afterglow/lumen-worker:0.1.1`을 사용하며 Afterglow release tag에 종속되지 않는다. Operator는 exact digest ref override를 그대로 유지할 수 있다.
-- **GitHub Release 워크플로우**: `v*` 태그 푸시 시 `.github/workflows/release-kolla.yml`이 실행되어 태그/버전 락스텝 검증, 휠 빌드, 독립 3.11 venv 설치/삭제 테스트를 거쳐 불변 휠 아티팩트를 GitHub Release에 자동 첨부한다.
+### 2. 독립 wheel/image release
+- **root package release**: `v*` tag push 시 `.github/workflows/release.yml`은 tag와 `lumen.__version__` lockstep을 확인하고 root wheel을 GitHub Release에 첨부한다.
+- **runtime image tag**: Kolla 역할의 `lumen_image_tag`는 이미 게시된 runtime image reference다. root package revision만으로 바꾸지 않으며 새 runtime image가 실제로 게시될 때만 명시적으로 갱신한다.
+- **기본 이미지 네임스페이스**: `ghcr.io/openstack-afterglow/lumen-api:<image-tag>` 및 `ghcr.io/openstack-afterglow/lumen-worker:<image-tag>`를 사용한다. Operator는 exact digest ref override를 그대로 유지할 수 있다.
 
-### 3. 운영자 동기화 (Operator Sync)
-- **역할 업데이트**: 새 버전 출시 시 릴리스된 `lumen_kolla-<version>-py3-none-any.whl`을 Kolla venv에 재설치하여 `share/kolla-ansible/ansible/roles/lumen` 자산을 동기화한다.
+### 3. 운영자 동기화
+- **역할 업데이트**: 새 root wheel을 Kolla environment에 재설치하여 `share/kolla-ansible/ansible/roles/lumen` 자산을 동기화한다.
 
-### 4. Upgrade vs. Reconfigure 동작 및 마이그레이션 보장 (Migration Guarantee)
+### 4. Upgrade vs. Reconfigure 동작 및 마이그레이션 보장
 - **Reconfigure 명령어 및 순서 (`reconfigure.yml`)**: `kolla-ansible -i <inventory> reconfigure --tags lumen` (`precheck` → `pull` → `config` → `bootstrap_service` (DB migration) → `start`)
   - Reconfigure 실행 시 최신 갱신 이미지를 먼저 pull하여, `bootstrap_service` 단계의 DB 마이그레이션이 항상 갱신된 최신 이미지 코드로 실행되도록 보장한다.
 - **Upgrade 명령어 및 순서 (`upgrade.yml`)**: `kolla-ansible -i <inventory> upgrade --tags lumen` (`pull` → `config` → `bootstrap_service` (DB migration) → `start`)
