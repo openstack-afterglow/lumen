@@ -129,6 +129,11 @@ class Settings(BaseSettings):
     # pinned LiteLLM chat config actually forwards `context_management`.
     # Turning this off leaves Lumen's own durable compaction untouched.
     chat_native_compaction_enabled: bool = True
+    # The same feature on the stateless compatibility proxies, which have a
+    # different blast radius: they carry no durable run, so a caller that does
+    # not replay the compaction block pays for a fresh compaction each turn.
+    # A caller that sends its own `context_management` is never overridden.
+    chat_native_compaction_passthrough_enabled: bool = True
     chat_mcp_oauth_callback_url: str = ""
     chat_checkpointer_postgres_url: str = ""
     chat_run_event_retention_hours: int = 24

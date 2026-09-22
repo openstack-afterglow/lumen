@@ -47,6 +47,10 @@ chat_reasoning_effort = "auto"
 # large enough to express the threshold above the provider's 50,000-token floor.
 # Lumen's own durable compaction runs regardless of this switch.
 chat_native_compaction_enabled = true
+# The same feature on the stateless compatibility proxies (/v1/messages,
+# /v1/responses, Claude gateway). A caller that sends its own
+# context_management is never overridden; this only fills an absent field.
+chat_native_compaction_passthrough_enabled = true
 chat_run_event_retention_hours = 24
 chat_checkpoint_retention_days = 7
 # v2 durable protocol을 사용할 때만 encrypted PostgreSQL checkpointer URL을 설정한다.

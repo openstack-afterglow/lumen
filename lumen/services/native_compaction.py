@@ -36,11 +36,20 @@ from typing import Any
 MIN_TRIGGER_TOKENS = 50_000
 EDIT_TYPE = "compact_20260112"
 
+# OpenAI's Responses API expresses the same idea with a different wire shape and
+# a far lower floor, so the two cannot share one constant.
+RESPONSES_MIN_TRIGGER_TOKENS = 1_000
+RESPONSES_EDIT_TYPE = "compaction"
+
 # Only providers whose pinned LiteLLM chat transport declares
 # ``context_management`` as a supported parameter.  Anything else is removed by
 # ``litellm.drop_params`` before the request is sent, which would leave the
 # caller believing compaction was armed when it was silently discarded.
 SUPPORTED_PROVIDERS = frozenset({"anthropic"})
+
+# The Responses transport is a separate LiteLLM surface with its own parameter
+# list, so support there is tracked separately from the chat transport.
+SUPPORTED_RESPONSES_PROVIDERS = frozenset({"openai"})
 
 # A compaction summary is provider-authored text that is sent straight back on
 # the next request.  Bound it so a malformed or hostile replay payload cannot
@@ -54,7 +63,12 @@ def supported(provider_type: str | None) -> bool:
     return provider_type in SUPPORTED_PROVIDERS
 
 
-def trigger_tokens(context_limit: object, ratio: float) -> int | None:
+def responses_supported(provider_type: str | None) -> bool:
+    """Return whether the Responses transport forwards ``context_management``."""
+    return provider_type in SUPPORTED_RESPONSES_PROVIDERS
+
+
+def trigger_tokens(context_limit: object, ratio: float, *, floor: int = MIN_TRIGGER_TOKENS) -> int | None:
     """Resolve the absolute trigger, or ``None`` when the ratio is unusable.
 
     ``None`` is returned rather than a clamped value whenever the resolved
@@ -66,7 +80,7 @@ def trigger_tokens(context_limit: object, ratio: float) -> int | None:
         return None
     if not isinstance(ratio, float) or not 0.0 < ratio < 1.0:
         return None
-    value = max(MIN_TRIGGER_TOKENS, int(context_limit * ratio))
+    value = max(floor, int(context_limit * ratio))
     if value >= context_limit:
         return None
     return value
@@ -86,6 +100,86 @@ def compaction_options(
     if value is None:
         return None
     return {"edits": [{"type": EDIT_TYPE, "trigger": {"type": "input_tokens", "value": value}}]}
+
+
+def responses_compaction_options(
+    *,
+    provider_type: str | None,
+    context_limit: object,
+    ratio: float,
+    enabled: bool = True,
+) -> list[dict[str, Any]] | None:
+    """Return the Responses-shaped ``context_management`` value, or ``None``.
+
+    The Responses API takes a list of entries keyed by ``compact_threshold``
+    rather than Anthropic's nested ``edits``/``trigger`` object, so the two
+    shapes are built separately instead of being translated at the transport.
+    """
+    if not enabled or not responses_supported(provider_type):
+        return None
+    value = trigger_tokens(context_limit, ratio, floor=RESPONSES_MIN_TRIGGER_TOKENS)
+    if value is None:
+        return None
+    return [{"type": RESPONSES_EDIT_TYPE, "compact_threshold": value}]
+
+
+def resolved_context_limit(resolved: object) -> object:
+    """Read the route window off a resolved compatibility model route."""
+    if not isinstance(resolved, dict):
+        return None
+    capabilities = resolved.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return None
+    return capabilities.get("context_limit")
+
+
+def _with_default(options: dict[str, Any], value: object) -> dict[str, Any]:
+    # A caller that sent its own configuration owns its context strategy; this
+    # only fills the gap for a caller that sent none. Overriding an explicit
+    # value would silently change a compatibility client's contract.
+    if value is None or "context_management" in options:
+        return options
+    return {**options, "context_management": value}
+
+
+def anthropic_passthrough_options(
+    options: dict[str, Any],
+    *,
+    resolved: object,
+    ratio: float,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    """Arm compaction on an Anthropic passthrough request the caller left unset."""
+    provider_type = resolved.get("provider_type") if isinstance(resolved, dict) else None
+    return _with_default(
+        options,
+        compaction_options(
+            provider_type=provider_type,
+            context_limit=resolved_context_limit(resolved),
+            ratio=ratio,
+            enabled=enabled,
+        ),
+    )
+
+
+def responses_passthrough_options(
+    options: dict[str, Any],
+    *,
+    resolved: object,
+    ratio: float,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    """Arm compaction on a Responses passthrough request the caller left unset."""
+    provider_type = resolved.get("provider_type") if isinstance(resolved, dict) else None
+    return _with_default(
+        options,
+        responses_compaction_options(
+            provider_type=provider_type,
+            context_limit=resolved_context_limit(resolved),
+            ratio=ratio,
+            enabled=enabled,
+        ),
+    )
 
 
 def sanitize_blocks(value: object) -> list[dict[str, Any]]:

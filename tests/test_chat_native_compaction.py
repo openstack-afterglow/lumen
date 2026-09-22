@@ -663,3 +663,79 @@ class TestApiSurfaceCoverage:
         source = inspect.getsource(openai_compat)
         assert "summary_route = await resolve_summary_route(resolved)" in source
         assert "summary_route=summary_route" in source
+
+
+_ANTHROPIC_ROUTE = {
+    "model_name": "claude-sonnet-5",
+    "provider_type": "anthropic",
+    "capabilities": {"context_limit": 200_000},
+}
+_RESPONSES_ROUTE = {
+    "model_name": "gpt-5.6-sol",
+    "provider_type": "openai",
+    "capabilities": {"context_limit": 200_000},
+}
+
+
+class TestPassthroughResolution:
+    """The compatibility proxies carry no durable run, so the provider's own
+    compaction is the only thing between a long client session and a hard
+    context-length error."""
+
+    def test_anthropic_shape_is_injected_when_absent(self):
+        options = native_compaction.anthropic_passthrough_options({}, resolved=_ANTHROPIC_ROUTE, ratio=0.80)
+        assert options["context_management"] == {
+            "edits": [{"type": _ANTHROPIC_EDIT, "trigger": {"type": "input_tokens", "value": 160_000}}]
+        }
+
+    def test_responses_shape_is_a_list_with_its_own_key(self):
+        options = native_compaction.responses_passthrough_options({}, resolved=_RESPONSES_ROUTE, ratio=0.80)
+        assert options["context_management"] == [{"type": "compaction", "compact_threshold": 160_000}]
+
+    @pytest.mark.parametrize(
+        ("resolver", "route"),
+        [
+            (native_compaction.anthropic_passthrough_options, _ANTHROPIC_ROUTE),
+            (native_compaction.responses_passthrough_options, _RESPONSES_ROUTE),
+        ],
+    )
+    def test_caller_configuration_is_never_overridden(self, resolver, route):
+        """A client that sent its own strategy owns its context; do not rewrite it."""
+        caller = {"context_management": {"edits": []}}
+        assert resolver(dict(caller), resolved=route, ratio=0.80) == caller
+
+    @pytest.mark.parametrize(
+        ("resolver", "route"),
+        [
+            (native_compaction.anthropic_passthrough_options, _ANTHROPIC_ROUTE),
+            (native_compaction.responses_passthrough_options, _RESPONSES_ROUTE),
+        ],
+    )
+    def test_disabled_injects_nothing(self, resolver, route):
+        assert resolver({}, resolved=route, ratio=0.80, enabled=False) == {}
+
+    def test_unsupported_transport_injects_nothing(self):
+        route = {**_ANTHROPIC_ROUTE, "provider_type": "gemini"}
+        assert native_compaction.anthropic_passthrough_options({}, resolved=route, ratio=0.80) == {}
+        assert native_compaction.responses_passthrough_options({}, resolved=route, ratio=0.80) == {}
+
+    def test_protocols_are_not_interchangeable(self):
+        """An Anthropic route must not receive the Responses shape and vice versa."""
+        assert native_compaction.responses_passthrough_options({}, resolved=_ANTHROPIC_ROUTE, ratio=0.80) == {}
+        assert native_compaction.anthropic_passthrough_options({}, resolved=_RESPONSES_ROUTE, ratio=0.80) == {}
+
+    def test_unknown_window_injects_nothing(self):
+        route = {"model_name": "m", "provider_type": "anthropic", "capabilities": {}}
+        assert native_compaction.anthropic_passthrough_options({}, resolved=route, ratio=0.80) == {}
+
+    def test_responses_floor_is_far_lower_than_the_anthropic_one(self):
+        """A 32k window cannot express 80% on Anthropic but can on Responses."""
+        assert native_compaction.trigger_tokens(32_768, 0.80) is None
+        assert (
+            native_compaction.trigger_tokens(32_768, 0.80, floor=native_compaction.RESPONSES_MIN_TRIGGER_TOKENS)
+            == 26_214
+        )
+        small = {**_RESPONSES_ROUTE, "capabilities": {"context_limit": 32_768}}
+        assert native_compaction.responses_passthrough_options({}, resolved=small, ratio=0.80)[
+            "context_management"
+        ] == [{"type": "compaction", "compact_threshold": 26_214}]

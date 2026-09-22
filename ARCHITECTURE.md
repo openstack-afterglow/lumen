@@ -199,9 +199,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "fff836d80e81257363fd132c1df7f7e534e3f1008f5fbe7fc3a7bc8da7dadddd",
-  "reviewed_at": "2026-09-22T03:29:43Z",
-  "summary": "Provider-native Anthropic compaction layered under the input_budget fence with in-run compaction-block round-trip, durable-run fence coverage confirmed for the OpenAI-compatible surface, and built-in Notion/GitHub MCP connector bundles with quiet exclusion of unconnected OAuth connectors"
+  "source_sha256": "51f99c6d7f8908785a1a3298126ec82ca65ceee934cc02f06eec966915f1ed5a",
+  "reviewed_at": "2026-09-22T07:11:25Z",
+  "summary": "Add Responses-shaped compaction resolvers and the passthrough switch; no structural impact yet because the compatibility proxies that consume them are wired in the following change"
 }
 ```
 <!-- architecture-review:end -->
