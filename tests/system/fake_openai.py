@@ -1,7 +1,7 @@
 """Standalone OpenAI-compatible fake provider for Lumen system tests.
 
 Provides deterministic responses for:
-- Standard chat completions (non-streaming and streaming)
+- Standard Chat Completions, Responses, and Anthropic Messages (non-streaming and streaming)
 - Small-delta then 2-second pause streaming (proves SSE flush <= 250ms scheduler allowance)
 - 500x4 burst streaming (ordered, replayable terminal output)
 - First-exchange title generation (detected via system prompt, influenced by first answer)
@@ -192,6 +192,351 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
     def _send_error_json(self, status: int, message: str) -> None:
         self._send_json(status, {"error": {"message": message, "type": "fake_openai_error"}})
 
+    def _read_json_body(self) -> dict[str, Any]:
+        content_length = int(self.headers.get("Content-Length", 0))
+        body_bytes = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        try:
+            payload = json.loads(body_bytes)
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _send_sse(self, events: list[dict[str, Any]]) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        for event in events:
+            event_type = str(event["type"])
+            data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            self.wfile.write(f"event: {event_type}\ndata: {data}\n\n".encode())
+            self.wfile.flush()
+        self.close_connection = True
+
+    @staticmethod
+    def _responses_object(
+        model: str,
+        *,
+        status: str = "completed",
+        text: str = "Hello from fake provider!",
+        output: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if output is None:
+            output = [
+                {
+                    "id": "msg_fake123",
+                    "type": "message",
+                    "status": "completed" if status == "completed" else "in_progress",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": text if status == "completed" else "",
+                            "annotations": [],
+                        }
+                    ],
+                }
+            ]
+        return {
+            "id": "resp_fake123",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": status,
+            "background": False,
+            "error": None,
+            "incomplete_details": None,
+            "instructions": None,
+            "max_output_tokens": None,
+            "model": model,
+            "output": output,
+            "parallel_tool_calls": True,
+            "previous_response_id": None,
+            "reasoning": {"effort": None, "summary": None},
+            "store": False,
+            "temperature": 1.0,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1.0,
+            "truncation": "disabled",
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 15,
+            },
+            "metadata": {},
+        }
+
+    def _handle_responses(self, request: dict[str, Any]) -> None:
+        model = str(request.get("model") or "fake-gpt-4")
+        input_items = request.get("input") if isinstance(request.get("input"), list) else []
+        tools = request.get("tools") if isinstance(request.get("tools"), list) else []
+        tool_names = [str(tool.get("name")) for tool in tools if isinstance(tool, dict) and tool.get("name")]
+        tool_schemas: dict[str, dict[str, str]] = {}
+        for tool in tools:
+            if not isinstance(tool, dict) or not tool.get("name"):
+                continue
+            properties = (tool.get("parameters") or {}).get("properties", {})
+            tool_schemas[str(tool["name"])] = {
+                str(key): str(value.get("type"))
+                for key, value in properties.items()
+                if isinstance(value, dict) and value.get("type")
+            }
+        _STATE.record_call(
+            "completion",
+            {
+                "protocol": "responses",
+                "stream": bool(request.get("stream")),
+                "input_types": [str(item.get("type")) for item in input_items if isinstance(item, dict)],
+                "tool_names": tool_names,
+                "tool_schemas": tool_schemas,
+                "has_prompt_cache_key": isinstance(request.get("prompt_cache_key"), str),
+                "has_client_metadata": "client_metadata" in request,
+            },
+        )
+
+        mode = _STATE.snapshot()["mode"]
+        has_tool_output = any(
+            isinstance(item, dict) and item.get("type") == "function_call_output" for item in input_items
+        )
+        text = "CODEX_TOOL_CONTINUATION_OK" if mode == "codex_tool" and has_tool_output else "Hello from fake provider!"
+
+        if mode == "codex_tool" and not has_tool_output:
+            command_tool = next(
+                (
+                    tool
+                    for tool in tools
+                    if isinstance(tool, dict)
+                    and tool.get("type") == "function"
+                    and tool.get("name") in {"shell", "exec_command"}
+                ),
+                None,
+            )
+            if command_tool is None:
+                self._send_error_json(400, "Codex command tool was not advertised")
+                return
+            tool_name = str(command_tool["name"])
+            properties = (command_tool.get("parameters") or {}).get("properties", {})
+            argument_name = "cmd" if "cmd" in properties else "command"
+            argument_schema = properties.get(argument_name, {})
+            command: str | list[str]
+            if argument_schema.get("type") == "array":
+                command = ["/bin/sh", "-lc", "printf CODEX_TOOL_OK"]
+            else:
+                command = "printf CODEX_TOOL_OK"
+            arguments = json.dumps({argument_name: command}, separators=(",", ":"))
+            function_call = {
+                "id": "fc_codex_item",
+                "type": "function_call",
+                "status": "completed",
+                "arguments": arguments,
+                "call_id": "call_codex_1",
+                "name": tool_name,
+            }
+            completed = self._responses_object(model, output=[function_call])
+            if not request.get("stream"):
+                self._send_json(200, completed)
+                return
+            in_progress_item = {**function_call, "status": "in_progress", "arguments": ""}
+            self._send_sse(
+                [
+                    {
+                        "type": "response.created",
+                        "sequence_number": 0,
+                        "response": self._responses_object(model, status="in_progress", output=[]),
+                    },
+                    {
+                        "type": "response.output_item.added",
+                        "sequence_number": 1,
+                        "output_index": 0,
+                        "item": in_progress_item,
+                    },
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "sequence_number": 2,
+                        "item_id": "fc_codex_item",
+                        "output_index": 0,
+                        "delta": arguments,
+                    },
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "sequence_number": 3,
+                        "item_id": "fc_codex_item",
+                        "output_index": 0,
+                        "arguments": arguments,
+                    },
+                    {
+                        "type": "response.output_item.done",
+                        "sequence_number": 4,
+                        "output_index": 0,
+                        "item": function_call,
+                    },
+                    {"type": "response.completed", "sequence_number": 5, "response": completed},
+                ]
+            )
+            return
+
+        completed = self._responses_object(model, text=text)
+        if not request.get("stream"):
+            self._send_json(200, completed)
+            return
+        in_progress = self._responses_object(model, status="in_progress", text=text)
+        self._send_sse(
+            [
+                {"type": "response.created", "sequence_number": 0, "response": in_progress},
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "item_id": "msg_fake123",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": text,
+                    "logprobs": [],
+                },
+                {
+                    "type": "response.output_text.done",
+                    "sequence_number": 2,
+                    "item_id": "msg_fake123",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": text,
+                    "logprobs": [],
+                },
+                {"type": "response.completed", "sequence_number": 3, "response": completed},
+            ]
+        )
+
+    def _handle_anthropic_messages(self, request: dict[str, Any]) -> None:
+        model = str(request.get("model") or "fake-claude")
+        tools = request.get("tools") if isinstance(request.get("tools"), list) else []
+        tool_names = [tool.get("name") for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)]
+        messages = request.get("messages") if isinstance(request.get("messages"), list) else []
+        tool_results = [
+            block
+            for message in messages
+            if isinstance(message, dict) and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        ]
+        protocol_headers = sorted(name.lower() for name in self.headers if name.lower().startswith("anthropic-"))
+        _STATE.record_call(
+            "completion",
+            {
+                "protocol": "anthropic",
+                "stream": bool(request.get("stream")),
+                "request_keys": sorted(request),
+                "protocol_headers": protocol_headers,
+                "tool_names": tool_names,
+                "has_tool_result": bool(tool_results),
+            },
+        )
+
+        if _STATE.mode == "claude_tool" and not tool_results:
+            tool_name = "Bash" if "Bash" in tool_names else (tool_names[0] if tool_names else "Bash")
+            tool_input = {
+                "command": "printf CLAUDE_LOCAL_TOOL_SENTINEL",
+                "description": "Print a deterministic local sentinel",
+            }
+            message = {
+                "id": "msg_fake_anthropic_tool",
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [{"type": "tool_use", "id": "toolu_fake_1", "name": tool_name, "input": tool_input}],
+                "stop_reason": "tool_use",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 10},
+            }
+            if not request.get("stream"):
+                self._send_json(200, message)
+                return
+            self._send_sse(
+                [
+                    {
+                        "type": "message_start",
+                        "message": {
+                            **message,
+                            "content": [],
+                            "stop_reason": None,
+                            "usage": {"input_tokens": 10, "output_tokens": 0},
+                        },
+                    },
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "tool_use", "id": "toolu_fake_1", "name": tool_name, "input": {}},
+                    },
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_input)},
+                    },
+                    {"type": "content_block_stop", "index": 0},
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                        "usage": {"output_tokens": 10},
+                    },
+                    {"type": "message_stop"},
+                ]
+            )
+            return
+
+        text = "Hello from fake provider!"
+        if _STATE.mode == "claude_tool":
+            result_text = json.dumps(tool_results, ensure_ascii=False)
+            text = (
+                "CLAUDE_TOOL_CONTINUATION_OK"
+                if "CLAUDE_LOCAL_TOOL_SENTINEL" in result_text
+                else "CLAUDE_TOOL_RESULT_MISSING"
+            )
+        message = {
+            "id": "msg_fake_anthropic",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        if not request.get("stream"):
+            self._send_json(200, message)
+            return
+        self._send_sse(
+            [
+                {
+                    "type": "message_start",
+                    "message": {
+                        **message,
+                        "content": [],
+                        "stop_reason": None,
+                        "usage": {"input_tokens": 10, "output_tokens": 0},
+                    },
+                },
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 5},
+                },
+                {"type": "message_stop"},
+            ]
+        )
+
     def do_HEAD(self) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -250,6 +595,14 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
         if path in ("/_control/reset", "/test/reset"):
             _STATE.reset()
             self._send_json(200, {"status": "ok", "reset": True})
+            return
+
+        if path in ("/responses", "/v1/responses"):
+            self._handle_responses(self._read_json_body())
+            return
+
+        if path in ("/messages", "/v1/messages"):
+            self._handle_anthropic_messages(self._read_json_body())
             return
 
         if path not in ("/chat/completions", "/v1/chat/completions"):

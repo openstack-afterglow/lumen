@@ -5,6 +5,7 @@
 - 라우터는 store monkeypatch로 발급 평문 1회·목록 마스킹·폐기/한도 소유 컨텍스트를 검증한다.
 """
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -38,6 +39,12 @@ class TestStorePureLogic:
         h2 = aks._hash_key("sk-afgl-abc")
         assert h1 == h2 and len(h1) == 64
         assert h1 != aks._hash_key("sk-afgl-abd")
+
+    def test_expiry_handles_mysql_naive_timestamps(self):
+        now = datetime.now(UTC)
+        assert aks._is_expired(None, now=now) is False
+        assert aks._is_expired((now - timedelta(seconds=1)).replace(tzinfo=None), now=now) is True
+        assert aks._is_expired((now + timedelta(seconds=1)).replace(tzinfo=None), now=now) is False
 
     def test_public_never_leaks_hash(self):
         row = SimpleNamespace(

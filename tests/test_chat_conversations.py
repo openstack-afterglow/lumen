@@ -103,11 +103,11 @@ class TestOwnership:
         assert resp.status_code == 403
 
     async def test_messages_forbidden_403(self, client, monkeypatch):
-        async def fake_msgs(conv_id, **kwargs):
+        async def fake_get(conv_id, **kwargs):
             raise cs.ConversationForbidden("접근 불가")
 
-        monkeypatch.setattr(cs, "list_message_tree", fake_msgs)
-        resp = await client.get(f"{_URL}/other-project-conv/messages")
+        monkeypatch.setattr(cs, "get_conversation", fake_get)
+        resp = await client.get(f"{_URL}/other-project-conv/messages", params={"cursor": "malformed"})
         assert resp.status_code == 403
 
     async def test_create_rejects_another_users_workspace(self, client, monkeypatch):
@@ -207,6 +207,7 @@ class TestForkAndActiveLeaf:
         assert captured["message_id"] == 7
         assert captured["user_id"] == "test-user-123"
         assert captured["project_id"] == "test-project-123"
+        assert captured["descend"] is False
 
     async def test_set_active_leaf_returns_409_when_conversation_run_active(self, client, monkeypatch):
         async def fake_set(conv_id, **kwargs):
@@ -243,26 +244,65 @@ class TestForkAndActiveLeaf:
         assert resp.status_code == 404
 
 
-async def test_messages_uses_backward_cursor_and_returns_page_metadata(client, monkeypatch):
+async def test_messages_uses_anchor_and_returns_signed_page_cursors(client, monkeypatch):
     from lumen.api import conversations
 
     captured = {}
 
+    async def fake_get(conv_id, **kwargs):
+        return _public_conv(id=conv_id, active_leaf_id=99, history_revision=7)
+
     async def fake_page(conv_id, **kwargs):
         captured["conv_id"] = conv_id
         captured.update(kwargs)
-        return {"messages": [], "active_leaf_id": 99, "has_more": True, "next_before_id": 42}
+        return {
+            "messages": [],
+            "active_leaf_id": 99,
+            "history_revision": 7,
+            "has_before": False,
+            "has_after": True,
+            "before_position": None,
+            "after_position": 39,
+        }
 
-    monkeypatch.setattr(conversations.cs, "list_message_tree", fake_page)
+    monkeypatch.setattr(conversations.cs, "get_conversation", fake_get)
+    monkeypatch.setattr(conversations.cs, "list_message_page", fake_page)
 
-    response = await client.get(f"{_URL}/conv-1/messages?before_id=100&limit=40")
+    response = await client.get(f"{_URL}/conv-1/messages?anchor=first&limit=40")
 
     assert response.status_code == 200
     assert captured == {
         "conv_id": "conv-1",
         "user_id": "test-user-123",
         "project_id": "test-project-123",
-        "before_id": 100,
+        "anchor": "first",
+        "cursor_direction": None,
+        "cursor_position": None,
+        "expected_revision": None,
         "limit": 40,
     }
-    assert response.json()["next_before_id"] == 42
+    body = response.json()
+    assert body["before_cursor"] is None
+    decoded = conversations._decode_history_cursor(body["after_cursor"], conversation_id="conv-1")
+    assert decoded == {
+        "v": 1,
+        "conversation_id": "conv-1",
+        "revision": 7,
+        "direction": "after",
+        "position": 39,
+    }
+
+
+async def test_messages_rejects_tampered_cursor_after_owner_check(client, monkeypatch):
+    owner_checked = False
+
+    async def fake_get(conv_id, **kwargs):
+        nonlocal owner_checked
+        owner_checked = True
+        return _public_conv(id=conv_id)
+
+    monkeypatch.setattr(cs, "get_conversation", fake_get)
+    response = await client.get(f"{_URL}/conv-1/messages", params={"cursor": "bad.cursor"})
+    assert owner_checked is True
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid_history_cursor"

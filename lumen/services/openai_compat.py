@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 VIRTUAL_MODEL_ID = "lumen"
 _DEFAULT_COMPAT_TIMEOUT_SECONDS = 300
-_MAX_TOKENS_CAP = 4096
+_DEFAULT_MAX_TOKENS = 4096
 _MAX_MESSAGE_CHARS = 32000
 _MAX_TOTAL_CHARS = 128000
 _MAX_MESSAGES = 100
@@ -119,10 +119,8 @@ def validate_and_normalize_transcript(
     if len(messages) > _MAX_MESSAGES:
         raise OpenAICompatError(400, f"Too many messages in transcript (maximum {_MAX_MESSAGES} allowed)")
 
-    if max_tokens is not None:
-        if max_tokens <= 0:
-            raise OpenAICompatError(400, "max_tokens must be a positive integer")
-        max_tokens = min(max_tokens, _MAX_TOKENS_CAP)
+    if max_tokens is not None and max_tokens <= 0:
+        raise OpenAICompatError(400, "max_tokens must be a positive integer")
 
     if temperature is not None and (temperature < 0.0 or temperature > 2.0):
         raise OpenAICompatError(400, "temperature must be between 0.0 and 2.0")
@@ -206,7 +204,7 @@ async def create_lumen_temp_run(
     capability_snapshot["extensions"] = _capability_extension_snapshot({"tools": [], "mcp": []})
     capability_snapshot["execution_protocol_version"] = protocol_version
 
-    effective_output_tokens = min(max_tokens or _MAX_TOKENS_CAP, _MAX_TOKENS_CAP)
+    effective_output_tokens = max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
     if context_limit is not None:

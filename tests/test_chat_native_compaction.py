@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from lumen.services import context_manager, graph, litellm_client, native_compaction
+from lumen.services import completion_api, context_manager, graph, litellm_client, native_compaction
 from lumen.services.durable_runs import execution
 from lumen.services.tool_runtime import contracts
 from lumen.services.tool_runtime import dispatch as tool_runtime
@@ -334,6 +334,31 @@ class TestGraphWiring:
             if message.get("role") == "assistant" and message.get("tool_calls")
         )
         assert "provider_specific_fields" not in assistant
+
+
+class TestPassthroughBilling:
+    def test_iterations_replace_the_top_level_counters(self):
+        payload = {
+            "usage": {
+                "input_tokens": 23_000,
+                "output_tokens": 1_000,
+                "iterations": [
+                    {"type": "compaction", "input_tokens": 180_000, "output_tokens": 3_500},
+                    {"type": "message", "input_tokens": 23_000, "output_tokens": 1_000},
+                ],
+            }
+        }
+        assert completion_api._native_usage(payload, input_key="input_tokens", output_key="output_tokens") == {
+            "prompt_tokens": 203_000,
+            "completion_tokens": 4_500,
+        }
+
+    def test_uncompacted_response_keeps_the_existing_reading(self):
+        payload = {"usage": {"input_tokens": 12, "output_tokens": 3}}
+        assert completion_api._native_usage(payload, input_key="input_tokens", output_key="output_tokens") == {
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+        }
 
 
 class TestProviderPayloadShape:
@@ -739,3 +764,123 @@ class TestPassthroughResolution:
         assert native_compaction.responses_passthrough_options({}, resolved=small, ratio=0.80)[
             "context_management"
         ] == [{"type": "compaction", "compact_threshold": 26_214}]
+
+
+class TestPassthroughInjection:
+    @pytest.fixture
+    def billing_stub(self, monkeypatch):
+        async def no_bill(*_args, **_kwargs):
+            return (0, 0, 0)
+
+        monkeypatch.setattr(completion_api, "_bill", no_bill)
+
+    @staticmethod
+    def _settings(monkeypatch, *, master=True, passthrough=True):
+        monkeypatch.setattr(
+            completion_api,
+            "get_settings",
+            lambda: type(
+                "S",
+                (),
+                {
+                    "chat_native_compaction_enabled": master,
+                    "chat_native_compaction_passthrough_enabled": passthrough,
+                },
+            )(),
+        )
+
+    async def test_anthropic_messages_request_carries_the_edit(self, monkeypatch, billing_stub):
+        captured: dict = {}
+        self._settings(monkeypatch)
+
+        async def fake(**kwargs):
+            captured.update(kwargs)
+            return {"content": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        monkeypatch.setattr(completion_api.litellm_client, "aanthropic_messages", fake)
+        await completion_api.complete_anthropic(
+            resolved=_ANTHROPIC_ROUTE,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1024,
+            stream=False,
+            user_id="u1",
+            project_id="p1",
+            api_key_id=None,
+            options={},
+        )
+        assert captured["context_management"]["edits"][0]["type"] == _ANTHROPIC_EDIT
+
+    async def test_responses_request_carries_the_entry(self, monkeypatch, billing_stub):
+        captured: dict = {}
+        self._settings(monkeypatch)
+
+        async def fake(**kwargs):
+            captured.update(kwargs)
+            return {"output": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        monkeypatch.setattr(completion_api.litellm_client, "aresponses", fake)
+        await completion_api.complete_responses(
+            resolved=_RESPONSES_ROUTE,
+            input="hi",
+            stream=False,
+            user_id="u1",
+            project_id="p1",
+            api_key_id=None,
+            options={},
+        )
+        assert captured["context_management"] == [{"type": "compaction", "compact_threshold": 160_000}]
+
+    async def test_caller_value_reaches_the_provider_unchanged(self, monkeypatch, billing_stub):
+        captured: dict = {}
+        self._settings(monkeypatch)
+        caller = {"edits": [{"type": _ANTHROPIC_EDIT, "trigger": {"type": "input_tokens", "value": 90_000}}]}
+
+        async def fake(**kwargs):
+            captured.update(kwargs)
+            return {"content": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        monkeypatch.setattr(completion_api.litellm_client, "aanthropic_messages", fake)
+        await completion_api.complete_anthropic(
+            resolved=_ANTHROPIC_ROUTE,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1024,
+            stream=False,
+            user_id="u1",
+            project_id="p1",
+            api_key_id=None,
+            options={"context_management": caller},
+        )
+        assert captured["context_management"] == caller
+
+    @pytest.mark.parametrize(("master", "passthrough"), [(False, True), (True, False), (False, False)])
+    async def test_either_switch_disarms_the_proxy(self, monkeypatch, billing_stub, master, passthrough):
+        captured: dict = {}
+        self._settings(monkeypatch, master=master, passthrough=passthrough)
+
+        async def fake(**kwargs):
+            captured.update(kwargs)
+            return {"content": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        monkeypatch.setattr(completion_api.litellm_client, "aanthropic_messages", fake)
+        await completion_api.complete_anthropic(
+            resolved=_ANTHROPIC_ROUTE,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1024,
+            stream=False,
+            user_id="u1",
+            project_id="p1",
+            api_key_id=None,
+            options={},
+        )
+        assert "context_management" not in captured
+
+    def test_responses_request_model_accepts_the_field(self):
+        """`extra="forbid"` would otherwise 400 a caller that sends its own."""
+        from lumen.api.compat.responses import ResponsesRequest
+
+        body = ResponsesRequest(
+            model="gpt-5.6-sol",
+            input="hi",
+            context_management=[{"type": "compaction", "compact_threshold": 120_000}],
+        )
+        assert body.context_management == [{"type": "compaction", "compact_threshold": 120_000}]

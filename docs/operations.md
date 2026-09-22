@@ -24,6 +24,7 @@ source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra ser
 | retention | run event/checkpoint/memory retention | 24h / 7d / 365d |
 | optional stores | `chat_checkpointer_postgres_url`, `chat_memory_pgvector_url`, `chat_asset_s3_*` | configured feature에만 필요 |
 | TLS/auth | `os_cacert`, `insecure`, Keystone fields | TLS verify 기본 활성; `insecure`는 예외적 개발 설정 |
+| Claude Gateway | `claude_gateway_base_url`, `claude_gateway_model`, `claude_gateway_provider`, `frontend_base_url` | public base는 origin + `/v1/claude-gateway`; loopback 외 HTTPS 필수; model/provider 모두 설정해야 inference 가능 |
 
 ### Chat asset S3 contract
 
@@ -44,6 +45,12 @@ Worker lease는 45초다. run이 `running`이 아니거나 lease owner/expiry가
 Migration `010_quota_policy_and_inheritance.sql`은 `user_wallets.max_quota_monthly/max_quota_weekly`를 nullable inheritance column으로 전환하고 singleton `chat_quota_policies`를 만든다. 기존 `0` 값은 명시적 무제한으로 보존되므로 자동으로 기본값 상속으로 바뀌지 않는다. 관리자가 해당 사용자를 reset해야 두 column이 `NULL`이 된다. API와 worker가 새 nullable 의미를 함께 사용하므로 이 migration도 mixed-version rolling deployment 없이 적용한다.
 
 Migration `011_provider_billing_admin_key.sql`은 `llm_providers.encrypted_billing_admin_key` nullable column을 추가한다. Direct OpenAI/Anthropic 조직 보고서 연동을 배포할 때는 Lumen API/worker를 중지하고 migration을 먼저 적용한 뒤 호환되는 Lumen API와 Afterglow UI를 순서대로 배포한다. 구 Lumen에서 Afterglow의 bulk `GET /admin/providers/billing`을 호출하면 동적 provider PATCH route와 충돌해 405가 나타날 수 있으므로 mixed-version 상태를 정상 기능으로 해석하지 않는다.
+
+Migration `012_chat_history_path.sql`은 `chat_conversation_active_path` projection과 `chat_conversations.history_revision`을 추가하고 각 legacy `active_leaf_id`의 immutable ancestry를 root-to-leaf position으로 backfill한다. Missing parent, cycle, cross-conversation ancestry, non-contiguous position 또는 projected leaf mismatch는 부분 결과를 publish하지 않고 migration을 실패시킨다. Cutover 전 `lumen-migrate --apply` 뒤 migration checksum과 active leaf/projection terminal equality를 확인한다. 운영 repair가 필요하면 API/worker admission을 중지하고 `python -m lumen.scripts.backfill_history --apply`로 unready conversation을 lock/backfill한 뒤 다시 검증한다.
+
+Migration `013_claude_gateway_device_auth.sql`은 API key expiry/credential kind와 hashed device grant store를 추가한다. Gateway를 노출하기 전에 MariaDB migration, Redis availability, `frontend_base_url`, HTTPS `claude_gateway_base_url`, configured model/provider route를 각각 확인한다. `GET /v1/health` 성공만으로 projection backfill, worker, rate limiter, device approval 또는 provider inference readiness를 증명하지 않는다.
+
+Legacy Lumen device rollout smoke는 (1) metadata, (2) device issuance, (3) Afterglow authenticated approve/deny, (4) interval을 지킨 one-time token poll, (5) gateway models/messages/count_tokens, (6) expired/consumed credential rejection을 분리해 확인한다. User/device/access token을 shell history나 CI log에 출력하지 않는다. 이 custom credential은 24시간 뒤 갱신되지 않으며 current Claude Apps Gateway login 호환성을 의미하지 않는다. Claude Code는 ordinary API-key direct Anthropic smoke를 별도로 실행한다.
 
 공식 OpenAI/Anthropic 조직 보고서는 UTC 월 시작과 이번 주 월요일 중 이른 시각부터 조회한다. 현재 일·주·월 projection은 각 기간의 시작으로 다시 필터링하므로 월초 주간 합계에는 전월 일자가 포함되지만 월간 합계에는 포함되지 않는다. 로컬 ledger와 upstream 보고서의 서로 다른 집계 범위는 계속 구분한다.
 

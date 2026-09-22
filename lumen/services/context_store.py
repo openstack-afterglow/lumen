@@ -16,10 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.db import get_session_factory, is_db_available
 from lumen.models.chat_agent_platform import ChatContextCheckpoint
-from lumen.models.chat_db import ChatMessage
+from lumen.models.chat_db import ChatConversationActivePath, ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatTempThread
 from lumen.services import context_inspector
 from lumen.services import conversation_store as cs
+from lumen.services.message_graph import ancestor_message_ids
 
 _ALLOWED_METADATA = {
     "version",
@@ -175,13 +176,32 @@ async def load_context_source(
         active_leaf_id: str | None = None
         if conversation_id is not None:
             conversation = await cs._load_owned(db, conversation_id, user_id, project_id)
-            rows = (
-                (await db.execute(select(ChatMessage).where(ChatMessage.conversation_id == conversation_id)))
-                .scalars()
-                .all()
-            )
             selected_leaf = leaf_id if leaf_id is not None else conversation.active_leaf_id
-            path = cs._backtrack(list(rows), selected_leaf)
+            if leaf_id is None:
+                if not conversation.history_index_ready:
+                    raise cs.HistoryIndexUnavailable("conversation history index is unavailable")
+                path = list(
+                    (
+                        await db.execute(
+                            select(ChatMessage)
+                            .join(
+                                ChatConversationActivePath,
+                                ChatConversationActivePath.message_id == ChatMessage.id,
+                            )
+                            .where(ChatConversationActivePath.conversation_id == conversation_id)
+                            .order_by(ChatConversationActivePath.position.asc())
+                        )
+                    ).scalars()
+                )
+            else:
+                message_ids = await ancestor_message_ids(
+                    db,
+                    conversation_id=conversation_id,
+                    leaf_id=selected_leaf,
+                )
+                rows = (await db.execute(select(ChatMessage).where(ChatMessage.id.in_(message_ids)))).scalars()
+                by_id = {row.id: row for row in rows}
+                path = [by_id[item] for item in message_ids]
             raw_messages = [cs._msg_public(row) for row in path]
             active_leaf_id = str(selected_leaf) if selected_leaf is not None else None
         else:

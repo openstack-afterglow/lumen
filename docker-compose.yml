@@ -36,6 +36,9 @@ services:
       CHAT_API_HOSTS: localhost,127.0.0.1,lumen-api
       CHAT_DEFAULT_MODEL: ${LUMEN_LOCAL_MODEL:-gpt-4.1-mini}
       CHAT_COMPAT_RUN_TIMEOUT_SECONDS: ${CHAT_COMPAT_RUN_TIMEOUT_SECONDS:-300}
+      CLAUDE_GATEWAY_BASE_URL: http://localhost:${LUMEN_API_PORT:-8012}/v1/claude-gateway
+      CLAUDE_GATEWAY_MODEL: ${LUMEN_LOCAL_MODEL:-gpt-4.1-mini}
+      CLAUDE_GATEWAY_PROVIDER: ${LUMEN_LOCAL_PROVIDER_TYPE:-openai}
     depends_on:
       mariadb:
         condition: service_healthy

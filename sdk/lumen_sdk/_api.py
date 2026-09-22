@@ -34,7 +34,7 @@ class _LumenApiMixin:
     def set_conversation_workspace(self, conversation_id, **attrs):
         return self._json_request("PATCH", f"/v1/conversations/{_segment(conversation_id)}/workspace", body=attrs)
 
-    def list_messages(self, conversation_id, **query):
+    def list_message_page(self, conversation_id, **query):
         return self._json_request(
             "GET", f"/v1/conversations/{_segment(conversation_id)}/messages", params=_query(**query)
         )

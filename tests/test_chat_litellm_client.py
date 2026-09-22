@@ -359,6 +359,43 @@ async def test_anthropic_subscription_pins_oauth_transport_parameters(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_native_anthropic_forwards_claude_code_fields_and_protocol_headers(monkeypatch):
+    captured = {}
+
+    async def create(**kwargs):
+        captured.update(kwargs)
+        return {"type": "message", "content": []}
+
+    import litellm
+
+    monkeypatch.setattr(litellm.anthropic.messages, "acreate", create)
+    await litellm_client.aanthropic_messages(
+        model="claude-sonnet",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=128,
+        stream=False,
+        api_base="https://anthropic.example/v1",
+        api_key="provider-secret",
+        custom_llm_provider="anthropic",
+        provider_auth=None,
+        context_management={"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        output_config={"effort": "high"},
+        anthropic_headers={
+            "anthropic-beta": "context-management-2025-06-27",
+            "anthropic-version": "2023-06-01",
+        },
+    )
+
+    assert captured["context_management"]["edits"][0]["keep"] == "all"
+    assert captured["output_config"] == {"effort": "high"}
+    assert captured["extra_headers"] == {
+        "anthropic-beta": "context-management-2025-06-27",
+        "anthropic-version": "2023-06-01",
+    }
+    assert captured["api_key"] == "provider-secret"
+
+
+@pytest.mark.asyncio
 async def test_subscription_stream_auth_failure_marks_only_credential_fingerprint(monkeypatch):
     provider_auth = {"provider_id": 7, "generation": 3, "auth_mode": "chatgpt_device"}
     marked = []
@@ -656,6 +693,32 @@ async def test_perplexity_agent_preserves_explicit_search_and_builtin_sonar(monk
             "end_index": 2,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_responses_forwards_prompt_cache_key(monkeypatch):
+    import litellm
+
+    captured = {}
+
+    async def responses(**kwargs):
+        captured.update(kwargs)
+        return {"id": "resp_codex", "object": "response", "status": "completed", "output": []}
+
+    monkeypatch.setattr(litellm, "aresponses", responses)
+    result = await litellm_client.aresponses(
+        model="openai/gpt-test",
+        input=[{"role": "user", "content": "hello"}],
+        stream=False,
+        api_base="https://provider.example/v1",
+        api_key="secret",
+        custom_llm_provider="openai",
+        provider_auth=None,
+        prompt_cache_key="session:codex",
+    )
+
+    assert result["id"] == "resp_codex"
+    assert captured["prompt_cache_key"] == "session:codex"
 
 
 def test_perplexity_agent_omits_strict_for_open_object_schema():

@@ -1,49 +1,64 @@
-"""Anthropic(Claude) 호환 엔드포인트 — POST /v1/messages, GET /v1/models(공유).
-
-내부는 OpenAI 포맷 messages 로 변환해 litellm 호출 후, Anthropic 포맷으로 재변환한다.
-도구는 pass-through(tool_use 릴레이). 인증은 API 키. stateless — 대화 저장 안 함.
-스트리밍은 Anthropic 이벤트 프로토콜(message_start/content_block_delta/…)을 따른다.
-"""
+"""Anthropic Messages-compatible stateless endpoints using LiteLLM native transport."""
 
 from __future__ import annotations
 
 import json
-import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, Header, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
+
+from .streaming import events_with_ping
 
 router = APIRouter()
 
 
 class AnthropicMessagesRequest(BaseModel):
     model: str = Field(..., max_length=190)
-    provider: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=40,
-        pattern=r"^[a-z0-9][a-z0-9_-]*$",
-    )
-    messages: list[dict] = Field(..., min_length=1)
-    system: Any = None  # str 또는 [{type:text,text}]
-    max_tokens: int | None = None
+    provider: str | None = Field(default=None, min_length=1, max_length=40, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    messages: list[dict[str, Any]] = Field(..., min_length=1)
+    system: Any = None
+    max_tokens: int = Field(..., gt=0)
     stream: bool = False
     temperature: float | None = None
-    tools: list[dict] | None = None
-    tool_choice: Any = None
+    metadata: dict[str, Any] | None = None
+    stop_sequences: list[str] | None = None
+    thinking: dict[str, Any] | None = None
+    context_management: dict[str, Any] | None = None
+    tool_choice: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    top_k: int | None = None
+    top_p: float | None = None
+    container: dict[str, Any] | None = None
+    output_config: dict[str, Any] | None = None
 
-    model_config = {"extra": "allow"}
+    model_config = {"extra": "forbid"}
+
+
+class AnthropicCountTokensRequest(BaseModel):
+    model: str = Field(..., max_length=190)
+    provider: str | None = Field(default=None, min_length=1, max_length=40, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    messages: list[dict[str, Any]] = Field(..., min_length=1)
+    system: Any = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: dict[str, Any] | None = None
+    thinking: dict[str, Any] | None = None
+
+    model_config = {"extra": "forbid"}
 
 
 class AnthropicUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+
+    model_config = {"extra": "allow"}
 
 
 class AnthropicMessagesResponse(BaseModel):
@@ -52,194 +67,65 @@ class AnthropicMessagesResponse(BaseModel):
     role: str = "assistant"
     model: str
     content: list[dict[str, Any]]
-    stop_reason: str | None = "end_turn"
+    stop_reason: str | None = None
     stop_sequence: str | None = None
     usage: AnthropicUsage
 
-
-def _convert_anthropic_tool_choice(tool_choice: Any) -> Any:
-    """Convert Anthropic tool_choice to OpenAI/LiteLLM tool_choice format.
-
-    Supported Anthropic choices:
-      - {"type": "auto"} -> "auto"
-      - {"type": "any"} -> "required"
-      - {"type": "none"} -> "none"
-      - {"type": "tool", "name": "..."} -> {"type": "function", "function": {"name": "..."}}
-      - "auto" -> "auto", "any" -> "required", "none" -> "none"
-
-    Raises CompletionError(422, ...) on malformed choice.
-    """
-    if tool_choice is None:
-        return None
-    if isinstance(tool_choice, str):
-        tc_lower = tool_choice.lower()
-        if tc_lower == "auto":
-            return "auto"
-        if tc_lower == "any":
-            return "required"
-        if tc_lower == "none":
-            return "none"
-        raise core.CompletionError(422, f"Invalid tool_choice string option: {tool_choice!r}")
-    if isinstance(tool_choice, dict):
-        tc_type = tool_choice.get("type")
-        if not isinstance(tc_type, str):
-            raise core.CompletionError(422, "tool_choice dict must contain a string 'type'")
-        tc_type_lower = tc_type.lower()
-        if tc_type_lower == "auto":
-            return "auto"
-        if tc_type_lower == "any":
-            return "required"
-        if tc_type_lower == "none":
-            return "none"
-        if tc_type_lower == "tool":
-            name = tool_choice.get("name")
-            if not isinstance(name, str) or not name.strip():
-                raise core.CompletionError(422, "tool_choice with type='tool' requires a non-empty string 'name'")
-            return {"type": "function", "function": {"name": name}}
-        raise core.CompletionError(422, f"Unsupported Anthropic tool_choice type: {tc_type!r}")
-    raise core.CompletionError(422, "tool_choice must be a dict or string")
+    model_config = {"extra": "allow"}
 
 
-# ── 순수 변환 함수 (단위 테스트 대상) ──────────────────────────────────────
+class AnthropicCountTokensResponse(BaseModel):
+    input_tokens: int
+
+    model_config = {"extra": "allow"}
+
+
 def anthropic_error(status_code: int, message: str) -> dict:
-    kind = "invalid_request_error" if status_code < 500 else "api_error"
+    if status_code == 401:
+        kind = "authentication_error"
+    elif status_code == 403:
+        kind = "permission_error"
+    elif status_code == 404:
+        kind = "not_found_error"
+    elif status_code == 429:
+        kind = "rate_limit_error"
+    elif status_code < 500:
+        kind = "invalid_request_error"
+    else:
+        kind = "api_error"
     return {"type": "error", "error": {"type": kind, "message": message}}
 
 
-def _flatten_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "\n".join(b.get("text", "") for b in value if isinstance(b, dict) and b.get("type") == "text")
-    return ""
+def anthropic_error_response(status_code: int, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content=anthropic_error(status_code, message),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
-def _anthropic_tools_to_openai(tools: list[dict] | None) -> list[dict] | None:
-    """Anthropic tools([{name,description,input_schema}]) → OpenAI function tools."""
-    if not tools:
-        return None
-    out = []
-    for t in tools:
-        if not isinstance(t, dict) or not t.get("name"):
+def _selected_provider(model: str, body_provider: str | None, header_provider: str | None) -> str | None:
+    return core.select_api_provider(model, body_provider, header_provider)
+
+
+def anthropic_protocol_headers(request: Request) -> dict[str, str]:
+    """Forward only Anthropic protocol headers, never caller credentials."""
+    headers: dict[str, str] = {}
+    total_size = 0
+    for name, value in request.headers.items():
+        normalized = name.lower()
+        if not normalized.startswith("anthropic-"):
             continue
-        out.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description") or "",
-                    "parameters": t.get("input_schema") or {"type": "object", "properties": {}},
-                },
-            }
-        )
-    return out or None
+        total_size += len(normalized) + len(value)
+        if total_size > 16_384:
+            raise core.CompletionError(400, "Anthropic protocol headers are too large")
+        headers[normalized] = value
+    return headers
 
 
-def to_internal_messages(body: AnthropicMessagesRequest) -> list[dict]:
-    """Anthropic 요청 → 내부 OpenAI 포맷 messages. system·tool_use·tool_result 변환."""
-    msgs: list[dict] = []
-    if body.system:
-        sys_text = _flatten_text(body.system)
-        if sys_text:
-            msgs.append({"role": "system", "content": sys_text})
-    for m in body.messages:
-        role = m.get("role", "user")
-        content = m.get("content")
-        if isinstance(content, str):
-            msgs.append({"role": role, "content": content})
-            continue
-        texts: list[str] = []
-        tool_calls: list[dict] = []
-        for block in content or []:
-            if not isinstance(block, dict):
-                continue
-            bt = block.get("type")
-            if bt == "text":
-                texts.append(block.get("text", ""))
-            elif bt == "tool_use":  # 이전 assistant 의 도구 호출
-                tool_calls.append(
-                    {
-                        "id": block.get("id"),
-                        "type": "function",
-                        "function": {
-                            "name": block.get("name"),
-                            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
-                        },
-                    }
-                )
-            elif bt == "tool_result":  # user 가 돌려준 도구 결과
-                msgs.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": block.get("tool_use_id"),
-                        "content": _flatten_text(block.get("content")),
-                    }
-                )
-        if tool_calls:
-            msgs.append({"role": "assistant", "content": ("\n".join(texts) or None), "tool_calls": tool_calls})
-        elif texts:
-            msgs.append({"role": role, "content": "\n".join(texts)})
-    return msgs
-
-
-def _message_id() -> str:
-    return "msg_" + uuid.uuid4().hex
-
-
-def _parse_args(raw: Any) -> dict:
-    if isinstance(raw, dict):
-        return raw
-    try:
-        return json.loads(raw) if raw else {}
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
-
-def nonstream_response(result: dict, *, msg_id: str) -> dict:
-    content: list[dict] = []
-    if result.get("content"):
-        content.append({"type": "text", "text": result["content"]})
-    stop_reason = "end_turn"
-    if result.get("tool_calls"):
-        for i, tc in enumerate(result["tool_calls"]):
-            content.append(
-                {
-                    "type": "tool_use",
-                    "id": tc.get("id") or f"toolu_{i}",
-                    "name": tc["function"].get("name"),
-                    "input": _parse_args(tc["function"].get("arguments")),
-                }
-            )
-        stop_reason = "tool_use"
-    return {
-        "id": msg_id,
-        "type": "message",
-        "role": "assistant",
-        "model": result["model"],
-        "content": content,
-        "stop_reason": stop_reason,
-        "stop_sequence": None,
-        "usage": {"input_tokens": result["prompt_tokens"], "output_tokens": result["completion_tokens"]},
-    }
-
-
-def _accumulate_tool_calls(acc: dict[int, dict], tcs: list[dict] | None) -> None:
-    """스트림 tool_call 조각(index별)을 누적한다."""
-    for tc in tcs or []:
-        idx = tc.get("index") or 0
-        slot = acc.setdefault(idx, {"id": None, "name": None, "arguments": ""})
-        if tc.get("id"):
-            slot["id"] = tc["id"]
-        fn = tc.get("function") or {}
-        if fn.get("name"):
-            slot["name"] = fn["name"]
-        if fn.get("arguments"):
-            slot["arguments"] += fn["arguments"]
-
-
-# ── 엔드포인트 ──────────────────────────────────────────────────────────────
-def _event(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def _event(payload: dict) -> str:
+    event_type = str(payload.get("type") or "message")
+    return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
 @router.post(
@@ -248,123 +134,75 @@ def _event(event: str, data: dict) -> str:
     openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
 )
 async def messages(
-    body: AnthropicMessagesRequest, token_info: dict = Depends(require_api_key_scopes("compat:completions:write"))
+    body: AnthropicMessagesRequest,
+    request: Request,
+    x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider"),
+    token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
-    user_id, project_id = token_info["user_id"], token_info["project_id"]
-    api_key_id = token_info.get("api_key_id")
-    internal = to_internal_messages(body)
-    tools = _anthropic_tools_to_openai(body.tools)
     try:
-        tool_choice = _convert_anthropic_tool_choice(body.tool_choice)
-        resolved = await core.resolve_api(body.model, provider=body.provider)
-        await core.precheck(user_id, project_id, api_key_id=api_key_id)
+        provider = _selected_provider(body.model, body.provider, x_lumen_provider)
+        resolved = await core.resolve_api(body.model, provider=provider)
+        await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"))
+        options = body.model_dump(
+            exclude={"model", "provider", "messages", "max_tokens", "stream"},
+            exclude_none=True,
+        )
+        protocol_headers = anthropic_protocol_headers(request)
+        if protocol_headers:
+            options["anthropic_headers"] = protocol_headers
+        result = await core.complete_anthropic(
+            resolved=resolved,
+            messages=body.messages,
+            max_tokens=body.max_tokens,
+            stream=body.stream,
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            api_key_id=token_info.get("api_key_id"),
+            options=options,
+        )
     except core.CompletionError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=anthropic_error(exc.status_code, exc.message)) from exc
-
-    msg_id = _message_id()
+        return anthropic_error_response(exc.status_code, exc.message)
 
     if not body.stream:
+        return JSONResponse(content=result)
+
+    async def generate() -> AsyncIterator[str]:
         try:
-            result = await core.complete_once(
-                resolved=resolved,
-                messages=internal,
-                user_id=user_id,
-                project_id=project_id,
-                api_key_id=api_key_id,
-                max_tokens=body.max_tokens,
-                temperature=body.temperature,
-                tools=tools,
-                tool_choice=tool_choice,
-            )
-        except core.CompletionError as exc:
-            raise HTTPException(
-                status_code=exc.status_code, detail=anthropic_error(exc.status_code, exc.message)
-            ) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=anthropic_error(502, "업스트림 모델 오류")) from exc
-        return nonstream_response(result, msg_id=msg_id)
+            async for payload in events_with_ping(result):
+                if payload is None:
+                    yield 'event: ping\ndata: {"type":"ping"}\n\n'
+                else:
+                    yield _event(payload)
+        except Exception:
+            yield _event(anthropic_error(502, "upstream model error"))
 
-    async def gen() -> AsyncIterator[str]:
-        model = resolved["api_model_name"]
-        yield _event(
-            "message_start",
-            {
-                "type": "message_start",
-                "message": {
-                    "id": msg_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": model,
-                    "content": [],
-                    "stop_reason": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
-                },
-            },
-        )
-        yield _event(
-            "content_block_start",
-            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-        )
-        tool_acc: dict[int, dict] = {}
-        out_tokens = 0
-        async for ev in core.complete_stream(
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post(
+    "/messages/count_tokens",
+    response_model=AnthropicCountTokensResponse,
+    openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
+)
+async def count_tokens(
+    body: AnthropicCountTokensRequest,
+    request: Request,
+    x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider"),
+    token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
+):
+    del token_info
+    try:
+        provider = _selected_provider(body.model, body.provider, x_lumen_provider)
+        resolved = await core.resolve_api(body.model, provider=provider)
+        payload = body.model_dump(exclude={"provider"}, exclude_none=True)
+        return await core.count_anthropic_tokens(
             resolved=resolved,
-            messages=internal,
-            user_id=user_id,
-            project_id=project_id,
-            api_key_id=api_key_id,
-            max_tokens=body.max_tokens,
-            temperature=body.temperature,
-            tools=tools,
-            tool_choice=tool_choice,
-        ):
-            if ev["type"] == "delta":
-                if ev.get("content"):
-                    yield _event(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type": "text_delta", "text": ev["content"]},
-                        },
-                    )
-                _accumulate_tool_calls(tool_acc, ev.get("tool_calls"))
-            elif ev["type"] == "done":
-                out_tokens = ev["completion_tokens"]
-            elif ev["type"] == "error":
-                yield _event("error", anthropic_error(502, ev.get("message", "오류")))
-                return
-        yield _event("content_block_stop", {"type": "content_block_stop", "index": 0})
-        # 누적된 tool_use 블록(있으면) 방출
-        stop_reason = "end_turn"
-        for i, (_, slot) in enumerate(sorted(tool_acc.items()), start=1):
-            stop_reason = "tool_use"
-            yield _event(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": i,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": slot["id"] or f"toolu_{i}",
-                        "name": slot["name"],
-                        "input": {},
-                    },
-                },
-            )
-            yield _event(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": i,
-                    "delta": {"type": "input_json_delta", "partial_json": slot["arguments"] or "{}"},
-                },
-            )
-            yield _event("content_block_stop", {"type": "content_block_stop", "index": i})
-        yield _event(
-            "message_delta",
-            {"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": out_tokens}},
+            payload=payload,
+            anthropic_headers=anthropic_protocol_headers(request),
         )
-        yield _event("message_stop", {"type": "message_stop"})
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    except core.CompletionError as exc:
+        return anthropic_error_response(exc.status_code, exc.message)

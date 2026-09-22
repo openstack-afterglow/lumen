@@ -4,12 +4,12 @@
 
 ## 인증과 scope
 
-Keystone token은 Native route에서 user 권한으로 통과하며, API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat 호환 route (`/v1/models`, `/v1/chat/completions`, `/v1/messages`)는 API Key만 허용하며 Keystone Token 사용 시 401을 반환한다. 한 요청에 `X-API-Key`, `Authorization`, `X-Auth-Token` 중 둘 이상을 보내면 400이다. API key의 `X-Project-Id`는 key owner project와 같아야 한다.
+Keystone token은 Native route에서 user 권한으로 통과하며, API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat 호환 route (`/v1/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API Key만 허용하며 Keystone Token 사용 시 401을 반환한다. 한 요청에 `X-API-Key`, `Authorization`, `X-Auth-Token` 중 둘 이상을 보내면 400이다. 단, 동일한 API key를 `X-API-Key`와 `Authorization: Bearer`로 중복 전달한 경우(Claude Code의 기본 동작)는 두 값이 일치할 때만 허용한다. API key의 `X-Project-Id`는 key owner project와 같아야 한다. `X-Lumen-Provider`는 선택적 provider selector이며 body `provider` 또는 인식 가능한 `model` provider prefix와 충돌하면 400이다.
 
 | Surface | API-key scope | Keystone only |
 | --- | --- | --- |
 | `GET /v1/models`, `/v1/chat/models`, `/v1/capabilities` | `models:read` | 아니오 |
-| `POST /v1/chat/completions`, `/v1/messages` | `compat:completions:write` | 아니오 |
+| `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` | `compat:completions:write` | 아니오 |
 | conversations read/write | `native:conversations:read` / `native:conversations:write` | 아니오 |
 | native run read/write | `native:runs:read` / `native:runs:write` | 아니오 |
 | custom tools, MCP, skills read/write | `native:extensions:read` / `native:extensions:write` | OAuth start 제외 |
@@ -24,8 +24,9 @@ API-key run은 text `execution_mode="chat"`만 허용한다. `memory=true`는 me
 | 그룹 | Route |
 | --- | --- |
 | Discovery/health | `GET /`, `/v1/` (both advertise `rel=models` for `/v1/models`), `/v1/health`, compat `GET /v1/compat` |
-| Compat | `GET /v1/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/messages` |
-| Conversations | `POST/GET /v1/conversations`, `GET/DELETE /v1/conversations/{id}`, messages/search/fork/workspace/active-leaf, completion/regenerate/retry/runs subroutes |
+| Compat | `GET /v1/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` |
+| Legacy Lumen device gateway | `/.well-known/oauth-authorization-server`, `/oauth/device/code`, `/oauth/token`, `/v1/managed-settings`, `/v1/models`, `/v1/messages`, `/v1/messages/count_tokens` under the configured `/v1/claude-gateway` base; not the current Claude Apps Gateway protocol |
+| Conversations | `POST/GET /v1/conversations`, `GET/DELETE /v1/conversations/{id}`, projected message pages/search/fork/workspace/active-leaf, completion/regenerate/retry/runs subroutes |
 | Native runs | `POST /v1/temp-completions`; `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/events`, `/v1/temp-threads/{id}`; approval/interaction/cancel POST routes |
 | Context | `POST /v1/conversations/{id}/context-preview`, `/compactions`; equivalent `POST /v1/temp-threads/{id}/context-preview`, `/compactions`. Preview is read-only; compaction requires `Idempotency-Key` and `expected_context_revision`, returns a durable `run_kind="compaction"` descriptor. |
 | Extensions | `GET/POST/PATCH/DELETE /v1/custom-tools`, `/v1/mcp-servers`, `/v1/skills`; OAuth status/disconnect; OAuth start is Keystone-only |
@@ -37,13 +38,23 @@ API-key run은 text `execution_mode="chat"`만 허용한다. `memory=true`는 me
 
 상세 연동 스펙, 프로필별 Base URL 규칙(OpenAI base URL `/v1` 접미사 vs Anthropic Origin), `CHAT_API_HOSTS` 은닉(404), 에러 JSON 구조 및 SSE 이벤트 처리, TypeScript/Python 연동 예제는 [Afterglow 연동 가이드](afterglow-integration.md)를 참고한다.
 
-인증 없는 `GET /v1/compat`는 현재 요청 origin을 기준으로 OpenAI `sdk_base_url` (`/v1` 포함), Anthropic `sdk_base_url` (Origin), `/v1/models`, `/v1/chat/completions` URL을 제공한다. 모델 목록과 completion 호출 자체에는 `models:read`, `compat:completions:write` scope를 가진 API key가 필요하다. 런타임 전체 스펙은 `/openapi.json` (`x-required-api-key-scopes` 포함)을 참조한다.
+인증 없는 `GET /v1/compat`는 현재 요청 origin을 기준으로 OpenAI `sdk_base_url` (`/v1` 포함), Anthropic `sdk_base_url` (Origin), `/v1/responses`, `/v1/messages/count_tokens`, legacy Lumen device base/metadata를 제공한다. 모델 목록과 completion 호출 자체에는 `models:read`, `compat:completions:write` scope를 가진 API key가 필요하다. 런타임 전체 스펙은 `/openapi.json` (`x-required-api-key-scopes` 포함)을 참조한다.
 
 Standalone Compose는 `seed-local`이 같은 scope와 native Console scope를 가진 local key를 발급하고 mode `0600` connection manifest에 저장한다. `docker compose run --rm --no-deps -T lumen-connection`을 명시적으로 실행할 때만 `/v1`로 끝나는 host `base_url`, Compose-network `container_base_url`, key, model을 출력한다. 생성 key를 반환하는 HTTP endpoint는 없다.
 
-OpenAI 비스트리밍/스트리밍 completion에서 `model="lumen"`을 사용하면 서버 설정 `chat_default_model`을 백엔드로 하는 Lumen durable run이 생성되어 worker에서 실행된다. 이 경로는 text-only, tools/memory 비활성 상태로 동작하며 응답 usage는 durable run 원장에 기록된다. `GET /v1/models`는 active `chat_default_model`이 구성되어 있을 때만 `owned_by="lumen"`인 `lumen` 모델을 표출한다. 일반 공개 provider model ID 지정 시에는 direct stateless 중계가 수행된다. 같은 공개 ID가 여러 provider에 있으면 선택적 `provider`가 없을 때 409이며, SDK는 `extra_body={"provider": "..."}`로 이를 전달할 수 있다. 스트리밍 usage는 요청에 `stream_options={"include_usage": true}`를 지정해야 마지막 usage chunk로 반환된다. 모든 경로가 API-key quota admission과 `source="api"` usage ledger를 거친다.
+OpenAI 비스트리밍/스트리밍 completion에서 `model="lumen"`을 사용하면 서버 설정 `chat_default_model`을 백엔드로 하는 Lumen durable run이 생성되어 worker에서 실행된다. 이 경로는 text-only, tools/memory 비활성 상태로 동작하며 응답 usage는 durable run 원장에 기록된다. `GET /v1/models`는 active `chat_default_model`이 구성되어 있을 때만 `owned_by="lumen"`인 `lumen` 모델을 표출한다. 일반 공개 provider model ID 지정 시에는 direct stateless 중계가 수행된다. 같은 공개 ID가 여러 provider에 있으면 선택적 `provider`가 없을 때 409이며, SDK는 `extra_body={"provider": "..."}` 또는 `X-Lumen-Provider`로 이를 전달할 수 있다. 스트리밍 usage는 요청에 `stream_options={"include_usage": true}`를 지정해야 마지막 usage chunk로 반환된다. 모든 경로가 API-key quota admission과 `source="api"` usage ledger를 거친다.
 
-호환 API는 full vendor API parity가 아니며, OpenAI 호환 오류는 최상위 `{ "error": { "message": ..., "type": ..., "code": ... } }` 구조를 반환한다. 처리 대상 필드(`model`, `provider`, `messages`, `system`, `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`, `stream_options`) 외 벤더 전용 추가 필드는 수용되나 무시된다. `model="lumen"` 요청은 `tools`, `tool_choice`, non-string/multimodal content 및 0 이하 `max_tokens`를 400 OpenAI error로 거부한다. Provider model direct 요청은 기존 caller-owned tool pass-through를 유지하며 `max_tokens` 생략/0을 4096으로 해석하고 그보다 큰 값은 4096으로 제한한다.
+`POST /v1/responses`는 stateless Responses-native surface다. `store=true`, `previous_response_id`, background execution은 400으로 거부하고 Lumen 대화나 Responses object를 영속화하지 않는다. 비스트리밍은 native `response` object, 스트리밍은 `response.created`/output delta/terminal event 이름을 그대로 전달하며 연결 종료가 provider 실행 취소 신호가 되지는 않는다. Codex custom provider는 `/v1` base, `wire_api="responses"`, ordinary scoped API key를 사용한다. Codex가 보내는 `prompt_cache_key`는 provider transport로 전달하고 local `client_metadata`는 외부 provider에 전달하지 않는다. HTTP Codex는 tool output을 포함한 전체 input을 다음 요청에 다시 보내므로 이 stateless contract와 호환된다. `/v1/messages`와 `/v1/messages/count_tokens`는 Anthropic-native body/response/SSE를 사용하고 약 15초 무활동마다 Anthropic `ping` event를 전송한다. Current Claude Code의 `context_management`, `output_config`, native tool/thinking blocks와 caller `anthropic-*` protocol headers는 explicit fields/header namespace로 보존하며 caller auth headers는 provider로 전달하지 않는다.
+
+Compat surface는 full vendor API parity가 아니다. OpenAI 오류는 최상위 `{ "error": { "message": ..., "type": ..., "code": ... } }`, Anthropic 오류는 `{ "type": "error", "error": ... }` 구조다. `max_tokens`/`max_output_tokens`를 생략할 수 있는 OpenAI path는 기존 4096 기본값을 적용하지만, 클라이언트가 명시한 양수 output budget을 임의로 4096으로 자르지 않는다. Anthropic `max_tokens`는 필수 양수다. Unknown request fields는 422로 거부하며 provider-specific 선택은 `provider` 또는 `X-Lumen-Provider`로 명시한다.
+
+### Claude Code direct API와 legacy Lumen device protocol
+
+Claude Code 2.1.278의 검증된 연결은 ordinary scoped API key, Anthropic origin `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, public model ID를 사용하는 direct `/v1/messages` path다. 격리된 실제 CLI process가 streaming text와 local `Bash` tool 실행 뒤 native `tool_result` continuation을 완료했다. 이 stateless payload는 Lumen browser conversation이나 durable run journal에 저장하지 않는다.
+
+Configured `${claude_gateway_base_url}`의 device routes는 Lumen custom protocol이다. `POST /oauth/device/code`는 exact fixed scopes의 10-minute grant를 만들고 Redis rate limit을 fail-closed로 적용한다. Afterglow authenticated approval 뒤 interval-valid poll이 grant를 한 번 consume해 hashed-at-rest `credential_kind="claude_gateway"` API key를 24시간 발급한다. Pending, fast polling, denial, expiry, replay, store outage는 credential 없이 OAuth 오류를 반환한다. Gateway Messages/models/settings route는 이 credential kind만 허용한다.
+
+Current Claude Apps Gateway login은 administrator-managed `forceLoginGatewayUrl`, official `/protocol`, OIDC device authorization, refresh session을 요구한다. Lumen custom protocol은 그 계약을 구현하지 않으므로 current Claude Code `/login` 경로로 advertise하지 않는다. Afterglow의 legacy approval shell은 custom clients에만 해당하며 current Claude Code 사용자는 direct ordinary API-key path를 사용한다.
 
 ## Provider credential 상태
 
@@ -99,6 +110,12 @@ API 키 발급 및 한도 관리는 Keystone token 인증 전용(Keystone-only)�
 - 본인 사용량 요약: `GET /v1/usage/summary`는 `month_credited_cost`, `week_credited_cost`, `quota_used`, `quota_max`, `quota_weekly_max`를 함께 반환한다. 독립 주간 ceiling이 없을 때 `quota_weekly_max=0`이지만 월 ceiling은 계속 강제된다.
 - 관리자 사용자 상세: `GET /v1/admin/stats/users/{user_id}`는 `range=7d|30d|90d|1y|all`, 선택적 `source=web|api`, `before_id`, `limit`을 받고 기간 metadata, 전체·모델별·source별 aggregate와 timestamp/token/raw USD/credited cost/API-key attribution을 포함한 immutable ledger page를 반환한다.
 - 이력 및 격리 사용량 Surface: 기존 `GET /v1/usage/keys` (기간별 historical 집계) 및 `GET /v1/usage/records` (현재 키로 격리된 레코드 커서 조회)는 기존 계약을 유지하며 당월 관리 뷰와 구별된다.
+
+## Active-path message history
+
+`GET /v1/conversations/{conversation_id}/messages`는 immutable parent graph 전체가 아니라 `chat_conversation_active_path`의 현재 root-to-leaf projection을 읽는다. `anchor=latest|first`와 `limit=1..100` 또는 응답이 반환한 단일 opaque `cursor`를 사용하며 `anchor`와 `cursor`를 함께 보낼 수 없다. Cursor는 conversation, projection revision, direction, exclusive position을 HMAC으로 묶는다. 정상 page는 항상 root-to-leaf 순서이며 `history_revision`, `has_before`, `has_after`, `before_cursor`, `after_cursor`, `active_leaf_id`를 반환한다. Branch 변경으로 revision이 달라진 cursor는 409 `history_revision_changed`; malformed/tampered/cross-conversation cursor는 422다.
+
+각 message의 `position`은 현재 projection 위치이고, `branch.previous_id`/`branch.next_id`는 같은 parent를 가진 인접 버전 ID다. `PATCH /v1/conversations/{id}/active-leaf` body `{"message_id": id, "descend": true}`는 선택한 sibling에서 이미 존재하는 newest descendant까지 내려간 뒤 active projection을 transactionally 교체한다. Append, completion, retry, regeneration, fork와 branch switch는 conversation lock 아래 immutable graph, `active_leaf_id`, projection을 함께 갱신한다.
 
 ## Native completion
 

@@ -10,8 +10,9 @@ Lumen은 목적과 권한 수준에 따라 3가지 연동 프로필을 제공합
 
 | 프로필 | 주요 용도 | 주요 엔드포인트 | 인증 및 Scope |
 | --- | --- | --- | --- |
-| **OpenAI Compatible** | `model="lumen"`: Lumen 백엔드 durable execution (`chat_default_model`, text-only, tools/memory 비활성화); provider model ID: stateless completion | `POST /v1/chat/completions`<br>`GET /v1/models` | `models:read`<br>`compat:completions:write` (API Key 전용) |
-| **Anthropic Stateless** | Claude 메시지 API 호환, 클라이언트 주도 Tool Call | `POST /v1/messages` | `models:read`<br>`compat:completions:write` (API Key 전용) |
+| **OpenAI Compatible** | `model="lumen"`: Lumen backend durable execution; provider model ID: stateless Chat Completions or Responses | `POST /v1/chat/completions`<br>`POST /v1/responses`<br>`GET /v1/models` | `models:read`<br>`compat:completions:write` (API Key 전용) |
+| **Anthropic Native** | Anthropic SDK와 Claude Code direct API-key Messages request/response/SSE, tool continuation, token counting | `POST /v1/messages`<br>`POST /v1/messages/count_tokens` | `models:read`<br>`compat:completions:write` (ordinary API Key 전용) |
+| **Legacy Lumen Device API** | Lumen custom one-time device grant 뒤 24시간 project-bound credential로 Anthropic-native 호출 | configured `/v1/claude-gateway` base의 OAuth/device, Messages, models, managed settings | Custom device credential 전용; current Claude Apps Gateway login과 호환되지 않음 |
 | **Native Durable** | Afterglow 영속 대화, 서버 관리형 Tool/Skill/Memory, Replay, 승인 및 사용량 추적 | `POST /v1/conversations/{id}/completions`<br>`POST /v1/temp-completions`<br>`GET /v1/runs/{id}/events` | Native least-privilege scope (Keystone Token 또는 Scoped API Key) |
 
 > **선택 기준**: `model="lumen"`은 OpenAI SDK 포맷으로 백엔드 durable worker 실행과 대화하며, 특정 provider model ID 지칭 시 stateless completion 중계로 동작합니다. 대화 이력 영속화, 서버 관리형 도구/스킬/메모리, 중단-승인(Human-in-the-loop) 및 복구가 필요한 경우 Native Durable 프로필을 사용합니다.
@@ -38,6 +39,12 @@ Lumen SDK 및 외부 AI SDK 설정 시 `base_url` 규칙을 엄격히 준수해�
    - `base_url`은 `/v1`이 **없는** Origin 형태여야 합니다. (Client 내부에서 `/v1/*` 엔드포인트를 호출하므로 `/v1`을 덧붙이지 않음)
    - 예: `https://lumen.example.com` 또는 `http://localhost:8012`
 
+
+4. **Codex custom model provider**
+   - `base_url`은 `/v1` 접미사를 포함한 Responses API root여야 합니다.
+   - 예: `https://lumen.example.com/v1`; Codex가 최종적으로 `POST /v1/responses`를 호출합니다.
+   - ordinary Lumen API key를 `env_key`로 전달합니다. Anthropic-only Claude Gateway credential/base는 Codex Responses provider로 사용할 수 없습니다.
+
 ### 2.2 독립형 Compose 네트워크 및 Manifest
 
 독립형 Docker Compose 환경에서는 `lumen-connection` 컨테이너 서비스를 이용해 매니페스트를 조회할 수 있습니다:
@@ -58,12 +65,12 @@ docker compose run --rm --no-deps -T lumen-connection
 
 * `GET /` 및 `GET /v1/`: 인증이 필요 없는 서비스/버전 디스커버리 응답입니다. 각 버전의 `links`에 `rel=self`와 `rel=models`를 제공하며, `rel=models`는 OpenAI 형식 `GET /v1/models`를 가리킵니다. 해당 모델 목록을 조회할 때는 `models:read` scope를 가진 API key가 필요합니다.
 * `GET /v1/compat`: 인증이 필요 없는(Public) 외부 API 디스커버리 엔드포인트입니다.
-  * 지원 포맷 (`openai`, `anthropic`), SDK별 추천 `sdk_base_url`, 모델 목록 경로를 JSON으로 제공합니다.
+  * OpenAI Chat Completions/Responses, Anthropic Messages/count_tokens, Native API, Claude Gateway base/device metadata와 SDK별 `sdk_base_url`을 제공합니다.
 * `GET /openapi.json`: 서버의 런타임 OpenAPI 스펙입니다. 각 엔드포인트별 요구 Scope(`x-required-api-key-scopes`) 및 `ChatRunEvent` 판별 유니온 구조가 기재되어 있습니다.
 
 ### 3.2 Host Gate (CHAT_API_HOSTS)
 
-Lumen 서버 설정에 `CHAT_API_HOSTS`가 설정된 경우(예: `CHAT_API_HOSTS=api.lumen.example`), 허용되지 않은 `Host` 헤더로 들어오는 호환 API 요청(`GET /v1/compat`, `POST /v1/chat/completions`, `POST /v1/messages` 등)은 보안 목적으로 **HTTP 404 (Not Found)**를 반환하여 경로 존재 자체를 은닉합니다.
+Lumen 서버 설정에 `CHAT_API_HOSTS`가 설정된 경우(예: `CHAT_API_HOSTS=api.lumen.example`), 허용되지 않은 `Host` 헤더로 들어오는 호환 API 요청(`GET /v1/compat`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, Claude Gateway 등)은 보안 목적으로 **HTTP 404 (Not Found)**를 반환하여 경로 존재 자체를 은닉합니다.
 
 ---
 
@@ -71,21 +78,21 @@ Lumen 서버 설정에 `CHAT_API_HOSTS`가 설정된 경우(예: `CHAT_API_HOSTS
 
 ### 4.1 인증 헤더 상충 배제 및 엔드포인트별 허용 자격 증명
 
-Lumen 요청 시 다음 3가지 인증 헤더 중 **정확히 1개**만 전달해야 합니다.
+Lumen 요청 시 다음 3가지 인증 헤더 중 **정확히 1개**만 전달해야 합니다. 유일한 예외로 동일한 API key를 `X-API-Key`와 `Authorization: Bearer`에 같이 담아 보내는 것은 허용됩니다(Claude Code 기본 동작).
 
 1. `Authorization: Bearer <API_KEY_OR_TOKEN>` (`sk-afgl-`로 시작하면 API Key, 그 외는 Keystone Token)
 2. `X-API-Key: <API_KEY>`
 3. `X-Auth-Token: <KEYSTONE_TOKEN>` (Keystone 전용)
 
 **엔드포인트별 허용 자격 증명 제약**:
-* **Compat 호환 엔드포인트 (`/v1/models`, `POST /v1/chat/completions`, `POST /v1/messages`)**:
-  - **API Key만 허용**됩니다 (`Authorization: Bearer sk-afgl-...` 또는 `X-API-Key`).
+* **Compat 호환 엔드포인트 (`/v1/models`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, `POST /v1/messages/count_tokens`)**:
+  - **API Key만 허용**됩니다 (`Authorization: Bearer sk-afgl-...` 또는 `X-API-Key`). Claude Gateway base는 device flow가 발급한 `credential_kind="claude_gateway"` key만 허용합니다.
   - Keystone Token (`X-Auth-Token` 또는 Keystone Bearer) 전달 시 **HTTP 401 Unauthorized**를 반환합니다.
 * **Native 엔드포인트 (`/v1/conversations`, `/v1/temp-completions`, `/v1/runs` 등)**:
   - Keystone Token 또는 해당 범위의 Scoped API Key 모두 허용됩니다.
 
 규칙:
-* 한 요청에 2개 이상의 인증 헤더를 동시 전달 시 **HTTP 400 Bad Request** (`"여러 인증 credential을 동시에 보낼 수 없습니다"`).
+* 한 요청에 2개 이상의 인증 헤더를 동시 전달 시 **HTTP 400 Bad Request** (`"여러 인증 credential을 동시에 보낼 수 없습니다"`). 동일한 API key를 `X-API-Key`와 `Authorization: Bearer`에 중복 전달한 경우만 예외이며, 값이 다르면 400입니다.
 * 인증 헤더 누락 시 **HTTP 401 Unauthorized**.
 * `X-Project-Id` 헤더를 함께 전달할 경우, API Key 소유자의 `project_id`와 일치하지 않으면 **HTTP 403 Forbidden**.
 
@@ -101,7 +108,7 @@ API Key 요청 시 필요한 최소 Scope 정의:
 | Scope | 사용 목적 |
 | --- | --- |
 | `models:read` | 모델 목록 조회 (`GET /v1/models`, `GET /v1/chat/models`, `GET /v1/capabilities`) |
-| `compat:completions:write` | Stateless 호환 completion (`POST /v1/chat/completions`, `POST /v1/messages`) |
+| `compat:completions:write` | Stateless 호환 completion (`POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`) |
 | `native:conversations:read` | Native 대화 목록/상세/경로 조회 |
 | `native:conversations:write` | Native 대화 생성/수정/삭제 |
 | `native:runs:read` | Native run 및 이벤트 스트림 조회 (`GET /v1/runs/{id}`, `GET /v1/runs/{id}/events`) |
@@ -130,6 +137,67 @@ API Key 요청 시 필요한 최소 Scope 정의:
    - 발급 성공 응답(201 Created) 객체의 `key` 필드에서만 1회성 평문(`sk-afgl-...`)이 반환됩니다. DB에는 SHA-256 해시만 저장되므로, 이후 `GET /v1/api-keys` 목록 조회나 어떠한 HTTP 엔드포인트에서도 평문 `key`는 절대로 다시 반환되지 않습니다.
 5. **독립형 Standalone Compose 로컬 키 획득**:
    - 독립형 Compose 환경의 시드 키는 모드 `0600` 매니페스트 파일에 저장되며, 오직 `docker compose run --rm --no-deps -T lumen-connection` CLI 명령어로만 확인할 수 있습니다. 생성된 로컬 키를 반환하거나 조회하는 HTTP 엔드포인트는 존재하지 않습니다.
+
+### 4.4 Claude Code direct Anthropic API
+
+Claude Code는 discovery의 Anthropic SDK base와 ordinary Lumen API key를 사용합니다. Current CLI가 `/v1/messages`를 결합하므로 base에 `/v1`을 직접 추가하지 않습니다.
+
+```bash
+export LUMEN_API_KEY="sk-afgl-..."
+export LUMEN_MODEL="provider-model-id"
+export ANTHROPIC_BASE_URL="https://lumen.example"
+export ANTHROPIC_AUTH_TOKEN="$LUMEN_API_KEY"
+export ANTHROPIC_MODEL="$LUMEN_MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$LUMEN_MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$LUMEN_MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$LUMEN_MODEL"
+# 동일 public model ID가 여러 provider에 있을 때만:
+# export ANTHROPIC_CUSTOM_HEADERS="X-Lumen-Provider: provider-id"
+claude
+```
+
+Claude Code 2.1.278의 direct stream과 local `Bash` tool→native `tool_result` continuation을 격리된 실제 CLI process에서 확인했습니다. Lumen은 현재 client의 명시적 `context_management`와 `output_config`, native tool/thinking block, bounded `anthropic-*` protocol-header namespace를 보존합니다. Caller `Authorization`과 `x-api-key`는 provider credential로 전달하지 않습니다.
+
+Configured `/v1/claude-gateway` device routes는 Lumen custom protocol입니다. Current Claude Apps Gateway login은 administrator-managed `forceLoginGatewayUrl`, official `/protocol`, OIDC device authorization, refresh session을 요구하므로 이 custom route를 Claude Code `/login` 대체로 광고하지 않습니다. 기존 grant는 10분, custom credential은 24시간이고 one-time consume·fixed scopes·Redis/MariaDB fail-closed 보안 계약은 그대로 유지됩니다.
+
+### 4.5 Codex CLI direct Responses provider
+
+Codex CLI의 custom provider는 Responses wire만 지원합니다. `~/.codex/config.toml`의 사용자 수준 설정에 다음을 추가합니다. 프로젝트의 `.codex/config.toml`은 provider redirect/auth 설정을 대체하지 않습니다.
+
+```toml
+model_provider = "lumen"
+model = "provider-model-id"
+
+[model_providers.lumen]
+name = "Lumen Responses"
+base_url = "https://lumen.example/v1"
+env_key = "LUMEN_API_KEY"
+wire_api = "responses"
+request_max_retries = 4
+stream_max_retries = 5
+stream_idle_timeout_ms = 300000
+requires_openai_auth = false
+```
+
+`provider-model-id`는 `GET /v1/models`의 공개 ID를 사용합니다. 같은 ID가 여러 provider에 있어 409가 날 수 있으면 provider를 추정하지 말고 해당 provider block에 비밀이 아닌 고정 selector를 추가합니다.
+
+```toml
+http_headers = { "X-Lumen-Provider" = "openai" }
+```
+
+`LUMEN_API_KEY`에는 `models:read`와 `compat:completions:write` scope가 필요합니다. 실제 key를 TOML에 넣지 않습니다.
+
+```bash
+export LUMEN_API_KEY="sk-afgl-..."
+codex --strict-config
+codex exec "Inspect this repository and report one concrete finding"
+```
+
+`wire_api = "chat"`이나 `/v1/chat/completions` URL은 Codex direct provider에서 사용할 수 없습니다. Lumen의 `/v1/responses`가 text, function-call item, JSON Schema tool, `function_call_output`을 포함한 다음 full-input 요청을 native Responses 형태로 전달합니다. Codex HTTP transport는 후속 턴마다 전체 input을 다시 보내므로 Lumen은 `previous_response_id`를 구현하지 않고 stateless 상태를 유지할 수 있습니다. 실제 provider/model도 function calling과 충분한 context window를 지원해야 하며 Lumen은 Codex 도구를 대신 실행하지 않습니다.
+
+Codex의 `prompt_cache_key`는 provider transport로 전달합니다. 로컬 installation/session/turn 식별자가 포함된 `client_metadata`는 Lumen이 호환 입력으로 소비하되 외부 model provider에는 전달하지 않습니다. 알 수 없는 다른 request field는 계속 422로 거부합니다. 모델 catalog가 없을 때 Codex의 metadata fallback 경고는 비치명적이지만, 운영 설정에는 provider가 공개한 정확한 `model_context_window` 또는 검증된 `model_catalog_json`만 사용합니다.
+
+2026-09-20에 설치된 `codex-cli 0.154.0`을 격리된 `CODEX_HOME`, `--strict-config`, bearer API key로 실제 containerized Lumen에 연결했습니다. Text turn이 성공했고 `exec_command` function call이 로컬에서 `CODEX_TOOL_OK`를 출력한 뒤, Codex가 `function_call_output`을 포함한 두 번째 full-input 요청을 보내 `CODEX_TOOL_CONTINUATION_OK`로 완료했습니다. 이 증거는 Lumen API와 synthetic provider의 wire/tool loop를 검증하며 live external model 품질이나 Keystone 배포를 증명하지 않습니다.
 
 ---
 
@@ -210,33 +278,27 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
 
 ### 6.1 지원 필드 범위
 
-* **OpenAI 호환 (`POST /v1/chat/completions`)**:
+* **OpenAI Chat Completions (`POST /v1/chat/completions`)**:
   - `model`: `lumen` virtual model 또는 공개 provider model ID (필수)
   - `provider`: 같은 공개 model ID의 route 충돌을 해소하는 선택적 provider type
   - `messages`: 메시지 목록 (필수)
-  - `stream`: 스트리밍 여부 (기본값 `false`)
-  - `temperature`: 생성 샘플링 온도
-  - `max_tokens`: 최대 생성 토큰 수
-  - `tools`: provider model direct 요청에서만 전달되는 Function calling 도구 정의 목록
-  - `tool_choice`: provider model direct 요청에서만 LiteLLM으로 전달되는 도구 선택 정책
-  - `stream_options`: `{"include_usage": true}` 지정 시 스트리밍 마지막에 토큰 사용량 chunk 반환
-  - `model="lumen"`은 문자열 content의 `system`/`developer`/`user`/`assistant` transcript만 받고 마지막 `user` message를 요구합니다. Caller tools/tool messages/multimodal content는 400으로 거부하며 Lumen memory/extensions/MCP/tool 실행은 이 첫 단계에서 비활성화됩니다.
-* **Anthropic 호환 (`POST /v1/messages`)**:
-  - `model`: 공개 provider model ID (필수)
-  - `provider`: 같은 공개 model ID의 route 충돌을 해소하는 선택적 provider type
-  - `messages`: 메시지 목록 (필수)
-  - `system`: 시스템 프롬프트
-  - `max_tokens`: 최대 생성 토큰 수
-  - `temperature`: 생성 샘플링 온도
-  - `stream`: 스트리밍 여부 (기본값 `false`)
-  - `tools`: 도구 정의 목록
-  - `tool_choice`: 도구 선택 정책 (`auto`, `any`, `none`, `tool(name)`)
-* **추가 필드 처리**: `provider`는 명시적으로 route 선택에 사용합니다. 그 밖의 벤더 전용 추가 파라미터는 요청 검증 단계에서 수용(`extra="allow"`)되지만 내부 동작에는 무시됩니다.
+  - `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`, `stream_options`
+  - `model="lumen"`은 문자열 content의 `system`/`developer`/`user`/`assistant` transcript만 받고 마지막 `user` message를 요구합니다. Caller tools/tool messages/multimodal content는 400으로 거부하며 Lumen memory/extensions/MCP/tool 실행은 비활성화됩니다.
+* **OpenAI Responses (`POST /v1/responses`)**:
+  - `model`, text 또는 item-list `input`, 선택적 `instructions`, `provider`, `stream`, `max_output_tokens`, `temperature`, `tools`, `tool_choice`와 documented stateless options를 받습니다.
+  - `store=true`, `previous_response_id`, `background=true`는 지원하지 않으며 안전한 400 code를 반환합니다. Lumen conversation/history에 Responses 요청이나 결과를 저장하지 않습니다.
+  - Streaming은 Responses-native named SSE event를 유지하고 idle ping은 comment frame입니다. Downstream disconnect는 pending upstream read를 취소하지 않고 background drain합니다.
+* **Anthropic native (`POST /v1/messages`)**:
+  - `model`, `messages`, 필수 양수 `max_tokens`, 선택적 `provider`, `system`, `temperature`, `stream`, `metadata`, `stop_sequences`, `thinking`, `tools`, `tool_choice`, `top_k`, `top_p`, `container`를 받습니다.
+  - `POST /v1/messages/count_tokens`는 동일한 Anthropic input block을 native token-count transport로 전달합니다.
+  - Streaming은 Anthropic event 이름과 body를 유지하고 약 15초 idle마다 `event: ping`을 보냅니다. OpenAI `[DONE]` sentinel로 변환하지 않습니다.
+* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르거나 header가 인식 가능한 `model` provider prefix와 충돌하면 400 `provider_header_conflict`입니다. Request schema에 없는 필드는 422로 거부합니다.
 
-### 6.2 토큰 수 상한 제약 (`max_tokens`)
+### 6.2 Output token budget
 
-* Compat Core 및 Native Provider 출력 모두 `max_tokens` 최대값을 **4096**으로 제한합니다.
-* `model="lumen"`은 0 이하 값을 400으로 거부합니다. Provider model direct 요청은 생략/0을 **4096**으로 해석합니다.
+* OpenAI path에서 token budget을 생략하면 기존 기본값 **4096**을 사용합니다.
+* 클라이언트가 명시한 양수 `max_tokens`/`max_output_tokens`는 4096으로 잘리지 않고 provider/model validation 경계까지 그대로 전달됩니다. 0 이하 값은 request validation 또는 호환 오류로 거부됩니다.
+* Native durable admission의 별도 4096 output cap은 유지되며 compat provider-direct contract와 혼동하지 않습니다.
 
 ---
 
@@ -384,7 +446,7 @@ FastAPI 프레임워크 특성에 따라 HTTP 예외 발생 시 반환되는 JSO
 
 | Status Code | 원인 및 설명 |
 | --- | --- |
-| **400 Bad Request** | 둘 이상의 인증 헤더 동시 사용, SSE 커서 불일치/손상 |
+| **400 Bad Request** | 둘 이상의 인증 헤더 동시 사용(동일 API key를 `X-API-Key`+`Authorization: Bearer`로 중복 전달한 경우는 제외), SSE 커서 불일치/손상 |
 | **401 Unauthorized** | 인증 헤더 누락, 유효하지 않거나 만료된 API Key 또는 Keystone Token |
 | **402 Payment Required** | Native Completion 호출 시 당월 Credit Quota 초과 |
 | **403 Forbidden** | 요청에 필요한 Scope 부족, API Key의 Project ID와 `X-Project-Id` 불일치 |

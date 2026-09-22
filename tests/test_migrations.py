@@ -130,3 +130,29 @@ def test_provider_billing_admin_key_migration_is_registered_and_additive():
     assert statements == [
         "ALTER TABLE llm_providers\n    ADD COLUMN encrypted_billing_admin_key TEXT NULL AFTER encrypted_api_key"
     ]
+
+
+def test_history_path_migration_is_additive_and_indexed():
+    migration = next(item for item in load_manifest() if item.logical_id == "012-chat-history-path")
+    statements = _statements(MIGRATIONS / migration.relative_path)
+
+    assert "ADD COLUMN IF NOT EXISTS history_revision BIGINT NOT NULL DEFAULT 0" in statements[0]
+    assert "ADD COLUMN IF NOT EXISTS history_index_ready BOOLEAN NOT NULL DEFAULT FALSE" in statements[0]
+    assert "CREATE TABLE IF NOT EXISTS chat_conversation_active_path" in statements[1]
+    assert "PRIMARY KEY (conversation_id, position)" in statements[1]
+    assert "UNIQUE (conversation_id, message_id)" in statements[1]
+    assert "ADD INDEX IF NOT EXISTS idx_chat_messages_branch" in statements[2]
+    assert "ADD INDEX IF NOT EXISTS idx_chat_runs_user_message_updated" in statements[3]
+
+
+def test_claude_gateway_migration_reuses_expiring_api_keys():
+    migration = next(item for item in load_manifest() if item.logical_id == "013-claude-gateway-device-auth")
+    statements = _statements(MIGRATIONS / migration.relative_path)
+
+    assert "ADD COLUMN expires_at DATETIME(6) NULL" in statements[0]
+    assert "ADD COLUMN credential_kind VARCHAR(32) NOT NULL DEFAULT 'api_key'" in statements[0]
+    assert "CREATE TABLE chat_gateway_device_grants" in statements[1]
+    assert "issued_api_key_id BIGINT NULL" in statements[1]
+    assert "client_id_hash CHAR(64) NOT NULL" in statements[1]
+    assert "refresh_token" not in statements[1]
+    assert "raw" not in statements[1]

@@ -41,6 +41,10 @@ chat_credit_per_usd = 1000.0
 chat_default_monthly_quota = 100000.0
 chat_stream_enabled = true
 chat_api_hosts = "lumen.example"
+# Claude Code gateway public base must be an origin plus this exact path.
+claude_gateway_base_url = "https://lumen.example/v1/claude-gateway"
+claude_gateway_model = "claude-sonnet-4-6"
+claude_gateway_provider = "anthropic"
 chat_reasoning_effort = "auto"
 # Provider-native server-side compaction. Armed only on routes whose transport
 # forwards `context_management` (Anthropic today) and whose context window is

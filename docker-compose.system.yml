@@ -15,6 +15,7 @@ services:
       - "127.0.0.1:${MARIADB_PORT:-33306}:3306"
     volumes:
       - system-mariadb:/var/lib/mysql
+      - ./tests/fixtures/mariadb-unicode-database.sql:/docker-entrypoint-initdb.d/10-lumen-collation.sql:ro
 
   redis:
     image: redis:7
@@ -57,6 +58,11 @@ services:
       CHAT_API_HOSTS: localhost,127.0.0.1,lumen-api
       CHAT_DEFAULT_MODEL: ${LUMEN_LOCAL_MODEL:-fake-gpt-4}
       CHAT_COMPAT_RUN_TIMEOUT_SECONDS: ${CHAT_COMPAT_RUN_TIMEOUT_SECONDS:-300}
+      CLAUDE_GATEWAY_BASE_URL: http://localhost:${LUMEN_API_PORT:-8012}/v1/claude-gateway
+      FRONTEND_BASE_URL: http://afterglow.example
+      # Keep a recognized adaptive Claude ID so LiteLLM preserves current output_config fields.
+      CLAUDE_GATEWAY_MODEL: ${LUMEN_GATEWAY_MODEL:-claude-sonnet-4-6}
+      CLAUDE_GATEWAY_PROVIDER: ${LUMEN_GATEWAY_PROVIDER:-anthropic}
     depends_on:
       mariadb:
         condition: service_healthy
@@ -141,6 +147,8 @@ services:
       LUMEN_CONNECTION_FILE: /seed/connection.json
       LUMEN_MODEL_NAME: fake-gpt-4
       PYTEST_ADDOPTS: ${SYSTEM_PYTEST_ADDOPTS:-}
+      DATABASE_URL: mysql+aiomysql://lumen:lumen@mariadb:3306/lumen
+      LUMEN_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     depends_on:
       lumen-api:
         condition: service_healthy

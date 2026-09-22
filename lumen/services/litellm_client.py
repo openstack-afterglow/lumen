@@ -12,10 +12,11 @@ litellm 의 로컬 계산(token_counter/cost_per_token)만 쓰는 함수는 네�
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
@@ -496,6 +497,72 @@ async def _guard_subscription_stream(
         if safe_error.code == "subscription_auth_required" and isinstance(fingerprint, str):
             await subscriptions._mark_subscription_credential_rejected(provider_auth, fingerprint)
         raise safe_error from None
+    finally:
+        close = getattr(source, "aclose", None)
+        if callable(close):
+            await close()
+
+
+def _next_sse_block(buffer: str) -> tuple[str, str] | None:
+    boundaries = ((buffer.find("\r\n\r\n"), 4), (buffer.find("\n\n"), 2), (buffer.find("\r\r"), 2))
+    candidates = [(index, width) for index, width in boundaries if index >= 0]
+    if not candidates:
+        return None
+    index, width = min(candidates, key=lambda item: item[0])
+    return buffer[:index], buffer[index + width :]
+
+
+def _anthropic_sse_payload(block: str) -> dict[str, Any] | None:
+    data_lines: list[str] = []
+    for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line.startswith("data:"):
+            continue
+        value = line[5:]
+        data_lines.append(value[1:] if value.startswith(" ") else value)
+    if not data_lines:
+        return None
+    payload = json.loads("\n".join(data_lines))
+    if not isinstance(payload, dict):
+        raise ValueError("Anthropic SSE data must be a JSON object")
+    return payload
+
+
+async def _anthropic_stream_events(source: Any) -> AsyncIterator[Any]:
+    """Normalize LiteLLM's raw native SSE byte chunks into Anthropic event objects."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    buffer = ""
+    saw_bytes = False
+
+    try:
+        async for chunk in source:
+            if isinstance(chunk, (bytes, bytearray, memoryview)):
+                saw_bytes = True
+                buffer += decoder.decode(bytes(chunk), final=False)
+            elif isinstance(chunk, str):
+                buffer += chunk
+            else:
+                if buffer.strip():
+                    raise ValueError("Anthropic stream mixed incomplete SSE data with structured events")
+                yield chunk
+                continue
+
+            while (split := _next_sse_block(buffer)) is not None:
+                block, buffer = split
+                payload = _anthropic_sse_payload(block)
+                if payload is not None:
+                    yield payload
+
+        if saw_bytes:
+            buffer += decoder.decode(b"", final=True)
+        while (split := _next_sse_block(buffer)) is not None:
+            block, buffer = split
+            payload = _anthropic_sse_payload(block)
+            if payload is not None:
+                yield payload
+        if buffer.strip():
+            payload = _anthropic_sse_payload(buffer)
+            if payload is not None:
+                yield payload
     finally:
         close = getattr(source, "aclose", None)
         if callable(close):
@@ -1076,3 +1143,175 @@ async def acompletion_stream(
     params["stream"] = True
     params["stream_options"] = {"include_usage": True}
     return await litellm.acompletion(**params)
+
+
+def _native_protocol_params(
+    *,
+    api_base: str | None,
+    api_key: str | None,
+    custom_llm_provider: str | None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if api_base:
+        params["api_base"] = api_base
+    if api_key:
+        params["api_key"] = api_key
+    if custom_llm_provider:
+        params["custom_llm_provider"] = custom_llm_provider
+    return params
+
+
+async def aresponses(
+    *,
+    model: str,
+    input: str | list[dict],
+    stream: bool,
+    api_base: str | None,
+    api_key: str | None,
+    custom_llm_provider: str | None,
+    provider_auth: ProviderAuthRef | None,
+    include: list[str] | None = None,
+    instructions: str | None = None,
+    max_output_tokens: int | None = None,
+    metadata: dict | None = None,
+    parallel_tool_calls: bool | None = None,
+    prompt_cache_key: str | None = None,
+    reasoning: dict | None = None,
+    temperature: float | None = None,
+    text: dict | None = None,
+    tool_choice: Any = None,
+    tools: list[dict] | None = None,
+    top_p: float | None = None,
+    truncation: str | None = None,
+    user: str | None = None,
+    service_tier: str | None = None,
+    safety_identifier: str | None = None,
+    context_management: list[dict] | None = None,
+) -> Any:
+    """Call LiteLLM's native Responses transport without forwarding arbitrary request keys."""
+    if provider_auth is not None or _requires_subscription_auth(model, custom_llm_provider):
+        raise ProviderSubscriptionError("subscription_protocol_unsupported", 400)
+    import litellm
+
+    params: dict[str, Any] = {
+        "model": model,
+        "input": input,
+        "stream": stream,
+        **_native_protocol_params(
+            api_base=api_base,
+            api_key=api_key,
+            custom_llm_provider=custom_llm_provider,
+        ),
+    }
+    optional = {
+        "include": include,
+        "instructions": instructions,
+        "max_output_tokens": max_output_tokens,
+        "metadata": metadata,
+        "parallel_tool_calls": parallel_tool_calls,
+        "prompt_cache_key": prompt_cache_key,
+        "reasoning": reasoning,
+        "temperature": temperature,
+        "text": text,
+        "tool_choice": tool_choice,
+        "tools": tools,
+        "top_p": top_p,
+        "truncation": truncation,
+        "user": user,
+        "service_tier": service_tier,
+        "safety_identifier": safety_identifier,
+        "context_management": context_management,
+    }
+    params.update({key: value for key, value in optional.items() if value is not None})
+    return await litellm.aresponses(**params)
+
+
+async def aanthropic_messages(
+    *,
+    model: str,
+    messages: list[dict],
+    max_tokens: int,
+    stream: bool,
+    api_base: str | None,
+    api_key: str | None,
+    custom_llm_provider: str | None,
+    provider_auth: ProviderAuthRef | None,
+    system: Any = None,
+    metadata: dict | None = None,
+    stop_sequences: list[str] | None = None,
+    temperature: float | None = None,
+    thinking: dict | None = None,
+    context_management: dict | None = None,
+    tool_choice: dict | None = None,
+    tools: list[dict] | None = None,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    container: dict | None = None,
+    output_config: dict | None = None,
+    anthropic_headers: dict[str, str] | None = None,
+) -> Any:
+    """Call LiteLLM's native Anthropic transport, including Anthropic subscription auth."""
+    import litellm
+
+    fingerprint: str | None = None
+    if provider_auth is not None:
+        from lumen.services.providers import subscriptions
+
+        if provider_auth.get("auth_mode") != "anthropic_subscription" or custom_llm_provider != "anthropic":
+            raise ProviderSubscriptionError("subscription_protocol_unsupported", 400)
+        credential = await subscriptions.resolve_subscription_credential(provider_auth)
+        access_token = credential.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise ProviderSubscriptionError("subscription_auth_required", 502)
+        api_key = access_token
+        api_base = "https://api.anthropic.com"
+        fingerprint = credential.get("_fingerprint") if isinstance(credential.get("_fingerprint"), str) else None
+    elif _requires_subscription_auth(model, custom_llm_provider):
+        raise ProviderSubscriptionError("subscription_auth_required", 502)
+
+    params: dict[str, Any] = {
+        "model": litellm_model_name(model),
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": stream,
+        **_native_protocol_params(
+            api_base=api_base,
+            api_key=api_key,
+            custom_llm_provider=custom_llm_provider,
+        ),
+    }
+    optional = {
+        "system": system,
+        "metadata": metadata,
+        "stop_sequences": stop_sequences,
+        "temperature": temperature,
+        "thinking": thinking,
+        "context_management": context_management,
+        "tool_choice": tool_choice,
+        "tools": tools,
+        "top_k": top_k,
+        "top_p": top_p,
+        "container": container,
+        "output_config": output_config,
+        "extra_headers": anthropic_headers,
+    }
+    params.update({key: value for key, value in optional.items() if value is not None})
+    try:
+        result = await litellm.anthropic.messages.acreate(**params)
+        if stream:
+            source = (
+                _guard_subscription_stream(result, provider_auth, fingerprint) if provider_auth is not None else result
+            )
+            return _anthropic_stream_events(source)
+        return result
+    except ProviderSubscriptionError:
+        raise
+    except BaseException as error:
+        if provider_auth is None:
+            raise
+        safe_error = _subscription_error(error)
+        if safe_error.code == "subscription_auth_required" and fingerprint is not None:
+            from lumen.services.providers import subscriptions
+
+            await subscriptions._mark_subscription_credential_rejected(provider_auth, fingerprint)
+        raise safe_error from None

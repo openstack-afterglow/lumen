@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -878,5 +879,281 @@ def test_process_stack_paused_provider_and_cancellation() -> None:
         assert terminal_detail.get("status") == "canceled", (
             f"Expected canceled status, got {terminal_detail.get('status')}"
         )
+
+    _reset_fake_provider(fake_provider_url)
+
+
+# ============================================================================
+# 8. Responses, Anthropic, and Claude Gateway Device Flow
+# ============================================================================
+
+
+async def _approve_gateway_code_and_seed_anthropic(user_code: str, fake_provider_url: str) -> None:
+    """Use the real DB/service transaction for the approval side of the process flow."""
+    from lumen.db import close_db, init_db
+    from lumen.services import claude_gateway
+    from lumen.services.providers import repository
+
+    init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
+    try:
+        provider = await repository.create_provider(
+            name=f"system-anthropic-{uuid.uuid4().hex}",
+            provider_type="anthropic",
+            api_base=fake_provider_url,
+            api_key="fake-anthropic-key",
+        )
+        await repository.create_model(
+            provider_id=provider["id"],
+            model_name="claude-sonnet-4-6",
+            input_price_per_million="1",
+            output_price_per_million="1",
+        )
+        decision = await claude_gateway.authorize_user_code(
+            user_code=user_code,
+            approve=True,
+            owner_user_id="system-gateway-user",
+            owner_project_id="system-gateway-project",
+        )
+        assert decision == {"status": "approved"}
+    finally:
+        await close_db()
+
+
+def test_process_stack_native_protocols_and_gateway_device_login() -> None:
+    """Exercise native protocol wires and one-time Gateway issuance through real processes."""
+    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    _reset_fake_provider(fake_provider_url)
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    with httpx.Client(base_url=api_base_url, timeout=30.0) as client:
+        response = client.post(
+            "/v1/responses",
+            headers=headers,
+            json={"model": model_name, "input": "native responses system check", "max_output_tokens": 64},
+        )
+        assert response.status_code == 200, response.text
+        response_body = response.json()
+        assert response_body["object"] == "response"
+        assert response_body["status"] == "completed"
+        assert response_body["output"][0]["content"][0]["text"] == "Hello from fake provider!"
+
+        streamed_response = client.post(
+            "/v1/responses",
+            headers=headers,
+            json={"model": model_name, "input": "stream responses system check", "stream": True},
+        )
+        assert streamed_response.status_code == 200, streamed_response.text
+        assert "event: response.created" in streamed_response.text
+        assert "event: response.output_text.delta" in streamed_response.text
+        assert "event: response.completed" in streamed_response.text
+        configured = _configure_fake_provider(fake_provider_url, {"mode": "codex_tool"})
+        assert configured is not None
+        codex_input = [{"role": "user", "content": [{"type": "input_text", "text": "run a shell command"}]}]
+        shell_tool = {
+            "type": "function",
+            "name": "shell",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        }
+        tool_response = client.post(
+            "/v1/responses",
+            headers=headers,
+            json={
+                "model": model_name,
+                "input": codex_input,
+                "stream": True,
+                "tools": [shell_tool],
+                "prompt_cache_key": "system-codex-session",
+                "client_metadata": {"thread_id": "local-only"},
+            },
+        )
+        assert tool_response.status_code == 200, tool_response.text
+        assert "event: response.output_item.done" in tool_response.text
+        assert '"type":"function_call"' in tool_response.text
+        assert '"call_id":"call_codex_1"' in tool_response.text
+        provider_stats = _get_fake_provider_stats(fake_provider_url)
+        assert provider_stats is not None
+        first_codex_call = provider_stats["history"][-1]
+        assert first_codex_call["has_prompt_cache_key"] is True
+        assert first_codex_call["has_client_metadata"] is False
+
+        function_call = {
+            "id": "fc_codex_item",
+            "type": "function_call",
+            "status": "completed",
+            "arguments": json.dumps({"command": "printf CODEX_TOOL_OK"}, separators=(",", ":")),
+            "call_id": "call_codex_1",
+            "name": "shell",
+        }
+        continuation = client.post(
+            "/v1/responses",
+            headers=headers,
+            json={
+                "model": model_name,
+                "input": [
+                    *codex_input,
+                    function_call,
+                    {"type": "function_call_output", "call_id": "call_codex_1", "output": "CODEX_TOOL_OK"},
+                ],
+                "stream": True,
+                "tools": [shell_tool],
+                "prompt_cache_key": "system-codex-session",
+            },
+        )
+        assert continuation.status_code == 200, continuation.text
+        assert "CODEX_TOOL_CONTINUATION_OK" in continuation.text
+        _reset_fake_provider(fake_provider_url)
+
+        device = client.post(
+            "/v1/claude-gateway/oauth/device/code",
+            data={
+                "client_id": "claude-code",
+                "scope": "models:read compat:completions:write",
+            },
+        )
+        assert device.status_code == 200, device.text
+        device_body = device.json()
+        assert device_body["verification_uri"].endswith("/oauth/claude/authorize")
+
+        asyncio.run(_approve_gateway_code_and_seed_anthropic(device_body["user_code"], fake_provider_url))
+        time.sleep(float(device_body["interval"]) + 0.2)
+        token = client.post(
+            "/v1/claude-gateway/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_body["device_code"],
+                "client_id": "claude-code",
+            },
+        )
+        assert token.status_code == 200, token.text
+        token_body = token.json()
+        assert token_body["expires_in"] == 24 * 60 * 60
+        assert "refresh_token" not in token_body
+        gateway_key = token_body["access_token"]
+        gateway_headers = {
+            "Authorization": f"Bearer {gateway_key}",
+            "x-api-key": gateway_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+
+        anthropic = client.post(
+            "/v1/claude-gateway/v1/messages",
+            headers=gateway_headers,
+            json={
+                "model": "client-alias-is-ignored",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "native anthropic system check"}],
+            },
+        )
+        assert anthropic.status_code == 200, anthropic.text
+        assert anthropic.json()["content"] == [{"type": "text", "text": "Hello from fake provider!"}]
+
+        anthropic_stream = client.post(
+            "/v1/claude-gateway/v1/messages",
+            headers=gateway_headers,
+            json={
+                "model": "client-alias-is-ignored",
+                "max_tokens": 128,
+                "stream": True,
+                "messages": [{"role": "user", "content": "stream anthropic system check"}],
+            },
+        )
+        assert anthropic_stream.status_code == 200, anthropic_stream.text
+        assert "event: message_start" in anthropic_stream.text
+        assert "event: content_block_delta" in anthropic_stream.text
+        assert "event: message_stop" in anthropic_stream.text
+        configured = _configure_fake_provider(fake_provider_url, {"mode": "claude_tool"})
+        assert configured is not None
+        bash_tool = {
+            "name": "Bash",
+            "description": "Run a shell command",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["command"],
+            },
+        }
+        claude_messages = [{"role": "user", "content": "run a local command"}]
+        claude_tool_response = client.post(
+            "/v1/claude-gateway/v1/messages",
+            headers={**gateway_headers, "anthropic-beta": "context-management-2025-06-27"},
+            json={
+                "model": "client-alias-is-ignored",
+                "max_tokens": 128,
+                "stream": True,
+                "messages": claude_messages,
+                "tools": [bash_tool],
+                "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+                "output_config": {"effort": "high"},
+            },
+        )
+        assert claude_tool_response.status_code == 200, claude_tool_response.text
+        assert '"type":"tool_use"' in claude_tool_response.text
+        assert '"name":"Bash"' in claude_tool_response.text
+        provider_stats = _get_fake_provider_stats(fake_provider_url)
+        assert provider_stats is not None
+        first_claude_call = provider_stats["history"][-1]
+        assert "context_management" in first_claude_call["request_keys"]
+        assert "output_config" in first_claude_call["request_keys"]
+        assert "anthropic-beta" in first_claude_call["protocol_headers"]
+        assert "anthropic-version" in first_claude_call["protocol_headers"]
+
+        claude_continuation = client.post(
+            "/v1/claude-gateway/v1/messages",
+            headers={**gateway_headers, "anthropic-beta": "context-management-2025-06-27"},
+            json={
+                "model": "client-alias-is-ignored",
+                "max_tokens": 128,
+                "stream": True,
+                "tools": [bash_tool],
+                "messages": [
+                    *claude_messages,
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_fake_1",
+                                "name": "Bash",
+                                "input": {"command": "printf CLAUDE_LOCAL_TOOL_SENTINEL"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_fake_1",
+                                "content": "CLAUDE_LOCAL_TOOL_SENTINEL",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+        assert claude_continuation.status_code == 200, claude_continuation.text
+        assert "CLAUDE_TOOL_CONTINUATION_OK" in claude_continuation.text
+        _reset_fake_provider(fake_provider_url)
+
+        replay = client.post(
+            "/v1/claude-gateway/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_body["device_code"],
+                "client_id": "claude-code",
+            },
+        )
+        assert replay.status_code == 400
+        assert replay.json()["error"] == "invalid_grant"
 
     _reset_fake_provider(fake_provider_url)

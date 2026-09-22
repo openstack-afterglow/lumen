@@ -89,6 +89,13 @@ def _iso(dt) -> str | None:
     return dt.isoformat() if dt else None
 
 
+def _is_expired(value: datetime | None, *, now: datetime | None = None) -> bool:
+    if value is None:
+        return False
+    normalized = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return normalized <= (now or datetime.now(UTC))
+
+
 def _validate_credit_limit(
     val: Decimal | str | float | int | None,
     *,
@@ -244,6 +251,38 @@ def _owner_ceilings(
     return monthly_ceiling, weekly_ceiling
 
 
+def prepare_key_record(
+    user_id: str,
+    project_id: str,
+    name: str,
+    scopes: list[str] | tuple[str, ...],
+    *,
+    expires_at: datetime | None = None,
+    credential_kind: str = "api_key",
+) -> tuple[ChatApiKey, str]:
+    """Build a one-time plaintext credential and its persistable hashed row."""
+    validated_scopes = _valid_scopes(list(scopes))
+    if validated_scopes is None:
+        raise ValueError("API 키 scope가 올바르지 않습니다")
+    if credential_kind not in {"api_key", "claude_gateway"}:
+        raise ValueError("API 키 credential kind가 올바르지 않습니다")
+    raw = _KEY_PREFIX + secrets.token_urlsafe(32)
+    return (
+        ChatApiKey(
+            owner_user_id=user_id,
+            owner_project_id=project_id,
+            name=(name or "").strip()[:100],
+            key_prefix=raw[: len(_KEY_PREFIX) + 4],
+            key_hash=_hash_key(raw),
+            scopes=list(validated_scopes),
+            expires_at=expires_at,
+            credential_kind=credential_kind,
+            is_active=True,
+        ),
+        raw,
+    )
+
+
 async def create_key(
     user_id: str,
     project_id: str,
@@ -253,24 +292,11 @@ async def create_key(
     weekly_credit_limit: Decimal | None = None,
 ) -> dict:
     """새 API 키 발급. 반환 dict 의 `key` 는 평문(1회만 노출) — 이후 조회 불가."""
-    validated_scopes = _valid_scopes(scopes)
-    if validated_scopes is None:
-        raise ValueError("API 키 scope가 올바르지 않습니다")
     monthly = _validate_credit_limit(monthly_credit_limit, label="월")
     weekly = _validate_credit_limit(weekly_credit_limit, label="주간")
-    raw = _KEY_PREFIX + secrets.token_urlsafe(32)
-    key_prefix = raw[: len(_KEY_PREFIX) + 4]  # 예: sk-afgl-AbCd
-    row = ChatApiKey(
-        owner_user_id=user_id,
-        owner_project_id=project_id,
-        name=(name or "").strip()[:100],
-        key_prefix=key_prefix,
-        key_hash=_hash_key(raw),
-        scopes=list(validated_scopes),
-        owner_monthly_credit_limit=monthly,
-        owner_weekly_credit_limit=weekly,
-        is_active=True,
-    )
+    row, raw = prepare_key_record(user_id, project_id, name, scopes)
+    row.owner_monthly_credit_limit = monthly
+    row.owner_weekly_credit_limit = weekly
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
@@ -305,7 +331,11 @@ async def list_keys(user_id: str, project_id: str) -> list[dict]:
                 (
                     await session.execute(
                         select(ChatApiKey)
-                        .where((ChatApiKey.owner_user_id == user_id) & (ChatApiKey.owner_project_id == project_id))
+                        .where(
+                            (ChatApiKey.owner_user_id == user_id)
+                            & (ChatApiKey.owner_project_id == project_id)
+                            & (ChatApiKey.credential_kind == "api_key")
+                        )
                         .order_by(ChatApiKey.id.desc())
                     )
                 )
@@ -534,7 +564,7 @@ async def verify_key(raw: str) -> dict | None:
             row = (
                 await session.execute(select(ChatApiKey).where(ChatApiKey.key_hash == computed))
             ).scalar_one_or_none()
-            if row is None or not row.is_active:
+            if row is None or not row.is_active or _is_expired(row.expires_at):
                 return None
             # 조회는 해시로 했지만 타이밍 안전 비교를 명시(CLAUDE.md §4).
             if not hmac.compare_digest(row.key_hash, computed):
@@ -547,6 +577,8 @@ async def verify_key(raw: str) -> dict | None:
                 "project_id": row.owner_project_id,
                 "api_key_id": row.id,
                 "scopes": scopes,
+                "credential_kind": row.credential_kind,
+                "expires_at": row.expires_at,
             }
             # last_used_at 갱신(best-effort — 실패해도 인증은 성공).
             try:

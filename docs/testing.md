@@ -7,8 +7,8 @@ Lumen의 테스트 시스템은 로컬 개발부터 외부 배포 검증까지 �
 | 계층 (Layer) | 주요 실행 명령 (Primary Command) | Real (실제 구성요소) | Faked (모의 구성요소) | 경계 (Boundary Covered) | 사용 목적 및 비용 (Expected Use & Cost) |
 | --- | --- | --- | --- | --- | --- |
 | **Contract** | `uv run lumen-test contract` | 실제 Python 서비스 로직, in-process ASGI | MariaDB, Redis, 외부 Provider, Keystone | 서비스 비즈니스 로직, API 스키마, SDK 트랜스포트, Ruff 린트 | 빠른 피드백, 커밋 전 기본 검증 (낮은 비용) |
-| **Integration** | `uv run lumen-test integration` | 실제 MariaDB 11, Redis 7, 마이그레이션 | in-process API/직접 worker 실행, 모의 Provider/Keystone | 데이터베이스 영속성, 마이그레이션 적용, 원장(ledger) 및 세션 격리 | 데이터스토어 연동 검증 (중간 비용) |
-| **System** | `uv run lumen-test system` | 컨테이너화된 lumen-api, lumen-worker, MariaDB, Redis, 마이그레이션, 실제 HTTP 소켓 | fake OpenAI HTTP provider, 자동 생성 connection manifest/API key | `/v1/models`, OpenAI 비스트리밍·스트리밍 content/token usage, native Redis wakeup·worker 실행, usage 원장 귀속 | 풀 스택 프로세스 연동 검증 (높은 비용, Docker 필요) |
+| **Integration** | `uv run lumen-test integration` | 실제 MariaDB 11, Redis 7, 마이그레이션 | in-process API/직접 worker 실행, 모의 Provider/Keystone | active-path row/revision/branch fence, Gateway grant→hashed expiring key one-time exchange, durable journal·ledger 및 세션 격리 | 데이터스토어 연동 검증 (중간 비용) |
+| **System** | `uv run lumen-test system` | 컨테이너화된 lumen-api, lumen-worker, MariaDB, Redis, 마이그레이션, 실제 HTTP 소켓 | fake OpenAI/Anthropic/Responses HTTP provider, 자동 생성 connection manifest/API key | Chat Completions, Responses text/function-call/full-input tool continuation, Codex cache/local-metadata boundary, Claude Code-compatible Anthropic fields/headers/native tool continuation, legacy Lumen device issue/poll/token/inference, native worker·Redis wakeup·usage 귀속 | 풀 스택 프로세스 연동 검증 (높은 비용, Docker 필요) |
 | **Deployment** *(외부)* | 외부 CI 파이프라인 (`afterglow`) | 실제 Keystone, OpenStack, Afterglow 공개 API, 실제 배포 클러스터 | 없음 (전체 실제 환경) | 서비스 간 엔드투엔드 통합, 실제 OpenStack 자원 프로비저닝 | 최종 배포/승격 검증 (Lumen 외부 소유, Zuul/DevStack/Tempest 모델) |
 
 ---
@@ -37,6 +37,10 @@ uv run lumen-test integration
 uv run lumen-test system
 ```
 
+### 실제 Codex CLI 확인
+
+Direct Codex provider의 영구 contract는 system gate의 Responses tool-call/full-input 시나리오가 담당합니다. Codex binary 자체는 repository dependency가 아니므로 gate에서 설치하지 않습니다. 2026-09-20에는 별도로 설치된 `codex-cli 0.154.0`을 격리된 `CODEX_HOME`과 `--strict-config`로 containerized Lumen에 연결해 text turn과 `exec_command` → local output → `function_call_output` 후속 turn을 실행했습니다. 정확한 설정과 이 증거의 한계는 [Afterglow 연동 가이드](afterglow-integration.md#45-codex-cli-direct-responses-provider)에 기록합니다.
+
 ### 디버깅을 위한 집중(Focused) pytest 실행
 
 특정 파일이나 마커를 대상으로 빠르게 디버깅할 때는 `pytest`를 직접 호출할 수 있습니다.
@@ -60,6 +64,7 @@ uv run pytest -m "not integration and not system" tests
 
 - **자동 프로젝트 격리**: 각 테스트 실행마다 `lumen-{layer}-{pid}-{hex}` 형태의 고유한 Compose 프로젝트 이름을 생성하여 동시 실행 간의 간섭을 방지합니다.
 - **포트 자동 할당**: MariaDB와 Redis의 호스트 포트를 로컬의 빈 루프백 포트(`MARIADB_PORT`, `REDIS_PORT`)로 자동 동적 할당합니다.
+- **DB collation 회귀 환경**: MariaDB init fixture가 `lumen` database를 `utf8mb4_unicode_ci`로 고정한다. Migration table은 database collation을 상속해야 하며, bare `DEFAULT CHARSET=utf8mb4`가 MariaDB 11에서 다른 default collation으로 해석되어 기존 `CHAR(36)` FK와 충돌하는 회귀를 이 환경에서 검출한다.
 - **자동 정리 (Clean Teardown)**: 테스트 종료 시 성공/실패 여부와 관계없이 `docker compose down -v --remove-orphans`를 수행하여 컨테이너, 네트워크 및 영속 볼륨까지 완전히 정리합니다.
 - **실패 시 로그 자동 수집**: `system` 계층 테스트 실패 시, teardown 직전에 컨테이너 로그(`docker compose logs`)를 자동으로 출력하여 원인을 즉시 파악할 수 있습니다.
 
@@ -121,4 +126,5 @@ OpenStack CI(Zuul/DevStack/Tempest) 관례와 유사하게:
 
 1. **Cross-Service 테스트 규칙**: 다른 서비스(Nova, Neutron, Keystone 등)와의 상호작용 테스트는 반드시 공개 API(Public REST API / OpenStack SDK)를 사용해야 합니다. 타 서비스의 내부 Python 모듈을 import하거나 상대 데이터베이스에 직접 접근하는 것은 금지됩니다.
 2. **Lumen 테스트의 한계 경계**: Lumen 내부의 `system` 테스트는 Provider 및 Keystone 경계(fake provider HTTP / 시드된 인증)에서 멈춥니다. 실제 OpenStack 자원 프로비저닝이나 외부 인프라 연동 시나리오는 배포/Afterglow 리포지토리의 소유 영역입니다.
-3. **테스트 마커 정립**: 데이터스토어 연동 테스트는 `integration` 마커와 `lumen-test` CLI 명령으로 정립됩니다. 오래되었거나 존재하지 않는 `pytest.mark.db` 또는 pgvector 기본 활성화 전제는 사용하지 않습니다.
+3. **Gateway system approval 경계**: system stack은 public device issue/poll/token과 issued Gateway key의 실제 HTTP inference를 검증한다. 승인 단계는 fake Keystone을 만들지 않고 같은 MariaDB에 대한 Lumen `authorize_user_code` transaction을 test container에서 실행한다. Keystone identity와 Afterglow authenticated BFF는 각 저장소의 contract test 소유이며, 이 system 증거는 실제 Keystone/Afterglow deployment 증거가 아니다.
+4. **테스트 마커 정립**: 데이터스토어 연동 테스트는 `integration` 마커와 `lumen-test` CLI 명령으로 정립됩니다. 오래되었거나 존재하지 않는 `pytest.mark.db` 또는 pgvector 기본 활성화 전제는 사용하지 않습니다.

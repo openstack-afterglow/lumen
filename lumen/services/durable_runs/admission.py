@@ -11,6 +11,7 @@ from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
 from lumen.models.chat_contracts import ChatRunDescriptor, validate_user_input_parts
 from lumen.models.chat_db import ChatConversation, ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatRunProvider, ChatTempThread
+from lumen.services.message_graph import append_active_message
 from lumen.services.message_parts import serialize_parts
 from lumen.services.message_timestamps import message_timestamps
 from lumen.services.providers import routing as ps
@@ -294,6 +295,8 @@ async def create_persistent_run(
             if existing.request_fingerprint != fingerprint:
                 raise DurableRunConflict("idempotency_key_reused_with_different_intent")
             return descriptor(existing)
+        if not conversation.history_index_ready:
+            raise DurableRunConflict("history_index_unavailable")
 
         active = (
             await session.execute(
@@ -327,6 +330,12 @@ async def create_persistent_run(
         )
         session.add(user_message)
         await session.flush()
+        await append_active_message(
+            session,
+            conversation_id=conversation_id,
+            parent_id=conversation.active_leaf_id,
+            message_id=user_message.id,
+        )
         conversation.active_leaf_id = user_message.id
 
         canonical_parts = await _canonical_user_parts(session, parts=user_parts, user_id=user_id, project_id=project_id)

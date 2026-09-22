@@ -136,6 +136,9 @@ class Settings(BaseSettings):
     chat_native_compaction_passthrough_enabled: bool = True
     chat_mcp_oauth_callback_url: str = ""
     chat_checkpointer_postgres_url: str = ""
+    claude_gateway_base_url: str = ""
+    claude_gateway_model: str = ""
+    claude_gateway_provider: str = ""
     chat_run_event_retention_hours: int = 24
     chat_checkpoint_retention_days: int = 7
     chat_semantic_memory_enabled: bool = False
@@ -184,6 +187,42 @@ class Settings(BaseSettings):
             return ""
         if not (value.startswith("http://") or value.startswith("https://")):
             raise ValueError("chat_mcp_oauth_callback_url must start with http:// or https://")
+        return value
+
+    @field_validator("claude_gateway_base_url")
+    @classmethod
+    def validate_claude_gateway_base_url(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            return ""
+        try:
+            parsed = urlsplit(value)
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("claude_gateway_base_url must be a valid URL") from exc
+        if (
+            parsed.path != "/v1/claude-gateway"
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or not parsed.netloc
+        ):
+            raise ValueError("claude_gateway_base_url must be an origin plus /v1/claude-gateway")
+        if parsed.scheme != "https" and not is_development_loopback_http_url(value):
+            raise ValueError("claude_gateway_base_url must use HTTPS outside development loopback")
+        return value
+
+    @field_validator("claude_gateway_provider")
+    @classmethod
+    def validate_claude_gateway_provider(cls, value: str) -> str:
+        value = value.strip()
+        if value and (
+            len(value) > 40
+            or not value[0].isalnum()
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in value)
+        ):
+            raise ValueError("claude_gateway_provider is invalid")
         return value
 
     @field_validator("chat_compat_run_timeout_seconds")

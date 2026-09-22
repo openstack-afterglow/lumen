@@ -97,6 +97,17 @@ lumen_sandbox_api_key: ""
 lumen_chat_api_hosts: ""
 lumen_chat_default_model: ""
 lumen_chat_compat_run_timeout_seconds: 300
+lumen_frontend_base_url: ""
+# Left empty on purpose. Deriving this from the public endpoint renders an http
+# URL wherever kolla_enable_tls_external is off, and a doubled slash wherever the
+# operator's endpoint ends in one — both of which the settings validator rejects.
+# get_settings() runs at module scope, so that rejection crashloops the API and
+# worker for an operator who never enabled the gateway. Discovery already
+# backfills the origin and configured_base_url() returns a clean 503 while unset,
+# so an explicit HTTPS value is the only thing worth setting here.
+lumen_claude_gateway_base_url: ""
+lumen_claude_gateway_model: ""
+lumen_claude_gateway_provider: ""
 
 lumen_service_environments:
   lumen-api:

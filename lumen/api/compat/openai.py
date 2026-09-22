@@ -12,7 +12,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -194,6 +194,10 @@ def models_list(models: list[dict], include_lumen: bool = False) -> dict:
     }
 
 
+def _selected_provider(model: str, body_provider: str | None, header_provider: str | None) -> str | None:
+    return core.select_api_provider(model, body_provider, header_provider)
+
+
 # ── 엔드포인트 ──────────────────────────────────────────────────────────────
 def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
@@ -207,14 +211,27 @@ def _sse(obj: dict) -> str:
 async def chat_completions(
     request: Request,
     body: OpenAIChatRequest,
+    x_lumen_provider: str | None = Header(
+        default=None,
+        alias="X-Lumen-Provider",
+        min_length=1,
+        max_length=40,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    ),
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
+    if body.max_tokens is not None and body.max_tokens <= 0:
+        return openai_error_response(400, "max_tokens must be positive", code="invalid_max_tokens")
     user_id, project_id = token_info["user_id"], token_info["project_id"]
     api_key_id = token_info.get("api_key_id")
-    source = token_info.get("source", "api")
+    source = str(token_info.get("source") or "api")
+    try:
+        selected_provider = _selected_provider(body.model, body.provider, x_lumen_provider)
+    except core.CompletionError as exc:
+        return openai_error_response(exc.status_code, exc.message)
 
     if openai_compat.is_lumen_virtual_model(body.model):
-        if body.provider is not None:
+        if selected_provider is not None:
             return openai_error_response(
                 400,
                 "provider is not supported for model=lumen",
@@ -283,7 +300,7 @@ async def chat_completions(
         )
 
     try:
-        resolved = await core.resolve_api(body.model, provider=body.provider)
+        resolved = await core.resolve_api(body.model, provider=selected_provider)
         await core.precheck(user_id, project_id, api_key_id=api_key_id)
     except core.CompletionError as exc:
         return openai_error_response(exc.status_code, exc.message)
@@ -340,10 +357,22 @@ async def chat_completions(
     response_model=OpenAIModelListResponse,
     openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
 )
-async def list_models(token_info: dict = Depends(require_api_key_scopes("models:read"))):
+async def list_models(
+    x_lumen_provider: str | None = Header(
+        default=None,
+        alias="X-Lumen-Provider",
+        min_length=1,
+        max_length=40,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    ),
+    token_info: dict = Depends(require_api_key_scopes("models:read")),
+):
+    del token_info
     try:
         models = await routing.list_api_models()
     except errors.ChatStorageUnavailable:
         models = []
-    include_lumen = await openai_compat.is_virtual_model_active(models)
+    if x_lumen_provider is not None:
+        models = [model for model in models if model.get("api_provider") == x_lumen_provider]
+    include_lumen = x_lumen_provider is None and await openai_compat.is_virtual_model_active(models)
     return models_list(models, include_lumen=include_lumen)

@@ -47,6 +47,9 @@ chat_sandbox_api_key = "sandbox-api-key"
 chat_api_hosts = "api.lumen.example.com"
 chat_default_model = "gpt-4.1-mini"
 chat_compat_run_timeout_seconds = 600
+claude_gateway_base_url = "https://api.lumen.example.com/v1/claude-gateway"
+claude_gateway_model = "claude-sonnet-4-6"
+claude_gateway_provider = "anthropic"
 """
     config_file.write_text(toml_content, encoding="utf-8")
 
@@ -72,6 +75,9 @@ chat_compat_run_timeout_seconds = 600
     assert raw["chat_api_hosts"] == "api.lumen.example.com"
     assert raw["chat_default_model"] == "gpt-4.1-mini"
     assert raw["chat_compat_run_timeout_seconds"] == 600
+    assert raw["claude_gateway_base_url"] == "https://api.lumen.example.com/v1/claude-gateway"
+    assert raw["claude_gateway_model"] == "claude-sonnet-4-6"
+    assert raw["claude_gateway_provider"] == "anthropic"
 
     settings = get_settings()
     assert settings.keystone_auth_url == "http://10.0.0.10:5000/v3"
@@ -87,6 +93,9 @@ chat_compat_run_timeout_seconds = 600
     assert settings.chat_api_hosts == "api.lumen.example.com"
     assert settings.chat_default_model == "gpt-4.1-mini"
     assert settings.chat_compat_run_timeout_seconds == 600
+    assert settings.claude_gateway_base_url == "https://api.lumen.example.com/v1/claude-gateway"
+    assert settings.claude_gateway_model == "claude-sonnet-4-6"
+    assert settings.claude_gateway_provider == "anthropic"
 
 
 def test_lumen_environment_variable_overrides(monkeypatch):
@@ -111,6 +120,9 @@ def test_lumen_environment_variable_overrides(monkeypatch):
     monkeypatch.setenv("MCP_CONTROL_PLANE_URL", "https://afterglow.internal")
     monkeypatch.setenv("LUMEN_MCP_SERVICE_TOKEN", "lumen-bridge-secret")
 
+    monkeypatch.setenv("CLAUDE_GATEWAY_BASE_URL", "https://env.lumen.example.com/v1/claude-gateway")
+    monkeypatch.setenv("CLAUDE_GATEWAY_MODEL", "claude-opus-4-6")
+    monkeypatch.setenv("CLAUDE_GATEWAY_PROVIDER", "anthropic")
     load_raw_toml.cache_clear()
     get_settings.cache_clear()
 
@@ -133,6 +145,9 @@ def test_lumen_environment_variable_overrides(monkeypatch):
     assert settings.chat_api_hosts == "env.lumen.example.com"
     assert settings.mcp_control_plane_url == "https://afterglow.internal"
     assert settings.lumen_mcp_service_token == "lumen-bridge-secret"
+    assert settings.claude_gateway_base_url == "https://env.lumen.example.com/v1/claude-gateway"
+    assert settings.claude_gateway_model == "claude-opus-4-6"
+    assert settings.claude_gateway_provider == "anthropic"
 
 
 def test_lumen_empty_environment_value_falls_back_to_toml(monkeypatch):
@@ -144,6 +159,17 @@ def test_lumen_empty_environment_value_falls_back_to_toml(monkeypatch):
             assert get_settings().keystone_auth_url == "https://keystone.example.test/v3"
         finally:
             get_settings.cache_clear()
+
+
+def test_claude_gateway_base_url_rejects_wrong_path_and_insecure_public_origin():
+    with pytest.raises(ValueError, match="origin plus /v1/claude-gateway"):
+        Settings(claude_gateway_base_url="https://lumen.example/v1")
+    with pytest.raises(ValueError, match="HTTPS"):
+        Settings(claude_gateway_base_url="http://lumen.example/v1/claude-gateway")
+    assert (
+        Settings(claude_gateway_base_url="http://127.0.0.1:8012/v1/claude-gateway").claude_gateway_base_url
+        == "http://127.0.0.1:8012/v1/claude-gateway"
+    )
 
 
 def test_lumen_maps_afterglow_openstack_section(monkeypatch):

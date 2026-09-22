@@ -39,14 +39,14 @@ JSON_METHOD_TABLE = [
         {"workspace_id": 5},
         None,
     ),
-    ("list_messages", ("conv-1",), {}, "GET", "/v1/conversations/conv-1/messages", None, None),
+    ("list_message_page", ("conv-1",), {"anchor": "latest"}, "GET", "/v1/conversations/conv-1/messages", None, {"anchor": "latest"}),
     (
         "set_active_leaf",
         ("conv-1",),
-        {"leaf_id": 12},
+        {"message_id": 12, "descend": True},
         "PATCH",
         "/v1/conversations/conv-1/active-leaf",
-        {"leaf_id": 12},
+        {"message_id": 12, "descend": True},
         None,
     ),
     (

@@ -172,10 +172,12 @@ from lumen.api import (
     chat_stats_router,
     chat_usage_router,
     chat_workspaces_router,
+    claude_gateway,
 )
 from lumen.api.compat import anthropic as compat_anthropic
 from lumen.api.compat import discovery as compat_discovery
 from lumen.api.compat import openai as compat_openai
+from lumen.api.compat import responses as compat_responses
 from lumen.auth import require_chat_api_host
 
 # Chat routers already declare their complete route paths. Mount once at `/v1`
@@ -205,8 +207,24 @@ for router, tag in (
     (compat_discovery.router, "AI Compat Discovery"),
     (compat_openai.router, "OpenAI Compat"),
     (compat_anthropic.router, "Anthropic Compat"),
+    (compat_responses.router, "OpenAI Responses Compat"),
 ):
     app.include_router(router, prefix="/v1", tags=[tag], dependencies=[Depends(require_chat_api_host)])
+
+# Claude Code's public machine protocol is host-gated with the other direct
+# compatibility APIs. The Keystone-only browser authorization handoff is
+# intentionally mounted without that public-host dependency for the internal BFF.
+app.include_router(
+    claude_gateway.public_router,
+    prefix="/v1/claude-gateway",
+    tags=["Claude Gateway"],
+    dependencies=[Depends(require_chat_api_host)],
+)
+app.include_router(
+    claude_gateway.internal_router,
+    prefix="/v1/claude-gateway",
+    tags=["Claude Gateway Authorization"],
+)
 
 
 def custom_openapi() -> dict:
@@ -220,8 +238,10 @@ def custom_openapi() -> dict:
     schema["x-profiles"] = {
         "openai_lumen": "OpenAI-compatible Lumen durable completion (/v1/chat/completions, model='lumen')",
         "openai_stateless": "OpenAI-compatible stateless provider completion (/v1/chat/completions, provider model IDs)",
+        "openai_responses": "OpenAI Responses-compatible stateless completion (/v1/responses)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
         "lumen_native": "Lumen native durable runs (/v1/conversations/{conversation_id}/completions, /v1/temp-completions, /v1/runs/...)",
+        "claude_gateway": "Claude Code device-authenticated Anthropic gateway (/v1/claude-gateway)",
     }
 
     security_schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
@@ -243,13 +263,29 @@ def custom_openapi() -> dict:
         "description": "API key header (x-api-key: <key>)",
     }
     api_key_security = [{"APIKeyBearer": []}, {"XApiKey": []}]
-    for path, method in (("/v1/chat/completions", "post"), ("/v1/messages", "post"), ("/v1/models", "get")):
+    for path, method in (
+        ("/v1/chat/completions", "post"),
+        ("/v1/responses", "post"),
+        ("/v1/messages", "post"),
+        ("/v1/messages/count_tokens", "post"),
+        ("/v1/models", "get"),
+        ("/v1/claude-gateway/v1/messages", "post"),
+        ("/v1/claude-gateway/v1/messages/count_tokens", "post"),
+        ("/v1/claude-gateway/v1/models", "get"),
+        ("/v1/claude-gateway/v1/managed-settings", "get"),
+    ):
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             schema["paths"][path][method]["security"] = api_key_security
 
     route_scopes: dict[tuple[str, str], list[str]] = {
         ("/v1/chat/completions", "post"): ["compat:completions:write"],
+        ("/v1/responses", "post"): ["compat:completions:write"],
         ("/v1/messages", "post"): ["compat:completions:write"],
+        ("/v1/messages/count_tokens", "post"): ["compat:completions:write"],
+        ("/v1/claude-gateway/v1/messages", "post"): ["compat:completions:write"],
+        ("/v1/claude-gateway/v1/messages/count_tokens", "post"): ["compat:completions:write"],
+        ("/v1/claude-gateway/v1/models", "get"): ["models:read"],
+        ("/v1/claude-gateway/v1/managed-settings", "get"): ["models:read"],
         ("/v1/models", "get"): ["models:read"],
         ("/v1/chat/models", "get"): ["models:read"],
         ("/v1/capabilities", "get"): ["models:read"],
@@ -309,7 +345,9 @@ def custom_openapi() -> dict:
                 op["x-conditional-api-key-scopes"] = conditional_scopes
     sse_routes = [
         ("/v1/chat/completions", "post", "OpenAI SSE stream (data: JSON \\n\\n data: [DONE])"),
+        ("/v1/responses", "post", "OpenAI Responses semantic SSE events"),
         ("/v1/messages", "post", "Anthropic SSE stream (event: <type> \\n data: JSON)"),
+        ("/v1/claude-gateway/v1/messages", "post", "Anthropic SSE stream (event: <type> \\n data: JSON)"),
         ("/v1/runs/{run_id}/events", "get", "Native ChatRunEvent journal stream"),
     ]
     for path, method, stream_desc in sse_routes:
