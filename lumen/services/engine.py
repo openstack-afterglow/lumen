@@ -45,10 +45,12 @@ async def stream(
     allowed_direct_effects: tuple[str, ...] | None = None,
     lumen_snapshot: dict[str, object] | None = None,
     lumen_snapshot_frozen: bool = False,
+    native_compaction_options: dict | None = None,
     resume: list[dict[str, str]] | None = None,
 ) -> AsyncIterator[dict]:
     async for ev in graph.stream(
         model=model,
+        native_compaction_options=native_compaction_options,
         messages=messages,
         project_id=project_id,
         user_id=user_id,

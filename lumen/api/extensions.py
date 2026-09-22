@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from lumen.auth import get_principal, require_admin, require_scopes
 from lumen.services import extensions_store as es
-from lumen.services import mcp_oauth
+from lumen.services import mcp_bundles, mcp_oauth
 
 admin_router = APIRouter(dependencies=[Depends(require_admin)])
 user_router = APIRouter()
@@ -104,6 +104,31 @@ _EXC = (
 # ---------------------------------------------------------------------------
 # 관리자 (global)
 # ---------------------------------------------------------------------------
+@admin_router.get("/admin/mcp-bundles")
+async def admin_list_mcp_bundles():
+    """List the built-in remote connector presets and whether each is installed."""
+    try:
+        return await mcp_bundles.catalog()
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@admin_router.post("/admin/mcp-bundles/{slug}/install")
+async def admin_install_mcp_bundle(slug: str):
+    """Materialize one built-in bundle as a global MCP source.
+
+    Idempotent by destination: a second call returns the existing row untouched
+    rather than rewriting it, because rewriting bumps ``config_version`` and
+    revokes every user's OAuth connection to that server.
+    """
+    try:
+        return await mcp_bundles.install(slug)
+    except mcp_bundles.McpBundleError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
 @admin_router.get("/admin/mcp-servers")
 async def admin_list_mcp():
     try:

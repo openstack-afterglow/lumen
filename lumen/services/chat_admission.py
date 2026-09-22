@@ -320,6 +320,10 @@ async def _resolve_extension_selection(
             selected_ids = explicit_ids
         if selected_ids == []:
             return []
+        # A selection nobody spelled out is "whatever is visible", which now
+        # includes administrator-installed connector bundles. An unconnected
+        # OAuth connector must not be frozen into such a selection.
+        implicit_selection = selected_ids is None
         try:
             visible = await es.list_for_user(kind, user_id=user_id, project_id=project_id, active_only=True)
             if selected_ids is None:
@@ -357,7 +361,17 @@ async def _resolve_extension_selection(
                 selected_item["description"] = str(item.get("description") or item.get("name") or "Custom HTTP tool")
                 selected_item["params_schema"] = item.get("params_schema")
             if kind == "mcp":
-                selected_item["credential_version"] = credential_versions.get(item_id, 0)
+                # ``None`` here means exactly one thing: an OAuth-gated server
+                # with no usable connection for this owner. Freezing it would
+                # make the worker's re-validation reject it and surface a
+                # "credential changed or was revoked" warning on every single
+                # run, which is wrong for a connector the caller never chose.
+                # An explicitly selected one still warns — that request asked
+                # for a server it cannot reach.
+                credential_version = credential_versions.get(item_id, 0)
+                if credential_version is None and implicit_selection:
+                    continue
+                selected_item["credential_version"] = credential_version
             selected.append(selected_item)
         return selected
 

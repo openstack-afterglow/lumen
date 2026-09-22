@@ -9,10 +9,20 @@ from typing import Any
 
 from sqlalchemy import select
 
+from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_db import ChatConversation, ChatMessage, ChatUsageLog
 from lumen.models.chat_runs import ChatRun, ChatRunSegment, ChatRunTurn, ChatTempThread
-from lumen.services import assets, context_manager, context_store, credit, engine, extensions_store, litellm_client
+from lumen.services import (
+    assets,
+    context_manager,
+    context_store,
+    credit,
+    engine,
+    extensions_store,
+    litellm_client,
+    native_compaction,
+)
 from lumen.services import conversation_store as cs
 from lumen.services.litellm_client import UsageCost
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
@@ -1440,6 +1450,34 @@ def _native_web_search_options(capability_snapshot: dict[str, Any]) -> dict[str,
     return native_options
 
 
+def _route_context_limit(capability_snapshot: dict[str, Any]) -> object:
+    """Read the frozen route window using the same accessor as the context fence."""
+    route_capabilities = capability_snapshot.get("capabilities")
+    if not isinstance(route_capabilities, dict):
+        route_capabilities = capability_snapshot
+    return route_capabilities.get("context_limit")
+
+
+def _native_compaction_options(capability_snapshot: dict[str, Any], resolved: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve provider-native compaction for this route, or None when unavailable.
+
+    This layers under, not over, the Lumen context fence in ``prepare_context``.
+    That fence measures against ``input_budget`` (window minus output and safety
+    reserves) and so trips at a lower absolute token count than a native trigger
+    resolved against the raw window, which keeps Lumen's durable summary the
+    primary mechanism.  The native edit only covers what the fence structurally
+    cannot: growth inside a single provider request, and rounds where the
+    summary route is unavailable and the fence skips itself.
+    """
+    if not get_settings().chat_native_compaction_enabled:
+        return None
+    return native_compaction.compaction_options(
+        provider_type=resolved.get("provider_type"),
+        context_limit=_route_context_limit(capability_snapshot),
+        ratio=context_manager.COMPACTION_REQUIRED,
+    )
+
+
 async def execute_queued_run(run_id: str, *, owner: str) -> bool:
     """Claim one queued run and stream its normalized engine output into the journal."""
     factory = _factory()
@@ -1752,6 +1790,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             raise DurableRunError("requested model configuration is unavailable")
         managed_search, managed_fetch, managed_advisor = await _managed_tool_configs(payload, capability_snapshot)
         native_web_search = _native_web_search_options(capability_snapshot)
+        native_compaction_options = _native_compaction_options(capability_snapshot, resolved)
         extension_snapshot = payload.get("extension_snapshot")
         if extension_snapshot is None:
             selected_tool_ids = _selected_tool_ids(payload.get("features"))
@@ -1845,6 +1884,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             managed_fetch=managed_fetch,
             managed_advisor=managed_advisor,
             native_web_search=native_web_search,
+            native_compaction_options=native_compaction_options,
             run_id=run_id,
             execution_hooks=execution_hooks,
             execution_protocol_version=run.execution_protocol_version,

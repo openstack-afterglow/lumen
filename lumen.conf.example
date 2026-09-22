@@ -42,6 +42,11 @@ chat_default_monthly_quota = 100000.0
 chat_stream_enabled = true
 chat_api_hosts = "lumen.example"
 chat_reasoning_effort = "auto"
+# Provider-native server-side compaction. Armed only on routes whose transport
+# forwards `context_management` (Anthropic today) and whose context window is
+# large enough to express the threshold above the provider's 50,000-token floor.
+# Lumen's own durable compaction runs regardless of this switch.
+chat_native_compaction_enabled = true
 chat_run_event_retention_hours = 24
 chat_checkpoint_retention_days = 7
 # v2 durable protocol을 사용할 때만 encrypted PostgreSQL checkpointer URL을 설정한다.

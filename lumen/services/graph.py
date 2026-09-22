@@ -27,7 +27,7 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from lumen.services import agent_runtime_v2, litellm_client
+from lumen.services import agent_runtime_v2, litellm_client, native_compaction
 from lumen.services.checkpointer import chat_checkpointer
 from lumen.services.providers.errors import ProviderSubscriptionError
 from lumen.services.tool_runtime import bindings, contracts, dispatch, selection
@@ -87,6 +87,9 @@ class ChatState(TypedDict, total=False):
     citations: list[dict]
     usage: dict[str, int]
     tool_usage: list[dict[str, object]]
+    # Provider-native compaction head for this run, carried across every later
+    # round so the compacted prefix is never re-sent.
+    compaction_blocks: list[dict]
     model_failed: bool
 
 
@@ -357,8 +360,38 @@ def _usage_pt_ct(usage) -> tuple[int, int] | None:
         return None
 
 
-def _assistant_tool_calls_msg(content: str, tool_calls: list[dict]) -> dict:
-    return {
+def _compaction_blocks(chunk, delta) -> list[dict]:
+    """Read provider-native compaction blocks off one streamed chunk.
+
+    LiteLLM accumulates the blocks it has seen so far and re-publishes the whole
+    list on every chunk that carries one, so the last non-empty read wins rather
+    than being appended to.
+    """
+    for carrier in (_get(delta, "provider_specific_fields"), _get(chunk, "provider_specific_fields")):
+        blocks = native_compaction.sanitize_blocks(_get(carrier, "compaction_blocks"))
+        if blocks:
+            return blocks
+    return []
+
+
+def _assistant_msg(content: str, *, compaction_blocks: list[dict] | None = None) -> dict:
+    """Build a plain assistant turn, preserving any provider compaction head.
+
+    The compaction block replaces every earlier block for the provider, so a
+    rebuilt turn that omits it silently re-sends the full history and pays for
+    the same compaction again.
+    """
+    message: dict = {"role": "assistant", "content": content}
+    provider_fields = native_compaction.assistant_provider_fields(compaction_blocks or [])
+    if provider_fields is not None:
+        message["provider_specific_fields"] = provider_fields
+    return message
+
+
+def _assistant_tool_calls_msg(
+    content: str, tool_calls: list[dict], *, compaction_blocks: list[dict] | None = None
+) -> dict:
+    message: dict = {
         "role": "assistant",
         "content": content or None,
         "tool_calls": [
@@ -370,6 +403,10 @@ def _assistant_tool_calls_msg(content: str, tool_calls: list[dict]) -> dict:
             for tool_call in tool_calls
         ],
     }
+    provider_fields = native_compaction.assistant_provider_fields(compaction_blocks or [])
+    if provider_fields is not None:
+        message["provider_specific_fields"] = provider_fields
+    return message
 
 
 def _v2_tool_schemas(bindings: dict[str, object]) -> list[dict]:
@@ -542,6 +579,11 @@ def _build_graph(params: dict, ctx: ToolContext):
                 provider_extra = {"reasoning_effort": "none"} if disable_reasoning else {}
                 if params.get("response_format") is not None:
                     provider_extra["response_format"] = params["response_format"]
+                # Provider-native compaction. The route resolves the absolute
+                # trigger up front; an unsupported transport resolves to None so
+                # the parameter is never sent where LiteLLM would drop it.
+                if params.get("native_compaction") is not None:
+                    provider_extra["context_management"] = params["native_compaction"]
                 return (
                     await litellm_client.acompletion_stream(
                         model=params["model"],
@@ -642,14 +684,21 @@ def _build_graph(params: dict, ctx: ToolContext):
                 max(0, int(replay_usage.get("prompt_tokens", 0))),
                 max(0, int(replay_usage.get("completion_tokens", 0))),
             )
+            # A replayed turn must carry the same compaction head the live turn
+            # produced, or the resumed run re-sends the uncompacted prefix.
+            round_compaction_blocks = native_compaction.sanitize_blocks(replay_payload.get("compaction_blocks"))
         else:
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             tool_acc: dict[int, dict] = {}
             final_usage = None
+            round_compaction_blocks: list[dict] = []
             try:
                 async for chunk in response:
                     delta = _delta(chunk)
+                    streamed_compaction = _compaction_blocks(chunk, delta)
+                    if streamed_compaction:
+                        round_compaction_blocks = streamed_compaction
                     if delta is not None:
                         reasoning = _delta_reasoning(delta)
                         if reasoning:
@@ -713,6 +762,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                     "tool_calls": tool_calls,
                     "citations": list(citations_by_url.values()),
                     "usage": {"prompt_tokens": round_usage[0], "completion_tokens": round_usage[1]},
+                    "compaction_blocks": round_compaction_blocks,
                 },
             )
 
@@ -721,15 +771,23 @@ def _build_graph(params: dict, ctx: ToolContext):
             "prompt_tokens": int(previous_usage.get("prompt_tokens", 0)) + round_usage[0],
             "completion_tokens": int(previous_usage.get("completion_tokens", 0)) + round_usage[1],
         }
+        # Compaction accumulates for the lifetime of a run: once the provider has
+        # compacted, every later round has to keep carrying that head.
+        carried_compaction = native_compaction.sanitize_blocks(
+            round_compaction_blocks or state.get("compaction_blocks")
+        )
         next_messages = messages
         if tool_calls:
-            next_messages = messages + [_assistant_tool_calls_msg(response_text, tool_calls)]
+            next_messages = messages + [
+                _assistant_tool_calls_msg(response_text, tool_calls, compaction_blocks=carried_compaction)
+            ]
         return {
             "messages": next_messages,
             "pending_tool_calls": tool_calls,
             "final_text": response_text,
             "citations": list(citations_by_url.values()),
             "usage": total_usage,
+            "compaction_blocks": carried_compaction,
             "model_turn_count": model_turn_count + 1,
             "model_failed": False,
         }
@@ -1280,7 +1338,15 @@ def _build_graph(params: dict, ctx: ToolContext):
         if state.get("tool_usage"):
             usage_event["tool_usage"] = state["tool_usage"]
         writer(usage_event)
-        return {"messages": state["messages"] + [{"role": "assistant", "content": state.get("final_text", "")}]}
+        return {
+            "messages": state["messages"]
+            + [
+                _assistant_msg(
+                    state.get("final_text", ""),
+                    compaction_blocks=native_compaction.sanitize_blocks(state.get("compaction_blocks")),
+                )
+            ]
+        }
 
     builder = StateGraph(ChatState)
     builder.add_node("call_model", call_model)
@@ -1334,11 +1400,13 @@ async def stream(
     allowed_direct_effects: tuple[str, ...] | None = None,
     lumen_snapshot: dict[str, object] | None = None,
     lumen_snapshot_frozen: bool = False,
+    native_compaction_options: dict[str, Any] | None = None,
     resume: list[dict[str, str]] | None = None,
 ) -> AsyncIterator[dict]:
     """Stream chat events while awaiting durable execution-boundary hooks."""
     params = {
         "model": model,
+        "native_compaction": native_compaction_options,
         "custom_llm_provider": custom_llm_provider,
         "api_base": api_base,
         "api_key": api_key,

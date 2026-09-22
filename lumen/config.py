@@ -125,6 +125,10 @@ class Settings(BaseSettings):
     chat_stream_enabled: bool = True
     chat_api_hosts: str = ""
     chat_reasoning_effort: str = "auto"
+    # Provider-native server-side compaction, armed only on transports whose
+    # pinned LiteLLM chat config actually forwards `context_management`.
+    # Turning this off leaves Lumen's own durable compaction untouched.
+    chat_native_compaction_enabled: bool = True
     chat_mcp_oauth_callback_url: str = ""
     chat_checkpointer_postgres_url: str = ""
     chat_run_event_retention_hours: int = 24
