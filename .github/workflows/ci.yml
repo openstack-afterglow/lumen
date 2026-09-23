@@ -45,6 +45,11 @@ permissions:
 jobs:
   service:
     name: Service tests
+    # Explicit status function: the caller's `test` job needs a `dedup` job that
+    # is skipped outside PRs, and an implicit success() may treat a skipped
+    # ancestor as a reason to skip (actions/runner#2205). No job here has
+    # `needs`, so this cannot hide a failure.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -69,6 +74,7 @@ jobs:
 
   sdk:
     name: SDK tests and lint
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -89,6 +95,7 @@ jobs:
 
   kolla:
     name: Kolla packaging and asset tests
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -106,6 +113,7 @@ jobs:
 
   integration:
     name: Datastore integration
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     services:
       mariadb:
@@ -118,13 +126,13 @@ jobs:
         ports: ["3306:3306"]
         options: >-
           --health-cmd "healthcheck.sh --connect --innodb_initialized"
-          --health-interval 2s --health-timeout 5s --health-retries 30 --health-start-period 5s
+          --health-interval 2s --health-timeout 5s --health-retries 50 --health-start-period 5s
       redis:
         image: redis:7
         ports: ["6379:6379"]
         options: >-
           --health-cmd "redis-cli ping"
-          --health-interval 2s --health-timeout 5s --health-retries 30 --health-start-period 5s
+          --health-interval 2s --health-timeout 5s --health-retries 50 --health-start-period 5s
     env:
       DATABASE_URL: mysql+aiomysql://lumen:lumen@127.0.0.1:3306/lumen
       REDIS_URL: redis://127.0.0.1:6379/0
@@ -151,6 +159,7 @@ jobs:
 
   system:
     name: Process-system integration
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

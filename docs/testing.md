@@ -90,9 +90,10 @@ uv run pytest -m "not integration and not system" tests
 ## CI 게이트 및 재사용 가능한 워크플로우
 
 Lumen GitHub Actions CI (`.github/workflows/ci.yml`)는 재사용 워크플로우다. 트리거는 `workflow_call`과 `workflow_dispatch`뿐이고 직접 push/PR trigger는 없다.
-- `main`/`dev` push·PR과 `v*` tag에서는 `.github/workflows/docker-build.yml`의 `test` job이 이 워크플로우를 한 번 호출한다.
+- `main`/`dev` push·PR과 `v*` tag에서는 `.github/workflows/docker-build.yml`의 `test` job이 이 워크플로우를 한 번 호출한다. `main`/`dev` push·PR에서는 이것이 유일한 테스트 실행이다.
 - 이미지 빌드(`build-and-push`)는 `needs.test.result == 'success'`로 전체 테스트 결과에 게이트된다.
-- `v*` tag에서는 `.github/workflows/release.yml`도 `ci.yml`을 별도로 호출한다.
+- `v*` tag에서는 `.github/workflows/release.yml`도 `ci.yml`을 별도로 호출하므로 테스트가 두 번 돈다(알려진 중복).
+- 다섯 잡은 모두 `if: ${{ !cancelled() }}`를 가지며 서로 `needs`가 없다. 호출자 `test`가 push·tag·dispatch에서 skip되는 `dedup`을 `needs`로 가지므로, skip된 조상 때문에 암묵적 `success()`가 내부 잡을 건너뛰는 일을 막는다.
 
 CI는 다음 5개 병렬 자동화 게이트로 구성된다.
 
@@ -100,7 +101,7 @@ CI는 다음 5개 병렬 자동화 게이트로 구성된다.
 2. **`sdk`**: SDK 패키지 검증 및 Ruff 린트.
 3. **`kolla`**: root `lumen` wheel의 Kolla role shared-data metadata와 wheel contents를 검증.
 4. **`integration`**: `service`·`dev` extra를 설치하고 MariaDB·Redis 서비스 컨테이너를 띄운다.
-   - 두 서비스의 health-check는 interval 2초, retries 30, start-period 5초다.
+   - 두 서비스의 health-check는 interval 2초, retries 50, start-period 5초다. 약 105초 창으로 기존 10초×10회(약 100초)보다 좁지 않다.
    - `lumen-migrate --apply`를 2회 연속 실행해 마이그레이션 멱등성(migration-twice)을 증명한 뒤 `pytest -m integration`을 수행한다.
 5. **`system`**: host venv 없이 runner의 `python3`로 stdlib-only `python3 -m lumen.scripts.test_layers system`을 호출해 프로세스 스택 전체의 HTTP 및 독립 실행을 검증한다. 이미지는 각자 `uv sync`를 수행한다.
 
@@ -115,10 +116,10 @@ CI는 다음 5개 병렬 자동화 게이트로 구성된다.
   - 이때 `test`와 `build-and-push`를 건너뛴다. 같은 트리는 해당 브랜치의 push 실행이 이미 테스트했다.
   - fork·dependabot·feature branch PR이나 조회 오류는 항상 테스트한다.
   - PR이 제어하는 값은 `env:`로만 script에 전달한다.
-- **PR cache export 없음**: PR 이미지 빌드는 GHA BuildKit cache를 읽기만 하고 export하지 않는다. PR 범위 cache는 그 PR만 복원할 수 있어 `dev` cache를 quota에서 밀어낸다.
+- **`dev`/`main` 외 cache export 없음**: GHA BuildKit cache export는 `refs/heads/dev`·`refs/heads/main` 실행에서만 한다. PR·`v*` tag·feature branch dispatch 이미지 빌드는 cache를 읽기만 한다. 그 ref에서 쓴 cache는 다른 ref가 복원할 수 없고 `dev` cache를 quota에서 밀어낸다.
 - **계약 테스트**: `tests/test_ci_shape.py`는 다음을 고정한다.
-  - trigger, dedup 조건(실제 step script를 stub `gh`로 실행), gate 식, cache export, health interval.
-  - system 잡의 stdlib-only 실행 전제, Dockerfile layer 순서와 `COPY --chown`.
+  - trigger, dedup 조건(실제 step script를 stub `gh`로 실행), gate 식, `ci.yml` 잡의 `!cancelled()`, cache export ref, health-check 창.
+  - system 잡의 stdlib-only 실행 전제, uv tag+digest 고정, Dockerfile layer 순서와 `COPY --chown`.
   - `tests/test_test_layers.py`는 compose 명령을 정확히 고정한다.
 - 규칙과 측정 기준선은 `AGENTS.md`의 "CI 파이프라인 성능 규정"을 따른다.
 

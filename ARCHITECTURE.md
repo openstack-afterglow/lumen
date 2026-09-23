@@ -191,33 +191,41 @@ Kolla role은 API/worker를 별도 host-network container로 실행하고 MariaD
 CI 형태(2026-09-24, source-reviewed, contract-tested, CI-unverified):
 
 - **진입점과 게이팅**
-  - `.github/workflows/docker-build.yml`이 `main`/`dev` push·PR과 `v*` tag의 유일한 테스트 진입점이다.
-  - 재사용 `ci.yml`은 `workflow_call`/`workflow_dispatch` 전용이며, 이벤트당 한 번 호출한다.
+  - `.github/workflows/docker-build.yml`이 `main`/`dev` push·PR의 유일한 테스트 진입점이다.
+  - 재사용 `ci.yml`은 `workflow_call`/`workflow_dispatch` 전용이며, `docker-build.yml`이 이벤트당 한 번 호출한다.
+  - `v*` tag push에서는 `docker-build.yml`과 `.github/workflows/release.yml`이 각각 `ci.yml`을 호출해 테스트가 두 번 돈다(알려진 중복).
   - `build-and-push`는 `!cancelled() && needs.test.result == 'success'`로 전체 test workflow에 게이트된다.
+  - `ci.yml`의 다섯 잡은 모두 `if: ${{ !cancelled() }}`를 가지며 서로 `needs`가 없다. 호출자 `test`의 skip된 `dedup` 조상이 암묵적 `success()`로 내부 잡을 건너뛰게 하지 않기 위한 방어다. GitHub 실제 동작은 CI-unverified다.
 - **PR 중복 제거**
   - PR 전용 `dedup` job(`contents: read`)은 다음 조건을 모두 충족할 때만 `test`/`build-and-push`를 건너뛴다.
     - head가 같은 저장소의 `dev`/`main`이다.
     - dependabot PR이 아니다.
     - merge 트리와 head 트리가 같다.
   - skipped·failed dedup은 테스트를 실행한다.
+  - 중복 PR의 `pull_request` check는 skipped(=통과)로 보이므로 merge 전 head SHA의 push 실행 결과를 확인한다. 2026-09-24 읽기 전용 확인 시 `dev`·`main`에 required status check가 없다.
 - **cache와 health-check**
-  - PR 이미지 빌드는 GHA cache를 읽기만 하고 export하지 않는다.
-  - `Datastore integration` 서비스 health-check는 2초 간격으로 확인한다.
+  - GHA cache export(`mode=max`)는 `refs/heads/dev`·`refs/heads/main` 실행에서만 한다. PR·tag·feature branch dispatch 이미지 빌드는 읽기만 한다.
+  - `Datastore integration` 서비스 health-check는 interval 2초, retries 50, start-period 5초다.
 - **system 잡**
   - host venv 없이 stdlib-only `python3 -m lumen.scripts.test_layers system`을 실행한다.
   - `test_layers`는 모든 compose 이미지를 한 번의 병렬 `docker compose build`로 만든 뒤 `--build` 없이 `up --wait` 한다.
   - integration/system teardown은 `down -v --remove-orphans --timeout 1`이다.
 - **이미지**
-  - `docker/Dockerfile`은 uv를 `0.12.18`로 고정해 apt layer 뒤에 복사한다.
+  - `docker/Dockerfile`은 uv를 `0.12.18` tag와 index digest로 고정해 apt layer 뒤에 복사한다.
   - runtime/test stage는 `COPY --chown=appuser:appuser`와 `appuser` compileall로 재귀 `chown -R` 없이 같은 소유권을 만든다.
 - **계약 테스트**: `tests/test_ci_shape.py`와 `tests/test_test_layers.py`가 이 형태를 고정한다.
 
-변경 전 기준선(최근 성공 20회, 2026-09-23):
+변경 전 기준선(워크플로우별 최근 성공 20회):
 
-- CI 크리티컬 패스: 중앙값 171초, p90 194초.
-- docker-build 전체: 중앙값 558초, p90 665초.
+- docker-build 테스트 구간(실행 생성부터 마지막 `test / *` 잡 종료, 2026-09-11~09-23): 중앙값 176초, p90 217초. `AGENTS.md` 12번 규칙의 비교 기준이다.
+- docker-build 전체(같은 20회): 중앙값 558초, p90 665초.
+- 과거 지표인 독립 `ci.yml` 크리티컬 패스(2026-09-07~09-23)는 중앙값 171초, p90 194초였다. 이제 `ci.yml` 단독 push/PR 실행이 없어 다시 잴 수 없다.
 
-workflow 실행 효과는 `dev` push 뒤 20회 이상 실측하기 전까지 CI-unverified다. Dockerfile/compose 변경은 docker gate(`uv run lumen-test system`/`integration`과 이미지 소유권 `stat` 확인)로 별도 검증한다.
+workflow 실행 효과는 `dev` push 뒤 20회 이상 실측하기 전까지 CI-unverified다.
+
+docker 검증 상태:
+- 2026-09-24 로컬 native arm64 `docker build --no-cache`로 `lumen-api`/`lumen-worker`/`lumen-test`를 빌드했다. 세 이미지 모두 `/app`·`/data`·`/seed` 아래 전부 `appuser:appuser`이고 `import lumen.main`/`lumen.worker`가 성공했다. 기록은 진행 중 OpenSpec change `ci-review-round-1`의 `tasks.md`에 있다.
+- CI의 amd64·arm64(QEMU) 빌드와 compose gate(`uv run lumen-test system`/`integration`)는 아직 미실행이며 그 change의 미완료 task로 남아 있다.
 
 `tests/integration/test_native_api_key_flow.py`와 `tests/integration/test_history_gateway_flow.py`는 HTTP admission, MariaDB/Redis persistence, active-path revision fence, Gateway one-time credential, worker execution/replay와 usage attribution을 정의하지만 외부 provider live 검증은 아니다. `tests/system/test_process_stack.py`는 `tests/system/fake_openai.py`와 container stack을 사용해 Chat Completions, Responses의 function-call/full-input continuation과 `prompt_cache_key` 전달/`client_metadata` 차단, Anthropic Messages와 Gateway issue/token/inference를 검증하므로 fake-provider system evidence를 live provider evidence로 승격하지 않는다. 실제 Keystone/OpenStack 배포 검증은 Lumen 외부 배포/Afterglow 소유 범위다.
 
@@ -252,9 +260,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "43152e9df721074181733e54ca0cf7d9cc0fd62c849131c6574dc207af1dd5ae",
-  "reviewed_at": "2026-09-23T19:19:34Z",
-  "summary": "CI critical-path and duplicate-run reduction (source-reviewed; runtime effect CI-unverified): ci.yml is workflow_call/workflow_dispatch only; docker-build.yml is the single push/PR/tag test entry with a PR-only read-only dedup job that skips test/build only for a same-repo dev/main non-dependabot PR whose merge tree equals its head tree (env-only inputs, any error runs tests), build-and-push gated on !cancelled() && needs.test.result == 'success', PR builds read but never export GHA cache; Datastore integration health checks 2s/30 retries/5s start; system job runs stdlib-only python3 -m lumen.scripts.test_layers system without host uv; test_layers builds all compose services in one parallel build, drops the second --build and tears down with --timeout 1; docker/Dockerfile pins uv 0.12.18 after the apt layer and replaces chown -R /app with pre-COPY user/dir setup, COPY --chown=appuser:appuser and appuser compileall (same ownership); tests/test_ci_shape.py and tests/test_test_layers.py pin the shape; AGENTS.md gains the CI performance rules with the 171s/194s CI and 558s/665s docker-build baseline. No service ownership, flow, store or API contract change."
+  "source_sha256": "9b3fd76885f08b177921d5a25ab738676f5fda83d081324889075ff8366314de",
+  "reviewed_at": "2026-09-23T21:42:07Z",
+  "summary": "CI review round 1 (source-reviewed; GitHub runtime effect CI-unverified): docker-build.yml is the single test entry for main/dev push and PR, while v* tags run ci.yml twice (docker-build.yml and release.yml, known duplicate); every ci.yml job has if: !cancelled() and no inner needs so a skipped dedup caller ancestor cannot skip them via implicit success(); GHA cache export only on refs/heads/dev and refs/heads/main (PR, tag and feature-branch dispatch only read); Datastore integration health checks 2s interval, 50 retries, 5s start period (~105s window); docker/Dockerfile pins uv 0.12.18 by tag and OCI index digest; tests/test_ci_shape.py pins these (mutation-checked); AGENTS.md rule-12 reference is the docker-build test portion 176s median/217s p90 (171s ci.yml kept as history), dedup is the one accepted rule-3 exception with a projected 6-9s PR cost, skipped duplicate-PR checks require checking the push run before merge; local native arm64 no-cache build of lumen-api/lumen-worker/lumen-test showed all of /app, /data, /seed appuser:appuser and imports ok, compose gates still pending in OpenSpec change ci-review-round-1. No service ownership, flow, store or API contract change."
 }
 ```
 <!-- architecture-review:end -->

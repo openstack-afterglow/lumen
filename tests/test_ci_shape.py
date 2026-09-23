@@ -83,6 +83,18 @@ def test_image_build_is_gated_on_the_whole_test_workflow() -> None:
     assert _compact(build["if"]) == "${{ !cancelled() && needs.test.result == 'success' }}"
 
 
+def test_reusable_ci_jobs_override_the_implicit_success_check() -> None:
+    # The caller's `test` job needs `dedup`, which is skipped outside PRs. An
+    # explicit status function keeps a skipped caller ancestor from skipping the
+    # inner jobs (actions/runner#2205); without inner `needs` it hides nothing.
+    jobs = _workflow("ci.yml")["jobs"]
+
+    assert set(jobs) == {"service", "sdk", "kolla", "integration", "system"}
+    for name, job in jobs.items():
+        assert _compact(job.get("if")) == "${{ !cancelled() }}", name
+        assert "needs" not in job, name
+
+
 def test_no_job_uses_a_self_hosted_runner() -> None:
     for name in ("ci.yml", "docker-build.yml", "release.yml"):
         for job_name, job in _workflow(name)["jobs"].items():
@@ -216,13 +228,19 @@ def test_dedup_script_marks_only_identical_same_repo_branch_trees(
 # --- build cache (rule 4) -------------------------------------------------------
 
 
-def test_pr_image_builds_read_but_never_export_the_gha_cache() -> None:
-    steps = _docker_jobs()["build-and-push"]["steps"]
+def test_only_dev_and_main_image_builds_export_the_gha_cache() -> None:
+    # Cache entries are restorable only from the ref that wrote them and from
+    # the default branch, so PR, tag and feature-branch dispatch runs read the
+    # cache but never export it.
+    workflow = _workflow("docker-build.yml")
+    steps = workflow["jobs"]["build-and-push"]["steps"]
     (build,) = [step for step in steps if str(step.get("uses", "")).startswith("docker/build-push-action")]
 
+    assert set(_triggers(workflow)["push"]["branches"]) == {"main", "dev"}
     assert build["with"]["cache-from"] == "type=gha,scope=${{ matrix.target }}"
     assert _compact(build["with"]["cache-to"]) == (
-        "${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope={0}', matrix.target) || '' }}"
+        "${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')"
+        " && format('type=gha,mode=max,scope={0}', matrix.target) || '' }}"
     )
 
 
@@ -235,9 +253,12 @@ def test_integration_service_health_checks_poll_fast_with_a_wide_window(service:
 
     interval = int(re.search(r"--health-interval (\d+)s", options).group(1))
     retries = int(re.search(r"--health-retries (\d+)", options).group(1))
+    start_period = int(re.search(r"--health-start-period (\d+)s", options).group(1))
     assert interval <= 2
-    assert retries >= 30
-    assert interval * retries >= 60
+    # Keep at least the old 10s x 10 window (~100s). 'Initialize containers'
+    # took up to 47s in the measured baseline runs, and a wide window costs
+    # nothing when the service becomes healthy early.
+    assert start_period + interval * retries >= 100
 
 
 def test_system_job_runs_the_stdlib_harness_without_a_host_venv() -> None:
@@ -309,7 +330,9 @@ def test_uv_is_pinned_and_copied_after_the_apt_layer() -> None:
     builder = _dockerfile_stages()["lumen-builder"]
 
     uv_copy = _index(builder, lambda line: "ghcr.io/astral-sh/uv:" in line)
-    assert re.fullmatch(r"COPY --from=ghcr\.io/astral-sh/uv:\d+\.\d+\.\d+ /uv /uvx /bin/", builder[uv_copy])
+    assert re.fullmatch(
+        r"COPY --from=ghcr\.io/astral-sh/uv:\d+\.\d+\.\d+@sha256:[0-9a-f]{64} /uv /uvx /bin/", builder[uv_copy]
+    )
     apt = _index(builder, lambda line: line.startswith("RUN apt-get") and "build-essential" in line)
     assert apt < uv_copy
 

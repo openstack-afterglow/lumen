@@ -10,9 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Pinned and copied after the apt layer: a floating uv tag changes digest often
-# and otherwise invalidates the build-essential layer (~106s under arm64 QEMU).
-COPY --from=ghcr.io/astral-sh/uv:0.12.18 /uv /uvx /bin/
+# Pinned by tag and index digest and copied after the apt layer: a floating uv
+# tag changes digest often and otherwise invalidates the build-essential layer
+# (~106s under arm64 QEMU). Bump the tag and digest together by hand.
+COPY --from=ghcr.io/astral-sh/uv:0.12.18@sha256:3adc3706091ce7c2fe595e669628caedd6d951551b92b258b7e7dbe06d9440bc /uv /uvx /bin/
 
 COPY pyproject.toml uv.lock LICENSE ./
 RUN uv sync --frozen --extra service --no-dev --no-install-project

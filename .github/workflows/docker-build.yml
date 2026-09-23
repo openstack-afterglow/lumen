@@ -116,6 +116,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.target }}
-          # PR-scoped cache entries are readable only by that PR, so exporting
-          # them costs ~100s per job and evicts the dev cache within the quota.
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope={0}', matrix.target) || '' }}
+          # Only dev/main runs export. Entries written on a PR, tag or feature
+          # ref are readable only from that ref, so exporting them costs ~100s
+          # per job and evicts the dev cache within the quota.
+          cache-to: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && format('type=gha,mode=max,scope={0}', matrix.target) || '' }}

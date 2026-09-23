@@ -31,23 +31,29 @@ Migration은 additive로 작성하고 `lumen/migrations/manifest.txt`의 checksu
 
 ## CI 파이프라인 성능 규정 (critical-path first)
 
-근거: 2026-09 lumen CI 실측(최근 성공 실행 20건, 2026-09-07~09-23), afterglow CI 실측, Linear의 CI 개편 사례. CI를 바꾸는 모든 변경은 아래 규칙을 따른다.
+근거: 2026-09 lumen CI 실측(워크플로우별 최근 성공 실행 20건), afterglow CI 실측, Linear의 CI 개편 사례. CI를 바꾸는 모든 변경은 아래 규칙을 따른다.
 
-기준선:
-- `ci.yml` 크리티컬 패스(실행 생성부터 마지막 테스트 잡 종료까지): 중앙값 171초, p90 194초.
-- `docker-build.yml` 전체(실행 생성부터 Build & Push 종료까지): 중앙값 558초, p90 665초.
-- 크리티컬 잡은 `Process-system integration`이며 중앙값 168초다.
+기준선(변경 전 실측):
+- **12번 규칙의 기준**: `docker-build.yml` 테스트 구간(실행 생성부터 마지막 `test / *` 잡 종료까지, 성공 20건, 2026-09-11~09-23): 중앙값 176초, p90 217초.
+- `docker-build.yml` 전체(실행 생성부터 Build & Push 종료까지, 같은 20건): 중앙값 558초, p90 665초.
+- 크리티컬 잡은 `Process-system integration`이다. 잡 시간 중앙값은 `ci.yml` 20건에서 168초, `docker-build.yml` 20건에서 172초다.
+- 과거 지표: 독립 `ci.yml` 크리티컬 패스(실행 생성부터 마지막 테스트 잡 종료까지, 성공 20건, 2026-09-07~09-23)는 중앙값 171초, p90 194초였다. 이 변경 뒤 `ci.yml`은 단독 push/PR 실행이 없으므로 이 지표는 다시 잴 수 없고 비교 기준으로 쓰지 않는다.
 
 이 저장소는 public이고 GitHub-hosted runner만 쓴다.
 
 워크플로우 구조:
-- `docker-build.yml`은 `main`/`dev` push·PR과 `v*` tag의 유일한 테스트 진입점이다. 재사용 워크플로우 `ci.yml`(`workflow_call`/`workflow_dispatch` 전용)을 한 번 호출하고, 이미지 빌드를 그 결과로 게이트한다.
-- `release.yml`은 tag push에서 `ci.yml`을 따로 호출한다.
+- `docker-build.yml`은 `main`/`dev` push·PR의 유일한 테스트 진입점이다. 재사용 워크플로우 `ci.yml`(`workflow_call`/`workflow_dispatch` 전용)을 한 번 호출하고, 이미지 빌드를 그 결과로 게이트한다.
+- `v*` tag push에서는 `docker-build.yml`과 `release.yml`이 각각 `ci.yml`을 호출하므로 테스트가 두 번 돈다(알려진 중복, 미해결).
+- `ci.yml`의 모든 잡은 `if: ${{ !cancelled() }}`를 갖는다.
+  - 호출자 `test` 잡은 push·tag·dispatch에서 skip되는 `dedup`을 `needs`로 가진다. 암묵적 `success()`는 skip된 조상 때문에 잡을 건너뛸 수 있다(actions/runner#2205). GitHub이 호출자의 조상을 재사용 워크플로우 내부 잡에 반영하는지는 미확인이므로 명시적 status 함수로 막는다.
+  - 내부 잡끼리는 `needs`가 없으므로 이 조건이 실패를 가리지 않는다.
+  - 이 변경 뒤 첫 `dev` push 실행에서 `test / *` 잡이 모두 실제로 실행되고 `build-and-push`가 게시했는지 확인한다.
 - 이 구조는 `tests/test_ci_shape.py`와 `tests/test_test_layers.py`가 고정한다.
 
 1. **측정 먼저, 추정 금지.**
    - CI를 바꾸기 전과 후에 최근 20회 이상 실행의 잡·스텝 시간을 `gh run list --workflow docker-build.yml`과 `gh api repos/openstack-afterglow/lumen/actions/runs/<id>/jobs`로 수집한다.
    - 크리티컬 패스의 중앙값과 p90을 변경 기록(OpenSpec proposal, PR, 커밋 본문)에 남긴다.
+   - 크리티컬 패스는 `docker-build.yml` 실행 생성부터 마지막 `test / *` 잡 종료까지로 잰다. `dedup`이 중복으로 판정해 테스트 잡이 없는 PR 실행은 표본에서 뺀다.
    - 절감 효과는 합산되지 않는다. 가장 긴 잡부터 줄이고, 효과는 실제 CI 전후 수치로만 주장한다.
 2. **목표 지표를 먼저 정한다.**
    - public 저장소가 무료 GitHub-hosted runner를 쓰면 wall-clock(대기 시간)이 목표다.
@@ -56,14 +62,17 @@ Migration은 additive로 작성하고 `lumen/migrations/manifest.txt`의 checksu
 3. **게이트 잡을 다른 잡 앞에 두지 않는다.**
    - architecture guard 같은 fail-fast 검사는 테스트 잡의 `needs:`로 걸지 않고 병렬 잡 안에서 실행한다. 현재 guard는 `Service tests`의 첫 step이다.
    - 빌드·배포 게이팅은 테스트 워크플로우 전체 결과로 한다(`needs.test.result == 'success'`).
+   - 승인된 예외는 PR 전용 `dedup` 잡(9번) 하나다. `test`가 `needs: dedup`을 갖지만, push·tag·dispatch에서는 `dedup`이 skip되어 테스트 앞 대기가 없다.
+     - non-duplicate PR에서 늘어나는 대기는 약 6~9초로 추정한다(추정치, 미측정). 근거는 기준선 20건의 첫 테스트 잡 대기 중앙값 3초, `Set up job` 약 1초, tree 조회 2회, 다음 잡 대기 약 3초다.
+     - `dedup` 도입 뒤 첫 non-duplicate PR들에서 `dedup` 대기+실행 시간을 실측해 변경 기록에 남긴다. 중복 PR 1건이 아끼는 시간(테스트와 이미지 빌드 검증 전체)보다 이 비용이 의미 있게 커지면 재검토한다.
 4. **잡당 고정비를 측정한다.**
    - checkout, 의존성 설치, 서비스 준비 시간을 잰다. 캐시 복원이 재설치보다 느리면 캐시를 쓰지 않는다.
-   - 서비스 컨테이너 health-check는 짧은 interval(2초)과 충분한 retries·start-period로 설정한다.
+   - 서비스 컨테이너 health-check는 짧은 interval(2초)과 충분한 retries·start-period로 설정한다. 현재 `Datastore integration`은 interval 2초, retries 50, start-period 5초로, 기존 10초×10회(약 100초)보다 좁지 않은 약 105초 창을 유지한다.
    - 잡이 쓰지 않는 host venv는 설치하지 않는다. system 잡은 stdlib-only인 `lumen.scripts.test_layers`를 `python3`로 직접 실행한다.
    - 이미지 layer는 캐시가 실제로 hit하게 만든다.
-     - apt·사용자 layer가 source COPY나 floating tag(`uv:latest`)에 의존하지 않게 한다.
+     - apt·사용자 layer가 source COPY나 floating tag(`uv:latest`)에 의존하지 않게 한다. uv는 tag와 index digest로 고정하고 둘을 함께 수동으로 갱신한다.
      - 재귀 `chown -R` 대신 `COPY --chown`을 쓴다.
-     - 복원할 수 없는 PR 범위 cache는 export하지 않는다.
+     - GHA cache entry는 그 entry를 쓴 ref, default branch, PR이면 base branch에서만 복원된다. 그래서 `dev`/`main` 실행만 export하고, PR·tag·feature branch dispatch 실행은 읽기만 한다.
    - teardown은 로그 수집과 종료 코드 결정 뒤 `--timeout 1`로 한다.
 5. **샤딩은 고정비가 작을 때만 한다.**
    - pytest가 작업을 나누는 단위(테스트 파일·node)로 균형을 맞춘다.
@@ -87,6 +96,8 @@ Migration은 additive로 작성하고 `lumen/migrations/manifest.txt`의 checksu
    - fork PR과 dependabot PR, 판정 오류는 항상 테스트한다.
    - 브랜치 이름만으로 판단하지 않는다(fork의 동명 브랜치 우회).
    - 같은 이벤트를 두 워크플로우가 각각 테스트하지 않게 `ci.yml`에는 push/PR trigger를 두지 않는다.
+   - `dedup`은 3번 규칙의 승인된 예외이며 비용은 3번에 기록한다.
+   - 중복 PR의 자기 `pull_request` check는 skipped로 보이고, GitHub은 skipped를 통과로 친다. 그래서 merge 전에 head SHA의 push 실행 check suite가 성공했는지 확인한다. required status check를 추가하면 이 dedup을 다시 검토한다(2026-09-24 읽기 전용 확인 시 `dev`·`main` 모두 required check가 없었다).
 10. **보안: public 저장소의 `pull_request` 코드를 self-hosted runner에서 실행하지 않는다.**
     - 워크플로우 YAML의 `if:`는 PR이 수정할 수 있으므로, runner group의 저장소 제한과 fork PR 승인 설정으로도 보장한다.
     - PR이 제어하는 값(`github.head_ref`, head repository 등)은 `env:`로만 script에 전달한다.
@@ -95,6 +106,6 @@ Migration은 additive로 작성하고 `lumen/migrations/manifest.txt`의 checksu
 12. **지속 개선.**
     - CI를 바꾸는 변경에는 전후 실측을 첨부한다.
     - 다음 중 하나라도 해당하면 1번 절차로 다시 측정하고 가장 긴 잡부터 개선한다.
-      - 크리티컬 패스 중앙값이 기록된 기준(171초)보다 20% 이상 나빠진다.
+      - 크리티컬 패스 중앙값이 기록된 기준(`docker-build.yml` 테스트 구간 중앙값 176초)보다 20% 이상 나빠진다.
       - 테스트 수가 크게 는다.
       - 새 테스트 계층을 추가한다.
