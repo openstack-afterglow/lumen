@@ -65,7 +65,10 @@ uv run pytest -m "not integration and not system" tests
 - **자동 프로젝트 격리**: 각 테스트 실행마다 `lumen-{layer}-{pid}-{hex}` 형태의 고유한 Compose 프로젝트 이름을 생성하여 동시 실행 간의 간섭을 방지합니다.
 - **포트 자동 할당**: MariaDB와 Redis의 호스트 포트를 로컬의 빈 루프백 포트(`MARIADB_PORT`, `REDIS_PORT`)로 자동 동적 할당합니다.
 - **DB collation 회귀 환경**: MariaDB init fixture가 `lumen` database를 `utf8mb4_unicode_ci`로 고정한다. Migration table은 database collation을 상속해야 하며, bare `DEFAULT CHARSET=utf8mb4`가 MariaDB 11에서 다른 default collation으로 해석되어 기존 `CHAR(36)` FK와 충돌하는 회귀를 이 환경에서 검출한다.
-- **자동 정리 (Clean Teardown)**: 테스트 종료 시 성공/실패 여부와 관계없이 `docker compose down -v --remove-orphans`를 수행하여 컨테이너, 네트워크 및 영속 볼륨까지 완전히 정리합니다.
+- **단일 병렬 빌드**: `system` 계층은 먼저 `docker compose build`를 한 번 실행해 모든 build 서비스를 빌드한다. 이때 bake가 공유 `lumen-builder` 뒤의 `lumen-test`와 `lumen-runtime` 체인을 병렬로 빌드한다. 그 다음 `up -d --wait --wait-timeout 180 lumen-api lumen-worker`로 두 번째 `--build` 없이 stack을 올린다.
+- **자동 정리 (Clean Teardown)**: 테스트 종료 시 성공/실패 여부와 관계없이 `docker compose down -v --remove-orphans --timeout 1`을 수행하여 컨테이너, 네트워크 및 영속 볼륨까지 완전히 정리합니다.
+  - 로그 수집과 종료 코드 결정은 teardown 전에 끝나므로 graceful stop을 기다리지 않는다.
+  - `lumen-worker`와 fake provider는 SIGTERM handler 없이 PID 1로 실행된다. 그래서 compose 기본 10초 timeout을 두 의존성 단계에 걸쳐 모두 소모했다.
 - **실패 시 로그 자동 수집**: `system` 계층 테스트 실패 시, teardown 직전에 컨테이너 로그(`docker compose logs`)를 자동으로 출력하여 원인을 즉시 파악할 수 있습니다.
 
 ### 고급 환경 변수 오버라이드
@@ -86,13 +89,38 @@ uv run pytest -m "not integration and not system" tests
 
 ## CI 게이트 및 재사용 가능한 워크플로우
 
-Lumen GitHub Actions CI (`.github/workflows/ci.yml`)는 다음과 같은 5개 자동화 게이트로 구성되어 있습니다.
+Lumen GitHub Actions CI (`.github/workflows/ci.yml`)는 재사용 워크플로우다. 트리거는 `workflow_call`과 `workflow_dispatch`뿐이고 직접 push/PR trigger는 없다.
+- `main`/`dev` push·PR과 `v*` tag에서는 `.github/workflows/docker-build.yml`의 `test` job이 이 워크플로우를 한 번 호출한다.
+- 이미지 빌드(`build-and-push`)는 `needs.test.result == 'success'`로 전체 테스트 결과에 게이트된다.
+- `v*` tag에서는 `.github/workflows/release.yml`도 `ci.yml`을 별도로 호출한다.
 
-1. **`service`**: `service` 및 `dev` extra를 설치한 Contract 테스트 (`pytest -m "not integration and not system"`) 및 Ruff 린트 검증.
+CI는 다음 5개 병렬 자동화 게이트로 구성된다.
+
+1. **`service`**: 첫 step에서 architecture freshness guard를 실행한다. 그 다음 `service`·`dev` extra를 설치하고 Contract 테스트(`pytest -m "not integration and not system"`)와 Ruff 린트를 검증한다.
 2. **`sdk`**: SDK 패키지 검증 및 Ruff 린트.
 3. **`kolla`**: root `lumen` wheel의 Kolla role shared-data metadata와 wheel contents를 검증.
-4. **`integration`**: `service` 및 `dev` extra를 설치하고 MariaDB 및 Redis 서비스 컨테이너를 띄운 뒤, `lumen-migrate --apply`를 2회 연속 실행하여 마이그레이션 멱등성(migration-twice)을 증명한 후 `pytest -m integration`을 수행.
-5. **`system`**: `service` 및 `dev` extra를 설치하고 `lumen-test system`을 호출하여 프로세스 스택 전체의 HTTP 및 독립 실행 검증.
+4. **`integration`**: `service`·`dev` extra를 설치하고 MariaDB·Redis 서비스 컨테이너를 띄운다.
+   - 두 서비스의 health-check는 interval 2초, retries 30, start-period 5초다.
+   - `lumen-migrate --apply`를 2회 연속 실행해 마이그레이션 멱등성(migration-twice)을 증명한 뒤 `pytest -m integration`을 수행한다.
+5. **`system`**: host venv 없이 runner의 `python3`로 stdlib-only `python3 -m lumen.scripts.test_layers system`을 호출해 프로세스 스택 전체의 HTTP 및 독립 실행을 검증한다. 이미지는 각자 `uv sync`를 수행한다.
+
+### 중복 실행 제거와 CI 형태 계약
+
+- **Identical-tree PR dedup**: `docker-build.yml`의 `dedup` job은 PR에서만 실행되며 `contents: read` 권한만 갖는다.
+  - `duplicate=true`를 내려면 다음 조건을 모두 충족해야 한다.
+    - head repository가 이 저장소다.
+    - 작성자·actor가 dependabot이 아니다.
+    - head branch가 push 실행이 있는 `dev`/`main`이다.
+    - merge commit 트리가 head commit 트리와 같다.
+  - 이때 `test`와 `build-and-push`를 건너뛴다. 같은 트리는 해당 브랜치의 push 실행이 이미 테스트했다.
+  - fork·dependabot·feature branch PR이나 조회 오류는 항상 테스트한다.
+  - PR이 제어하는 값은 `env:`로만 script에 전달한다.
+- **PR cache export 없음**: PR 이미지 빌드는 GHA BuildKit cache를 읽기만 하고 export하지 않는다. PR 범위 cache는 그 PR만 복원할 수 있어 `dev` cache를 quota에서 밀어낸다.
+- **계약 테스트**: `tests/test_ci_shape.py`는 다음을 고정한다.
+  - trigger, dedup 조건(실제 step script를 stub `gh`로 실행), gate 식, cache export, health interval.
+  - system 잡의 stdlib-only 실행 전제, Dockerfile layer 순서와 `COPY --chown`.
+  - `tests/test_test_layers.py`는 compose 명령을 정확히 고정한다.
+- 규칙과 측정 기준선은 `AGENTS.md`의 "CI 파이프라인 성능 규정"을 따른다.
 
 ### Reusable Workflow 활용 예시 (Exact Refs)
 

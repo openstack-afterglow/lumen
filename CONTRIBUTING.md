@@ -26,6 +26,12 @@ uv run ruff check lumen tests
 
 MariaDB/Redis가 있는 CI 조건에서는 `uv run pytest -m integration`을 실행한다. 새 observable contract에는 그 contract를 깨뜨릴 수 있는 테스트를 추가한다.
 
+GitHub Actions에서는 `.github/workflows/docker-build.yml`이 `main`/`dev` push·PR마다 재사용 워크플로우 `.github/workflows/ci.yml`을 한 번 호출한다. `ci.yml`에는 직접 push/PR trigger가 없다.
+
+- check 이름은 `Docker Build & Push / test / <job>`이다.
+- 같은 저장소 `dev`/`main` PR의 merge 트리가 head 트리와 같으면 push 실행이 이미 검증했으므로 PR 테스트를 건너뛴다.
+- workflow, `docker/Dockerfile`, `lumen/scripts/test_layers.py`를 바꾸면 `AGENTS.md`의 CI 파이프라인 성능 규정을 따르고 `tests/test_ci_shape.py`, `tests/test_test_layers.py`, `actionlint .github/workflows/*.yml`로 검증한다.
+
 ## 의존성 방향
 
 HTTP route는 auth/scope, request parsing, HTTP error/SSE만 맡긴다. `chat_admission`은 request-independent admission을, `durable_runs`는 journal/admission/lifecycle/execution을, `tool_runtime`은 binding/selection/dispatch를, `providers`는 repository/routing을 소유한다. API가 store/ORM private helper를 우회하거나 package `__init__` facade를 추가하지 않는다.

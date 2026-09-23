@@ -63,8 +63,14 @@ Lumen은 GitHub Actions 파이프라인(`.github/workflows/docker-build.yml`)을
 - **Worker 이미지 (`lumen-worker` 타겟)**: `ghcr.io/openstack-afterglow/lumen-worker`
 
 ### 게시 트리거 및 태그 규칙
-게시 작업(`build-and-push`)은 재사용 가능한 CI 워크플로우(`ci.yml`) 검증 성공을 전제로 실행된다.
+게시 작업(`build-and-push`)은 재사용 가능한 CI 워크플로우(`ci.yml`) 검증 성공을 전제로 실행된다(`needs.test.result == 'success'`). `ci.yml`에는 직접 push/PR trigger가 없으므로 이 워크플로우의 `test` job이 이벤트당 유일한 테스트 실행이다.
 - **PR (`pull_request`)**: `main` 및 `dev` 브랜치 대상 PR은 빌드 검증만 수행하고 GHCR 로그인 및 푸시는 진행하지 않는다 (`push: false`).
+  - 다음 조건을 모두 충족하면 `dedup` job이 PR을 중복으로 판정한다.
+    - head가 같은 저장소의 `dev`/`main`이다.
+    - dependabot PR이 아니다.
+    - merge 트리가 head 트리와 같다.
+  - 중복 판정 시 테스트와 빌드 검증을 건너뛴다. 그 트리는 해당 브랜치 push 실행이 이미 테스트·빌드했다.
+  - fork·dependabot·feature branch PR과 판정 오류는 항상 전체를 실행한다.
 - **`dev` 브랜치 푸시**: CI 성공 후 `dev` 태그 및 `sha-<hash>` 태그로 GHCR에 게시된다.
 - **`main` 브랜치 푸시**: CI 성공 후 `latest` 태그 및 `sha-<hash>` 태그로 GHCR에 게시된다.
 - **버전 태그 푸시 (`v*`)**: 유효한 시맨틱 버전 Git 태그 `v1.2.3`은 이미지 태그 `1.2.3` 및 `sha-<hash>`로 게시된다.
@@ -73,6 +79,17 @@ Lumen은 GitHub Actions 파이프라인(`.github/workflows/docker-build.yml`)을
 ### 아키텍처 및 캐시 설정
 - **두 플랫폼 지원**: QEMU (`docker/setup-qemu-action@v4`)와 Buildx (`docker/setup-buildx-action@v4`)를 사용해 `linux/amd64` 및 `linux/arm64` 멀티 아키텍처 이미지를 빌드한다.
 - **GHA BuildKit 캐시**: 타겟별 독립 캐시 스코프(`type=gha,scope=lumen-api`, `type=gha,scope=lumen-worker`)를 적용하여 타겟 간 캐시 충돌을 방지한다.
+  - 모든 이벤트가 cache를 읽는다(`cache-from`). export(`cache-to`, `mode=max`)는 PR이 아닌 이벤트에서만 한다.
+  - PR 범위 cache entry는 그 PR만 복원할 수 있다. export하면 job마다 약 100초를 쓰고 10GB quota 안에서 `dev` cache를 밀어낸다.
+- **캐시 친화적 layer 순서** (`docker/Dockerfile`):
+  - `lumen-builder`는 build-essential apt layer 뒤에 고정 버전 `ghcr.io/astral-sh/uv:0.12.18`을 복사한다. uv 갱신은 이 줄을 명시적으로 바꾸는 변경으로 한다.
+  - `lumen-runtime`·`lumen-test`는 source COPY 전에 한 RUN에서 다음을 처리한다.
+    - curl 설치와 `appuser` 생성(root group 포함)
+    - `/data`·`/seed`와 COPY 대상 디렉터리 생성
+    - 이 디렉터리들의 non-recursive `chown`
+  - venv와 source는 `COPY --chown=appuser:appuser`로 복사하고, `USER appuser`로 `python -m compileall`을 실행한다.
+  - 결과 소유권은 기존 재귀 `chown -R /app`과 같다. `/app`, venv, source, `__pycache__`, `/data`, `/seed`가 모두 `appuser` 소유다.
+  - apt·사용자 layer는 코드 변경 시에도 cache에 남는다.
 
 ### 권한 및 인증 사전 요구사항
 - **GHA 작업 권한**: 빌드 및 게시 작업에 `contents: read` 및 `packages: write` 권한이 지정되어 있다.

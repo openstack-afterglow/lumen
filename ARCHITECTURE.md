@@ -94,6 +94,7 @@ flowchart LR
 | `lumen/cache.py`, `lumen/services/checkpointer.py`, `lumen/services/semantic_memory.py` | Redis cache/wakeup, optional PostgreSQL checkpointer/pgvector | optional/optimization 경계 |
 | `sdk/lumen_sdk/client.py`, `sdk/lumen_sdk/proxy.py`, `sdk/lumen_sdk/_api.py` | 동일 native route mixin의 httpx API-key transport와 OpenStack SDK transport | caller → `/v1` |
 | `docker/Dockerfile`, `docker-compose.yml`, `deploy/kolla/ansible/roles/lumen/` | root build context를 유지하는 local API/worker/migrate/Console container stages와 root wheel Kolla role shared data | operator → service processes |
+| `.github/workflows/docker-build.yml`, `.github/workflows/ci.yml`, `lumen/scripts/test_layers.py`, `docker-compose.system.yml` | CI 진입점과 이미지 게시, 재사용 test workflow, layered test CLI와 system process stack | push/PR → `docker-build.yml` → `ci.yml` → `test_layers` → compose stack |
 
 ## Runtime flows
 
@@ -187,6 +188,37 @@ Kolla role은 API/worker를 별도 host-network container로 실행하고 MariaD
 | SDK | `cd sdk && uv run pytest && uv run ruff check .` | SDK package 자체의 httpx/OpenStack transport contract |
 | focused source tests | `uv run pytest -m "not integration and not system" tests` | in-process contract 범위; live deployment/provider 검증 아님 |
 
+CI 형태(2026-09-24, source-reviewed, contract-tested, CI-unverified):
+
+- **진입점과 게이팅**
+  - `.github/workflows/docker-build.yml`이 `main`/`dev` push·PR과 `v*` tag의 유일한 테스트 진입점이다.
+  - 재사용 `ci.yml`은 `workflow_call`/`workflow_dispatch` 전용이며, 이벤트당 한 번 호출한다.
+  - `build-and-push`는 `!cancelled() && needs.test.result == 'success'`로 전체 test workflow에 게이트된다.
+- **PR 중복 제거**
+  - PR 전용 `dedup` job(`contents: read`)은 다음 조건을 모두 충족할 때만 `test`/`build-and-push`를 건너뛴다.
+    - head가 같은 저장소의 `dev`/`main`이다.
+    - dependabot PR이 아니다.
+    - merge 트리와 head 트리가 같다.
+  - skipped·failed dedup은 테스트를 실행한다.
+- **cache와 health-check**
+  - PR 이미지 빌드는 GHA cache를 읽기만 하고 export하지 않는다.
+  - `Datastore integration` 서비스 health-check는 2초 간격으로 확인한다.
+- **system 잡**
+  - host venv 없이 stdlib-only `python3 -m lumen.scripts.test_layers system`을 실행한다.
+  - `test_layers`는 모든 compose 이미지를 한 번의 병렬 `docker compose build`로 만든 뒤 `--build` 없이 `up --wait` 한다.
+  - integration/system teardown은 `down -v --remove-orphans --timeout 1`이다.
+- **이미지**
+  - `docker/Dockerfile`은 uv를 `0.12.18`로 고정해 apt layer 뒤에 복사한다.
+  - runtime/test stage는 `COPY --chown=appuser:appuser`와 `appuser` compileall로 재귀 `chown -R` 없이 같은 소유권을 만든다.
+- **계약 테스트**: `tests/test_ci_shape.py`와 `tests/test_test_layers.py`가 이 형태를 고정한다.
+
+변경 전 기준선(최근 성공 20회, 2026-09-23):
+
+- CI 크리티컬 패스: 중앙값 171초, p90 194초.
+- docker-build 전체: 중앙값 558초, p90 665초.
+
+workflow 실행 효과는 `dev` push 뒤 20회 이상 실측하기 전까지 CI-unverified다. Dockerfile/compose 변경은 docker gate(`uv run lumen-test system`/`integration`과 이미지 소유권 `stat` 확인)로 별도 검증한다.
+
 `tests/integration/test_native_api_key_flow.py`와 `tests/integration/test_history_gateway_flow.py`는 HTTP admission, MariaDB/Redis persistence, active-path revision fence, Gateway one-time credential, worker execution/replay와 usage attribution을 정의하지만 외부 provider live 검증은 아니다. `tests/system/test_process_stack.py`는 `tests/system/fake_openai.py`와 container stack을 사용해 Chat Completions, Responses의 function-call/full-input continuation과 `prompt_cache_key` 전달/`client_metadata` 차단, Anthropic Messages와 Gateway issue/token/inference를 검증하므로 fake-provider system evidence를 live provider evidence로 승격하지 않는다. 실제 Keystone/OpenStack 배포 검증은 Lumen 외부 배포/Afterglow 소유 범위다.
 
 ## Change guide
@@ -201,6 +233,7 @@ Kolla role은 API/worker를 별도 host-network container로 실행하고 MariaD
 | auth/project scope | `lumen/auth.py`, API dependencies, SDK proxy | Keystone/API-key matrix, target-project invariant, security docs and auth tests |
 | deployment/config | `pyproject.toml`, `docker/Dockerfile`, `docker-compose*.yml`, `lumen/config.py`, `deploy/kolla/ansible/roles/lumen/` | root wheel shared data, service-extra boundary, root build context/stages, migration/bootstrap order, independent image defaults, operations docs and Kolla tests |
 | SDK surface | `sdk/lumen_sdk/{client,proxy,_api}.py`, `sdk/pyproject.toml` | package version, route mixin/transport tests, `docs/sdk.md` and this Code map |
+| CI workflow/test harness | `.github/workflows/docker-build.yml`, `.github/workflows/ci.yml`, `lumen/scripts/test_layers.py`, `docker/Dockerfile`, `docker-compose.system.yml` | `AGENTS.md` CI 파이프라인 성능 규정(전후 실측 median/p90), `tests/test_ci_shape.py`, `tests/test_test_layers.py`, `actionlint`, `docs/testing.md`, `docs/operations.md` |
 | bugfix/refactor with no architecture change | actual source and affected tests | root architecture Maintenance marker summary must state why ownership/flow/store contracts are unchanged; still run guard before completion/commit |
 
 ## Maintenance
@@ -219,9 +252,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6db124a4c6cc2901f785ae5cc48cb086e2c4927b14f4e95fced6bc805d86df1c",
-  "reviewed_at": "2026-09-23T07:23:17Z",
-  "summary": "Prompt-cache billing: cache prices on llm_models (cache_read/cache_write 5m/cache_write_1h, manual only, unset bills 0 and marks partial), org-report shaped ledger columns with prompt_tokens kept as total input, UsageBreakdown readers for LiteLLM/Anthropic/Responses incl. compaction iterations and stream merge, every billing path incl. advisor and interrupted streams, migration 014, admin API and billing breakdown; reviewed source in the index, excluding the concurrent live-provider-model-onboarding work."
+  "source_sha256": "43152e9df721074181733e54ca0cf7d9cc0fd62c849131c6574dc207af1dd5ae",
+  "reviewed_at": "2026-09-23T19:19:34Z",
+  "summary": "CI critical-path and duplicate-run reduction (source-reviewed; runtime effect CI-unverified): ci.yml is workflow_call/workflow_dispatch only; docker-build.yml is the single push/PR/tag test entry with a PR-only read-only dedup job that skips test/build only for a same-repo dev/main non-dependabot PR whose merge tree equals its head tree (env-only inputs, any error runs tests), build-and-push gated on !cancelled() && needs.test.result == 'success', PR builds read but never export GHA cache; Datastore integration health checks 2s/30 retries/5s start; system job runs stdlib-only python3 -m lumen.scripts.test_layers system without host uv; test_layers builds all compose services in one parallel build, drops the second --build and tears down with --timeout 1; docker/Dockerfile pins uv 0.12.18 after the apt layer and replaces chown -R /app with pre-COPY user/dir setup, COPY --chown=appuser:appuser and appuser compileall (same ownership); tests/test_ci_shape.py and tests/test_test_layers.py pin the shape; AGENTS.md gains the CI performance rules with the 171s/194s CI and 558s/665s docker-build baseline. No service ownership, flow, store or API contract change."
 }
 ```
 <!-- architecture-review:end -->

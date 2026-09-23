@@ -35,10 +35,9 @@ on:
         required: false
         default: ''
         description: 'afterglow-crypto git ref override'
-  pull_request:
-    branches: [main, dev]
-  push:
-    branches: [main, dev]
+# No push/pull_request triggers: docker-build.yml calls this workflow once per
+# event and gates image publishing on it, so a direct trigger would run the same
+# test suite twice for every push and PR (see AGENTS.md CI rules 9 and 11).
 
 permissions:
   contents: read
@@ -119,11 +118,13 @@ jobs:
         ports: ["3306:3306"]
         options: >-
           --health-cmd "healthcheck.sh --connect --innodb_initialized"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+          --health-interval 2s --health-timeout 5s --health-retries 30 --health-start-period 5s
       redis:
         image: redis:7
         ports: ["6379:6379"]
-        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 10
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 5s --health-retries 30 --health-start-period 5s
     env:
       DATABASE_URL: mysql+aiomysql://lumen:lumen@127.0.0.1:3306/lumen
       REDIS_URL: redis://127.0.0.1:6379/0
@@ -156,12 +157,9 @@ jobs:
         with:
           repository: ${{ inputs.lumen_repository || github.repository }}
           ref: ${{ inputs.lumen_ref || github.sha }}
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: '3.12'
-          enable-cache: true
-      - run: uv sync --extra service --extra dev --frozen
+      # No setup-uv/uv sync: test_layers is stdlib-only and the images run
+      # their own uv sync, so a host venv would only add setup time here.
       - name: Run system integration tests
         env:
           AFTERGLOW_CRYPTO_REF: ${{ inputs.afterglow_crypto_ref }}
-        run: uv run lumen-test system
+        run: python3 -m lumen.scripts.test_layers system

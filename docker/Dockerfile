@@ -5,12 +5,14 @@ ARG AFTERGLOW_CRYPTO_REF=""
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
     && rm -rf /var/lib/apt/lists/*
+
+# Pinned and copied after the apt layer: a floating uv tag changes digest often
+# and otherwise invalidates the build-essential layer (~106s under arm64 QEMU).
+COPY --from=ghcr.io/astral-sh/uv:0.12.18 /uv /uvx /bin/
 
 COPY pyproject.toml uv.lock LICENSE ./
 RUN uv sync --frozen --extra service --no-dev --no-install-project
@@ -35,23 +37,27 @@ FROM python:3.12-slim AS lumen-runtime
 
 WORKDIR /app
 
-COPY --from=lumen-builder /app/.venv /app/.venv
-COPY pyproject.toml uv.lock LICENSE ./
-COPY lumen/ ./lumen/
-COPY lumen_console/ ./lumen_console/
-
+# The user, directories and their ownership come before the source COPYs so
+# this layer stays cached across code changes. COPY --chown replaces a
+# recursive chown, which copied the whole venv into another layer.
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && python -m compileall -q lumen \
     && adduser --disabled-password --gecos "" appuser \
     && adduser appuser root \
-    && mkdir -p /data /seed \
-    && chown appuser:appuser /data /seed \
-    && chown -R appuser:appuser /app
+    && mkdir -p /data /seed /app/.venv /app/lumen /app/lumen_console \
+    && chown appuser:appuser /app /app/.venv /app/lumen /app/lumen_console /data /seed
+
+COPY --from=lumen-builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --chown=appuser:appuser pyproject.toml uv.lock LICENSE ./
+COPY --chown=appuser:appuser lumen/ ./lumen/
+COPY --chown=appuser:appuser lumen_console/ ./lumen_console/
 
 ENV PATH="/app/.venv/bin:$PATH"
 
 USER appuser
+
+# Compiled as appuser so __pycache__ keeps appuser ownership.
+RUN python -m compileall -q lumen
 
 FROM lumen-runtime AS lumen-api
 CMD ["uvicorn", "lumen.main:app", "--host", "0.0.0.0", "--port", "8012"]
@@ -63,23 +69,23 @@ FROM python:3.12-slim AS lumen-test
 
 WORKDIR /app
 
-COPY --from=lumen-test-builder /app/.venv /app/.venv
-COPY pyproject.toml uv.lock LICENSE ./
-COPY lumen/ ./lumen/
-COPY lumen_console/ ./lumen_console/
-COPY tests/ ./tests/
-
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && python -m compileall -q lumen tests \
     && adduser --disabled-password --gecos "" appuser \
     && adduser appuser root \
-    && mkdir -p /data /seed \
-    && chown appuser:appuser /data /seed \
-    && chown -R appuser:appuser /app
+    && mkdir -p /data /seed /app/.venv /app/lumen /app/lumen_console /app/tests \
+    && chown appuser:appuser /app /app/.venv /app/lumen /app/lumen_console /app/tests /data /seed
+
+COPY --from=lumen-test-builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --chown=appuser:appuser pyproject.toml uv.lock LICENSE ./
+COPY --chown=appuser:appuser lumen/ ./lumen/
+COPY --chown=appuser:appuser lumen_console/ ./lumen_console/
+COPY --chown=appuser:appuser tests/ ./tests/
 
 ENV PATH="/app/.venv/bin:$PATH"
 
 USER appuser
+
+RUN python -m compileall -q lumen tests
 
 CMD ["pytest", "-m", "system", "tests/system"]

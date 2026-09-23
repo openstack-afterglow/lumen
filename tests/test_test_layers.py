@@ -56,7 +56,17 @@ def test_run_integration_success(mock_run: MagicMock) -> None:
     ]
     assert calls[1][0][0] == ["lumen-migrate", "--apply"]
     assert calls[2][0][0] == ["pytest", "-m", "integration"]
-    assert calls[3][0][0] == ["docker", "compose", "-f", "docker-compose.system.yml", "down", "-v", "--remove-orphans"]
+    assert calls[3][0][0] == [
+        "docker",
+        "compose",
+        "-f",
+        "docker-compose.system.yml",
+        "down",
+        "-v",
+        "--remove-orphans",
+        "--timeout",
+        "1",
+    ]
     projects = {call.kwargs["env"]["COMPOSE_PROJECT_NAME"] for call in calls}
     assert len(projects) == 1
     assert next(iter(projects)).startswith("lumen-integration-")
@@ -77,7 +87,17 @@ def test_run_integration_cleanup_on_failure(mock_run: MagicMock) -> None:
 
     calls = mock_run.call_args_list
     assert len(calls) == 4
-    assert calls[3][0][0] == ["docker", "compose", "-f", "docker-compose.system.yml", "down", "-v", "--remove-orphans"]
+    assert calls[3][0][0] == [
+        "docker",
+        "compose",
+        "-f",
+        "docker-compose.system.yml",
+        "down",
+        "-v",
+        "--remove-orphans",
+        "--timeout",
+        "1",
+    ]
 
 
 @patch("subprocess.run")
@@ -90,12 +110,11 @@ def test_run_system_success(mock_run: MagicMock) -> None:
     calls = mock_run.call_args_list
     assert len(calls) == 4
     compose = ["docker", "compose", "-f", "docker-compose.system.yml"]
-    assert calls[0][0][0] == [*compose, "build", "system-tests"]
+    assert calls[0][0][0] == [*compose, "build"]
     assert calls[1][0][0] == [
         *compose,
         "up",
         "-d",
-        "--build",
         "--wait",
         "--wait-timeout",
         "180",
@@ -103,7 +122,7 @@ def test_run_system_success(mock_run: MagicMock) -> None:
         "lumen-worker",
     ]
     assert calls[2][0][0] == [*compose, "run", "--rm", "--no-deps", "system-tests"]
-    assert calls[3][0][0] == [*compose, "down", "-v", "--remove-orphans"]
+    assert calls[3][0][0] == [*compose, "down", "-v", "--remove-orphans", "--timeout", "1"]
     projects = {call.kwargs["env"]["COMPOSE_PROJECT_NAME"] for call in calls}
     assert len(projects) == 1
     assert next(iter(projects)).startswith("lumen-system-")
@@ -113,7 +132,7 @@ def test_run_system_success(mock_run: MagicMock) -> None:
 @patch("subprocess.run")
 def test_run_system_logs_and_cleanup_on_failure(mock_run: MagicMock) -> None:
     mock_run.side_effect = [
-        MagicMock(returncode=1),  # up fails
+        MagicMock(returncode=1),  # build fails
         MagicMock(returncode=0),  # logs
         MagicMock(returncode=0),  # down
     ]
@@ -124,4 +143,14 @@ def test_run_system_logs_and_cleanup_on_failure(mock_run: MagicMock) -> None:
     calls = mock_run.call_args_list
     assert len(calls) == 3
     assert calls[1][0][0] == ["docker", "compose", "-f", "docker-compose.system.yml", "logs"]
-    assert calls[2][0][0] == ["docker", "compose", "-f", "docker-compose.system.yml", "down", "-v", "--remove-orphans"]
+    assert calls[2][0][0] == [
+        "docker",
+        "compose",
+        "-f",
+        "docker-compose.system.yml",
+        "down",
+        "-v",
+        "--remove-orphans",
+        "--timeout",
+        "1",
+    ]
