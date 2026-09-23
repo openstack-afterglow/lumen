@@ -225,24 +225,38 @@ def usage_iteration_totals(usage: object) -> tuple[int, int] | None:
     at zero.  ``None`` means the payload carries no usable iteration breakdown
     and the caller's existing accounting is already correct.
     """
+    totals = usage_iteration_breakdown(usage)
+    return None if totals is None else (totals[0], totals[1])
+
+
+def usage_iteration_breakdown(usage: object) -> tuple[int, int, int, int] | None:
+    """Return ``(input, output, cache_read, cache_creation)`` summed over ``usage.iterations``.
+
+    The cache counters are summed per iteration the same way LiteLLM's
+    ``calculate_usage`` does, because the top-level cache counters exclude the
+    compaction iteration exactly like the top-level input counter does.
+    ``input`` stays Anthropic's uncached quantity; callers add the cache
+    counters themselves when they need total input.
+    """
     if not isinstance(usage, dict):
         return None
     iterations = usage.get("iterations")
     if not isinstance(iterations, list) or not iterations:
         return None
-    input_tokens = 0
-    output_tokens = 0
+    totals = [0, 0, 0, 0]
+    keys = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
     for iteration in iterations:
         if not isinstance(iteration, dict):
             return None
-        value_in = iteration.get("input_tokens")
-        value_out = iteration.get("output_tokens")
-        if value_in is not None:
-            if not isinstance(value_in, int) or isinstance(value_in, bool) or value_in < 0:
+        for index, key in enumerate(keys):
+            value = iteration.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                # A malformed cache counter is ignored rather than voiding the
+                # whole breakdown, so input/output accounting stays unchanged.
+                if index >= 2:
+                    continue
                 return None
-            input_tokens += value_in
-        if value_out is not None:
-            if not isinstance(value_out, int) or isinstance(value_out, bool) or value_out < 0:
-                return None
-            output_tokens += value_out
-    return input_tokens, output_tokens
+            totals[index] += value
+    return totals[0], totals[1], totals[2], totals[3]

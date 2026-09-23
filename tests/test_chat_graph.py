@@ -18,6 +18,10 @@ from lumen.services import graph, litellm_client
 from lumen.services.tool_runtime import contracts, selection
 from lumen.services.tool_runtime import dispatch as tool_runtime
 
+# Runtime usage dicts always carry the prompt-cache split; these rounds report no cache.
+_NO_CACHE = {"cache_read_input_tokens": 0, "cache_creation_5m_input_tokens": 0, "cache_creation_1h_input_tokens": 0}
+
+
 _MSGS = [{"role": "user", "content": "안녕하세요"}]
 
 
@@ -102,7 +106,7 @@ class TestGraphStream:
         assert types.count("token") == 2
         assert events[0] == {"type": "token", "text": "안녕"}
         usage = [e for e in events if e["type"] == "usage"][-1]
-        assert usage["usage"] == {"prompt_tokens": 5, "completion_tokens": 2}
+        assert usage["usage"] == {"prompt_tokens": 5, "completion_tokens": 2, **_NO_CACHE}
 
     async def test_emits_reasoning_events(self, monkeypatch):
         """reasoning_content 델타 → reasoning 이벤트(최종 답변 텍스트와 분리)."""
@@ -834,12 +838,66 @@ class TestToolLoop:
         assert text == "대화는 3개입니다"
         # 멀티스텝 usage 합산 (10+20, 3+5)
         usage = [e for e in events if e["type"] == "usage"][-1]
-        assert usage["usage"] == {"prompt_tokens": 30, "completion_tokens": 8}
+        assert usage["usage"] == {"prompt_tokens": 30, "completion_tokens": 8, **_NO_CACHE}
         assert captured["second_messages"][-1] == {
             "role": "tool",
             "tool_call_id": "call_1",
             "name": "list_my_conversations",
             "content": "대화 3개",
+        }
+
+    async def test_multistep_usage_sums_prompt_cache_categories(self, monkeypatch):
+        """Each round's LiteLLM-normalized cache split survives the round sum."""
+        from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+        def anthropic_usage(uncached, output, read, five_minute, one_hour):
+            return AnthropicConfig().calculate_usage(
+                {
+                    "input_tokens": uncached,
+                    "output_tokens": output,
+                    "cache_read_input_tokens": read,
+                    "cache_creation_input_tokens": five_minute + one_hour,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": five_minute,
+                        "ephemeral_1h_input_tokens": one_hour,
+                    },
+                },
+                None,
+            )
+
+        responses = [
+            [
+                _ChunkTC(_DeltaTC(tool_calls=[_ToolCallDelta(0, "call_1", "list_my_conversations", "{}")])),
+                _ChunkTC(_DeltaTC(), usage=anthropic_usage(10, 3, 0, 40, 10)),
+            ],
+            [
+                _ChunkTC(_DeltaTC(content="완료")),
+                _ChunkTC(_DeltaTC(), usage=anthropic_usage(5, 2, 50, 4, 0)),
+            ],
+        ]
+        calls = {"n": 0}
+
+        async def fake_stream(**_kwargs):
+            idx = calls["n"]
+            calls["n"] += 1
+            return _aiter(responses[idx])
+
+        async def fake_execute(_name, _args, _ctx):
+            return contracts.ToolExecutionResult("대화 3개")
+
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
+
+        events = [ev async for ev in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
+
+        usage = [e for e in events if e["type"] == "usage"][-1]
+        # prompt_tokens stays total input: (10+40+10) + (5+50+4).
+        assert usage["usage"] == {
+            "prompt_tokens": 119,
+            "completion_tokens": 5,
+            "cache_read_input_tokens": 50,
+            "cache_creation_5m_input_tokens": 44,
+            "cache_creation_1h_input_tokens": 10,
         }
 
     async def test_long_provider_tool_id_uses_bounded_journal_id_and_is_echoed_to_provider(self, monkeypatch):
@@ -1121,7 +1179,7 @@ class TestToolLoop:
             )
         ]
 
-        assert events[-1] == {"type": "usage", "usage": {"prompt_tokens": 2, "completion_tokens": 3}}
+        assert events[-1] == {"type": "usage", "usage": {"prompt_tokens": 2, "completion_tokens": 3, **_NO_CACHE}}
         assert {"type": "token", "text": "replayed"} in events
 
     async def test_batches_multi_tool_calls_in_one_assistant_event(self, monkeypatch):
@@ -1289,7 +1347,7 @@ class TestUsageEstimation:
             )
         ]
         usage = [event for event in events if event["type"] == "usage"][-1]
-        assert usage["usage"] == {"prompt_tokens": 9, "completion_tokens": 3}
+        assert usage["usage"] == {"prompt_tokens": 9, "completion_tokens": 3, **_NO_CACHE}
 
 
 async def test_graph_invokes_prepare_context_hook(monkeypatch):

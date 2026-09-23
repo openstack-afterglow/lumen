@@ -110,6 +110,11 @@ class LlmModel(Base):
     # 미지정 시 litellm 내장 단가 사용 (override용). 토큰당 USD 단가.
     input_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     output_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
+    # 프롬프트 캐시 토큰당 USD 단가(관리자 수동 설정 전용, catalog fallback 없음).
+    # 미설정 카테고리는 0원으로 과금하고 pricing_status=partial 로 남는다.
+    cache_read_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
+    cache_write_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # 5분 TTL cache write
+    cache_write_1h_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     # models.dev catalog mapping and the immutable provenance of the last import.
     models_dev_model_id: Mapped[str | None] = mapped_column(VARCHAR(190))
     price_source: Mapped[str | None] = mapped_column(VARCHAR(20))
@@ -249,8 +254,13 @@ class ChatUsageLog(Base):
     conversation_id: Mapped[str | None] = mapped_column(CHAR(36))  # 대화 삭제 후에도 원장 보존 — FK 없음
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     provider: Mapped[str | None] = mapped_column(VARCHAR(100))
+    # prompt_tokens 는 캐시 read/creation 을 포함한 총 입력이다.
+    # uncached = prompt_tokens - cache_read - cache_creation_5m - cache_creation_1h (파생, 음수 없음).
     prompt_tokens: Mapped[int] = mapped_column(INT, nullable=False, default=0)
     completion_tokens: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    cache_read_input_tokens: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    cache_creation_5m_input_tokens: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    cache_creation_1h_input_tokens: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
     raw_cost: Mapped[Decimal] = mapped_column(Numeric(20, 10), nullable=False, default=Decimal("0"))
     credited_cost: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     source: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="web")  # web | api

@@ -29,6 +29,7 @@ from lumen.services.providers.credentials import (
     perplexity_route_model_name,
 )
 from lumen.services.providers.errors import ProviderSubscriptionError
+from lumen.services.usage_breakdown import UsageBreakdown
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +55,14 @@ _OFFICIAL_PRICE_PER_MILLION: dict[tuple[str, str], tuple[Decimal, Decimal, str]]
 @dataclass(frozen=True)
 class UsageCost:
     raw_cost: Decimal
+    # ``input_cost`` prices UNCACHED input only; cache categories carry their own cost.
     input_cost: Decimal
     output_cost: Decimal
     pricing_status: Literal["priced", "partial", "unpriced"]
     pricing_snapshot: dict[str, object]
+    cache_read_cost: Decimal = Decimal("0")
+    cache_creation_5m_cost: Decimal = Decimal("0")
+    cache_creation_1h_cost: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -150,37 +155,36 @@ def count_context_tokens(model: str, messages: list[dict], tools: list[dict] | N
         )
 
 
-def _usage_field(usage: Any, key: str) -> int | None:
-    """usage(dict 또는 litellm Usage 객체)에서 정수 필드를 안전하게 추출."""
-    val = usage.get(key) if isinstance(usage, Mapping) else getattr(usage, key, None)
-    if val is None:
-        return None
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return None
-
-
 def extract_usage(
     model: str,
     messages: list[dict],
     completion_text: str,
     final_usage: Any | None,
 ) -> tuple[int, int]:
-    """(prompt_tokens, completion_tokens) 산출.
+    """(prompt_tokens, completion_tokens) 산출. prompt_tokens 는 캐시 포함 총 입력이다.
 
     스트리밍 마지막 청크의 usage 가 있으면 그대로, 없으면 token_counter 폴백.
     이 폴백이 없으면 스트리밍 경로에서 completion_cost 가 0이 되어 과금이 누락된다.
     """
+    usage = extract_usage_breakdown(model, messages, completion_text, final_usage)
+    return usage.input_tokens, usage.output_tokens
+
+
+def extract_usage_breakdown(
+    model: str,
+    messages: list[dict],
+    completion_text: str,
+    final_usage: Any | None,
+) -> UsageBreakdown:
+    """Return the ledger breakdown; the token-counter fallback carries no cache split."""
     if final_usage is not None:
-        pt = _usage_field(final_usage, "prompt_tokens")
-        ct = _usage_field(final_usage, "completion_tokens")
-        if pt is not None and ct is not None:
-            return pt, ct
+        breakdown = UsageBreakdown.from_runtime(final_usage)
+        if breakdown is not None:
+            return breakdown
 
     prompt_tokens = count_tokens(model, messages=messages)
     completion_tokens = count_tokens(model, text=completion_text)
-    return prompt_tokens, completion_tokens
+    return UsageBreakdown.from_totals(prompt_tokens, completion_tokens)
 
 
 def _as_decimal(value: object) -> Decimal | None:
@@ -317,6 +321,19 @@ def _decimal_string(value: Decimal | None) -> str | None:
     return format(value, "f") if value is not None else None
 
 
+def _snapshot_component(
+    tokens: int, rate: Decimal | None, cost: Decimal, source: str | None, **extra: object
+) -> dict[str, object]:
+    return {
+        "tokens": tokens,
+        "effective_price_per_token": _decimal_string(rate),
+        "effective_price_per_million": _decimal_string(rate * _TOKENS_PER_MILLION if rate is not None else None),
+        "cost": _decimal_string(cost),
+        "source": source,
+        **extra,
+    }
+
+
 def cost_from_usage(
     model: str,
     prompt_tokens: int,
@@ -326,17 +343,35 @@ def cost_from_usage(
     output_price_per_token: Decimal | None,
     price_source: str | None,
     provider_type: str | None = None,
+    breakdown: UsageBreakdown | None = None,
+    cache_read_price_per_token: Decimal | None = None,
+    cache_write_price_per_token: Decimal | None = None,
+    cache_write_1h_price_per_token: Decimal | None = None,
 ) -> UsageCost:
-    """Resolve manual → reviewed models.dev → LiteLLM bundled pricing per component."""
-    prompt_tokens = max(0, int(prompt_tokens))
-    completion_tokens = max(0, int(completion_tokens))
+    """Resolve manual → reviewed models.dev → LiteLLM bundled pricing per component.
+
+    ``prompt_tokens`` is total input. With a ``breakdown`` the input component
+    prices only the uncached share and each cache category uses its own
+    manual rate. Cache rates never fall back to a catalog: an unset rate bills
+    that category at 0 and marks the usage ``partial``.
+    """
+    if breakdown is None:
+        breakdown = UsageBreakdown.from_totals(prompt_tokens, completion_tokens)
+    elif (breakdown.input_tokens, breakdown.output_tokens) != (
+        max(0, int(prompt_tokens)),
+        max(0, int(completion_tokens)),
+    ):
+        raise ValueError("usage breakdown totals do not match prompt/completion tokens")
+    prompt_tokens = breakdown.input_tokens
+    completion_tokens = breakdown.output_tokens
+    uncached_tokens = breakdown.uncached_input_tokens
     fallback_input, fallback_output, fallback_source = (
         _fallback_component_rates(model, prompt_tokens, completion_tokens, provider_type)
         if input_price_per_token is None or output_price_per_token is None
         else (None, None, None)
     )
     input_cost, input_rate, input_source, input_priced = _component_cost(
-        tokens=prompt_tokens,
+        tokens=uncached_tokens,
         stored_rate=input_price_per_token,
         stored_source=price_source,
         fallback_rate=fallback_input,
@@ -349,43 +384,44 @@ def cost_from_usage(
         fallback_rate=fallback_output,
         fallback_source=fallback_source,
     )
+    input_cost = input_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
+    output_cost = output_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
+    cache_components: dict[str, tuple[int, Decimal | None, Decimal]] = {}
+    for name, tokens, rate in (
+        ("cache_read", breakdown.cache_read_input_tokens, cache_read_price_per_token),
+        ("cache_creation_5m", breakdown.cache_creation_5m_input_tokens, cache_write_price_per_token),
+        ("cache_creation_1h", breakdown.cache_creation_1h_input_tokens, cache_write_1h_price_per_token),
+    ):
+        cost = (rate * tokens).quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else Decimal("0")
+        cache_components[name] = (tokens, rate, cost)
     priced_components = int(input_priced) + int(output_priced)
     pricing_status: Literal["priced", "partial", "unpriced"]
     if priced_components == 2:
-        pricing_status = "priced"
+        unpriced_cache = any(tokens > 0 and rate is None for tokens, rate, _ in cache_components.values())
+        pricing_status = "partial" if unpriced_cache else "priced"
     elif priced_components:
         pricing_status = "partial"
     else:
         pricing_status = "unpriced"
-    raw_cost = (input_cost + output_cost).quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
-    snapshot = {
+    raw_cost = input_cost + output_cost + sum((cost for _, _, cost in cache_components.values()), Decimal("0"))
+    snapshot: dict[str, object] = {
         "model": model,
-        "input": {
-            "tokens": prompt_tokens,
-            "effective_price_per_token": _decimal_string(input_rate),
-            "effective_price_per_million": _decimal_string(
-                input_rate * _TOKENS_PER_MILLION if input_rate is not None else None
-            ),
-            "cost": _decimal_string(input_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)),
-            "source": input_source,
-            "provider_type": provider_type,
-        },
-        "output": {
-            "tokens": completion_tokens,
-            "effective_price_per_token": _decimal_string(output_rate),
-            "effective_price_per_million": _decimal_string(
-                output_rate * _TOKENS_PER_MILLION if output_rate is not None else None
-            ),
-            "cost": _decimal_string(output_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)),
-            "source": output_source,
-        },
+        "input": _snapshot_component(
+            uncached_tokens, input_rate, input_cost, input_source, provider_type=provider_type
+        ),
+        "output": _snapshot_component(completion_tokens, output_rate, output_cost, output_source),
     }
+    for name, (tokens, rate, cost) in cache_components.items():
+        snapshot[name] = _snapshot_component(tokens, rate, cost, "manual" if rate is not None else None)
     return UsageCost(
-        raw_cost=raw_cost,
-        input_cost=input_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP),
-        output_cost=output_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP),
+        raw_cost=raw_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP),
+        input_cost=input_cost,
+        output_cost=output_cost,
         pricing_status=pricing_status,
         pricing_snapshot=snapshot,
+        cache_read_cost=cache_components["cache_read"][2],
+        cache_creation_5m_cost=cache_components["cache_creation_5m"][2],
+        cache_creation_1h_cost=cache_components["cache_creation_1h"][2],
     )
 
 

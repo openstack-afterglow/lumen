@@ -128,6 +128,8 @@ async def test_openai_admin_reports_normalize_current_period_cost_requests_and_t
         "cost": {"daily": "2.75", "weekly": "4.00", "monthly": "4.00", "total": None},
         "requests": {"daily": "5", "weekly": "5", "monthly": "5", "total": None},
         "tokens": {"daily": "170", "weekly": "170", "monthly": "170", "total": None},
+        # The OpenAI completions usage report has no cache-creation split.
+        "token_breakdown": None,
     }
     assert {call[0] for call in calls} == {"openai_costs", "openai_usage"}
     assert all(call[1] == "admin-secret" for call in calls)
@@ -172,6 +174,15 @@ async def test_anthropic_admin_reports_convert_minor_units_and_sum_token_classes
     assert snapshot["provider_usage"]["cost"]["monthly"] == "2.5"
     assert snapshot["provider_usage"]["requests"] is None
     assert snapshot["provider_usage"]["tokens"]["daily"] == "165"
+    breakdown = snapshot["provider_usage"]["token_breakdown"]
+    assert {category: periods["daily"] for category, periods in breakdown.items()} == {
+        "uncached_input": "100",
+        "cache_read": "20",
+        "cache_creation_5m": "10",
+        "cache_creation_1h": "5",
+        "output": "30",
+    }
+    assert all(periods["total"] is None for periods in breakdown.values())
 
 
 @pytest.mark.parametrize("provider", ["openai", "anthropic"])
@@ -342,6 +353,28 @@ async def test_local_usage_aggregates_all_periods_and_keeps_missing_providers_ze
             5,
             500,
             Decimal("5.0"),
+            # Category columns follow the legacy ones: (total, daily, weekly, monthly) each for
+            # uncached_input, cache_read, cache_creation_5m, cache_creation_1h, output.
+            500,
+            60,
+            190,
+            310,
+            100,
+            10,
+            40,
+            60,
+            40,
+            5,
+            20,
+            30,
+            10,
+            5,
+            0,
+            10,
+            150,
+            20,
+            50,
+            90,
         )
     ]
 
@@ -379,6 +412,13 @@ async def test_local_usage_aggregates_all_periods_and_keeps_missing_providers_ze
         "requests": {"total": "8", "daily": "1", "weekly": "3", "monthly": "5"},
         "tokens": {"total": "800", "daily": "100", "weekly": "300", "monthly": "500"},
         "raw_cost": {"total": "8.0", "daily": "1.0", "weekly": "3.0", "monthly": "5.0"},
+        "token_breakdown": {
+            "uncached_input": {"total": "500", "daily": "60", "weekly": "190", "monthly": "310"},
+            "cache_read": {"total": "100", "daily": "10", "weekly": "40", "monthly": "60"},
+            "cache_creation_5m": {"total": "40", "daily": "5", "weekly": "20", "monthly": "30"},
+            "cache_creation_1h": {"total": "10", "daily": "5", "weekly": "0", "monthly": "10"},
+            "output": {"total": "150", "daily": "20", "weekly": "50", "monthly": "90"},
+        },
     }
     assert "claude-prod" not in usage_by_name
 

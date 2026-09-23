@@ -66,6 +66,18 @@ Current Claude Apps Gateway login은 administrator-managed `forceLoginGatewayUrl
 
 OpenRouter와 DeepSeek는 inference credential과 동일한 API key를 사용해 각각 고정된 공식 `GET https://openrouter.ai/api/v1/key`, `GET https://api.deepseek.com/user/balance`에서 live 한도·잔액을 보강한다. Gemini는 programmatic prepay balance API가 없어 `provider_console_only`, Perplexity Enterprise Computer Analytics는 Sonar/API Platform billing과 제품 범위가 달라 `provider_analytics_scope_mismatch`를 반환하고 outbound analytics 요청을 하지 않는다. API-key provider에는 Lumen이 고정한 공식 HTTPS 결제·사용량 console URL을 반환하지만 subscription auth와 custom base에는 official provider portal을 붙이지 않는다. Provider/report별 실패는 다른 provider와 route 전체를 실패시키지 않고 안전한 `status`/`reason`으로 격리한다. Credential, upstream body, 원문 오류는 응답이나 로그에 복제하지 않는다.
 
+Anthropic direct provider의 `provider_usage.token_breakdown`과 모든 provider의 `local_usage.token_breakdown`은 Anthropic organization usage report 범주(`uncached_input`, `cache_read`, `cache_creation_5m`, `cache_creation_1h`, `output`)별 일·주·월(local은 누적 포함) token 수를 추가로 반환한다. 기존 `tokens` 합계 field는 그대로다. Local ledger의 `uncached_input`은 행마다 `prompt_tokens - cache_read - cache_creation_5m - cache_creation_1h`를 0 이상으로 clamp해 파생한다. OpenAI organization Completions Usage report에는 cache creation 분할이 없어 OpenAI의 `provider_usage.token_breakdown`은 `null`이다.
+
+## 모델 단가와 prompt-cache 단가
+
+관리자 `POST /v1/admin/models`와 `PATCH /v1/admin/models/{model_id}`는 기존 `input_price_per_million`/`output_price_per_million` 쌍 외에 선택적 `cache_read_price_per_million`, `cache_write_price_per_million`(5분 TTL cache write), `cache_write_1h_price_per_million`을 받는다. 세 cache 단가는 서로 독립이며 입력·출력 쌍 규칙과도 무관하다. PATCH에서 key가 있으면 설정하고 `null`은 제거하며, key가 없으면 기존 값을 유지한다. 유한한 0 이상 값만 허용하고 저장 정밀도(토큰당 10자리)보다 작은 0 아닌 값은 422/400으로 거부한다. 응답 projection은 세 필드를 per-million Decimal 문자열 또는 `null`로 반환한다. 실행 중인 run이 쓰는 모델의 cache 단가 변경도 다른 가격 변경과 같은 active-run lock(409)을 거친다.
+
+Cache 단가에는 LiteLLM 또는 models.dev catalog fallback이 없다. 미설정 범주의 cache token은 0 USD로 과금되고 그 usage는 input/output이 가격화되어 있으면 `pricing_status="partial"`이다. 관리자가 단가를 설정한 시점 이후 admission된 run과 stateless 호환 요청부터 정상 과금된다. 이미 admission된 durable run은 frozen snapshot의 단가(과거 snapshot에는 cache key가 없으므로 0)를 사용한다. 비용은 `uncached_input × input + cache_read × cache_read + cache_creation_5m × cache_write + cache_creation_1h × cache_write_1h + output × output`이다. Cache 단가가 하나라도 설정된 모델만 `config_version_hash`에 cache 단가를 포함하므로 cache 단가가 없는 모델의 기존 hash는 변하지 않는다.
+
+`chat_usage_logs.prompt_tokens`는 계속 cache read/creation을 포함한 총 입력이고, 새 `cache_read_input_tokens`, `cache_creation_5m_input_tokens`, `cache_creation_1h_input_tokens` 열이 분할을 기록한다. `/v1/chat/completions`, `/v1/responses`, `/v1/messages` 응답의 caller-facing token 수는 바뀌지 않는다(`usage.prompt_tokens`는 총 입력). TTL 분할이 없는 cache creation은 모두 5분 범주로 기록한다. `/v1/messages` stream이 `message_stop` 전에 끊기면 `message_start`(와 받은 `message_delta`)의 입력·cache 분할을 그대로 과금하고 출력만 로컬 token counter 값이 더 크면 그 값을 쓴다; 보고된 usage가 없거나 입력이 0이면(LiteLLM의 non-Anthropic `/v1/messages` adapter는 `message_start`에 전부 0인 usage를 보내고 실제 값은 마지막에만 보낸다) 입력은 로컬 token counter(cache 분할 없음)로 과금한다.
+
+Managed advisor는 advisor 모델 행의 manual cache 단가를 run snapshot `component_prices`에 `advisor_cache_read_price_per_token`, `advisor_cache_write_price_per_token`, `advisor_cache_write_1h_price_per_token`으로 (설정된 것만) 고정한다. advisor 입력 단가는 uncached 입력에만 적용되고, 단가가 없는 advisor cache 범주는 0 USD이며 해당 component `metadata.unpriced=true`와 함께 run usage를 `partial`로 만든다.
+
 ## API 키와 월·주간 사용 한도
 
 API 키 발급 및 한도 관리는 Keystone token 인증 전용(Keystone-only)이다. API 키 헤더(Bearer/X-API-Key)로 관리 route 호출 시 401 Unauthorized를 반환한다.

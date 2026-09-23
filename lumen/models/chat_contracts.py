@@ -621,6 +621,10 @@ _USAGE_KINDS = {
     "input_tokens",
     "output_tokens",
     "cached_input_tokens",
+    # Anthropic organization-report categories; ``input_tokens`` is then the uncached share.
+    "cache_read_input_tokens",
+    "cache_creation_5m_input_tokens",
+    "cache_creation_1h_input_tokens",
     "reasoning_tokens",
     "embedding_tokens",
     "web_search_requests",
@@ -629,6 +633,10 @@ _USAGE_KINDS = {
     "web_fetch_context",
     "advisor_input_tokens",
     "advisor_output_tokens",
+    # Advisor cache categories; ``advisor_input_tokens`` is then the uncached share.
+    "advisor_cache_read_tokens",
+    "advisor_cache_creation_5m_tokens",
+    "advisor_cache_creation_1h_tokens",
     "image_units",
     "audio_input_seconds",
     "audio_output_seconds",

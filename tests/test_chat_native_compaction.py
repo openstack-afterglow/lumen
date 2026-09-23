@@ -348,16 +348,22 @@ class TestPassthroughBilling:
                 ],
             }
         }
-        assert completion_api._native_usage(payload, input_key="input_tokens", output_key="output_tokens") == {
+        assert completion_api._native_usage(payload, protocol="anthropic") == {
             "prompt_tokens": 203_000,
             "completion_tokens": 4_500,
+            "cache_read_input_tokens": 0,
+            "cache_creation_5m_input_tokens": 0,
+            "cache_creation_1h_input_tokens": 0,
         }
 
     def test_uncompacted_response_keeps_the_existing_reading(self):
         payload = {"usage": {"input_tokens": 12, "output_tokens": 3}}
-        assert completion_api._native_usage(payload, input_key="input_tokens", output_key="output_tokens") == {
+        assert completion_api._native_usage(payload, protocol="anthropic") == {
             "prompt_tokens": 12,
             "completion_tokens": 3,
+            "cache_read_input_tokens": 0,
+            "cache_creation_5m_input_tokens": 0,
+            "cache_creation_1h_input_tokens": 0,
         }
 
 

@@ -220,7 +220,8 @@ async def generate_memory_if_applicable(
         usage = getattr(response, "usage", None)
         if usage is None and isinstance(response, Mapping):
             usage = response.get("usage")
-        prompt_tokens, completion_tokens = litellm_client.extract_usage(model, messages, text, usage)
+        breakdown = litellm_client.extract_usage_breakdown(model, messages, text, usage)
+        prompt_tokens, completion_tokens = breakdown.input_tokens, breakdown.output_tokens
         usage_cost = litellm_client.cost_from_usage(
             model,
             prompt_tokens,
@@ -229,6 +230,10 @@ async def generate_memory_if_applicable(
             output_price_per_token=resolved.get("output_price_per_token"),
             price_source=resolved.get("price_source"),
             provider_type=resolved.get("provider_type"),
+            breakdown=breakdown,
+            cache_read_price_per_token=resolved.get("cache_read_price_per_token"),
+            cache_write_price_per_token=resolved.get("cache_write_price_per_token"),
+            cache_write_1h_price_per_token=resolved.get("cache_write_1h_price_per_token"),
         )
         await credit.apply_usage(
             event_id=f"memory:{conversation_id}:{uuid.uuid4().hex}",
@@ -243,6 +248,7 @@ async def generate_memory_if_applicable(
             conversation_id=conversation_id,
             source="system",
             charge_wallet=False,
+            breakdown=breakdown,
         )
     except Exception:
         logger.warning("메모리 추출 시스템 과금 기록 실패 conv=%s", conversation_id, exc_info=True)

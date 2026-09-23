@@ -7,6 +7,7 @@ import logging
 
 from lumen.services import advisor, web_fetch, web_search
 from lumen.services.tools import ToolContext
+from lumen.services.usage_breakdown import UsageBreakdown
 
 from .contracts import ToolExecutionResult
 
@@ -205,25 +206,38 @@ async def _execute_managed_advisor(args: dict, ctx: ToolContext) -> ToolExecutio
     except advisor.AdvisorError:
         logger.warning("managed advisor failed", exc_info=True)
         return ToolExecutionResult("Advisor request failed.", visible=False, warning_code="advisor_call_failed")
+    breakdown = getattr(result, "breakdown", None)
+    if not isinstance(breakdown, UsageBreakdown):
+        breakdown = UsageBreakdown.from_totals(result.prompt_tokens, result.completion_tokens)
+    model_name = str(route.get("model_name") or "")
+    # Advisor input follows the ledger categories: the input rate applies to the
+    # uncached share only, and each cache category carries its own manual rate.
+    token_usage = [
+        ("advisor_input_tokens", "advisor_input_price_per_token", breakdown.uncached_input_tokens),
+        ("advisor_output_tokens", "advisor_output_price_per_token", breakdown.output_tokens),
+        (
+            "advisor_cache_read_tokens",
+            "advisor_cache_read_price_per_token",
+            breakdown.cache_read_input_tokens,
+        ),
+        (
+            "advisor_cache_creation_5m_tokens",
+            "advisor_cache_write_price_per_token",
+            breakdown.cache_creation_5m_input_tokens,
+        ),
+        (
+            "advisor_cache_creation_1h_tokens",
+            "advisor_cache_write_1h_price_per_token",
+            breakdown.cache_creation_1h_input_tokens,
+        ),
+    ]
     return ToolExecutionResult(
         result.advice,
         visible=False,
-        usage=(
-            _managed_usage(
-                kind="advisor_input_tokens",
-                price_key="advisor_input_price_per_token",
-                unit="token",
-                source="advisor",
-                model_name=str(route.get("model_name") or ""),
-            )
-            | {"quantity": str(result.prompt_tokens)},
-            _managed_usage(
-                kind="advisor_output_tokens",
-                price_key="advisor_output_price_per_token",
-                unit="token",
-                source="advisor",
-                model_name=str(route.get("model_name") or ""),
-            )
-            | {"quantity": str(result.completion_tokens)},
+        usage=tuple(
+            _managed_usage(kind=kind, price_key=price_key, unit="token", source="advisor", model_name=model_name)
+            | {"quantity": str(quantity)}
+            for kind, price_key, quantity in token_usage
+            if quantity > 0 or not kind.startswith("advisor_cache_")
         ),
     )

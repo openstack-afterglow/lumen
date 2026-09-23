@@ -157,6 +157,18 @@ def _require_execution_capability(
         raise HTTPException(status_code=422, detail="requested chat capability is not available")
 
 
+_CACHE_PRICE_KEYS = (
+    "cache_read_price_per_token",
+    "cache_write_price_per_token",
+    "cache_write_1h_price_per_token",
+)
+
+
+def _cache_price_snapshot(route: dict[str, Any]) -> dict[str, str | None]:
+    """Freeze the manual cache rates; ``None`` bills that cache category at 0."""
+    return {key: str(route[key]) if route.get(key) is not None else None for key in _CACHE_PRICE_KEYS}
+
+
 def _feature_route_snapshot(route: dict[str, Any], *, purpose: str) -> dict[str, Any]:
     """Copy only immutable non-secret route identity into the plaintext run snapshot."""
     fields = ("provider_id", "provider_name", "config_version_hash")
@@ -233,6 +245,11 @@ def _run_snapshots(
         for price_key, route_key in (
             ("advisor_input_price_per_token", "input_price_per_token"),
             ("advisor_output_price_per_token", "output_price_per_token"),
+            # Manual cache rates only (no catalog fallback); an absent key bills
+            # that advisor cache category at 0 and marks the usage partial.
+            ("advisor_cache_read_price_per_token", "cache_read_price_per_token"),
+            ("advisor_cache_write_price_per_token", "cache_write_price_per_token"),
+            ("advisor_cache_write_1h_price_per_token", "cache_write_1h_price_per_token"),
         ):
             if advisor_route.get(route_key) is not None:
                 component_prices[price_key] = str(advisor_route[route_key])
@@ -260,6 +277,7 @@ def _run_snapshots(
         "margin_multiplier": str(resolved.get("margin_multiplier", "1")),
         "chat_credit_per_usd": str(get_settings().chat_credit_per_usd),
         "rounding_version": "half_even_v1",
+        **_cache_price_snapshot(resolved),
     }
     if summary_route is not None:
         capability_snapshot["summary_route"] = _feature_route_snapshot(summary_route, purpose="summary")
@@ -274,6 +292,7 @@ def _run_snapshots(
             "price_version": summary_route.get("price_version"),
             "provider_name": summary_route.get("provider_name"),
             "model_name": summary_route.get("model_name"),
+            **_cache_price_snapshot(summary_route),
         }
     return capability_snapshot, pricing_snapshot
 

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from dataclasses import replace
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from time import monotonic
 from typing import Any
@@ -40,6 +41,7 @@ from lumen.services.run_store import (
     replay_events,
 )
 from lumen.services.structured_output import StructuredOutputError, parse_structured_output
+from lumen.services.usage_breakdown import CACHE_USAGE_KEYS, UsageBreakdown
 
 from .common import (
     _V2_DEFAULT_MAX_MODEL_TURNS,
@@ -213,6 +215,7 @@ async def _finish(
                 source=run.source,
                 api_key_id=run.api_key_id,
                 run_id=run.id,
+                breakdown=usage_record.get("breakdown"),
             )
             run.usage_reconciled_at = _now()
             await append_event(
@@ -395,10 +398,11 @@ class _DurableExecutionHooks:
     ) -> None:
         """Record one observed summary call with a stable, replay-safe ledger key."""
         try:
-            prompt_tokens = max(0, int(usage_payload.get("prompt_tokens") or 0))
-            completion_tokens = max(0, int(usage_payload.get("completion_tokens") or 0))
+            breakdown = _usage_payload_breakdown(usage_payload)
         except (TypeError, ValueError) as exc:
             raise DurableRunError("context compaction usage is invalid") from exc
+        prompt_tokens = breakdown.input_tokens
+        completion_tokens = breakdown.output_tokens
         factory = _factory()
         async with factory() as session, session.begin():
             run = (
@@ -423,6 +427,19 @@ class _DurableExecutionHooks:
                 ),
                 "price_source": summary_pricing.get("price_source"),
                 "price_version": summary_pricing.get("price_version"),
+                # Snapshots frozen before cache rates existed carry no cache keys.
+                # The route fallback mirrors the input/output keys above: a live
+                # route only resolves under the admission config hash, which
+                # pins the same (then null) cache rates, and a replayed route
+                # snapshot carries no rates, so those categories bill 0 (partial).
+                **{
+                    key: summary_pricing.get(key, route.get(key))
+                    for key in (
+                        "cache_read_price_per_token",
+                        "cache_write_price_per_token",
+                        "cache_write_1h_price_per_token",
+                    )
+                },
             }
             if pricing["input_price_per_token"] is None or pricing["output_price_per_token"] is None:
                 raise DurableRunError("context compaction pricing is unavailable")
@@ -430,26 +447,16 @@ class _DurableExecutionHooks:
                 pricing,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                breakdown=breakdown,
             )
-            components = []
-            for kind, quantity, cost in (
-                ("input_tokens", prompt_tokens, usage_cost.input_cost),
-                ("output_tokens", completion_tokens, usage_cost.output_cost),
-            ):
-                unit_price = cost / quantity if quantity else Decimal("0")
-                components.append(
-                    {
-                        "segment_id": segment_id,
-                        "kind": kind,
-                        "quantity": str(quantity),
-                        "unit": "token",
-                        "unit_price_usd": format(unit_price, "f"),
-                        "cost_usd": format(cost, "f"),
-                        "source": "system",
-                        "model_name": route.get("model_name") or run.model_name,
-                        "metadata": {"operation": "context_compaction"},
-                    }
-                )
+            components = _token_usage_components(
+                breakdown,
+                usage_cost,
+                segment_id=segment_id,
+                source="system",
+                model_name=route.get("model_name") or run.model_name,
+                metadata={"operation": "context_compaction"},
+            )
             await credit.apply_usage_in_transaction(
                 session,
                 event_id=event_id,
@@ -468,6 +475,7 @@ class _DurableExecutionHooks:
                 run_id=str(run.id),
                 charge_wallet=False,
                 usage_components=components,
+                breakdown=breakdown,
             )
 
     async def _summary_compactor(
@@ -564,14 +572,7 @@ class _DurableExecutionHooks:
             ):
                 raise DurableRunError("context compaction result is invalid")
             usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
-            usage_payload = {
-                "prompt_tokens": int(usage.get("prompt_tokens", 0))
-                if isinstance(usage, dict)
-                else int(getattr(usage, "prompt_tokens", 0) or 0),
-                "completion_tokens": int(usage.get("completion_tokens", 0))
-                if isinstance(usage, dict)
-                else int(getattr(usage, "completion_tokens", 0) or 0),
-            }
+            usage_payload = (UsageBreakdown.from_runtime(usage) or UsageBreakdown(0, 0)).as_usage_dict()
             await self._complete(
                 segment_id=segment_id,
                 ordinal=ordinal,
@@ -1325,6 +1326,59 @@ class _DurableExecutionHooks:
             }
 
 
+def _usage_payload_breakdown(value: dict[str, Any]) -> UsageBreakdown:
+    """Read a journaled usage dict; entries written before cache accounting carry no split."""
+    return UsageBreakdown.from_totals(
+        max(0, int(value.get("prompt_tokens") or 0)),
+        max(0, int(value.get("completion_tokens") or 0)),
+        **{key: value.get(key) or 0 for key in CACHE_USAGE_KEYS},
+    )
+
+
+# (usage kind, breakdown token field, UsageCost cost field). ``input_tokens`` is
+# the UNCACHED quantity, matching Anthropic where input_tokens excludes cache.
+_TOKEN_USAGE_KINDS = (
+    ("input_tokens", "uncached_input_tokens", "input_cost"),
+    ("output_tokens", "output_tokens", "output_cost"),
+    ("cache_read_input_tokens", "cache_read_input_tokens", "cache_read_cost"),
+    ("cache_creation_5m_input_tokens", "cache_creation_5m_input_tokens", "cache_creation_5m_cost"),
+    ("cache_creation_1h_input_tokens", "cache_creation_1h_input_tokens", "cache_creation_1h_cost"),
+)
+
+
+def _token_usage_components(
+    breakdown: UsageBreakdown,
+    usage_cost: UsageCost,
+    *,
+    segment_id: str,
+    source: str,
+    model_name: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Per-category token components; cache categories appear only with tokens."""
+    components: list[dict[str, Any]] = []
+    for kind, token_field, cost_field in _TOKEN_USAGE_KINDS:
+        quantity = getattr(breakdown, token_field)
+        if kind.startswith("cache_") and quantity == 0:
+            continue
+        cost = getattr(usage_cost, cost_field)
+        unit_price = cost / quantity if quantity else Decimal("0")
+        components.append(
+            {
+                "segment_id": segment_id,
+                "kind": kind,
+                "quantity": str(quantity),
+                "unit": "token",
+                "unit_price_usd": format(unit_price, "f"),
+                "cost_usd": format(cost, "f"),
+                "source": source,
+                "model_name": model_name,
+                "metadata": dict(metadata),
+            }
+        )
+    return components
+
+
 _MANAGED_USAGE_KEYS = {
     ("web_search_requests", "web_search_request_per_unit", "request", "search"),
     ("web_search_context", "web_search_context_low_per_unit", "context", "search"),
@@ -1334,7 +1388,19 @@ _MANAGED_USAGE_KEYS = {
     ("web_fetch_context", "web_fetch_context_per_unit", "context", "fetch"),
     ("advisor_input_tokens", "advisor_input_price_per_token", "token", "advisor"),
     ("advisor_output_tokens", "advisor_output_price_per_token", "token", "advisor"),
+    ("advisor_cache_read_tokens", "advisor_cache_read_price_per_token", "token", "advisor"),
+    ("advisor_cache_creation_5m_tokens", "advisor_cache_write_price_per_token", "token", "advisor"),
+    ("advisor_cache_creation_1h_tokens", "advisor_cache_write_1h_price_per_token", "token", "advisor"),
 }
+# Advisor cache rates are optional manual prices: a missing frozen key bills the
+# category at 0 and marks the component unpriced (the usage becomes partial).
+_OPTIONAL_MANAGED_PRICE_KEYS = frozenset(
+    {
+        "advisor_cache_read_price_per_token",
+        "advisor_cache_write_price_per_token",
+        "advisor_cache_write_1h_price_per_token",
+    }
+)
 
 
 def _managed_usage_components(
@@ -1356,9 +1422,10 @@ def _managed_usage_components(
         source = record.get("source")
         if (kind, price_key, unit, source) not in _MANAGED_USAGE_KEYS:
             raise DurableRunError("managed tool usage record is invalid")
+        unpriced = price_key in _OPTIONAL_MANAGED_PRICE_KEYS and prices.get(price_key) is None
         try:
             quantity = Decimal(str(record.get("quantity")))
-            unit_price = Decimal(str(prices[price_key]))
+            unit_price = Decimal("0") if unpriced else Decimal(str(prices[price_key]))
         except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
             raise DurableRunError("managed tool pricing snapshot is invalid") from exc
         is_advisor = source == "advisor"
@@ -1384,7 +1451,7 @@ def _managed_usage_components(
                 "cost_usd": format(cost, "f"),
                 "source": source,
                 "model_name": record.get("model_name") if isinstance(record.get("model_name"), str) else model_name,
-                "metadata": {},
+                "metadata": {"unpriced": True} if unpriced and quantity > 0 else {},
             }
         )
     return total.quantize(Decimal("0.0000000001"), rounding=ROUND_HALF_EVEN), components
@@ -1649,7 +1716,8 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
     citations: list[dict[str, Any]] = []
     tool_invocations: dict[str, dict[str, Any]] = {}
     tool_results: dict[str, dict[str, Any]] = {}
-    usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
+    usage_breakdown = UsageBreakdown(0, 0)
+    usage: dict[str, int] = usage_breakdown.as_usage_dict()
     managed_tool_usage: list[dict[str, Any]] = []
 
     text: list[str] = []
@@ -2117,8 +2185,8 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
                 elif etype == "usage":
                     value = event.get("usage")
                     if isinstance(value, dict):
-                        usage["prompt_tokens"] = max(0, int(value.get("prompt_tokens") or 0))
-                        usage["completion_tokens"] = max(0, int(value.get("completion_tokens") or 0))
+                        usage_breakdown = _usage_payload_breakdown(value)
+                        usage = usage_breakdown.as_usage_dict()
                     emitted_tool_usage = event.get("tool_usage")
                     if isinstance(emitted_tool_usage, list):
                         managed_tool_usage = [item for item in emitted_tool_usage if isinstance(item, dict)]
@@ -2178,6 +2246,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             pricing_snapshot,
             prompt_tokens=usage["prompt_tokens"],
             completion_tokens=usage["completion_tokens"],
+            breakdown=usage_breakdown,
         )
         managed_cost, managed_components = _managed_usage_components(
             managed_tool_usage,
@@ -2185,39 +2254,31 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             model_name=resolved["model_name"],
         )
         if managed_cost:
-            usage_cost = UsageCost(
+            usage_cost = replace(
+                usage_cost,
                 raw_cost=(usage_cost.raw_cost + managed_cost).quantize(
                     Decimal("0.0000000001"), rounding=ROUND_HALF_EVEN
                 ),
-                input_cost=usage_cost.input_cost,
-                output_cost=usage_cost.output_cost,
-                pricing_status=usage_cost.pricing_status,
-                pricing_snapshot=usage_cost.pricing_snapshot,
             )
-        usage_components = []
-        for kind, quantity, cost in (
-            ("input_tokens", usage["prompt_tokens"], usage_cost.input_cost),
-            ("output_tokens", usage["completion_tokens"], usage_cost.output_cost),
+        if (
+            any(component["metadata"].get("unpriced") for component in managed_components)
+            and usage_cost.pricing_status == "priced"
         ):
-            unit_price = cost / quantity if quantity else 0
-            usage_components.append(
-                {
-                    "segment_id": "executor:aggregate",
-                    "kind": kind,
-                    "quantity": str(quantity),
-                    "unit": "token",
-                    "unit_price_usd": format(unit_price, "f"),
-                    "cost_usd": format(cost, "f"),
-                    "source": "executor",
-                    "model_name": resolved["model_name"],
-                    "metadata": {},
-                }
-            )
+            usage_cost = replace(usage_cost, pricing_status="partial")
+        usage_components = _token_usage_components(
+            usage_breakdown,
+            usage_cost,
+            segment_id="executor:aggregate",
+            source="executor",
+            model_name=resolved["model_name"],
+            metadata={},
+        )
         usage_components.extend(managed_components)
         usage_record = {
             "usage_cost": usage_cost,
             "prompt_tokens": usage["prompt_tokens"],
             "completion_tokens": usage["completion_tokens"],
+            "breakdown": usage_breakdown,
             "usage_components": usage_components,
             "model_name": resolved["model_name"],
             "provider_name": resolved["provider_name"],

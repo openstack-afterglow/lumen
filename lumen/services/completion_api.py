@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -19,6 +20,7 @@ from lumen.config import get_settings
 from lumen.services import context_manager, credit, litellm_client, native_compaction
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
+from lumen.services.usage_breakdown import UsageBreakdown
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +130,8 @@ async def _bill(
     이 멱등성이 깨져 이중 과금·통계 이중집계가 발생한다.
     """
     model_name = resolved["model_name"]
-    pt, ct = litellm_client.extract_usage(model_name, messages, text, final_usage)
+    breakdown = litellm_client.extract_usage_breakdown(model_name, messages, text, final_usage)
+    pt, ct = breakdown.input_tokens, breakdown.output_tokens
     usage_cost = litellm_client.cost_from_usage(
         model_name,
         pt,
@@ -137,6 +140,10 @@ async def _bill(
         output_price_per_token=resolved.get("output_price_per_token"),
         price_source=resolved.get("price_source"),
         provider_type=resolved.get("provider_type"),
+        breakdown=breakdown,
+        cache_read_price_per_token=resolved.get("cache_read_price_per_token"),
+        cache_write_price_per_token=resolved.get("cache_write_price_per_token"),
+        cache_write_1h_price_per_token=resolved.get("cache_write_1h_price_per_token"),
     )
     credited = await credit.apply_usage(
         event_id=event_id,
@@ -151,6 +158,7 @@ async def _bill(
         conversation_id=None,
         source="api",
         api_key_id=api_key_id,
+        breakdown=breakdown,
     )
     return pt, ct, credited
 
@@ -394,22 +402,22 @@ def _with_passthrough_compaction(
     )
 
 
-def _native_usage(value: dict, *, input_key: str, output_key: str) -> dict | None:
+def _native_usage(value: dict, *, protocol: Literal["anthropic", "responses"]) -> dict | None:
+    """Map raw provider-native usage to the runtime dict ``_bill`` consumes.
+
+    Anthropic ``input_tokens`` excludes cache, so cache read/creation are added
+    to reach total input; Responses ``input_tokens`` already includes cached
+    tokens, which must not be added again. Under provider-native compaction the
+    top-level counters cover the non-compaction iterations only, so the
+    per-iteration breakdown is authoritative whenever the provider sends one.
+    """
     usage = value.get("usage")
     if not isinstance(usage, dict):
         return None
-    # Under provider-native compaction the top-level counters cover the
-    # non-compaction iterations only, so billing them alone charges the
-    # compaction pass at zero. The per-iteration breakdown is authoritative
-    # whenever the provider sends one.
-    iteration_totals = native_compaction.usage_iteration_totals(usage)
-    if iteration_totals is not None:
-        return {"prompt_tokens": iteration_totals[0], "completion_tokens": iteration_totals[1]}
-    input_tokens = usage.get(input_key)
-    output_tokens = usage.get(output_key)
-    if isinstance(input_tokens, int) and isinstance(output_tokens, int):
-        return {"prompt_tokens": input_tokens, "completion_tokens": output_tokens}
-    return None
+    breakdown = (
+        UsageBreakdown.from_anthropic(usage) if protocol == "anthropic" else UsageBreakdown.from_responses(usage)
+    )
+    return breakdown.as_usage_dict() if breakdown is not None else None
 
 
 def _responses_input_messages(input_value: str | list[dict]) -> list[dict]:
@@ -455,7 +463,7 @@ async def complete_responses(
             resolved,
             messages,
             _native_text(payload.get("output", [])),
-            _native_usage(payload, input_key="input_tokens", output_key="output_tokens"),
+            _native_usage(payload, protocol="responses"),
             event_id=event_id,
             user_id=user_id,
             project_id=project_id,
@@ -478,7 +486,7 @@ async def complete_responses(
                         resolved,
                         messages,
                         "".join(text_parts) or _native_text(completed.get("output", [])),
-                        _native_usage(completed, input_key="input_tokens", output_key="output_tokens"),
+                        _native_usage(completed, protocol="responses"),
                         event_id=event_id,
                         user_id=user_id,
                         project_id=project_id,
@@ -543,7 +551,7 @@ async def complete_anthropic(
             resolved,
             messages,
             _native_text(payload.get("content", [])),
-            _native_usage(payload, input_key="input_tokens", output_key="output_tokens"),
+            _native_usage(payload, protocol="anthropic"),
             event_id=event_id,
             user_id=user_id,
             project_id=project_id,
@@ -552,8 +560,8 @@ async def complete_anthropic(
         return payload
 
     async def events() -> AsyncIterator[dict]:
-        input_tokens = 0
-        output_tokens = 0
+        start_usage: dict = {}
+        delta_usages: list[dict] = []
         text_parts: list[str] = []
         charged = False
         try:
@@ -561,28 +569,27 @@ async def complete_anthropic(
                 event = _native_dict(raw_event)
                 event_type = event.get("type")
                 if event_type == "message_start":
-                    usage = (event.get("message") or {}).get("usage") or {}
-                    input_tokens = int(usage.get("input_tokens") or 0)
+                    usage = (event.get("message") or {}).get("usage")
+                    start_usage = usage if isinstance(usage, dict) else {}
                 elif event_type == "content_block_delta":
                     delta = event.get("delta") or {}
                     if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
                         text_parts.append(delta["text"])
                 elif event_type == "message_delta":
-                    usage = event.get("usage") or {}
-                    # A compacted turn reports its real cost only in the
-                    # per-iteration breakdown; the top-level counters exclude
-                    # the compaction pass entirely.
-                    iteration_totals = native_compaction.usage_iteration_totals(usage)
-                    if iteration_totals is not None:
-                        input_tokens, output_tokens = iteration_totals
-                    else:
-                        output_tokens = int(usage.get("output_tokens") or output_tokens)
+                    usage = event.get("usage")
+                    # message_delta usage is cumulative: later fields override
+                    # message_start ones. A compacted turn reports its real
+                    # cost only in the per-iteration breakdown, which the
+                    # merged breakdown prefers over the top-level counters.
+                    if isinstance(usage, dict):
+                        delta_usages.append(usage)
                 elif event_type == "message_stop":
+                    breakdown = UsageBreakdown.from_anthropic_stream(start_usage, delta_usages)
                     await _bill(
                         resolved,
                         messages,
                         "".join(text_parts),
-                        {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
+                        breakdown.as_usage_dict() if breakdown is not None else None,
                         event_id=event_id,
                         user_id=user_id,
                         project_id=project_id,
@@ -593,11 +600,36 @@ async def complete_anthropic(
         finally:
             if not charged and text_parts:
                 try:
+                    completion_text = "".join(text_parts)
+                    # A stream cut before message_stop still bills what
+                    # message_start reported: its input side and cache split
+                    # stay authoritative, and the output falls back to the
+                    # local counter only when that exceeds the reported count.
+                    # LiteLLM's non-Anthropic /v1/messages adapters open with an
+                    # all-zero usage and report real counts only at the end, so
+                    # a report with no input at all is not evidence of a free
+                    # prompt: the prompt is counted locally instead.
+                    reported = (
+                        UsageBreakdown.from_anthropic_stream(start_usage, delta_usages)
+                        if start_usage or delta_usages
+                        else None
+                    )
+                    output_tokens = max(
+                        reported.output_tokens if reported is not None else 0,
+                        litellm_client.count_tokens(resolved["model_name"], text=completion_text),
+                    )
+                    if reported is not None and reported.input_tokens > 0:
+                        partial = replace(reported, output_tokens=output_tokens)
+                    else:
+                        partial = UsageBreakdown.from_totals(
+                            litellm_client.count_tokens(resolved["model_name"], messages=messages),
+                            output_tokens,
+                        )
                     await _bill(
                         resolved,
                         messages,
-                        "".join(text_parts),
-                        None,
+                        completion_text,
+                        partial.as_usage_dict(),
                         event_id=event_id,
                         user_id=user_id,
                         project_id=project_id,

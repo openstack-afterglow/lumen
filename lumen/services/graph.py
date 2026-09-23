@@ -32,6 +32,7 @@ from lumen.services.checkpointer import chat_checkpointer
 from lumen.services.providers.errors import ProviderSubscriptionError
 from lumen.services.tool_runtime import bindings, contracts, dispatch, selection
 from lumen.services.tools import ToolContext
+from lumen.services.usage_breakdown import CACHE_USAGE_KEYS, UsageBreakdown
 
 logger = logging.getLogger(__name__)
 
@@ -343,21 +344,19 @@ def _managed_tool_citations(tool_name: str, result: str) -> list[dict]:
     return citations
 
 
-def _usage_pt_ct(usage) -> tuple[int, int] | None:
-    if usage is None:
-        return None
-    pt = getattr(usage, "prompt_tokens", None)
-    if pt is None and isinstance(usage, dict):
-        pt = usage.get("prompt_tokens")
-    ct = getattr(usage, "completion_tokens", None)
-    if ct is None and isinstance(usage, dict):
-        ct = usage.get("completion_tokens")
-    if pt is None or ct is None:
-        return None
-    try:
-        return int(pt), int(ct)
-    except (TypeError, ValueError):
-        return None
+def _usage_breakdown(usage) -> UsageBreakdown | None:
+    """Read one round's provider usage; ``prompt_tokens`` stays total input."""
+    return UsageBreakdown.from_runtime(usage)
+
+
+def _replayed_usage(value: object) -> UsageBreakdown:
+    """Journaled round usage; entries written before cache accounting carry no split."""
+    value = value if isinstance(value, dict) else {}
+    return UsageBreakdown.from_totals(
+        max(0, int(value.get("prompt_tokens", 0))),
+        max(0, int(value.get("completion_tokens", 0))),
+        **{key: value.get(key, 0) for key in CACHE_USAGE_KEYS},
+    )
 
 
 def _compaction_blocks(chunk, delta) -> list[dict]:
@@ -679,11 +678,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                 if replay_payload.get("_durable_replay") is True:
                     token_event["_durable_replay"] = True
                 writer(token_event)
-            replay_usage = replay_payload.get("usage", {})
-            round_usage = (
-                max(0, int(replay_usage.get("prompt_tokens", 0))),
-                max(0, int(replay_usage.get("completion_tokens", 0))),
-            )
+            round_usage = _replayed_usage(replay_payload.get("usage", {}))
             # A replayed turn must carry the same compaction head the live turn
             # produced, or the resumed run re-sends the uncompacted prefix.
             round_compaction_blocks = native_compaction.sanitize_blocks(replay_payload.get("compaction_blocks"))
@@ -744,33 +739,31 @@ def _build_graph(params: dict, ctx: ToolContext):
                 [tool_call for tool_call in tool_acc.values() if tool_call.get("name")],
                 require_unique_provider_ids=isinstance(v2_bindings, dict),
             )
-            round_usage = _usage_pt_ct(final_usage)
+            round_usage = _usage_breakdown(final_usage)
             if round_usage is None:
+                # The token-counter fallback has no provider cache report to split.
                 tool_payload = json.dumps(tool_calls, ensure_ascii=False, sort_keys=True) if tool_calls else ""
-                round_usage = litellm_client.extract_usage(
-                    params["model"], messages, "".join(text_parts) + tool_payload, None
+                round_usage = UsageBreakdown.from_totals(
+                    *litellm_client.extract_usage(params["model"], messages, "".join(text_parts) + tool_payload, None)
                 )
             response_text = "".join(text_parts)
             await boundary(
                 "provider_completed",
                 round_index=round_index,
                 attempt=attempt,
-                usage={"prompt_tokens": round_usage[0], "completion_tokens": round_usage[1]},
+                usage=round_usage.as_usage_dict(),
                 result_payload={
                     "text": response_text,
                     "reasoning": "".join(reasoning_parts),
                     "tool_calls": tool_calls,
                     "citations": list(citations_by_url.values()),
-                    "usage": {"prompt_tokens": round_usage[0], "completion_tokens": round_usage[1]},
+                    "usage": round_usage.as_usage_dict(),
                     "compaction_blocks": round_compaction_blocks,
                 },
             )
 
-        previous_usage = state.get("usage", {})
-        total_usage = {
-            "prompt_tokens": int(previous_usage.get("prompt_tokens", 0)) + round_usage[0],
-            "completion_tokens": int(previous_usage.get("completion_tokens", 0)) + round_usage[1],
-        }
+        # Rounds sum per category, so the aggregate keeps prompt_tokens as total input.
+        total_usage = (_replayed_usage(state.get("usage", {})) + round_usage).as_usage_dict()
         # Compaction accumulates for the lifetime of a run: once the provider has
         # compacted, every later round has to keep carrying that head.
         carried_compaction = native_compaction.sanitize_blocks(

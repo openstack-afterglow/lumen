@@ -354,7 +354,7 @@ Native Run의 실행 과정을 실시간으로 수신하기 위해 SSE 스트림
 * **Event Type 정의**:
   - 상태 및 실행 이벤트: `run.started`, `run.stage.changed`, `run.warning`, `message.created`, `part.delta`, `part.completed`
   - 도구 및 인터랙션: `tool.call.started`, `tool.call.completed`, `tool.approval_required`, `tool.approval_resolved`, `interaction.resolved`
-  - 사용량: `usage.updated`
+  - 사용량: `usage.updated` — `components[].kind`는 `input_tokens`(캐시 제외 uncached 입력), `output_tokens`와 해당 토큰이 있을 때만 `cache_read_input_tokens`, `cache_creation_5m_input_tokens`, `cache_creation_1h_input_tokens`를 포함합니다. managed advisor도 같은 규칙으로 `advisor_input_tokens`(uncached), `advisor_output_tokens`와 토큰이 있을 때만 `advisor_cache_read_tokens`, `advisor_cache_creation_5m_tokens`, `advisor_cache_creation_1h_tokens`를 보냅니다. `prompt_tokens`는 캐시를 포함한 총 입력입니다. 소비자는 이 여섯 kind를 허용해야 하며, 모르는 kind를 거부하는 strict parser는 캐시 토큰이 있는 run의 `usage.updated`에서 실패합니다. 따라서 배포 순서는 이 kind들을 허용하는 Afterglow frontend(`chatContracts.ts`)가 먼저이고, 그다음이 migration 014와 cache 과금을 포함한 Lumen입니다. 반대로 배포하면 캐시 토큰이 있는 모든 web run이 `usage.updated`에서 멈춥니다.
   - 종결 이벤트 (Terminal Events): `run.completed`, `run.failed`, `run.canceled`
 * **Keepalive**: 주기적으로 `: keepalive\n\n` 주석을 전송합니다.
 * **종료 조건**: 종결 이벤트(`run.completed`, `run.failed`, `run.canceled`) 수신 시 SSE 클라이언트 스트림을 정상 종료합니다. Native 실행 도중 오류가 발생하면 `run.failed` 종결 이벤트가 발송됩니다.

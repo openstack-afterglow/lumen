@@ -58,6 +58,34 @@ def _per_million_price(value: Decimal | None) -> Decimal | None:
     return value * _TOKENS_PER_MILLION if value is not None else None
 
 
+# (admin per-million field, LlmModel per-token column, resolved per-token key)
+CACHE_PRICE_FIELDS = (
+    ("cache_read_price_per_million", "cache_read_price", "cache_read_price_per_token"),
+    ("cache_write_price_per_million", "cache_write_price", "cache_write_price_per_token"),
+    ("cache_write_1h_price_per_million", "cache_write_1h_price", "cache_write_1h_price_per_token"),
+)
+
+
+def _resolved_cache_prices(model: LlmModel) -> dict[str, Decimal | None]:
+    """Return the manual per-token cache rates; there is deliberately no catalog fallback.
+
+    A catalog fallback would silently start charging cache tokens on deploy,
+    so an unset rate stays ``None`` and bills that category at 0.
+    """
+    prices: dict[str, Decimal | None] = {}
+    for _, column, resolved_key in CACHE_PRICE_FIELDS:
+        value = getattr(model, column, None)
+        prices[resolved_key] = Decimal(value) if value is not None else None
+    return prices
+
+
+def _validate_cache_prices(values: dict) -> dict[str, Decimal | None]:
+    """Convert present admin per-million cache prices to per-token column values."""
+    return {
+        column: _per_token_price(values[field], field) for field, column, _ in CACHE_PRICE_FIELDS if field in values
+    }
+
+
 def _json_decimal_strings(value):
     if isinstance(value, Decimal):
         return format(value, "f")
@@ -179,6 +207,7 @@ def _model_public(
         "effective_input_price_per_million": effective_input_price_per_million,
         "effective_output_price_per_million": effective_output_price_per_million,
         "effective_price_source": effective_price_source,
+        **{field: _per_million_price(getattr(row, column, None)) for field, column, _ in CACHE_PRICE_FIELDS},
         "models_dev_model_id": row.models_dev_model_id,
         "price_source": row.price_source,
         "capabilities": row.capabilities,
