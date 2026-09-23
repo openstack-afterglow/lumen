@@ -52,11 +52,11 @@ Measured facts used here come from read-only `gh` queries on 2026-09-24:
 
 ### Modified Capabilities
 
-- None. This changes CI, the image build and documentation only, with no service contract delta, so it is archived with `--skip-specs`.
+- None. This changes CI, the image build and documentation only, with no service contract delta. Once the open owner follow-up tasks in tasks.md are done, archive it with `--skip-specs`. Until then it stays active so those tasks remain visible.
 
 ## Impact
 
-- Tag pushes and feature-branch dispatch runs no longer spend about 100s per image job exporting cache that no other ref can restore.
+- Projection, not measured: tag pushes and feature-branch dispatch runs should no longer spend about 100s per image job exporting cache that no other ref can restore. The ~100s figure is the per-job export cost reported by the base change. It was not re-measured in this round.
 - Datastore health checks tolerate a slower first MariaDB start.
 - Projection, not measured: a non-duplicate PR waits roughly 6-9s longer for `dedup`. This is an estimate from the measured 3s queue and 1s setup plus two API calls and a second queue. It must be measured on the first non-duplicate PRs after this lands.
 - Image ownership is unchanged. It was verified by a local native arm64 build (see tasks.md).
