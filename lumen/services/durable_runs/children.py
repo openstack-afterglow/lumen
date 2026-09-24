@@ -162,6 +162,7 @@ async def _locked_children(session: AsyncSession, parent_run_id: str, order: bud
                 .where(ChatRun.parent_run_id == parent_run_id)
                 .order_by(ChatRun.created_at, ChatRun.id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalars()
     )

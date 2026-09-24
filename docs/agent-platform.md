@@ -58,6 +58,8 @@ Root `agent_budget`(`credit_ceiling` decimal string, `sandbox_seconds_ceiling`, 
 
 Project quota row가 없으면 첫 lock에서 runtime config `project_quota_defaults`로 한 번 생성되며, 이후 설정 변경은 기존 row를 바꾸지 않는다. Root terminal barrier(worker 완료·실패, 즉시 취소, `waiting_resource` 실패)는 code root의 sandbox slot을 해제하고 sandbox `ready_at` 이후 실제 사용한 초만 정산한 뒤, root model-call credit과 settled child credit/seconds의 project hold를 `chat_runs.reservation_released_at` marker로 한 번만 해제한다. 정산 ledger(`settled_amount`, model-call `actual_credits`)는 지우지 않는다. Barrier 시점에 실행 중인 descendant는 자기 hold를 유지하다 terminal 정산에서 사용분과 미사용분을 함께 해제한다. Child sandbox seconds도 resource `ready_at` 이후만 누적한다.
 
+Terminal barrier은 lock class를 고르려고 run을 lock 없이 먼저 읽는다. 그래서 `budgets.lock_run`, project quota, child, ledger lock helper는 `populate_existing`으로 lock한 row를 다시 채운다. 그렇지 않으면 두 read 사이에 commit된 worker claim·lease 이전·terminal 전이를 ORM identity map이 가린다. MariaDB 11.6.2+ 기본 `innodb_snapshot_isolation=ON`에서는 같은 경합이 1020(record changed)이 되므로 `request_cancelled`, worker `_finish`, `fail_waiting_run` transaction 전체를 `retry_deadlocks`(1020/1205/1213, 최대 3회, attempt마다 새 lock order)로 다시 결정한다. Credit-reserving segment start/settle(`_credit_lineage`)은 아직 retry되지 않으며 snapshot isolation에서 sibling의 quota/root 변경과 겹치면 1020을 그대로 올린다.
+
 v2 model/provider 호출과 가격이 있는 managed tool은 네트워크 dispatch **전** frozen unit price, 출력 상한 및 root/child 잔액으로 보수적 상한을 예약한다(migration 017). 완료된 durable segment만 고유 identity로 실제 사용량을 한 번 정산하고 미사용액을 해제한다. 외부 호출 후 사용량을 알 수 없으면 reservation을 유지한 채 재조정을 기다리며 별도 중복 청구/재시도는 하지 않는다. Hosted native search의 provider-enforced 횟수 상한이 없고 가격이 0보다 크면 dispatch 자체를 거부한다; 명시적으로 frozen zero-price 항목은 허용한다. 동일 parent quota ceiling을 child가 새 재원처럼 복제하지 않는다.
 
 ## 구현 상태

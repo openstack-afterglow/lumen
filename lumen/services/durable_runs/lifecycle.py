@@ -88,6 +88,22 @@ async def purge_expired_temp_threads(*, limit: int = 100) -> int:
 
 
 async def request_cancelled(*, run_id: str, project_id: str, user_id: str) -> ChatRunResponse:
+    from . import budgets
+
+    # Pure DB barrier; a row changed after the transaction's first read (MariaDB 1020) is re-decided.
+    response, wake_parent = await budgets.retry_deadlocks(
+        lambda: _request_cancelled_transaction(run_id=run_id, project_id=project_id, user_id=user_id)
+    )
+    if wake_parent is not None:
+        from .common import wake_run
+
+        await wake_run(wake_parent)
+    return response
+
+
+async def _request_cancelled_transaction(
+    *, run_id: str, project_id: str, user_id: str
+) -> tuple[ChatRunResponse, str | None]:
     from . import budgets, children
     from .execution import _cancel_streaming_assistant_message
     from .interactions import _approval_resolved_payload
@@ -241,11 +257,7 @@ async def request_cancelled(*, run_id: str, project_id: str, user_id: str) -> Ch
             last_seq=run.last_seq,
             terminal=run.status not in NONTERMINAL,
         )
-    if wake_parent is not None:
-        from .common import wake_run
-
-        await wake_run(wake_parent)
-    return response
+    return response, wake_parent
 
 
 async def _cancel_requested(run_id: str) -> bool:

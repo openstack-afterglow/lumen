@@ -216,6 +216,31 @@ async def _finish(
     completed_parts: list[tuple[int, dict[str, Any]]] | None = None,
     child_result: dict[str, Any] | None = None,
 ) -> None:
+    # Pure DB barrier; each attempt re-reads and re-locks with a fresh lock order (MariaDB 1020 retry).
+    wake_parent = await budgets.retry_deadlocks(lambda: _finish_transaction(
+        run_id, status=status, message_id=message_id, owner=owner, error_code=error_code,
+        safe_message=safe_message, usage_record=usage_record, message_finalization=message_finalization,
+        completed_parts=completed_parts, child_result=child_result,
+    ))
+    if wake_parent is not None:
+        from .common import wake_run
+
+        await wake_run(wake_parent)
+
+
+async def _finish_transaction(
+    run_id: str,
+    *,
+    status: str,
+    message_id: str | None,
+    owner: str,
+    error_code: str | None,
+    safe_message: str | None,
+    usage_record: dict[str, Any] | None,
+    message_finalization: dict[str, Any] | None,
+    completed_parts: list[tuple[int, dict[str, Any]]] | None,
+    child_result: dict[str, Any] | None,
+) -> str | None:
     factory = _factory()
     order = budgets.LockOrder()
     wake_parent: str | None = None
@@ -432,10 +457,7 @@ async def _finish(
                 await infra_store.release_sandbox_intent(session, run_id=child_id, order=order)
             if run.execution_mode == "code":
                 await infra_store.release_sandbox_intent(session, run_id=run.id, order=order)
-    if wake_parent is not None:
-        from .common import wake_run
-
-        await wake_run(wake_parent)
+    return wake_parent
 
 
 

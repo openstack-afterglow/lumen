@@ -734,3 +734,87 @@ async def test_terminal_root_keeps_running_child_holds_until_child_finishes(fami
         assert (quota.active_children, quota.active_sandboxes, quota.credits_reserved, quota.sandbox_seconds_reserved) == (
             0, 0, Decimal("0"), 0,
         )
+
+
+@pytest.mark.parametrize("snapshot_isolation", ["ON", "OFF"], ids=["snapshot-isolation", "latest-locking-read"])
+@pytest.mark.parametrize("path", ["fail_waiting", "cancel", "finish"])
+async def test_terminal_paths_decide_on_the_locked_row_not_an_earlier_read(monkeypatch, request, path, snapshot_isolation):
+    """A claim or lease takeover committed between a path's unlocked read and its row lock must win.
+
+    MariaDB >= 11.6.2 rejects that stale locking read (1020) by default and the transaction must retry;
+    older servers or ``innodb_snapshot_isolation=OFF`` return the newer row, which the ORM must not mask.
+    """
+    from sqlalchemy import event, text
+    from sqlalchemy.pool import Pool
+
+    from lumen.services.durable_runs.errors import DurableRunLeaseLost
+    from lumen.services.durable_runs.execution import _finish
+
+    def pin_isolation(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f"SET SESSION innodb_snapshot_isolation={snapshot_isolation}")
+        cursor.close()
+
+    event.listen(Pool, "connect", pin_isolation)
+    request.addfinalizer(lambda: event.remove(Pool, "connect", pin_isolation))
+    init_db(os.environ["DATABASE_URL"], pool_size=3, max_overflow=1)
+    factory = get_session_factory()
+    assert factory is not None
+    nonce = uuid.uuid4().hex
+    project = f"race-it-{nonce}"
+    run_id = str(uuid.uuid4())
+    stale_owner = f"worker-a-{nonce}#1"
+    rival_owner = f"worker-b-{nonce}#2" if path == "finish" else f"worker-b-{nonce}#1"
+    state = (
+        {"status": "running", "lease_owner": stale_owner, "lease_fence": 1,
+         "lease_expires_at": datetime.now(UTC) + timedelta(minutes=5)}
+        if path == "finish" else {"status": "queued"}
+    )
+    lock_run = budgets.lock_run
+    interleaved: list[str] = []
+
+    async def commit_rival_then_lock(session, locked_id, **kwargs):
+        if locked_id == run_id and not interleaved:
+            async with factory() as rival, rival.begin():
+                if path == "finish":
+                    row = (await rival.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one()
+                    row.lease_fence = 2
+                    row.lease_owner = rival_owner
+                else:
+                    assert await claim_queued_run(rival, run_id, owner=f"worker-b-{nonce}") is not None
+            interleaved.append(locked_id)
+        return await lock_run(session, locked_id, **kwargs)
+
+    try:
+        async with factory() as session, session.begin():
+            isolation = (await session.execute(text("SELECT @@SESSION.innodb_snapshot_isolation"))).scalar_one()
+            assert int(isolation) == (snapshot_isolation == "ON")
+            session.add(ChatRun(
+                id=run_id, run_scope="persistent", project_id=project, user_id=project, model_name="scripted-race",
+                capability_snapshot={}, pricing_snapshot={}, client_request_id=str(uuid.uuid4()),
+                request_fingerprint=nonce, fingerprint_version=1, execution_protocol_version=2, **state,
+            ))
+        monkeypatch.setattr(budgets, "lock_run", commit_rival_then_lock)
+        if path == "fail_waiting":
+            assert not await lifecycle.fail_waiting_run(run_id, error_code="sandbox_unavailable", safe_message="unavailable")
+        elif path == "cancel":
+            response = await lifecycle.request_cancelled(run_id=run_id, project_id=project, user_id=project)
+            assert (response.status, response.terminal) == ("running", False)
+        else:
+            with pytest.raises(DurableRunLeaseLost):
+                await _finish(run_id, status="completed", message_id=None, owner=stale_owner)
+        assert interleaved == [run_id]
+        async with factory() as session:
+            run = await session.get(ChatRun, run_id)
+            events = set((await session.execute(
+                select(ChatRunEventRow.event_type).where(ChatRunEventRow.run_id == run_id)
+            )).scalars())
+        assert (run.status, run.lease_owner) == ("running", rival_owner)
+        assert not events & {"run.failed", "run.canceled", "run.completed"}
+        assert (run.cancel_requested_at is not None) == (path == "cancel")
+    finally:
+        async with factory() as session, session.begin():
+            await session.execute(delete(ChatRunEventRow).where(ChatRunEventRow.run_id == run_id))
+            await session.execute(delete(ChatRun).where(ChatRun.id == run_id))
+            await session.execute(delete(ChatProjectAgentQuota).where(ChatProjectAgentQuota.project_id == project))
+        await close_db()

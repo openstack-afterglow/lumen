@@ -85,6 +85,7 @@ async def lock_project_quota(session: AsyncSession, project_id: str, *, order: L
     row = (
         await session.execute(
             select(ChatProjectAgentQuota).where(ChatProjectAgentQuota.project_id == project_id).with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if row is None:
@@ -140,6 +141,7 @@ async def close_root_budget(session: AsyncSession, *, quota: ChatProjectAgentQuo
         select(ChatAgentReservation)
         .where(ChatAgentReservation.root_run_id == root.id, ChatAgentReservation.status == "settled")
         .with_for_update()
+        .execution_options(populate_existing=True)
     )).scalars())
     now = datetime.now(UTC)
     for row in rows:
@@ -156,8 +158,15 @@ async def close_root_budget(session: AsyncSession, *, quota: ChatProjectAgentQuo
 
 
 async def lock_run(session: AsyncSession, run_id: str, *, order: LockOrder, lock_class: str) -> ChatRun:
+    """Lock and refresh the run: callers often read it unlocked first to choose earlier lock classes.
+
+    Without ``populate_existing`` the identity map keeps that earlier read, so a claim, lease change
+    or terminal transition committed in between would be invisible to the decision taken under lock.
+    """
     order.take(lock_class)
-    run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one_or_none()
+    run = (await session.execute(
+        select(ChatRun).where(ChatRun.id == run_id).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
     if run is None:
         raise DurableRunError("chat run was not found")
     return run
@@ -241,6 +250,7 @@ async def _locked_reservation(session: AsyncSession, run_id: str, kind: str, ord
             select(ChatAgentReservation)
             .where(ChatAgentReservation.run_id == run_id, ChatAgentReservation.kind == kind)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
 
@@ -400,6 +410,7 @@ async def settle_call_credit(
             select(ChatModelCallReservation)
             .where(ChatModelCallReservation.run_id == run.id, ChatModelCallReservation.segment_id == segment.segment_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if row is None:
