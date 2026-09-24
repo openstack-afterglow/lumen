@@ -10,6 +10,12 @@ import socket
 import subprocess
 import sys
 
+# Teardown discards the stack and its volumes after logs were collected and the
+# exit code was decided, so a graceful stop buys nothing. The worker and fake
+# provider run as PID 1 without a SIGTERM handler and would otherwise wait out
+# compose's 10s default in two dependency waves.
+_TEARDOWN = ["down", "-v", "--remove-orphans", "--timeout", "1"]
+
 
 def _run_cmd(cmd: list[str], env: dict[str, str] | None = None) -> int:
     """Run subprocess command and return exit code."""
@@ -103,7 +109,7 @@ def run_integration(extra_args: list[str] | None = None) -> int:
         pytest_cmd = ["pytest", "-m", "integration", "tests", *extra]
         return _run_cmd(pytest_cmd, env=env)
     finally:
-        _run_cmd(["docker", "compose", "-f", compose_file, "down", "-v", "--remove-orphans"], env=env)
+        _run_cmd(["docker", "compose", "-f", compose_file, *_TEARDOWN], env=env)
 
 
 def run_system(extra_args: list[str] | None = None) -> int:
@@ -115,7 +121,10 @@ def run_system(extra_args: list[str] | None = None) -> int:
 
     exit_code = 1
     try:
-        exit_code = _run_cmd([*compose, "build", "system-tests"], env=env)
+        # One build over every service lets bake build the lumen-test and
+        # lumen-runtime chains in parallel after the shared lumen-builder, so
+        # `up` needs no second --build pass.
+        exit_code = _run_cmd([*compose, "build"], env=env)
         if exit_code != 0:
             return exit_code
 
@@ -124,7 +133,6 @@ def run_system(extra_args: list[str] | None = None) -> int:
                 *compose,
                 "up",
                 "-d",
-                "--build",
                 "--wait",
                 "--wait-timeout",
                 "180",
@@ -141,7 +149,7 @@ def run_system(extra_args: list[str] | None = None) -> int:
     finally:
         if exit_code != 0:
             _run_cmd([*compose, "logs"], env=env)
-        _run_cmd([*compose, "down", "-v", "--remove-orphans"], env=env)
+        _run_cmd([*compose, *_TEARDOWN], env=env)
 
 
 def main() -> None:

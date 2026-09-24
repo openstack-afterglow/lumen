@@ -121,6 +121,7 @@ flowchart LR
 | `lumen/services/infrastructure/`, `lumen/controller.py` | fenced pool/resource reconcile, Nova provider, disabled-until-isolated Zun adapter, guest mTLS readiness/dispatch, measured API scaling and Octavia ingress | controller → MariaDB intent + operator cloud credentials; public SSRF transport 별도 |
 | `lumen/api/plugins.py`, `lumen/api/agent_runtime.py` | owner/admin plugin bindings, run children, admin quota/pool/resource inventory | authenticated route → binding/resource stores |
 | `docker/Dockerfile`, `docker-compose*.yml`, `deploy/kolla/ansible/roles/lumen/` | root runtime와 controller/sandbox/test 이미지, opt-in runtime profile, Kolla role/shared data | operator → service processes; cloud profile IDs와 secret은 operator 소유 |
+| `.github/workflows/docker-build.yml`, `.github/workflows/ci.yml`, `lumen/scripts/test_layers.py`, `docker-compose.system.yml` | CI 진입점과 이미지 게시, 재사용 test workflow, layered test CLI와 system process stack | push/PR → `docker-build.yml` → `ci.yml` → `test_layers` → compose stack |
 
 ## Runtime flows
 
@@ -233,6 +234,45 @@ Kolla role은 API/worker를 별도 host-network container로 실행하고 MariaD
 | SDK | `cd sdk && uv run pytest && uv run ruff check .` | SDK package 자체의 httpx/OpenStack transport contract |
 | focused source tests | `uv run pytest -m "not integration and not system" tests` | in-process contract 범위; live deployment/provider 검증 아님 |
 
+CI 형태(2026-09-24, source-reviewed, contract-tested, CI-unverified):
+
+- **진입점과 게이팅**
+  - `.github/workflows/docker-build.yml`이 `main`/`dev` push·PR의 유일한 테스트 진입점이다.
+  - 재사용 `ci.yml`은 `workflow_call`/`workflow_dispatch` 전용이며, `docker-build.yml`이 이벤트당 한 번 호출한다.
+  - `v*` tag push에서는 `docker-build.yml`과 `.github/workflows/release.yml`이 각각 `ci.yml`을 호출해 테스트가 두 번 돈다(알려진 중복).
+  - `build-and-push`는 `!cancelled() && needs.test.result == 'success'`로 전체 test workflow에 게이트된다.
+  - `ci.yml`의 일곱 잡(`service`, `plugins`, `sandbox`, `sdk`, `kolla`, `integration`, `system`)은 모두 `if: ${{ !cancelled() }}`를 가지며 서로 `needs`가 없다. 호출자 `test`의 skip된 `dedup` 조상이 암묵적 `success()`로 내부 잡을 건너뛰게 하지 않기 위한 방어다. GitHub 실제 동작은 CI-unverified다.
+- **PR 중복 제거**
+  - PR 전용 `dedup` job(`contents: read`)은 다음 조건을 모두 충족할 때만 `test`/`build-and-push`를 건너뛴다.
+    - head가 같은 저장소의 `dev`/`main`이다.
+    - dependabot PR이 아니다.
+    - merge 트리와 head 트리가 같다.
+  - skipped·failed dedup은 테스트를 실행한다.
+  - 중복 PR의 `pull_request` check는 skipped(=통과)로 보이므로 merge 전 head SHA의 push 실행 결과를 확인한다. 2026-09-24 읽기 전용 확인 시 `dev`·`main`에 required status check가 없다.
+- **cache와 health-check**
+  - GHA cache export(`mode=max`)는 `refs/heads/dev`·`refs/heads/main` 실행에서만 한다. PR·tag·feature branch dispatch 이미지 빌드는 읽기만 한다.
+  - `Datastore integration` 서비스 health-check는 interval 2초, retries 50, start-period 5초다. 이 잡과 `lumen-test integration`은 root `tests/`만 수집하므로 독립 sandbox wheel tests는 `sandbox` 잡이 소유한다.
+- **system 잡**
+  - host venv 없이 stdlib-only `python3 -m lumen.scripts.test_layers system`을 실행한다.
+  - `test_layers`는 모든 compose 이미지를 한 번의 병렬 `docker compose build`로 만든 뒤 `--build` 없이 `up --wait` 한다.
+  - integration/system teardown은 `down -v --remove-orphans --timeout 1`이다.
+- **이미지**
+  - `docker/Dockerfile`은 uv를 `0.12.18` tag와 index digest로 고정해 apt layer 뒤에 복사하며, `lumen-sandbox-builder`도 같은 고정값을 쓴다.
+  - runtime/test stage는 workspace member source(`packages/lumen-plugin-api`, `plugins/`)를 포함한 COPY 대상 디렉터리를 먼저 만들고 `COPY --chown=appuser:appuser`와 `appuser` compileall로 재귀 `chown -R` 없이 같은 소유권을 만든다. runtime stage는 그 뒤 `python -m lumen.scripts.migrate --help`로 plugin distribution import를 검사한다.
+- **계약 테스트**: `tests/test_ci_shape.py`와 `tests/test_test_layers.py`가 이 형태를 고정한다.
+
+변경 전 기준선(워크플로우별 최근 성공 20회):
+
+- docker-build 테스트 구간(실행 생성부터 마지막 `test / *` 잡 종료, 2026-09-11~09-23): 중앙값 176초, p90 217초. `AGENTS.md` 12번 규칙의 비교 기준이다.
+- docker-build 전체(같은 20회): 중앙값 558초, p90 665초.
+- 과거 지표인 독립 `ci.yml` 크리티컬 패스(2026-09-07~09-23)는 중앙값 171초, p90 194초였다. 이제 `ci.yml` 단독 push/PR 실행이 없어 다시 잴 수 없다.
+
+workflow 실행 효과는 `dev` push 뒤 20회 이상 실측하기 전까지 CI-unverified다.
+
+docker 검증 상태:
+- 2026-09-24 로컬 native arm64 `docker build --no-cache`로 origin/dev(merge 전 CI 변경만 포함) `lumen-api`/`lumen-worker`/`lumen-test`를 빌드했다. 세 이미지 모두 `/app`·`/data`·`/seed` 아래 전부 `appuser:appuser`이고 `import lumen.main`/`lumen.worker`가 성공했다. 기록은 진행 중 OpenSpec change `ci-review-round-1`의 `tasks.md`에 있다.
+- 2026-09-25 통합 Dockerfile로 `lumen-api`·`lumen-worker`·`lumen-controller`·`lumen-test`·`lumen-sandbox`의 linux/amd64 및 linux/arm64 이미지를 빌드했다. 두 architecture에서 runtime package/ownership 및 Node·bubblewrap 실행을 확인했고, native arm64 sandbox 실제 격리 workload 21건을 통과했다. 통합 source의 contract 1,316건·SDK 125건, MariaDB/Redis integration 40건, Docker process-system 9건과 plugin conformance 88건(1 skip)을 통과했다. Afterglow dev Compose에서 migration과 API/worker 재배포 후 authenticated BFF를 확인했다. 이는 live provider inference, native amd64 sandbox isolation 또는 cloud sandbox lifecycle 검증이 아니다.
+
 `tests/integration/test_native_api_key_flow.py`와 `tests/integration/test_history_gateway_flow.py`는 HTTP admission, MariaDB/Redis persistence, active-path revision fence, Gateway one-time credential, worker execution/replay와 usage attribution을 정의하지만 외부 provider live 검증은 아니다. `tests/system/test_process_stack.py`는 `tests/system/fake_openai.py`와 container stack을 사용해 Chat Completions, Responses의 function-call/full-input continuation과 `prompt_cache_key` 전달/`client_metadata` 차단, Anthropic Messages와 Gateway issue/token/inference를 검증하므로 fake-provider system evidence를 live provider evidence로 승격하지 않는다. 실제 Keystone/OpenStack 배포 검증은 Lumen 외부 배포/Afterglow 소유 범위다.
 
 ## Change guide
@@ -250,6 +290,7 @@ Kolla role은 API/worker를 별도 host-network container로 실행하고 MariaD
 | auth/project scope | `lumen/auth.py`, API dependencies, SDK proxy | Keystone/API-key matrix, target-project invariant, security docs and auth tests |
 | deployment/config | `pyproject.toml`, `docker/Dockerfile`, `docker-compose*.yml`, `lumen/config.py`, `deploy/kolla/ansible/roles/lumen/` | root wheel shared data, service-extra boundary, root build context/stages, migration/bootstrap order, independent image defaults, operations docs and Kolla tests |
 | SDK surface | `sdk/lumen_sdk/{client,proxy,_api}.py`, `sdk/pyproject.toml` | package version, route mixin/transport tests, `docs/sdk.md` and this Code map |
+| CI workflow/test harness | `.github/workflows/docker-build.yml`, `.github/workflows/ci.yml`, `lumen/scripts/test_layers.py`, `docker/Dockerfile`, `docker-compose.system.yml` | `AGENTS.md` CI 파이프라인 성능 규정(전후 실측 median/p90), `tests/test_ci_shape.py`, `tests/test_test_layers.py`, `actionlint`, `docs/testing.md`, `docs/operations.md` |
 | bugfix/refactor with no architecture change | actual source and affected tests | root architecture Maintenance marker summary must state why ownership/flow/store contracts are unchanged; still run guard before completion/commit |
 
 ## Maintenance
@@ -268,9 +309,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "a483d4e3827934841d30f5433bdcc2e3c6a8b965a205ddebc6735c608ff7a4c3",
-  "reviewed_at": "2026-09-24T13:55:08Z",
-  "summary": "Reviewed durable_runs lock helpers and terminal barriers: budgets lock_run/quota/ledger/call-credit and children._locked_children now refresh identity-mapped rows (populate_existing); request_cancelled and _finish run as retry_deadlocks transactions with a fresh LockOrder per attempt, matching fail_waiting_run. Two-session MariaDB regression covers fail_waiting/cancel/finish under innodb_snapshot_isolation ON and OFF. Docs: ARCHITECTURE evidence (integration 40) and residual _credit_lineage 1020 limit; docs/agent-platform.md lock/retry contract. No schema, API or migration change."
+  "source_sha256": "548735b29e82ea6f19ff927c5e0580d4c18606c68e5d611646df678ff8a8f5f5",
+  "reviewed_at": "2026-09-24T15:55:10Z",
+  "summary": "Integrated dev plugin/runtime changes with origin CI; both architectures built and package ownership executed, contract 1316 and SDK 125, datastore 40, process-system 9, plugin 88 passed with one optional skip, native arm64 sandbox 21 passed. Native amd64 isolation and real provider/cloud sandbox lifecycle remain unverified. Merge adds no API or schema change."
 }
 ```
 <!-- architecture-review:end -->

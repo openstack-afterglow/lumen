@@ -5,12 +5,15 @@ ARG AFTERGLOW_CRYPTO_REF=""
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
     && rm -rf /var/lib/apt/lists/*
+
+# Pinned by tag and index digest and copied after the apt layer: a floating uv
+# tag changes digest often and otherwise invalidates the build-essential layer
+# (~106s under arm64 QEMU). Bump the tag and digest together by hand.
+COPY --from=ghcr.io/astral-sh/uv:0.12.18@sha256:3adc3706091ce7c2fe595e669628caedd6d951551b92b258b7e7dbe06d9440bc /uv /uvx /bin/
 
 # Workspace manifests first so the frozen dependency layer caches independently of sources.
 COPY pyproject.toml uv.lock LICENSE ./
@@ -44,25 +47,29 @@ FROM python:3.12-slim AS lumen-runtime
 
 WORKDIR /app
 
-COPY --from=lumen-builder /app/.venv /app/.venv
-COPY pyproject.toml uv.lock LICENSE ./
-COPY lumen/ ./lumen/
-COPY lumen_console/ ./lumen_console/
-COPY packages/lumen-plugin-api/ ./packages/lumen-plugin-api/
-COPY plugins/ ./plugins/
-
+# The user, directories and their ownership come before the source COPYs so
+# this layer stays cached across code changes. COPY --chown replaces a
+# recursive chown, which copied the whole venv into another layer.
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && python -m compileall -q lumen \
     && adduser --disabled-password --gecos "" appuser \
     && adduser appuser root \
-    && mkdir -p /data /seed \
-    && chown appuser:appuser /data /seed \
-    && chown -R appuser:appuser /app
+    && mkdir -p /data /seed /app/.venv /app/lumen /app/lumen_console /app/packages/lumen-plugin-api /app/plugins \
+    && chown appuser:appuser /app /app/.venv /app/lumen /app/lumen_console /app/packages /app/packages/lumen-plugin-api /app/plugins /data /seed
+
+COPY --from=lumen-builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --chown=appuser:appuser pyproject.toml uv.lock LICENSE ./
+COPY --chown=appuser:appuser lumen/ ./lumen/
+COPY --chown=appuser:appuser lumen_console/ ./lumen_console/
+COPY --chown=appuser:appuser packages/lumen-plugin-api/ ./packages/lumen-plugin-api/
+COPY --chown=appuser:appuser plugins/ ./plugins/
 
 ENV PATH="/app/.venv/bin:$PATH"
 
 USER appuser
+
+# Compiled as appuser so __pycache__ keeps appuser ownership.
+RUN python -m compileall -q lumen
 
 # Import the actual migration entry point without opening a database connection.
 # This catches missing workspace distributions or editable sources before deployment.
@@ -83,26 +90,26 @@ FROM python:3.12-slim AS lumen-test
 
 WORKDIR /app
 
-COPY --from=lumen-test-builder /app/.venv /app/.venv
-COPY pyproject.toml uv.lock LICENSE ./
-COPY lumen/ ./lumen/
-COPY lumen_console/ ./lumen_console/
-COPY packages/lumen-plugin-api/ ./packages/lumen-plugin-api/
-COPY plugins/ ./plugins/
-COPY tests/ ./tests/
-
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && python -m compileall -q lumen tests \
     && adduser --disabled-password --gecos "" appuser \
     && adduser appuser root \
-    && mkdir -p /data /seed \
-    && chown appuser:appuser /data /seed \
-    && chown -R appuser:appuser /app
+    && mkdir -p /data /seed /app/.venv /app/lumen /app/lumen_console /app/packages/lumen-plugin-api /app/plugins /app/tests \
+    && chown appuser:appuser /app /app/.venv /app/lumen /app/lumen_console /app/packages /app/packages/lumen-plugin-api /app/plugins /app/tests /data /seed
+
+COPY --from=lumen-test-builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --chown=appuser:appuser pyproject.toml uv.lock LICENSE ./
+COPY --chown=appuser:appuser lumen/ ./lumen/
+COPY --chown=appuser:appuser lumen_console/ ./lumen_console/
+COPY --chown=appuser:appuser packages/lumen-plugin-api/ ./packages/lumen-plugin-api/
+COPY --chown=appuser:appuser plugins/ ./plugins/
+COPY --chown=appuser:appuser tests/ ./tests/
 
 ENV PATH="/app/.venv/bin:$PATH"
 
 USER appuser
+
+RUN python -m compileall -q lumen tests
 
 CMD ["pytest", "-m", "system", "tests/system"]
 
@@ -113,7 +120,7 @@ CMD ["pytest", "-m", "system", "tests/system"]
 FROM python:3.12-slim AS lumen-sandbox-builder
 
 WORKDIR /build
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.18@sha256:3adc3706091ce7c2fe595e669628caedd6d951551b92b258b7e7dbe06d9440bc /uv /uvx /bin/
 COPY packages/lumen-sandbox/ ./packages/lumen-sandbox/
 RUN uv build --wheel --out-dir /wheels ./packages/lumen-sandbox
 

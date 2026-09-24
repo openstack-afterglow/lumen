@@ -100,8 +100,15 @@ Lumen은 GitHub Actions 파이프라인(`.github/workflows/docker-build.yml`)을
 - **Controller/Sandbox**: `ghcr.io/openstack-afterglow/lumen-controller`, `ghcr.io/openstack-afterglow/lumen-sandbox` (sandbox는 별도 격리 이미지이며 API/worker dependency를 담지 않는다)
 
 ### 게시 트리거 및 태그 규칙
-게시 작업(`build-and-push`)은 재사용 가능한 CI 워크플로우(`ci.yml`) 검증 성공을 전제로 실행된다.
+게시 작업(`build-and-push`)은 재사용 가능한 CI 워크플로우(`ci.yml`) 검증 성공을 전제로 실행된다(`needs.test.result == 'success'`). `ci.yml`에는 직접 push/PR trigger가 없으므로 `main`/`dev` push·PR에서는 이 워크플로우의 `test` job이 유일한 테스트 실행이다. `v*` tag push에서는 `release.yml`도 `ci.yml`을 따로 호출하므로 테스트가 두 번 돈다(알려진 중복).
 - **PR (`pull_request`)**: `main` 및 `dev` 브랜치 대상 PR은 빌드 검증만 수행하고 GHCR 로그인 및 푸시는 진행하지 않는다 (`push: false`).
+  - 다음 조건을 모두 충족하면 `dedup` job이 PR을 중복으로 판정한다.
+    - head가 같은 저장소의 `dev`/`main`이다.
+    - dependabot PR이 아니다.
+    - merge 트리가 head 트리와 같다.
+  - 중복 판정 시 테스트와 빌드 검증을 건너뛴다. 그 트리는 해당 브랜치 push 실행이 이미 테스트·빌드했다.
+  - fork·dependabot·feature branch PR과 판정 오류는 항상 전체를 실행한다.
+  - 중복 PR의 자기 `pull_request` check는 skipped로 표시되고 GitHub은 이를 통과로 친다. maintainer는 merge 전에 head SHA의 push 실행(`push` event) check suite가 성공했는지 확인한다. 2026-09-24 읽기 전용 확인 시 `dev`·`main` 모두 required status check가 없고, `main` ruleset은 deletion·non_fast_forward 규칙만 가진다. required status check를 추가하면 이 dedup을 다시 검토한다.
 - **`dev` 브랜치 푸시**: CI 성공 후 `dev` 태그 및 `sha-<hash>` 태그로 GHCR에 게시된다.
 - **`main` 브랜치 푸시**: CI 성공 후 `latest` 태그 및 `sha-<hash>` 태그로 GHCR에 게시된다.
 - **버전 태그 푸시 (`v*`)**: 유효한 시맨틱 버전 Git 태그 `v1.2.3`은 이미지 태그 `1.2.3` 및 `sha-<hash>`로 게시된다.
@@ -109,7 +116,19 @@ Lumen은 GitHub Actions 파이프라인(`.github/workflows/docker-build.yml`)을
 
 ### 아키텍처 및 캐시 설정
 - **두 플랫폼 지원**: QEMU (`docker/setup-qemu-action@v4`)와 Buildx (`docker/setup-buildx-action@v4`)를 사용해 `linux/amd64` 및 `linux/arm64` 멀티 아키텍처 이미지를 빌드한다.
-- **GHA BuildKit 캐시**: matrix target별 독립 스코프(`type=gha,scope=<target>`)를 사용한다.
+- **GHA BuildKit 캐시**: matrix target(`lumen-api`, `lumen-worker`, `lumen-controller`, `lumen-sandbox`)별 독립 스코프(`type=gha,scope=<target>`)를 사용해 타겟 간 캐시 충돌을 방지한다.
+  - 모든 이벤트가 cache를 읽는다(`cache-from`). export(`cache-to`, `mode=max`)는 `refs/heads/dev`·`refs/heads/main` 실행(push와 해당 브랜치 `workflow_dispatch`)에서만 한다.
+  - GHA cache entry는 그 entry를 쓴 ref, default branch, PR이면 base branch에서만 복원된다. PR·`v*` tag·feature branch dispatch가 export하면 다른 ref가 복원할 수 없는 entry에 job마다 약 100초를 쓰고, 10GB quota 안에서 `dev` cache를 밀어낸다.
+- **캐시 친화적 layer 순서** (`docker/Dockerfile`):
+  - `lumen-builder`는 build-essential apt layer 뒤에 tag와 multi-arch index digest로 고정한 `ghcr.io/astral-sh/uv:0.12.18@sha256:…`을 복사한다. `lumen-sandbox-builder`도 같은 tag+digest를 쓴다. 자동 갱신 도구는 없다. uv 갱신은 tag와 digest(`docker buildx imagetools inspect ghcr.io/astral-sh/uv:<version>`의 index `Digest`)를 함께 바꾸는 명시적 변경으로 한다.
+  - `lumen-builder`는 workspace manifest(root, `packages/lumen-plugin-api`, 다섯 `plugins/*`)만으로 `uv sync --locked` dependency layer를 만든 뒤 source와 workspace member를 설치한다.
+  - `lumen-runtime`·`lumen-test`는 source COPY 전에 한 RUN에서 다음을 처리한다.
+    - curl 설치와 `appuser` 생성(root group 포함)
+    - `/data`·`/seed`와 COPY 대상 디렉터리(`lumen`, `lumen_console`, `packages/lumen-plugin-api`, `plugins`, test stage의 `tests`) 생성
+    - 이 디렉터리들의 non-recursive `chown`
+  - venv, source와 editable workspace member source는 `COPY --chown=appuser:appuser`로 복사하고, `USER appuser`로 `python -m compileall`을 실행한다. runtime stage는 이어서 DB 연결 없이 `python -m lumen.scripts.migrate --help`로 실제 migration entry import를 검사한다.
+  - 결과 소유권은 기존 재귀 `chown -R /app`과 같다. `/app`, venv, source, `__pycache__`, `/data`, `/seed`가 모두 `appuser` 소유다.
+  - apt·사용자 layer는 코드 변경 시에도 cache에 남는다.
 
 ### 권한 및 인증 사전 요구사항
 - **GHA 작업 권한**: 빌드 및 게시 작업에 `contents: read` 및 `packages: write` 권한이 지정되어 있다.

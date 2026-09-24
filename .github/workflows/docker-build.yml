@@ -12,12 +12,62 @@ env:
   IMAGE_OWNER: ${{ github.repository_owner }}
 
 jobs:
+  # A same-repository dev/main PR whose merge tree equals its head tree tests
+  # exactly the tree the push run on that branch already tested, so it is a
+  # duplicate. Fork and dependabot PRs, feature branches and any lookup error
+  # are never duplicates. Values reach the script only through env.
+  dedup:
+    name: Detect duplicate PR tree
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      duplicate: ${{ steps.tree.outputs.duplicate }}
+    steps:
+      - name: Compare PR merge tree with head tree
+        id: tree
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          ACTOR: ${{ github.actor }}
+          MERGE_SHA: ${{ github.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          duplicate=false
+          merge_tree=""
+          head_tree=""
+          if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" = "$REPO" ] \
+            && [ "$PR_AUTHOR" != "dependabot[bot]" ] && [ "$ACTOR" != "dependabot[bot]" ]; then
+            case "$HEAD_REF" in
+              dev|main)
+                merge_tree="$(gh api "repos/${REPO}/git/commits/${MERGE_SHA}" --jq .tree.sha)" || merge_tree=""
+                head_tree="$(gh api "repos/${REPO}/git/commits/${HEAD_SHA}" --jq .tree.sha)" || head_tree=""
+                if [[ "$merge_tree" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] && [ "$merge_tree" = "$head_tree" ]; then
+                  duplicate=true
+                fi
+                ;;
+            esac
+          fi
+          echo "merge_tree=${merge_tree:-none} head_tree=${head_tree:-none} duplicate=${duplicate}"
+          echo "duplicate=${duplicate}" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: dedup
+    # dedup is skipped on push/tag/dispatch and may fail; only an explicit
+    # 'true' skips the tests.
+    if: ${{ !cancelled() && needs.dedup.outputs.duplicate != 'true' }}
     uses: ./.github/workflows/ci.yml
 
   build-and-push:
     name: Build & Push Lumen Images
-    needs: test
+    needs: [dedup, test]
+    if: ${{ !cancelled() && needs.test.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -66,4 +116,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+          # Only dev/main runs export. Entries written on a PR, tag or feature
+          # ref are readable only from that ref, so exporting them costs ~100s
+          # per job and evicts the dev cache within the quota.
+          cache-to: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && format('type=gha,mode=max,scope={0}', matrix.target) || '' }}
