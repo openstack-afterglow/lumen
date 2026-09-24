@@ -9,12 +9,17 @@ MCP token or a user's Keystone credential.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
+from lumen_plugin_api.contracts import PluginError
 
 from lumen.config import get_settings
+
+if TYPE_CHECKING:
+    from lumen_plugin_api.contracts import Namespace
+    from lumen_plugin_api.mcp import McpAuthorityAccess
 
 REGISTRY_VERSION = "v1"
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0)
@@ -22,7 +27,16 @@ _EMPTY_FINGERPRINT = "0" * 64
 
 
 class McpLumenAuthorityError(RuntimeError):
-    """The remote control plane cannot validate the selected grant."""
+    """The remote control plane cannot validate the selected grant.
+
+    ``revoked`` distinguishes an authoritative rejection (bad grant, stale
+    epoch/generation) from a transport-level outage, for callers that need to
+    map onto ``PluginErrorCode`` without inspecting message text.
+    """
+
+    def __init__(self, message: str, *, revoked: bool = False) -> None:
+        super().__init__(message)
+        self.revoked = revoked
 
 
 class McpInvocationError(RuntimeError):
@@ -152,7 +166,7 @@ async def _bridge_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     except (httpx.HTTPError, ValueError) as exc:
         raise McpLumenAuthorityError("Lumen MCP control plane is unavailable") from exc
     if response.status_code in {401, 403, 404, 409, 422}:
-        raise McpLumenAuthorityError("Lumen MCP authority rejected the request")
+        raise McpLumenAuthorityError("Lumen MCP authority rejected the request", revoked=True)
     if response.status_code >= 500:
         raise McpLumenAuthorityError("Lumen MCP control plane is unavailable")
     try:
@@ -302,3 +316,59 @@ async def build_mutation_preview(
         )
     except McpLumenAuthorityError as exc:
         raise McpInvocationError("Cloud mutation preview is unavailable") from exc
+
+
+def _plugin_error(exc: McpLumenAuthorityError) -> PluginError:
+    code = "plugin_authority_revoked" if exc.revoked else "plugin_unavailable"
+    return PluginError(code, str(exc))
+
+
+class _BridgeAuthority:
+    """Transport-only ``McpAuthorityAccess`` view of the configured bridge.
+
+    Every structural and business rule -- snapshot/epoch/generation equality,
+    entry parsing, effect dispatch, idempotency semantics -- belongs to the
+    Afterglow authority plugin that consumes this host capability. This class
+    only posts to the bridge and classifies transport failures as
+    ``PluginError`` so the plugin package never needs to import Lumen's
+    internal exception types.
+    """
+
+    async def registry(self, namespace: Namespace) -> dict[str, Any]:
+        try:
+            return await _bridge_post("/snapshot", {"user_id": namespace.user_id, "project_id": namespace.project_id or ""})
+        except McpLumenAuthorityError as exc:
+            raise _plugin_error(exc) from exc
+
+    async def read(self, snapshot: dict[str, Any], name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await _bridge_post("/execute", {"snapshot": snapshot, "name": name, "arguments": arguments})
+        except McpLumenAuthorityError as exc:
+            raise _plugin_error(exc) from exc
+
+    async def preview(self, snapshot: dict[str, Any], name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await _bridge_post("/preview", {"snapshot": snapshot, "name": name, "arguments": arguments})
+        except McpLumenAuthorityError as exc:
+            raise _plugin_error(exc) from exc
+
+    async def claim(self, snapshot: dict[str, Any], name: str, arguments: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+        try:
+            return await _bridge_post(
+                "/execute",
+                {"snapshot": snapshot, "name": name, "arguments": arguments, "idempotency_key": idempotency_key},
+            )
+        except McpLumenAuthorityError as exc:
+            raise _plugin_error(exc) from exc
+
+    async def complete(self, invocation_id: str) -> dict[str, Any]:
+        # The bridge finalizes preview/authorize/dispatch atomically under the
+        # idempotency key passed to `claim`; there is no separate remote
+        # completion call to make.
+        del invocation_id
+        return {}
+
+
+def authority_access() -> McpAuthorityAccess:
+    """Host factory: an ``McpAuthorityAccess`` backed by the configured Afterglow bridge."""
+    return _BridgeAuthority()

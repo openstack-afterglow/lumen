@@ -497,6 +497,8 @@ class TestPrincipalDependency:
                 skill_ids=[],
                 agent=None,
                 extension_selection={"tools": [], "mcp": []},
+                plugin_tool_snapshots=[],
+                plugin_skill_snapshots=[],
             )
         assert exc_info.value.status_code == 403
 
@@ -519,9 +521,48 @@ class TestPrincipalDependency:
                 skill_ids=[],
                 agent=None,
                 extension_selection={"tools": [], "mcp": []},
+                plugin_tool_snapshots=[],
+                plugin_skill_snapshots=[],
             )
         assert exc_info.value.status_code == 403
 
+
+    def test_plugin_tool_selection_requires_execute_scope(self):
+        """A frozen plugin tool needs both extension read and tool execute; a plugin skill only read."""
+        principal = {
+            "auth_type": "api_key",
+            "user_id": "u1",
+            "project_id": "p1",
+            "api_key_id": 7,
+            "scopes": ("native:memory:read", "native:memory:write", "native:extensions:read"),
+            "source": "api",
+            "roles": [],
+            "is_system_admin": False,
+        }
+        features = ChatFeatureOptions(tool_policy={"mode": "none"})
+        chat_admission._require_native_admission_scopes(
+            principal,
+            features,
+            parts=[TextPart(type="text", text="hello")],
+            execution_mode="chat",
+            skill_ids=[],
+            agent=None,
+            extension_selection={"tools": [], "mcp": []},
+            plugin_tool_snapshots=[],
+            plugin_skill_snapshots=[{"binding": {"id": "b"}}],
+        )
+        with pytest.raises(HTTPException, match="native:tools:execute"):
+            chat_admission._require_native_admission_scopes(
+                principal,
+                features,
+                parts=[TextPart(type="text", text="hello")],
+                execution_mode="chat",
+                skill_ids=[],
+                agent=None,
+                extension_selection={"tools": [], "mcp": []},
+                plugin_tool_snapshots=[{"binding": {"id": "b"}}],
+                plugin_skill_snapshots=[],
+            )
 
 class TestRouter:
     async def test_create_returns_plaintext_once(self, client, monkeypatch):

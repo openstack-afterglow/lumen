@@ -260,7 +260,7 @@ async def _persist_v2_approval_interrupt(*, run_id: str, owner: str, calls: obje
                 or len(call_id) > 190
                 or not isinstance(name, str)
                 or not name
-                or source not in {"builtin", "managed", "custom_http", "mcp", "workspace", "agent"}
+                or source not in {"builtin", "managed", "custom_http", "mcp", "workspace", "agent", "plugin"}
                 or effect not in {"read", "workspace_write", "process", "external_mutation"}
             ):
                 raise DurableRunError("v2 approval interrupt call is invalid")

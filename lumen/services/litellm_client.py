@@ -51,6 +51,54 @@ _OFFICIAL_PRICE_PER_MILLION: dict[tuple[str, str], tuple[Decimal, Decimal, str]]
     ),
 }
 
+# Custom OpenAI-compatible bases may route the same model ID to a different
+# tariff. Only the actual provider endpoint may use bundled provider prices.
+_DIRECT_API_BASES = {
+    "openai": {"https://api.openai.com", "https://api.openai.com/v1"},
+    "anthropic": {"https://api.anthropic.com", "https://api.anthropic.com/v1"},
+    "gemini": {"https://generativelanguage.googleapis.com", "https://generativelanguage.googleapis.com/v1beta"},
+    "deepseek": {"https://api.deepseek.com", "https://api.deepseek.com/v1"},
+    "openrouter": {"https://openrouter.ai/api/v1"},
+    "xai": {"https://api.x.ai/v1"},
+    "perplexity": {
+        "https://api.perplexity.ai", "https://api.perplexity.ai/v1",
+        "https://api.perplexity.ai/router", "https://api.perplexity.ai/router/v1",
+    },
+}
+
+
+def direct_provider_route(provider_type: str | None, api_base: str | None) -> bool:
+    if provider_type not in _DIRECT_API_BASES:
+        return False
+    return api_base is None or api_base.rstrip("/") in _DIRECT_API_BASES[provider_type]
+
+
+def bundled_cache_rates(model: str, provider_type: str | None, api_base: str | None) -> dict[str, Decimal | None]:
+    """Exact provider catalog rates; a missing cache category remains unpriced."""
+    if not direct_provider_route(provider_type, api_base):
+        return {}
+    try:
+        import litellm
+    except ImportError:
+        return {}
+    metadata: dict[str, Any] = {}
+    for candidate in _pricing_model_candidates(model, provider_type):
+        entry = litellm.model_cost.get(f"{provider_type}/{candidate}") or litellm.model_cost.get(candidate)
+        if isinstance(entry, dict) and entry.get("litellm_provider") == provider_type:
+            metadata = entry
+            break
+    return {
+        key: _as_decimal(metadata.get(field))
+        for key, field in (
+            ("cache_read_price_per_token", "cache_read_input_token_cost"),
+            ("cache_write_price_per_token", "cache_creation_input_token_cost"),
+            ("cache_write_1h_price_per_token", "cache_creation_input_token_cost_above_1hr"),
+            ("cache_read_price_per_token_above_200k", "cache_read_input_token_cost_above_200k_tokens"),
+            ("cache_write_price_per_token_above_200k", "cache_creation_input_token_cost_above_200k_tokens"),
+            ("cache_write_1h_price_per_token_above_200k", "cache_creation_input_token_cost_above_1hr_above_200k_tokens"),
+        )
+    }
+
 
 @dataclass(frozen=True)
 class UsageCost:
@@ -233,6 +281,16 @@ def _litellm_component_rates(
         logger.warning("litellm cost catalog is unavailable model=%s", model, exc_info=True)
         return None, None
     for candidate in _pricing_model_candidates(model, provider_type):
+        # Provider calculators can return zero for unknown IDs. A successful
+        # calculation is not evidence of a published (including explicitly free) price.
+        catalog_key = f"{provider_type}/{candidate}" if provider_type else candidate
+        metadata = litellm.model_cost.get(catalog_key) or litellm.model_cost.get(candidate)
+        if not isinstance(metadata, dict):
+            continue
+        catalog_input = _as_decimal(metadata.get("input_cost_per_token"))
+        catalog_output = _as_decimal(metadata.get("output_cost_per_token"))
+        if catalog_input is None or catalog_output is None:
+            return catalog_input, catalog_output
         kwargs = {
             "model": candidate,
             "prompt_tokens": lookup_prompt_tokens,
@@ -271,6 +329,8 @@ def _fallback_component_rates(
     provider_type: str | None = None,
     api_base: str | None = None,
 ) -> tuple[Decimal | None, Decimal | None, str | None]:
+    if api_base and not direct_provider_route(provider_type, api_base):
+        return None, None, None
     # Agent Sonar is a different priced product from the legacy Sonar API.
     # Exact published Agent rates must win over its legacy bundled alias.
     official_input, official_output, official_source = _official_component_rates(model, provider_type, api_base)
@@ -343,17 +403,22 @@ def cost_from_usage(
     output_price_per_token: Decimal | None,
     price_source: str | None,
     provider_type: str | None = None,
+    api_base: str | None = None,
     breakdown: UsageBreakdown | None = None,
     cache_read_price_per_token: Decimal | None = None,
     cache_write_price_per_token: Decimal | None = None,
     cache_write_1h_price_per_token: Decimal | None = None,
+    cache_read_price_per_token_above_200k: Decimal | None = None,
+    cache_write_price_per_token_above_200k: Decimal | None = None,
+    cache_write_1h_price_per_token_above_200k: Decimal | None = None,
+    cache_price_sources: Mapping[str, str] | None = None,
+    allow_catalog_cache: bool = True,
+    allow_catalog_prices: bool = True,
 ) -> UsageCost:
-    """Resolve manual → reviewed models.dev → LiteLLM bundled pricing per component.
+    """Bill provider-reported token totals using manual or exact catalog prices.
 
-    ``prompt_tokens`` is total input. With a ``breakdown`` the input component
-    prices only the uncached share and each cache category uses its own
-    manual rate. Cache rates never fall back to a catalog: an unset rate bills
-    that category at 0 and marks the usage ``partial``.
+    A direct provider's known cache rates fill only unset categories. A custom
+    base requires configured prices; missing categories remain visibly partial.
     """
     if breakdown is None:
         breakdown = UsageBreakdown.from_totals(prompt_tokens, completion_tokens)
@@ -366,8 +431,8 @@ def cost_from_usage(
     completion_tokens = breakdown.output_tokens
     uncached_tokens = breakdown.uncached_input_tokens
     fallback_input, fallback_output, fallback_source = (
-        _fallback_component_rates(model, prompt_tokens, completion_tokens, provider_type)
-        if input_price_per_token is None or output_price_per_token is None
+        _fallback_component_rates(model, prompt_tokens, completion_tokens, provider_type, api_base)
+        if allow_catalog_prices and (input_price_per_token is None or output_price_per_token is None)
         else (None, None, None)
     )
     input_cost, input_rate, input_source, input_priced = _component_cost(
@@ -386,14 +451,38 @@ def cost_from_usage(
     )
     input_cost = input_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
     output_cost = output_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
+    catalog_cache = bundled_cache_rates(model, provider_type, api_base) if breakdown.has_cache and allow_catalog_cache else {}
+    cache_rates = {
+        "cache_read": (
+            cache_read_price_per_token, catalog_cache.get("cache_read_price_per_token"),
+            cache_read_price_per_token_above_200k, catalog_cache.get("cache_read_price_per_token_above_200k"),
+        ),
+        "cache_creation_5m": (
+            cache_write_price_per_token, catalog_cache.get("cache_write_price_per_token"),
+            cache_write_price_per_token_above_200k, catalog_cache.get("cache_write_price_per_token_above_200k"),
+        ),
+        "cache_creation_1h": (
+            cache_write_1h_price_per_token, catalog_cache.get("cache_write_1h_price_per_token"),
+            cache_write_1h_price_per_token_above_200k, catalog_cache.get("cache_write_1h_price_per_token_above_200k"),
+        ),
+    }
+    cache_sources: dict[str, str | None] = dict(cache_price_sources or {})
     cache_components: dict[str, tuple[int, Decimal | None, Decimal]] = {}
-    for name, tokens, rate in (
-        ("cache_read", breakdown.cache_read_input_tokens, cache_read_price_per_token),
-        ("cache_creation_5m", breakdown.cache_creation_5m_input_tokens, cache_write_price_per_token),
-        ("cache_creation_1h", breakdown.cache_creation_1h_input_tokens, cache_write_1h_price_per_token),
+    for name, tokens in (
+        ("cache_read", breakdown.cache_read_input_tokens),
+        ("cache_creation_5m", breakdown.cache_creation_5m_input_tokens),
+        ("cache_creation_1h", breakdown.cache_creation_1h_input_tokens),
     ):
+        configured, catalog, configured_tier, catalog_tier = cache_rates[name]
+        rate = configured if configured is not None else catalog
+        source = cache_sources.get(name, "manual") if configured is not None else "litellm" if catalog is not None else None
+        tier = configured_tier if configured_tier is not None else catalog_tier if source == "litellm" else None
+        if prompt_tokens > 200_000 and tier is not None:
+            rate = tier
+            source = source or "litellm"
         cost = (rate * tokens).quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else Decimal("0")
         cache_components[name] = (tokens, rate, cost)
+        cache_sources[name] = source
     priced_components = int(input_priced) + int(output_priced)
     pricing_status: Literal["priced", "partial", "unpriced"]
     if priced_components == 2:
@@ -412,7 +501,7 @@ def cost_from_usage(
         "output": _snapshot_component(completion_tokens, output_rate, output_cost, output_source),
     }
     for name, (tokens, rate, cost) in cache_components.items():
-        snapshot[name] = _snapshot_component(tokens, rate, cost, "manual" if rate is not None else None)
+        snapshot[name] = _snapshot_component(tokens, rate, cost, cache_sources.get(name))
     return UsageCost(
         raw_cost=raw_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP),
         input_cost=input_cost,
@@ -465,6 +554,55 @@ def _native_web_search_extra(
     if custom_llm_provider == "gemini":
         merged["include_server_side_tool_invocations"] = True
     return merged
+
+
+def _cache_marker_present(value: object) -> bool:
+    if isinstance(value, dict):
+        return "cache_control" in value or any(_cache_marker_present(part) for part in value.values())
+    return isinstance(value, list) and any(_cache_marker_present(part) for part in value)
+
+
+def _anthropic_cached_messages(
+    model: str, messages: list[dict], provider_type: str | None, api_base: str | None,
+    *, tools: list[dict] | None = None, extra: dict | None = None,
+) -> list[dict]:
+    """Mark only a stable system prefix when no caller breakpoint already exists."""
+    if provider_type != "anthropic" or not direct_provider_route(provider_type, api_base):
+        return messages
+    if (any(_cache_marker_present(message) for message in messages)
+            or _cache_marker_present(tools) or _cache_marker_present(extra)):
+        return messages
+    try:
+        from litellm.utils import supports_prompt_caching
+
+        if not supports_prompt_caching(model=litellm_model_name(model)):
+            return messages
+    except Exception:
+        return messages
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            updated_content = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+        elif isinstance(content, list):
+            last_text = next(
+                (n for n in range(len(content) - 1, -1, -1)
+                 if isinstance(content[n], dict) and content[n].get("type") == "text"
+                 and isinstance(content[n].get("text"), str) and content[n]["text"]),
+                None,
+            )
+            if last_text is None:
+                return messages
+            updated_content = list(content)
+            updated_content[last_text] = {**content[last_text], "cache_control": {"type": "ephemeral"}}
+        else:
+            return messages
+        updated = list(messages)
+        updated[index] = {**message, "content": updated_content}
+        return updated
+    return messages
 
 
 def _build_params(
@@ -1098,7 +1236,7 @@ async def acompletion(
     litellm.drop_params = True
     params = _build_params(
         model,
-        messages,
+        _anthropic_cached_messages(model, messages, custom_llm_provider, api_base, tools=tools, extra=merged_extra),
         api_base=api_base,
         api_key=api_key,
         max_tokens=max_tokens,
@@ -1167,7 +1305,7 @@ async def acompletion_stream(
     litellm.drop_params = True
     params = _build_params(
         model,
-        messages,
+        _anthropic_cached_messages(model, messages, custom_llm_provider, api_base, tools=tools, extra=merged_extra),
         api_base=api_base,
         api_key=api_key,
         max_tokens=max_tokens,

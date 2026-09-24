@@ -2,9 +2,9 @@ import asyncio
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
+from lumen_plugin_api.tools import ToolBinding, ToolDefinition, ToolExecutionResult
 
 from lumen.services import graph
-from lumen.services.agent_protocol import ToolBinding, ToolDefinition, ToolExecutionResult
 
 
 def test_v2_approval_defaults_fail_closed_for_non_read_effects():
@@ -451,7 +451,7 @@ async def test_v2_graph_interrupts_before_external_mutation_dispatch(monkeypatch
             user_id="user",
             execution_protocol_version=2,
             approval_mode="required_for_mutations",
-            resume=[{"call_id": "call-1", "decision": "approve"}],
+            resume={"kind": "tool_approval", "decisions": [{"call_id": "call-1", "decision": "approve"}]},
             run_id="run-v2-interrupt",
         )
     ]
@@ -543,7 +543,10 @@ async def test_v2_graph_rejects_pre_interrupt_tool_id_reused_after_approval_resu
                 user_id="user",
                 execution_protocol_version=2,
                 approval_mode="required_for_mutations",
-                resume=[{"call_id": "call-before-interrupt", "decision": "approve"}],
+                resume={
+                    "kind": "tool_approval",
+                    "decisions": [{"call_id": "call-before-interrupt", "decision": "approve"}],
+                },
                 run_id="run-v2-resume-duplicate-call-id",
             )
         ]
@@ -648,7 +651,7 @@ async def test_v2_graph_rejects_changed_binding_before_resumed_dispatch(
                 user_id="user",
                 execution_protocol_version=2,
                 approval_mode="required_for_mutations",
-                resume=[{"call_id": "call-1", "decision": "approve"}],
+                resume={"kind": "tool_approval", "decisions": [{"call_id": "call-1", "decision": "approve"}]},
                 run_id="run-v2-drift",
             )
         ]

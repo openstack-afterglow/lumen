@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
 import tempfile
 import tomllib
 import zipfile
@@ -67,6 +70,85 @@ def test_kolla_yaml_and_jinja_validity():
     template_content = template_path.read_text(encoding="utf-8")
     parsed_ast = jinja_env.parse(template_content)
     assert parsed_ast is not None
+
+def test_runtime_enabled_kolla_config_loads_as_typed_settings(tmp_path):
+    from jinja2 import meta
+
+    source = (ROLE_DIR / "templates" / "lumen.conf.j2").read_text(encoding="utf-8")
+    environment = jinja2.Environment(undefined=jinja2.StrictUndefined)
+    environment.filters.update(
+        bool=bool,
+        combine=lambda values, other: {**values, **other},
+        to_json=json.dumps,
+    )
+    runtime = {
+        "deployment_id": "example",
+        "controller_url": "https://controller.example/v1",
+        "dispatch_key": {"file": "/etc/lumen/controller/dispatch.key"},
+        "tls": {
+            "ca_file": "/etc/lumen/controller/ca.pem",
+            "ca_key_file": "/etc/lumen/controller/ca-key.pem",
+            "cert_file": "/etc/lumen/controller/server.pem",
+            "key_file": "/etc/lumen/controller/server-key.pem",
+            "operator_client_cert_file": "/etc/lumen/controller/worker.pem",
+            "operator_client_key_file": "/etc/lumen/controller/worker-key.pem",
+        },
+        "managed_networks": ["10.42.0.0/24"],
+        "cloud_profiles": [{
+            "id": "trusted", "auth_url": "https://keystone.example/v3",
+            "project_id": "trusted-project", "region_name": "RegionOne", "purpose": "trusted",
+            "application_credential_id": "credential-id",
+            "application_credential_secret": {"file": "/etc/lumen/controller/cloud.key"},
+        }],
+        "pools": [{
+            "name": "workers", "role": "worker", "backend": "nova", "enabled": True,
+            "cloud_profile_id": "trusted", "image": "worker-image", "architecture": "aarch64",
+            "network_id": "managed-net", "security_group_ids": ["worker-sg"],
+            "min_replicas": 1, "max_replicas": 2, "db_connection_budget": 20,
+            "profile": {"backend": "nova", "flavor_id": "flavor", "guest_image_id": "image",
+                        "guest_image_hash": "a" * 64},
+        }],
+    }
+    values = dict.fromkeys(meta.find_undeclared_variables(environment.parse(source)), "")
+    values.update(
+        lumen_runtime_enabled=True, lumen_runtime_config=runtime,
+        lumen_controller_listen_address="10.42.0.5", lumen_controller_listen_port=8013,
+        lumen_worker_concurrency=4, lumen_worker_heartbeat_seconds=5,
+        lumen_worker_drain_seconds=300, lumen_chat_compat_run_timeout_seconds=300,
+    )
+    config_file = tmp_path / "lumen.conf"
+    config_file.write_text(environment.from_string(source).render(**values), encoding="utf-8")
+    parsed = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    assert isinstance(parsed["lumen"]["runtime_config"], str)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import json; from lumen.config import get_settings; "
+         "c = get_settings().runtime_config; "
+         "print(json.dumps([c.enabled, c.listen_host, c.pools[0].cloud_profile_id]))"],
+        env={"LUMEN_CONFIG_FILE": str(config_file), "PATH": os.environ.get("PATH", ""),
+             "PYTHONPATH": str(REPO_ROOT)},
+        capture_output=True, text=True, check=True, timeout=20,
+    )
+    assert json.loads(result.stdout) == [True, "10.42.0.5", "trusted"]
+
+
+def test_runtime_worker_mount_excludes_controller_signing_keys():
+    from jinja2.nativetypes import NativeEnvironment
+
+    defaults = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
+    environment = NativeEnvironment()
+    environment.filters["bool"] = bool
+    render = environment.from_string
+    for enabled in (False, True):
+        worker_mounts = render(defaults["lumen_worker_runtime_volumes"]).render(
+            lumen_runtime_enabled=enabled, lumen_worker_secrets_dir="/srv/worker-client",
+        )
+        mounts = render(defaults["lumen_services"]["lumen-worker"]["volumes"]).render(
+            lumen_worker_runtime_volumes=worker_mounts,
+        )
+        assert isinstance(mounts, list)
+        assert ("/srv/worker-client:/etc/lumen/controller:ro" in mounts) is enabled
+        assert not any("/etc/kolla/lumen/controller" in mount for mount in mounts)
 
 
 def test_kolla_package_and_image_version_contract():
@@ -261,7 +343,7 @@ def test_kolla_secret_isolation():
     service_envs = defaults["lumen_service_environments"]
     services = defaults["lumen_services"]
 
-    container_services = {"lumen-api", "lumen-worker"}
+    container_services = {"lumen-api", "lumen-worker", "lumen-controller"}
     assert set(service_envs.keys()) == container_services
     assert set(services.keys()) == container_services
 

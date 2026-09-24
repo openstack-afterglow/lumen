@@ -12,6 +12,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
+from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
@@ -23,6 +24,14 @@ MAX_PARTS_PER_MESSAGE = 32
 MAX_PARTS_PER_RUN = 256
 MAX_TOOL_RESULT_DEPTH = 4
 MAX_TEMP_VISIBLE_MESSAGES = 50
+
+
+def validate_plugin_binding_ids(values: list[str]) -> list[str]:
+    if len(values) > 100 or len(set(values)) != len(values):
+        raise ValueError("plugin binding IDs must be unique and bounded")
+    if any(str(UUID(value)) != value for value in values):
+        raise ValueError("plugin binding IDs must be canonical UUID strings")
+    return values
 
 
 class _StrictModel(BaseModel):
@@ -470,6 +479,7 @@ class ChatFeatureOptions(_StrictModel):
     web_fetch: WebFetchOptions = Field(default_factory=WebFetchOptions)
     advisor: AdvisorOptions = Field(default_factory=AdvisorOptions)
     memory: bool = True
+    memory_retrieval: Literal["recency", "semantic"] = "recency"
     response_format: ResponseFormat = Field(default_factory=ResponseFormat)
     tool_policy: ToolPolicy = Field(default_factory=ToolPolicy)
     output_modalities: list[Literal["text", "image", "audio", "video"]] = Field(
@@ -512,6 +522,21 @@ class _ReasoningEffortRequest(_StrictModel):
         return value
 
 
+class AgentBudget(_StrictModel):
+    """Explicit root ceilings; delegation/code execution is unavailable without them."""
+
+    credit_ceiling: str = Field(pattern=r"^\d+(\.\d{1,8})?$")
+    sandbox_seconds_ceiling: int = Field(ge=1, le=86_400)
+    wall_time_seconds: int = Field(ge=60, le=86_400)
+
+    @field_validator("credit_ceiling")
+    @classmethod
+    def positive_credit(cls, value: str) -> str:
+        if Decimal(value) <= 0:
+            raise ValueError("credit_ceiling must be positive")
+        return format(Decimal(value), "f")
+
+
 class _CompletionSelectionRequest(_ReasoningEffortRequest):
     """Selection fields shared by completion, preview, and compaction requests."""
 
@@ -521,6 +546,14 @@ class _CompletionSelectionRequest(_ReasoningEffortRequest):
     execution_mode: Literal["chat", "plan", "code"] = "chat"
     code_workspace_id: str | None = Field(default=None, max_length=36)
     skill_ids: list[int] = Field(default_factory=list, max_length=100)
+    plugin_tool_ids: list[str] = Field(default_factory=list, max_length=100)
+    plugin_skill_ids: list[str] = Field(default_factory=list, max_length=100)
+    agent_budget: AgentBudget | None = None
+
+    @field_validator("plugin_tool_ids", "plugin_skill_ids")
+    @classmethod
+    def validate_plugin_ids(cls, value: list[str]) -> list[str]:
+        return validate_plugin_binding_ids(value)
 
     @field_validator("skill_ids")
     @classmethod
@@ -585,6 +618,7 @@ class ChatRunDescriptor(_StrictModel):
         "awaiting_approval",
         "awaiting_input",
         "waiting_children",
+        "waiting_resource",
         "finalizing",
         "completed",
         "failed",
@@ -602,6 +636,7 @@ class ChatRunResponse(_StrictModel):
         "awaiting_approval",
         "awaiting_input",
         "waiting_children",
+        "waiting_resource",
         "finalizing",
         "completed",
         "failed",
@@ -834,6 +869,8 @@ class RunStageChangedPayload(_StrictModel):
         "tool_execution",
         "response_writing",
         "awaiting_input",
+        "waiting_children",
+        "waiting_resource",
         "finalizing",
     ]
     tool_name: str | None = Field(default=None, min_length=1, max_length=190)
@@ -877,7 +914,7 @@ class ToolCallStartedPayload(_StrictModel):
     call_id: str = Field(min_length=1, max_length=190)
     name: str = Field(min_length=1, max_length=190)
     arguments: dict[str, Any]
-    source: Literal["builtin", "managed", "custom_http", "mcp", "workspace", "agent"] = "builtin"
+    source: Literal["builtin", "managed", "custom_http", "mcp", "workspace", "agent", "plugin"] = "builtin"
     category: str = Field(default="기본 도구", min_length=1, max_length=100)
 
 
@@ -887,14 +924,14 @@ class ToolCallCompletedPayload(_StrictModel):
     content: ChatParts = Field(min_length=1, max_length=MAX_PARTS_PER_MESSAGE)
     status: Literal["completed", "failed"]
     error_code: str | None = Field(default=None, max_length=100)
-    source: Literal["builtin", "managed", "custom_http", "mcp", "workspace", "agent"] = "builtin"
+    source: Literal["builtin", "managed", "custom_http", "mcp", "workspace", "agent", "plugin"] = "builtin"
     category: str = Field(default="기본 도구", min_length=1, max_length=100)
 
 
 class ToolApprovalRequiredPayload(_StrictModel):
     call_id: str = Field(min_length=1, max_length=190)
     name: str = Field(min_length=1, max_length=190)
-    source: Literal["builtin", "managed", "custom_http", "mcp", "workspace", "agent"]
+    source: Literal["builtin", "managed", "custom_http", "mcp", "workspace", "agent", "plugin"]
     effect: Literal["read", "workspace_write", "process", "external_mutation"]
     destination: str | None = Field(default=None, max_length=255)
     redacted_arguments: dict[str, Any] = Field(max_length=256)
@@ -966,6 +1003,26 @@ class RunCanceledPayload(_StrictModel):
     error_code: str = Field(min_length=1, max_length=100)
     safe_message: str = Field(min_length=1, max_length=2_000)
 
+
+
+class ChildCreatedPayload(_StrictModel):
+    child_run_id: str = Field(min_length=1, max_length=36)
+    call_id: str = Field(min_length=1, max_length=190)
+    wait_group_id: str = Field(min_length=1, max_length=36)
+    agent_id: int = Field(ge=1)
+    access: Literal["read", "write"]
+    ordinal: int = Field(ge=0)
+    status: Literal["queued", "waiting_resource"]
+
+
+class ChildCompletedPayload(_StrictModel):
+    child_run_id: str = Field(min_length=1, max_length=36)
+    call_id: str = Field(min_length=1, max_length=190)
+    wait_group_id: str = Field(min_length=1, max_length=36)
+    status: Literal["completed", "failed", "canceled"]
+    error_code: str | None = Field(default=None, max_length=100)
+    summary: str = Field(default="", max_length=8_192)
+    artifacts: list[FilePart] = Field(default_factory=list, max_length=20)
 
 class _RunEvent(_StrictModel):
     event_id: str = Field(min_length=3, max_length=256)
@@ -1060,6 +1117,16 @@ class RunCanceledEvent(_RunEvent):
     payload: RunCanceledPayload
 
 
+
+class ChildCreatedEvent(_RunEvent):
+    type: Literal["child.created"]
+    payload: ChildCreatedPayload
+
+
+class ChildCompletedEvent(_RunEvent):
+    type: Literal["child.completed"]
+    payload: ChildCompletedPayload
+
 ChatRunEvent = Annotated[
     RunStartedEvent
     | RunStageChangedEvent
@@ -1076,7 +1143,9 @@ ChatRunEvent = Annotated[
     | UsageUpdatedEvent
     | RunCompletedEvent
     | RunFailedEvent
-    | RunCanceledEvent,
+    | RunCanceledEvent
+    | ChildCreatedEvent
+    | ChildCompletedEvent,
     Field(discriminator="type"),
 ]
 _CHAT_RUN_EVENT = TypeAdapter(ChatRunEvent)
@@ -1094,6 +1163,10 @@ class UsageRecord(_StrictModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    uncached_input_tokens: int = Field(ge=0)
+    cache_read_input_tokens: int = Field(ge=0)
+    cache_creation_5m_input_tokens: int = Field(ge=0)
+    cache_creation_1h_input_tokens: int = Field(ge=0)
     credited_cost: str
     source: Literal["web", "api"]
     api_key_id: int | None = None
@@ -1120,6 +1193,13 @@ class TempCompletionRequest(BaseModel):
     code_workspace_id: str | None = Field(default=None, max_length=36)
     skill_ids: list[int] = Field(default_factory=list, max_length=100)
     temp_thread_id: str | None = Field(default=None, max_length=36)
+    plugin_tool_ids: list[str] = Field(default_factory=list, max_length=100)
+    plugin_skill_ids: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("plugin_tool_ids", "plugin_skill_ids")
+    @classmethod
+    def validate_plugin_ids(cls, value: list[str]) -> list[str]:
+        return validate_plugin_binding_ids(value)
 
     @field_validator("skill_ids")
     @classmethod

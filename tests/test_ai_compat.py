@@ -3,6 +3,7 @@
 completion_api 코어와 api_key_store.verify_key 를 monkeypatch 해 실제 litellm/DB 없이 검증한다.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -826,7 +827,14 @@ class TestOpenAILumenVirtualModel:
                 SimpleNamespace(
                     seq=3,
                     type="usage.updated",
-                    payload=SimpleNamespace(model_dump=lambda: {"prompt_tokens": 10, "completion_tokens": 5}),
+                    payload=SimpleNamespace(model_dump=lambda: {
+                        "prompt_tokens": 10, "completion_tokens": 5,
+                        "components": [
+                            {"source": "executor", "kind": "cache_read_input_tokens", "quantity": "3"},
+                            {"source": "advisor", "kind": "cache_read_input_tokens", "quantity": "7"},
+                            {"source": "executor", "kind": "input_tokens", "quantity": "7"},
+                        ],
+                    }),
                 ),
                 SimpleNamespace(
                     seq=4,
@@ -857,6 +865,7 @@ class TestOpenAILumenVirtualModel:
         assert body["usage"]["prompt_tokens"] == 10
         assert body["usage"]["completion_tokens"] == 5
         assert body["usage"]["total_tokens"] == 15
+        assert body["usage"]["prompt_tokens_details"] == {"cached_tokens": 3}
 
     async def test_lumen_stream_success(self, client, _auth, monkeypatch):
         from lumen.config import get_settings
@@ -891,7 +900,13 @@ class TestOpenAILumenVirtualModel:
                 SimpleNamespace(
                     seq=2,
                     type="usage.updated",
-                    payload=SimpleNamespace(model_dump=lambda: {"prompt_tokens": 4, "completion_tokens": 2}),
+                    payload=SimpleNamespace(model_dump=lambda: {
+                        "prompt_tokens": 4, "completion_tokens": 2,
+                        "components": [
+                            {"source": "executor", "kind": "cache_read_input_tokens", "quantity": "2"},
+                            {"source": "advisor", "kind": "advisor_cache_read_tokens", "quantity": "20"},
+                        ],
+                    }),
                 ),
                 SimpleNamespace(
                     seq=3,
@@ -924,6 +939,12 @@ class TestOpenAILumenVirtualModel:
         text = resp.text
         assert "Stream text" in text
         assert "data: [DONE]" in text
+        usage_chunk = next(
+            json.loads(line[6:]) for line in text.splitlines()
+            if line.startswith("data: {") and '"usage"' in line
+        )
+        assert usage_chunk["usage"]["prompt_tokens_details"] == {"cached_tokens": 2}
+        assert usage_chunk["usage"]["total_tokens"] == 6
 
     async def test_lumen_timeout_cancels_run(self, client, _auth, monkeypatch):
         from lumen.config import get_settings

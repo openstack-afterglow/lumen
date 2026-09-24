@@ -13,6 +13,8 @@ from httpx import ASGITransport, AsyncClient
 from lumen.auth import get_os_conn, get_principal, require_token
 from lumen.config import get_settings
 from lumen.main import app
+from lumen.plugins.host import build_host
+from lumen.plugins.registry import get_registry
 
 
 class _LegacyChatPathAdapter:
@@ -42,6 +44,19 @@ async def _reset_lumen_state(monkeypatch):
     monkeypatch.setattr("lumen.cache._client", None)
     get_settings.cache_clear()
 
+
+
+@pytest.fixture(autouse=True)
+async def started_plugins():
+    """Start the installed default plugins exactly as API/worker lifespans do.
+
+    Tests that need an absent or incompatible plugin construct their own
+    ``PluginRegistry`` instead of mutating this process-wide instance.
+    """
+    registry = get_registry()
+    if not registry.ready:
+        await registry.start(build_host())
+    yield registry
 
 @pytest.fixture
 def mock_conn():

@@ -6,11 +6,13 @@ import argparse
 import asyncio
 import logging
 
+from lumen_plugin_api.database import DatabaseConfig
 from sqlalchemy import delete, func, select
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from lumen.config import get_settings
 from lumen.models import ChatConversation, ChatConversationActivePath
+from lumen.plugins.registry import get_plugin
 from lumen.services.message_graph import MessageGraphError, ancestor_message_ids
 
 logger = logging.getLogger(__name__)
@@ -113,12 +115,12 @@ def main() -> None:
         raise SystemExit("database URL is required")
 
     async def run() -> tuple[int, int]:
-        engine = create_async_engine(database_url, pool_pre_ping=True)
+        handle = get_plugin("database").open(DatabaseConfig(url=database_url))
         try:
-            completed = await backfill_history(engine) if args.apply else 0
-            return completed, await count_unready(engine)
+            completed = await backfill_history(handle.engine) if args.apply else 0
+            return completed, await count_unready(handle.engine)
         finally:
-            await engine.dispose()
+            await handle.close()
 
     completed, unready = asyncio.run(run())
     if unready:

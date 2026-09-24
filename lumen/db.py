@@ -1,4 +1,10 @@
-"""Lumen SQLAlchemy async database lifecycle."""
+"""Lumen database lifecycle: availability circuit and ORM metadata only.
+
+Engine/pool/driver creation and connection-error classification belong to the
+selected ``lumen.database`` plugin (``DatabasePlugin.open`` /
+``DatabaseHandle``). This module owns only the process-wide availability
+circuit breaker and the SQLAlchemy declarative base shared by every model.
+"""
 
 from __future__ import annotations
 
@@ -6,17 +12,15 @@ import logging
 import sys
 import time
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from lumen_plugin_api.database import DatabaseConfig, DatabaseHandle
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
 _logger = logging.getLogger(__name__)
-_engine: AsyncEngine | None = None
-_session_factory: async_sessionmaker[AsyncSession] | None = None
+_handle: DatabaseHandle | None = None
 
 _db_unhealthy_until: float = 0.0
 _default_unhealthy_seconds: int = 15
-_CONNECTION_ERROR_CODES = frozenset({2003, 2006, 2013, 2014, 2055})
 
 
 class Base(DeclarativeBase):
@@ -31,26 +35,28 @@ def init_db(
     pool_timeout: int = 30,
     unhealthy_seconds: int = 15,
 ) -> None:
-    global _engine, _session_factory, _default_unhealthy_seconds
+    """Open the selected database plugin's handle; synchronous, no I/O."""
+    global _handle, _default_unhealthy_seconds
+    from lumen.plugins.registry import get_plugin
+
     _default_unhealthy_seconds = unhealthy_seconds
-    connect_args: dict = {"connect_timeout": connect_timeout}
-    _engine = create_async_engine(
-        database_url,
-        pool_size=pool_size,
-        max_overflow=max_overflow,
-        pool_timeout=pool_timeout,
-        pool_pre_ping=True,
-        connect_args=connect_args,
+    _handle = get_plugin("database").open(
+        DatabaseConfig(
+            url=database_url,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            connect_timeout=connect_timeout,
+            pool_timeout=pool_timeout,
+        )
     )
-    _session_factory = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession] | None:
-    return _session_factory
+    return _handle.session_factory if _handle is not None else None
 
 
 def is_db_available() -> bool:
-    if _engine is None:
+    if _handle is None:
         return False
     if time.monotonic() < _db_unhealthy_until:
         return False
@@ -58,18 +64,13 @@ def is_db_available() -> bool:
 
 
 def is_db_configured() -> bool:
-    return _engine is not None
+    return _handle is not None
 
 
 def is_connection_error(error: BaseException | None) -> bool:
-    if error is None:
+    if error is None or _handle is None:
         return False
-    if isinstance(error, (TimeoutError, ConnectionError, OSError)):
-        return True
-    args = getattr(error, "args", None)
-    if args and isinstance(args[0], int) and args[0] in _CONNECTION_ERROR_CODES:
-        return True
-    return False
+    return _handle.is_connection_error(error)
 
 
 def mark_db_unhealthy(error: BaseException | None = None, seconds: int | None = None) -> bool:
@@ -84,20 +85,17 @@ def mark_db_unhealthy(error: BaseException | None = None, seconds: int | None = 
 
 
 async def check_db() -> bool:
-    if _engine is None:
+    if _handle is None:
         return False
     try:
-        async with _engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        return True
+        return await _handle.check()
     except Exception as exc:
         mark_db_unhealthy(exc)
         return False
 
 
 async def close_db() -> None:
-    global _engine, _session_factory
-    if _engine is not None:
-        await _engine.dispose()
-        _engine = None
-    _session_factory = None
+    global _handle
+    if _handle is not None:
+        await _handle.close()
+        _handle = None

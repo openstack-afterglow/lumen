@@ -46,7 +46,10 @@ async def stream(
     lumen_snapshot: dict[str, object] | None = None,
     lumen_snapshot_frozen: bool = False,
     native_compaction_options: dict | None = None,
-    resume: list[dict[str, str]] | None = None,
+    resume: dict | None = None,
+    plugin_tool_snapshots: tuple[dict, ...] = (),
+    delegation_enabled: bool = False,
+    sandbox_lease: tuple[str, int] | None = None,
 ) -> AsyncIterator[dict]:
     async for ev in graph.stream(
         model=model,
@@ -82,5 +85,8 @@ async def stream(
         lumen_snapshot=lumen_snapshot,
         lumen_snapshot_frozen=lumen_snapshot_frozen,
         resume=resume,
+        plugin_tool_snapshots=plugin_tool_snapshots,
+        delegation_enabled=delegation_enabled,
+        sandbox_lease=sandbox_lease,
     ):
         yield ev

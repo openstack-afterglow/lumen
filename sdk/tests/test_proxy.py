@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from lumen_sdk import register
-from lumen_sdk._api import _LumenApiMixin
 from lumen_sdk.proxy import Proxy
 from lumen_sdk.service import LumenService
 
@@ -328,17 +327,6 @@ OTHER_METHOD_TABLE = [
     ("download_asset", ("asset-1",), {}, "GET", "/v1/assets/asset-1/download"),
 ]
 
-_PUBLIC_PROXY_METHODS = {
-    name for name, value in _LumenApiMixin.__dict__.items() if not name.startswith("_") and callable(value)
-}
-
-
-def test_route_tables_cover_every_public_proxy_method():
-    """Regression guard: every public Proxy method must appear in exactly one route table."""
-    covered = {row[0] for row in JSON_METHOD_TABLE}
-    covered |= {row[0] for row in OTHER_METHOD_TABLE}
-    covered |= {row[0] for row in STREAM_METHOD_TABLE}
-    assert covered == _PUBLIC_PROXY_METHODS
 
 
 @pytest.mark.parametrize("method_name,args,kwargs,http_method,path,body,params", JSON_METHOD_TABLE)

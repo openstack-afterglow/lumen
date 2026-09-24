@@ -453,11 +453,16 @@ async def _apply_result(job: dict[str, Any]) -> bool:
                 input_price_per_token=_decimal_or_none(pricing.get("input_price_per_token")),
                 output_price_per_token=_decimal_or_none(pricing.get("output_price_per_token")),
                 price_source=pricing.get("price_source"),
-                provider_type=payload.get("summary_route", {}).get("provider_type"),
                 breakdown=breakdown,
                 cache_read_price_per_token=_decimal_or_none(pricing.get("cache_read_price_per_token")),
                 cache_write_price_per_token=_decimal_or_none(pricing.get("cache_write_price_per_token")),
                 cache_write_1h_price_per_token=_decimal_or_none(pricing.get("cache_write_1h_price_per_token")),
+                cache_read_price_per_token_above_200k=_decimal_or_none(pricing.get("cache_read_price_per_token_above_200k")),
+                cache_write_price_per_token_above_200k=_decimal_or_none(pricing.get("cache_write_price_per_token_above_200k")),
+                cache_write_1h_price_per_token_above_200k=_decimal_or_none(pricing.get("cache_write_1h_price_per_token_above_200k")),
+                cache_price_sources=pricing.get("cache_price_sources"),
+                allow_catalog_cache=False,
+                allow_catalog_prices=False,
             )
             await credit.apply_usage_in_transaction(
                 session,

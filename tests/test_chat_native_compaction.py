@@ -489,9 +489,8 @@ class TestReplayAndResume:
     async def test_compaction_head_survives_an_approval_interrupt_and_resume(self, monkeypatch):
         """The v2 checkpointer must round-trip the block across processes."""
         from langgraph.checkpoint.memory import MemorySaver
-
-        from lumen.services.agent_protocol import ToolBinding, ToolDefinition
-        from lumen.services.agent_protocol import ToolExecutionResult as V2Result
+        from lumen_plugin_api.tools import ToolBinding, ToolDefinition
+        from lumen_plugin_api.tools import ToolExecutionResult as V2Result
 
         block = {"type": "compaction", "content": "체크포인트 요약"}
         tool_name = "custom__7__mutate_1"
@@ -581,7 +580,7 @@ class TestReplayAndResume:
                 custom_llm_provider="anthropic",
                 execution_protocol_version=2,
                 approval_mode="required_for_mutations",
-                resume=[{"call_id": "call-1", "decision": "approve"}],
+                resume={"kind": "tool_approval", "decisions": [{"call_id": "call-1", "decision": "approve"}]},
                 run_id="run-compaction-interrupt",
             )
         ]

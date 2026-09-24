@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import BIGINT, CHAR, INT, JSON, VARCHAR, DateTime, ForeignKey, Index, Numeric
+from sqlalchemy import BIGINT, CHAR, INT, JSON, VARCHAR, CheckConstraint, DateTime, ForeignKey, Index, Numeric
 from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column
@@ -71,6 +71,13 @@ class ChatRun(Base):
     descendant_credits_reserved: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     sandbox_seconds_ceiling: Mapped[int | None] = mapped_column(INT)
     sandbox_seconds_reserved: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    lease_fence: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
+    assigned_resource_id: Mapped[str | None] = mapped_column(CHAR(36))
+    runtime_pool_id: Mapped[str | None] = mapped_column(CHAR(36))
+    required_plugin_digest: Mapped[str | None] = mapped_column(CHAR(64))
+    credit_ceiling: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    wall_time_seconds: Mapped[int | None] = mapped_column(INT)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
@@ -82,6 +89,9 @@ class ChatRun(Base):
         Index("idx_chat_runs_root_status", "root_run_id", "status"),
         Index("idx_chat_runs_parent_status", "parent_run_id", "status"),
         Index("uq_chat_runs_parent_delegation", "parent_run_id", "delegation_call_id", unique=True),
+        Index("idx_chat_runs_status_pool", "status", "runtime_pool_id"),
+        Index("idx_chat_runs_status_plugin_digest", "status", "required_plugin_digest"),
+        Index("idx_chat_runs_assigned_resource", "assigned_resource_id"),
     )
 
 
@@ -195,6 +205,25 @@ class ChatRunSegment(Base):
     __table_args__ = (
         Index("uq_chat_run_segments_ordinal", "run_id", "ordinal", unique=True),
         Index("uq_chat_run_segments_boundary", "run_id", "boundary_key", unique=True),
+    )
+
+
+class ChatModelCallReservation(Base):
+    """One fenced credit hold per chargeable provider or tool segment, including zero-cost calls."""
+
+    __tablename__ = "chat_model_call_reservations"
+
+    run_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("chat_runs.id", ondelete="RESTRICT"), primary_key=True)
+    segment_id: Mapped[str] = mapped_column(VARCHAR(190), primary_key=True)
+    bound_credits: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
+    actual_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    status: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="reserved")
+    created_at: Mapped[datetime] = mapped_column(MYSQL_DATETIME(fsp=6), nullable=False, default=_now)
+    settled_at: Mapped[datetime | None] = mapped_column(MYSQL_DATETIME(fsp=6))
+
+    __table_args__ = (
+        CheckConstraint("bound_credits >= 0", name="ck_model_call_bound"),
+        CheckConstraint("actual_credits IS NULL OR actual_credits >= 0", name="ck_model_call_actual"),
     )
 
 

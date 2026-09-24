@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from functools import lru_cache
@@ -9,8 +10,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from lumen.plugins.config import PluginRuntimeConfig
+from lumen.services.infrastructure.config import RuntimeConfig
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -87,6 +91,14 @@ def _load_toml() -> dict[str, Any]:
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
+
+    plugin_config: PluginRuntimeConfig = Field(default_factory=PluginRuntimeConfig)
+    runtime_config: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    worker_concurrency: int = Field(default=4, ge=1, le=64)
+    worker_heartbeat_seconds: int = Field(default=5, ge=1, le=30)
+    worker_drain_seconds: int = Field(default=300, ge=0, le=3600)
+    api_max_active_requests: int = Field(default=256, ge=1)
+    api_max_sse_connections: int = Field(default=256, ge=1)
 
     # Infrastructure & Auth
     keystone_auth_url: str = "http://localhost:5000/v3"
@@ -258,5 +270,5 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     for key, value in _load_toml().items():
         if not os.environ.get(key.upper()):
-            os.environ[key.upper()] = str(value)
+            os.environ[key.upper()] = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
     return Settings()

@@ -10,12 +10,12 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
-from lumen.models.chat_contracts import FilePart, TextPart
+from .contracts import ExecutionContext, Plugin, PluginExport, PluginIdentity
 
 MAX_TOOL_SCHEMA_BYTES = 32 * 1024
 MAX_TOOL_ARGUMENT_BYTES = 256 * 1024
@@ -28,13 +28,27 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, protected_namespaces=())
 
 
+class ToolTextPart(_StrictModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
+    type: Literal["text"] = "text"
+    text: str = Field(min_length=1, max_length=100_000)
+
+
+class ToolFilePart(_StrictModel):
+    type: Literal["file"] = "file"
+    asset_id: str = Field(min_length=1, max_length=36)
+    mime_type: str = Field(min_length=1, max_length=127)
+    name: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(ge=0)
+
+
 class CodePart(_StrictModel):
     type: Literal["code"] = "code"
     code: str = Field(min_length=1, max_length=65_536)
     language: str | None = Field(default=None, max_length=64)
 
 
-ToolDisplayPart = TextPart | CodePart | FilePart
+ToolDisplayPart = ToolTextPart | CodePart | ToolFilePart
 _TOOL_DISPLAY_PARTS = TypeAdapter(list[ToolDisplayPart])
 
 
@@ -44,7 +58,7 @@ class ToolDefinition(_StrictModel):
     input_schema: dict[str, Any]
     effect: Literal["read", "workspace_write", "process", "external_mutation"]
     parallel_safe: bool = False
-    source: Literal["builtin", "managed", "custom_http", "mcp", "workspace", "agent"]
+    source: Literal["builtin", "managed", "custom_http", "mcp", "workspace", "agent", "plugin"]
     activity_category: str = Field(default="기본 도구", min_length=1, max_length=100)
 
     @field_validator("name")
@@ -66,11 +80,11 @@ class ToolBinding:
     """Server-only executable binding; it must never enter a model or journal payload."""
 
     definition: ToolDefinition
-    execute: Callable[[dict[str, Any], object], Awaitable[ToolExecutionResult]]
+    execute: Callable[[dict[str, Any], ExecutionContext], Awaitable[ToolExecutionResult]]
     classify_effect: (
         Callable[[dict[str, Any]], Literal["read", "workspace_write", "process", "external_mutation"]] | None
     ) = None
-    preview: Callable[[dict[str, Any], object], Awaitable[dict[str, Any]]] | None = None
+    preview: Callable[[dict[str, Any], ExecutionContext], Awaitable[dict[str, Any]]] | None = None
     config_fingerprint: str | None = None
     destination_origin: str | None = None
     load_policy: Literal["preloaded", "on_demand"] | None = None
@@ -181,3 +195,21 @@ def _validate_schema_shape(value: object, *, depth: int = 0) -> None:
             _validate_schema_shape(child, depth=depth + 1)
     elif not isinstance(value, (str, int, float, bool, type(None))):
         raise ValueError("tool input_schema contains an unsupported value")
+
+
+class ToolSpec(_StrictModel):
+    binding_id: str
+    export_key: str
+    identity: PluginIdentity
+    configuration: dict[str, Any] = Field(default_factory=dict)
+
+
+
+if TYPE_CHECKING:
+    from .contracts import PluginHost
+
+
+class ToolProvider(Plugin, Protocol):
+    def catalog(self) -> tuple[PluginExport, ...]: ...
+
+    async def bind(self, spec: ToolSpec, context: ExecutionContext, host: PluginHost) -> ToolBinding: ...

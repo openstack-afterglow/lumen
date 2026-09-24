@@ -116,6 +116,7 @@ API Key 요청 시 필요한 최소 Scope 정의:
 | `native:memory:read`, `native:memory:write` | 대화 메모리 읽기 및 업데이트 (`features.memory=true` 시 필수) |
 | `native:tools:execute` | 서버 관리형 도구 실행 (`tool_policy.mode != "none"` 시 필수) |
 | `native:extensions:read`, `native:extensions:write` | 스킬, MCP 서버, 커스텀 도구 사용 |
+| `native:agents:use` | API-key native `chat` run의 소유/승인된 `agent_id` 사용 (agent 정의 관리 권한은 아님) |
 | `usage:read` | 사용량 기록 및 API key 사용 현황 조회 (`GET /v1/usage/*`) |
 
 > **Native Default Features 주의사항**:
@@ -213,6 +214,14 @@ Codex의 `prompt_cache_key`는 provider transport로 전달합니다. 로컬 ins
 
 * Cutover는 Lumen migration `011_provider_billing_admin_key.sql`과 호환 Lumen API를 Afterglow UI보다 먼저 배포합니다. 구 Lumen에서 bulk GET이 동적 provider PATCH route의 `provider_id="billing"`과 충돌해 반환하는 HTTP 405는 credential 오류가 아니라 mixed-version 신호입니다.
 
+Afterglow 관리자 모델 onboarding은 `GET /v1/admin/providers/{id}/available-models`의 read-only live 후보를 사용합니다. Anthropic/Gemini pagination을 모두 완료한 결과만 표시하고, 실패·한도 초과에서는 부분 후보나 static fallback을 등록 대상으로 삼지 않습니다. `source`, `live_status`, `complete`, `fetched_at`, safe error는 [API 참조](api-reference.md#관리자-provider-모델-후보-조회)의 typed 계약입니다. 정상 empty와 미지원 설정의 정적 참고는 별개입니다.
+
+UI는 provider·exact ID·표시명·가격을 검토한 뒤 기존 `POST /v1/admin/models`로 등록·활성화하거나 비활성 저장합니다. 조회 metadata는 가격/고급 capability/실제 추론 성공의 증거가 아니며 수동 가격 또는 명시 models.dev mapping과 capability override를 별도로 적용합니다. Browser generation/provider/token/project fence가 오래된 조회와 bulk 등록의 provider 혼합을 막습니다. 등록/변경 후 열린 모델 선택기는 invalidation, focus/visible 복귀 또는 명시 새로고침으로 목록을 다시 읽되 유효한 선택은 보존합니다. API/worker의 route는 DB를 request-time에 읽으므로 새 ID 등록에 프로세스 재시작이나 정적 registry 수정이 필요하지 않습니다.
+
+호출별 token 수는 provider 응답의 `usage`를 우선하며 확정 USD 비용은 일반 inference API가 반환하지 않습니다. Lumen은 모델의 수동 단가를 우선 적용하고, direct provider의 exact LiteLLM bundled cache 단가가 있으면 미설정 cache 범주에만 적용합니다. 동일 model ID의 custom `api_base`에는 catalog 가격을 상속하지 않으므로 운영자가 입력·출력·cache 가격을 명시해야 합니다. `/v1/usage/records`의 `uncached_input_tokens`·`cache_read_input_tokens`·`cache_creation_5m_input_tokens`·`cache_creation_1h_input_tokens`와 `credited_cost`를 함께 표시할 수 있습니다. 관리자 `/v1/admin/stats/users/{user_id}`의 각 record는 `cache_costs_usd`와 `cache_price_sources`도 제공합니다. `/v1/chat/completions`의 `usage.prompt_tokens_details.cached_tokens`는 보고된 hit 수입니다. OpenAI/Gemini의 자동 캐싱 및 Anthropic direct chat의 stable-system breakpoint는 모두 **실제 cache counter가 있는 응답**에서만 hit로 판단하며, provider organization report와 Lumen per-request 원가는 범위·시차·tier가 다를 수 있습니다. 상세 운영 계약은 [API 참조](api-reference.md#모델-단가와-prompt-cache-단가)입니다.
+
+Direct Gemini/Anthropic에서 exact LiteLLM catalog의 cache 단가에 `above_200k_tokens` tier가 있으면 호출별 provider-reported prompt 총량이 200,000을 초과할 때만 그 tier가 적용됩니다. Run·요약·advisor 가격은 admission에 고정되고, 관리자가 수동 설정한 cache 단가는 두 문맥 tier 모두에서 우선합니다. Advisor 사용량은 호출별로 판단합니다. `model="lumen"`의 OpenAI 호환 `cached_tokens`는 해당 executor 호출의 cache-read만 포함하고 별도 advisor 사용량은 포함하지 않습니다. Frozen title job은 누락 가격을 public catalog로 채우지 않습니다.
+
 ### 5.1 공개 모델 ID와 실행 route
 
 호환 API 클라이언트는 `api_model_name`만 `model`로 보내고 필요할 때 `api_provider`를 `provider`로 보냅니다. 다른 provider와 겹치지 않는 고유 모델(예: Perplexity 단독의 `sonar`, `kimi-k3`, `deepseek-v4-flash-0731`)은 `provider`를 생략해도 정상적으로 라우팅됩니다. 동일한 공개 ID가 여러 provider type에 존재하는 경우에만 `provider`를 생략한 completion이 **HTTP 409 Conflict**로 실패합니다. 요청 body의 `provider`는 소문자 provider type이며 OpenAI/Anthropic Python SDK에서는 `extra_body={"provider": "perplexity"}`로 전달할 수 있습니다. 같은 provider type 안에서도 route가 둘 이상이면 선택자가 충분하지 않으므로 409를 유지합니다. Perplexity Agent API는 명시적으로 요청한 native search만 tool로 전달하며, 일반 Agent route에 검색 도구를 자동 주입하지 않습니다.
@@ -269,6 +278,14 @@ Context preview는 exact LiteLLM `max_input_tokens`와 검토된 override를 사
 Preview의 tool 스키마 집합은 실행기가 실제로 보내는 집합(내장 도구 + `list_available_tools` 카탈로그 + `preloaded` 확장)과 정확히 일치합니다. 커스텀 도구 이름·스키마는 binding과 동일한 투영(`custom__{id}__{name}_{digest}` + `additionalProperties=false`)을 공유하며, 정규 destination이 없어 binding이 제외하는 확장은 preview에서도 계수하거나 deferred로 제시하지 않습니다.
 
 모델 한도를 알 수 없거나(`context_window_unknown`) 토큰 계수가 불가능해도(`token_count_unavailable`) breakdown은 사라지지 않습니다. 계수가 가능하면 값이 있는 완전한 구성을 그대로 제공하고, 계수가 불가능하면 토큰만 `null`로 비운 뒤 이름·개수를 유지한 채 `complete=false`로 보고합니다. `items[]`는 128개로 제한되지만 `count`는 잘리기 전 실제 총계입니다. request scope에서 모델이 `list_available_tools`로 적재한 도구는 `deferred_tools`에서 제거되어 `tools`/`mcp_tools`로 계수되므로, 같은 도구가 포함과 지연에 동시에 나타나지 않습니다.
+
+### 5.4 Plugin bindings, managed agent/child와 BFF 경계
+
+Python plugin wheel은 관리자 이미지에 설치하고 `[lumen.plugin_config]`의 exact distribution/name/version/kind allowlist를 갱신한다. Afterglow 사용자에게 패키지 설치 UI/API를 제공하지 않는다. Keystone admin은 `GET /v1/admin/plugins` 및 `/v1/admin/plugin-bindings`로 승인된 manifest/export와 global tool/skill binding을 관리한다. `GET/POST/PATCH/DELETE /v1/plugin-bindings`는 이미 승인된 `user_configurable` export에 한해 사용자 설정을 관리하며 API key 사용 시 `native:extensions:read|write`가 필요하다. Native 요청/agent 정의의 `plugin_tool_ids`/`plugin_skill_ids`는 이 binding UUID이며 기존 `tool_ids`/`skill_ids`와 분리한다. 변경된 config/version/revoke가 active run의 재인가를 실패시킬 수 있으므로 화면에서 해당 오류를 임의로 재시도하거나 이전 설정을 복원해 실행하지 않는다.
+
+`POST /v1/conversations/{id}/completions`의 `execution_mode=plan|code`는 Keystone 사용자의 persistent run, protocol v2, PostgreSQL checkpointer 및 명시적 `agent_budget`(positive `credit_ceiling` decimal string, `sandbox_seconds_ceiling`, `wall_time_seconds`)이 필요하다. `code`와 child delegation은 enabled managed sandbox pool이 추가로 필요하며 프로젝트별 agent quota는 관리자 `GET/PUT /v1/admin/agent-project-quotas/{project_id}`에서 설정한다(기본 0은 비활성). API key는 text/chat만 허용되고 `/v1/temp-completions`는 agent/code workspace 및 plan/code를 허용하지 않는다. `delegate_agent`는 승인된 agent를 model이 호출하는 server-managed tool이다; Afterglow는 임의 child-create endpoint나 자체 queue를 만들지 않는다.
+
+BFF는 Lumen의 소유자/프로젝트 인증을 유지한 채 `GET /v1/runs/{run_id}/children?limit=...&cursor=...`를 전달한다. 응답은 creation-order `children`과 `next_cursor`이고 각 child의 상태/terminal/결과 요약 및 `events_url`/`cancel_url`을 포함한다. SSE는 parent/child 모두 기존 cursor replay 계약을 따르고 cancel도 기존 `POST /v1/runs/{id}/cancel`을 사용한다. `waiting_resource`는 sandbox provisioning 전의 정상 상태이지만 영구 성공 상태가 아니다. UI는 `GET /v1/ready`(DB/plugin/checkpointer), 관리자 runtime pool/resource inventory, 실제 worker registration 및 provider/sandbox verification을 구분하고 `/v1/health`만으로 feature를 활성화하지 않는다. Controller의 `/v1/sandbox/bootstrap`와 dispatch route는 별도 private HTTPS listener이며 BFF/browser로 proxy하지 않는다.
 
 ---
 

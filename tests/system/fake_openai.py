@@ -20,6 +20,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 
 class ProviderState:
@@ -412,7 +413,9 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
     def _handle_anthropic_messages(self, request: dict[str, Any]) -> None:
         model = str(request.get("model") or "fake-claude")
         tools = request.get("tools") if isinstance(request.get("tools"), list) else []
-        tool_names = [tool.get("name") for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)]
+        tool_names = [
+            tool.get("name") for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+        ]
         messages = request.get("messages") if isinstance(request.get("messages"), list) else []
         tool_results = [
             block
@@ -426,6 +429,7 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
             "completion",
             {
                 "protocol": "anthropic",
+                "model": model,
                 "stream": bool(request.get("stream")),
                 "request_keys": sorted(request),
                 "protocol_headers": protocol_headers,
@@ -553,6 +557,31 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
 
         if path in ("/_control/stats", "/test/stats"):
             self._send_json(200, _STATE.snapshot())
+            return
+
+        if path == "/v1/models" and self.headers.get("x-api-key"):
+            # Discovery must follow the Anthropic cursor, not just its first page.
+            cursor = parse_qs(urlsplit(self.path).query).get("after_id", [None])[0]
+            first_id = "claude-sonnet-4-6"
+            if cursor is None:
+                ids, has_more = [first_id], True
+            elif cursor == first_id:
+                ids, has_more = ["claude-system-unlisted-2099-01-01", "claude-system-unpriced-2099-01-01"], False
+            else:
+                self._send_error_json(400, "unknown model cursor")
+                return
+            self._send_json(
+                200,
+                {
+                    "data": [
+                        {"type": "model", "id": mid, "display_name": mid, "created_at": "2099-01-01T00:00:00Z"}
+                        for mid in ids
+                    ],
+                    "has_more": has_more,
+                    "first_id": ids[0],
+                    "last_id": ids[-1],
+                },
+            )
             return
 
         if path in ("/models", "/v1/models"):

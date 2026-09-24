@@ -11,6 +11,12 @@ dependencies = []
 
 [project.optional-dependencies]
 service = [
+    "lumen-plugin-api==0.1.0",
+    "lumen-database-mariadb==0.1.0",
+    "lumen-memory-default==0.1.0",
+    "lumen-tools-default==0.1.0",
+    "lumen-skills-default==0.1.0",
+    "lumen-mcp-default==0.1.0",
     "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@65ff43db4d386d65436411fc0642ebc3044bd517",
     "fastapi==0.125.0",
     "uvicorn[standard]==0.39.0",
@@ -26,6 +32,7 @@ service = [
     "slowapi>=0.1.9",
     "pyyaml>=6.0",
     "httpx>=0.28.1",
+    "h11>=0.16.0,<1",
     "boto3>=1.35.0",
     "litellm==1.93.0",
     "mcp==1.28.1",
@@ -57,6 +64,7 @@ dev = [
 [project.scripts]
 lumen-api = "lumen.main:run"
 lumen-worker = "lumen.worker:main"
+lumen-controller = "lumen.controller:main"
 lumen-migrate = "lumen.scripts.migrate:main"
 lumen-seed-local = "lumen.scripts.seed_local:main"
 lumen-local-connection = "lumen.scripts.show_connection:main"
@@ -86,3 +94,17 @@ ignore = ["E501", "B008", "B904", "SIM103", "SIM105", "SIM108"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["B", "SIM", "E402"]
+
+[tool.uv.workspace]
+members = ["packages/*", "plugins/*"]
+# The sandbox daemon is a standalone distribution with no shared dependency graph; it is
+# built and released from its own manifest and must never join the service environment.
+exclude = ["packages/lumen-sandbox"]
+
+[tool.uv.sources]
+lumen-plugin-api = { workspace = true }
+lumen-database-mariadb = { workspace = true }
+lumen-memory-default = { workspace = true }
+lumen-tools-default = { workspace = true }
+lumen-skills-default = { workspace = true }
+lumen-mcp-default = { workspace = true }

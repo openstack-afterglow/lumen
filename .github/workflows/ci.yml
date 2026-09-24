@@ -68,6 +68,49 @@ jobs:
       - run: uv run ruff check lumen tests
       - run: uv run pytest -m "not integration and not system" tests
 
+  plugins:
+    name: Plugin conformance
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package:
+          - plugins/database-mariadb
+          - plugins/memory-default
+          - plugins/tools-default
+          - plugins/skills-default
+          - plugins/mcp-default
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.lumen_repository || github.repository }}
+          ref: ${{ inputs.lumen_ref || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - name: Build and test the package against its published contract only
+        run: |
+          uv sync --extra service --extra dev --frozen
+          uv build --wheel --out-dir dist ${{ matrix.package }}
+          uv run --project ${{ matrix.package }} --extra testing pytest -q ${{ matrix.package }}/tests
+
+  sandbox:
+    name: Sandbox daemon package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.lumen_repository || github.repository }}
+          ref: ${{ inputs.lumen_ref || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - name: Build and test the standalone sandbox wheel
+        run: |
+          uv build --wheel --out-dir dist packages/lumen-sandbox
+          uv run --project packages/lumen-sandbox --extra testing pytest -q packages/lumen-sandbox/tests
+
   sdk:
     name: SDK tests and lint
     runs-on: ubuntu-latest

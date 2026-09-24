@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lumen-memory-default"
+version = "0.1.0"
+description = "Default Lumen memory access provider: recency/semantic ranking and a content-free pgvector index"
+requires-python = ">=3.11"
+dependencies = ["lumen-plugin-api==0.1.0", "pgvector==0.4.2", "psycopg[binary]==3.3.4"]
+
+[project.entry-points."lumen.memory"]
+default-memory = "lumen_memory_default:create_plugin"
+
+[project.optional-dependencies]
+testing = ["pytest>=9.0.3", "pytest-asyncio>=0.24"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["lumen_memory_default"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

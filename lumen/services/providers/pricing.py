@@ -11,7 +11,7 @@ from lumen.services.capabilities import (
     litellm_capabilities,
     normalize_capabilities,
 )
-from lumen.services.litellm_client import effective_prices_per_million, official_price_source
+from lumen.services.litellm_client import bundled_cache_rates, effective_prices_per_million, official_price_source
 
 from .billing import billing_capability_for
 from .credentials import api_key_source, api_model_name
@@ -66,16 +66,20 @@ CACHE_PRICE_FIELDS = (
 )
 
 
-def _resolved_cache_prices(model: LlmModel) -> dict[str, Decimal | None]:
-    """Return the manual per-token cache rates; there is deliberately no catalog fallback.
-
-    A catalog fallback would silently start charging cache tokens on deploy,
-    so an unset rate stays ``None`` and bills that category at 0.
-    """
+def _resolved_cache_prices(model: LlmModel, provider: LlmProvider) -> dict[str, Decimal | None]:
+    """Manual rates override exact direct-provider catalog rates per category."""
+    catalog = bundled_cache_rates(model.model_name, provider.provider_type, provider.api_base)
     prices: dict[str, Decimal | None] = {}
     for _, column, resolved_key in CACHE_PRICE_FIELDS:
         value = getattr(model, column, None)
-        prices[resolved_key] = Decimal(value) if value is not None else None
+        rate = Decimal(value) if value is not None else catalog.get(resolved_key)
+        prices[resolved_key] = (
+            rate.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else None
+        )
+        tier_rate = catalog.get(f"{resolved_key}_above_200k") if value is None else None
+        prices[f"{resolved_key}_above_200k"] = (
+            tier_rate.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if tier_rate is not None else None
+        )
     return prices
 
 

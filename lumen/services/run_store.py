@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_contracts import ChatRunEvent, validate_chat_run_event
+from lumen.models.chat_infrastructure import ChatRuntimeResource, ChatWorkerRegistration
 from lumen.models.chat_runs import ChatRun, ChatRunEventRow, ChatRunSegment
 
 
@@ -19,7 +20,15 @@ class RunStoreError(RuntimeError):
     pass
 
 
-NONTERMINAL = {"queued", "running", "awaiting_approval", "awaiting_input", "waiting_children", "finalizing"}
+NONTERMINAL = {
+    "queued",
+    "running",
+    "awaiting_approval",
+    "awaiting_input",
+    "waiting_children",
+    "waiting_resource",
+    "finalizing",
+}
 TERMINAL = {"completed", "failed", "canceled"}
 
 
@@ -129,15 +138,47 @@ async def replay_events(session: AsyncSession, run: ChatRun, *, after_seq: int) 
     return events
 
 
+def fenced_owner(owner: str, fence: int) -> str:
+    """Lease token = worker identity + claim fence; every ownership check compares both."""
+    return f"{owner}#{fence}"
+
+
 async def claim_queued_run(
-    session: AsyncSession, run_id: str, *, owner: str, lease_seconds: int = 45
+    session: AsyncSession, run_id: str, *, owner: str, lease_seconds: int = 45,
+    registration_id: str | None = None,
 ) -> ChatRun | None:
     run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one_or_none()
     if run is None or run.status != "queued" or run.cancel_requested_at is not None:
         return None
+    if registration_id is not None:
+        registration = (await session.execute(select(ChatWorkerRegistration).where(
+            ChatWorkerRegistration.id == registration_id,
+            ChatWorkerRegistration.worker_identity == owner,
+        ).with_for_update())).scalar_one_or_none()
+        now = datetime.now(UTC)
+        if (registration is None or registration.draining or not registration.accepting
+                or _as_utc(registration.heartbeat_at) < now - timedelta(seconds=20)
+                or run.execution_protocol_version not in registration.protocol_versions
+                or (run.required_plugin_digest is not None
+                    and run.required_plugin_digest != registration.plugin_digest)):
+            return None
+        if registration.resource_id is not None:
+            resource = (await session.execute(select(ChatRuntimeResource).where(
+                ChatRuntimeResource.id == registration.resource_id))).scalar_one_or_none()
+            if (resource is None or resource.role != "worker" or resource.observed_state != "ready"
+                    or resource.desired_state == "deleting" or resource.pool_id != registration.pool_id
+                    or resource.generation != registration.resource_generation
+                    or resource.certificate_fingerprint != registration.certificate_fingerprint
+                    or resource.bootstrap_token_hash is not None):
+                return None
+        elif registration.resource_generation is not None or registration.certificate_fingerprint is not None:
+            return None
     now = datetime.now(UTC)
     run.status = "running"
-    run.lease_owner = owner
+    # Monotonic per claim: the owner token carries the fence, so a worker whose lease
+    # lapsed keeps a token no later transaction accepts once a newer claim succeeded.
+    run.lease_fence = int(run.lease_fence or 0) + 1
+    run.lease_owner = fenced_owner(owner, run.lease_fence)
     run.lease_expires_at = now + timedelta(seconds=lease_seconds)
     return run
 
@@ -245,11 +286,21 @@ async def transition_run(session: AsyncSession, run: ChatRun, *, expected: str, 
     """Apply only legal durable state transitions while the caller owns the run row lock."""
     allowed = {
         ("queued", "running"),
+        ("queued", "waiting_resource"),
         ("running", "awaiting_approval"),
+        ("running", "awaiting_input"),
+        ("running", "waiting_children"),
+        ("running", "waiting_resource"),
         ("awaiting_approval", "queued"),
+        ("awaiting_input", "queued"),
+        ("waiting_children", "queued"),
+        ("waiting_resource", "queued"),
         ("queued", "finalizing"),
         ("running", "finalizing"),
         ("awaiting_approval", "finalizing"),
+        ("awaiting_input", "finalizing"),
+        ("waiting_children", "finalizing"),
+        ("waiting_resource", "finalizing"),
         ("finalizing", "completed"),
         ("finalizing", "failed"),
         ("finalizing", "canceled"),

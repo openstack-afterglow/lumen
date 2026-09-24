@@ -6,10 +6,12 @@ Lumen의 테스트 시스템은 로컬 개발부터 외부 배포 검증까지 �
 
 | 계층 (Layer) | 주요 실행 명령 (Primary Command) | Real (실제 구성요소) | Faked (모의 구성요소) | 경계 (Boundary Covered) | 사용 목적 및 비용 (Expected Use & Cost) |
 | --- | --- | --- | --- | --- | --- |
-| **Contract** | `uv run lumen-test contract` | 실제 Python 서비스 로직, in-process ASGI | MariaDB, Redis, 외부 Provider, Keystone | 서비스 비즈니스 로직, API 스키마, SDK 트랜스포트, Ruff 린트 | 빠른 피드백, 커밋 전 기본 검증 (낮은 비용) |
-| **Integration** | `uv run lumen-test integration` | 실제 MariaDB 11, Redis 7, 마이그레이션 | in-process API/직접 worker 실행, 모의 Provider/Keystone | active-path row/revision/branch fence, Gateway grant→hashed expiring key one-time exchange, durable journal·ledger 및 세션 격리 | 데이터스토어 연동 검증 (중간 비용) |
-| **System** | `uv run lumen-test system` | 컨테이너화된 lumen-api, lumen-worker, MariaDB, Redis, 마이그레이션, 실제 HTTP 소켓 | fake OpenAI/Anthropic/Responses HTTP provider, 자동 생성 connection manifest/API key | Chat Completions, Responses text/function-call/full-input tool continuation, Codex cache/local-metadata boundary, Claude Code-compatible Anthropic fields/headers/native tool continuation, legacy Lumen device issue/poll/token/inference, native worker·Redis wakeup·usage 귀속 | 풀 스택 프로세스 연동 검증 (높은 비용, Docker 필요) |
-| **Deployment** *(외부)* | 외부 CI 파이프라인 (`afterglow`) | 실제 Keystone, OpenStack, Afterglow 공개 API, 실제 배포 클러스터 | 없음 (전체 실제 환경) | 서비스 간 엔드투엔드 통합, 실제 OpenStack 자원 프로비저닝 | 최종 배포/승격 검증 (Lumen 외부 소유, Zuul/DevStack/Tempest 모델) |
+| **Contract** | `uv run lumen-test contract`; plugin/sandbox package tests separately | 실제 Python 서비스 로직, in-process ASGI, plugin conformance kit/standalone sandbox unit logic | MariaDB, Redis, 외부 Provider, Keystone, 실제 cloud/guest | plugin manifest/allowlist, API/SDK schema, controller fencing/scheduler 및 sandbox capability/isolation logic, Ruff | 빠른 피드백; 실제 cloud provisioning/host 격리를 증명하지 않음 |
+| **Integration** | `uv run lumen-test integration` | 실제 MariaDB 11, Redis 7, 마이그레이션 | in-process API/직접 worker 실행, 모의 Provider/Keystone | durable journal·ledger, migration-twice, pool operation fencing/unknown create와 registration heartbeat/staleness | 데이터스토어 연동; 실제 Nova/Zun/Octavia/CA guest는 없음 |
+| **System** | `uv run lumen-test system` | 컨테이너화된 lumen-api, lumen-worker, MariaDB, Redis, PostgreSQL checkpointer, 마이그레이션, 실제 HTTP 소켓 | fake OpenAI/Anthropic/Responses HTTP provider, 자동 생성 connection manifest/API key | Chat Completions/Responses/Anthropic, native worker·SSE·usage/Redis wakeup, legacy device | 풀 스택 프로세스 연동; controller/OpenStack/sandbox guest와 실제 Keystone는 증명하지 않음 |
+| **Deployment** *(외부)* | 외부 CI/운영 검증 (`afterglow` 및 OpenStack 환경) | 실제 Keystone, OpenStack Nova/Octavia, trusted worker/controller, sandbox host, Afterglow 공개 API; Zun은 격리 강제 구현 이후 별도 승격 | 없음 | 설치 이미지/CA/bootstrap/mTLS, ingress/drain, namespace·cgroup·network 격리, parent→child→artifact와 restore/rollout | 최종 승격; 이 저장소의 unit/system green으로 대체 불가 |
+
+Standalone sandbox host 격리 수용은 [sandbox 이미지 검증 절차](../packages/lumen-sandbox/IMAGE.md#disposable-local-isolation-acceptance)를 따른다. 실제 cpu/memory/pids delegation, bubblewrap namespace, network-denial probe와 nft default-drop을 분리해 확인한다. 2026-09-24 local Docker arm64에서 실제 격리 테스트 21건 통과 및 일회용 fake controller를 붙인 sandbox daemon의 HTTPS bootstrap, mTLS readiness, 무인증서 거부, HMAC POST/GET Python 실행을 관측했다. amd64 image는 빌드·실행 및 비-workload 계약 14건 통과했지만 arm64 호스트 에뮬레이션의 `bwrap: Can't open source /usr: Function not implemented`로 7건 workload 테스트를 의도적으로 제외했다. Native amd64 Linux 격리와 Nova/KVM guest/Neutron security group/실제 Keystone·controller는 미검증이다. Zun pool은 isolation 강제 미구현으로 설정에서 거부한다.
 
 ---
 
@@ -86,13 +88,15 @@ uv run pytest -m "not integration and not system" tests
 
 ## CI 게이트 및 재사용 가능한 워크플로우
 
-Lumen GitHub Actions CI (`.github/workflows/ci.yml`)는 다음과 같은 5개 자동화 게이트로 구성되어 있습니다.
+Lumen GitHub Actions CI (`.github/workflows/ci.yml`)는 7개 job을 실행합니다.
 
-1. **`service`**: `service` 및 `dev` extra를 설치한 Contract 테스트 (`pytest -m "not integration and not system"`) 및 Ruff 린트 검증.
-2. **`sdk`**: SDK 패키지 검증 및 Ruff 린트.
-3. **`kolla`**: root `lumen` wheel의 Kolla role shared-data metadata와 wheel contents를 검증.
-4. **`integration`**: `service` 및 `dev` extra를 설치하고 MariaDB 및 Redis 서비스 컨테이너를 띄운 뒤, `lumen-migrate --apply`를 2회 연속 실행하여 마이그레이션 멱등성(migration-twice)을 증명한 후 `pytest -m integration`을 수행.
-5. **`system`**: `service` 및 `dev` extra를 설치하고 `lumen-test system`을 호출하여 프로세스 스택 전체의 HTTP 및 독립 실행 검증.
+1. **`service`**: architecture freshness check, `service`/`dev` extra, in-process contract pytest 및 Ruff.
+2. **`plugins`**: 기본 database/memory/tools/skills/MCP wheel 각각 build/conformance package tests; `lumen-plugin-api`는 별도 테스트 디렉터리가 없는 공개 conformance helper package이며 wheel build와 플러그인 테스트에서 검증한다.
+3. **`sandbox`**: standalone `lumen-sandbox` wheel build/package tests (Linux guest 실제 isolation 증명은 아님).
+4. **`sdk`**: SDK 패키지 테스트와 Ruff.
+5. **`kolla`**: root wheel/Kolla role asset tests.
+6. **`integration`**: MariaDB/Redis service에서 migration 두 번 적용 뒤 root `tests/`에서 `pytest -m integration tests` (sandbox 독립 wheel tests는 `sandbox` job이 별도 수집).
+7. **`system`**: `lumen-test system`으로 API/worker 프로세스와 fake provider의 HTTP 계약 검증.
 
 ### Reusable Workflow 활용 예시 (Exact Refs)
 
@@ -128,3 +132,9 @@ OpenStack CI(Zuul/DevStack/Tempest) 관례와 유사하게:
 2. **Lumen 테스트의 한계 경계**: Lumen 내부의 `system` 테스트는 Provider 및 Keystone 경계(fake provider HTTP / 시드된 인증)에서 멈춥니다. 실제 OpenStack 자원 프로비저닝이나 외부 인프라 연동 시나리오는 배포/Afterglow 리포지토리의 소유 영역입니다.
 3. **Gateway system approval 경계**: system stack은 public device issue/poll/token과 issued Gateway key의 실제 HTTP inference를 검증한다. 승인 단계는 fake Keystone을 만들지 않고 같은 MariaDB에 대한 Lumen `authorize_user_code` transaction을 test container에서 실행한다. Keystone identity와 Afterglow authenticated BFF는 각 저장소의 contract test 소유이며, 이 system 증거는 실제 Keystone/Afterglow deployment 증거가 아니다.
 4. **테스트 마커 정립**: 데이터스토어 연동 테스트는 `integration` 마커와 `lumen-test` CLI 명령으로 정립됩니다. 오래되었거나 존재하지 않는 `pytest.mark.db` 또는 pgvector 기본 활성화 전제는 사용하지 않습니다.
+
+### Managed agent runtime 승격 체크 (실행 결과가 아닌 절차)
+
+CI 계약/스토어 테스트는 plugin manifest/entry-point ABI, cloud operation lease/fence 및 ambiguous create 격리, worker 등록·heartbeat를 점검한다. Image build는 amd64/arm64 산출물을 만들지만 실제 Nova/Zun cloud 권한, guest image hash, Octavia pool membership, controller CA/TLS/bootstrap token 경계, namespace/cgroup/firewall, API/worker drain 또는 parent→child→sandbox artifact end-to-end를 증명하지 않는다. 특정 실행이 아직 관찰되지 않았으면 `live-verified`로 표시하지 않는다.
+
+실배포 승격에서는 중지/백업/015~018 migration-twice 후 동일 plugin wheel·config의 API/worker/controller 시작과 `/v1/ready`를 확인한다. Trusted/sandbox project와 CIDR 분리, Nova profile preflight(Zun adapter는 isolation 강제 부재로 모든 pool이 거부됨), certificate/CSR 1회 교환 및 replay 거부, generation/fingerprint-bound worker heartbeat/plugin digest, sandbox `/readyz`와 mTLS/dispatch 거부, 실제 네트워크 차단/격리, agent budget cap, child `waiting_resource`→ready→join/cancel 및 reservation 정산을 각각 관측한다. API 부하에서는 실제 SSE 첫 text TTFT/active 수집, 2-sample high·300초 low scale, telemetry 누락 시 ingress drain/no scale-in을 확인한다. Under load에서는 SIGTERM worker drain/lease 유지, unknown create adoption 또는 확증 부재 후 삭제, ingress drain/backup restore의 일관성을 확인한다. 외부 Keystone/Afterglow public API·OpenStack 공급자 실증은 Deployment layer 소유이며 fake provider나 in-process assertion의 증거와 구별해 기록한다.

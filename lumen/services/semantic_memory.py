@@ -1,11 +1,10 @@
-"""Semantic-memory availability and pgvector-index construction."""
+"""Semantic-memory availability, backed by the selected memory plugin's index."""
 
 from __future__ import annotations
 
-from functools import lru_cache
+from lumen_plugin_api.memory import MemoryIndex
 
-from lumen.config import get_settings
-from lumen.services.memory_index import PgVectorMemoryIndex
+from lumen.plugins import memory_host
 
 _ready = False
 
@@ -14,17 +13,11 @@ class SemanticMemoryUnavailable(RuntimeError):
     pass
 
 
-@lru_cache(maxsize=1)
-def configured_memory_index() -> PgVectorMemoryIndex:
-    settings = get_settings()
-    if not settings.chat_semantic_memory_enabled:
-        raise SemanticMemoryUnavailable("semantic memory is disabled")
-    if not settings.chat_memory_pgvector_url or settings.chat_memory_embedding_dimensions <= 0:
-        raise SemanticMemoryUnavailable("semantic memory configuration is incomplete")
-    return PgVectorMemoryIndex(
-        settings.chat_memory_pgvector_url,
-        dimensions=settings.chat_memory_embedding_dimensions,
-    )
+def configured_memory_index() -> MemoryIndex:
+    index = memory_host.configured_index()
+    if index is None:
+        raise SemanticMemoryUnavailable("semantic memory is disabled or its configuration is incomplete")
+    return index
 
 
 async def setup_semantic_memory() -> None:

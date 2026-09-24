@@ -228,10 +228,17 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "capabilities": capabilities,
         "api_key": api_key,
     }
-    cache_prices = _resolved_cache_prices(model)
-    # Cache rates join the fingerprint only once one is set, so every existing
-    # config_version_hash of a model without cache rates stays byte-identical
-    # while setting a cache rate still invalidates admitted run snapshots.
+    cache_prices = _resolved_cache_prices(model, provider)
+    cache_price_sources = {
+        category: "manual" if getattr(model, column, None) is not None else "litellm"
+        for category, column in (
+            ("cache_read", "cache_read_price"),
+            ("cache_creation_5m", "cache_write_price"),
+            ("cache_creation_1h", "cache_write_1h_price"),
+        )
+    }
+    # Catalog rates are frozen with the route fingerprint; old run snapshots
+    # retain their previously admitted prices after a LiteLLM upgrade.
     if any(price is not None for price in cache_prices.values()):
         config_fingerprint["cache_prices_per_token"] = {
             key: str(price) if price is not None else None for key, price in cache_prices.items()
@@ -264,6 +271,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "price_version": price_version,
         "price_metadata": model.price_metadata,
         **cache_prices,
+        "cache_price_sources": cache_price_sources,
         "provider_id": provider.id,
         "model_id": model.id,
         "config_version_hash": config_version_hash,

@@ -33,6 +33,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       # Development-only deterministic key. Replace before exposing a deployment.
       LUMEN_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      CHAT_EXECUTION_PROTOCOL_VERSION: ${CHAT_EXECUTION_PROTOCOL_VERSION:-1}
+      CHAT_CHECKPOINTER_POSTGRES_URL: ${CHAT_CHECKPOINTER_POSTGRES_URL:-}
+      RUNTIME_CONFIG: '${RUNTIME_CONFIG:-{}}'
+      CHAT_MCP_OAUTH_CALLBACK_URL: http://localhost:${LUMEN_API_PORT:-8012}/api/v1/chat/mcp-oauth/callback
       CHAT_API_HOSTS: localhost,127.0.0.1,lumen-api
       CHAT_DEFAULT_MODEL: ${LUMEN_LOCAL_MODEL:-gpt-4.1-mini}
       CHAT_COMPAT_RUN_TIMEOUT_SECONDS: ${CHAT_COMPAT_RUN_TIMEOUT_SECONDS:-300}
@@ -137,6 +141,37 @@ services:
     volumes:
       - lumen-console:/data
       - lumen-seed:/seed:ro
+
+  # Opt-in runtime requires an operator-provided RUNTIME_CONFIG with dedicated
+  # internal TLS and cloud profiles. No cloud credentials are provided by Compose.
+  postgres:
+    profiles: ["agent-runtime"]
+    image: pgvector/pgvector:0.8.6-pg16
+    environment:
+      POSTGRES_DB: lumen
+      POSTGRES_USER: lumen
+      POSTGRES_PASSWORD: lumen
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumen -d lumen"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  lumen-controller:
+    profiles: ["agent-runtime"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: lumen-controller
+    environment:
+      <<: *lumen-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${LUMEN_RUNTIME_TLS_DIR:-./runtime-tls}:/etc/lumen/runtime:ro
 
 volumes:
   lumen-mariadb:

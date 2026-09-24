@@ -27,6 +27,20 @@ services:
     ports:
       - "127.0.0.1:${REDIS_PORT:-36379}:6379"
 
+  # Real PostgreSQL for the encrypted protocol-v2 LangGraph checkpointer. Ordinary v1 smoke
+  # keeps running without it; the agent-runtime scenarios below require it.
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg16
+    environment:
+      POSTGRES_DB: lumen
+      POSTGRES_USER: lumen
+      POSTGRES_PASSWORD: lumen
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumen -d lumen"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
   fake-provider:
     build:
       context: .
@@ -63,6 +77,12 @@ services:
       # Keep a recognized adaptive Claude ID so LiteLLM preserves current output_config fields.
       CLAUDE_GATEWAY_MODEL: ${LUMEN_GATEWAY_MODEL:-claude-sonnet-4-6}
       CLAUDE_GATEWAY_PROVIDER: ${LUMEN_GATEWAY_PROVIDER:-anthropic}
+      # Protocol/checkpointer are opt-in per scenario; v1 smoke leaves them at defaults.
+      CHAT_EXECUTION_PROTOCOL_VERSION: ${CHAT_EXECUTION_PROTOCOL_VERSION:-1}
+      CHAT_CHECKPOINTER_POSTGRES_URL: ${CHAT_CHECKPOINTER_POSTGRES_URL:-}
+      RUNTIME_CONFIG: '${RUNTIME_CONFIG:-{}}'
+      CHAT_MCP_OAUTH_CALLBACK_URL: http://localhost:${LUMEN_API_PORT:-8012}/api/v1/chat/mcp-oauth/callback
+      AFTERGLOW_ENV: development
     depends_on:
       mariadb:
         condition: service_healthy
@@ -111,6 +131,8 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8012/v1/health || exit 1"]
       interval: 3s
@@ -132,6 +154,34 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # Manual development-only controller profile, not part of lumen-test system.
+  # Requires explicit runtime config, TLS and a built sandbox image on a disposable Docker host.
+  # The Docker socket is never mounted in production; this profile is not cloud/isolation acceptance.
+  lumen-controller:
+    profiles: ["agent-runtime"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: lumen-test
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    command: ["python", "-m", "lumen.controller"]
+    environment:
+      <<: *lumen-environment
+      LUMEN_CONTROLLER_PROVIDER_FACTORY: tests.system.docker_provider:create
+      LUMEN_SANDBOX_IMAGE: ${LUMEN_SANDBOX_IMAGE:-lumen-sandbox:system}
+      LUMEN_SYSTEM_NETWORK: ${COMPOSE_PROJECT_NAME:-lumen-system}_default
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - system-runtime-tls:/etc/lumen/runtime
 
   system-tests:
     build:
@@ -149,6 +199,7 @@ services:
       PYTEST_ADDOPTS: ${SYSTEM_PYTEST_ADDOPTS:-}
       DATABASE_URL: mysql+aiomysql://lumen:lumen@mariadb:3306/lumen
       LUMEN_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      CHAT_EXECUTION_PROTOCOL_VERSION: ${CHAT_EXECUTION_PROTOCOL_VERSION:-1}
     depends_on:
       lumen-api:
         condition: service_healthy
@@ -160,3 +211,4 @@ services:
 volumes:
   system-mariadb:
   system-seed:
+  system-runtime-tls:

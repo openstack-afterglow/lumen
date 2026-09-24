@@ -100,7 +100,7 @@ def run_integration(extra_args: list[str] | None = None) -> int:
             return mig_code
 
         # Run integration tests
-        pytest_cmd = ["pytest", "-m", "integration"] + extra
+        pytest_cmd = ["pytest", "-m", "integration", "tests", *extra]
         return _run_cmd(pytest_cmd, env=env)
     finally:
         _run_cmd(["docker", "compose", "-f", compose_file, "down", "-v", "--remove-orphans"], env=env)

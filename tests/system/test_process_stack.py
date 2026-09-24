@@ -20,6 +20,7 @@ import json
 import os
 import time
 import uuid
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -1157,3 +1158,172 @@ def test_process_stack_native_protocols_and_gateway_device_login() -> None:
         assert replay.json()["error"] == "invalid_grant"
 
     _reset_fake_provider(fake_provider_url)
+
+
+async def _register_discovered_system_model(fake_provider_url: str, model_name: str) -> dict[str, Any]:
+    """Use the same MariaDB as the already-running API and worker, not their in-process state."""
+    from sqlalchemy import func, select
+
+    from lumen.db import close_db, get_session_factory, init_db
+    from lumen.models.chat_db import LlmModel
+    from lumen.services import model_discovery
+    from lumen.services.providers import repository
+
+    init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
+    try:
+        provider = await repository.create_provider(
+            name=f"system-discovery-{uuid.uuid4().hex}",
+            provider_type="anthropic",
+            api_base=fake_provider_url,
+            api_key="fake-anthropic-key",
+        )
+        factory = get_session_factory()
+        assert factory is not None
+        async with factory() as session:
+            before = await session.scalar(select(func.count(LlmModel.id)).where(LlmModel.provider_id == provider["id"]))
+        discovered = await model_discovery.discover_models(provider["id"])
+        assert discovered["live_status"] == "success" and discovered["complete"] is True
+        assert model_name in discovered["models"]
+        assert "claude-system-unpriced-2099-01-01" in discovered["models"]
+        assert discovered["source"] == "api"
+        async with factory() as session:
+            after = await session.scalar(select(func.count(LlmModel.id)).where(LlmModel.provider_id == provider["id"]))
+        assert before == after == 0, "Discovery must not register models"
+
+        unpriced = await repository.create_model(
+            provider_id=provider["id"], model_name="claude-system-unpriced-2099-01-01"
+        )
+        registered = await repository.create_model(
+            provider_id=provider["id"],
+            model_name=model_name,
+            input_price_per_million="2",
+            output_price_per_million="4",
+        )
+        return {"provider": provider, "unpriced": unpriced, "registered": registered}
+    finally:
+        await close_db()
+
+
+async def _read_system_run_accounting(run_id: str) -> dict[str, Any]:
+    from sqlalchemy import select
+
+    from lumen.db import close_db, get_session_factory, init_db
+    from lumen.models.chat_db import ChatUsageLog
+    from lumen.models.chat_runs import ChatRun, ChatRunProvider
+
+    init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
+    try:
+        factory = get_session_factory()
+        assert factory is not None
+        async with factory() as session:
+            run = await session.get(ChatRun, run_id)
+            ledger = (await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))).scalar_one()
+            route = await session.get(ChatRunProvider, (run_id, "executor"))
+            assert run is not None and route is not None
+            return {
+                "capability": run.capability_snapshot,
+                "pricing": run.pricing_snapshot,
+                "provider_id": route.provider_id,
+                "model_id": route.model_id,
+                "version": route.config_version_hash,
+                "raw_cost": ledger.raw_cost,
+            }
+    finally:
+        await close_db()
+
+
+def test_process_stack_discovers_and_routes_new_claude_without_restart() -> None:
+    """Real API/worker processes see a newly registered, second-page fake Claude model."""
+    api_base_url, _, api_key, _, fake_provider_url = _load_connection_context()
+    _reset_fake_provider(fake_provider_url)
+    model_name = "claude-system-unlisted-2099-01-01"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    with httpx.Client(base_url=api_base_url, timeout=30.0) as client:
+        before = client.get("/v1/models", headers=headers)
+        assert before.status_code == 200, before.text
+        assert model_name not in {item["id"] for item in before.json()["data"]}
+
+        rows = asyncio.run(_register_discovered_system_model(fake_provider_url, model_name))
+        registered = rows["registered"]
+        assert registered["provider_id"] == rows["provider"]["id"]
+        assert registered["api_provider"] == "anthropic"
+        assert registered["api_model_name"] == model_name
+        assert registered["price_source"] == "manual"
+
+        active = client.get("/v1/models", headers=headers)
+        assert active.status_code == 200, active.text
+        public = next(item for item in active.json()["data"] if item["id"] == model_name)
+        assert "anthropic" in public["providers"]
+
+        denied = client.post(
+            "/v1/temp-completions",
+            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+            json={
+                "parts": [{"type": "text", "text": "unpriced route must not run"}],
+                "model_id": rows["unpriced"]["model_name"],
+                "features": {"memory": False, "tool_policy": {"mode": "none"}},
+            },
+        )
+        assert denied.status_code == 422, denied.text
+        assert "text (pricing_unavailable)" in denied.json()["detail"]
+
+        unsupported = client.post(
+            "/v1/temp-completions",
+            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+            json={
+                "parts": [{"type": "text", "text": "search must remain denied"}],
+                "model_id": model_name,
+                "features": {
+                    "memory": False,
+                    "tool_policy": {"mode": "agent_default"},
+                    "web_search": {"enabled": True, "mode": "native"},
+                },
+            },
+        )
+        assert unsupported.status_code == 422, unsupported.text
+        assert "web_search" in unsupported.json()["detail"]
+
+        compat = client.post(
+            "/v1/chat/completions",
+            headers=headers,
+            json={"model": model_name, "provider": "anthropic", "messages": [{"role": "user", "content": "compat"}]},
+        )
+        assert compat.status_code == 200, compat.text
+        assert compat.json()["choices"][0]["message"]["content"] == "Hello from fake provider!"
+        assert compat.json()["model"] == model_name
+
+        admitted = client.post(
+            "/v1/temp-completions",
+            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+            json={
+                "parts": [{"type": "text", "text": "newly registered worker route"}],
+                "model_id": model_name,
+                "features": {"memory": False, "tool_policy": {"mode": "none"}},
+            },
+        )
+        assert admitted.status_code == 202, admitted.text
+        run_id = admitted.json()["run_id"]
+        terminal = _poll_run_until_terminal(client, run_id, headers)
+        assert terminal["status"] == "completed", terminal
+
+        records = client.get("/v1/usage/records", headers=headers)
+        assert records.status_code == 200, records.text
+        record = next(item for item in records.json()["records"] if item["run_id"] == run_id)
+        assert record["model_name"] == model_name
+        assert record["prompt_tokens"] == 10
+        assert record["completion_tokens"] == 5
+        assert record["pricing_status"] == "priced"
+        accounting = asyncio.run(_read_system_run_accounting(run_id))
+        assert accounting["provider_id"] == rows["provider"]["id"]
+        assert accounting["model_id"] == registered["id"]
+        assert accounting["capability"]["config_version_hash"] == accounting["version"]
+        assert accounting["capability"]["model_name"] == model_name
+        assert accounting["pricing"]["price_source"] == "manual"
+        assert accounting["pricing"]["input_price_per_token"] == "0.0000020000"
+        assert accounting["pricing"]["output_price_per_token"] == "0.0000040000"
+        assert accounting["raw_cost"] == Decimal("0.0000400000")
+
+        stats = _get_fake_provider_stats(fake_provider_url)
+        assert stats is not None
+        assert any(item.get("protocol") == "anthropic" and item.get("model") == model_name for item in stats["history"])

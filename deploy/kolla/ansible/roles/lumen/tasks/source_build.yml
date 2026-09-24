@@ -88,9 +88,8 @@
     build:
       path: "{{ lumen_source_dir }}"
       target: "{{ item }}"
+      dockerfile: docker/Dockerfile
     source: build
     force_source: false
-  loop:
-    - lumen-api
-    - lumen-worker
+  loop: "{{ ['lumen-api', 'lumen-worker'] + (['lumen-controller'] if lumen_runtime_enabled | bool else []) }}"
   when: inventory_hostname in groups['lumen']

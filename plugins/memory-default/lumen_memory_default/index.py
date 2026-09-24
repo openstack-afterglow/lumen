@@ -1,47 +1,14 @@
-"""Content-free pgvector index for encrypted MySQL chat memories."""
+"""Content-free pgvector index for encrypted MySQL chat memories.
+
+``MemoryVector``/``MemoryIndex`` are defined once in ``lumen_plugin_api.memory``;
+this module only supplies the default provider's concrete adapter.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol
-
+from lumen_plugin_api.memory import MemoryVector
 from pgvector.psycopg import register_vector_async
 from psycopg import AsyncConnection, sql
-
-
-@dataclass(frozen=True)
-class MemoryVector:
-    memory_id: int
-    generation: int
-    user_id: str
-    project_id: str | None
-    workspace_id: int | None
-    embedding: list[float]
-    embedding_model: str
-    content_hash: str
-
-
-class MemoryIndex(Protocol):
-    async def setup(self) -> None: ...
-
-    async def search_ids(
-        self,
-        *,
-        user_id: str,
-        project_id: str | None,
-        workspace_id: int | None,
-        embedding: list[float],
-        limit: int,
-    ) -> list[int]: ...
-
-    async def required_generations(self) -> list[int]: ...
-    async def upsert(self, vector: MemoryVector) -> None: ...
-
-    async def delete(self, *, generation: int, memory_id: int) -> None: ...
-
-    async def delete_namespace(
-        self, *, generation: int, user_id: str, project_id: str | None, workspace_id: int | None
-    ) -> None: ...
 
 
 class PgVectorMemoryIndex:
@@ -108,6 +75,8 @@ class PgVectorMemoryIndex:
     ) -> list[int]:
         if not 1 <= limit <= 100:
             raise ValueError("memory search limit must be between 1 and 100")
+        if len(embedding) != self._dimensions:
+            raise ValueError("memory query embedding dimensions do not match index")
         conn = await self._connection()
         try:
             async with conn.cursor() as cursor:

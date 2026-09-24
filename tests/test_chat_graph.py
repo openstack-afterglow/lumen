@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
+from lumen_plugin_api.contracts import PluginError
 
 from lumen.models.chat_contracts import validate_chat_run_event
 from lumen.services import graph, litellm_client
@@ -845,6 +846,39 @@ class TestToolLoop:
             "name": "list_my_conversations",
             "content": "대화 3개",
         }
+
+    async def test_revoked_skill_blocks_the_next_model_turn(self, monkeypatch):
+        provider_calls = 0
+
+        async def fake_stream(**_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            if provider_calls != 1:
+                raise AssertionError("revoked instructions must not reach a second provider call")
+            return _aiter([_ChunkTC(_DeltaTC(tool_calls=[
+                _ToolCallDelta(0, "call_1", "list_my_conversations", "{}"),
+            ]))])
+
+        async def fake_execute(*_args):
+            return contracts.ToolExecutionResult("result")
+
+        class Hooks:
+            validations = 0
+
+            async def revalidate_skills(self):
+                self.validations += 1
+                if self.validations == 2:
+                    raise PluginError("plugin_authority_revoked", "skill binding revoked")
+
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
+        hooks = Hooks()
+        with pytest.raises(PluginError, match="skill binding revoked"):
+            async for _ in graph.stream(
+                model="m", messages=_MSGS, project_id="p1", user_id="u1", execution_hooks=hooks,
+            ):
+                pass
+        assert provider_calls == 1 and hooks.validations == 2
 
     async def test_multistep_usage_sums_prompt_cache_categories(self, monkeypatch):
         """Each round's LiteLLM-normalized cache split survives the round sum."""

@@ -31,6 +31,7 @@ def test_default_feature_options_preserve_manual_memory_without_tools():
         "web_fetch": {"enabled": False, "allowed_domains": [], "blocked_domains": [], "max_uses": 1},
         "advisor": {"enabled": False, "max_uses": 1, "model_id": None},
         "memory": True,
+        "memory_retrieval": "recency",
         "response_format": {"kind": "text", "name": None, "version": None, "schema": None},
         "tool_policy": {
             "mode": "agent_default",

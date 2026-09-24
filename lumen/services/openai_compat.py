@@ -8,6 +8,7 @@ import json
 import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from decimal import Decimal
 from typing import Any
 
 from fastapi import HTTPException
@@ -37,6 +38,18 @@ _MAX_TOTAL_CHARS = 128000
 _MAX_MESSAGES = 100
 KEEPALIVE_INTERVAL_SECONDS = 15.0
 _POLL_INTERVAL_SECONDS = 0.25
+
+
+def _executor_cached_tokens(payload: dict) -> int:
+    """Only the executor prompt belongs to OpenAI cached_tokens, not advisor calls."""
+    components = payload.get("components")
+    if not isinstance(components, list):
+        return 0
+    return sum(
+        int(Decimal(component["quantity"]))
+        for component in components
+        if component.get("source") == "executor" and component.get("kind") == "cache_read_input_tokens"
+    )
 
 
 class OpenAICompatError(Exception):
@@ -283,7 +296,7 @@ async def execute_lumen_nonstream(
     start_time = asyncio.get_running_loop().time()
     after_seq = 0
     text_content = ""
-    usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "cache_read_input_tokens": 0}
     run_completed = False
     run_terminal = False
 
@@ -319,6 +332,7 @@ async def execute_lumen_nonstream(
                 elif event_type == "usage.updated":
                     usage["prompt_tokens"] = payload.get("prompt_tokens", 0)
                     usage["completion_tokens"] = payload.get("completion_tokens", 0)
+                    usage["cache_read_input_tokens"] = _executor_cached_tokens(payload)
                 elif event_type == "run.completed":
                     run_completed = True
                     run_terminal = True
@@ -345,6 +359,7 @@ async def execute_lumen_nonstream(
             "finish_reason": "stop",
             "prompt_tokens": usage["prompt_tokens"],
             "completion_tokens": usage["completion_tokens"],
+            "cache_read_input_tokens": usage["cache_read_input_tokens"],
         }
     finally:
         if not run_terminal:
@@ -371,7 +386,7 @@ async def execute_lumen_stream(
 
     start_time = asyncio.get_running_loop().time()
     after_seq = 0
-    usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "cache_read_input_tokens": 0}
     run_finished = False
     run_completed = False
     last_event_time = start_time
@@ -452,6 +467,7 @@ async def execute_lumen_stream(
                 elif event_type == "usage.updated":
                     usage["prompt_tokens"] = payload.get("prompt_tokens", 0)
                     usage["completion_tokens"] = payload.get("completion_tokens", 0)
+                    usage["cache_read_input_tokens"] = _executor_cached_tokens(payload)
                 elif event_type in ("run.failed", "run.canceled"):
                     run_finished = True
                     safe_msg = payload.get("safe_message") or "Durable run execution failed"
@@ -509,6 +525,7 @@ async def execute_lumen_stream(
                                 "prompt_tokens": usage["prompt_tokens"],
                                 "completion_tokens": usage["completion_tokens"],
                                 "total_tokens": usage["prompt_tokens"] + usage["completion_tokens"],
+                                "prompt_tokens_details": {"cached_tokens": usage["cache_read_input_tokens"]},
                             },
                         },
                     }

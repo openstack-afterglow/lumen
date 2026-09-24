@@ -636,15 +636,50 @@ async def delete_provider(provider_id: int):
         raise _map_storage(exc) from exc
 
 
-@router.get("/admin/providers/{provider_id}/available-models")
-async def available_models(provider_id: int):
-    """프로바이더 API(또는 litellm 정적 목록)에서 사용 가능한 모델 id 목록을 조회. 등록 전 선택/필터용."""
+class AvailableModelCandidate(BaseModel):
+    """Additive discovery candidate — factual provider metadata only, never capability/price."""
+
+    id: str
+    display_name: str | None = None
+    purpose: Literal["chat", "non_chat", "unknown"] = "unknown"
+    generation_methods: list[str] = Field(default_factory=list)
+    input_token_limit: int | None = None
+    output_token_limit: int | None = None
+
+    model_config = {"protected_namespaces": ()}
+
+
+class AvailableModelsError(BaseModel):
+    code: str
+    message: str
+    retryable: bool
+
+
+class AvailableModelsResponse(BaseModel):
+    provider_id: int
+    fetched_at: str
+    source: Literal["api", "litellm", "none"]
+    live_status: Literal["success", "empty", "unsupported", "error"]
+    complete: bool
+    error: AvailableModelsError | None = None
+    models: list[str]
+    candidates: list[AvailableModelCandidate]
+
+    model_config = {"protected_namespaces": ()}
+
+
+@router.get("/admin/providers/{provider_id}/available-models", response_model=AvailableModelsResponse)
+async def available_models(provider_id: int, response: Response):
+    """프로바이더 API(또는 litellm 정적 목록)에서 사용 가능한 모델 후보를 조회. 등록 전 선택/검토용."""
+    response.headers.update(_NO_STORE)
     try:
         return await model_discovery.discover_models(provider_id)
     except errors.ProviderNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=str(exc), headers=_NO_STORE) from exc
     except errors.ChatStorageUnavailable as exc:
-        raise _map_storage(exc) from exc
+        mapped = _map_storage(exc)
+        mapped.headers = _NO_STORE
+        raise mapped from exc
 
 
 # ---------------------------------------------------------------------------

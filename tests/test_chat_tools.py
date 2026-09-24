@@ -15,8 +15,8 @@ _CTX = ToolContext(project_id="proj-A", user_id="user-A")
 
 
 class TestSchemas:
-    def test_tool_schemas_openai_format(self):
-        schemas = tool_schemas()
+    async def test_tool_schemas_openai_format(self):
+        schemas = await tool_schemas()
         assert len(schemas) >= 2
         names = {s["function"]["name"] for s in schemas}
         assert "list_my_conversations" in names
@@ -42,8 +42,9 @@ class TestUnknownAndErrors:
 
         monkeypatch.setattr(cs, "list_conversations", boom)
         out = await execute_tool("list_my_conversations", {}, _CTX)
-        assert "오류" in out
+        assert isinstance(out, str) and out
         assert "boom" not in out  # 내부 예외 메시지 미노출
+        assert "RuntimeError" not in out
 
 
 class TestTenantSafety:

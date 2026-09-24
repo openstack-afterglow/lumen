@@ -157,29 +157,37 @@ class TestCountTokens:
 
 
 class TestEffectiveDisplayPrices:
-    def test_uses_same_provider_aware_litellm_lookup_as_charging(self, monkeypatch):
-        captured = {}
+    def test_unknown_anthropic_id_is_unpriced_not_implicitly_free(self, monkeypatch):
+        import litellm
 
-        def fallback(model, prompt_tokens, completion_tokens, provider_type=None):
-            captured.update(
-                model=model,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                provider_type=provider_type,
-            )
-            return Decimal("0.000002"), Decimal("0.000008")
-
-        monkeypatch.setattr(litellm_client, "_litellm_component_rates", fallback)
-        assert litellm_client.effective_prices_per_million("gpt-5.4", "openai") == (
-            Decimal("2.000000"),
-            Decimal("8.000000"),
+        monkeypatch.setattr(litellm, "cost_per_token", lambda **kwargs: (0, 0))
+        model = "claude-onboarding-unlisted-2099-01-01"
+        assert litellm_client.effective_prices_per_million(model, "anthropic") == (None, None)
+        usage = litellm_client.cost_from_usage(
+            model,
+            10,
+            5,
+            input_price_per_token=None,
+            output_price_per_token=None,
+            price_source=None,
+            provider_type="anthropic",
         )
-        assert captured == {
-            "model": "gpt-5.4",
-            "prompt_tokens": 1_000_000,
-            "completion_tokens": 1_000_000,
-            "provider_type": "openai",
-        }
+        assert usage.pricing_status == "unpriced"
+
+    def test_exact_free_catalog_entry_is_distinct_from_missing_price(self, monkeypatch):
+        import litellm
+
+        monkeypatch.setattr(
+            litellm,
+            "model_cost",
+            {
+                "anthropic/explicit-free": {"input_cost_per_token": 0, "output_cost_per_token": 0},
+                "anthropic/missing-output": {"input_cost_per_token": 0.000002},
+            },
+        )
+        monkeypatch.setattr(litellm, "cost_per_token", lambda **kwargs: (0, 0))
+        assert litellm_client.effective_prices_per_million("explicit-free", "anthropic") == (0, 0)
+        assert litellm_client.effective_prices_per_million("missing-output", "anthropic") == (Decimal("2"), None)
 
     def test_reads_bundled_deepseek_price_table_without_network(self):
         assert litellm_client.effective_prices_per_million("deepseek-chat", "deepseek") == (
@@ -719,6 +727,109 @@ async def test_native_responses_forwards_prompt_cache_key(monkeypatch):
 
     assert result["id"] == "resp_codex"
     assert captured["prompt_cache_key"] == "session:codex"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_direct_anthropic_marks_stable_system_prefix_without_mutating_messages(monkeypatch, stream):
+    import litellm
+
+    captured = {}
+
+    async def completion(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    messages = [{"role": "system", "content": "Stable policy " * 250}, {"role": "user", "content": "one"}]
+    call = litellm_client.acompletion_stream if stream else litellm_client.acompletion
+    await call("claude-sonnet-4-5", messages, custom_llm_provider="anthropic", api_key="secret")
+
+    assert captured["messages"][0]["content"] == [
+        {"type": "text", "text": messages[0]["content"], "cache_control": {"type": "ephemeral"}}
+    ]
+    assert captured["messages"][1] is messages[1]
+    assert isinstance(messages[0]["content"], str)
+    if stream:
+        assert captured["stream_options"] == {"include_usage": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("marker_location", ["tool", "function", "request"])
+async def test_explicit_anthropic_tool_or_request_breakpoints_do_not_add_fifth(monkeypatch, stream, marker_location):
+    import litellm
+
+    captured = {}
+
+    async def completion(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    messages = [{"role": "system", "content": "Stable instructions " * 250}, {"role": "user", "content": "Hi"}]
+    tools = [{"type": "function", "function": {
+        "name": f"lookup_{index}", "description": "Lookup", "parameters": {"type": "object"},
+    }} for index in range(4)]
+    extra = None
+    if marker_location == "request":
+        extra = {"cache_control": {"type": "ephemeral"}}
+    else:
+        for tool in tools:
+            owner = tool if marker_location == "tool" else tool["function"]
+            owner["cache_control"] = {"type": "ephemeral"}
+    call = litellm_client.acompletion_stream if stream else litellm_client.acompletion
+    await call("claude-sonnet-4-5", messages, custom_llm_provider="anthropic", tools=tools, extra=extra)
+
+    assert captured["messages"] is messages
+    assert captured["tools"] is tools
+    assert sum(1 for item in tools if litellm_client._cache_marker_present(item)) == (0 if extra else 4)
+    if extra:
+        assert captured["cache_control"] == extra["cache_control"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_cache_breakpoint_and_custom_provider_base_are_preserved(monkeypatch):
+    import litellm
+
+    seen = []
+
+    async def completion(**kwargs):
+        seen.append(kwargs["messages"])
+        return object()
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    marked = [{"role": "system", "content": [
+        {"type": "text", "text": "policy", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+    ]}, {"role": "user", "content": "question"}]
+    await litellm_client.acompletion("claude-sonnet-4-5", marked, custom_llm_provider="anthropic")
+    assert seen[-1] is marked
+
+    unmarked = [{"role": "system", "content": "policy"}, {"role": "user", "content": "question"}]
+    await litellm_client.acompletion(
+        "claude-sonnet-4-5", unmarked, custom_llm_provider="anthropic",
+        api_base="https://custom.example/v1",
+    )
+    assert seen[-1] is unmarked
+    await litellm_client.acompletion(
+        "gemini/gemini-2.5-flash-lite", unmarked, custom_llm_provider="gemini",
+    )
+    assert seen[-1] is unmarked  # Gemini implicit caching needs no extra cachedContents resource.
+
+
+def test_anthropic_cache_marker_reaches_native_system_blocks():
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    messages = litellm_client._anthropic_cached_messages(
+        "claude-sonnet-4-5",
+        [{"role": "system", "content": "Reusable policy " * 180}, {"role": "user", "content": "OK?"}],
+        "anthropic", None,
+    )
+    wire = AnthropicConfig().transform_request(
+        "claude-sonnet-4-5", messages, {"max_tokens": 16}, {}, {},
+    )
+    assert wire["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert wire["messages"] == [{"role": "user", "content": [{"type": "text", "text": "OK?"}]}]
 
 
 def test_perplexity_agent_omits_strict_for_open_object_schema():

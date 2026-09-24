@@ -8,10 +8,12 @@ import re
 from dataclasses import dataclass, field
 from uuid import NAMESPACE_URL, uuid5
 
-from lumen.models.chat_contracts import TextPart
-from lumen.services import ssrf, tools
-from lumen.services.agent_protocol import ToolBinding, ToolDefinition
-from lumen.services.agent_protocol import ToolExecutionResult as V2ToolExecutionResult
+from lumen_plugin_api.contracts import ExecutionContext
+from lumen_plugin_api.tools import ToolBinding, ToolFilePart, ToolTextPart
+from lumen_plugin_api.tools import ToolExecutionResult as V2ToolExecutionResult
+
+from lumen.models.chat_contracts import FilePart, TextPart
+from lumen.services import ssrf
 from lumen.services.tools import ToolContext
 
 
@@ -48,44 +50,44 @@ class ToolExecutionResult:
         self.status = status
 
 
-_MANAGED_ADVISOR_TOOL = "managed_advisor"
+def execution_context(ctx: ToolContext) -> ExecutionContext:
+    """Bridge authenticated run state, never model arguments, to the public plugin API."""
+    return ExecutionContext(
+        user_id=ctx.user_id,
+        project_id=ctx.project_id,
+        run_id=ctx.run_id,
+        call_id=ctx.tool_call_id,
+    )
 
 
-def v2_builtin_tool_bindings() -> dict[str, ToolBinding]:
-    """Return immutable v2 bindings for the read-only built-in tool registry.
+def native_tool_part(part: ToolTextPart | ToolFilePart) -> TextPart | FilePart:
+    """Explicit DTO conversion at the core wire boundary."""
+    if isinstance(part, ToolTextPart):
+        return TextPart(type="text", text=part.text)
+    if isinstance(part, ToolFilePart):
+        return FilePart(type="file", asset_id=part.asset_id, mime_type=part.mime_type, name=part.name, size_bytes=part.size_bytes)
+    raise ValueError("unsupported tool display part")
 
-    The v2 graph dispatches these bindings through ``agent_runtime_v2`` so JSON
-    schema validation runs before a handler receives model-supplied arguments.
-    """
 
+async def v2_builtin_tool_bindings(ctx: ToolContext) -> dict[str, ToolBinding]:
+    """Bind selected installed builtin exports, with no core handler registry."""
+    from lumen.plugins.registry import get_plugin
+    from lumen.plugins.tools_host import bind_default_tool
+
+    provider = get_plugin("tools", "default-tools")
+    public_context = execution_context(ctx)
     bindings: dict[str, ToolBinding] = {}
-    for tool in tools.TOOLS:
+    for export in provider.catalog():
+        if export.key not in {"list_my_conversations", "get_conversation_detail"}:
+            continue
+        bound = await bind_default_tool(export.key, public_context)
 
-        async def execute(arguments: dict[str, object], context: object, *, builtin=tool) -> V2ToolExecutionResult:
+        async def execute(arguments: dict[str, object], context: object, *, binding=bound) -> V2ToolExecutionResult:
             if not isinstance(context, ToolContext):
-                return V2ToolExecutionResult(
-                    status="failed",
-                    model_content="Tool execution context is invalid.",
-                    error_code="invalid_tool_context",
-                )
-            result = await builtin.handler(arguments, context)
-            model_content = str(result)[:8_192]
-            return V2ToolExecutionResult(
-                status="completed",
-                model_content=model_content,
-                display=[TextPart(type="text", text=model_content)] if model_content else [],
-            )
+                return V2ToolExecutionResult(status="failed", model_content="Tool execution context is invalid.", error_code="invalid_tool_context")
+            return await binding.execute(arguments, execution_context(context))
 
-        definition = ToolDefinition(
-            name=tool.name,
-            description=tool.description,
-            input_schema={**tool.parameters, "additionalProperties": False},
-            effect="read",
-            parallel_safe=True,
-            source="builtin",
-            activity_category="기본 도구",
-        )
-        bindings[definition.name] = ToolBinding(definition=definition, execute=execute)
+        bindings[bound.definition.name] = ToolBinding(definition=bound.definition, execute=execute)
     return bindings
 
 
@@ -96,23 +98,31 @@ def _v2_provider_name(prefix: str, identifier: int, name: object) -> str:
     return f"{prefix}__{identifier}__{normalized[:96]}_{digest}"[:128]
 
 
-def custom_tool_function_schema(
-    identifier: int, name: object, description: object, params_schema: object
-) -> dict[str, object]:
-    """Project one custom HTTP tool into the exact provider function schema.
+async def custom_tool_function_schema(tool_def: dict[str, object], ctx: ToolContext) -> dict[str, object]:
+    """Bind the scoped selected row; admission keeps only a secret-free projection."""
+    from lumen_plugin_api.contracts import Namespace, PluginError
 
-    Binding construction and read-only context preview share this projection so
-    a preview budget never counts a name or schema shape the provider request
-    does not carry.  Invalid schema material raises, matching the binding path
-    that excludes the tool instead of sending a malformed declaration.
-    """
+    from lumen.plugins.registry import get_registry
+    from lumen.plugins.tools_host import bind_default_tool
+    from lumen.services.extensions_store import selection_fingerprint
+
+    identifier = tool_def.get("id")
+    if not isinstance(identifier, int) or isinstance(identifier, bool) or identifier < 1:
+        raise ValueError("invalid custom tool identifier")
+    host = get_registry().host("default-tools")
+    if host.extensions is None:
+        raise PluginError("plugin_unavailable", "tool extension access is unavailable")
+    row = await host.extensions.resolve(
+        "tool", identifier, Namespace(user_id=ctx.user_id, project_id=ctx.project_id)
+    )
+    expected = tool_def.get("config_fingerprint")
+    if expected is not None and expected != selection_fingerprint(row):
+        raise PluginError("plugin_configuration_changed", "custom HTTP tool changed before preview")
+    definition = (await bind_default_tool("custom_http", execution_context(ctx), row)).definition
     return {
-        "name": _v2_provider_name("custom", identifier, name),
-        "description": str(description or name or "Custom HTTP tool"),
-        "parameters": {
-            **(params_schema or {"type": "object", "properties": {}}),
-            "additionalProperties": False,
-        },
+        "name": definition.name,
+        "description": definition.description,
+        "parameters": definition.input_schema,
     }
 
 
@@ -142,7 +152,7 @@ def _v2_result(value: str | ToolExecutionResult) -> V2ToolExecutionResult:
     return V2ToolExecutionResult(
         status=legacy.status,
         model_content=model_content,
-        display=[TextPart(type="text", text=model_content)] if legacy.visible and model_content else [],
+        display=[ToolTextPart(text=model_content)] if legacy.visible and model_content else [],
         usage_components={"components": list(legacy.usage)},
         error_code=legacy.warning_code,
     )

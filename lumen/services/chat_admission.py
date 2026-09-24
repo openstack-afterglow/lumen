@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException
+from lumen_plugin_api.contracts import PluginError
 
 from lumen.auth import Principal, ensure_scopes
 from lumen.config import get_settings
 from lumen.models.chat_contracts import (
+    AgentBudget,
     ChatFeatureOptions,
     UserInputPart,
     text_projection_from_user_input_parts,
 )
+from lumen.plugins import bindings as plugin_bindings
+from lumen.plugins import memory_host, skills_host
+from lumen.plugins.registry import get_registry
 from lumen.services import agent_store as ags
 from lumen.services import context_inspector as inspector
 from lumen.services import conversation_store as cs
@@ -34,6 +38,38 @@ _LOAD_POLICIES = ("preloaded", "on_demand")
 
 logger = logging.getLogger(__name__)
 
+
+def _plugin_http(exc: PluginError) -> HTTPException:
+    """503 when the required runtime is unavailable; 422 when the selection itself is invalid."""
+    status = 503 if exc.code in {"plugin_unavailable", "plugin_incompatible"} else 422
+    return HTTPException(status_code=status, detail=exc.code)
+
+
+def _resolve_plugin_ids(agent: dict | None, explicit_ids: list[str], *, kind: str, union: bool) -> list[str]:
+    """Skills union the agent and request; tools narrow the agent allowlist like HTTP tools."""
+    allowed = [item for item in (agent or {}).get(f"plugin_{kind}_ids", []) if isinstance(item, str)]
+    if union:
+        return list(dict.fromkeys([*allowed, *explicit_ids]))
+    if agent is None:
+        return list(explicit_ids)
+    if not explicit_ids:
+        return allowed
+    if not set(explicit_ids) <= set(allowed):
+        raise HTTPException(status_code=422, detail=f"selected plugin {kind} is outside the agent allowlist")
+    return list(explicit_ids)
+
+
+async def _freeze_plugin_bindings(ids: list[str], *, kind: str, user_id: str, project_id: str) -> list[dict]:
+    if not ids:
+        return []
+    try:
+        return await plugin_bindings.freeze_bindings(ids, kind=kind, user_id=user_id, project_id=project_id)
+    except PluginError as exc:
+        raise _plugin_http(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="plugin binding selection is invalid") from exc
+    except es.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 def _capability_gate(feature: str, resolved: dict) -> dict:
     """Normalize legacy overrides and canonical gates to one fail-closed shape."""
@@ -161,12 +197,18 @@ _CACHE_PRICE_KEYS = (
     "cache_read_price_per_token",
     "cache_write_price_per_token",
     "cache_write_1h_price_per_token",
+    "cache_read_price_per_token_above_200k",
+    "cache_write_price_per_token_above_200k",
+    "cache_write_1h_price_per_token_above_200k",
 )
 
 
-def _cache_price_snapshot(route: dict[str, Any]) -> dict[str, str | None]:
-    """Freeze the manual cache rates; ``None`` bills that cache category at 0."""
-    return {key: str(route[key]) if route.get(key) is not None else None for key in _CACHE_PRICE_KEYS}
+def _cache_price_snapshot(route: dict[str, Any]) -> dict[str, Any]:
+    """Freeze resolved direct-provider or manual cache prices and provenance."""
+    return {
+        **{key: str(route[key]) if route.get(key) is not None else None for key in _CACHE_PRICE_KEYS},
+        "cache_price_sources": route.get("cache_price_sources") or {},
+    }
 
 
 def _feature_route_snapshot(route: dict[str, Any], *, purpose: str) -> dict[str, Any]:
@@ -175,6 +217,11 @@ def _feature_route_snapshot(route: dict[str, Any], *, purpose: str) -> dict[str,
     snapshot = {field: route[field] for field in fields}
     if purpose in {"advisor", "summary"}:
         snapshot.update({"model_id": route["model_id"], "model_name": route["model_name"]})
+    if purpose == "advisor":
+        capabilities = route.get("capabilities")
+        snapshot["context_limit"] = route.get("context_limit") or (
+            capabilities.get("context_limit") if isinstance(capabilities, dict) else None
+        )
     if purpose == "summary":
         capabilities = route.get("capabilities")
         context_limit = route.get("context_limit")
@@ -245,11 +292,13 @@ def _run_snapshots(
         for price_key, route_key in (
             ("advisor_input_price_per_token", "input_price_per_token"),
             ("advisor_output_price_per_token", "output_price_per_token"),
-            # Manual cache rates only (no catalog fallback); an absent key bills
-            # that advisor cache category at 0 and marks the usage partial.
+            # Advisor prices use the same resolved manual or direct-provider rates.
             ("advisor_cache_read_price_per_token", "cache_read_price_per_token"),
             ("advisor_cache_write_price_per_token", "cache_write_price_per_token"),
             ("advisor_cache_write_1h_price_per_token", "cache_write_1h_price_per_token"),
+            ("advisor_cache_read_price_per_token_above_200k", "cache_read_price_per_token_above_200k"),
+            ("advisor_cache_write_price_per_token_above_200k", "cache_write_price_per_token_above_200k"),
+            ("advisor_cache_write_1h_price_per_token_above_200k", "cache_write_1h_price_per_token_above_200k"),
         ):
             if advisor_route.get(route_key) is not None:
                 component_prices[price_key] = str(advisor_route[route_key])
@@ -485,41 +534,51 @@ async def _resolve_agent(agent_id: int | None, user_id: str, project_id: str) ->
 
 
 async def _load_skill_snapshot(
-    agent: dict | None, payload_skill_ids: list[int], user_id: str, project_id: str
-) -> tuple[list[str], list[dict[str, int | str]]]:
-    """Resolve each active, authorized skill exactly once and freeze its content provenance."""
+    agent: dict | None,
+    payload_skill_ids: list[int],
+    plugin_skill_snapshots: list[dict],
+    user_id: str,
+    project_id: str,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Resolve each authorized skill exactly once through the selected provider and freeze it."""
     selected_ids: list[int] = []
     for item_id in [*(agent or {}).get("skill_ids", []), *payload_skill_ids]:
         if isinstance(item_id, int) and item_id not in selected_ids:
             selected_ids.append(item_id)
-    if not selected_ids:
+    if not selected_ids and not plugin_skill_snapshots:
         return [], []
     try:
-        items = await es.list_for_user("skill", user_id=user_id, project_id=project_id, active_only=True)
-    except es.ChatStorageUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    by_id = {item["id"]: item for item in items if isinstance(item.get("id"), int)}
-    selected: list[dict] = []
-    for item_id in selected_ids:
-        item = by_id.get(item_id)
-        if item is None or not isinstance(item.get("instructions"), str):
-            raise HTTPException(status_code=404, detail="selected skill is unavailable")
-        selected.append(item)
-    return (
-        [item["instructions"] for item in selected],
-        [
+        instructions, frozen = await skills_host.resolve_skills(
+            selected_ids, plugin_skill_snapshots, user_id=user_id, project_id=project_id
+        )
+    except PluginError as exc:
+        if exc.code == "plugin_authority_revoked":
+            raise HTTPException(status_code=404, detail="selected skill is unavailable") from exc
+        raise _plugin_http(exc) from exc
+    snapshot: list[dict[str, Any]] = []
+    for item in frozen:
+        public = item["snapshot"]
+        reference = public["reference"]
+        snapshot.append(
             {
-                "id": item["id"],
-                "name": str(item.get("name") or ""),
-                "content_hash": hashlib.sha256(item["instructions"].encode()).hexdigest(),
+                **item,
+                "id": reference.get("database_id") or reference.get("binding_id"),
+                "name": public.get("name") or (item.get("binding") or {}).get("binding", {}).get("name") or "",
+                "content_hash": public["content_digest"],
             }
-            for item in selected
-        ],
-    )
+        )
+    return instructions, snapshot
 
 
 async def _load_context(
-    conv: dict, user_id: str, project_id: str, *, include_memory: bool, include_account_memory: bool = True
+    conv: dict,
+    user_id: str,
+    project_id: str,
+    *,
+    include_memory: bool,
+    include_account_memory: bool = True,
+    memory_strategy: str = "recency",
+    memory_query: str = "",
 ) -> tuple[str | None, list[str]]:
     """Load workspace instructions and only the caller's visible memory scopes."""
     workspace_instr = None
@@ -529,12 +588,26 @@ async def _load_context(
         logger.warning("워크스페이스 지침 로드 실패", exc_info=True)
     if not include_memory:
         return workspace_instr, []
-    memories = await ms.active_contents_for_run(
-        user_id=user_id,
-        project_id=project_id,
-        workspace_id=conv.get("workspace_id"),
-        **({"include_account": False} if not include_account_memory else {}),
-    )
+    settings = get_settings()
+    semantic = memory_strategy == "semantic"
+    try:
+        memories = await memory_host.recall_for_run(
+            user_id=user_id,
+            project_id=project_id,
+            workspace_id=conv.get("workspace_id"),
+            include_account=include_account_memory,
+            strategy=memory_strategy,
+            query=memory_query if semantic else "",
+            limit=min(30, max(1, settings.chat_memory_candidate_limit)) if semantic else 30,
+            token_budget=max(0, settings.chat_memory_retrieval_token_budget) if semantic else 0,
+        )
+    except PluginError as exc:
+        if semantic and exc.code == "plugin_unavailable":
+            raise HTTPException(
+                status_code=422,
+                detail="requested chat capability is not available: memory (semantic_unavailable)",
+            ) from exc
+        raise _plugin_http(exc) from exc
     return workspace_instr, memories
 
 
@@ -579,6 +652,8 @@ def _require_native_admission_scopes(
     parts: list[UserInputPart],
     execution_mode: str,
     skill_ids: list[int],
+    plugin_tool_snapshots: list[dict],
+    plugin_skill_snapshots: list[dict],
     agent: dict | None,
     extension_selection: dict[str, list[dict[str, object]]],
 ) -> None:
@@ -592,8 +667,10 @@ def _require_native_admission_scopes(
     if features.memory:
         required.update(("native:memory:read", "native:memory:write"))
     agent_skill_ids = agent.get("skill_ids") if agent else None
-    if skill_ids or agent_skill_ids:
+    if skill_ids or agent_skill_ids or plugin_skill_snapshots:
         required.add("native:extensions:read")
+    if plugin_tool_snapshots:
+        required.update(("native:extensions:read", "native:tools:execute"))
     selected_extensions = extension_selection["tools"] or extension_selection["mcp"]
     if selected_extensions:
         required.update(("native:extensions:read", "native:tools:execute"))
@@ -615,6 +692,7 @@ def _require_context_read_scopes(
     *,
     skill_ids: list[int],
     agent: dict | None,
+    plugin_skill_snapshots: list[dict],
 ) -> None:
     """Check read-only context admission scopes without requiring execution or write grants."""
     if token_info["auth_type"] != "api_key":
@@ -625,7 +703,7 @@ def _require_context_read_scopes(
     if features.memory:
         required.add("native:memory:read")
     agent_skill_ids = agent.get("skill_ids") if agent else None
-    if skill_ids or agent_skill_ids:
+    if skill_ids or agent_skill_ids or plugin_skill_snapshots:
         required.add("native:extensions:read")
     if agent is not None:
         required.add("native:agents:use")
@@ -644,13 +722,16 @@ def _preloaded(item: dict[str, object]) -> bool:
 def _deferred(item: dict[str, object]) -> bool:
     return _bindable(item) and item.get("load_policy") == "on_demand"
 
+async def custom_tool_schema(item: dict[str, object], *, user_id: str, project_id: str) -> dict[str, Any] | None:
+    """Project one selected custom tool exactly as bindings would, or ``None`` when bindings would drop it."""
+    from lumen.services.tools import ToolContext
 
-def custom_tool_schema(item: dict[str, object]) -> dict[str, Any] | None:
-    """Project one selected custom tool exactly as bindings would, or ``None``."""
     try:
-        function = contracts.custom_tool_function_schema(
-            item["id"], item.get("name"), item.get("description"), item.get("params_schema")
-        )
+        function = await contracts.custom_tool_function_schema(item, ToolContext(project_id=project_id, user_id=user_id))
+    except PluginError as exc:
+        if exc.code in {"plugin_unavailable", "plugin_incompatible"}:
+            raise _plugin_http(exc) from exc
+        return None
     except (TypeError, ValueError):
         return None
     return {"type": "function", "function": function}
@@ -679,6 +760,10 @@ def _managed_tool_names(features: ChatFeatureOptions) -> list[str]:
 async def _preview_tool_schemas(
     features: ChatFeatureOptions,
     extension_selection: dict[str, list[dict[str, object]]],
+    *,
+    user_id: str,
+    project_id: str,
+    plugin_tool_snapshots: list[dict] | None = None,
 ) -> list[dict[str, Any]]:
     """Project exactly the schemas the first provider request will carry.
 
@@ -693,7 +778,7 @@ async def _preview_tool_schemas(
     from lumen.services import tools
     from lumen.services.tool_runtime import bindings
 
-    schemas = list(tools.tool_schemas())
+    schemas = list(await tools.tool_schemas())
     catalog = bindings._catalog_binding({}, include_managed=False).definition
     schemas.append(
         {
@@ -708,9 +793,22 @@ async def _preview_tool_schemas(
     for tool in extension_selection.get("tools", []):
         if not _preloaded(tool):
             continue
-        schema = custom_tool_schema(tool)
+        schema = await custom_tool_schema(tool, user_id=user_id, project_id=project_id)
         if schema is not None:
             schemas.append(schema)
+    for snapshot in plugin_tool_snapshots or []:
+        definition = snapshot.get("definition")
+        if isinstance(definition, dict):
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": definition["name"],
+                        "description": definition["description"],
+                        "parameters": definition["input_schema"],
+                    },
+                }
+            )
     return schemas
 
 
@@ -813,6 +911,81 @@ def _context_plan(
     )
 
 
+async def _project_agent_quota(project_id: str) -> dict[str, Any]:
+    """Read the project's finite agent caps; a missing row means delegation/code are disabled."""
+    from sqlalchemy import select
+
+    from lumen.db import get_session_factory, is_db_available
+    from lumen.models.chat_infrastructure import ChatProjectAgentQuota
+
+    factory = get_session_factory()
+    if factory is None or not is_db_available():
+        raise HTTPException(status_code=503, detail="chat storage is unavailable")
+    async with factory() as session:
+        row = (
+            await session.execute(select(ChatProjectAgentQuota).where(ChatProjectAgentQuota.project_id == project_id))
+        ).scalar_one_or_none()
+    defaults = get_settings().runtime_config.project_quota_defaults
+    if row is None:
+        return {
+            "max_active_children": defaults.max_active_children,
+            "max_active_sandboxes": defaults.max_active_sandboxes,
+            "max_sandbox_seconds": defaults.max_sandbox_seconds,
+            "max_credit_reservation": Decimal(defaults.max_credit_reservation),
+        }
+    return {
+        "max_active_children": int(row.max_active_children),
+        "max_active_sandboxes": int(row.max_active_sandboxes),
+        "max_sandbox_seconds": int(row.max_sandbox_seconds),
+        "max_credit_reservation": Decimal(str(row.max_credit_reservation)),
+    }
+
+
+def _agent_runtime_prerequisites(execution_mode: str) -> None:
+    """`plan`/`code` need protocol v2 + checkpointer; `code` additionally needs an enabled sandbox pool."""
+    from lumen.services.checkpointer import chat_checkpointer
+
+    settings = get_settings()
+    if settings.chat_execution_protocol_version != 2 or not chat_checkpointer.available:
+        raise HTTPException(
+            status_code=422, detail="requested chat execution mode is not available (protocol_v2_required)"
+        )
+    runtime = settings.runtime_config
+    if execution_mode == "code" and not (
+        runtime.enabled and any(pool.enabled and pool.role == "sandbox" for pool in runtime.pools)
+    ):
+        raise HTTPException(status_code=422, detail="requested chat execution mode is not available (sandbox_unavailable)")
+
+
+async def _validate_agent_budget(
+    agent_budget: AgentBudget | None, *, execution_mode: str, project_id: str, agent: dict | None
+) -> dict[str, Any] | None:
+    """Budgets are explicit, positive and inside the project caps; NULL never means unlimited."""
+    delegation_capable = bool(agent and (agent.get("execution_policy") or {}).get("can_delegate_read"))
+    delegation_capable = delegation_capable or bool(
+        agent and (agent.get("execution_policy") or {}).get("can_delegate_write")
+    )
+    if agent_budget is None:
+        if execution_mode != "chat":
+            raise HTTPException(status_code=422, detail="agent_budget is required for plan and code modes")
+        return None
+    caps = await _project_agent_quota(project_id)
+    credit = Decimal(agent_budget.credit_ceiling)
+    if caps["max_credit_reservation"] <= 0 or caps["max_sandbox_seconds"] <= 0:
+        raise HTTPException(status_code=422, detail="agent execution is disabled for this project (delegation_disabled)")
+    if credit > caps["max_credit_reservation"] or agent_budget.sandbox_seconds_ceiling > caps["max_sandbox_seconds"]:
+        raise HTTPException(status_code=422, detail="agent_budget exceeds the project caps")
+    if execution_mode == "chat" and not delegation_capable:
+        # A budget without any delegation- or sandbox-capable path is not an error, but it
+        # must not be silently interpreted as enabling either.
+        pass
+    return {
+        "credit_ceiling": format(credit, "f"),
+        "sandbox_seconds_ceiling": agent_budget.sandbox_seconds_ceiling,
+        "wall_time_seconds": agent_budget.wall_time_seconds,
+    }
+
+
 async def prepare_context_input(
     *,
     user_id: str,
@@ -825,6 +998,9 @@ async def prepare_context_input(
     features: ChatFeatureOptions,
     agent_id: int | None = None,
     skill_ids: list[int] | None = None,
+    plugin_tool_ids: list[str] | None = None,
+    plugin_skill_ids: list[str] | None = None,
+    agent_budget: AgentBudget | None = None,
     execution_mode: str = "chat",
     reasoning_effort: str = "auto",
     code_workspace_id: str | None = None,
@@ -838,6 +1014,8 @@ async def prepare_context_input(
     from lumen.services import context_store
 
     skill_ids = skill_ids or []
+    plugin_tool_ids = plugin_tool_ids or []
+    plugin_skill_ids = plugin_skill_ids or []
     parts = parts or []
     if temp_thread_id is not None:
         if agent_id is not None or code_workspace_id is not None:
@@ -845,7 +1023,7 @@ async def prepare_context_input(
         if execution_mode != "chat":
             raise HTTPException(status_code=422, detail="requested chat execution mode is not available")
     if execution_mode != "chat":
-        raise HTTPException(status_code=422, detail="requested chat execution mode is not available")
+        _agent_runtime_prerequisites(execution_mode)
 
     conv = None
     if conversation_id is not None:
@@ -886,11 +1064,34 @@ async def prepare_context_input(
             raise HTTPException(status_code=422, detail="context source is invalid") from exc
 
     agent = await _resolve_agent(agent_id, user_id, project_id)
+    frozen_budget = (
+        None
+        if is_preview or is_context_operation
+        else await _validate_agent_budget(agent_budget, execution_mode=execution_mode, project_id=project_id, agent=agent)
+    )
     resolved = await _resolve_model(model_id)
     extension_selection = await _resolve_extension_selection(agent, features, user_id=user_id, project_id=project_id)
+    selected_plugin_tool_ids = (
+        []
+        if features.tool_policy.mode == "none"
+        else _resolve_plugin_ids(agent, plugin_tool_ids, kind="tool", union=False)
+    )
+    selected_plugin_skill_ids = _resolve_plugin_ids(agent, plugin_skill_ids, kind="skill", union=True)
+    plugin_tool_snapshots = await _freeze_plugin_bindings(
+        selected_plugin_tool_ids, kind="tool", user_id=user_id, project_id=project_id
+    )
+    plugin_skill_snapshots = await _freeze_plugin_bindings(
+        selected_plugin_skill_ids, kind="skill", user_id=user_id, project_id=project_id
+    )
     if token_info is not None:
         if is_preview or is_context_operation:
-            _require_context_read_scopes(token_info, features, skill_ids=skill_ids, agent=agent)
+            _require_context_read_scopes(
+                token_info,
+                features,
+                skill_ids=skill_ids,
+                agent=agent,
+                plugin_skill_snapshots=plugin_skill_snapshots,
+            )
         else:
             _require_native_admission_scopes(
                 token_info,
@@ -900,6 +1101,8 @@ async def prepare_context_input(
                 skill_ids=skill_ids,
                 agent=agent,
                 extension_selection=extension_selection,
+                plugin_tool_snapshots=plugin_tool_snapshots,
+                plugin_skill_snapshots=plugin_skill_snapshots,
             )
 
     feature_routes = await _resolve_feature_routes(features)
@@ -907,7 +1110,9 @@ async def prepare_context_input(
     validated_reasoning_effort = _validated_reasoning_effort(reasoning_effort, resolved)
     _validate_tool_reasoning_compatibility(validated_reasoning_effort, resolved, features)
 
-    skill_instructions, skill_snapshot = await _load_skill_snapshot(agent, skill_ids, user_id, project_id)
+    skill_instructions, skill_snapshot = await _load_skill_snapshot(
+        agent, skill_ids, plugin_skill_snapshots, user_id, project_id
+    )
     draft_text = text_projection_from_user_input_parts(parts) if parts and append_draft else ""
     base_messages = _model_input(source.get("messages", []), extra_user=draft_text if draft_text else None)
 
@@ -921,6 +1126,8 @@ async def prepare_context_input(
                 project_id,
                 include_memory=include_memory,
                 include_account_memory=include_account,
+                memory_strategy=features.memory_retrieval,
+                memory_query=draft_text,
             )
             if conv is not None
             else (None, [])
@@ -946,8 +1153,16 @@ async def prepare_context_input(
         summary_route=summary_route,
     )
     capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
+    if plugin_tool_snapshots or plugin_skill_snapshots:
+        capability_snapshot["required_plugin_digest"] = get_registry().digest
 
-    tool_schemas = await _preview_tool_schemas(features, extension_selection)
+    tool_schemas = await _preview_tool_schemas(
+        features,
+        extension_selection,
+        user_id=user_id,
+        project_id=project_id,
+        plugin_tool_snapshots=plugin_tool_snapshots,
+    )
     context_plan = _context_plan(
         features,
         extension_selection,
@@ -976,8 +1191,10 @@ async def prepare_context_input(
         "feature_routes": feature_routes,
         "extension_selection": extension_selection,
         "skill_snapshot": skill_snapshot,
+        "plugin_tool_snapshots": plugin_tool_snapshots,
         "tool_schemas": tool_schemas,
         "context_plan": context_plan,
         "workspace_instr": workspace_instr,
         "memories": memories,
+        "agent_budget": frozen_budget,
     }

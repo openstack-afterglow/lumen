@@ -26,6 +26,7 @@ from typing import Any, TypedDict
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
+from lumen_plugin_api.tools import CodePart, ToolBinding
 
 from lumen.services import agent_runtime_v2, litellm_client, native_compaction
 from lumen.services.checkpointer import chat_checkpointer
@@ -43,6 +44,7 @@ _REASONING_UNSUPPORTED: set[str] = set()
 # OpenAI Chat Completions models that require the explicit `none` value when tools are sent.
 _TOOL_REASONING_EXPLICIT_NONE: set[str] = set()
 _MAX_INTERNAL_TOOL_CALL_ID = 190
+_DELEGATE_TOOL_NAME = "delegate_agent"
 
 
 def _requires_explicit_none_for_tools(
@@ -92,6 +94,10 @@ class ChatState(TypedDict, total=False):
     # round so the compacted prefix is never re-sent.
     compaction_blocks: list[dict]
     model_failed: bool
+    # Delegation wait group of the current model response (plan Step 6).
+    pending_delegations: list[dict]
+    child_wait_group_id: str | None
+    joined_child_results: list[dict]
 
 
 def _delta(chunk) -> Any:
@@ -484,6 +490,45 @@ def _v2_tool_call_id(tool_call: dict) -> str:
         raise RuntimeError("v2 tool call ID is invalid") from exc
 
 
+
+def _delegate_binding() -> ToolBinding:
+    """Server-only ``delegate_agent`` binding; the durable executor, not this callable, spawns children."""
+    from lumen_plugin_api.tools import ToolDefinition, ToolExecutionResult
+
+    from lumen.services.durable_runs import children as child_runs
+
+    definition = ToolDefinition(
+        name=child_runs.DELEGATE_TOOL_NAME,
+        description=(
+            "Delegate one bounded task to an approved child agent. The child runs in its own sandbox with "
+            "an explicit credit and runtime budget and returns a typed result when it finishes."
+        ),
+        input_schema=child_runs.delegate_tool_schema(),
+        effect="read",
+        parallel_safe=False,
+        source="agent",
+        activity_category="에이전트 위임",
+    )
+
+    async def execute(_arguments: dict, _context: object) -> ToolExecutionResult:
+        return ToolExecutionResult(
+            status="failed",
+            model_content="Delegation is dispatched by the durable executor, not as a direct tool call.",
+            error_code="delegation_not_dispatchable",
+        )
+
+    def classify(arguments: dict) -> str:
+        return "process" if arguments.get("access") == "write" else "read"
+
+    return ToolBinding(definition=definition, execute=execute, classify_effect=classify)
+
+
+def _validated_resume(resume: object, expected_kind: str) -> dict[str, Any]:
+    """Resume payloads are discriminated: approvals and child joins never share a shape."""
+    if not isinstance(resume, dict) or resume.get("kind") != expected_kind:
+        raise RuntimeError(f"v2 resume payload is not a {expected_kind} payload")
+    return resume
+
 def _build_graph(params: dict, ctx: ToolContext):
     """Execute one provider call or tool batch per resumable LangGraph node."""
     hooks = params.get("execution_hooks")
@@ -558,6 +603,9 @@ def _build_graph(params: dict, ctx: ToolContext):
             if not isinstance(prepared_messages, list) or not all(isinstance(item, dict) for item in prepared_messages):
                 raise RuntimeError("context preparation returned invalid messages")
             messages = prepared_messages
+        # A prior tool turn, approval or restart may have revoked a frozen skill.
+        # Do not send its instructions to another model call before rechecking.
+        await boundary("revalidate_skills")
 
         reasoning_effort = None if params["model"] in _REASONING_UNSUPPORTED else params.get("reasoning_effort")
         disable_reasoning_for_tools = bool(schemas) and (
@@ -569,7 +617,11 @@ def _build_graph(params: dict, ctx: ToolContext):
         async def open_stream(effort, *, disable_reasoning: bool = False):
             nonlocal attempt
             attempt += 1
-            replay_payload = await boundary("provider_started", round_index=round_index, attempt=attempt)
+            replay_payload = await boundary(
+                "provider_started", round_index=round_index, attempt=attempt,
+                **({"messages": messages, "tool_schemas": schemas, "max_tokens": params.get("max_tokens")}
+                   if getattr(hooks, "requires_credit_reservation", False) else {}),
+            )
             if _abort_code(replay_payload) is not None:
                 raise _BoundaryAbort(_abort_code(replay_payload))
             if isinstance(replay_payload, dict):
@@ -740,6 +792,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                 require_unique_provider_ids=isinstance(v2_bindings, dict),
             )
             round_usage = _usage_breakdown(final_usage)
+            usage_observed = round_usage is not None
             if round_usage is None:
                 # The token-counter fallback has no provider cache report to split.
                 tool_payload = json.dumps(tool_calls, ensure_ascii=False, sort_keys=True) if tool_calls else ""
@@ -751,7 +804,8 @@ def _build_graph(params: dict, ctx: ToolContext):
                 "provider_completed",
                 round_index=round_index,
                 attempt=attempt,
-                usage=round_usage.as_usage_dict(),
+                usage={**round_usage.as_usage_dict(), **({"_durable_estimated": True}
+                    if getattr(hooks, "requires_credit_reservation", False) and not usage_observed else {})},
                 result_payload={
                     "text": response_text,
                     "reasoning": "".join(reasoning_parts),
@@ -914,12 +968,16 @@ def _build_graph(params: dict, ctx: ToolContext):
                 )
             return payload
 
-        decisions = interrupt(
-            {
-                "kind": "tool_approval",
-                "calls": [approval_call(item) for item in gated],
-            }
+        resume_payload = _validated_resume(
+            interrupt(
+                {
+                    "kind": "tool_approval",
+                    "calls": [approval_call(item) for item in gated],
+                }
+            ),
+            "tool_approval",
         )
+        decisions = resume_payload.get("decisions")
         if not isinstance(decisions, list):
             raise RuntimeError("v2 approval resume payload is invalid")
         for item in gated:
@@ -981,7 +1039,20 @@ def _build_graph(params: dict, ctx: ToolContext):
         denied_tool_calls = state.get("denied_tool_calls", [])
         effect_denied_tool_calls = state.get("effect_denied_tool_calls", [])
         policy_limited_tool_calls = state.get("policy_limited_tool_calls", [])
-        tool_calls = [*denied_tool_calls, *effect_denied_tool_calls, *policy_limited_tool_calls, *approved_tool_calls]
+        delegation_enabled = bool(params.get("delegation_enabled"))
+        delegation_calls = [
+            tool_call
+            for tool_call in approved_tool_calls
+            if delegation_enabled and tool_call.get("name") == _DELEGATE_TOOL_NAME
+        ]
+        approved_tool_calls = [tool_call for tool_call in approved_tool_calls if tool_call not in delegation_calls]
+        tool_calls = [
+            *denied_tool_calls,
+            *effect_denied_tool_calls,
+            *policy_limited_tool_calls,
+            *approved_tool_calls,
+            *delegation_calls,
+        ]
         v2_bindings = params.get("v2_bindings")
 
         def call_id_for(tool_call: dict) -> str:
@@ -1170,7 +1241,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                         "result": execution_result.model_content,
                         "visible": bool(execution_result.display or execution_result.artifacts),
                         "execution_usage": components if isinstance(components, list) else [],
-                        "display": [part.model_dump(mode="json") for part in execution_result.display],
+                        "display": [_native_display_part(part) for part in execution_result.display],
                         "artifacts": [artifact.model_dump(mode="json") for artifact in execution_result.artifacts],
                         "warning_code": execution_result.error_code,
                         "result_status": execution_result.status,
@@ -1316,9 +1387,157 @@ def _build_graph(params: dict, ctx: ToolContext):
             "denied_tool_calls": [],
             "effect_denied_tool_calls": [],
             "policy_limited_tool_calls": [],
+            "pending_delegations": delegation_calls,
             "loop_count": state.get("loop_count", 0) + 1,
             "citations": list(citations_by_url.values()),
             "tool_usage": tool_usage,
+        }
+
+    async def await_children(state: ChatState) -> dict:
+        """Persist children first, park on a checkpoint-compatible interrupt, then join exactly once."""
+        from lumen.services.durable_runs import children as child_runs
+
+        pending = state.get("pending_delegations") or []
+        if not pending:
+            return {"pending_delegations": [], "child_wait_group_id": None}
+        writer = get_stream_writer()
+        messages = list(state["messages"])
+        # execute_tools already advanced loop_count for this round.
+        round_index = int(state.get("loop_count", 1)) - 1
+        journals_tool_events = bool(getattr(hooks, "journals_tool_events", False))
+        tool_messages: list[dict[str, str]] = []
+        parsed: list[tuple[dict, child_runs.DelegationCall | None, str | None]] = []
+        for tool_call in pending:
+            call_id = _v2_tool_call_id(tool_call)
+            try:
+                arguments = json.loads(tool_call.get("args") or "{}")
+                if not isinstance(arguments, dict):
+                    raise ValueError("tool arguments must be an object")
+                parsed.append((tool_call, child_runs.parse_delegation_call(call_id, arguments), None))
+            except (json.JSONDecodeError, TypeError, ValueError, child_runs.ChildFailure) as exc:
+                parsed.append((tool_call, None, getattr(exc, "code", "invalid_tool_arguments")))
+        for tool_index, (tool_call, _call, _error) in enumerate(parsed):
+            replay_payload = await boundary(
+                "tool_started",
+                round_index=round_index,
+                tool_index=900 + tool_index,
+                tool_call_id=_v2_tool_call_id(tool_call),
+                tool_name=tool_call["name"],
+                arguments=json.loads(tool_call.get("args") or "{}") if _call is not None else {},
+                source="agent",
+                category="에이전트 위임",
+            )
+            if _abort_code(replay_payload) is not None:
+                raise _BoundaryAbort(_abort_code(replay_payload))
+            tool_event = {
+                "type": "tool_call",
+                "tool_call_id": _v2_tool_call_id(tool_call),
+                "name": tool_call["name"],
+                "args": tool_call.get("args") or "{}",
+            }
+            if journals_tool_events:
+                tool_event["_durable_journaled"] = True
+            writer(tool_event)
+        calls = [call for _tool_call, call, _error in parsed if call is not None]
+        results_by_call: dict[str, dict[str, Any]] = {}
+        group_id: str | None = None
+        if calls:
+            segment_id = f"delegation:{round_index}"
+            try:
+                group = await boundary("delegations_prepared", segment_id=segment_id, calls=calls)
+            except child_runs.ChildFailure as exc:
+                # The whole group is refused before any child exists; every call fails identically.
+                for call in calls:
+                    results_by_call[call.call_id] = child_runs.child_result_payload(
+                        status="failed", error_code=exc.code, summary=str(exc), artifacts=[]
+                    )
+            else:
+                if not isinstance(group, dict) or not group.get("children"):
+                    raise RuntimeError("delegation group preparation returned no children")
+                group_id = str(group["wait_group_id"])
+                joined = _validated_resume(
+                    interrupt(
+                        {
+                            "kind": "children",
+                            "wait_group_id": group_id,
+                            "child_run_ids": [child["child_run_id"] for child in group["children"]],
+                        }
+                    ),
+                    "children",
+                )
+                if joined.get("wait_group_id") != group_id or not isinstance(joined.get("results"), list):
+                    raise RuntimeError("v2 children resume payload does not match the wait group")
+                for result in joined["results"]:
+                    if isinstance(result, dict) and isinstance(result.get("call_id"), str):
+                        results_by_call[result["call_id"]] = result
+        for tool_index, (tool_call, call, error) in enumerate(parsed):
+            tool_call_id = _v2_tool_call_id(tool_call)
+            if call is None:
+                result = child_runs.child_result_payload(
+                    status="failed", error_code=error or "invalid_tool_arguments", summary="", artifacts=[]
+                )
+            else:
+                result = results_by_call.get(call.call_id) or child_runs.child_result_payload(
+                    status="failed", error_code="child_result_missing", summary="", artifacts=[]
+                )
+            status = "completed" if result.get("status") == "completed" else "failed"
+            content = json.dumps(
+                {
+                    "status": result.get("status"),
+                    "error_code": result.get("error_code"),
+                    "result": result.get("summary", ""),
+                    "artifacts": [item.get("asset_id") for item in result.get("artifacts", []) if isinstance(item, dict)],
+                },
+                ensure_ascii=False,
+            )
+            display = [{"type": "text", "text": result.get("summary") or f"child {result.get('status')}"}]
+            await boundary(
+                "tool_completed",
+                round_index=round_index,
+                tool_index=900 + tool_index,
+                tool_call_id=tool_call_id,
+                tool_name=tool_call["name"],
+                source="agent",
+                category="에이전트 위임",
+                result_payload={
+                    "content": content,
+                    "tool_name": tool_call["name"],
+                    "usage": [],
+                    "visible": True,
+                    "display": display,
+                    "artifacts": result.get("artifacts", []),
+                    "warning_code": result.get("error_code"),
+                    "status": status,
+                    "error_code": result.get("error_code"),
+                },
+            )
+            tool_result_event = {
+                "type": "tool_result",
+                "tool_call_id": tool_call_id,
+                "name": tool_call["name"],
+                "content": content,
+                "hidden": False,
+                "status": status,
+                "display": display,
+                "artifacts": result.get("artifacts", []),
+                "error_code": result.get("error_code"),
+            }
+            if journals_tool_events:
+                tool_result_event["_durable_journaled"] = True
+            writer(tool_result_event)
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": _provider_tool_call_id(tool_call),
+                    "name": tool_call["name"],
+                    "content": content,
+                }
+            )
+        return {
+            "messages": messages + tool_messages,
+            "pending_delegations": [],
+            "child_wait_group_id": group_id,
+            "joined_child_results": [*state.get("joined_child_results", []), *results_by_call.values()],
         }
 
     async def finalize(state: ChatState) -> dict:
@@ -1348,6 +1567,7 @@ def _build_graph(params: dict, ctx: ToolContext):
     builder.add_node("await_input", await_input)
     builder.add_node("route_tools", route_tools)
     builder.add_node("execute_tools", execute_tools)
+    builder.add_node("await_children", await_children)
     builder.add_node("finalize", finalize)
     builder.add_edge(START, "call_model")
     builder.add_edge("call_model", "classify_tool_calls")
@@ -1355,9 +1575,39 @@ def _build_graph(params: dict, ctx: ToolContext):
     builder.add_edge("preview_tool_calls", "await_input")
     builder.add_edge("await_input", "route_tools")
     builder.add_conditional_edges("route_tools", next_step, {"execute_tools": "execute_tools", "finalize": "finalize"})
-    builder.add_edge("execute_tools", "call_model")
+    builder.add_edge("execute_tools", "await_children")
+    builder.add_edge("await_children", "call_model")
     builder.add_edge("finalize", END)
     return builder.compile(checkpointer=chat_checkpointer.saver)
+
+
+def _native_display_part(part: object) -> dict[str, Any]:
+    """Convert public plugin display DTOs to the canonical wire part at the core boundary."""
+    if isinstance(part, CodePart):
+        language = part.language or ""
+        return {"type": "text", "text": f"```{language}\n{part.code}\n```"}
+    return contracts.native_tool_part(part).model_dump(mode="json")
+
+
+async def pending_interrupt(run_id: str) -> dict[str, Any] | None:
+    """Return the checkpointed interrupt a resumed run must answer, with its checkpoint id.
+
+    The durable executor uses this to choose a typed resume payload (approval decisions or
+    joined child results) instead of guessing from unrelated ledger rows.
+    """
+    if not chat_checkpointer.available:
+        return None
+    compiled = StateGraph(ChatState).add_node("noop", lambda state: state).set_entry_point("noop").compile(
+        checkpointer=chat_checkpointer.saver
+    )
+    snapshot = await compiled.aget_state({"configurable": {"thread_id": run_id}})
+    checkpoint_id = (snapshot.config or {}).get("configurable", {}).get("checkpoint_id") if snapshot else None
+    for task in getattr(snapshot, "tasks", ()) or ():
+        for item in getattr(task, "interrupts", ()) or ():
+            value = getattr(item, "value", None)
+            if isinstance(value, dict) and value.get("kind") in {"tool_approval", "children"}:
+                return {**value, "checkpoint_id": checkpoint_id}
+    return None
 
 
 async def stream(
@@ -1394,7 +1644,10 @@ async def stream(
     lumen_snapshot: dict[str, object] | None = None,
     lumen_snapshot_frozen: bool = False,
     native_compaction_options: dict[str, Any] | None = None,
-    resume: list[dict[str, str]] | None = None,
+    resume: dict[str, Any] | None = None,
+    delegation_enabled: bool = False,
+    sandbox_lease: tuple[str, int] | None = None,
+    plugin_tool_snapshots: tuple[dict[str, Any], ...] = (),
 ) -> AsyncIterator[dict]:
     """Stream chat events while awaiting durable execution-boundary hooks."""
     params = {
@@ -1416,6 +1669,7 @@ async def stream(
         "max_tool_calls": max_tool_calls,
         "allowed_direct_effects": frozenset(allowed_direct_effects) if allowed_direct_effects is not None else None,
         "native_web_search": native_web_search,
+        "delegation_enabled": delegation_enabled,
     }
     ctx = ToolContext(
         project_id=project_id,
@@ -1433,6 +1687,7 @@ async def stream(
         managed_fetch=managed_fetch,
         managed_advisor=managed_advisor,
         binding_session=contracts.ToolBindingSession(),
+        plugin_tool_snapshots=tuple(plugin_tool_snapshots),
     )
     if execution_protocol_version == 2:
         initial_bindings = await bindings.v2_tool_bindings(ctx)
@@ -1446,6 +1701,16 @@ async def stream(
                 params["v2_bindings"],
                 include_managed=True,
             )
+        if delegation_enabled:
+            delegate = _delegate_binding()
+            params["v2_bindings"][delegate.definition.name] = delegate
+        if sandbox_lease is not None and "process" in (params["allowed_direct_effects"] or frozenset()):
+            # Only runs with an assigned ready sandbox AND process authority expose run_code;
+            # read-only children keep their sandbox allocation but never this binding.
+            from lumen.services import sandbox_binding
+
+            run_code = sandbox_binding.run_code_binding(ctx, lease_owner=sandbox_lease[0], fence=sandbox_lease[1])
+            params["v2_bindings"][run_code.definition.name] = run_code
     graph = _build_graph(params, ctx)
     config = {"configurable": {"thread_id": run_id}} if run_id else None
     graph_input: dict[str, list[dict]] | Command = (
@@ -1460,5 +1725,5 @@ async def stream(
             continue
         for interrupt_item in interrupts:
             payload = getattr(interrupt_item, "value", None)
-            if isinstance(payload, dict) and payload.get("kind") == "tool_approval":
+            if isinstance(payload, dict) and payload.get("kind") in {"tool_approval", "children"}:
                 yield {"type": "input.interrupted", "payload": payload}

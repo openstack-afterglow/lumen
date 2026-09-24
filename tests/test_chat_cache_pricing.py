@@ -1,17 +1,11 @@
-"""Prompt-cache pricing and the Anthropic organization-report shaped ledger.
+"""Prompt-cache billing across direct provider and configured custom routes.
 
-User policy under test:
-- cache rates live on the per-model price record and are optional;
-- an unset cache rate bills that category at 0 USD and marks the usage
-  ``partial``; there is no catalog fallback for cache rates;
-- the ledger splits input into uncached / cache read / cache creation 5m /
-  cache creation 1h while ``prompt_tokens`` stays total input.
+Provider token counts are authoritative; exact bundled cache prices fill only
+unset direct-provider categories. Durable runs freeze their admission prices.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 from decimal import Decimal
 from types import SimpleNamespace
@@ -20,11 +14,13 @@ import litellm
 import pytest
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
 
+from lumen.api.compat import openai as openai_api
 from lumen.api.models import ModelCreateRequest, ModelResponse, ModelUpdateRequest
 from lumen.models.chat_contracts import UsageComponent, UsageUpdatedPayload
 from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider
 from lumen.scripts.migrate import MIGRATIONS, _sha256, _statements, load_manifest
 from lumen.services import advisor, completion_api, credit, graph, litellm_client
+from lumen.services import stats as stats_service
 from lumen.services.chat_admission import _run_snapshots
 from lumen.services.durable_runs import execution
 from lumen.services.providers import billing, pricing, repository, routing
@@ -385,20 +381,6 @@ class TestCacheRates:
         )
         assert cost.pricing_status == "priced"
 
-    def test_catalog_fallback_never_prices_cache(self, monkeypatch):
-        monkeypatch.setattr(litellm_client, "_litellm_component_rates", lambda *_args: (_INPUT, _OUTPUT))
-        cost = litellm_client.cost_from_usage(
-            _MODEL,
-            1000,
-            100,
-            input_price_per_token=None,
-            output_price_per_token=None,
-            price_source=None,
-            breakdown=self._BREAKDOWN,
-        )
-        assert cost.pricing_snapshot["input"]["source"] == "litellm"
-        assert cost.cache_read_cost == Decimal("0")
-        assert cost.pricing_status == "partial"
 
     def test_breakdown_totals_must_match(self):
         with pytest.raises(ValueError):
@@ -586,38 +568,6 @@ class TestConfigFingerprint:
             lambda model, _provider: (model.input_price, model.output_price, "manual", "v1"),
         )
 
-    def test_hash_is_byte_identical_without_cache_rates(self):
-        model, provider = self._rows()
-        resolved = routing._resolved_model(model, provider)
-
-        # The fingerprint exactly as it was before cache rates existed.
-        legacy_fingerprint = {
-            "provider_id": 1,
-            "model_id": 10,
-            "provider_name": "anthropic-prod",
-            "provider_type": "anthropic",
-            "provider_active": True,
-            "api_base": None,
-            "model_name": _MODEL,
-            "model_active": True,
-            "margin_multiplier": "1.2",
-            "input_price_per_token": "0.0000030000",
-            "output_price_per_token": "0.0000150000",
-            "price_source": "manual",
-            "price_version": "v1",
-            "price_metadata": None,
-            "capabilities": {},
-            "api_key": "key-1",
-        }
-        expected = hmac.new(
-            b"test-routing-key",
-            json.dumps(legacy_fingerprint, ensure_ascii=False, sort_keys=True, default=str).encode(),
-            hashlib.sha256,
-        ).hexdigest()
-        assert resolved["config_version_hash"] == expected
-        assert resolved["cache_read_price_per_token"] is None
-        assert resolved["cache_write_price_per_token"] is None
-        assert resolved["cache_write_1h_price_per_token"] is None
 
     def test_setting_any_cache_rate_changes_the_hash(self):
         baseline = routing._resolved_model(*self._rows())["config_version_hash"]
@@ -638,6 +588,188 @@ class TestConfigFingerprint:
         assert Decimal(pricing_snapshot["cache_write_price_per_token"]) == Decimal("0.00000375")
         assert pricing_snapshot["cache_write_1h_price_per_token"] is None
         assert Decimal(pricing_snapshot["summary_route"]["cache_write_1h_price_per_token"]) == Decimal("0.000006")
+
+
+    async def test_direct_gemini_cache_hit_uses_frozen_catalog_rate_and_ledger(self):
+        model, provider = self._rows()
+        model.model_name = "gemini/gemini-2.5-flash-lite"
+        model.input_price = Decimal("0.0000001000")
+        model.output_price = Decimal("0.0000004000")
+        provider.provider_type = "gemini"
+        resolved = routing._resolved_model(model, provider)
+        assert resolved["cache_read_price_per_token"] == Decimal("0.0000000100")
+        assert resolved["cache_price_sources"]["cache_read"] == "litellm"
+
+        _, snapshot = _run_snapshots(resolved, {})
+        observed = UsageBreakdown.from_runtime(litellm.Usage(
+            prompt_tokens=2806, completion_tokens=2,
+            prompt_tokens_details={"cached_tokens": 2038},
+        ))
+        direct = litellm_client.cost_from_usage(
+            model.model_name, observed.input_tokens, observed.output_tokens,
+            input_price_per_token=resolved["input_price_per_token"],
+            output_price_per_token=resolved["output_price_per_token"],
+            price_source=resolved["price_source"], provider_type=resolved["provider_type"],
+            breakdown=observed, cache_read_price_per_token=resolved["cache_read_price_per_token"],
+            cache_price_sources=resolved["cache_price_sources"],
+        )
+        frozen = credit.usage_cost_from_pricing_snapshot(
+            snapshot, prompt_tokens=2806, completion_tokens=2, breakdown=observed,
+        )
+        row = await _ledger_row(frozen, observed)
+        assert direct.raw_cost == frozen.raw_cost == row.raw_cost == Decimal("0.0000979800")
+        assert direct.pricing_status == frozen.pricing_status == "priced"
+        assert row.cache_read_input_tokens == 2038
+        assert direct.pricing_snapshot["cache_read"]["source"] == "litellm"
+        assert frozen.pricing_snapshot["token_components"]["cache_read"]["source"] == "litellm"
+        admin = stats_service._cache_price_projection(row.pricing_snapshot)
+        assert admin["cache_costs_usd"]["cache_read"] == "0.0000203800"
+        assert admin["cache_price_sources"]["cache_read"] == "litellm"
+
+    @pytest.mark.parametrize("provider_type,model_name", [
+        ("gemini", "gemini/gemini-pro-latest"),
+        ("anthropic", "anthropic/claude-sonnet-5"),
+    ])
+    def test_catalog_long_context_tiers_freeze_at_admission(self, monkeypatch, provider_type, model_name):
+        catalog_key = model_name
+        metadata = {
+            "litellm_provider": provider_type,
+            "cache_read_input_token_cost": "0.0000002",
+            "cache_read_input_token_cost_above_200k_tokens": "0.0000004",
+            "cache_creation_input_token_cost": "0.0000005",
+            "cache_creation_input_token_cost_above_200k_tokens": "0.0000008",
+            "cache_creation_input_token_cost_above_1hr": "0.000001",
+            "cache_creation_input_token_cost_above_1hr_above_200k_tokens": "0.0000015",
+        }
+        monkeypatch.setitem(litellm.model_cost, catalog_key, metadata)
+        model, provider = self._rows()
+        model.model_name = model_name
+        provider.provider_type = provider_type
+        resolved = routing._resolved_model(model, provider)
+        _, frozen = _run_snapshots(resolved, {})
+        assert frozen["cache_price_sources"] == {
+            "cache_read": "litellm", "cache_creation_5m": "litellm", "cache_creation_1h": "litellm",
+        }
+        assert Decimal(frozen["cache_read_price_per_token_above_200k"]) == Decimal("0.0000004")
+        metadata["cache_read_input_token_cost_above_200k_tokens"] = "0.000009"
+
+        for prompt in (200_000, 200_001):
+            breakdown = UsageBreakdown.from_totals(
+                prompt, 0, cache_read_input_tokens=prompt - 100_000,
+                cache_creation_5m_input_tokens=50_000, cache_creation_1h_input_tokens=50_000,
+            )
+            direct = litellm_client.cost_from_usage(
+                model_name, prompt, 0, input_price_per_token=resolved["input_price_per_token"],
+                output_price_per_token=resolved["output_price_per_token"],
+                price_source=resolved["price_source"], provider_type=provider_type,
+                breakdown=breakdown, allow_catalog_cache=False,
+                **{key: resolved[key] for key in (
+                    "cache_read_price_per_token", "cache_write_price_per_token", "cache_write_1h_price_per_token",
+                    "cache_read_price_per_token_above_200k", "cache_write_price_per_token_above_200k",
+                    "cache_write_1h_price_per_token_above_200k", "cache_price_sources",
+                )},
+            )
+            durable = credit.usage_cost_from_pricing_snapshot(
+                frozen, prompt_tokens=prompt, completion_tokens=0, breakdown=breakdown,
+            )
+            high = prompt > 200_000
+            read_rate = Decimal("0.0000004" if high else "0.0000002")
+            write_rate = Decimal("0.0000008" if high else "0.0000005")
+            write_1h_rate = Decimal("0.0000015" if high else "0.000001")
+            expected = read_rate * (prompt - 100_000) + write_rate * 50_000 + write_1h_rate * 50_000
+            assert direct.raw_cost == durable.raw_cost == expected
+            assert Decimal(direct.pricing_snapshot["cache_read"]["effective_price_per_token"]) == read_rate
+            assert Decimal(durable.pricing_snapshot["token_components"]["cache_creation_1h"]["price_per_token"]) == write_1h_rate
+
+        model.cache_read_price = Decimal("0.0000003")
+        manual = routing._resolved_model(model, provider)
+        assert manual["cache_price_sources"]["cache_read"] == "manual"
+        assert manual["cache_read_price_per_token_above_200k"] is None
+        manual_frozen = _run_snapshots(manual, {})[1]
+        assert credit.usage_cost_from_pricing_snapshot(
+            manual_frozen, prompt_tokens=200_001, completion_tokens=0,
+            breakdown=UsageBreakdown.from_totals(200_001, 0, cache_read_input_tokens=200_001),
+        ).cache_read_cost == Decimal("0.0600003000")
+
+    def test_custom_base_uses_configured_prices_not_public_catalog(self):
+        model, provider = self._rows(cache_read_price=Decimal("0.0000002500"))
+        model.model_name = "gemini/gemini-2.5-flash-lite"
+        provider.provider_type = "gemini"
+        provider.api_base = "https://tenant.example/v1"
+        resolved = routing._resolved_model(model, provider)
+        assert resolved["cache_price_sources"]["cache_read"] == "manual"
+        breakdown = UsageBreakdown.from_totals(2806, 2, cache_read_input_tokens=2038)
+        cost = litellm_client.cost_from_usage(
+            model.model_name, breakdown.input_tokens, breakdown.output_tokens,
+            input_price_per_token=resolved["input_price_per_token"],
+            output_price_per_token=resolved["output_price_per_token"],
+            price_source=resolved["price_source"], provider_type="gemini",
+            api_base=provider.api_base, breakdown=breakdown,
+            cache_read_price_per_token=resolved["cache_read_price_per_token"],
+            cache_price_sources=resolved["cache_price_sources"],
+        )
+        assert cost.cache_read_cost == Decimal("0.0005095000")
+        assert cost.pricing_snapshot["cache_read"]["source"] == "manual"
+        model.cache_read_price = None
+        assert routing._resolved_model(model, provider)["cache_read_price_per_token"] is None
+        assert litellm_client.effective_prices_per_million(
+            model.model_name, "gemini", api_base=provider.api_base
+        ) == (None, None)
+
+
+    async def test_compat_completion_uses_provider_hit_for_charge_and_openai_usage(self, monkeypatch):
+        model, provider = self._rows()
+        model.model_name = "gemini/gemini-2.5-flash-lite"
+        model.input_price = Decimal("0.0000001000")
+        model.output_price = Decimal("0.0000004000")
+        provider.provider_type = "gemini"
+        resolved = routing._resolved_model(model, provider)
+        usage = litellm.Usage(
+            prompt_tokens=2806, completion_tokens=2,
+            prompt_tokens_details={"cached_tokens": 2038},
+        )
+        captured = []
+
+        async def complete(*_args, **_kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="OK", tool_calls=None), finish_reason="stop")],
+                usage=usage,
+            )
+
+        async def apply_usage(**kwargs):
+            captured.append(kwargs)
+            return Decimal("0.00009798")
+
+        monkeypatch.setattr(completion_api.litellm_client, "acompletion", complete)
+        monkeypatch.setattr(completion_api.credit, "apply_usage", apply_usage)
+        result = await completion_api.complete_once(
+            resolved=resolved, messages=[{"role": "user", "content": "hello"}],
+            user_id="u1", project_id="p1", api_key_id=1,
+            max_tokens=16, temperature=None,
+        )
+        wire = openai_api.OpenAIChatResponse.model_validate(
+            openai_api.nonstream_response(result, cmpl_id="chatcmpl-test", created=1)
+        )
+        assert wire.usage.prompt_tokens_details["cached_tokens"] == 2038
+        assert wire.usage.prompt_tokens == 2806
+        assert captured[0]["usage_cost"].raw_cost == Decimal("0.0000979800")
+        assert captured[0]["breakdown"].uncached_input_tokens == 768
+
+        async def complete_stream(*_args, **_kwargs):
+            async def chunks():
+                yield SimpleNamespace(usage=usage, choices=[])
+            return chunks()
+
+        monkeypatch.setattr(completion_api.litellm_client, "acompletion_stream", complete_stream)
+        events = [event async for event in completion_api.complete_stream(
+            resolved=resolved, messages=[{"role": "user", "content": "hello"}],
+            user_id="u1", project_id="p1", api_key_id=1,
+            max_tokens=16, temperature=None,
+        )]
+        wire_chunk = openai_api.usage_chunk(events[-1], cmpl_id="chatcmpl-test", created=1, model=model.model_name)
+        assert wire_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2038
+        assert len(captured) == 2
+        assert captured[1]["usage_cost"].raw_cost == captured[0]["usage_cost"].raw_cost
 
 
 class _Tx:
@@ -936,6 +1068,12 @@ async def _execute_with_usage_event(monkeypatch, usage_event: dict, *, component
         },
         execution_protocol_version=1,
         status="queued",
+        lease_owner="worker-1#1",
+        assigned_resource_id=None,
+        parent_run_id=None,
+        credit_ceiling=None,
+        sandbox_seconds_ceiling=None,
+        depth=0,
     )
 
     class _Session:
@@ -1180,6 +1318,40 @@ class TestAdvisorCachePricing:
             ("advisor_output_tokens", "advisor_output_price_per_token", "10"),
             ("advisor_cache_read_tokens", "advisor_cache_read_price_per_token", "800"),
         ]
+        assert usage[-1]["prompt_tokens"] == 1000
+
+    def test_advisor_cache_tier_uses_each_call_prompt_size(self):
+        def call(prompt):
+            return [
+                {"kind": "advisor_input_tokens", "price_key": "advisor_input_price_per_token",
+                 "unit": "token", "source": "advisor", "quantity": str(prompt - 120_000)},
+                {"kind": "advisor_output_tokens", "price_key": "advisor_output_price_per_token",
+                 "unit": "token", "source": "advisor", "quantity": "0"},
+                {"kind": "advisor_cache_read_tokens", "price_key": "advisor_cache_read_price_per_token",
+                 "unit": "token", "source": "advisor", "quantity": "120000", "prompt_tokens": prompt},
+            ]
+
+        frozen = {"component_prices": {
+            "advisor_input_price_per_token": "0", "advisor_output_price_per_token": "0",
+            "advisor_cache_read_price_per_token": "0.0000002",
+            "advisor_cache_read_price_per_token_above_200k": "0.0000004",
+        }}
+        separate = call(150_000) + call(150_000)
+        total, rows = execution._managed_usage_components(separate, pricing_snapshot=frozen, model_name="gemini")
+        assert total == Decimal("0.0480000000")
+        assert [row["unit_price_usd"] for row in rows if row["kind"] == "advisor_cache_read_tokens"] == [
+            "0.0000002", "0.0000002",
+        ]
+
+        total, rows = execution._managed_usage_components(call(200_001), pricing_snapshot=frozen, model_name="gemini")
+        assert total == Decimal("0.0480000000")
+        assert rows[-1]["unit_price_usd"] == "0.0000004"
+        with pytest.raises(execution.DurableRunError, match="prompt size"):
+            execution._managed_usage_components(
+                [{key: value for key, value in row.items() if key != "prompt_tokens"} for row in call(200_001)],
+                pricing_snapshot=frozen, model_name="gemini",
+            )
+
 
     def test_admission_freezes_only_set_advisor_cache_rates(self):
         resolved = {
@@ -1204,7 +1376,6 @@ class TestAdvisorCachePricing:
         prices = pricing_snapshot["component_prices"]
 
         assert Decimal(prices["advisor_cache_read_price_per_token"]) == Decimal("0.0000003")
-        # No catalog fallback: an unset advisor cache rate is simply absent.
         assert "advisor_cache_write_price_per_token" not in prices
         assert "advisor_cache_write_1h_price_per_token" not in prices
 

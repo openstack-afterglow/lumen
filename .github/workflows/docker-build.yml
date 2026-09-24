@@ -24,7 +24,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        target: [lumen-api, lumen-worker]
+        target: [lumen-api, lumen-worker, lumen-controller, lumen-sandbox]
 
     steps:
       - name: Checkout

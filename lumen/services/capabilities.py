@@ -11,7 +11,15 @@ from lumen.services.execution_protocol import v2_runtime_ready
 from lumen.services.litellm_client import chatgpt_model_metadata
 from lumen.services.providers.credentials import api_model_name, litellm_model_name
 
-_RUNTIME_TOOL_FEATURES = ("mcp", "approval_tools", "code_interpreter", "computer_use", "code_workspace", "child_agents")
+_RUNTIME_TOOL_FEATURES = (
+    "mcp",
+    "plugin_tools",
+    "approval_tools",
+    "code_interpreter",
+    "computer_use",
+    "code_workspace",
+    "child_agents",
+)
 
 
 def _runtime_gate(*, available: bool, mode: str, reason_code: str | None) -> dict[str, Any]:
@@ -52,13 +60,42 @@ def runtime_capabilities(settings=None) -> dict[str, Any]:
         and not parsed_workspace_url.query
         and not parsed_workspace_url.fragment
     )
+    # Managed sandboxes are real only when the resource controller runtime is enabled with an
+    # enabled sandbox pool; the legacy fixed external sandbox URL is a distinct profile.
+    runtime = getattr(settings, "runtime_config", None)
+    managed_sandbox_ready = bool(
+        runtime is not None
+        and runtime.enabled
+        and any(pool.enabled and pool.role == "sandbox" for pool in runtime.pools)
+    )
+    sandbox_ready = managed_sandbox_ready or sandbox_policy is not None
+    try:
+        from lumen.plugins.registry import get_registry
+
+        plugins_ready = get_registry().ready
+        plugin_reason = None if plugins_ready else "plugin_unavailable"
+    except Exception:
+        plugins_ready = False
+        plugin_reason = "plugin_incompatible"
     v2_reason = "execution_protocol_v2_unavailable"
+    child_agents_ready = protocol_v2_ready and checkpointer_ready and managed_sandbox_ready and plugins_ready
+    if not protocol_v2_ready:
+        child_reason = v2_reason
+    elif not checkpointer_ready:
+        child_reason = "checkpointer_unavailable"
+    elif not managed_sandbox_ready:
+        child_reason = "sandbox_runtime_disabled"
+    else:
+        child_reason = plugin_reason
     return {
         "checkpointer_ready": checkpointer_ready,
         "workspace_ready": workspace_ready,
         "protocol_v2_ready": protocol_v2_ready,
+        "managed_sandbox_ready": managed_sandbox_ready,
+        "plugins_ready": plugins_ready,
         "feature_gates": {
-            "mcp": _runtime_gate(available=True, mode="native", reason_code=None),
+            "mcp": _runtime_gate(available=plugins_ready, mode="native", reason_code=plugin_reason),
+            "plugin_tools": _runtime_gate(available=plugins_ready, mode="native", reason_code=plugin_reason),
             "approval_tools": _runtime_gate(
                 available=protocol_v2_ready and checkpointer_ready,
                 mode="native",
@@ -67,17 +104,17 @@ def runtime_capabilities(settings=None) -> dict[str, Any]:
                 else ("checkpointer_unavailable" if protocol_v2_ready else v2_reason),
             ),
             "code_interpreter": _runtime_gate(
-                available=protocol_v2_ready and sandbox_policy is not None,
+                available=protocol_v2_ready and sandbox_ready,
                 mode="remote",
                 reason_code=None
-                if protocol_v2_ready and sandbox_policy is not None
+                if protocol_v2_ready and sandbox_ready
                 else ("sandbox_unavailable" if protocol_v2_ready else v2_reason),
             ),
             "computer_use": _runtime_gate(
-                available=protocol_v2_ready and sandbox_policy is not None,
+                available=protocol_v2_ready and sandbox_ready,
                 mode="remote",
                 reason_code=None
-                if protocol_v2_ready and sandbox_policy is not None
+                if protocol_v2_ready and sandbox_ready
                 else ("sandbox_unavailable" if protocol_v2_ready else v2_reason),
             ),
             "code_workspace": _runtime_gate(
@@ -87,13 +124,7 @@ def runtime_capabilities(settings=None) -> dict[str, Any]:
                 if protocol_v2_ready and workspace_ready and checkpointer_ready
                 else ("workspace_or_checkpointer_unavailable" if protocol_v2_ready else v2_reason),
             ),
-            "child_agents": _runtime_gate(
-                available=protocol_v2_ready and checkpointer_ready,
-                mode="native",
-                reason_code=None
-                if protocol_v2_ready and checkpointer_ready
-                else ("checkpointer_unavailable" if protocol_v2_ready else v2_reason),
-            ),
+            "child_agents": _runtime_gate(available=child_agents_ready, mode="native", reason_code=child_reason),
         },
     }
 
@@ -124,6 +155,8 @@ def effective_runtime_capabilities(
         "checkpointer_ready": bool(runtime.get("checkpointer_ready")),
         "workspace_ready": bool(runtime.get("workspace_ready")),
         "protocol_v2_ready": bool(runtime.get("protocol_v2_ready")),
+        "managed_sandbox_ready": bool(runtime.get("managed_sandbox_ready")),
+        "plugins_ready": bool(runtime.get("plugins_ready")),
         "feature_gates": gates,
     }
 

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lumen-skills-default"
+version = "0.1.0"
+description = "Default declarative skills plugin for Lumen"
+requires-python = ">=3.11"
+dependencies = ["lumen-plugin-api==0.1.0"]
+
+[project.optional-dependencies]
+testing = ["pytest>=9.0.3", "pytest-asyncio>=0.24"]
+
+[project.entry-points."lumen.skills"]
+default-skills = "lumen_skills_default:create_plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lumen_skills_default"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.uv.sources]
+lumen-plugin-api = { workspace = true }

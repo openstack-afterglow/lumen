@@ -82,6 +82,128 @@
     - enable_lumen | bool
     - lumen_enable_pgvector | bool
 
+- name: Precheck | Verify Lumen agent runtime configuration
+  ansible.builtin.assert:
+    that:
+      - lumen_runtime_config is mapping
+      - lumen_runtime_config.deployment_id is defined
+      - lumen_runtime_config.controller_url is defined and lumen_runtime_config.controller_url is match('^https://')
+      - lumen_runtime_config.tls is defined
+      - lumen_runtime_config.dispatch_key is defined
+      - lumen_runtime_config.managed_networks is defined and lumen_runtime_config.managed_networks | length > 0
+      - lumen_runtime_config.cloud_profiles is defined and lumen_runtime_config.cloud_profiles | length > 0
+      - lumen_runtime_config.pools is defined and lumen_runtime_config.pools | length > 0
+    fail_msg: >-
+      lumen_runtime_config must declare deployment_id, an https controller_url, tls material,
+      a dispatch_key reference, managed_networks CIDRs, cloud_profiles and pools before
+      lumen_runtime_enabled can be true; the role never guesses cloud identifiers.
+  run_once: true
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_runtime_enabled | bool
+
+- name: Precheck | Verify Lumen controller secret material
+  become: true
+  ansible.builtin.stat:
+    path: "{{ lumen_controller_dispatch_key_file }}"
+  register: lumen_dispatch_key_stat
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_runtime_enabled | bool
+    - inventory_hostname in groups['lumen']
+
+- name: Precheck | Require the controller dispatch key file
+  ansible.builtin.assert:
+    that:
+      - lumen_dispatch_key_stat.stat.exists
+      - lumen_dispatch_key_stat.stat.mode in ['0600', '0400']
+      - lumen_dispatch_key_stat.stat.isreg
+      - lumen_dispatch_key_stat.stat.uid == 0
+    fail_msg: "{{ lumen_controller_dispatch_key_file }} must exist with mode 0600/0400 on every lumen host"
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_runtime_enabled | bool
+    - inventory_hostname in groups['lumen']
+
+- name: Precheck | Require runtime TLS and key references under controller mount
+  ansible.builtin.assert:
+    that:
+      - lumen_runtime_config.dispatch_key.file is defined
+      - lumen_runtime_config.dispatch_key.file == '/etc/lumen/controller/dispatch.key'
+      - lumen_runtime_config.tls.ca_file is match('^/etc/lumen/controller/[^/]+$')
+      - lumen_runtime_config.tls.ca_key_file is match('^/etc/lumen/controller/[^/]+$')
+      - lumen_runtime_config.tls.cert_file is match('^/etc/lumen/controller/[^/]+$')
+      - lumen_runtime_config.tls.key_file is match('^/etc/lumen/controller/[^/]+$')
+      - lumen_runtime_config.tls.operator_client_cert_file is match('^/etc/lumen/controller/[^/]+$')
+      - lumen_runtime_config.tls.operator_client_key_file is match('^/etc/lumen/controller/[^/]+$')
+      - ([lumen_runtime_config.tls.ca_file, lumen_runtime_config.tls.operator_client_cert_file, lumen_runtime_config.tls.operator_client_key_file] | unique | list | length) == 3
+      - lumen_runtime_config.tls.ca_key_file not in [lumen_runtime_config.tls.ca_file, lumen_runtime_config.tls.operator_client_cert_file, lumen_runtime_config.tls.operator_client_key_file]
+      - lumen_runtime_config.tls.key_file not in [lumen_runtime_config.tls.ca_file, lumen_runtime_config.tls.operator_client_cert_file, lumen_runtime_config.tls.operator_client_key_file]
+    fail_msg: "runtime TLS files must reside under /etc/lumen/controller with separate worker client material"
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_runtime_enabled | bool
+    - inventory_hostname in groups['lumen']
+
+- name: Precheck | Inspect worker-only TLS directory
+  become: true
+  ansible.builtin.stat:
+    path: "{{ lumen_worker_secrets_dir }}"
+  register: lumen_worker_secrets_stat
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_runtime_enabled | bool
+    - inventory_hostname in groups['lumen']
+
+- name: Precheck | Require a restricted worker-only TLS directory
+  ansible.builtin.assert:
+    that:
+      - lumen_worker_secrets_stat.stat.isdir
+      - lumen_worker_secrets_stat.stat.uid == 0
+      - lumen_worker_secrets_stat.stat.gid == 0
+      - lumen_worker_secrets_stat.stat.mode == '0750'
+    fail_msg: "{{ lumen_worker_secrets_dir }} must be root:root mode 0750"
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_runtime_enabled | bool
+    - inventory_hostname in groups['lumen']
+
+- name: Precheck | Inventory worker-only TLS files
+  become: true
+  ansible.builtin.find:
+    paths: "{{ lumen_worker_secrets_dir }}"
+    file_type: any
+    hidden: true
+    recurse: false
+  register: lumen_worker_secrets_inventory
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_runtime_enabled | bool
+    - inventory_hostname in groups['lumen']
+
+- name: Precheck | Require only public CA and dedicated client material in worker mount
+  ansible.builtin.assert:
+    that:
+      - (lumen_worker_secrets_inventory.files | map(attribute='path') | list | sort) == ([lumen_worker_secrets_dir ~ '/' ~ (lumen_runtime_config.tls.ca_file | basename), lumen_worker_secrets_dir ~ '/' ~ (lumen_runtime_config.tls.operator_client_cert_file | basename), lumen_worker_secrets_dir ~ '/' ~ (lumen_runtime_config.tls.operator_client_key_file | basename)] | sort)
+      - (lumen_worker_secrets_inventory.files | map(attribute='uid') | unique | list) == [0]
+      - (lumen_worker_secrets_inventory.files | map(attribute='gid') | unique | list) == [0]
+      - (lumen_worker_secrets_inventory.files | selectattr('isreg') | list | length) == 3
+      - (lumen_worker_secrets_inventory.files | selectattr('mode', 'in', ['0440', '0640', '0444', '0644']) | list | length) == 3
+      - (lumen_worker_secrets_inventory.files | selectattr('path', 'equalto', lumen_worker_secrets_dir ~ '/' ~ (lumen_runtime_config.tls.operator_client_key_file | basename)) | map(attribute='mode') | first) in ['0440', '0640']
+    fail_msg: "worker TLS mount must contain only regular, root:root public CA and client cert/key; client key must be group-readable without world access"
+  tags: precheck
+  when:
+    - enable_lumen | bool
+    - lumen_runtime_enabled | bool
+    - inventory_hostname in groups['lumen']
+
 - name: Precheck | Verify Lumen API image accessibility
   become: true
   ansible.builtin.command:

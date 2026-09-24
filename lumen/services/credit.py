@@ -71,9 +71,9 @@ def credits_for_cost(raw_cost_usd, margin_multiplier=1.0, credit_per_usd=None) -
 
 
 _CACHE_SNAPSHOT_PRICES = (
-    ("cache_read", "cache_read_input_tokens", "cache_read_price_per_token"),
-    ("cache_creation_5m", "cache_creation_5m_input_tokens", "cache_write_price_per_token"),
-    ("cache_creation_1h", "cache_creation_1h_input_tokens", "cache_write_1h_price_per_token"),
+    ("cache_read", "cache_read_input_tokens", "cache_read_price_per_token", "cache_read_price_per_token_above_200k"),
+    ("cache_creation_5m", "cache_creation_5m_input_tokens", "cache_write_price_per_token", "cache_write_price_per_token_above_200k"),
+    ("cache_creation_1h", "cache_creation_1h_input_tokens", "cache_write_1h_price_per_token", "cache_write_1h_price_per_token_above_200k"),
 )
 
 
@@ -104,7 +104,9 @@ def usage_cost_from_pricing_snapshot(
         input_price = _snapshot_price(pricing_snapshot, "input_price_per_token", required=True)
         output_price = _snapshot_price(pricing_snapshot, "output_price_per_token", required=True)
         cache_prices = {
-            name: _snapshot_price(pricing_snapshot, key, required=False) for name, _, key in _CACHE_SNAPSHOT_PRICES
+            name: (_snapshot_price(pricing_snapshot, key, required=False),
+                   _snapshot_price(pricing_snapshot, tier_key, required=False))
+            for name, _, key, tier_key in _CACHE_SNAPSHOT_PRICES
         }
     except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
         raise ValueError("durable pricing snapshot is invalid") from exc
@@ -132,9 +134,12 @@ def usage_cost_from_pricing_snapshot(
     }
     cache_costs: dict[str, Decimal] = {}
     unpriced_cache = False
-    for name, token_field, _ in _CACHE_SNAPSHOT_PRICES:
+    for name, token_field, _, _ in _CACHE_SNAPSHOT_PRICES:
         tokens = getattr(breakdown, token_field)
-        rate = cache_prices[name]
+        rate, tier_rate = cache_prices[name]
+        source = (pricing_snapshot.get("cache_price_sources") or {}).get(name, "manual")
+        if breakdown.input_tokens > 200_000 and source == "litellm" and tier_rate is not None:
+            rate = tier_rate
         cost = (rate * tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN) if rate is not None else Decimal("0")
         unpriced_cache = unpriced_cache or (tokens > 0 and rate is None)
         cache_costs[name] = cost
@@ -142,7 +147,7 @@ def usage_cost_from_pricing_snapshot(
             "tokens": tokens,
             "price_per_token": format(rate, "f") if rate is not None else None,
             "cost": format(cost, "f"),
-            "source": "manual" if rate is not None else None,
+            "source": source if rate is not None else None,
         }
     raw_cost = input_cost + output_cost + sum(cache_costs.values(), Decimal("0"))
     return UsageCost(

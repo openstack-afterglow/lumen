@@ -26,6 +26,7 @@ from lumen.models.chat_db import (
     ChatMemory,
     ChatMemoryOwnerLock,
     ChatMessage,
+    ChatPluginBinding,
     ChatQuotaPolicy,
     ChatSkill,
     ChatUsageLog,
@@ -33,6 +34,16 @@ from lumen.models.chat_db import (
     LlmModel,
     LlmProvider,
     UserWallet,
+)
+from lumen.models.chat_infrastructure import (
+    ChatAgentReservation,
+    ChatDelegationCall,
+    ChatDelegationGroup,
+    ChatProjectAgentQuota,
+    ChatResourceOperation,
+    ChatRuntimePool,
+    ChatRuntimeResource,
+    ChatWorkerRegistration,
 )
 from lumen.models.chat_jobs import ChatInputDerivation, ChatJob, ChatMemoryOutbox, ChatMemoryProvenance
 from lumen.models.chat_runs import (
@@ -90,4 +101,13 @@ __all__ = [
     "ChatExtensionPackage",
     "ChatExtensionPackageInstall",
     "ChatExtensionPackageComponent",
+    "ChatPluginBinding",
+    "ChatRuntimePool",
+    "ChatRuntimeResource",
+    "ChatResourceOperation",
+    "ChatWorkerRegistration",
+    "ChatProjectAgentQuota",
+    "ChatAgentReservation",
+    "ChatDelegationGroup",
+    "ChatDelegationCall",
 ]

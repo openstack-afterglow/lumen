@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import logging
 
+from lumen_plugin_api.contracts import Namespace, PluginError
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import OperationalError
 
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
+from lumen.models.chat_contracts import validate_plugin_binding_ids
 from lumen.models.chat_db import ChatAgent
+from lumen.plugins.bindings import resolve_binding
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,8 @@ def _public(row: ChatAgent, *, owner_view: bool = False) -> dict:
         "mcp_ids": row.mcp_ids or [],
         "tool_ids": row.tool_ids or [],
         "skill_ids": getattr(row, "skill_ids", None) or [],
+        "plugin_tool_ids": (row.plugin_tool_ids or []) if owner_view else [],
+        "plugin_skill_ids": (row.plugin_skill_ids or []) if owner_view else [],
         "visibility": row.visibility,
         "cloned_from_id": row.cloned_from_id,
         "clone_count": row.clone_count,
@@ -96,6 +101,17 @@ def _validate_ids(value: list | None, label: str) -> list | None:
     return value
 
 
+async def _validate_plugin_selection(values: list[str] | None, kind: str, *, user_id: str, project_id: str) -> list[str]:
+    try:
+        ids = validate_plugin_binding_ids(values or [])
+        namespace = Namespace(user_id=user_id, project_id=project_id)
+        for identifier in ids:
+            await resolve_binding(identifier, kind=kind, namespace=namespace)
+        return ids
+    except (ValueError, PluginError) as exc:
+        raise AgentValidationError("selected plugin binding is unavailable") from exc
+
+
 async def create_agent(
     *,
     owner_user_id: str,
@@ -109,6 +125,8 @@ async def create_agent(
     mcp_ids: list[int] | None = None,
     tool_ids: list[int] | None = None,
     skill_ids: list[int] | None = None,
+    plugin_tool_ids: list[str] | None = None,
+    plugin_skill_ids: list[str] | None = None,
     visibility: str = "private",
 ) -> dict:
     factory = _require_db()
@@ -116,6 +134,8 @@ async def create_agent(
     mcp_ids = _validate_ids(mcp_ids, "MCP")
     tool_ids = _validate_ids(tool_ids, "tool")
     skill_ids = _validate_ids(skill_ids, "skill")
+    plugin_tool_ids = await _validate_plugin_selection(plugin_tool_ids, "tool", user_id=owner_user_id, project_id=project_id)
+    plugin_skill_ids = await _validate_plugin_selection(plugin_skill_ids, "skill", user_id=owner_user_id, project_id=project_id)
     row = ChatAgent(
         owner_user_id=owner_user_id,
         project_id=project_id,
@@ -128,6 +148,8 @@ async def create_agent(
         mcp_ids=(mcp_ids or None),
         tool_ids=(tool_ids or None),
         skill_ids=(skill_ids or None),
+        plugin_tool_ids=plugin_tool_ids,
+        plugin_skill_ids=plugin_skill_ids,
         visibility=visibility,
     )
     try:
@@ -224,6 +246,9 @@ async def update_agent(agent_id: int, *, user_id: str, project_id: str, patch: d
     for field, label in (("mcp_ids", "MCP"), ("tool_ids", "tool"), ("skill_ids", "skill")):
         if field in patch:
             _validate_ids(patch[field], label)
+    for field, kind in (("plugin_tool_ids", "tool"), ("plugin_skill_ids", "skill")):
+        if field in patch:
+            patch[field] = await _validate_plugin_selection(patch[field], kind, user_id=user_id, project_id=project_id)
     try:
         async with factory() as session, session.begin():
             row = await _load_owned_project(session, agent_id, user_id, project_id)
@@ -245,6 +270,9 @@ async def update_agent(agent_id: int, *, user_id: str, project_id: str, patch: d
                 row.tool_ids = patch["tool_ids"] or None
             if "skill_ids" in patch:
                 row.skill_ids = patch["skill_ids"] or None
+            for field in ("plugin_tool_ids", "plugin_skill_ids"):
+                if field in patch:
+                    setattr(row, field, patch[field])
             if patch.get("visibility"):
                 row.visibility = patch["visibility"]
             await session.flush()
@@ -297,6 +325,8 @@ async def clone_agent(agent_id: int, *, user_id: str, project_id: str) -> dict:
                 mcp_ids=None,
                 tool_ids=None,
                 skill_ids=None,
+                plugin_tool_ids=[],
+                plugin_skill_ids=[],
                 delegable_agent_ids=None,
                 visibility="private",
                 cloned_from_id=src.id,
@@ -339,6 +369,8 @@ async def get_agent_for_run(agent_id: int, *, user_id: str, project_id: str) -> 
                 "role": row.role,
                 "tool_ids": row.tool_ids or [],
                 "skill_ids": row.skill_ids or [],
+                "plugin_tool_ids": row.plugin_tool_ids or [],
+                "plugin_skill_ids": row.plugin_skill_ids or [],
                 "execution_policy": row.execution_policy or {},
                 "delegable_agent_ids": row.delegable_agent_ids or [],
             }

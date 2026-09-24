@@ -1,7 +1,7 @@
 import pytest
+from lumen_plugin_api.tools import AgentExecutionPolicy
 
 from lumen.services.agent_policy import resolve_direct_effects, resolve_execution_policy
-from lumen.services.agent_protocol import AgentExecutionPolicy
 from lumen.services.subagents import ChildRequest, DelegationDenied, merge_policy, validate_child_request
 
 

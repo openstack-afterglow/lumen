@@ -59,6 +59,7 @@ class OpenAIUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    prompt_tokens_details: dict[str, int] = Field(default_factory=lambda: {"cached_tokens": 0})
 
 
 class OpenAIChatResponse(BaseModel):
@@ -121,6 +122,7 @@ def nonstream_response(result: dict, *, cmpl_id: str, created: int) -> dict:
             "prompt_tokens": result["prompt_tokens"],
             "completion_tokens": result["completion_tokens"],
             "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
+            "prompt_tokens_details": {"cached_tokens": result.get("cache_read_input_tokens", 0)},
         },
     }
 
@@ -151,6 +153,7 @@ def usage_chunk(done: dict, *, cmpl_id: str, created: int, model: str) -> dict:
             "prompt_tokens": done["prompt_tokens"],
             "completion_tokens": done["completion_tokens"],
             "total_tokens": done["prompt_tokens"] + done["completion_tokens"],
+            "prompt_tokens_details": {"cached_tokens": done.get("cache_read_input_tokens", 0)},
         },
     }
 

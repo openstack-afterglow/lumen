@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 
+from lumen_plugin_api.contracts import PluginError
+
 from lumen.services import mcp_client, tools
 from lumen.services.tools import ToolContext
 
@@ -11,8 +13,6 @@ from . import contracts, managed
 
 logger = logging.getLogger(__name__)
 _MCP_PREFIX = "mcp__"
-_MAX_RESPONSE_BYTES = 64 * 1024
-_MAX_RESPONSE_CHARS = 4000
 
 
 def _selected(items: list[dict], selected_ids: tuple[int, ...] | None) -> list[dict]:
@@ -105,18 +105,6 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
     return _frozen_selection(_selected(usable, ctx.selected_mcp_ids), ctx, "mcp")
 
 
-def _custom_schema(tool_def: dict) -> dict:
-    params = tool_def.get("params_schema") or {"type": "object", "properties": {}}
-    return {
-        "type": "function",
-        "function": {
-            "name": tool_def["name"],
-            "description": tool_def.get("description") or tool_def["name"],
-            "parameters": params,
-        },
-    }
-
-
 def _mcp_schema(server_id: int, tool: dict) -> dict:
     """MCP 툴 → litellm function 스키마. 이름에 server_id 를 접두해 실행 시 라우팅."""
     return {
@@ -149,8 +137,13 @@ async def context_tool_activity_metadata(name: str, ctx: ToolContext) -> tuple[s
         return "mcp", "MCP"
     if name in {managed._MANAGED_SEARCH_TOOL, managed._MANAGED_FETCH_TOOL, managed._MANAGED_ADVISOR_TOOL}:
         return "managed", "관리형 도구"
-    if any(tool.get("name") == name for tool in await _load_custom(ctx)):
-        return "custom_http", "커스텀 도구"
+    for tool in await _load_custom(ctx):
+        try:
+            definition = await contracts.custom_tool_function_schema(tool, ctx)
+        except (PluginError, TypeError, ValueError):
+            continue
+        if definition["name"] == name:
+            return "custom_http", "커스텀 도구"
     return "builtin", "기본 도구"
 
 
@@ -162,26 +155,22 @@ async def context_tool_schemas(ctx: ToolContext) -> list[dict]:
         from . import bindings
 
         dynamic_bindings = await bindings._legacy_dynamic_bindings(ctx)
-        return [*tools.tool_schemas(), *(bindings._binding_schema(binding) for binding in dynamic_bindings.values())]
-    schemas = list(tools.tool_schemas())
-    if ctx.managed_search is not None:
-        schemas.append(
-            managed._managed_schema(
-                managed._MANAGED_SEARCH_TOOL, "Search the public web through the selected provider.", "query"
-            )
-        )
-    if ctx.managed_fetch is not None:
-        schemas.append(
-            managed._managed_schema(managed._MANAGED_FETCH_TOOL, "Fetch a permitted public HTTPS document.", "url")
-        )
-    if ctx.managed_advisor is not None:
-        schemas.append(
-            managed._managed_schema(
-                managed._MANAGED_ADVISOR_TOOL, "Ask the selected advisor for private analysis.", "goal"
-            )
-        )
+        return [*await tools.tool_schemas(), *(bindings._binding_schema(binding) for binding in dynamic_bindings.values())]
+    schemas = await tools.tool_schemas()
+    for name, enabled in (
+        (managed._MANAGED_SEARCH_TOOL, ctx.managed_search),
+        (managed._MANAGED_FETCH_TOOL, ctx.managed_fetch),
+        (managed._MANAGED_ADVISOR_TOOL, ctx.managed_advisor),
+    ):
+        if enabled is not None:
+            schemas.append(await managed._managed_schema(name))
     for tool_def in await _load_custom(ctx):
-        schemas.append(_custom_schema(tool_def))
+        try:
+            function = await contracts.custom_tool_function_schema(tool_def, ctx)
+        except (PluginError, TypeError, ValueError):
+            logger.warning("invalid custom tool excluded from legacy schemas id=%s", tool_def.get("id"))
+            continue
+        schemas.append({"type": "function", "function": function})
     for server in await _load_mcp(ctx):
         server_id = server.get("id")
         for tool_def in await mcp_client.list_tools(server):

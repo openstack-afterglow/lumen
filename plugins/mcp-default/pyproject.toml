@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lumen-mcp-default"
+version = "0.1.0"
+description = "Remote and delegated MCP authority plugins for Lumen"
+requires-python = ">=3.11"
+dependencies = ["lumen-plugin-api==0.1.0", "httpx>=0.28.1", "langchain-mcp-adapters==0.3.1"]
+
+[project.optional-dependencies]
+testing = ["pytest>=9.0.3", "pytest-asyncio>=0.24"]
+
+[project.entry-points."lumen.mcp"]
+remote-mcp = "lumen_mcp_default.remote:create_remote_plugin"
+afterglow-mcp = "lumen_mcp_default.afterglow:create_afterglow_plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lumen_mcp_default"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.uv.sources]
+lumen-plugin-api = { workspace = true }

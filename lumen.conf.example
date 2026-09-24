@@ -32,6 +32,57 @@ redis_db_index = 8
 # 정확히 64개의 hex 문자. lumen_encryption_key가 필요하다.
 lumen_encryption_key = "CHANGE_TO_64_HEX_CHARACTERS"
 service_chat_enabled = true
+worker_concurrency = 4
+worker_heartbeat_seconds = 5
+worker_drain_seconds = 300
+api_max_active_requests = 256
+api_max_sse_connections = 256
+
+# Opt-in only after provisioning distinct trusted/sandbox projects, dedicated internal
+# CA and guest images. Override the whole mapping with RUNTIME_CONFIG JSON if needed.
+# Missing enabled-pool prerequisites are configuration errors, not fallback values.
+[lumen.runtime_config]
+enabled = false
+deployment_id = "lumen"
+controller_url = ""
+listen_host = "127.0.0.1"
+listen_port = 8013
+reconcile_interval_seconds = 5
+pool_lease_seconds = 30
+max_parallel_cloud_operations = 4
+managed_networks = []
+cloud_profiles = []
+pools = []
+# tls = { ca_file = "/etc/lumen/runtime/ca.pem", ca_key_file = "/etc/lumen/runtime/ca.key", cert_file = "/etc/lumen/runtime/controller.pem", key_file = "/etc/lumen/runtime/controller.key" }
+# dispatch_key = { file = "/etc/lumen/runtime/dispatch.key" }
+
+[lumen.runtime_config.project_quota_defaults]
+max_active_children = 0
+max_active_sandboxes = 0
+max_sandbox_seconds = 0
+max_credit_reservation = "0"
+
+
+# Installed plugin approval. Only exact distribution/name/version entries load; a
+# missing or mismatched required plugin stops API/worker startup instead of falling
+# back to an in-core implementation. Override with PLUGIN_CONFIG as a JSON object.
+[lumen.plugin_config]
+database = "mariadb"
+memory = "default-memory"
+tools = ["default-tools"]
+skills = ["default-skills"]
+mcp = ["remote-mcp", "afterglow-mcp"]
+allowlist = [
+  { kind = "database", name = "mariadb", distribution = "lumen-database-mariadb", version = "0.1.0" },
+  { kind = "memory", name = "default-memory", distribution = "lumen-memory-default", version = "0.1.0" },
+  { kind = "tools", name = "default-tools", distribution = "lumen-tools-default", version = "0.1.0" },
+  { kind = "skills", name = "default-skills", distribution = "lumen-skills-default", version = "0.1.0" },
+  { kind = "mcp", name = "remote-mcp", distribution = "lumen-mcp-default", version = "0.1.0" },
+  { kind = "mcp", name = "afterglow-mcp", distribution = "lumen-mcp-default", version = "0.1.0" },
+]
+# Per-plugin operator settings, validated against each manifest's configuration schema.
+# Secrets are server-side references, never literals.
+[lumen.plugin_config.settings]
 
 [chat]
 chat_execution_protocol_version = 1

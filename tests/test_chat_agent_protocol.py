@@ -1,7 +1,5 @@
 import pytest
-from pydantic import ValidationError
-
-from lumen.services.agent_protocol import (
+from lumen_plugin_api.tools import (
     AgentExecutionPolicy,
     GeneratedToolFile,
     ToolBinding,
@@ -9,6 +7,8 @@ from lumen.services.agent_protocol import (
     ToolExecutionResult,
     validate_tool_arguments,
 )
+from pydantic import ValidationError
+
 from lumen.services.agent_runtime_v2 import dispatch_tool_call
 from lumen.services.tool_runtime import bindings as tool_runtime
 from lumen.services.tool_runtime import dispatch
@@ -312,8 +312,8 @@ async def test_v2_mcp_binding_persists_embedded_file_bytes(monkeypatch):
     }
 
 
-def test_v2_builtin_bindings_are_read_only_and_schema_closed():
-    bindings = v2_builtin_tool_bindings()
+async def test_v2_builtin_bindings_are_read_only_and_schema_closed():
+    bindings = await v2_builtin_tool_bindings(ToolContext(project_id="project", user_id="user"))
 
     assert set(bindings) == {"list_my_conversations", "get_conversation_detail"}
     detail = bindings["get_conversation_detail"].definition
@@ -324,21 +324,34 @@ def test_v2_builtin_bindings_are_read_only_and_schema_closed():
 
 
 async def test_v2_dynamic_bindings_namespace_names_and_freeze_effects(monkeypatch):
+    from lumen.plugins import tools_host
+
+    custom_row = {
+        "id": 7,
+        "name": "status-check",
+        "description": "Read one status.",
+        "params_schema": {
+            "type": "object",
+            "properties": {"resource": {"type": "string", "enum": ["status"]}},
+            "required": ["resource"],
+        },
+        "effect": "read",
+        "url": "https://API.Example.com/status",
+        "method": "GET",
+        "timeout_seconds": 10,
+        "config_version": 1,
+        "load_policy": "preloaded",
+        "is_active": True,
+    }
+
     async def load_custom(_ctx):
-        return [
-            {
-                "id": 7,
-                "name": "status-check",
-                "description": "Read one status.",
-                "params_schema": {
-                    "type": "object",
-                    "properties": {"resource": {"type": "string", "enum": ["status"]}},
-                    "required": ["resource"],
-                },
-                "effect": "read",
-                "url": "https://API.Example.com/status",
-            }
-        ]
+        return [custom_row]
+
+    async def resolve(self, kind, identifier, namespace):
+        assert (kind, identifier) == ("tool", 7)
+        return dict(custom_row)
+
+    monkeypatch.setattr(tools_host.ToolsExtensionAccess, "resolve", resolve)
 
     async def load_mcp(_ctx):
         return [{"id": 8, "url": "https://Mcp.Example.com/api", "effect_overrides": {"inspect-status": "read"}}]
@@ -374,32 +387,63 @@ async def test_v2_dynamic_bindings_namespace_names_and_freeze_effects(monkeypatc
 
 
 async def test_v2_dynamic_binding_dispatches_only_schema_validated_arguments(monkeypatch):
+    """Validated arguments reach the SSRF-safe host client; out-of-schema calls never open a stream."""
+    from contextlib import asynccontextmanager
+
+    from lumen.plugins import tools_host
+
+    row = {
+        "id": 9,
+        "name": "status",
+        "description": "Read status.",
+        "params_schema": {
+            "type": "object",
+            "properties": {"resource": {"type": "string", "enum": ["status"]}},
+            "required": ["resource"],
+        },
+        "url": "https://api.example.com/status",
+        "method": "GET",
+        "timeout_seconds": 10,
+        "effect": "read",
+        "config_version": 1,
+        "load_policy": "preloaded",
+        "is_active": True,
+    }
     seen: list[dict[str, object]] = []
 
     async def load_custom(_ctx):
-        return [
-            {
-                "id": 9,
-                "name": "status",
-                "params_schema": {
-                    "type": "object",
-                    "properties": {"resource": {"type": "string", "enum": ["status"]}},
-                    "required": ["resource"],
-                },
-                "url": "https://api.example.com/status",
-            }
-        ]
+        return [row]
 
     async def load_mcp(_ctx):
         return []
 
-    async def execute_custom(_tool, arguments, _ctx):
-        seen.append(arguments)
-        return "healthy"
+    async def resolve(self, kind, identifier, namespace):
+        assert (kind, identifier, namespace.user_id, namespace.project_id) == ("tool", 9, "user", "project")
+        return dict(row)
+
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "text/plain"}
+        encoding = "utf-8"
+
+        async def aiter_bytes(self):
+            yield b"healthy"
+
+    class _Client:
+        @asynccontextmanager
+        async def stream(self, method, url, **kwargs):
+            assert (method, url) == ("GET", "https://api.example.com/status")
+            seen.append(kwargs["params"])
+            yield _Response()
+
+    @asynccontextmanager
+    async def client(self, **_kwargs):
+        yield _Client()
 
     monkeypatch.setattr(tool_runtime, "_load_custom", load_custom)
     monkeypatch.setattr(tool_runtime, "_load_mcp", load_mcp)
-    monkeypatch.setattr(dispatch, "_execute_custom_http_tool", execute_custom)
+    monkeypatch.setattr(tools_host.ToolsExtensionAccess, "resolve", resolve)
+    monkeypatch.setattr(tools_host.ToolsPublicHttpAccess, "client", client)
 
     bindings = await tool_runtime.v2_tool_bindings(ToolContext(project_id="project", user_id="user"))
     binding = next(binding for binding in bindings.values() if binding.definition.source == "custom_http")
@@ -409,7 +453,7 @@ async def test_v2_dynamic_binding_dispatches_only_schema_validated_arguments(mon
     invalid = await dispatch_tool_call(binding, {"resource": "status", "extra": True}, context)
 
     assert valid.status == "completed"
-    assert valid.model_content == "healthy"
+    assert "healthy" in valid.model_content
     assert invalid.error_code == "invalid_tool_arguments"
     assert seen == [{"resource": "status"}]
 
@@ -430,7 +474,7 @@ async def test_v2_remote_bindings_require_canonical_destinations(monkeypatch):
 
     bindings = await tool_runtime.v2_tool_bindings(ToolContext(project_id="project", user_id="user"))
 
-    assert set(bindings) == set(v2_builtin_tool_bindings())
+    assert set(bindings) == set(await v2_builtin_tool_bindings(ToolContext(project_id="project", user_id="user")))
 
 
 async def test_lumen_bindings_freeze_only_the_selected_grant_snapshot(monkeypatch):

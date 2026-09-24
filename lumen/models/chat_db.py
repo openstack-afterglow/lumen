@@ -568,6 +568,32 @@ class ChatSkill(Base):
     )
 
 
+class ChatPluginBinding(Base):
+    """Approved installed export, distinct from HTTP extension records."""
+
+    __tablename__ = "chat_plugin_bindings"
+
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(VARCHAR(10), nullable=False)
+    plugin_id: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
+    export_key: Mapped[str] = mapped_column(VARCHAR(128), nullable=False)
+    name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
+    scope: Mapped[str] = mapped_column(VARCHAR(10), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    owner_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    encrypted_config: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
+    config_version: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
+    is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('tool', 'skill')", name="ck_plugin_binding_kind"),
+        CheckConstraint("(scope = 'global' AND owner_user_id IS NULL AND owner_project_id IS NULL) OR (scope = 'user' AND owner_user_id IS NOT NULL AND owner_project_id IS NOT NULL)", name="ck_plugin_binding_owner"),
+        Index("idx_plugin_binding_catalog", "scope", "owner_user_id", "owner_project_id", "is_active"),
+    )
+
+
 class ChatAgent(Base):
     """사용자 정의 에이전트 — 프롬프트(instructions) + 모델 + 파라미터 + MCP/툴 묶음.
 
@@ -591,6 +617,8 @@ class ChatAgent(Base):
     mcp_ids: Mapped[list | None] = mapped_column(JSON)  # 바인딩된 ChatMcpServer id 목록
     tool_ids: Mapped[list | None] = mapped_column(JSON)  # 바인딩된 ChatCustomTool id 목록
     skill_ids: Mapped[list | None] = mapped_column(JSON)
+    plugin_tool_ids: Mapped[list | None] = mapped_column(JSON)
+    plugin_skill_ids: Mapped[list | None] = mapped_column(JSON)
     visibility: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="private")  # private|public
     role: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="general")
     execution_policy: Mapped[dict | None] = mapped_column(JSON)

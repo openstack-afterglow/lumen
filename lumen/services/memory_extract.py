@@ -230,10 +230,15 @@ async def generate_memory_if_applicable(
             output_price_per_token=resolved.get("output_price_per_token"),
             price_source=resolved.get("price_source"),
             provider_type=resolved.get("provider_type"),
+            api_base=resolved.get("api_base"),
             breakdown=breakdown,
             cache_read_price_per_token=resolved.get("cache_read_price_per_token"),
             cache_write_price_per_token=resolved.get("cache_write_price_per_token"),
             cache_write_1h_price_per_token=resolved.get("cache_write_1h_price_per_token"),
+            cache_read_price_per_token_above_200k=resolved.get("cache_read_price_per_token_above_200k"),
+            cache_write_price_per_token_above_200k=resolved.get("cache_write_price_per_token_above_200k"),
+            cache_write_1h_price_per_token_above_200k=resolved.get("cache_write_1h_price_per_token_above_200k"),
+            cache_price_sources=resolved.get("cache_price_sources"),
         )
         await credit.apply_usage(
             event_id=f"memory:{conversation_id}:{uuid.uuid4().hex}",

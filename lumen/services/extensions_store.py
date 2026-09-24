@@ -206,8 +206,10 @@ def selection_fingerprint(item: dict) -> str:
         for key in (
             "id",
             "name",
+            "description",
             "url",
             "method",
+            "timeout_seconds",
             "transport",
             "auth_mode",
             "params_schema",

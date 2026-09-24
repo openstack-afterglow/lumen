@@ -161,6 +161,13 @@ async def list_usage_records(
                 prompt_tokens=row.prompt_tokens,
                 completion_tokens=row.completion_tokens,
                 total_tokens=row.prompt_tokens + row.completion_tokens,
+                uncached_input_tokens=max(
+                    0, row.prompt_tokens - row.cache_read_input_tokens
+                    - row.cache_creation_5m_input_tokens - row.cache_creation_1h_input_tokens
+                ),
+                cache_read_input_tokens=row.cache_read_input_tokens,
+                cache_creation_5m_input_tokens=row.cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens=row.cache_creation_1h_input_tokens,
                 credited_cost=format(row.credited_cost, "f"),
                 source=row.source,
                 api_key_id=row.api_key_id,

@@ -8,10 +8,11 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
+from lumen_plugin_api.database import DatabaseConfig
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from lumen.config import get_settings
+from lumen.plugins.registry import get_plugin
 from lumen.scripts.backfill_history import backfill_history, count_unready
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
@@ -156,7 +157,8 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
     if not database_url:
         raise MigrationLedgerError("database URL is required")
     migrations = load_manifest()
-    engine = create_async_engine(database_url, pool_pre_ping=True)
+    handle = get_plugin("database").open(DatabaseConfig(url=database_url))
+    engine = handle.engine
     pending: list[str] = []
     try:
         async with engine.begin() as connection:
@@ -216,7 +218,7 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
                 unready = int((await connection.execute(text("SELECT COUNT(*) FROM chat_conversations"))).scalar_one())
         return pending, unready
     finally:
-        await engine.dispose()
+        await handle.close()
 
 
 def main() -> None:

@@ -140,10 +140,15 @@ async def _bill(
         output_price_per_token=resolved.get("output_price_per_token"),
         price_source=resolved.get("price_source"),
         provider_type=resolved.get("provider_type"),
+        api_base=resolved.get("api_base"),
         breakdown=breakdown,
         cache_read_price_per_token=resolved.get("cache_read_price_per_token"),
         cache_write_price_per_token=resolved.get("cache_write_price_per_token"),
         cache_write_1h_price_per_token=resolved.get("cache_write_1h_price_per_token"),
+        cache_read_price_per_token_above_200k=resolved.get("cache_read_price_per_token_above_200k"),
+        cache_write_price_per_token_above_200k=resolved.get("cache_write_price_per_token_above_200k"),
+        cache_write_1h_price_per_token_above_200k=resolved.get("cache_write_1h_price_per_token_above_200k"),
+        cache_price_sources=resolved.get("cache_price_sources"),
     )
     credited = await credit.apply_usage(
         event_id=event_id,
@@ -241,6 +246,9 @@ async def complete_once(
         "finish_reason": finish_reason,
         "prompt_tokens": pt,
         "completion_tokens": ct,
+        "cache_read_input_tokens": (
+            UsageBreakdown.from_runtime(getattr(resp, "usage", None)) or UsageBreakdown(0, 0)
+        ).cache_read_input_tokens,
         "credited_cost": float(credited),
     }
 
@@ -339,6 +347,9 @@ async def complete_stream(
             "completion_tokens": ct,
             "finish_reason": finish_reason,
             "credited_cost": float(credited),
+            "cache_read_input_tokens": (
+                UsageBreakdown.from_runtime(final_usage) or UsageBreakdown(0, 0)
+            ).cache_read_input_tokens,
         }
     finally:
         if not charged and text:
