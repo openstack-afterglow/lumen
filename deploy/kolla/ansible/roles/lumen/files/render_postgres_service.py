@@ -12,7 +12,6 @@ import os
 import sys
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-
 ALLOWED_QUERY_PARAMETERS = frozenset(
     {
         "application_name",
