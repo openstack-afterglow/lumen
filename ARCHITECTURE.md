@@ -6,7 +6,7 @@ Lumen은 LiteLLM provider 실행, LangGraph/LangChain agent runtime, 대화·dur
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: root `lumen` package `0.2.2` (`pyproject.toml`, `lumen/__init__.py`), 독립 `lumen-sdk` `0.2.1` (`sdk/pyproject.toml`), discovery/API contract `1.0.0` (`lumen/api/compat/discovery.py`)
+- 버전: root `lumen` package `0.3.0` (`pyproject.toml`, `lumen/__init__.py`, `uv.lock`), 독립 `lumen-sdk` `0.2.1` (`sdk/pyproject.toml`), discovery/API contract `1.0.0` (`lumen/api/compat/discovery.py`). Kolla의 package-owned API/worker/controller image default는 `0.3.0` tag를 가리키며, 실제 게시와 배포 수용은 tag workflow와 운영자 검증 전까지 미확인이다. `lumen_source_version`은 별도 source-build commit pin이다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 wakeup 최적화일 뿐 queue 정본이 아니다.
@@ -309,9 +309,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "548735b29e82ea6f19ff927c5e0580d4c18606c68e5d611646df678ff8a8f5f5",
-  "reviewed_at": "2026-09-24T15:55:10Z",
-  "summary": "Integrated dev plugin/runtime changes with origin CI; both architectures built and package ownership executed, contract 1316 and SDK 125, datastore 40, process-system 9, plugin 88 passed with one optional skip, native arm64 sandbox 21 passed. Native amd64 isolation and real provider/cloud sandbox lifecycle remain unverified. Merge adds no API or schema change."
+  "source_sha256": "61b865a54282898f32e0a268815da6c5ea97300300901255a87acbe8ecdccc44",
+  "reviewed_at": "2026-09-24T16:33:48Z",
+  "summary": "Reviewed 0.3.0 root/runtime/lock, packaged Kolla release defaults and existing plugin/SDK version boundaries; normalized one import block. No runtime structure change from release preparation; external provider and native amd64 isolation gaps remain explicit."
 }
 ```
 <!-- architecture-review:end -->

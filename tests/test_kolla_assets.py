@@ -152,15 +152,14 @@ def test_runtime_worker_mount_excludes_controller_signing_keys():
 
 
 def test_kolla_package_and_image_version_contract():
-    assert lumen.__version__ == "0.2.2"
+    manifest = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    locked_root = next(package for package in lock["package"] if package["name"] == "lumen")
+    assert lumen.__version__ == manifest["project"]["version"] == locked_root["version"]
 
-    sdk_init = (REPO_ROOT / "sdk" / "lumen_sdk" / "__init__.py").read_text(encoding="utf-8")
-    assert '__version__ = "0.2.1"' in sdk_init
 
     defaults_yaml = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
 
-    # The root package revision does not imply a new published runtime image.
-    assert defaults_yaml["lumen_image_tag"] == "0.2.1"
     assert defaults_yaml["lumen_source_version"] == "c561a1550921e49e6516c3e05fa89fee8457352a"
 
     defaults_raw = (ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8")

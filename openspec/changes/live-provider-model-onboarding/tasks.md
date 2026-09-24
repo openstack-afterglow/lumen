@@ -23,4 +23,9 @@
 - API/worker built and executed on linux/amd64 and linux/arm64. Canonical Afterglow local Compose rebuild, migration and targeted recreation succeeded without deleting persistent volumes. API health passed; worker readiness was verified by its live Redis BRPOP consumer (no Docker health check is configured for this service).
 - Authenticated Afterglow→Lumen runtime smoke verified safe no-store discovery failure, inactive unknown-price persistence, explicit-price activation and immediate user-list visibility. Temporary rows were deleted afterward; no real upstream request was made.
 - Architecture working/staged checks passed with isolated temporary indexes; original staging was preserved. No commit/push/production deployment.
+
 - **Blocked:** real Anthropic/OpenAI credentials and an approved priced model are absent. Live inventory, paid inference and actual-provider usage/billing acceptance remain unchecked; synthetic process proof does not replace them. Keep this change open rather than archive it.
+
+## 0.3.0 release boundary
+
+Candidate discovery and explicitly priced onboarding are in the root 0.3.0 release candidate; tag publication has not been verified. The unchecked real Anthropic/OpenAI inventory and paid inference task remains open; synthetic upstream and local container verification are not external-provider acceptance. See `CHANGELOG.md` for release notes.

@@ -35,7 +35,7 @@ docker pull ghcr.io/openstack-afterglow/lumen-worker:latest
 
 - **휠 빌드**: `uv build --wheel`로 `lumen-<version>-py3-none-any.whl`을 생성한다.
 - **역할 설치 경로**: `pip install --no-deps lumen-<version>-py3-none-any.whl`은 Kolla 환경의 `share/kolla-ansible/ansible/roles/lumen`에 역할 자산을 설치한다.
-- **독립된 이미지 기본값**: root package release는 기존 `lumen_image_tag`를 변경하지 않는다. 새 runtime image를 게시한 release에서만 operator가 image tag를 갱신한다.
+- **릴리스 이미지 기본값**: 0.3.0 root wheel의 `lumen_image_tag` 기본값은 `0.3.0`이다. 실제 게시 여부를 tag workflow에서 확인한 뒤 배포하고, 이미지가 아직 없거나 이전 이미지를 유지해야 하면 operator가 검증된 tag/digest로 명시적으로 override한다. Source-build commit pin과 SDK/플러그인 버전은 독립적이다.
 - **첫 배포 및 운영자 동기화**: `kolla-ansible -i <inventory> deploy --tags lumen`으로 최초 기동하며, root wheel 재설치로 패키지 역할을 동기화한다.
 - **PostgreSQL 전제**: 기본 `lumen_postgres_mode="external"`은 운영자가 `lumen_external_postgres_url`을 secret 설정에 제공해야 한다. 자체 PostgreSQL을 만들려면 `bundled`와 강한 `lumen_postgres_password`를 명시한다.
 - **업그레이드 및 Reconfigure 검증**: `kolla-ansible -i <inventory> reconfigure --tags lumen`은 이미지 pull (`pull.yml`) → 설정 렌더링 (`config.yml`) → DB 마이그레이션 (`bootstrap_service.yml`) → 서비스 기동 (`start.yml`) 순서로 실행되어 API/Worker 서비스가 기동되기 전 마이그레이션과 이미지 갱신을 보장한다.
@@ -140,6 +140,7 @@ with Client("https://lumen.example", "sk-afgl-...") as client:
 ## 문서
 
 - [문서 안내](docs/index.md)
+- [변경 이력과 0.3.0 릴리스 노트](CHANGELOG.md)
 - [정본 아키텍처](ARCHITECTURE.md)
 - [아키텍처 상세 안내](docs/architecture.md)
 - [Afterglow 연동 가이드](docs/afterglow-integration.md)

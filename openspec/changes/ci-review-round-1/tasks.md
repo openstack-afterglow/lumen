@@ -39,4 +39,9 @@ Not verified here:
 - `lumen-test contract`: service 1,316 passed and SDK 125 passed; lint passed. Plugin wheels built and conformance suites passed 88 cases (one optional database-dependent skip).
 - Isolated MariaDB/Redis integration: 40 passed. Docker process-stack system: 9 passed. Local Afterglow Compose migrations exited 0; current API/worker images were deployed and authenticated BFF reads passed.
 - Native arm64 sandbox isolation: 21 passed. Native amd64 isolation, live provider inference and cloud sandbox lifecycle remain unverified; package/binary smoke is not that proof.
+
 - GitHub workflow publication and dedup timing remain the open post-push item above.
+
+## 0.3.0 release boundary
+
+The workflow and packaging changes are in the root 0.3.0 release candidate; tag publication has not been verified. The unchecked first-`dev`-push job/publication check and PR dedup timing remain open; local multi-platform builds do not establish that the `v0.3.0` tag workflows or GHCR image publication have succeeded. See `CHANGELOG.md` for release notes.
