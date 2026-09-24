@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict
@@ -32,6 +33,8 @@ class Principal(TypedDict):
     source: Literal["web", "api"]
     roles: list[str]
     is_system_admin: bool
+    credential_kind: NotRequired[str]
+    expires_at: NotRequired[object]
     token: NotRequired[str]
 
 
@@ -177,6 +180,14 @@ async def get_principal(
     x_api_key = (request.headers.get("X-API-Key") or "").strip()
     authorization = (request.headers.get("Authorization") or "").strip()
     x_auth_token = (request.headers.get("X-Auth-Token") or "").strip()
+    if x_api_key and authorization:
+        if not authorization.lower().startswith("bearer "):
+            raise HTTPException(status_code=400, detail="인증 credential 조합이 올바르지 않습니다")
+        bearer_value = authorization[7:].strip()
+        if not bearer_value or not hmac.compare_digest(x_api_key, bearer_value):
+            raise HTTPException(status_code=400, detail="API 키 인증 credential이 일치하지 않습니다")
+        authorization = ""
+
     supplied = [value for value in (x_api_key, authorization, x_auth_token) if value]
     if len(supplied) > 1:
         raise HTTPException(status_code=400, detail="여러 인증 credential을 동시에 보낼 수 없습니다")
@@ -221,6 +232,8 @@ async def get_principal(
             "scopes": scopes,
             "source": "api",
             "roles": [],
+            "credential_kind": info.get("credential_kind", "api_key"),
+            "expires_at": info.get("expires_at"),
             "is_system_admin": False,
         }
     else:
@@ -353,6 +366,8 @@ async def get_api_key_info(
         "scopes": scopes,
         "source": "api",
         "roles": [],
+        "credential_kind": info.get("credential_kind", "api_key"),
+        "expires_at": info.get("expires_at"),
         "is_system_admin": False,
     }
     request.state.token_info = principal

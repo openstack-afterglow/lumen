@@ -1,7 +1,11 @@
 """Scoped user memory API.
 
 The request project determines all project/workspace namespaces; clients never
-submit an OpenStack project identifier.
+submit an OpenStack project identifier. Every mutation/list/search route goes
+through the selected ``lumen.memory`` plugin (``MemoryProvider``) with a
+core-owned ``MemoryAccess``; authorization, encryption and the atomic
+mutation+outbox transaction stay entirely inside ``memory_store``/
+``MemoryHost`` regardless of which provider is selected.
 """
 
 from __future__ import annotations
@@ -9,14 +13,17 @@ from __future__ import annotations
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
+from lumen_plugin_api.contracts import Namespace, PluginError
+from lumen_plugin_api.memory import MemoryMutation
 from pydantic import BaseModel, Field
 
 from lumen.auth import require_scopes
 from lumen.config import get_settings
+from lumen.plugins import memory_host
+from lumen.plugins.registry import get_plugin
 from lumen.services import memory_retrieval as mr
 from lumen.services import memory_store as ms
 from lumen.services import workspace_store as ws
-from lumen.services.providers import routing as ps
 from lumen.services.semantic_memory import SemanticMemoryUnavailable, semantic_memory_available
 
 router = APIRouter()
@@ -59,6 +66,14 @@ def _map_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=503, detail=str(exc))
 
 
+def _plugin_http(exc: PluginError) -> HTTPException:
+    if exc.code in {"plugin_unavailable", "plugin_incompatible"}:
+        return HTTPException(status_code=503, detail=exc.code)
+    if exc.code == "plugin_authority_revoked":
+        return HTTPException(status_code=403, detail=exc.code)
+    return HTTPException(status_code=422, detail=exc.code)
+
+
 async def _resolve_namespace(
     *, scope: Literal["account", "project", "workspace"], workspace_id: int | None, token_info: dict
 ) -> tuple[str | None, int | None]:
@@ -79,33 +94,38 @@ async def _resolve_namespace(
     return project_id, workspace_id
 
 
+def _namespace(*, project_id: str | None, workspace_id: int | None, token_info: dict) -> Namespace:
+    return Namespace(
+        user_id=token_info["user_id"],
+        project_id=project_id,
+        workspace_id=workspace_id,
+        include_account=token_info["auth_type"] != "api_key",
+    )
+
+
 @router.post("/memories", status_code=201)
 async def create_memory(payload: MemoryCreate, token_info: dict = Depends(require_scopes("native:memory:write"))):
     try:
         project_id, workspace_id = await _resolve_namespace(
             scope=payload.scope, workspace_id=payload.workspace_id, token_info=token_info
         )
-        return await ms.create_memory(
-            user_id=token_info["user_id"],
-            content=payload.content,
-            scope=payload.scope,
-            project_id=project_id,
-            workspace_id=workspace_id,
-            category=payload.category,
-        )
+        namespace = _namespace(project_id=project_id, workspace_id=workspace_id, token_info=token_info)
+        mutation = MemoryMutation(content=payload.content, category=payload.category, scope=payload.scope)
+        provider = get_plugin("memory")
+        return await provider.create(mutation, memory_host.access_for(namespace))
     except (ms.MemoryValidationError, ms.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
+    except PluginError as exc:
+        raise _plugin_http(exc) from exc
 
 
 @router.get("/memories")
 async def list_memories(token_info: dict = Depends(require_scopes("native:memory:read"))):
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
-        return await ms.list_memories(
-            user_id=token_info["user_id"],
-            project_id=token_info["project_id"],
-            **({"include_account": False} if token_info["auth_type"] == "api_key" else {}),
-        )
+        namespace = _namespace(project_id=token_info["project_id"], workspace_id=None, token_info=token_info)
+        provider = get_plugin("memory")
+        return await provider.list(memory_host.access_for(namespace))
     except ms.ChatStorageUnavailable:
         return []
 
@@ -113,11 +133,9 @@ async def list_memories(token_info: dict = Depends(require_scopes("native:memory
 @router.get("/memories/document", response_model=MemoryDocument)
 async def get_memory_document(token_info: dict = Depends(require_scopes("native:memory:read"))):
     try:
-        memories = await ms.list_memories(
-            user_id=token_info["user_id"],
-            project_id=token_info["project_id"],
-            **({"include_account": False} if token_info["auth_type"] == "api_key" else {}),
-        )
+        namespace = _namespace(project_id=token_info["project_id"], workspace_id=None, token_info=token_info)
+        provider = get_plugin("memory")
+        memories = await provider.list(memory_host.access_for(namespace))
     except ms.ChatStorageUnavailable:
         memories = []
     return MemoryDocument(content=ms.render_memory_markdown(memories))
@@ -133,17 +151,12 @@ async def search_memories(payload: MemorySearch, token_info: dict = Depends(requ
             scope=payload.scope, workspace_id=payload.workspace_id, token_info=token_info
         )
         settings = get_settings()
-        route = await ps.resolve_model(settings.chat_memory_embedding_model)
-        if route is None:
-            raise SemanticMemoryUnavailable("semantic memory embedding route is unavailable")
         ids = await mr.candidate_ids(
             query=payload.query,
-            embedding_route=route,
-            dimensions=settings.chat_memory_embedding_dimensions,
             user_id=token_info["user_id"],
             project_id=project_id,
             workspace_id=workspace_id,
-            limit=settings.chat_memory_candidate_limit,
+            limit=min(30, max(1, settings.chat_memory_candidate_limit)),
         )
         return await ms.hydrate_candidate_ids(
             ids=ids,
@@ -156,6 +169,8 @@ async def search_memories(payload: MemorySearch, token_info: dict = Depends(requ
         raise _map_error(exc) from exc
     except SemanticMemoryUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except PluginError as exc:
+        raise _plugin_http(exc) from exc
 
 
 @router.patch("/memories/{memory_id}")
@@ -163,25 +178,23 @@ async def update_memory(
     memory_id: int, payload: MemoryUpdate, token_info: dict = Depends(require_scopes("native:memory:write"))
 ):
     try:
-        return await ms.update_memory(
-            memory_id,
-            user_id=token_info["user_id"],
-            project_id=token_info["project_id"],
-            patch=payload.model_dump(exclude_unset=True),
-            **({"include_account": False} if token_info["auth_type"] == "api_key" else {}),
-        )
+        namespace = _namespace(project_id=token_info["project_id"], workspace_id=None, token_info=token_info)
+        mutation = MemoryMutation(content=payload.content, category=payload.category, is_active=payload.is_active)
+        provider = get_plugin("memory")
+        return await provider.update(memory_id, mutation, memory_host.access_for(namespace))
     except (ms.MemoryNotFound, ms.MemoryForbidden, ms.MemoryValidationError, ms.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
+    except PluginError as exc:
+        raise _plugin_http(exc) from exc
 
 
 @router.delete("/memories/{memory_id}", status_code=204)
 async def delete_memory(memory_id: int, token_info: dict = Depends(require_scopes("native:memory:write"))):
     try:
-        await ms.delete_memory(
-            memory_id,
-            user_id=token_info["user_id"],
-            project_id=token_info["project_id"],
-            **({"include_account": False} if token_info["auth_type"] == "api_key" else {}),
-        )
+        namespace = _namespace(project_id=token_info["project_id"], workspace_id=None, token_info=token_info)
+        provider = get_plugin("memory")
+        await provider.delete(memory_id, memory_host.access_for(namespace))
     except (ms.MemoryNotFound, ms.MemoryForbidden, ms.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
+    except PluginError as exc:
+        raise _plugin_http(exc) from exc

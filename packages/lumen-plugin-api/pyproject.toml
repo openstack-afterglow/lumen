@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lumen-plugin-api"
+version = "0.1.0"
+description = "Versioned host capability contracts for trusted Lumen plugins"
+requires-python = ">=3.11"
+dependencies = ["pydantic==2.13.4", "jsonschema==4.26.0"]
+
+[project.optional-dependencies]
+database = ["sqlalchemy[asyncio]>=2.0.0"]
+testing = ["pytest>=9.0.3", "pytest-asyncio>=0.24"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["lumen_plugin_api"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

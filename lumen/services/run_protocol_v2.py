@@ -9,15 +9,24 @@ from __future__ import annotations
 from typing import Literal
 
 RunStatusV2 = Literal[
-    "queued", "running", "awaiting_input", "waiting_children", "finalizing", "completed", "failed", "canceled"
+    "queued",
+    "running",
+    "awaiting_input",
+    "waiting_children",
+    "waiting_resource",
+    "finalizing",
+    "completed",
+    "failed",
+    "canceled",
 ]
 
-_NONTERMINAL = frozenset({"queued", "running", "awaiting_input", "waiting_children", "finalizing"})
+_NONTERMINAL = frozenset({"queued", "running", "awaiting_input", "waiting_children", "waiting_resource", "finalizing"})
 _TRANSITIONS: dict[str, frozenset[str]] = {
-    "queued": frozenset({"running", "finalizing"}),
-    "running": frozenset({"awaiting_input", "waiting_children", "finalizing"}),
+    "queued": frozenset({"running", "waiting_resource", "finalizing"}),
+    "running": frozenset({"awaiting_input", "waiting_children", "waiting_resource", "finalizing"}),
     "awaiting_input": frozenset({"queued", "finalizing"}),
     "waiting_children": frozenset({"queued", "finalizing"}),
+    "waiting_resource": frozenset({"queued", "finalizing"}),
     "finalizing": frozenset({"completed", "failed", "canceled"}),
     "completed": frozenset(),
     "failed": frozenset(),

@@ -2,6 +2,8 @@
 
 import json
 import uuid
+from datetime import timedelta
+from decimal import Decimal
 from typing import Any, Literal
 
 from sqlalchemy import select
@@ -11,6 +13,7 @@ from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
 from lumen.models.chat_contracts import ChatRunDescriptor, validate_user_input_parts
 from lumen.models.chat_db import ChatConversation, ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatRunProvider, ChatTempThread
+from lumen.services.message_graph import append_active_message
 from lumen.services.message_parts import serialize_parts
 from lumen.services.message_timestamps import message_timestamps
 from lumen.services.providers import routing as ps
@@ -29,6 +32,64 @@ from .common import (
     wake_run,
 )
 from .errors import DurableRunConflict, DurableRunError, DurableRunInputError, DurableRunNotFound
+
+
+async def _apply_root_budget(
+    session,
+    run: ChatRun,
+    *,
+    agent_budget: dict[str, Any] | None,
+    execution_mode: str,
+    quota,
+    order,
+) -> bool:
+    """Freeze explicit root ceilings; a ``code`` root also takes its sandbox intent now.
+
+    Returns True when the run must start in ``waiting_resource`` instead of ``queued``.
+    Ceilings are never inferred from NULL, and the sandbox slot/seconds are reserved
+    against the project caps before the run becomes runnable.
+    """
+    from lumen.config import get_settings
+    from lumen.services.infrastructure import store as infra_store
+
+    from . import budgets
+
+    if agent_budget is None:
+        if execution_mode != "chat":
+            raise DurableRunInputError("agent_budget is required for plan and code execution modes")
+        return False
+    credit = Decimal(str(agent_budget["credit_ceiling"]))
+    sandbox_seconds = int(agent_budget["sandbox_seconds_ceiling"])
+    wall_time = int(agent_budget["wall_time_seconds"])
+    if credit <= 0 or sandbox_seconds <= 0 or wall_time <= 0:
+        raise DurableRunInputError("agent_budget values must be positive")
+    run.credit_ceiling = credit
+    # Existing descendant ceiling stays a separate, never-wider cap.
+    run.descendant_credit_ceiling = credit if run.descendant_credit_ceiling is None else min(
+        Decimal(str(run.descendant_credit_ceiling)), credit
+    )
+    run.sandbox_seconds_ceiling = sandbox_seconds
+    run.wall_time_seconds = wall_time
+    run.deadline_at = _now() + timedelta(seconds=wall_time)
+    if execution_mode != "code":
+        return False
+    try:
+        await budgets.reserve(session, quota=quota, root=run, run_id=run.id, kind="sandbox_slot", amount=1, order=order)
+        await budgets.reserve(
+            session, quota=quota, root=run, run_id=run.id, kind="sandbox_seconds", amount=sandbox_seconds, order=order
+        )
+        await infra_store.assign_sandbox(
+            session,
+            run=run,
+            config=get_settings().runtime_config,
+            deadline_at=_now() + timedelta(seconds=min(sandbox_seconds, wall_time)),
+            order=order,
+        )
+    except budgets.BudgetExceeded as exc:
+        raise DurableRunInputError(str(exc)) from exc
+    except infra_store.ResourceUnavailable as exc:
+        raise DurableRunInputError(f"sandbox is unavailable ({exc.code})") from exc
+    return True
 
 
 async def existing_run_for_intent(
@@ -239,6 +300,8 @@ async def create_persistent_run(
     source: str = "web",
     api_key_id: int | None = None,
     expected_parent_id: int | None = None,
+    agent_budget: dict[str, Any] | None = None,
+    execution_mode: str = "chat",
 ) -> ChatRunDescriptor:
     """Atomically create the user turn, run, and first journal event.
 
@@ -265,6 +328,13 @@ async def create_persistent_run(
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        from . import budgets
+
+        order = budgets.LockOrder()
+        quota = None
+        if agent_budget is not None or execution_mode != "chat":
+            quota = await budgets.lock_project_quota(session, project_id, order=order)
+        order.take("conversation")
         conversation = (
             await session.execute(
                 select(ChatConversation)
@@ -294,6 +364,8 @@ async def create_persistent_run(
             if existing.request_fingerprint != fingerprint:
                 raise DurableRunConflict("idempotency_key_reused_with_different_intent")
             return descriptor(existing)
+        if not conversation.history_index_ready:
+            raise DurableRunConflict("history_index_unavailable")
 
         active = (
             await session.execute(
@@ -327,6 +399,12 @@ async def create_persistent_run(
         )
         session.add(user_message)
         await session.flush()
+        await append_active_message(
+            session,
+            conversation_id=conversation_id,
+            parent_id=conversation.active_leaf_id,
+            message_id=user_message.id,
+        )
         conversation.active_leaf_id = user_message.id
 
         canonical_parts = await _canonical_user_parts(session, parts=user_parts, user_id=user_id, project_id=project_id)
@@ -352,6 +430,7 @@ async def create_persistent_run(
             agent_id=agent_id,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
+            required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
             pricing_snapshot=pricing_snapshot,
             request_payload=encrypt_chat_content(
                 json.dumps(request_payload, ensure_ascii=False, separators=(",", ":"))
@@ -363,9 +442,17 @@ async def create_persistent_run(
             run_kind=run_kind,
             current_ordinal=0,
             status="queued",
+            execution_mode=execution_mode,
         )
         _add_run_providers(session, run, capability_snapshot)
         session.add(run)
+        await session.flush()
+        order.take("root")
+        waiting_resource = await _apply_root_budget(
+            session, run, agent_budget=agent_budget, execution_mode=execution_mode, quota=quota, order=order
+        )
+        if waiting_resource:
+            run.status = "waiting_resource"
         await append_event(
             session,
             run,
@@ -381,9 +468,10 @@ async def create_persistent_run(
                 },
             ),
         )
-        await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+        await append_event(session, run, _event(run, "run.stage.changed", {"stage": run.status}))
         created = descriptor(run)
-    await wake_run(created.run_id)
+    if created.status == "queued":
+        await wake_run(created.run_id)
     return created
 
 
@@ -406,6 +494,8 @@ async def create_run(
     source: str = "web",
     api_key_id: int | None = None,
     expected_parent_id: int | None = None,
+    agent_budget: dict[str, Any] | None = None,
+    execution_mode: str = "chat",
 ) -> ChatRunDescriptor:
     """Create/reuse one owner-scoped run and its first durable event."""
     try:
@@ -424,6 +514,13 @@ async def create_run(
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        from . import budgets
+
+        order = budgets.LockOrder()
+        quota = None
+        if agent_budget is not None or execution_mode != "chat":
+            quota = await budgets.lock_project_quota(session, project_id, order=order)
+        order.take("conversation")
         conv = None
         thread = None
         if conversation_id is not None:
@@ -510,6 +607,7 @@ async def create_run(
             api_key_id=api_key_id,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
+            required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
             pricing_snapshot=pricing_snapshot,
             request_payload=encrypt_chat_content(
                 json.dumps(request_payload, ensure_ascii=False, separators=(",", ":"))
@@ -521,9 +619,16 @@ async def create_run(
             current_ordinal=0,
             run_kind=run_kind,
             status="queued",
+            execution_mode=execution_mode,
         )
         session.add(run)
         _add_run_providers(session, run, capability_snapshot)
+        await session.flush()
+        order.take("root")
+        if await _apply_root_budget(
+            session, run, agent_budget=agent_budget, execution_mode=execution_mode, quota=quota, order=order
+        ):
+            run.status = "waiting_resource"
         if temp_thread_id is not None:
             thread.active_run_id = run.id
         await append_event(
@@ -541,9 +646,10 @@ async def create_run(
                 },
             ),
         )
-        await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+        await append_event(session, run, _event(run, "run.stage.changed", {"stage": run.status}))
         created = descriptor(run)
-    await wake_run(created.run_id)
+    if created.status == "queued":
+        await wake_run(created.run_id)
     return created
 
 
@@ -641,6 +747,7 @@ async def create_temp_run(
             api_key_id=api_key_id,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
+            required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
             pricing_snapshot=pricing_snapshot,
             request_payload=encrypt_chat_content(
                 json.dumps(request_payload, ensure_ascii=False, separators=(",", ":"))
@@ -831,6 +938,7 @@ async def create_compaction_run(
             api_key_id=api_key_id,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
+            required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
             pricing_snapshot=pricing_snapshot,
             request_payload=encrypt_chat_content(
                 json.dumps(request_payload, ensure_ascii=False, separators=(",", ":"))

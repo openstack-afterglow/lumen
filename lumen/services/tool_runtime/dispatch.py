@@ -4,57 +4,15 @@ from __future__ import annotations
 
 import logging
 
-from lumen.services import mcp_client, ssrf, tools
-from lumen.services.agent_protocol import validate_tool_arguments
+from lumen_plugin_api.contracts import PluginError
+from lumen_plugin_api.tools import validate_tool_arguments
+
+from lumen.services import mcp_client, tools
 from lumen.services.tools import ToolContext
 
 from . import bindings, contracts, managed, selection
 
 logger = logging.getLogger(__name__)
-_MAX_RESPONSE_BYTES = 64 * 1024
-_MAX_RESPONSE_CHARS = 4000
-
-
-async def _read_bounded_response(response) -> str:
-    content_encoding = response.headers.get("content-encoding", "identity").strip().lower()
-    if content_encoding not in ("", "identity"):
-        return "압축된 툴 응답은 허용되지 않습니다."
-    content = bytearray()
-    async for chunk in response.aiter_bytes():
-        if len(content) + len(chunk) > _MAX_RESPONSE_BYTES:
-            return "툴 응답이 허용 크기를 초과했습니다."
-        content.extend(chunk)
-    return content.decode(response.encoding or "utf-8", errors="replace")[:_MAX_RESPONSE_CHARS]
-
-
-async def _execute_custom_http_tool(tool_def: dict, args: dict, ctx: ToolContext) -> str:
-    """커스텀 HTTP 툴을 SSRF 가드 후 대리 호출. 항상 안전한 문자열 반환."""
-    url = tool_def.get("url") or ""
-    method = (tool_def.get("method") or "GET").upper()
-    timeout = int(tool_def.get("timeout_seconds") or 10)
-
-    safe_args = args if isinstance(args, dict) else {}
-    try:
-        import httpx
-
-        # 인증 헤더 미부착(사용자 토큰 유출 방지), redirect 미추적(내부 우회 차단).
-        async with httpx.AsyncClient(
-            transport=ssrf.SafeAsyncTransport(),
-            headers={"Accept-Encoding": "identity"},
-            timeout=timeout,
-            follow_redirects=False,
-            trust_env=False,
-        ) as cx:
-            request_kwargs = {"json": safe_args} if method == "POST" else {"params": safe_args}
-            request_method = "POST" if method == "POST" else "GET"
-            async with cx.stream(request_method, url, **request_kwargs) as response:
-                body = await _read_bounded_response(response)
-                return f"[{response.status_code}] {body}"
-    except ssrf.SsrfBlocked:
-        return "허용되지 않은 URL 입니다(내부/사설 주소 차단)."
-    except Exception:
-        logger.warning("커스텀 툴 HTTP 호출 실패 name=%s", tool_def.get("name"), exc_info=True)
-        return "툴 호출 중 오류가 발생했습니다."
 
 
 async def _execute_mcp_tool(name: str, args: dict, ctx: ToolContext) -> str:
@@ -113,10 +71,12 @@ async def context_execute_result(name: str, args: dict, ctx: ToolContext) -> con
         return await managed._execute_managed_advisor(args, ctx)
     if name.startswith(selection._MCP_PREFIX):
         return contracts._visible_result(await _execute_mcp_tool(name, args, ctx))
-    if name in tools._TOOL_BY_NAME:
-        tool = tools._TOOL_BY_NAME[name]
+    if name in {"list_my_conversations", "get_conversation_detail"}:
+        from lumen.plugins.tools_host import bind_default_tool
+
+        binding = await bind_default_tool(name, contracts.execution_context(ctx))
         try:
-            safe_args = validate_tool_arguments({**tool.parameters, "additionalProperties": False}, args)
+            safe_args = validate_tool_arguments(binding.definition.input_schema, args)
         except ValueError:
             return contracts.ToolExecutionResult(
                 "Tool arguments do not match the required schema.",
@@ -124,9 +84,26 @@ async def context_execute_result(name: str, args: dict, ctx: ToolContext) -> con
                 status="failed",
             )
         return contracts._visible_result(await tools.execute_tool(name, safe_args, ctx))
-    customs = {tool["name"]: tool for tool in await selection._load_custom(ctx)}
-    if name in customs:
-        return contracts._visible_result(await _execute_custom_http_tool(customs[name], args, ctx))
+    from lumen.plugins.tools_host import bind_default_tool
+
+    for tool_def in await selection._load_custom(ctx):
+        try:
+            binding = await bind_default_tool("custom_http", contracts.execution_context(ctx), tool_def)
+        except (PluginError, TypeError, ValueError):
+            continue
+        if binding.definition.name == name:
+            try:
+                safe_args = validate_tool_arguments(binding.definition.input_schema, args)
+            except ValueError:
+                return contracts.ToolExecutionResult("Tool arguments do not match the required schema.")
+            try:
+                result = await binding.execute(safe_args, contracts.execution_context(ctx))
+            except PluginError:
+                return contracts.ToolExecutionResult(
+                    "The selected custom tool is no longer available.",
+                    warning_code="extension_unavailable", status="failed",
+                )
+            return contracts._visible_result(result.model_content)
     return contracts.ToolExecutionResult(f"알 수 없는 툴입니다: {name}")
 
 

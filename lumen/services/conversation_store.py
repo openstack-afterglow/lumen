@@ -13,14 +13,20 @@ import logging
 import uuid
 from datetime import UTC
 
-from sqlalchemy import literal, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import aliased
 
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
-from lumen.models.chat_db import ChatConversation, ChatMessage, ChatWorkspace
+from lumen.models.chat_db import ChatConversation, ChatConversationActivePath, ChatMessage, ChatWorkspace
 from lumen.models.chat_runs import ChatRun, ChatRunSegment, ChatRunTurn
+from lumen.services.message_graph import (
+    MessageGraphError,
+    ancestor_message_ids,
+    append_active_message,
+    replace_active_path,
+)
 from lumen.services.message_parts import deserialize_parts, serialize_parts
 from lumen.services.message_timestamps import message_timestamps
 from lumen.services.run_store import NONTERMINAL, replay_events
@@ -79,6 +85,18 @@ class ConversationRunActive(RuntimeError):
     code = "conversation_run_active"
 
 
+class HistoryIndexUnavailable(RuntimeError):
+    """The active-path backfill has not completed for this conversation."""
+
+    code = "history_index_unavailable"
+
+
+class HistoryRevisionChanged(RuntimeError):
+    """A cursor was minted for an obsolete selected-path revision."""
+
+    code = "history_revision_changed"
+
+
 def _require_db():
     if not is_db_available():
         raise ChatStorageUnavailable("chat DB 를 사용할 수 없습니다")
@@ -111,6 +129,7 @@ def _conv_public(row: ChatConversation) -> dict:
         "model_name": row.model_name,
         "workspace_id": row.workspace_id,
         "active_leaf_id": row.active_leaf_id,
+        "history_revision": int(row.history_revision or 0),
         "parent_conversation_id": row.parent_conversation_id,
         "forked_from_message_id": row.forked_from_message_id,
         "created_at": _iso(row.created_at),
@@ -182,6 +201,8 @@ async def create_conversation(
         title_revision=0,
         model_name=(model_name or None),
         workspace_id=workspace_id,
+        history_revision=0,
+        history_index_ready=True,
     )
     try:
         async with factory() as session, session.begin():
@@ -406,11 +427,14 @@ async def list_messages(
     factory = _require_db()
     try:
         async with factory() as session:
-            await _load_owned(session, conv_id, user_id, project_id)  # 소유권 검증
+            conversation = await _load_owned(session, conv_id, user_id, project_id)
+            if not conversation.history_index_ready:
+                raise HistoryIndexUnavailable("conversation history index is unavailable")
             stmt = (
                 select(ChatMessage)
-                .where(ChatMessage.conversation_id == conv_id)
-                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                .join(ChatConversationActivePath, ChatConversationActivePath.message_id == ChatMessage.id)
+                .where(ChatConversationActivePath.conversation_id == conv_id)
+                .order_by(ChatConversationActivePath.position.asc())
                 .limit(min(limit, 500))
                 .offset(max(offset, 0))
             )
@@ -555,11 +579,7 @@ async def add_message(
     client_timezone: str | None = None,
     set_leaf: bool = False,
 ) -> dict:
-    """메시지 추가(소유권은 호출부가 이미 검증했다고 가정 — 완료 경로 내부용).
-
-    버전 트리: parent_id 로 부모를 잇는다(같은 parent = 재생성 형제). set_leaf=True 면 대화의
-    active_leaf_id 를 이 메시지로 갱신한다(활성 경로의 새 리프). model_name 은 형제 버전 라벨.
-    """
+    """Add a message and atomically append it to the selected path when requested."""
     factory = _require_db()
     created_at, created_at_local, created_timezone = message_timestamps(client_timezone)
     row = ChatMessage(
@@ -583,12 +603,29 @@ async def add_message(
     )
     try:
         async with factory() as session, session.begin():
+            conv = None
+            if set_leaf:
+                conv = (
+                    await session.execute(
+                        select(ChatConversation).where(ChatConversation.id == conv_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if conv is None:
+                    raise ConversationNotFound(f"대화 {conv_id} 를 찾을 수 없습니다")
+                if not conv.history_index_ready:
+                    raise HistoryIndexUnavailable("conversation history index is unavailable")
+                if conv.active_leaf_id != parent_id:
+                    raise MessageGraphError("message parent is not the active leaf")
             session.add(row)
             await session.flush()
-            if set_leaf:
-                conv = await session.get(ChatConversation, conv_id)
-                if conv is not None:
-                    conv.active_leaf_id = row.id
+            if conv is not None:
+                await append_active_message(
+                    session,
+                    conversation_id=conv_id,
+                    parent_id=parent_id,
+                    message_id=row.id,
+                )
+                conv.active_leaf_id = row.id
             return _msg_public(row)
     except OperationalError as exc:
         mark_db_unhealthy()
@@ -608,7 +645,7 @@ async def complete_message_in_transaction(
     token_prompt: int = 0,
     token_completion: int = 0,
 ) -> None:
-    """Finalize an assistant placeholder in the caller's transaction."""
+    """Finalize a placeholder and project it only after its canonical body is durable."""
     from lumen.services.message_parts import serialize_parts
 
     if status not in {"complete", "failed", "canceled"}:
@@ -620,10 +657,16 @@ async def complete_message_in_transaction(
             parts.append({"type": "text", "text": content})
         if reasoning:
             parts.append({"type": "reasoning", "text": reasoning, "visibility": "user"})
+    conv = (
+        await session.execute(select(ChatConversation).where(ChatConversation.id == conv_id).with_for_update())
+    ).scalar_one_or_none()
     message = await session.get(ChatMessage, message_id)
-    conv = await session.get(ChatConversation, conv_id)
     if message is None or message.conversation_id != conv_id or conv is None:
         raise ConversationNotFound(f"메시지 {message_id} 를 대화에서 찾을 수 없습니다")
+    if not conv.history_index_ready:
+        raise HistoryIndexUnavailable("conversation history index is unavailable")
+    if conv.active_leaf_id != message.parent_id:
+        raise MessageGraphError("assistant parent is not the active leaf")
     message.content = _enc(content)
     message.reasoning = _enc(reasoning)
     message.parts = serialize_parts(parts) if parts else None
@@ -632,6 +675,12 @@ async def complete_message_in_transaction(
     message.model_name = model_name
     message.token_prompt = token_prompt
     message.token_completion = token_completion
+    await append_active_message(
+        session,
+        conversation_id=conv_id,
+        parent_id=message.parent_id,
+        message_id=message.id,
+    )
     conv.active_leaf_id = message.id
 
 
@@ -675,135 +724,147 @@ def _backtrack(rows: list[ChatMessage], leaf_id: int | None) -> list[ChatMessage
 
 
 async def get_active_path(conv_id: str, *, user_id: str, project_id: str) -> dict:
-    """active_leaf 에서 역추적한 활성 경로(모델 입력·재개용). {"messages":[오름차순], "active_leaf_id"}."""
+    """Load the selected root-to-leaf path from its indexed projection."""
     factory = _require_db()
     try:
         async with factory() as session:
             conv = await _load_owned(session, conv_id, user_id, project_id)
+            if not conv.history_index_ready:
+                raise HistoryIndexUnavailable("conversation history index is unavailable")
             rows = (
-                (await session.execute(select(ChatMessage).where(ChatMessage.conversation_id == conv_id)))
-                .scalars()
-                .all()
-            )
-            path = _backtrack(list(rows), conv.active_leaf_id)
-            return {"messages": [_msg_public(r) for r in path], "active_leaf_id": conv.active_leaf_id}
+                await session.execute(
+                    select(ChatMessage)
+                    .join(ChatConversationActivePath, ChatConversationActivePath.message_id == ChatMessage.id)
+                    .where(ChatConversationActivePath.conversation_id == conv_id)
+                    .order_by(ChatConversationActivePath.position.asc())
+                )
+            ).scalars()
+            return {"messages": [_msg_public(row) for row in rows], "active_leaf_id": conv.active_leaf_id}
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
 async def path_ending_at(conv_id: str, *, user_id: str, project_id: str, message_id: int) -> list[dict]:
-    """message_id 를 리프로 한 경로(루트→message_id 오름차순). 재생성 모델 입력용."""
+    """Load only the ancestor chain for an arbitrary owned branch anchor."""
     factory = _require_db()
     try:
         async with factory() as session:
             await _load_owned(session, conv_id, user_id, project_id)
-            rows = (
-                (await session.execute(select(ChatMessage).where(ChatMessage.conversation_id == conv_id)))
-                .scalars()
-                .all()
-            )
-            return [_msg_public(r) for r in _backtrack(list(rows), message_id)]
+            try:
+                message_ids = await ancestor_message_ids(
+                    session,
+                    conversation_id=conv_id,
+                    leaf_id=message_id,
+                )
+            except MessageGraphError as exc:
+                raise ConversationNotFound(f"메시지 {message_id} 를 대화에서 찾을 수 없습니다") from exc
+            rows = (await session.execute(select(ChatMessage).where(ChatMessage.id.in_(message_ids)))).scalars()
+            by_id = {row.id: row for row in rows}
+            return [_msg_public(by_id[item]) for item in message_ids]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def list_message_tree(
+async def list_message_page(
     conv_id: str,
     *,
     user_id: str,
     project_id: str,
-    before_id: int | None = None,
+    anchor: str = "latest",
+    cursor_direction: str | None = None,
+    cursor_position: int | None = None,
+    expected_revision: int | None = None,
     limit: int = 40,
 ) -> dict:
-    """Fetch one backwards page through the conversation index in a single normal-path query."""
+    """Return one bounded page from the indexed active path in display order."""
     factory = _require_db()
     page_size = max(1, min(limit, 100))
     try:
         async with factory() as session:
-            conversation = aliased(ChatConversation)
-            parent = aliased(ChatMessage)
-            seed_id = before_id if before_id is not None else conversation.active_leaf_id
-            active_path = (
-                select(
-                    ChatMessage.id.label("id"),
-                    ChatMessage.parent_id.label("parent_id"),
-                    literal(0).label("depth"),
-                )
-                .join(conversation, ChatMessage.conversation_id == conversation.id)
+            conv = await _load_owned(session, conv_id, user_id, project_id)
+            if not conv.history_index_ready:
+                raise HistoryIndexUnavailable("conversation history index is unavailable")
+            revision = int(conv.history_revision or 0)
+            if expected_revision is not None and expected_revision != revision:
+                raise HistoryRevisionChanged("conversation history revision changed")
+
+            previous = aliased(ChatMessage)
+            following = aliased(ChatMessage)
+            same_previous_parent = or_(
+                previous.parent_id == ChatMessage.parent_id,
+                and_(previous.parent_id.is_(None), ChatMessage.parent_id.is_(None)),
+            )
+            same_following_parent = or_(
+                following.parent_id == ChatMessage.parent_id,
+                and_(following.parent_id.is_(None), ChatMessage.parent_id.is_(None)),
+            )
+            previous_id = (
+                select(previous.id)
                 .where(
-                    ChatMessage.id == seed_id,
-                    conversation.id == conv_id,
-                    conversation.user_id == user_id,
-                    conversation.project_id == project_id,
+                    previous.conversation_id == ChatMessage.conversation_id,
+                    previous.role == ChatMessage.role,
+                    same_previous_parent,
+                    or_(
+                        previous.created_at < ChatMessage.created_at,
+                        and_(previous.created_at == ChatMessage.created_at, previous.id < ChatMessage.id),
+                    ),
                 )
-                .cte("active_path", recursive=True)
+                .order_by(previous.created_at.desc(), previous.id.desc())
+                .limit(1)
+                .correlate(ChatMessage)
+                .scalar_subquery()
             )
-            active_path = active_path.union_all(
+            next_id = (
+                select(following.id)
+                .where(
+                    following.conversation_id == ChatMessage.conversation_id,
+                    following.role == ChatMessage.role,
+                    same_following_parent,
+                    or_(
+                        following.created_at > ChatMessage.created_at,
+                        and_(following.created_at == ChatMessage.created_at, following.id > ChatMessage.id),
+                    ),
+                )
+                .order_by(following.created_at.asc(), following.id.asc())
+                .limit(1)
+                .correlate(ChatMessage)
+                .scalar_subquery()
+            )
+            query = (
                 select(
-                    parent.id.label("id"),
-                    parent.parent_id.label("parent_id"),
-                    (active_path.c.depth + 1).label("depth"),
+                    ChatMessage,
+                    ChatConversationActivePath.position,
+                    previous_id.label("previous_id"),
+                    next_id.label("next_id"),
                 )
-                .join(active_path, parent.id == active_path.c.parent_id)
-                .where(active_path.c.depth < page_size)
+                .join(ChatConversationActivePath, ChatConversationActivePath.message_id == ChatMessage.id)
+                .where(ChatConversationActivePath.conversation_id == conv_id)
             )
-            rows = (
-                await session.execute(
-                    select(ChatMessage, conversation.active_leaf_id)
-                    .join(active_path, ChatMessage.id == active_path.c.id)
-                    .join(conversation, ChatMessage.conversation_id == conversation.id)
-                    .where(
-                        conversation.id == conv_id,
-                        conversation.user_id == user_id,
-                        conversation.project_id == project_id,
-                    )
-                    .order_by(active_path.c.depth.asc())
-                    .limit(page_size + 1)
-                )
-            ).all()
-            if not rows:
-                # Preserve 404/403 semantics for empty conversations without penalizing
-                # the normal non-empty history page.
-                conv = await _load_owned(session, conv_id, user_id, project_id)
-                return {
-                    "messages": [],
-                    "tree_nodes": [],
-                    "active_leaf_id": conv.active_leaf_id,
-                    "has_more": False,
-                    "next_before_id": None,
-                }
-            tree_nodes: list[dict] = []
-            if before_id is None:
-                # Full-tree metadata is sent only with the initial page. Older pages
-                # carry text only; the client retains this lightweight branch map.
-                tree_rows = (
-                    await session.execute(
-                        select(
-                            ChatMessage.id,
-                            ChatMessage.parent_id,
-                            ChatMessage.role,
-                            ChatMessage.created_at,
-                        )
-                        .where(ChatMessage.conversation_id == conv_id)
-                        .order_by(ChatMessage.id.asc())
-                    )
-                ).all()
-                tree_nodes = [
-                    {
-                        "id": row.id,
-                        "parent_id": row.parent_id,
-                        "role": row.role,
-                        "created_at": _iso(row.created_at),
-                    }
-                    for row in tree_rows
-                ]
-            has_more = len(rows) > page_size
+            descending = False
+            if cursor_direction == "before":
+                if cursor_position is None:
+                    raise ValueError("before cursor position is required")
+                query = query.where(ChatConversationActivePath.position < cursor_position)
+                descending = True
+            elif cursor_direction == "after":
+                if cursor_position is None:
+                    raise ValueError("after cursor position is required")
+                query = query.where(ChatConversationActivePath.position > cursor_position)
+            elif anchor == "latest":
+                descending = True
+            elif anchor != "first":
+                raise ValueError("history anchor is invalid")
+            order = (
+                ChatConversationActivePath.position.desc() if descending else ChatConversationActivePath.position.asc()
+            )
+            rows = (await session.execute(query.order_by(order).limit(page_size + 1))).all()
             page = rows[:page_size]
-            page.reverse()
-            active_leaf_id = page[-1][1]
-            user_message_ids = [message.id for message, _leaf in page if message.role == "user"]
+            if descending:
+                page.reverse()
+
+            user_message_ids = [row.ChatMessage.id for row in page if row.ChatMessage.role == "user"]
             execution_by_message: dict[int, dict] = {}
             if user_message_ids:
                 run_rows = (
@@ -821,25 +882,57 @@ async def list_message_tree(
                         "status": run.status,
                         "retryable": run.status in {"failed", "canceled"},
                     }
-            messages = [_msg_public(message, execution=execution_by_message.get(message.id)) for message, _leaf in page]
+
+            messages: list[dict] = []
+            for row in page:
+                message = row.ChatMessage
+                public = _msg_public(message, execution=execution_by_message.get(message.id))
+                public["position"] = int(row.position)
+                public["branch"] = {
+                    "previous_id": row.previous_id,
+                    "next_id": row.next_id,
+                }
+                messages.append(public)
+            first_position = int(page[0].position) if page else None
+            last_position = int(page[-1].position) if page else None
+            terminal_position = (
+                await session.execute(
+                    select(ChatConversationActivePath.position)
+                    .where(ChatConversationActivePath.conversation_id == conv_id)
+                    .order_by(ChatConversationActivePath.position.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            has_before = first_position is not None and first_position > 0
+            has_after = (
+                last_position is not None and terminal_position is not None and last_position < int(terminal_position)
+            )
             return {
                 "messages": messages,
-                "tree_nodes": tree_nodes,
-                "active_leaf_id": active_leaf_id,
-                "has_more": has_more,
-                "next_before_id": messages[0]["parent_id"] if has_more and messages else None,
+                "active_leaf_id": conv.active_leaf_id,
+                "history_revision": revision,
+                "has_before": has_before,
+                "has_after": has_after,
+                "before_position": first_position if has_before else None,
+                "after_position": last_position if has_after else None,
             }
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def set_active_leaf(conv_id: str, *, user_id: str, project_id: str, message_id: int) -> dict:
-    """Move the active branch only when no durable run is currently mutating it."""
+async def set_active_leaf(
+    conv_id: str,
+    *,
+    user_id: str,
+    project_id: str,
+    message_id: int,
+    descend: bool = False,
+) -> dict:
+    """Move the selected branch under the conversation-then-run lock order."""
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
-            await _load_owned(session, conv_id, user_id, project_id)
             conv = (
                 await session.execute(
                     select(ChatConversation)
@@ -850,7 +943,12 @@ async def set_active_leaf(conv_id: str, *, user_id: str, project_id: str, messag
                     )
                     .with_for_update()
                 )
-            ).scalar_one()
+            ).scalar_one_or_none()
+            if conv is None:
+                await _load_owned(session, conv_id, user_id, project_id)
+                raise ConversationNotFound(f"대화 {conv_id} 를 찾을 수 없습니다")
+            if not conv.history_index_ready:
+                raise HistoryIndexUnavailable("conversation history index is unavailable")
             active = (
                 await session.execute(
                     select(ChatRun.id)
@@ -863,7 +961,35 @@ async def set_active_leaf(conv_id: str, *, user_id: str, project_id: str, messag
             msg = await session.get(ChatMessage, message_id, with_for_update=True)
             if msg is None or msg.conversation_id != conv_id:
                 raise ConversationNotFound(f"메시지 {message_id} 를 대화에서 찾을 수 없습니다")
-            conv.active_leaf_id = message_id
+            selected_id = message_id
+            if descend:
+                seen = {selected_id}
+                while True:
+                    child_id = (
+                        await session.execute(
+                            select(ChatMessage.id)
+                            .where(
+                                ChatMessage.conversation_id == conv_id,
+                                ChatMessage.parent_id == selected_id,
+                            )
+                            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                    if child_id is None:
+                        break
+                    if int(child_id) in seen:
+                        raise MessageGraphError("message ancestry contains a cycle")
+                    selected_id = int(child_id)
+                    seen.add(selected_id)
+            if conv.active_leaf_id != selected_id:
+                await replace_active_path(
+                    session,
+                    conversation_id=conv_id,
+                    leaf_id=selected_id,
+                )
+                conv.active_leaf_id = selected_id
+                conv.history_revision = int(conv.history_revision or 0) + 1
             return _conv_public(conv)
     except OperationalError as exc:
         mark_db_unhealthy()
@@ -886,24 +1012,32 @@ async def get_message_owned(conv_id: str, *, user_id: str, project_id: str, mess
 
 
 async def find_turn_start_user(conv_id: str, *, user_id: str, project_id: str, message_id: int) -> dict | None:
-    """message_id 에서 위로 걸어 가장 가까운 role='user' 메시지(재생성 분기점). 없으면 None."""
+    """Find the nearest user ancestor without loading sibling branches."""
     factory = _require_db()
     try:
         async with factory() as session:
             await _load_owned(session, conv_id, user_id, project_id)
-            rows = (
-                (await session.execute(select(ChatMessage).where(ChatMessage.conversation_id == conv_id)))
+            try:
+                message_ids = await ancestor_message_ids(
+                    session,
+                    conversation_id=conv_id,
+                    leaf_id=message_id,
+                )
+            except MessageGraphError:
+                return None
+            row = (
+                (
+                    await session.execute(
+                        select(ChatMessage).where(ChatMessage.id.in_(message_ids), ChatMessage.role == "user")
+                    )
+                )
                 .scalars()
                 .all()
             )
-            by_id = {r.id: r for r in rows}
-            cur = by_id.get(message_id)
-            seen: set[int] = set()
-            while cur is not None and cur.id not in seen:
-                if cur.role == "user":
-                    return _msg_public(cur)
-                seen.add(cur.id)
-                cur = by_id.get(cur.parent_id) if cur.parent_id else None
+            by_id = {message.id: message for message in row}
+            for ancestor_id in reversed(message_ids):
+                if ancestor_id in by_id:
+                    return _msg_public(by_id[ancestor_id])
             return None
     except OperationalError as exc:
         mark_db_unhealthy()
@@ -911,24 +1045,23 @@ async def find_turn_start_user(conv_id: str, *, user_id: str, project_id: str, m
 
 
 async def fork_conversation(conv_id: str, *, user_id: str, project_id: str, message_id: int) -> dict:
-    """message_id 까지의 경로를 새 대화로 복사(분기). 소유자 동일, 원본 독립."""
+    """Copy one selected ancestor path into a new, independently indexed conversation."""
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
             conv = await _load_owned(session, conv_id, user_id, project_id)
-            rows = list(
-                (await session.execute(select(ChatMessage).where(ChatMessage.conversation_id == conv_id)))
-                .scalars()
-                .all()
-            )
-            by_id = {r.id: r for r in rows}
-            if message_id not in by_id:
-                raise ConversationNotFound(f"메시지 {message_id} 를 대화에서 찾을 수 없습니다")
-            path = _backtrack(rows, message_id)
+            try:
+                message_ids = await ancestor_message_ids(
+                    session,
+                    conversation_id=conv_id,
+                    leaf_id=message_id,
+                )
+            except MessageGraphError as exc:
+                raise ConversationNotFound(f"메시지 {message_id} 를 대화에서 찾을 수 없습니다") from exc
+            source_rows = (await session.execute(select(ChatMessage).where(ChatMessage.id.in_(message_ids)))).scalars()
+            source_by_id = {row.id: row for row in source_rows}
+            path = [source_by_id[item] for item in message_ids]
 
-            # A fork has no corresponding title-generation job.  Preserve a
-            # stable title, but never copy a pending reservation/revision that
-            # belongs to the source conversation's first-response job.
             fork_title = conv.title
             fork_title_source = conv.title_source
             fork_title_status = conv.title_status
@@ -957,28 +1090,46 @@ async def fork_conversation(conv_id: str, *, user_id: str, project_id: str, mess
                 model_name=conv.model_name,
                 parent_conversation_id=conv_id,
                 forked_from_message_id=message_id,
+                history_revision=0,
+                history_index_ready=True,
             )
             session.add(new_conv)
             await session.flush()
 
-            id_map: dict[int, int] = {}  # old id -> new id (parent 재구성)
+            id_map: dict[int, int] = {}
             new_leaf_id = None
-            for r in path:
-                new_parent = id_map.get(r.parent_id) if r.parent_id else None
-                nr = ChatMessage(
+            for position, source in enumerate(path):
+                new_parent = id_map.get(source.parent_id) if source.parent_id else None
+                copied = ChatMessage(
                     conversation_id=new_conv.id,
-                    role=r.role,
+                    role=source.role,
                     parent_id=new_parent,
-                    content=r.content,  # 암호문 그대로 복사(재암호화 불필요)
-                    tool_calls=r.tool_calls,
-                    token_prompt=r.token_prompt,
-                    token_completion=r.token_completion,
-                    model_name=r.model_name,
+                    content=source.content,
+                    tool_calls=source.tool_calls,
+                    citations=source.citations,
+                    reasoning=source.reasoning,
+                    attachments=source.attachments,
+                    parts=source.parts,
+                    parts_version=source.parts_version,
+                    status=source.status,
+                    token_prompt=source.token_prompt,
+                    token_completion=source.token_completion,
+                    model_name=source.model_name,
+                    created_at=source.created_at,
+                    created_at_local=source.created_at_local,
+                    created_timezone=source.created_timezone,
                 )
-                session.add(nr)
+                session.add(copied)
                 await session.flush()
-                id_map[r.id] = nr.id
-                new_leaf_id = nr.id
+                id_map[source.id] = copied.id
+                new_leaf_id = copied.id
+                session.add(
+                    ChatConversationActivePath(
+                        conversation_id=new_conv.id,
+                        position=position,
+                        message_id=copied.id,
+                    )
+                )
             new_conv.active_leaf_id = new_leaf_id
             return _conv_public(new_conv)
     except OperationalError as exc:

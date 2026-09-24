@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import logging
 
+from lumen_plugin_api.tools import ToolArtifactRef, ToolBinding, ToolExecutionResult, validate_tool_arguments
+
 from lumen.services import assets
-from lumen.services.agent_protocol import ToolArtifactRef, ToolBinding, ToolExecutionResult, validate_tool_arguments
+from lumen.services.tool_runtime.contracts import execution_context
+from lumen.services.tools import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +34,8 @@ async def dispatch_tool_call(binding: ToolBinding, arguments: object, context: o
             retryable=False,
         )
     try:
-        result = await binding.execute(validated_arguments, context)
+        supplied_context = execution_context(context) if binding.definition.source == "plugin" and isinstance(context, ToolContext) else context
+        result = await binding.execute(validated_arguments, supplied_context)
     except Exception:
         logger.warning("v2 tool handler failed name=%s", binding.definition.name, exc_info=True)
         return ToolExecutionResult(

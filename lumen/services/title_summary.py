@@ -34,6 +34,10 @@ class TitleResult:
     completion_tokens: int
     messages: list[dict[str, Any]]
     model_name: str
+    # prompt_tokens is total input; these are its prompt-cache shares.
+    cache_read_input_tokens: int = 0
+    cache_creation_5m_input_tokens: int = 0
+    cache_creation_1h_input_tokens: int = 0
 
 
 def _clean(text: str) -> str:
@@ -72,10 +76,15 @@ def _resp_text(resp: Any) -> str:
 
 
 def _resp_usage(resp: Any, model: str, messages: list[dict[str, Any]], text: str) -> tuple[int, int]:
+    usage = _resp_usage_breakdown(resp, model, messages, text)
+    return usage.input_tokens, usage.output_tokens
+
+
+def _resp_usage_breakdown(resp: Any, model: str, messages: list[dict[str, Any]], text: str):
     usage = getattr(resp, "usage", None)
     if usage is None and isinstance(resp, Mapping):
         usage = resp.get("usage")
-    return litellm_client.extract_usage(model, messages, text, usage)
+    return litellm_client.extract_usage_breakdown(model, messages, text, usage)
 
 
 def _route_capabilities(route: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -239,13 +248,14 @@ async def generate_title(*, exchange: Sequence[Mapping[str, Any]], route: Mappin
     title = _clean(raw)
     if not title:
         raise ValueError("title model returned an empty title")
-    prompt_tokens, completion_tokens = _resp_usage(response, model, messages, raw)
+    usage = _resp_usage_breakdown(response, model, messages, raw)
     return TitleResult(
         title=title,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
+        prompt_tokens=usage.input_tokens,
+        completion_tokens=usage.output_tokens,
         messages=messages,
         model_name=model,
+        **usage.cache_fields(),
     )
 
 

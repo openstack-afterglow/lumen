@@ -138,11 +138,22 @@ class ProviderBillingDecimalPeriods(BaseModel):
     total: Decimal
 
 
+class ProviderBillingTokenBreakdown(BaseModel):
+    """Anthropic organization-report token categories; consistent rows sum to ``tokens``."""
+
+    uncached_input: ProviderBillingIntegerPeriods
+    cache_read: ProviderBillingIntegerPeriods
+    cache_creation_5m: ProviderBillingIntegerPeriods
+    cache_creation_1h: ProviderBillingIntegerPeriods
+    output: ProviderBillingIntegerPeriods
+
+
 class ProviderBillingLocalUsage(BaseModel):
     currency: Literal["USD"]
     requests: ProviderBillingIntegerPeriods
     tokens: ProviderBillingIntegerPeriods
     raw_cost: ProviderBillingDecimalPeriods
+    token_breakdown: ProviderBillingTokenBreakdown | None = None
 
 
 class ProviderBillingOptionalIntegerPeriods(BaseModel):
@@ -159,12 +170,22 @@ class ProviderBillingOptionalDecimalPeriods(BaseModel):
     total: Decimal | None
 
 
+class ProviderBillingOptionalTokenBreakdown(BaseModel):
+    uncached_input: ProviderBillingOptionalIntegerPeriods
+    cache_read: ProviderBillingOptionalIntegerPeriods
+    cache_creation_5m: ProviderBillingOptionalIntegerPeriods
+    cache_creation_1h: ProviderBillingOptionalIntegerPeriods
+    output: ProviderBillingOptionalIntegerPeriods
+
+
 class ProviderBillingProviderUsage(BaseModel):
     source: Literal["openai_admin_usage", "anthropic_admin_usage"]
     currency: Literal["USD"]
     cost: ProviderBillingOptionalDecimalPeriods | None
     requests: ProviderBillingOptionalIntegerPeriods | None
     tokens: ProviderBillingOptionalIntegerPeriods | None
+    # Anthropic organization usage report only; OpenAI reports no cache-creation split.
+    token_breakdown: ProviderBillingOptionalTokenBreakdown | None = None
 
 
 class ProviderBillingResponse(BaseModel):
@@ -267,12 +288,23 @@ class ModelCreateRequest(BaseModel):
     display_name: str | None = Field(default=None, max_length=150)
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
+    # Optional prompt-cache rates, independent of each other and of the input/output pair.
+    # An unset rate bills that cache category at 0 USD (no catalog fallback).
+    cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
+    cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
+    cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
     capabilities: CapabilitiesInput | None = None
     is_active: bool = True
 
     model_config = {"protected_namespaces": (), "extra": "forbid"}
 
-    @field_validator("input_price_per_million", "output_price_per_million")
+    @field_validator(
+        "input_price_per_million",
+        "output_price_per_million",
+        "cache_read_price_per_million",
+        "cache_write_price_per_million",
+        "cache_write_1h_price_per_million",
+    )
     @classmethod
     def _finite_precise_price(cls, value: Decimal | None) -> Decimal | None:
         if value is not None and not value.is_finite():
@@ -297,12 +329,23 @@ class ModelUpdateRequest(BaseModel):
     display_name: str | None = Field(default=None, max_length=150)
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
+    # Optional prompt-cache rates, independent of each other and of the input/output pair.
+    # An unset rate bills that cache category at 0 USD (no catalog fallback).
+    cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
+    cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
+    cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
     capabilities: CapabilitiesInput | None = None
     is_active: bool | None = None
 
     model_config = {"protected_namespaces": (), "extra": "forbid"}
 
-    @field_validator("input_price_per_million", "output_price_per_million")
+    @field_validator(
+        "input_price_per_million",
+        "output_price_per_million",
+        "cache_read_price_per_million",
+        "cache_write_price_per_million",
+        "cache_write_1h_price_per_million",
+    )
     @classmethod
     def _finite_precise_price(cls, value: Decimal | None) -> Decimal | None:
         if value is not None and not value.is_finite():
@@ -341,6 +384,9 @@ class ModelResponse(BaseModel):
     effective_input_price_per_million: Decimal | None = None
     effective_output_price_per_million: Decimal | None = None
     effective_price_source: str | None = None
+    cache_read_price_per_million: Decimal | None = None
+    cache_write_price_per_million: Decimal | None = None
+    cache_write_1h_price_per_million: Decimal | None = None
     models_dev_model_id: str | None = None
     price_source: str | None = None
     capabilities: dict | None = None
@@ -590,15 +636,50 @@ async def delete_provider(provider_id: int):
         raise _map_storage(exc) from exc
 
 
-@router.get("/admin/providers/{provider_id}/available-models")
-async def available_models(provider_id: int):
-    """프로바이더 API(또는 litellm 정적 목록)에서 사용 가능한 모델 id 목록을 조회. 등록 전 선택/필터용."""
+class AvailableModelCandidate(BaseModel):
+    """Additive discovery candidate — factual provider metadata only, never capability/price."""
+
+    id: str
+    display_name: str | None = None
+    purpose: Literal["chat", "non_chat", "unknown"] = "unknown"
+    generation_methods: list[str] = Field(default_factory=list)
+    input_token_limit: int | None = None
+    output_token_limit: int | None = None
+
+    model_config = {"protected_namespaces": ()}
+
+
+class AvailableModelsError(BaseModel):
+    code: str
+    message: str
+    retryable: bool
+
+
+class AvailableModelsResponse(BaseModel):
+    provider_id: int
+    fetched_at: str
+    source: Literal["api", "litellm", "none"]
+    live_status: Literal["success", "empty", "unsupported", "error"]
+    complete: bool
+    error: AvailableModelsError | None = None
+    models: list[str]
+    candidates: list[AvailableModelCandidate]
+
+    model_config = {"protected_namespaces": ()}
+
+
+@router.get("/admin/providers/{provider_id}/available-models", response_model=AvailableModelsResponse)
+async def available_models(provider_id: int, response: Response):
+    """프로바이더 API(또는 litellm 정적 목록)에서 사용 가능한 모델 후보를 조회. 등록 전 선택/검토용."""
+    response.headers.update(_NO_STORE)
     try:
         return await model_discovery.discover_models(provider_id)
     except errors.ProviderNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=str(exc), headers=_NO_STORE) from exc
     except errors.ChatStorageUnavailable as exc:
-        raise _map_storage(exc) from exc
+        mapped = _map_storage(exc)
+        mapped.headers = _NO_STORE
+        raise mapped from exc
 
 
 # ---------------------------------------------------------------------------

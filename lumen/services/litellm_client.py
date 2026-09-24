@@ -12,10 +12,11 @@ litellm 의 로컬 계산(token_counter/cost_per_token)만 쓰는 함수는 네�
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
@@ -28,6 +29,7 @@ from lumen.services.providers.credentials import (
     perplexity_route_model_name,
 )
 from lumen.services.providers.errors import ProviderSubscriptionError
+from lumen.services.usage_breakdown import UsageBreakdown
 
 logger = logging.getLogger(__name__)
 
@@ -49,14 +51,66 @@ _OFFICIAL_PRICE_PER_MILLION: dict[tuple[str, str], tuple[Decimal, Decimal, str]]
     ),
 }
 
+# Custom OpenAI-compatible bases may route the same model ID to a different
+# tariff. Only the actual provider endpoint may use bundled provider prices.
+_DIRECT_API_BASES = {
+    "openai": {"https://api.openai.com", "https://api.openai.com/v1"},
+    "anthropic": {"https://api.anthropic.com", "https://api.anthropic.com/v1"},
+    "gemini": {"https://generativelanguage.googleapis.com", "https://generativelanguage.googleapis.com/v1beta"},
+    "deepseek": {"https://api.deepseek.com", "https://api.deepseek.com/v1"},
+    "openrouter": {"https://openrouter.ai/api/v1"},
+    "xai": {"https://api.x.ai/v1"},
+    "perplexity": {
+        "https://api.perplexity.ai", "https://api.perplexity.ai/v1",
+        "https://api.perplexity.ai/router", "https://api.perplexity.ai/router/v1",
+    },
+}
+
+
+def direct_provider_route(provider_type: str | None, api_base: str | None) -> bool:
+    if provider_type not in _DIRECT_API_BASES:
+        return False
+    return api_base is None or api_base.rstrip("/") in _DIRECT_API_BASES[provider_type]
+
+
+def bundled_cache_rates(model: str, provider_type: str | None, api_base: str | None) -> dict[str, Decimal | None]:
+    """Exact provider catalog rates; a missing cache category remains unpriced."""
+    if not direct_provider_route(provider_type, api_base):
+        return {}
+    try:
+        import litellm
+    except ImportError:
+        return {}
+    metadata: dict[str, Any] = {}
+    for candidate in _pricing_model_candidates(model, provider_type):
+        entry = litellm.model_cost.get(f"{provider_type}/{candidate}") or litellm.model_cost.get(candidate)
+        if isinstance(entry, dict) and entry.get("litellm_provider") == provider_type:
+            metadata = entry
+            break
+    return {
+        key: _as_decimal(metadata.get(field))
+        for key, field in (
+            ("cache_read_price_per_token", "cache_read_input_token_cost"),
+            ("cache_write_price_per_token", "cache_creation_input_token_cost"),
+            ("cache_write_1h_price_per_token", "cache_creation_input_token_cost_above_1hr"),
+            ("cache_read_price_per_token_above_200k", "cache_read_input_token_cost_above_200k_tokens"),
+            ("cache_write_price_per_token_above_200k", "cache_creation_input_token_cost_above_200k_tokens"),
+            ("cache_write_1h_price_per_token_above_200k", "cache_creation_input_token_cost_above_1hr_above_200k_tokens"),
+        )
+    }
+
 
 @dataclass(frozen=True)
 class UsageCost:
     raw_cost: Decimal
+    # ``input_cost`` prices UNCACHED input only; cache categories carry their own cost.
     input_cost: Decimal
     output_cost: Decimal
     pricing_status: Literal["priced", "partial", "unpriced"]
     pricing_snapshot: dict[str, object]
+    cache_read_cost: Decimal = Decimal("0")
+    cache_creation_5m_cost: Decimal = Decimal("0")
+    cache_creation_1h_cost: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -149,37 +203,36 @@ def count_context_tokens(model: str, messages: list[dict], tools: list[dict] | N
         )
 
 
-def _usage_field(usage: Any, key: str) -> int | None:
-    """usage(dict 또는 litellm Usage 객체)에서 정수 필드를 안전하게 추출."""
-    val = usage.get(key) if isinstance(usage, Mapping) else getattr(usage, key, None)
-    if val is None:
-        return None
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return None
-
-
 def extract_usage(
     model: str,
     messages: list[dict],
     completion_text: str,
     final_usage: Any | None,
 ) -> tuple[int, int]:
-    """(prompt_tokens, completion_tokens) 산출.
+    """(prompt_tokens, completion_tokens) 산출. prompt_tokens 는 캐시 포함 총 입력이다.
 
     스트리밍 마지막 청크의 usage 가 있으면 그대로, 없으면 token_counter 폴백.
     이 폴백이 없으면 스트리밍 경로에서 completion_cost 가 0이 되어 과금이 누락된다.
     """
+    usage = extract_usage_breakdown(model, messages, completion_text, final_usage)
+    return usage.input_tokens, usage.output_tokens
+
+
+def extract_usage_breakdown(
+    model: str,
+    messages: list[dict],
+    completion_text: str,
+    final_usage: Any | None,
+) -> UsageBreakdown:
+    """Return the ledger breakdown; the token-counter fallback carries no cache split."""
     if final_usage is not None:
-        pt = _usage_field(final_usage, "prompt_tokens")
-        ct = _usage_field(final_usage, "completion_tokens")
-        if pt is not None and ct is not None:
-            return pt, ct
+        breakdown = UsageBreakdown.from_runtime(final_usage)
+        if breakdown is not None:
+            return breakdown
 
     prompt_tokens = count_tokens(model, messages=messages)
     completion_tokens = count_tokens(model, text=completion_text)
-    return prompt_tokens, completion_tokens
+    return UsageBreakdown.from_totals(prompt_tokens, completion_tokens)
 
 
 def _as_decimal(value: object) -> Decimal | None:
@@ -228,6 +281,16 @@ def _litellm_component_rates(
         logger.warning("litellm cost catalog is unavailable model=%s", model, exc_info=True)
         return None, None
     for candidate in _pricing_model_candidates(model, provider_type):
+        # Provider calculators can return zero for unknown IDs. A successful
+        # calculation is not evidence of a published (including explicitly free) price.
+        catalog_key = f"{provider_type}/{candidate}" if provider_type else candidate
+        metadata = litellm.model_cost.get(catalog_key) or litellm.model_cost.get(candidate)
+        if not isinstance(metadata, dict):
+            continue
+        catalog_input = _as_decimal(metadata.get("input_cost_per_token"))
+        catalog_output = _as_decimal(metadata.get("output_cost_per_token"))
+        if catalog_input is None or catalog_output is None:
+            return catalog_input, catalog_output
         kwargs = {
             "model": candidate,
             "prompt_tokens": lookup_prompt_tokens,
@@ -266,6 +329,8 @@ def _fallback_component_rates(
     provider_type: str | None = None,
     api_base: str | None = None,
 ) -> tuple[Decimal | None, Decimal | None, str | None]:
+    if api_base and not direct_provider_route(provider_type, api_base):
+        return None, None, None
     # Agent Sonar is a different priced product from the legacy Sonar API.
     # Exact published Agent rates must win over its legacy bundled alias.
     official_input, official_output, official_source = _official_component_rates(model, provider_type, api_base)
@@ -316,6 +381,19 @@ def _decimal_string(value: Decimal | None) -> str | None:
     return format(value, "f") if value is not None else None
 
 
+def _snapshot_component(
+    tokens: int, rate: Decimal | None, cost: Decimal, source: str | None, **extra: object
+) -> dict[str, object]:
+    return {
+        "tokens": tokens,
+        "effective_price_per_token": _decimal_string(rate),
+        "effective_price_per_million": _decimal_string(rate * _TOKENS_PER_MILLION if rate is not None else None),
+        "cost": _decimal_string(cost),
+        "source": source,
+        **extra,
+    }
+
+
 def cost_from_usage(
     model: str,
     prompt_tokens: int,
@@ -325,17 +403,40 @@ def cost_from_usage(
     output_price_per_token: Decimal | None,
     price_source: str | None,
     provider_type: str | None = None,
+    api_base: str | None = None,
+    breakdown: UsageBreakdown | None = None,
+    cache_read_price_per_token: Decimal | None = None,
+    cache_write_price_per_token: Decimal | None = None,
+    cache_write_1h_price_per_token: Decimal | None = None,
+    cache_read_price_per_token_above_200k: Decimal | None = None,
+    cache_write_price_per_token_above_200k: Decimal | None = None,
+    cache_write_1h_price_per_token_above_200k: Decimal | None = None,
+    cache_price_sources: Mapping[str, str] | None = None,
+    allow_catalog_cache: bool = True,
+    allow_catalog_prices: bool = True,
 ) -> UsageCost:
-    """Resolve manual → reviewed models.dev → LiteLLM bundled pricing per component."""
-    prompt_tokens = max(0, int(prompt_tokens))
-    completion_tokens = max(0, int(completion_tokens))
+    """Bill provider-reported token totals using manual or exact catalog prices.
+
+    A direct provider's known cache rates fill only unset categories. A custom
+    base requires configured prices; missing categories remain visibly partial.
+    """
+    if breakdown is None:
+        breakdown = UsageBreakdown.from_totals(prompt_tokens, completion_tokens)
+    elif (breakdown.input_tokens, breakdown.output_tokens) != (
+        max(0, int(prompt_tokens)),
+        max(0, int(completion_tokens)),
+    ):
+        raise ValueError("usage breakdown totals do not match prompt/completion tokens")
+    prompt_tokens = breakdown.input_tokens
+    completion_tokens = breakdown.output_tokens
+    uncached_tokens = breakdown.uncached_input_tokens
     fallback_input, fallback_output, fallback_source = (
-        _fallback_component_rates(model, prompt_tokens, completion_tokens, provider_type)
-        if input_price_per_token is None or output_price_per_token is None
+        _fallback_component_rates(model, prompt_tokens, completion_tokens, provider_type, api_base)
+        if allow_catalog_prices and (input_price_per_token is None or output_price_per_token is None)
         else (None, None, None)
     )
     input_cost, input_rate, input_source, input_priced = _component_cost(
-        tokens=prompt_tokens,
+        tokens=uncached_tokens,
         stored_rate=input_price_per_token,
         stored_source=price_source,
         fallback_rate=fallback_input,
@@ -348,43 +449,68 @@ def cost_from_usage(
         fallback_rate=fallback_output,
         fallback_source=fallback_source,
     )
+    input_cost = input_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
+    output_cost = output_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
+    catalog_cache = bundled_cache_rates(model, provider_type, api_base) if breakdown.has_cache and allow_catalog_cache else {}
+    cache_rates = {
+        "cache_read": (
+            cache_read_price_per_token, catalog_cache.get("cache_read_price_per_token"),
+            cache_read_price_per_token_above_200k, catalog_cache.get("cache_read_price_per_token_above_200k"),
+        ),
+        "cache_creation_5m": (
+            cache_write_price_per_token, catalog_cache.get("cache_write_price_per_token"),
+            cache_write_price_per_token_above_200k, catalog_cache.get("cache_write_price_per_token_above_200k"),
+        ),
+        "cache_creation_1h": (
+            cache_write_1h_price_per_token, catalog_cache.get("cache_write_1h_price_per_token"),
+            cache_write_1h_price_per_token_above_200k, catalog_cache.get("cache_write_1h_price_per_token_above_200k"),
+        ),
+    }
+    cache_sources: dict[str, str | None] = dict(cache_price_sources or {})
+    cache_components: dict[str, tuple[int, Decimal | None, Decimal]] = {}
+    for name, tokens in (
+        ("cache_read", breakdown.cache_read_input_tokens),
+        ("cache_creation_5m", breakdown.cache_creation_5m_input_tokens),
+        ("cache_creation_1h", breakdown.cache_creation_1h_input_tokens),
+    ):
+        configured, catalog, configured_tier, catalog_tier = cache_rates[name]
+        rate = configured if configured is not None else catalog
+        source = cache_sources.get(name, "manual") if configured is not None else "litellm" if catalog is not None else None
+        tier = configured_tier if configured_tier is not None else catalog_tier if source == "litellm" else None
+        if prompt_tokens > 200_000 and tier is not None:
+            rate = tier
+            source = source or "litellm"
+        cost = (rate * tokens).quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else Decimal("0")
+        cache_components[name] = (tokens, rate, cost)
+        cache_sources[name] = source
     priced_components = int(input_priced) + int(output_priced)
     pricing_status: Literal["priced", "partial", "unpriced"]
     if priced_components == 2:
-        pricing_status = "priced"
+        unpriced_cache = any(tokens > 0 and rate is None for tokens, rate, _ in cache_components.values())
+        pricing_status = "partial" if unpriced_cache else "priced"
     elif priced_components:
         pricing_status = "partial"
     else:
         pricing_status = "unpriced"
-    raw_cost = (input_cost + output_cost).quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
-    snapshot = {
+    raw_cost = input_cost + output_cost + sum((cost for _, _, cost in cache_components.values()), Decimal("0"))
+    snapshot: dict[str, object] = {
         "model": model,
-        "input": {
-            "tokens": prompt_tokens,
-            "effective_price_per_token": _decimal_string(input_rate),
-            "effective_price_per_million": _decimal_string(
-                input_rate * _TOKENS_PER_MILLION if input_rate is not None else None
-            ),
-            "cost": _decimal_string(input_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)),
-            "source": input_source,
-            "provider_type": provider_type,
-        },
-        "output": {
-            "tokens": completion_tokens,
-            "effective_price_per_token": _decimal_string(output_rate),
-            "effective_price_per_million": _decimal_string(
-                output_rate * _TOKENS_PER_MILLION if output_rate is not None else None
-            ),
-            "cost": _decimal_string(output_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)),
-            "source": output_source,
-        },
+        "input": _snapshot_component(
+            uncached_tokens, input_rate, input_cost, input_source, provider_type=provider_type
+        ),
+        "output": _snapshot_component(completion_tokens, output_rate, output_cost, output_source),
     }
+    for name, (tokens, rate, cost) in cache_components.items():
+        snapshot[name] = _snapshot_component(tokens, rate, cost, cache_sources.get(name))
     return UsageCost(
-        raw_cost=raw_cost,
-        input_cost=input_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP),
-        output_cost=output_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP),
+        raw_cost=raw_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP),
+        input_cost=input_cost,
+        output_cost=output_cost,
         pricing_status=pricing_status,
         pricing_snapshot=snapshot,
+        cache_read_cost=cache_components["cache_read"][2],
+        cache_creation_5m_cost=cache_components["cache_creation_5m"][2],
+        cache_creation_1h_cost=cache_components["cache_creation_1h"][2],
     )
 
 
@@ -428,6 +554,55 @@ def _native_web_search_extra(
     if custom_llm_provider == "gemini":
         merged["include_server_side_tool_invocations"] = True
     return merged
+
+
+def _cache_marker_present(value: object) -> bool:
+    if isinstance(value, dict):
+        return "cache_control" in value or any(_cache_marker_present(part) for part in value.values())
+    return isinstance(value, list) and any(_cache_marker_present(part) for part in value)
+
+
+def _anthropic_cached_messages(
+    model: str, messages: list[dict], provider_type: str | None, api_base: str | None,
+    *, tools: list[dict] | None = None, extra: dict | None = None,
+) -> list[dict]:
+    """Mark only a stable system prefix when no caller breakpoint already exists."""
+    if provider_type != "anthropic" or not direct_provider_route(provider_type, api_base):
+        return messages
+    if (any(_cache_marker_present(message) for message in messages)
+            or _cache_marker_present(tools) or _cache_marker_present(extra)):
+        return messages
+    try:
+        from litellm.utils import supports_prompt_caching
+
+        if not supports_prompt_caching(model=litellm_model_name(model)):
+            return messages
+    except Exception:
+        return messages
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            updated_content = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+        elif isinstance(content, list):
+            last_text = next(
+                (n for n in range(len(content) - 1, -1, -1)
+                 if isinstance(content[n], dict) and content[n].get("type") == "text"
+                 and isinstance(content[n].get("text"), str) and content[n]["text"]),
+                None,
+            )
+            if last_text is None:
+                return messages
+            updated_content = list(content)
+            updated_content[last_text] = {**content[last_text], "cache_control": {"type": "ephemeral"}}
+        else:
+            return messages
+        updated = list(messages)
+        updated[index] = {**message, "content": updated_content}
+        return updated
+    return messages
 
 
 def _build_params(
@@ -496,6 +671,72 @@ async def _guard_subscription_stream(
         if safe_error.code == "subscription_auth_required" and isinstance(fingerprint, str):
             await subscriptions._mark_subscription_credential_rejected(provider_auth, fingerprint)
         raise safe_error from None
+    finally:
+        close = getattr(source, "aclose", None)
+        if callable(close):
+            await close()
+
+
+def _next_sse_block(buffer: str) -> tuple[str, str] | None:
+    boundaries = ((buffer.find("\r\n\r\n"), 4), (buffer.find("\n\n"), 2), (buffer.find("\r\r"), 2))
+    candidates = [(index, width) for index, width in boundaries if index >= 0]
+    if not candidates:
+        return None
+    index, width = min(candidates, key=lambda item: item[0])
+    return buffer[:index], buffer[index + width :]
+
+
+def _anthropic_sse_payload(block: str) -> dict[str, Any] | None:
+    data_lines: list[str] = []
+    for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line.startswith("data:"):
+            continue
+        value = line[5:]
+        data_lines.append(value[1:] if value.startswith(" ") else value)
+    if not data_lines:
+        return None
+    payload = json.loads("\n".join(data_lines))
+    if not isinstance(payload, dict):
+        raise ValueError("Anthropic SSE data must be a JSON object")
+    return payload
+
+
+async def _anthropic_stream_events(source: Any) -> AsyncIterator[Any]:
+    """Normalize LiteLLM's raw native SSE byte chunks into Anthropic event objects."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    buffer = ""
+    saw_bytes = False
+
+    try:
+        async for chunk in source:
+            if isinstance(chunk, (bytes, bytearray, memoryview)):
+                saw_bytes = True
+                buffer += decoder.decode(bytes(chunk), final=False)
+            elif isinstance(chunk, str):
+                buffer += chunk
+            else:
+                if buffer.strip():
+                    raise ValueError("Anthropic stream mixed incomplete SSE data with structured events")
+                yield chunk
+                continue
+
+            while (split := _next_sse_block(buffer)) is not None:
+                block, buffer = split
+                payload = _anthropic_sse_payload(block)
+                if payload is not None:
+                    yield payload
+
+        if saw_bytes:
+            buffer += decoder.decode(b"", final=True)
+        while (split := _next_sse_block(buffer)) is not None:
+            block, buffer = split
+            payload = _anthropic_sse_payload(block)
+            if payload is not None:
+                yield payload
+        if buffer.strip():
+            payload = _anthropic_sse_payload(buffer)
+            if payload is not None:
+                yield payload
     finally:
         close = getattr(source, "aclose", None)
         if callable(close):
@@ -995,7 +1236,7 @@ async def acompletion(
     litellm.drop_params = True
     params = _build_params(
         model,
-        messages,
+        _anthropic_cached_messages(model, messages, custom_llm_provider, api_base, tools=tools, extra=merged_extra),
         api_base=api_base,
         api_key=api_key,
         max_tokens=max_tokens,
@@ -1064,7 +1305,7 @@ async def acompletion_stream(
     litellm.drop_params = True
     params = _build_params(
         model,
-        messages,
+        _anthropic_cached_messages(model, messages, custom_llm_provider, api_base, tools=tools, extra=merged_extra),
         api_base=api_base,
         api_key=api_key,
         max_tokens=max_tokens,
@@ -1076,3 +1317,175 @@ async def acompletion_stream(
     params["stream"] = True
     params["stream_options"] = {"include_usage": True}
     return await litellm.acompletion(**params)
+
+
+def _native_protocol_params(
+    *,
+    api_base: str | None,
+    api_key: str | None,
+    custom_llm_provider: str | None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if api_base:
+        params["api_base"] = api_base
+    if api_key:
+        params["api_key"] = api_key
+    if custom_llm_provider:
+        params["custom_llm_provider"] = custom_llm_provider
+    return params
+
+
+async def aresponses(
+    *,
+    model: str,
+    input: str | list[dict],
+    stream: bool,
+    api_base: str | None,
+    api_key: str | None,
+    custom_llm_provider: str | None,
+    provider_auth: ProviderAuthRef | None,
+    include: list[str] | None = None,
+    instructions: str | None = None,
+    max_output_tokens: int | None = None,
+    metadata: dict | None = None,
+    parallel_tool_calls: bool | None = None,
+    prompt_cache_key: str | None = None,
+    reasoning: dict | None = None,
+    temperature: float | None = None,
+    text: dict | None = None,
+    tool_choice: Any = None,
+    tools: list[dict] | None = None,
+    top_p: float | None = None,
+    truncation: str | None = None,
+    user: str | None = None,
+    service_tier: str | None = None,
+    safety_identifier: str | None = None,
+    context_management: list[dict] | None = None,
+) -> Any:
+    """Call LiteLLM's native Responses transport without forwarding arbitrary request keys."""
+    if provider_auth is not None or _requires_subscription_auth(model, custom_llm_provider):
+        raise ProviderSubscriptionError("subscription_protocol_unsupported", 400)
+    import litellm
+
+    params: dict[str, Any] = {
+        "model": model,
+        "input": input,
+        "stream": stream,
+        **_native_protocol_params(
+            api_base=api_base,
+            api_key=api_key,
+            custom_llm_provider=custom_llm_provider,
+        ),
+    }
+    optional = {
+        "include": include,
+        "instructions": instructions,
+        "max_output_tokens": max_output_tokens,
+        "metadata": metadata,
+        "parallel_tool_calls": parallel_tool_calls,
+        "prompt_cache_key": prompt_cache_key,
+        "reasoning": reasoning,
+        "temperature": temperature,
+        "text": text,
+        "tool_choice": tool_choice,
+        "tools": tools,
+        "top_p": top_p,
+        "truncation": truncation,
+        "user": user,
+        "service_tier": service_tier,
+        "safety_identifier": safety_identifier,
+        "context_management": context_management,
+    }
+    params.update({key: value for key, value in optional.items() if value is not None})
+    return await litellm.aresponses(**params)
+
+
+async def aanthropic_messages(
+    *,
+    model: str,
+    messages: list[dict],
+    max_tokens: int,
+    stream: bool,
+    api_base: str | None,
+    api_key: str | None,
+    custom_llm_provider: str | None,
+    provider_auth: ProviderAuthRef | None,
+    system: Any = None,
+    metadata: dict | None = None,
+    stop_sequences: list[str] | None = None,
+    temperature: float | None = None,
+    thinking: dict | None = None,
+    context_management: dict | None = None,
+    tool_choice: dict | None = None,
+    tools: list[dict] | None = None,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    container: dict | None = None,
+    output_config: dict | None = None,
+    anthropic_headers: dict[str, str] | None = None,
+) -> Any:
+    """Call LiteLLM's native Anthropic transport, including Anthropic subscription auth."""
+    import litellm
+
+    fingerprint: str | None = None
+    if provider_auth is not None:
+        from lumen.services.providers import subscriptions
+
+        if provider_auth.get("auth_mode") != "anthropic_subscription" or custom_llm_provider != "anthropic":
+            raise ProviderSubscriptionError("subscription_protocol_unsupported", 400)
+        credential = await subscriptions.resolve_subscription_credential(provider_auth)
+        access_token = credential.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise ProviderSubscriptionError("subscription_auth_required", 502)
+        api_key = access_token
+        api_base = "https://api.anthropic.com"
+        fingerprint = credential.get("_fingerprint") if isinstance(credential.get("_fingerprint"), str) else None
+    elif _requires_subscription_auth(model, custom_llm_provider):
+        raise ProviderSubscriptionError("subscription_auth_required", 502)
+
+    params: dict[str, Any] = {
+        "model": litellm_model_name(model),
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": stream,
+        **_native_protocol_params(
+            api_base=api_base,
+            api_key=api_key,
+            custom_llm_provider=custom_llm_provider,
+        ),
+    }
+    optional = {
+        "system": system,
+        "metadata": metadata,
+        "stop_sequences": stop_sequences,
+        "temperature": temperature,
+        "thinking": thinking,
+        "context_management": context_management,
+        "tool_choice": tool_choice,
+        "tools": tools,
+        "top_k": top_k,
+        "top_p": top_p,
+        "container": container,
+        "output_config": output_config,
+        "extra_headers": anthropic_headers,
+    }
+    params.update({key: value for key, value in optional.items() if value is not None})
+    try:
+        result = await litellm.anthropic.messages.acreate(**params)
+        if stream:
+            source = (
+                _guard_subscription_stream(result, provider_auth, fingerprint) if provider_auth is not None else result
+            )
+            return _anthropic_stream_events(source)
+        return result
+    except ProviderSubscriptionError:
+        raise
+    except BaseException as error:
+        if provider_auth is None:
+            raise
+        safe_error = _subscription_error(error)
+        if safe_error.code == "subscription_auth_required" and fingerprint is not None:
+            from lumen.services.providers import subscriptions
+
+            await subscriptions._mark_subscription_credential_rejected(provider_auth, fingerprint)
+        raise safe_error from None

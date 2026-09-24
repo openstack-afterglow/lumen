@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from lumen.services.agent_protocol import AgentExecutionPolicy
+from lumen_plugin_api.tools import AgentExecutionPolicy
 
 
 class DelegationDenied(ValueError):

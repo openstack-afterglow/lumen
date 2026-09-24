@@ -182,6 +182,27 @@ async def test_renew_run_lease_requires_current_running_owner():
 
 
 @pytest.mark.asyncio
+async def test_claim_fence_invalidates_stale_owner_after_reclaim():
+    """A lapsed owner's token must not renew once a later claim advanced the fence."""
+    from lumen.services.run_store import claim_queued_run
+
+    run = _run("queued")
+    run.lease_fence = 0
+    first = await claim_queued_run(_LeaseSession(run), run.id, owner="worker-a")
+    stale_token = first.lease_owner
+    assert run.lease_fence == 1 and stale_token.endswith("#1")
+
+    # Lease lapses and recovery requeues the run; a fresh worker claims it again.
+    run.status = "queued"
+    run.lease_owner = None
+    run.lease_expires_at = None
+    second = await claim_queued_run(_LeaseSession(run), run.id, owner="worker-a")
+    assert run.lease_fence == 2 and second.lease_owner != stale_token
+
+    assert await renew_run_lease(_LeaseSession(run), run.id, owner=stale_token) is None
+    assert await renew_run_lease(_LeaseSession(run), run.id, owner=second.lease_owner) is run
+
+@pytest.mark.asyncio
 async def test_finalizer_claim_accepts_persisted_naive_expiry():
     from datetime import UTC, datetime, timedelta
 

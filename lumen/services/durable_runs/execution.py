@@ -3,16 +3,32 @@
 import asyncio
 import json
 import logging
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from collections.abc import Callable
+from dataclasses import replace
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from time import monotonic
 from typing import Any
 
+from lumen_plugin_api.contracts import Namespace, PluginError
 from sqlalchemy import select
 
+from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_db import ChatConversation, ChatMessage, ChatUsageLog
 from lumen.models.chat_runs import ChatRun, ChatRunSegment, ChatRunTurn, ChatTempThread
-from lumen.services import assets, context_manager, context_store, credit, engine, extensions_store, litellm_client
+from lumen.plugins import bindings as plugin_bindings
+from lumen.plugins import skills_host
+from lumen.services import (
+    advisor,
+    assets,
+    context_manager,
+    context_store,
+    credit,
+    engine,
+    extensions_store,
+    litellm_client,
+    native_compaction,
+)
 from lumen.services import conversation_store as cs
 from lumen.services.litellm_client import UsageCost
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
@@ -30,7 +46,9 @@ from lumen.services.run_store import (
     replay_events,
 )
 from lumen.services.structured_output import StructuredOutputError, parse_structured_output
+from lumen.services.usage_breakdown import CACHE_USAGE_KEYS, UsageBreakdown
 
+from . import budgets, children
 from .common import (
     _V2_DEFAULT_MAX_MODEL_TURNS,
     _V2_DEFAULT_MAX_TOOL_CALLS,
@@ -57,6 +75,42 @@ from .errors import (
 )
 from .interactions import _persist_v2_approval_interrupt, _v2_approval_resume
 from .lifecycle import _cancel_requested, _renew_lease, _require_owned_running_lease
+
+
+async def _v2_resume(*, run_id: str, owner: str) -> dict[str, Any] | None:
+    """Answer exactly the interrupt the checkpoint is waiting on with a discriminated payload."""
+    from lumen.services import graph
+
+    pending = await graph.pending_interrupt(run_id)
+    if pending is None:
+        # No checkpointed interrupt: a fresh start, or a run that resumes past an already
+        # consumed approval boundary. Legacy approval rows alone never fabricate a payload.
+        return None
+    if pending["kind"] == "tool_approval":
+        decisions = await _v2_approval_resume(run_id=run_id, owner=owner)
+        if decisions is None:
+            raise DurableRunError("queued v2 run is waiting on approvals that were never recorded")
+        return {"kind": "tool_approval", "decisions": decisions}
+    wait_group_id = pending.get("wait_group_id")
+    if not isinstance(wait_group_id, str):
+        raise DurableRunError("children interrupt is missing its wait group")
+    return await children.delegation_results(parent_run_id=run_id, owner=owner, wait_group_id=wait_group_id)
+
+
+def _delegation_enabled(run: ChatRun, payload: dict[str, Any]) -> bool:
+    """Advertise ``delegate_agent`` only when policy, budgets and a sandbox runtime all permit it."""
+    if run.execution_protocol_version != 2 or run.credit_ceiling is None or run.sandbox_seconds_ceiling is None:
+        return False
+    try:
+        policy = children._policy_from_snapshot(run.capability_snapshot or {})
+    except DurableRunError:
+        return False
+    if not (policy.can_delegate_read or policy.can_delegate_write) or policy.max_children < 1:
+        return False
+    if int(run.depth or 0) >= policy.max_child_depth:
+        return False
+    runtime = get_settings().runtime_config
+    return runtime.enabled and any(pool.enabled and pool.role == "sandbox" for pool in runtime.pools)
 
 logger = logging.getLogger(__name__)
 
@@ -160,13 +214,51 @@ async def _finish(
     usage_record: dict[str, Any] | None = None,
     message_finalization: dict[str, Any] | None = None,
     completed_parts: list[tuple[int, dict[str, Any]]] | None = None,
+    child_result: dict[str, Any] | None = None,
 ) -> None:
+    # Pure DB barrier; each attempt re-reads and re-locks with a fresh lock order (MariaDB 1020 retry).
+    wake_parent = await budgets.retry_deadlocks(lambda: _finish_transaction(
+        run_id, status=status, message_id=message_id, owner=owner, error_code=error_code,
+        safe_message=safe_message, usage_record=usage_record, message_finalization=message_finalization,
+        completed_parts=completed_parts, child_result=child_result,
+    ))
+    if wake_parent is not None:
+        from .common import wake_run
+
+        await wake_run(wake_parent)
+
+
+async def _finish_transaction(
+    run_id: str,
+    *,
+    status: str,
+    message_id: str | None,
+    owner: str,
+    error_code: str | None,
+    safe_message: str | None,
+    usage_record: dict[str, Any] | None,
+    message_finalization: dict[str, Any] | None,
+    completed_parts: list[tuple[int, dict[str, Any]]] | None,
+    child_result: dict[str, Any] | None,
+) -> str | None:
     factory = _factory()
+    order = budgets.LockOrder()
+    wake_parent: str | None = None
     async with factory() as session, session.begin():
-        # Lock parent conversation/temp row first, then run row.
+        # Global lock order: project quota for code roots or lineages -> conversation/temp ->
+        # root -> ancestors -> children -> ledgers -> resources.
         unlocked_run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id))).scalar_one_or_none()
         if unlocked_run is None:
             return
+        quota = None
+        root = None
+        has_children = (
+            await session.execute(select(ChatRun.id).where(ChatRun.parent_run_id == run_id).limit(1))
+        ).scalar_one_or_none() is not None
+        if (unlocked_run.parent_run_id is not None or has_children or unlocked_run.execution_mode == "code"
+                or unlocked_run.credit_ceiling is not None):
+            quota = await budgets.lock_project_quota(session, unlocked_run.project_id, order=order)
+        order.take("conversation")
         if unlocked_run.conversation_id is not None:
             await session.execute(
                 select(ChatConversation.id).where(ChatConversation.id == unlocked_run.conversation_id).with_for_update()
@@ -175,11 +267,12 @@ async def _finish(
             await session.execute(
                 select(ChatTempThread.id).where(ChatTempThread.id == unlocked_run.temp_thread_id).with_for_update()
             )
-        run = (
-            await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())
-        ).scalar_one_or_none()
-        if run is None:
-            return
+        if unlocked_run.parent_run_id is not None:
+            _quota, root, _ancestors = await children._lock_lineage(session, unlocked_run, order, quota=quota)
+            run = await budgets.lock_run(session, run_id, order=order, lock_class="child")
+        else:
+            run = await budgets.lock_run(session, run_id, order=order, lock_class="root")
+            root = run
         _require_owned_running_lease(run, owner)
         if run.status not in NONTERMINAL:
             return
@@ -203,6 +296,7 @@ async def _finish(
                 source=run.source,
                 api_key_id=run.api_key_id,
                 run_id=run.id,
+                breakdown=usage_record.get("breakdown"),
             )
             run.usage_reconciled_at = _now()
             await append_event(
@@ -328,21 +422,165 @@ async def _finish(
         if status != "completed":
             payload.update(error_code=error_code or "run_failed", safe_message=safe_message or "chat run failed")
         await append_event(session, run, _event(run, event_type, payload))
+        if run.parent_run_id is not None:
+            finalized = []
+            if has_children and status != "completed":
+                finalized = await children.cancel_descendants(
+                    session, run, quota=quota, order=order, user_id=run.user_id,
+                    release_resources=False, budget_root=root,
+                )
+            result = child_result or children.child_result_payload(
+                status=status, error_code=error_code, summary="", artifacts=[]
+            )
+            wake_parent = await children.record_child_terminal(
+                session, run, quota=quota, root=root, order=order, status=status,
+                error_code=error_code, result=result, release_resource=False,
+            )
+            from lumen.services.infrastructure import store as infra_store
 
+            for child_id in finalized:
+                await infra_store.release_sandbox_intent(session, run_id=child_id, order=order)
+            await infra_store.release_sandbox_intent(session, run_id=run.id, order=order)
+        else:
+            finalized = []
+            if has_children and status != "completed":
+                finalized = await children.cancel_descendants(
+                    session, run, quota=quota, order=order, user_id=run.user_id, release_resources=False
+                )
+            if run.execution_mode == "code":
+                await budgets.settle_root_sandbox(session, quota=quota, root=run, order=order)
+            if quota is not None:
+                await budgets.close_root_budget(session, quota=quota, root=run, order=order)
+            from lumen.services.infrastructure import store as infra_store
+
+            for child_id in finalized:
+                await infra_store.release_sandbox_intent(session, run_id=child_id, order=order)
+            if run.execution_mode == "code":
+                await infra_store.release_sandbox_intent(session, run_id=run.id, order=order)
+    return wake_parent
+
+
+
+def _bounded_credits(pricing: dict[str, Any], input_tokens: int, output_tokens: int, *,
+                     input_keys: tuple[str, ...], output_key: str) -> Decimal:
+    """Round a worst-case frozen price upward, never a live catalog price."""
+    try:
+        rates = [Decimal(str(pricing[key])) for key in input_keys if pricing.get(key) is not None]
+        output_rate = Decimal(str(pricing[output_key]))
+        if not rates or any(not rate.is_finite() or rate < 0 for rate in [*rates, output_rate]):
+            raise ValueError("missing or invalid frozen price")
+        multiplier = Decimal(str(pricing["margin_multiplier"])) * Decimal(str(pricing["chat_credit_per_usd"]))
+        if not multiplier.is_finite() or multiplier < 0:
+            raise ValueError("invalid credit conversion")
+        cost = max(rates) * input_tokens + output_rate * output_tokens
+        # Each of the at most five billed token categories is rounded to 1e-10 USD.
+        # Cushion only nonzero estimates so their rounded sum cannot exceed the hold.
+        return ((cost + (Decimal("0.0000000005") if cost else 0)) * multiplier).quantize(
+            Decimal("0.00000001"), rounding=ROUND_CEILING
+        )
+    except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
+        raise DurableRunError("bounded credit pricing is unavailable") from exc
+
+
+def _provider_credit_bound(run: ChatRun, *, messages: list[dict], tool_schemas: list[dict],
+                           max_tokens: int | None, summary: bool = False) -> Decimal:
+    snapshot = run.pricing_snapshot
+    pricing = (snapshot.get("summary_route") or snapshot) if summary and isinstance(snapshot, dict) else snapshot
+    if not isinstance(pricing, dict):
+        raise DurableRunError("frozen provider pricing is unavailable")
+    pricing = {**pricing, "margin_multiplier": snapshot["margin_multiplier"],
+               "chat_credit_per_usd": snapshot["chat_credit_per_usd"]}
+    capabilities = run.capability_snapshot if isinstance(run.capability_snapshot, dict) else {}
+    if not summary:
+        features = capabilities.get("effective_features")
+        search = features.get("web_search") if isinstance(features, dict) else None
+        if isinstance(search, dict) and search.get("enabled") is True and search.get("mode") == "native":
+            # The provider may perform an unbounded number of searches in one turn.
+            # Only explicitly frozen zero request/context rates need no hold.
+            prices = snapshot.get("component_prices") or {}
+            keys = ("web_search_request_per_unit", f"web_search_context_{search.get('context_size')}_per_unit")
+            if any(key not in prices or Decimal(str(prices[key])) != 0 for key in keys):
+                raise DurableRunError("native web search has no provider-enforced request bound")
+    route = (capabilities.get("summary_route") or capabilities.get("capabilities")) if summary else capabilities.get("capabilities")
+    route = route if isinstance(route, dict) else capabilities
+    limit = route.get("context_limit")
+    count = litellm_client.count_context_tokens(
+        str(route.get("model_name") or run.model_name), messages, tool_schemas
+    )
+    input_keys = ("input_price_per_token", "cache_read_price_per_token",
+                  "cache_write_price_per_token", "cache_write_1h_price_per_token",
+                  "cache_read_price_per_token_above_200k", "cache_write_price_per_token_above_200k",
+                  "cache_write_1h_price_per_token_above_200k")
+    priced_input = any(Decimal(str(pricing.get(key) or 0)) > 0 for key in input_keys)
+    priced_output = Decimal(str(pricing.get("output_price_per_token") or 0)) > 0
+    if priced_input and (type(limit) is not int or limit <= 0):
+        raise DurableRunError("bounded provider input requires a frozen context limit")
+    if priced_output and (type(max_tokens) is not int or max_tokens <= 0):
+        raise DurableRunError("bounded provider output requires max_tokens")
+    if count.tokens is not None and type(limit) is int and count.tokens > limit:
+        raise DurableRunError("provider context exceeds frozen input bound")
+    return _bounded_credits(pricing, limit if priced_input else 0, max_tokens if priced_output else 0,
+                            input_keys=input_keys, output_key="output_price_per_token")
+
+
+def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
+    snapshot = run.pricing_snapshot
+    prices = snapshot.get("component_prices") if isinstance(snapshot, dict) else None
+    if not isinstance(prices, dict):
+        raise DurableRunError("frozen tool pricing is unavailable")
+    if name == "managed_web_search":
+        features = run.capability_snapshot.get("effective_features") or {}
+        options = features.get("web_search") or {}
+        size = options.get("context_size")
+        if size not in {"low", "medium", "high"}:
+            raise DurableRunError("managed search context bound is unavailable")
+        keys = ("web_search_request_per_unit", f"web_search_context_{size}_per_unit")
+        usd = sum(Decimal(str(prices[key])) for key in keys)
+    elif name == "managed_web_fetch":
+        usd = sum(Decimal(str(prices[key])) for key in ("web_fetch_request_per_unit", "web_fetch_context_per_unit"))
+    elif name == "managed_advisor":
+        route = (run.capability_snapshot.get("feature_routes") or {}).get("advisor") or {}
+        limit = route.get("context_limit")
+        keys = ("advisor_input_price_per_token", "advisor_cache_read_price_per_token",
+                "advisor_cache_write_price_per_token", "advisor_cache_write_1h_price_per_token",
+                "advisor_cache_read_price_per_token_above_200k",
+                "advisor_cache_write_price_per_token_above_200k",
+                "advisor_cache_write_1h_price_per_token_above_200k")
+        rates = [Decimal(str(prices[key])) for key in keys if prices.get(key) is not None]
+        if not rates or (max(rates) > 0 and (type(limit) is not int or limit <= 0)):
+            raise DurableRunError("bounded advisor input requires frozen context limit")
+        usd = max(rates) * (limit if type(limit) is int else 0) + Decimal(str(prices["advisor_output_price_per_token"])) * advisor._MAX_ADVISOR_TOKENS
+    else:
+        return Decimal("0")
+    multiplier = Decimal(str(snapshot["margin_multiplier"])) * Decimal(str(snapshot["chat_credit_per_usd"]))
+    if not usd.is_finite() or usd < 0 or not multiplier.is_finite() or multiplier < 0:
+        raise DurableRunError("frozen tool pricing is invalid")
+    return ((usd + (Decimal("0.0000000002") if usd else 0)) * multiplier).quantize(
+        Decimal("0.00000001"), rounding=ROUND_CEILING
+    )
 
 class _DurableExecutionHooks:
     """Persist and replay each external graph boundary for one leased run."""
 
     journals_tool_events = True
 
-    def __init__(self, *, run_id: str, owner: str) -> None:
+    def __init__(self, *, run_id: str, owner: str, credit_bounded: bool = False,
+                 skill_snapshots: list[dict] | None = None, user_id: str = "", project_id: str = "") -> None:
         self.run_id = run_id
         self.owner = owner
+        self.requires_credit_reservation = credit_bounded
+        self.skill_snapshots = skill_snapshots or []
+        self.user_id = user_id
+        self.project_id = project_id
         self.active_turn_ordinal: int | None = None
         self.force_compaction = False
         self.active_message_id: str | None = None
         self._conversation_id: str | None = None
         self._temp_thread_id: str | None = None
+
+    async def revalidate_skills(self) -> None:
+        if self.skill_snapshots:
+            await skills_host.revalidate_skills(self.skill_snapshots, user_id=self.user_id, project_id=self.project_id)
 
     async def loaded_tool_names(self) -> list[str]:
         """Restore completed deferred bindings after restart or approval resume."""
@@ -385,10 +623,11 @@ class _DurableExecutionHooks:
     ) -> None:
         """Record one observed summary call with a stable, replay-safe ledger key."""
         try:
-            prompt_tokens = max(0, int(usage_payload.get("prompt_tokens") or 0))
-            completion_tokens = max(0, int(usage_payload.get("completion_tokens") or 0))
+            breakdown = _usage_payload_breakdown(usage_payload)
         except (TypeError, ValueError) as exc:
             raise DurableRunError("context compaction usage is invalid") from exc
+        prompt_tokens = breakdown.input_tokens
+        completion_tokens = breakdown.output_tokens
         factory = _factory()
         async with factory() as session, session.begin():
             run = (
@@ -413,6 +652,23 @@ class _DurableExecutionHooks:
                 ),
                 "price_source": summary_pricing.get("price_source"),
                 "price_version": summary_pricing.get("price_version"),
+                "cache_price_sources": summary_pricing.get("cache_price_sources") or route.get("cache_price_sources") or {},
+                # Snapshots frozen before cache rates existed carry no cache keys.
+                # The route fallback mirrors the input/output keys above: a live
+                # route only resolves under the admission config hash, which
+                # pins the same (then null) cache rates, and a replayed route
+                # snapshot carries no rates, so those categories bill 0 (partial).
+                **{
+                    key: summary_pricing.get(key, route.get(key))
+                    for key in (
+                        "cache_read_price_per_token",
+                        "cache_write_price_per_token",
+                        "cache_write_1h_price_per_token",
+                        "cache_read_price_per_token_above_200k",
+                        "cache_write_price_per_token_above_200k",
+                        "cache_write_1h_price_per_token_above_200k",
+                    )
+                },
             }
             if pricing["input_price_per_token"] is None or pricing["output_price_per_token"] is None:
                 raise DurableRunError("context compaction pricing is unavailable")
@@ -420,26 +676,16 @@ class _DurableExecutionHooks:
                 pricing,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                breakdown=breakdown,
             )
-            components = []
-            for kind, quantity, cost in (
-                ("input_tokens", prompt_tokens, usage_cost.input_cost),
-                ("output_tokens", completion_tokens, usage_cost.output_cost),
-            ):
-                unit_price = cost / quantity if quantity else Decimal("0")
-                components.append(
-                    {
-                        "segment_id": segment_id,
-                        "kind": kind,
-                        "quantity": str(quantity),
-                        "unit": "token",
-                        "unit_price_usd": format(unit_price, "f"),
-                        "cost_usd": format(cost, "f"),
-                        "source": "system",
-                        "model_name": route.get("model_name") or run.model_name,
-                        "metadata": {"operation": "context_compaction"},
-                    }
-                )
+            components = _token_usage_components(
+                breakdown,
+                usage_cost,
+                segment_id=segment_id,
+                source="system",
+                model_name=route.get("model_name") or run.model_name,
+                metadata={"operation": "context_compaction"},
+            )
             await credit.apply_usage_in_transaction(
                 session,
                 event_id=event_id,
@@ -458,6 +704,7 @@ class _DurableExecutionHooks:
                 run_id=str(run.id),
                 charge_wallet=False,
                 usage_components=components,
+                breakdown=breakdown,
             )
 
     async def _summary_compactor(
@@ -482,11 +729,21 @@ class _DurableExecutionHooks:
         async with factory() as session:
             run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id))).scalar_one()
             await credit.precheck(run.user_id, run.project_id, api_key_id=getattr(run, "api_key_id", None))
+        summary_run_context = context.get("run_context")
+        summary_run_context = summary_run_context if isinstance(summary_run_context, dict) else {}
+        system_prompt = str(summary_run_context.get("summary_system_prompt") or context_manager._SUMMARY_SYSTEM)
+        messages = context.get("summary_messages")
+        if not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
+            messages = context_manager._summary_messages(chunks, system_prompt=system_prompt)
+        output_bound = min(4096, int(run_context.get("summary_output_reserve") or 512))
         started = await self._start(
             segment_id=segment_id,
             ordinal=ordinal,
             endpoint="context_compaction",
             turn_ordinal=round_index,
+            credit_bound=(lambda run: _provider_credit_bound(
+                run, messages=messages, tool_schemas=[], max_tokens=output_bound, summary=True,
+            )) if self.requires_credit_reservation else None,
         )
         usage_payload: dict[str, Any] = {}
         if isinstance(started, dict):
@@ -519,12 +776,6 @@ class _DurableExecutionHooks:
                 turn_ordinal=round_index,
             )
             raise DurableRunError("context compaction route is unavailable")
-        summary_run_context = context.get("run_context")
-        summary_run_context = summary_run_context if isinstance(summary_run_context, dict) else {}
-        system_prompt = str(summary_run_context.get("summary_system_prompt") or context_manager._SUMMARY_SYSTEM)
-        messages = context.get("summary_messages")
-        if not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
-            messages = context_manager._summary_messages(chunks, system_prompt=system_prompt)
         segment_completed = False
         try:
             response = await litellm_client.acompletion(
@@ -534,7 +785,7 @@ class _DurableExecutionHooks:
                 api_key=resolved_route.get("api_key"),
                 custom_llm_provider=resolved_route.get("provider_type"),
                 provider_auth=resolved_route.get("provider_auth"),
-                max_tokens=min(4096, int(run_context.get("summary_output_reserve") or 512)),
+                max_tokens=output_bound,
                 temperature=0,
                 extra={"response_format": {"type": "json_object"}},
             )
@@ -554,21 +805,18 @@ class _DurableExecutionHooks:
             ):
                 raise DurableRunError("context compaction result is invalid")
             usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
-            usage_payload = {
-                "prompt_tokens": int(usage.get("prompt_tokens", 0))
-                if isinstance(usage, dict)
-                else int(getattr(usage, "prompt_tokens", 0) or 0),
-                "completion_tokens": int(usage.get("completion_tokens", 0))
-                if isinstance(usage, dict)
-                else int(getattr(usage, "completion_tokens", 0) or 0),
-            }
+            observed_usage = UsageBreakdown.from_runtime(usage)
+            usage_payload = (
+                observed_usage
+                or litellm_client.extract_usage_breakdown(resolved_route["model_name"], messages, content, None)
+            ).as_usage_dict()
             await self._complete(
                 segment_id=segment_id,
                 ordinal=ordinal,
                 endpoint="context_compaction",
                 turn_ordinal=round_index,
                 result_payload=parsed,
-                usage_payload=usage_payload,
+                usage_payload={**usage_payload, **({"_durable_estimated": True} if observed_usage is None else {})},
             )
             segment_completed = True
             await self._record_summary_usage(
@@ -1016,6 +1264,44 @@ class _DurableExecutionHooks:
             run.assistant_message_id = turn.assistant_message_id
             self.active_message_id = str(turn.assistant_message_id)
 
+    async def _credit_lineage(self, session):
+        """Acquire quota and lineage before the segment ledger, including on completion."""
+        identity = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id))).scalar_one()
+        order = budgets.LockOrder()
+        quota, root, _ancestors = await children._lock_lineage(session, identity, order)
+        run = root if root.id == self.run_id else await budgets.lock_run(
+            session, self.run_id, order=order, lock_class="child"
+        )
+        return quota, root, run
+
+    def _actual_credit(self, run: ChatRun, endpoint: str, usage: dict[str, Any] | None,
+                       result: dict[str, Any] | None) -> Decimal | None:
+        if endpoint == "tool":
+            records = result.get("usage", []) if isinstance(result, dict) else []
+            if not isinstance(records, list):
+                raise DurableRunError("tool usage payload is invalid")
+            if not records and isinstance(result, dict) and (
+                result.get("status") == "failed"
+                or result.get("tool_name") in {"managed_web_search", "managed_web_fetch", "managed_advisor"}
+            ):
+                return None
+            cost, _ = _managed_usage_components(records, pricing_snapshot=run.pricing_snapshot, model_name=run.model_name)
+        else:
+            if not isinstance(usage, dict) or usage.get("_durable_estimated") is True:
+                return None
+            breakdown = _usage_payload_breakdown(usage)
+            pricing = run.pricing_snapshot
+            if endpoint == "context_compaction":
+                summary = pricing.get("summary_route") if isinstance(pricing, dict) else None
+                if isinstance(summary, dict):
+                    pricing = summary
+            cost = credit.usage_cost_from_pricing_snapshot(
+                pricing, prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens,
+                breakdown=breakdown,
+            ).raw_cost
+        snapshot = run.pricing_snapshot
+        return credit.credits_for_cost(cost, snapshot["margin_multiplier"], snapshot["chat_credit_per_usd"])
+
     async def _start(
         self,
         *,
@@ -1025,12 +1311,14 @@ class _DurableExecutionHooks:
         turn_ordinal: int,
         call_id: str | None = None,
         journal_started: tuple[str, dict[str, Any]] | None = None,
+        credit_bound: Callable[[ChatRun], Decimal] | None = None,
     ) -> dict[str, Any] | None:
         factory = _factory()
         async with factory() as session, session.begin():
-            run = (
-                await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())
-            ).scalar_one()
+            if self.requires_credit_reservation:
+                quota, root, run = await self._credit_lineage(session)
+            else:
+                run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())).scalar_one()
             _require_owned_running_lease(run, self.owner)
             if endpoint == "chat_completions":
                 await self._ensure_provider_turn(session, run, turn_ordinal)
@@ -1055,9 +1343,17 @@ class _DurableExecutionHooks:
                 }
             if segment.status == "provider_started":
                 fail_unresolved_segment(segment, error_code="provider_result_unknown")
+                if self.requires_credit_reservation:
+                    await budgets.settle_call_credit(session, run=run, root=root, quota=quota, segment=segment, actual=None)
                 return {"_boundary_abort": "provider_result_unknown"}
             if segment.status == "failed":
                 return {"_boundary_abort": "provider_result_unknown"}
+            if self.requires_credit_reservation:
+                if credit_bound is None:
+                    raise DurableRunError("v2 call is missing its bounded credit estimate")
+                await budgets.reserve_call_credit(
+                    session, run=run, root=root, quota=quota, segment=segment, amount=credit_bound(run)
+                )
             begin_segment_io(segment)
             if journal_started is not None:
                 event_type, payload = journal_started
@@ -1080,9 +1376,10 @@ class _DurableExecutionHooks:
     ) -> None:
         factory = _factory()
         async with factory() as session, session.begin():
-            run = (
-                await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())
-            ).scalar_one()
+            if self.requires_credit_reservation:
+                quota, root, run = await self._credit_lineage(session)
+            else:
+                run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())).scalar_one()
             _require_owned_running_lease(run, self.owner)
             segment = await prepare_segment(
                 session,
@@ -1101,6 +1398,11 @@ class _DurableExecutionHooks:
                     run=run,
                     asset_ids=output_asset_ids,
                 )
+            if self.requires_credit_reservation:
+                await budgets.settle_call_credit(
+                    session, run=run, root=root, quota=quota, segment=segment,
+                    actual=self._actual_credit(run, endpoint, usage_payload, result_payload),
+                )
             complete_segment_io(segment, result_payload=result_payload, usage_payload=usage_payload)
             if journal_completed is not None:
                 event_type, payload = journal_completed
@@ -1118,9 +1420,10 @@ class _DurableExecutionHooks:
     ) -> dict[str, str] | None:
         factory = _factory()
         async with factory() as session, session.begin():
-            run = (
-                await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())
-            ).scalar_one()
+            if self.requires_credit_reservation:
+                quota, root, run = await self._credit_lineage(session)
+            else:
+                run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())).scalar_one()
             _require_owned_running_lease(run, self.owner)
             segment = await prepare_segment(
                 session,
@@ -1133,14 +1436,21 @@ class _DurableExecutionHooks:
             )
             if segment.status == "provider_started":
                 fail_unresolved_segment(segment, error_code="provider_result_unknown")
+                if self.requires_credit_reservation:
+                    await budgets.settle_call_credit(session, run=run, root=root, quota=quota, segment=segment, actual=None)
             return {"_boundary_abort": "provider_result_unknown"}
 
-    async def provider_started(self, *, round_index: int, attempt: int) -> dict[str, Any] | None:
+    async def provider_started(self, *, round_index: int, attempt: int,
+                               messages: list[dict] | None = None, tool_schemas: list[dict] | None = None,
+                               max_tokens: int | None = None) -> dict[str, Any] | None:
         return await self._start(
             segment_id=f"provider:{round_index}:{attempt}",
             ordinal=round_index * 1_000 + attempt,
             endpoint="chat_completions",
             turn_ordinal=round_index,
+            credit_bound=(lambda run: _provider_credit_bound(
+                run, messages=messages or [], tool_schemas=tool_schemas or [], max_tokens=max_tokens,
+            )) if self.requires_credit_reservation else None,
         )
 
     async def provider_completed(
@@ -1185,6 +1495,7 @@ class _DurableExecutionHooks:
             endpoint="tool",
             turn_ordinal=round_index,
             call_id=tool_call_id,
+            credit_bound=(lambda run: _tool_credit_bound(run, tool_name)) if self.requires_credit_reservation else None,
             journal_started=(
                 "tool.call.started",
                 {
@@ -1264,6 +1575,12 @@ class _DurableExecutionHooks:
             output_asset_ids=output_asset_ids,
         )
 
+    async def delegations_prepared(self, *, segment_id: str, calls: list[Any]) -> dict[str, Any]:
+        """Create or recover the wait group for one model response's delegation calls."""
+        return await children.prepare_delegations(
+            parent_run_id=self.run_id, owner=self.owner, model_segment_id=segment_id, calls=list(calls)
+        )
+
     async def tool_failed(
         self, *, round_index: int, tool_index: int, tool_call_id: str, tool_name: str
     ) -> dict[str, str]:
@@ -1315,6 +1632,59 @@ class _DurableExecutionHooks:
             }
 
 
+def _usage_payload_breakdown(value: dict[str, Any]) -> UsageBreakdown:
+    """Read a journaled usage dict; entries written before cache accounting carry no split."""
+    return UsageBreakdown.from_totals(
+        max(0, int(value.get("prompt_tokens") or 0)),
+        max(0, int(value.get("completion_tokens") or 0)),
+        **{key: value.get(key) or 0 for key in CACHE_USAGE_KEYS},
+    )
+
+
+# (usage kind, breakdown token field, UsageCost cost field). ``input_tokens`` is
+# the UNCACHED quantity, matching Anthropic where input_tokens excludes cache.
+_TOKEN_USAGE_KINDS = (
+    ("input_tokens", "uncached_input_tokens", "input_cost"),
+    ("output_tokens", "output_tokens", "output_cost"),
+    ("cache_read_input_tokens", "cache_read_input_tokens", "cache_read_cost"),
+    ("cache_creation_5m_input_tokens", "cache_creation_5m_input_tokens", "cache_creation_5m_cost"),
+    ("cache_creation_1h_input_tokens", "cache_creation_1h_input_tokens", "cache_creation_1h_cost"),
+)
+
+
+def _token_usage_components(
+    breakdown: UsageBreakdown,
+    usage_cost: UsageCost,
+    *,
+    segment_id: str,
+    source: str,
+    model_name: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Per-category token components; cache categories appear only with tokens."""
+    components: list[dict[str, Any]] = []
+    for kind, token_field, cost_field in _TOKEN_USAGE_KINDS:
+        quantity = getattr(breakdown, token_field)
+        if kind.startswith("cache_") and quantity == 0:
+            continue
+        cost = getattr(usage_cost, cost_field)
+        unit_price = cost / quantity if quantity else Decimal("0")
+        components.append(
+            {
+                "segment_id": segment_id,
+                "kind": kind,
+                "quantity": str(quantity),
+                "unit": "token",
+                "unit_price_usd": format(unit_price, "f"),
+                "cost_usd": format(cost, "f"),
+                "source": source,
+                "model_name": model_name,
+                "metadata": dict(metadata),
+            }
+        )
+    return components
+
+
 _MANAGED_USAGE_KEYS = {
     ("web_search_requests", "web_search_request_per_unit", "request", "search"),
     ("web_search_context", "web_search_context_low_per_unit", "context", "search"),
@@ -1324,7 +1694,19 @@ _MANAGED_USAGE_KEYS = {
     ("web_fetch_context", "web_fetch_context_per_unit", "context", "fetch"),
     ("advisor_input_tokens", "advisor_input_price_per_token", "token", "advisor"),
     ("advisor_output_tokens", "advisor_output_price_per_token", "token", "advisor"),
+    ("advisor_cache_read_tokens", "advisor_cache_read_price_per_token", "token", "advisor"),
+    ("advisor_cache_creation_5m_tokens", "advisor_cache_write_price_per_token", "token", "advisor"),
+    ("advisor_cache_creation_1h_tokens", "advisor_cache_write_1h_price_per_token", "token", "advisor"),
 }
+# Advisor cache rates come from the frozen resolved route (manual or exact
+# direct-provider catalog); a missing category stays unpriced.
+_OPTIONAL_MANAGED_PRICE_KEYS = frozenset(
+    {
+        "advisor_cache_read_price_per_token",
+        "advisor_cache_write_price_per_token",
+        "advisor_cache_write_1h_price_per_token",
+    }
+)
 
 
 def _managed_usage_components(
@@ -1346,11 +1728,22 @@ def _managed_usage_components(
         source = record.get("source")
         if (kind, price_key, unit, source) not in _MANAGED_USAGE_KEYS:
             raise DurableRunError("managed tool usage record is invalid")
+        unpriced = price_key in _OPTIONAL_MANAGED_PRICE_KEYS and prices.get(price_key) is None
         try:
             quantity = Decimal(str(record.get("quantity")))
-            unit_price = Decimal(str(prices[price_key]))
+            unit_price = Decimal("0") if unpriced else Decimal(str(prices[price_key]))
         except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
             raise DurableRunError("managed tool pricing snapshot is invalid") from exc
+        above_price_key = f"{price_key}_above_200k"
+        if price_key in _OPTIONAL_MANAGED_PRICE_KEYS and prices.get(above_price_key) is not None:
+            prompt_tokens = record.get("prompt_tokens")
+            if type(prompt_tokens) is not int or prompt_tokens < 0 or prompt_tokens > 10_000_000:
+                raise DurableRunError("managed advisor cache prompt size is invalid")
+            if prompt_tokens > 200_000 and not unpriced:
+                try:
+                    unit_price = Decimal(str(prices[above_price_key]))
+                except (InvalidOperation, TypeError, ValueError) as exc:
+                    raise DurableRunError("managed tool pricing snapshot is invalid") from exc
         is_advisor = source == "advisor"
         if (
             not quantity.is_finite()
@@ -1374,7 +1767,7 @@ def _managed_usage_components(
                 "cost_usd": format(cost, "f"),
                 "source": source,
                 "model_name": record.get("model_name") if isinstance(record.get("model_name"), str) else model_name,
-                "metadata": {},
+                "metadata": {"unpriced": True} if unpriced and quantity > 0 else {},
             }
         )
     return total.quantize(Decimal("0.0000000001"), rounding=ROUND_HALF_EVEN), components
@@ -1440,13 +1833,43 @@ def _native_web_search_options(capability_snapshot: dict[str, Any]) -> dict[str,
     return native_options
 
 
-async def execute_queued_run(run_id: str, *, owner: str) -> bool:
+def _route_context_limit(capability_snapshot: dict[str, Any]) -> object:
+    """Read the frozen route window using the same accessor as the context fence."""
+    route_capabilities = capability_snapshot.get("capabilities")
+    if not isinstance(route_capabilities, dict):
+        route_capabilities = capability_snapshot
+    return route_capabilities.get("context_limit")
+
+
+def _native_compaction_options(capability_snapshot: dict[str, Any], resolved: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve provider-native compaction for this route, or None when unavailable.
+
+    This layers under, not over, the Lumen context fence in ``prepare_context``.
+    That fence measures against ``input_budget`` (window minus output and safety
+    reserves) and so trips at a lower absolute token count than a native trigger
+    resolved against the raw window, which keeps Lumen's durable summary the
+    primary mechanism.  The native edit only covers what the fence structurally
+    cannot: growth inside a single provider request, and rounds where the
+    summary route is unavailable and the fence skips itself.
+    """
+    if not get_settings().chat_native_compaction_enabled:
+        return None
+    return native_compaction.compaction_options(
+        provider_type=resolved.get("provider_type"),
+        context_limit=_route_context_limit(capability_snapshot),
+        ratio=context_manager.COMPACTION_REQUIRED,
+    )
+
+
+async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | None = None) -> bool:
     """Claim one queued run and stream its normalized engine output into the journal."""
     factory = _factory()
     async with factory() as session, session.begin():
-        run = await claim_queued_run(session, run_id, owner=owner)
+        run = await claim_queued_run(session, run_id, owner=owner, registration_id=registration_id)
         if run is None:
             return False
+        # From here on every journal write proves the claim fence, not just the worker identity.
+        owner = run.lease_owner
         payload = _payload(run)
         model_name = run.model_name
         project_id = run.project_id
@@ -1611,7 +2034,8 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
     citations: list[dict[str, Any]] = []
     tool_invocations: dict[str, dict[str, Any]] = {}
     tool_results: dict[str, dict[str, Any]] = {}
-    usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
+    usage_breakdown = UsageBreakdown(0, 0)
+    usage: dict[str, int] = usage_breakdown.as_usage_dict()
     managed_tool_usage: list[dict[str, Any]] = []
 
     text: list[str] = []
@@ -1752,6 +2176,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             raise DurableRunError("requested model configuration is unavailable")
         managed_search, managed_fetch, managed_advisor = await _managed_tool_configs(payload, capability_snapshot)
         native_web_search = _native_web_search_options(capability_snapshot)
+        native_compaction_options = _native_compaction_options(capability_snapshot, resolved)
         extension_snapshot = payload.get("extension_snapshot")
         if extension_snapshot is None:
             selected_tool_ids = _selected_tool_ids(payload.get("features"))
@@ -1775,6 +2200,16 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
                 selected_tool_ids,
                 selected_mcp_ids,
             )
+        plugin_tool_snapshots = payload.get("plugin_tool_snapshots") or []
+        skill_snapshot = payload.get("skill_snapshot") or []
+        if not isinstance(plugin_tool_snapshots, list) or not isinstance(skill_snapshot, list):
+            raise DurableRunInputError("frozen plugin selection is invalid")
+        # Graph checks frozen skill authority before each provider model turn;
+        # installed tool bindings are also checked before constructing bindings.
+        for snapshot in plugin_tool_snapshots:
+            if not isinstance(snapshot, dict):
+                raise DurableRunInputError("frozen plugin selection is invalid")
+            await plugin_bindings.revalidate(snapshot, namespace=Namespace(user_id=user_id, project_id=project_id))
         input_messages = [dict(message) for message in payload["input_messages"]]
         input_parts = payload.get("input_parts")
         if isinstance(input_parts, list) and any(
@@ -1796,7 +2231,10 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
                     break
         awaiting_model_response = True
         pending_tool_results: int | None = None
-        execution_hooks = _DurableExecutionHooks(run_id=run_id, owner=owner)
+        execution_hooks = _DurableExecutionHooks(
+            run_id=run_id, owner=owner, credit_bounded=run.execution_protocol_version == 2,
+            skill_snapshots=skill_snapshot, user_id=user_id, project_id=project_id,
+        )
         feature_options = payload.get("features")
         tool_policy = feature_options.get("tool_policy") if isinstance(feature_options, dict) else None
         approval_mode = tool_policy.get("approval_mode") if isinstance(tool_policy, dict) else None
@@ -1805,7 +2243,14 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             if isinstance(tool_policy, dict) and tool_policy.get("workspace_write_mode") in {"ask", "auto_edit"}
             else "ask"
         )
-        resume = await _v2_approval_resume(run_id=run_id, owner=owner) if run.execution_protocol_version == 2 else None
+        resume = await _v2_resume(run_id=run_id, owner=owner) if run.execution_protocol_version == 2 else None
+        delegation_enabled = _delegation_enabled(run, payload)
+        sandbox_lease = None
+        if run.execution_protocol_version == 2 and run.assigned_resource_id is not None:
+            try:
+                sandbox_lease = (owner, int(str(owner).rsplit("#", 1)[1]))
+            except (IndexError, ValueError):
+                raise DurableRunError("lease owner token is not fenced") from None
         hydrated_turn_ordinal: int | None = None
 
         async def hydrate_replayed_turn() -> None:
@@ -1845,6 +2290,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             managed_fetch=managed_fetch,
             managed_advisor=managed_advisor,
             native_web_search=native_web_search,
+            native_compaction_options=native_compaction_options,
             run_id=run_id,
             execution_hooks=execution_hooks,
             execution_protocol_version=run.execution_protocol_version,
@@ -1853,6 +2299,9 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             approval_mode=approval_mode if isinstance(approval_mode, str) else None,
             workspace_write_mode=workspace_write_mode,
             resume=resume,
+            plugin_tool_snapshots=tuple(plugin_tool_snapshots),
+            delegation_enabled=delegation_enabled,
+            sandbox_lease=sandbox_lease,
         ).__aiter__()
         next_event_task = asyncio.create_task(anext(engine_iterator))
         lease_lost_wait_task = asyncio.create_task(lease_lost.wait())
@@ -1938,10 +2387,29 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
                     calls = event.get("tool_calls")
                     pending_tool_results = len(calls) if isinstance(calls, list) else None
                 elif etype == "input.interrupted":
-                    payload = event.get("payload")
-                    if not isinstance(payload, dict) or run.execution_protocol_version != 2:
+                    payload_value = event.get("payload")
+                    if not isinstance(payload_value, dict) or run.execution_protocol_version != 2:
                         raise DurableRunError("unexpected durable input interrupt")
-                    await _persist_v2_approval_interrupt(run_id=run_id, owner=owner, calls=payload.get("calls"))
+                    if payload_value.get("kind") == "children":
+                        from lumen.services import graph as graph_module
+
+                        checkpointed = await graph_module.pending_interrupt(run_id)
+                        wait_group_id = payload_value.get("wait_group_id")
+                        if (
+                            checkpointed is None
+                            or checkpointed.get("kind") != "children"
+                            or checkpointed.get("wait_group_id") != wait_group_id
+                            or not isinstance(wait_group_id, str)
+                        ):
+                            raise DurableRunError("children interrupt has no resumable checkpoint")
+                        await children.mark_waiting_children(
+                            parent_run_id=run_id,
+                            owner=owner,
+                            wait_group_id=wait_group_id,
+                            checkpoint_id=checkpointed.get("checkpoint_id"),
+                        )
+                        return True
+                    await _persist_v2_approval_interrupt(run_id=run_id, owner=owner, calls=payload_value.get("calls"))
                     return True
                 elif etype == "tool_call":
                     try:
@@ -2077,8 +2545,8 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
                 elif etype == "usage":
                     value = event.get("usage")
                     if isinstance(value, dict):
-                        usage["prompt_tokens"] = max(0, int(value.get("prompt_tokens") or 0))
-                        usage["completion_tokens"] = max(0, int(value.get("completion_tokens") or 0))
+                        usage_breakdown = _usage_payload_breakdown(value)
+                        usage = usage_breakdown.as_usage_dict()
                     emitted_tool_usage = event.get("tool_usage")
                     if isinstance(emitted_tool_usage, list):
                         managed_tool_usage = [item for item in emitted_tool_usage if isinstance(item, dict)]
@@ -2138,6 +2606,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             pricing_snapshot,
             prompt_tokens=usage["prompt_tokens"],
             completion_tokens=usage["completion_tokens"],
+            breakdown=usage_breakdown,
         )
         managed_cost, managed_components = _managed_usage_components(
             managed_tool_usage,
@@ -2145,39 +2614,31 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             model_name=resolved["model_name"],
         )
         if managed_cost:
-            usage_cost = UsageCost(
+            usage_cost = replace(
+                usage_cost,
                 raw_cost=(usage_cost.raw_cost + managed_cost).quantize(
                     Decimal("0.0000000001"), rounding=ROUND_HALF_EVEN
                 ),
-                input_cost=usage_cost.input_cost,
-                output_cost=usage_cost.output_cost,
-                pricing_status=usage_cost.pricing_status,
-                pricing_snapshot=usage_cost.pricing_snapshot,
             )
-        usage_components = []
-        for kind, quantity, cost in (
-            ("input_tokens", usage["prompt_tokens"], usage_cost.input_cost),
-            ("output_tokens", usage["completion_tokens"], usage_cost.output_cost),
+        if (
+            any(component["metadata"].get("unpriced") for component in managed_components)
+            and usage_cost.pricing_status == "priced"
         ):
-            unit_price = cost / quantity if quantity else 0
-            usage_components.append(
-                {
-                    "segment_id": "executor:aggregate",
-                    "kind": kind,
-                    "quantity": str(quantity),
-                    "unit": "token",
-                    "unit_price_usd": format(unit_price, "f"),
-                    "cost_usd": format(cost, "f"),
-                    "source": "executor",
-                    "model_name": resolved["model_name"],
-                    "metadata": {},
-                }
-            )
+            usage_cost = replace(usage_cost, pricing_status="partial")
+        usage_components = _token_usage_components(
+            usage_breakdown,
+            usage_cost,
+            segment_id="executor:aggregate",
+            source="executor",
+            model_name=resolved["model_name"],
+            metadata={},
+        )
         usage_components.extend(managed_components)
         usage_record = {
             "usage_cost": usage_cost,
             "prompt_tokens": usage["prompt_tokens"],
             "completion_tokens": usage["completion_tokens"],
+            "breakdown": usage_breakdown,
             "usage_components": usage_components,
             "model_name": resolved["model_name"],
             "provider_name": resolved["provider_name"],
@@ -2201,6 +2662,14 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
         )
         if conversation_id is None:
             await _append_temp_history(run_id, payload, parts, owner=owner)
+        child_result = None
+        if run.parent_run_id is not None:
+            child_result = children.child_result_payload(
+                status=terminal_status,
+                error_code=terminal_error_code,
+                summary=raw_text,
+                artifacts=[part for part in parts if isinstance(part, dict) and part.get("type") == "file"],
+            )
         await _finish(
             run_id,
             status=terminal_status,
@@ -2211,6 +2680,7 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             usage_record=usage_record,
             message_finalization=message_finalization,
             completed_parts=completed_parts,
+            child_result=child_result,
         )
     except DurableRunLeaseLost:
         logger.warning("stopped stale durable chat worker run_id=%s owner=%s", run_id, owner)
@@ -2234,6 +2704,15 @@ async def execute_queued_run(run_id: str, *, owner: str) -> bool:
             owner=owner,
             error_code="execution_protocol_mismatch",
             safe_message="chat run execution protocol is unavailable",
+        )
+    except PluginError as exc:
+        await _finish(
+            run_id,
+            status="failed",
+            message_id=message_id,
+            owner=owner,
+            error_code=exc.code,
+            safe_message="selected plugin is unavailable or changed since admission",
         )
     except context_manager.ContextLimitExceeded as exc:
         await _finish(

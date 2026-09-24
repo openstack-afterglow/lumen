@@ -232,6 +232,21 @@ async def by_user(
         return []
 
 
+def _cache_price_projection(snapshot: object) -> dict:
+    details = snapshot if isinstance(snapshot, dict) else {}
+    components = details.get("token_components", details)
+    components = components if isinstance(components, dict) else {}
+    names = ("cache_read", "cache_creation_5m", "cache_creation_1h")
+    entries = {}
+    for name in names:
+        entry = components.get(name)
+        entries[name] = entry if isinstance(entry, dict) else {}
+    return {
+        "cache_costs_usd": {name: entries[name].get("cost") for name in names},
+        "cache_price_sources": {name: entries[name].get("source") for name in names},
+    }
+
+
 async def user_detail(
     user_id: str,
     *,
@@ -394,6 +409,14 @@ async def user_detail(
                     "prompt_tokens": row.prompt_tokens,
                     "completion_tokens": row.completion_tokens,
                     "total_tokens": row.prompt_tokens + row.completion_tokens,
+                    "uncached_input_tokens": max(
+                        0, row.prompt_tokens - row.cache_read_input_tokens
+                        - row.cache_creation_5m_input_tokens - row.cache_creation_1h_input_tokens
+                    ),
+                    "cache_read_input_tokens": row.cache_read_input_tokens,
+                    "cache_creation_5m_input_tokens": row.cache_creation_5m_input_tokens,
+                    "cache_creation_1h_input_tokens": row.cache_creation_1h_input_tokens,
+                    **_cache_price_projection(row.pricing_snapshot),
                     "credited_cost": format(row.credited_cost, "f"),
                     "raw_cost": format(row.raw_cost, "f"),
                     "source": row.source,

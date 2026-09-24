@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from lumen_plugin_api.memory import MemoryVector
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
@@ -14,7 +15,6 @@ from lumen.db import get_session_factory
 from lumen.models.chat_db import ChatMemory
 from lumen.models.chat_jobs import ChatMemoryOutbox
 from lumen.services.memory_embeddings import embed_maintenance
-from lumen.services.memory_index import MemoryVector
 from lumen.services.memory_store import memory_content_fingerprint
 from lumen.services.semantic_memory import configured_memory_index
 

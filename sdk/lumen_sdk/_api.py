@@ -34,7 +34,7 @@ class _LumenApiMixin:
     def set_conversation_workspace(self, conversation_id, **attrs):
         return self._json_request("PATCH", f"/v1/conversations/{_segment(conversation_id)}/workspace", body=attrs)
 
-    def list_messages(self, conversation_id, **query):
+    def list_message_page(self, conversation_id, **query):
         return self._json_request(
             "GET", f"/v1/conversations/{_segment(conversation_id)}/messages", params=_query(**query)
         )
@@ -143,6 +143,9 @@ class _LumenApiMixin:
 
     def cancel_run(self, run_id):
         return self._json_request("POST", f"/v1/runs/{_segment(run_id)}/cancel")
+
+    def run_children(self, run_id, **query):
+        return self._json_request("GET", f"/v1/runs/{_segment(run_id)}/children", params=_query(**query))
 
     # -- Models & Capabilities ------------------------------------------
 
@@ -348,6 +351,49 @@ class _LumenApiMixin:
 
     def admin_delete_skill(self, item_id):
         return self._json_request("DELETE", f"/v1/admin/skills/{_segment(item_id)}")
+
+    # -- Installed plugin bindings --------------------------------------
+
+    def plugin_bindings(self):
+        return self._json_request("GET", "/v1/plugin-bindings")
+
+    def create_plugin_binding(self, **attrs):
+        return self._json_request("POST", "/v1/plugin-bindings", body=attrs)
+
+    def update_plugin_binding(self, binding_id, **attrs):
+        return self._json_request("PATCH", f"/v1/plugin-bindings/{_segment(binding_id)}", body=attrs)
+
+    def delete_plugin_binding(self, binding_id):
+        return self._json_request("DELETE", f"/v1/plugin-bindings/{_segment(binding_id)}")
+
+    def admin_plugins(self):
+        return self._json_request("GET", "/v1/admin/plugins")
+
+    def admin_plugin_bindings(self):
+        return self._json_request("GET", "/v1/admin/plugin-bindings")
+
+    def admin_create_plugin_binding(self, **attrs):
+        return self._json_request("POST", "/v1/admin/plugin-bindings", body=attrs)
+
+    def admin_update_plugin_binding(self, binding_id, **attrs):
+        return self._json_request("PATCH", f"/v1/admin/plugin-bindings/{_segment(binding_id)}", body=attrs)
+
+    def admin_delete_plugin_binding(self, binding_id):
+        return self._json_request("DELETE", f"/v1/admin/plugin-bindings/{_segment(binding_id)}")
+
+    # -- Agent runtime administration ------------------------------------
+
+    def admin_agent_project_quota(self, project_id):
+        return self._json_request("GET", f"/v1/admin/agent-project-quotas/{_segment(project_id)}")
+
+    def admin_set_agent_project_quota(self, project_id, **attrs):
+        return self._json_request("PUT", f"/v1/admin/agent-project-quotas/{_segment(project_id)}", body=attrs)
+
+    def admin_runtime_pools(self):
+        return self._json_request("GET", "/v1/admin/runtime-pools")
+
+    def admin_runtime_resources(self, **query):
+        return self._json_request("GET", "/v1/admin/runtime-resources", params=_query(**query))
 
     # -- Usage & API Keys -----------------------------------------------
 

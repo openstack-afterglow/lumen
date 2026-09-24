@@ -6,12 +6,17 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from lumen.auth import require_scopes
+from lumen.config import get_settings
 from lumen.services import capabilities
 from lumen.services import conversation_store as cs
 from lumen.services.providers import errors, repository, routing
@@ -107,6 +112,7 @@ class ConversationResponse(BaseModel):
     model_name: str | None
     workspace_id: int | None = None
     active_leaf_id: int | None = None
+    history_revision: int = 0
     parent_conversation_id: str | None = None
     forked_from_message_id: int | None = None
     created_at: str | None
@@ -133,35 +139,80 @@ class MessageResponse(BaseModel):
     created_at: str | None
     created_at_local: str | None = None
     created_timezone: str | None = None
+    position: int | None = None
+    branch: dict[str, int | None] | None = None
 
     model_config = {"protected_namespaces": ()}
 
 
-class MessageTreeNode(BaseModel):
-    """Unencrypted branch metadata used for version navigation."""
-
-    id: int
-    parent_id: int | None
-    role: str
-    created_at: str | None
-
-
-class MessageTreeResponse(BaseModel):
-    """Backward page from a conversation message tree."""
+class MessagePageResponse(BaseModel):
+    """Bounded bidirectional page from the selected conversation path."""
 
     messages: list[MessageResponse]
     active_leaf_id: int | None = None
-    has_more: bool = False
-    tree_nodes: list[MessageTreeNode] = []
-    next_before_id: int | None = None
+    history_revision: int
+    has_before: bool = False
+    has_after: bool = False
+    before_cursor: str | None = None
+    after_cursor: str | None = None
 
 
 class ActiveLeafRequest(BaseModel):
     message_id: int
+    descend: bool = False
 
 
 class ForkRequest(BaseModel):
     message_id: int
+
+
+def _encode_history_cursor(
+    *, conversation_id: str, revision: int, direction: Literal["before", "after"], position: int
+) -> str:
+    payload = json.dumps(
+        {
+            "v": 1,
+            "conversation_id": conversation_id,
+            "revision": revision,
+            "direction": direction,
+            "position": position,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    secret = bytes.fromhex(get_settings().get_lumen_encryption_key)
+    signature = hmac.new(secret, payload, hashlib.sha256).digest()
+    encoded_payload = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+    return f"{encoded_payload}.{encoded_signature}"
+
+
+def _decode_history_cursor(cursor: str, *, conversation_id: str) -> dict:
+    if not cursor or len(cursor) > 512:
+        raise ValueError("invalid cursor")
+    try:
+        encoded_payload, encoded_signature = cursor.split(".", 1)
+        payload = base64.urlsafe_b64decode(encoded_payload + "=" * (-len(encoded_payload) % 4))
+        signature = base64.urlsafe_b64decode(encoded_signature + "=" * (-len(encoded_signature) % 4))
+        expected = hmac.new(bytes.fromhex(get_settings().get_lumen_encryption_key), payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("invalid signature")
+        decoded = json.loads(payload)
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid cursor") from exc
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != {"v", "conversation_id", "revision", "direction", "position"}
+        or decoded.get("v") != 1
+        or decoded.get("conversation_id") != conversation_id
+        or decoded.get("direction") not in {"before", "after"}
+        or not isinstance(decoded.get("revision"), int)
+        or not isinstance(decoded.get("position"), int)
+        or decoded["revision"] < 0
+        or decoded["position"] < 0
+    ):
+        raise ValueError("invalid cursor")
+    return decoded
 
 
 def _map_error(exc: Exception) -> HTTPException:
@@ -169,8 +220,10 @@ def _map_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, (cs.ConversationForbidden, cs.WorkspaceForbidden)):
         return HTTPException(status_code=403, detail=str(exc))
-    if isinstance(exc, cs.ConversationRunActive):
-        return HTTPException(status_code=409, detail=cs.ConversationRunActive.code)
+    if isinstance(exc, (cs.ConversationRunActive, cs.HistoryRevisionChanged)):
+        return HTTPException(status_code=409, detail=exc.code)
+    if isinstance(exc, cs.HistoryIndexUnavailable):
+        return HTTPException(status_code=503, detail=exc.code)
     return HTTPException(status_code=503, detail=str(exc))
 
 
@@ -267,23 +320,72 @@ async def delete_conversation(
         raise _map_error(exc) from exc
 
 
-@router.get("/conversations/{conversation_id}/messages", response_model=MessageTreeResponse)
+@router.get("/conversations/{conversation_id}/messages", response_model=MessagePageResponse)
 async def list_messages(
     conversation_id: str,
-    before_id: int | None = Query(default=None, gt=0),
+    anchor: Literal["latest", "first"] | None = Query(default=None),
+    cursor: str | None = Query(default=None, max_length=512),
     limit: int = Query(default=40, ge=1, le=100),
     token_info: dict = Depends(require_scopes("native:conversations:read")),
 ):
-    """Return a bounded active-branch page; before_id anchors the next ancestor page."""
+    """Return an indexed page; cursor boundaries are exclusive and revision-fenced."""
     try:
-        return await cs.list_message_tree(
+        await cs.get_conversation(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
-            before_id=before_id,
+        )
+        if cursor is not None and anchor is not None:
+            raise HTTPException(status_code=422, detail="anchor_and_cursor_are_mutually_exclusive")
+        decoded = None
+        if cursor is not None:
+            try:
+                decoded = _decode_history_cursor(cursor, conversation_id=conversation_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail="invalid_history_cursor") from exc
+        page = await cs.list_message_page(
+            conversation_id,
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            anchor=anchor or "latest",
+            cursor_direction=decoded["direction"] if decoded else None,
+            cursor_position=decoded["position"] if decoded else None,
+            expected_revision=decoded["revision"] if decoded else None,
             limit=limit,
         )
-    except (cs.ConversationNotFound, cs.ConversationForbidden, cs.ChatStorageUnavailable) as exc:
+        revision = page["history_revision"]
+        before_position = page.pop("before_position")
+        after_position = page.pop("after_position")
+        page["before_cursor"] = (
+            _encode_history_cursor(
+                conversation_id=conversation_id,
+                revision=revision,
+                direction="before",
+                position=before_position,
+            )
+            if before_position is not None
+            else None
+        )
+        page["after_cursor"] = (
+            _encode_history_cursor(
+                conversation_id=conversation_id,
+                revision=revision,
+                direction="after",
+                position=after_position,
+            )
+            if after_position is not None
+            else None
+        )
+        return page
+    except HTTPException:
+        raise
+    except (
+        cs.ConversationNotFound,
+        cs.ConversationForbidden,
+        cs.HistoryIndexUnavailable,
+        cs.HistoryRevisionChanged,
+        cs.ChatStorageUnavailable,
+    ) as exc:
         raise _map_error(exc) from exc
 
 
@@ -300,6 +402,7 @@ async def set_active_leaf(
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
             message_id=payload.message_id,
+            descend=payload.descend,
         )
     except (
         cs.ConversationNotFound,

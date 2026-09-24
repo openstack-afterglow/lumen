@@ -1,10 +1,17 @@
-"""Remote MCP OAuth discovery and chat-extension routing contracts."""
+"""Core MCP OAuth lane: SQL-owned callback URL policy, config-revision matching,
+and delegation of the protocol-level OAuth flow to the started remote-mcp plugin.
+
+Discovery, PKCE, browser-bound state, and token refresh/rotation are owned by
+the plugins/mcp-default package and exercised by its own test suite. This file
+covers only what core itself is responsible for: the callback URL/origin policy
+functions, the SQL config-revision matcher, delegation from the caller-facing
+wrapper functions to the registry-resolved plugin, and the public callback route.
+"""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-import httpx
 import pytest
 
 from lumen.api import extensions
@@ -12,42 +19,10 @@ from lumen.api import mcp_oauth as mcp_oauth_callback
 from lumen.services import mcp_oauth
 
 
-async def _async_value(value):
-    return value
-
-
 @pytest.fixture(autouse=True)
 def _public_oauth_endpoints(monkeypatch):
+    """Callback URL policy tests use reserved example hosts; configuration-time DNS is stubbed."""
     monkeypatch.setattr(mcp_oauth.ssrf, "validate_url", lambda url: url)
-
-
-class _AsyncNullContext:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False
-
-
-class _OAuthBeginSession:
-    def __init__(self, server):
-        self.server = server
-        self.requests = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False
-
-    def begin(self):
-        return _AsyncNullContext()
-
-    async def get(self, _model, _server_id):
-        return self.server
-
-    def add(self, request):
-        self.requests.append(request)
 
 
 class TestMcpOAuthCallbackUrl:
@@ -141,243 +116,6 @@ class TestMcpOAuthCallbackUrl:
         with pytest.raises(mcp_oauth.McpOAuthError, match="URL is invalid"):
             mcp_oauth._callback_url()
 
-    def test_rejects_victim_browser_nonce_for_attacker_request(self):
-        attacker_nonce = "a" * 43
-        with pytest.raises(mcp_oauth.McpOAuthError, match="not initiated by this browser"):
-            mcp_oauth._verify_initiator_nonce(
-                {"initiator_nonce_hash": mcp_oauth._hash(attacker_nonce)},
-                "victim-browser-nonce",
-            )
-
-
-class TestMcpOAuthDiscovery:
-    async def test_discovers_https_metadata_and_registration_endpoint(self, monkeypatch):
-        seen: list[str] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen.append(str(request.url))
-            payloads = {
-                "https://mcp.example/.well-known/oauth-protected-resource": {
-                    "resource": "https://mcp.example/mcp",
-                    "authorization_servers": ["https://auth.example"],
-                },
-                "https://auth.example/.well-known/oauth-authorization-server": {
-                    "issuer": "https://auth.example",
-                    "authorization_endpoint": "https://auth.example/authorize",
-                    "token_endpoint": "https://auth.example/token",
-                    "registration_endpoint": "https://auth.example/register",
-                },
-            }
-            return httpx.Response(200, json=payloads[str(request.url)])
-
-        monkeypatch.setattr(
-            mcp_oauth,
-            "_http_client",
-            lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://unused.example"),
-        )
-
-        metadata = await mcp_oauth._discover("https://mcp.example/mcp")
-
-        assert metadata == {
-            "issuer": "https://auth.example",
-            "authorization_endpoint": "https://auth.example/authorize",
-            "token_endpoint": "https://auth.example/token",
-            "registration_endpoint": "https://auth.example/register",
-            "resource": "https://mcp.example/mcp",
-        }
-        assert seen == [
-            "https://mcp.example/.well-known/oauth-protected-resource",
-            "https://auth.example/.well-known/oauth-authorization-server",
-        ]
-
-    async def test_allows_metadata_without_dynamic_registration(self, monkeypatch):
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.host == "mcp.example":
-                return httpx.Response(200, json={"authorization_servers": ["https://auth.example"]})
-            return httpx.Response(
-                200,
-                json={
-                    "issuer": "https://auth.example",
-                    "authorization_endpoint": "https://auth.example/authorize",
-                    "token_endpoint": "https://auth.example/token",
-                },
-            )
-
-        monkeypatch.setattr(
-            mcp_oauth,
-            "_http_client",
-            lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://unused.example"),
-        )
-
-        metadata = await mcp_oauth._discover("https://mcp.example/mcp")
-
-        assert metadata["registration_endpoint"] is None
-
-    async def test_rejects_authorization_metadata_with_wrong_issuer(self, monkeypatch):
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.host == "mcp.example":
-                return httpx.Response(200, json={"authorization_servers": ["https://auth.example"]})
-            return httpx.Response(
-                200,
-                json={
-                    "issuer": "https://other-auth.example",
-                    "authorization_endpoint": "https://auth.example/authorize",
-                    "token_endpoint": "https://auth.example/token",
-                },
-            )
-
-        monkeypatch.setattr(
-            mcp_oauth,
-            "_http_client",
-            lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://unused.example"),
-        )
-
-        with pytest.raises(mcp_oauth.McpOAuthError, match="issuer does not match"):
-            await mcp_oauth._discover("https://mcp.example/mcp")
-
-    def test_rejects_callback_issuer_that_differs_from_bound_issuer(self):
-        assert mcp_oauth._callback_issuer_matches("https://auth.example", "https://auth.example/")
-        assert not mcp_oauth._callback_issuer_matches("https://auth.example", "https://attacker.example")
-        assert not mcp_oauth._callback_issuer_matches("https://auth.example", "http://auth.example")
-
-    def test_pending_callback_and_connection_tokens_bind_to_server_revision(self):
-        server = SimpleNamespace(is_active=True, auth_mode="oauth", config_version=4)
-
-        assert mcp_oauth._oauth_configuration_matches(server, 4)
-        server.config_version = 5  # URL or OAuth configuration was changed while the browser authorized.
-        assert not mcp_oauth._oauth_configuration_matches(server, 4)
-
-
-class TestMcpOAuthAuthorizationOwnership:
-    @pytest.mark.parametrize("scope", ("global", "user"))
-    async def test_begin_preserves_detected_oauth_mode(self, monkeypatch, scope):
-        server = SimpleNamespace(
-            id=7,
-            scope=scope,
-            is_active=True,
-            url="https://mcp.example/mcp",
-            owner_user_id="user-1",
-            owner_project_id="project-1",
-            auth_mode="oauth",
-            config_version=4,
-        )
-        session = _OAuthBeginSession(server)
-        metadata = {
-            "issuer": "https://auth.example",
-            "authorization_endpoint": "https://auth.example/authorize",
-            "token_endpoint": "https://auth.example/token",
-            "registration_endpoint": "https://auth.example/register",
-            "resource": "https://mcp.example/mcp",
-        }
-
-        monkeypatch.setattr(mcp_oauth, "get_session_factory", lambda: lambda: session)
-        monkeypatch.setattr(mcp_oauth, "_discover", lambda _url: _async_value(metadata))
-        monkeypatch.setattr(
-            mcp_oauth,
-            "_register_client",
-            lambda _metadata, _callback_url: _async_value({"client_id": "client-1", "client_secret": ""}),
-        )
-        monkeypatch.setattr(mcp_oauth, "_callback_url", lambda: "https://console.example/oauth/callback")
-        monkeypatch.setattr(mcp_oauth, "_encrypt", lambda _payload: "encrypted")
-
-        result = await mcp_oauth.begin(7, user_id="user-1", project_id="project-1", initiator_nonce="n" * 43)
-
-        assert result["authorization_url"].startswith("https://auth.example/authorize?")
-        assert server.auth_mode == "oauth"
-        assert len(session.requests) == 1
-
-    async def test_detect_marks_user_source_oauth_without_accepting_credentials(self, monkeypatch):
-        server = SimpleNamespace(
-            id=7,
-            scope="user",
-            is_active=True,
-            url="https://mcp.example/mcp",
-            owner_user_id="user-1",
-            owner_project_id="project-1",
-            auth_mode="none",
-            config_version=4,
-        )
-        session = _OAuthBeginSession(server)
-        metadata = {
-            "issuer": "https://auth.example",
-            "authorization_endpoint": "https://auth.example/authorize",
-            "token_endpoint": "https://auth.example/token",
-            "registration_endpoint": "https://auth.example/register",
-            "resource": "https://mcp.example/mcp",
-        }
-
-        monkeypatch.setattr(mcp_oauth, "get_session_factory", lambda: lambda: session)
-        monkeypatch.setattr(mcp_oauth, "_discover", lambda _url: _async_value(metadata))
-
-        result = await mcp_oauth.detect(7, user_id="user-1", project_id="project-1")
-
-        assert result == {
-            "auth_mode": "oauth",
-            "oauth_required": True,
-            "oauth_connection_available": True,
-        }
-        assert server.auth_mode == "oauth"
-        assert server.config_version == 5
-
-    async def test_begin_uses_admin_static_client_and_declared_scopes(self, monkeypatch):
-        server = SimpleNamespace(
-            id=7,
-            scope="global",
-            is_active=True,
-            url="https://mcp.example/mcp",
-            auth_mode="oauth",
-            oauth_client_id="static-client",
-            encrypted_oauth_client_secret="encrypted-secret",
-            oauth_scopes=["read", "write"],
-            config_version=4,
-        )
-        session = _OAuthBeginSession(server)
-        metadata = {
-            "issuer": "https://auth.example",
-            "authorization_endpoint": "https://auth.example/authorize",
-            "token_endpoint": "https://auth.example/token",
-            "registration_endpoint": None,
-            "resource": "https://mcp.example/mcp",
-        }
-        encrypted_payloads: list[dict] = []
-
-        monkeypatch.setattr(mcp_oauth, "get_session_factory", lambda: lambda: session)
-        monkeypatch.setattr(mcp_oauth, "_discover", lambda _url: _async_value(metadata))
-        monkeypatch.setattr(mcp_oauth, "decrypt_llm_provider_key", lambda _blob: "static-secret")
-        monkeypatch.setattr(mcp_oauth, "_callback_url", lambda: "https://console.example/oauth/callback")
-        monkeypatch.setattr(mcp_oauth, "_encrypt", lambda payload: encrypted_payloads.append(payload) or "encrypted")
-        monkeypatch.setattr(
-            mcp_oauth,
-            "get_settings",
-            lambda: SimpleNamespace(
-                cors_origin_list=("https://console.example",),
-                frontend_base_url="https://console.example",
-                public_api_base="https://api.example",
-            ),
-        )
-
-        result = await mcp_oauth.begin(
-            7,
-            user_id="user-1",
-            project_id="project-1",
-            initiator_nonce="n" * 43,
-            return_origin="https://console.example",
-        )
-        assert "client_id=static-client" in result["authorization_url"]
-        assert "scope=read+write" in result["authorization_url"]
-        assert encrypted_payloads == [
-            {
-                **metadata,
-                "client_id": "static-client",
-                "client_secret": "static-secret",
-                "code_verifier": encrypted_payloads[0]["code_verifier"],
-                "callback_url": "https://console.example/oauth/callback",
-                "initiator_nonce_hash": mcp_oauth._hash("n" * 43),
-                "scopes": ["read", "write"],
-                "return_origin": "https://console.example",
-            }
-        ]
-
     def test_local_callback_returns_to_local_chat(self, monkeypatch):
         monkeypatch.setattr(
             mcp_oauth_callback,
@@ -388,6 +126,100 @@ class TestMcpOAuthAuthorizationOwnership:
         assert mcp_oauth_callback._return_url(connected=True, server_id=7) == (
             "http://localhost:3080/dashboard/chat/settings?section=mcp&mcp_oauth=connected&mcp_server_id=7"
         )
+
+
+class TestMcpOAuthConfigurationRevision:
+    def test_pending_callback_and_connection_tokens_bind_to_server_revision(self):
+        server = SimpleNamespace(is_active=True, auth_mode="oauth", config_version=4)
+
+        assert mcp_oauth._oauth_configuration_matches(server, 4)
+        server.config_version = 5  # URL or OAuth configuration was changed while the browser authorized.
+        assert not mcp_oauth._oauth_configuration_matches(server, 4)
+
+
+class _FakeOAuthProvider:
+    """Records delegation from the caller-facing wrapper functions."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, tuple, dict]] = []
+
+    async def detect(self, server_id, namespace):
+        self.calls.append(("detect", (server_id, namespace), {}))
+        return {"auth_mode": "oauth", "oauth_required": True, "oauth_connection_available": True}
+
+    async def begin_connect(self, server_id, namespace, *, initiator_nonce, return_origin=None):
+        self.calls.append(("begin_connect", (server_id, namespace), {"initiator_nonce": initiator_nonce, "return_origin": return_origin}))
+        return {"authorization_url": "https://auth.example/authorize?state=opaque"}
+
+    async def complete_callback(self, *, state, code, error, iss, initiator_nonce):
+        self.calls.append(("complete_callback", (), {"state": state, "code": code, "error": error, "iss": iss, "initiator_nonce": initiator_nonce}))
+        return 7, "https://console.example"
+
+    async def connection_status(self, server_id, namespace):
+        self.calls.append(("connection_status", (server_id, namespace), {}))
+        return {"mcp_server_id": server_id, "required": True, "connected": True, "expires_at": None}
+
+    async def disconnect(self, server_id, namespace):
+        self.calls.append(("disconnect", (server_id, namespace), {}))
+
+    async def headers_for_user(self, namespace):
+        self.calls.append(("headers_for_user", (namespace,), {}))
+        return {7: {"Authorization": "Bearer token"}}
+
+
+@pytest.fixture
+def fake_oauth_provider(monkeypatch):
+    provider = _FakeOAuthProvider()
+    monkeypatch.setattr(mcp_oauth, "_oauth_provider", lambda: provider)
+    return provider
+
+
+class TestMcpOAuthCallerDelegation:
+    """The caller-facing wrapper functions delegate to the registry-resolved plugin."""
+
+    async def test_detect_delegates_to_started_plugin(self, fake_oauth_provider):
+        result = await mcp_oauth.detect(7, user_id="user-1", project_id="project-1")
+
+        assert result == {"auth_mode": "oauth", "oauth_required": True, "oauth_connection_available": True}
+        [(name, args, kwargs)] = fake_oauth_provider.calls
+        assert name == "detect"
+        assert args[0] == 7
+        assert (args[1].user_id, args[1].project_id) == ("user-1", "project-1")
+
+    async def test_begin_delegates_initiator_nonce_and_return_origin(self, fake_oauth_provider):
+        result = await mcp_oauth.begin(
+            7, user_id="user-1", project_id="project-1", initiator_nonce="n" * 43, return_origin="https://console.example"
+        )
+
+        assert result == {"authorization_url": "https://auth.example/authorize?state=opaque"}
+        [(name, args, kwargs)] = fake_oauth_provider.calls
+        assert name == "begin_connect"
+        assert args[0] == 7
+        assert kwargs == {"initiator_nonce": "n" * 43, "return_origin": "https://console.example"}
+
+    async def test_complete_delegates_callback_fields(self, fake_oauth_provider):
+        result = await mcp_oauth.complete(state="opaque-state", code="oauth-code", error=None, iss=None, initiator_nonce="browser-nonce")
+
+        assert result == (7, "https://console.example")
+        [(name, args, kwargs)] = fake_oauth_provider.calls
+        assert name == "complete_callback"
+        assert kwargs == {"state": "opaque-state", "code": "oauth-code", "error": None, "iss": None, "initiator_nonce": "browser-nonce"}
+
+    async def test_status_and_disconnect_delegate_with_namespace(self, fake_oauth_provider):
+        status = await mcp_oauth.status(7, user_id="user-1", project_id="project-1")
+        await mcp_oauth.disconnect(7, user_id="user-1", project_id="project-1")
+
+        assert status == {"mcp_server_id": 7, "required": True, "connected": True, "expires_at": None}
+        names = [call[0] for call in fake_oauth_provider.calls]
+        assert names == ["connection_status", "disconnect"]
+
+    async def test_headers_for_user_delegates_with_namespace(self, fake_oauth_provider):
+        result = await mcp_oauth.headers_for_user(user_id="user-1", project_id="project-1")
+
+        assert result == {7: {"Authorization": "Bearer token"}}
+        [(name, args, kwargs)] = fake_oauth_provider.calls
+        assert name == "headers_for_user"
+        assert (args[0].user_id, args[0].project_id) == ("user-1", "project-1")
 
 
 class TestMcpOAuthRoutes:

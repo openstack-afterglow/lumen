@@ -372,3 +372,261 @@ async def test_subscription_model_namespace_is_unique_under_concurrent_registrat
             async with factory() as session, session.begin():
                 await session.execute(delete(LlmProvider).where(LlmProvider.id.in_(provider_ids)))
         await close_db()
+
+
+async def test_second_page_claude_requires_explicit_pricing_before_native_admission(monkeypatch):
+    """Discovery is read-only; explicit registration becomes routable and billable without a flush."""
+    import json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+    from urllib.parse import parse_qs, urlsplit
+
+    from lumen.models.chat_db import ChatUsageLog
+    from lumen.models.chat_runs import ChatRunProvider
+
+    nonce = uuid.uuid4().hex
+    model_name = f"claude-onboarding-unlisted-{nonce}"
+    unpriced_name = f"claude-unpriced-{nonce}"
+    project_id = f"onboarding-project-{nonce}"
+    user_id = f"onboarding-user-{nonce}"
+    init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
+    factory = get_session_factory()
+    assert factory is not None
+    redis = Redis.from_url(os.environ["REDIS_URL"])
+    fake_provider = None
+    fake_thread = None
+    try:
+        assert await redis.ping() is True
+
+        def validate_admin(token: str, project_id: str = "") -> dict:
+            assert token == "onboarding-admin-token"
+            return {
+                "user_id": user_id,
+                "username": "onboarding-admin",
+                "project_id": project_id or f"onboarding-project-{nonce}",
+                "roles": ["admin"],
+                "is_system_admin": True,
+            }
+
+        monkeypatch.setattr("lumen.auth.validate_token", validate_admin)
+        admin_headers = {"X-Auth-Token": "onboarding-admin-token"}
+        requested_pages: list[str | None] = []
+
+        class FakeClaudeCatalog(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                parsed = urlsplit(self.path)
+                query = parse_qs(parsed.query)
+                cursor = query.get("after_id", [None])[0]
+                if (
+                    parsed.path != "/v1/models"
+                    or self.headers.get("x-api-key") != "isolated-fake-key"
+                    or self.headers.get("anthropic-version") != "2023-06-01"
+                    or query.get("limit") != ["200"]
+                    or cursor not in (None, "claude-sonnet-4-6")
+                ):
+                    self.send_error(400)
+                    return
+                requested_pages.append(cursor)
+                mid, display_name = (
+                    ("claude-sonnet-4-6", "Sonnet") if cursor is None else (model_name, "Unlisted Claude")
+                )
+                body = json.dumps(
+                    {
+                        "data": [
+                            {"id": mid, "display_name": display_name, "type": "model"},
+                            *(
+                                [{"id": unpriced_name, "display_name": "Unpriced Claude", "type": "model"}]
+                                if cursor
+                                else []
+                            ),
+                        ],
+                        "has_more": cursor is None,
+                        "last_id": unpriced_name if cursor else mid,
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        fake_provider = ThreadingHTTPServer(("127.0.0.1", 0), FakeClaudeCatalog)
+        fake_thread = Thread(target=fake_provider.serve_forever, daemon=True)
+        fake_thread.start()
+        key = await api_key_store.create_key(
+            user_id,
+            project_id,
+            "onboarding",
+            ["models:read", "native:runs:read", "native:runs:write", "native:tools:execute", "usage:read"],
+            None,
+        )
+        key_headers = {"X-Api-Key": key["key"]}
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+            created_provider = await client.post(
+                "/v1/admin/providers",
+                headers=admin_headers,
+                json={
+                    "name": f"onboarding-provider-{nonce}",
+                    "provider_type": "anthropic",
+                    "api_base": f"http://127.0.0.1:{fake_provider.server_port}/v1",
+                    "api_key": "isolated-fake-key",
+                },
+            )
+            assert created_provider.status_code == 201, created_provider.text
+            provider_id = created_provider.json()["id"]
+
+            discovered = await client.get(f"/v1/admin/providers/{provider_id}/available-models", headers=admin_headers)
+            assert discovered.status_code == 200, discovered.text
+            catalog = discovered.json()
+            assert catalog["provider_id"] == provider_id
+            assert catalog["source"] == "api" and catalog["live_status"] == "success"
+            assert catalog["complete"] is True and catalog["error"] is None
+            assert catalog["models"] == ["claude-sonnet-4-6", model_name, unpriced_name]
+            candidate = next(item for item in catalog["candidates"] if item["id"] == model_name)
+            assert candidate["display_name"] == "Unlisted Claude" and candidate["purpose"] == "chat"
+            assert requested_pages == [None, "claude-sonnet-4-6"]
+            async with factory() as session:
+                count = await session.scalar(select(func.count(LlmModel.id)).where(LlmModel.provider_id == provider_id))
+            assert count == 0, "Discovery must not persist a model"
+
+            unpriced = await client.post(
+                "/v1/admin/models",
+                headers=admin_headers,
+                json={"provider_id": provider_id, "model_name": unpriced_name},
+            )
+            assert unpriced.status_code == 201, unpriced.text
+            registered = await client.post(
+                "/v1/admin/models",
+                headers=admin_headers,
+                json={
+                    "provider_id": provider_id,
+                    "model_name": model_name,
+                    "input_price_per_million": "2",
+                    "output_price_per_million": "4",
+                },
+            )
+            assert registered.status_code == 201, registered.text
+            model = registered.json()
+            assert model["provider_id"] == provider_id
+            assert model["api_model_name"] == model_name and model["api_provider"] == "anthropic"
+            assert model["price_source"] == "manual"
+            assert model["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is True
+
+            active = await client.get("/v1/admin/models?active_only=true", headers=admin_headers)
+            assert active.status_code == 200, active.text
+            assert any(item["id"] == model["id"] for item in active.json())
+            unpriced_projection = next(item for item in active.json() if item["id"] == unpriced.json()["id"])
+            assert unpriced_projection["effective_price_source"] == "unpriced", unpriced_projection
+            assert unpriced_projection["effective_input_price_per_million"] is None
+            assert unpriced_projection["effective_output_price_per_million"] is None
+            public = await client.get("/v1/models", headers=key_headers)
+            assert public.status_code == 200, public.text
+            assert "anthropic" in next(item for item in public.json()["data"] if item["id"] == model_name)["providers"]
+
+            def native_request(selected_model: str, text: str, *, search: bool = False) -> dict:
+                return {
+                    "parts": [{"type": "text", "text": text}],
+                    "model_id": selected_model,
+                    "features": {
+                        "memory": False,
+                        "tool_policy": {"mode": "agent_default" if search else "none"},
+                        **({"web_search": {"enabled": True, "mode": "native"}} if search else {}),
+                    },
+                }
+
+            async with factory() as session:
+                before_denial = await session.scalar(select(func.count(ChatRun.id)).where(ChatRun.user_id == user_id))
+            denied = await client.post(
+                "/v1/temp-completions",
+                headers={**key_headers, "Idempotency-Key": str(uuid.uuid4())},
+                json=native_request(unpriced_name, "no price must deny"),
+            )
+            assert denied.status_code == 422, denied.text
+            assert "text (pricing_unavailable)" in denied.json()["detail"]
+
+            advanced = await client.post(
+                "/v1/temp-completions",
+                headers={**key_headers, "Idempotency-Key": str(uuid.uuid4())},
+                json=native_request(model_name, "unsupported search", search=True),
+            )
+            async with factory() as session:
+                after_denial = await session.scalar(select(func.count(ChatRun.id)).where(ChatRun.user_id == user_id))
+            assert before_denial == after_denial == 0
+            assert advanced.status_code == 422, advanced.text
+            assert "web_search" in advanced.json()["detail"]
+
+            admitted = await client.post(
+                "/v1/temp-completions",
+                headers={**key_headers, "Idempotency-Key": str(uuid.uuid4())},
+                json=native_request(model_name, "priced text only"),
+            )
+            assert admitted.status_code == 202, admitted.text
+            run_id = admitted.json()["run_id"]
+            async with factory() as session:
+                run = await session.get(ChatRun, run_id)
+                route = await session.get(ChatRunProvider, (run_id, "executor"))
+                assert run is not None and route is not None
+                assert route.provider_id == provider_id and route.model_id == model["id"]
+                assert run.capability_snapshot["config_version_hash"] == route.config_version_hash
+                assert run.pricing_snapshot["price_source"] == "manual"
+                assert Decimal(run.pricing_snapshot["input_price_per_token"]) == Decimal("0.000002")
+                assert Decimal(run.pricing_snapshot["output_price_per_token"]) == Decimal("0.000004")
+                admitted_pricing = dict(run.pricing_snapshot)
+
+            async def fake_stream(**kwargs):
+                assert kwargs["model"] == model_name
+                assert kwargs["custom_llm_provider"] == "anthropic"
+
+                async def chunks():
+                    yield SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content="fake Claude answer", tool_calls=None))],
+                        usage=None,
+                    )
+                    yield SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content=None, tool_calls=None))],
+                        usage={"prompt_tokens": 10, "completion_tokens": 5},
+                    )
+
+                return chunks()
+
+            monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_stream)
+            assert await execution.execute_queued_run(run_id, owner=f"onboarding-worker-{nonce}") is True
+            async with factory() as session:
+                stored = await session.get(ChatRun, run_id)
+                ledger = (await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))).scalar_one()
+                assert stored.status == "completed"
+                assert ledger.provider == f"onboarding-provider-{nonce}"
+                assert (ledger.prompt_tokens, ledger.completion_tokens) == (10, 5)
+                assert ledger.raw_cost == Decimal("0.0000400000")
+                assert ledger.pricing_status == "priced"
+            usage = await client.get("/v1/usage/records", headers=key_headers)
+            assert usage.status_code == 200, usage.text
+            record = next(item for item in usage.json()["records"] if item["run_id"] == run_id)
+            assert record["source"] == "api" and record["api_key_id"] == key["id"]
+            assert record["total_tokens"] == 15
+
+            repriced = await client.patch(
+                f"/v1/admin/models/{model['id']}",
+                headers=admin_headers,
+                json={"input_price_per_million": "6", "output_price_per_million": "8"},
+            )
+            assert repriced.status_code == 200, repriced.text
+            async with factory() as session:
+                unchanged_run = await session.get(ChatRun, run_id)
+                unchanged_ledger = (
+                    await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))
+                ).scalar_one()
+                assert unchanged_run.pricing_snapshot == admitted_pricing
+                assert unchanged_ledger.raw_cost == Decimal("0.0000400000")
+    finally:
+        if fake_provider is not None:
+            fake_provider.shutdown()
+            fake_provider.server_close()
+        if fake_thread is not None:
+            fake_thread.join()
+        await redis.close()
+        await close_db()

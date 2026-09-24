@@ -4,31 +4,32 @@ from lumen.services import memory_retrieval
 
 
 @pytest.mark.asyncio
-async def test_retrieval_uses_pinned_route_and_single_namespace(monkeypatch):
+async def test_candidate_ids_delegates_one_exact_namespace_semantic_recall(monkeypatch):
     captured = {}
 
-    class Index:
-        async def search_ids(self, **kwargs):
-            captured.update(kwargs)
-            return [4, 2]
+    async def fake_recall_candidate_ids(*, namespace, strategy, query, limit, **_kwargs):
+        captured["namespace"] = namespace
+        captured["strategy"] = strategy
+        captured["query"] = query
+        captured["limit"] = limit
+        return [4, 2]
 
-    async def embed_with_route(**kwargs):
-        assert kwargs["route"]["model_name"] == "run-pinned-embed"
-        return [0.1, 0.2]
+    monkeypatch.setattr(memory_retrieval.memory_host, "recall_candidate_ids", fake_recall_candidate_ids)
 
-    monkeypatch.setattr(memory_retrieval, "semantic_memory_available", lambda: True)
-    monkeypatch.setattr(memory_retrieval, "configured_memory_index", lambda: Index())
-    monkeypatch.setattr(memory_retrieval, "embed_with_route", embed_with_route)
-
-    assert await memory_retrieval.candidate_ids(
-        query="owned query",
-        embedding_route={"model_name": "run-pinned-embed"},
-        dimensions=2,
-        user_id="user",
-        project_id="project",
-        workspace_id=7,
-        limit=20,
-    ) == [4, 2]
-    assert captured["user_id"] == "user"
-    assert captured["project_id"] == "project"
-    assert captured["workspace_id"] == 7
+    assert (
+        await memory_retrieval.candidate_ids(
+            query="owned query",
+            user_id="user",
+            project_id="project",
+            workspace_id=7,
+            limit=20,
+        )
+        == [4, 2]
+    )
+    assert captured["strategy"] == "semantic"
+    assert captured["query"] == "owned query"
+    assert captured["limit"] == 20
+    assert captured["namespace"].user_id == "user"
+    assert captured["namespace"].project_id == "project"
+    assert captured["namespace"].workspace_id == 7
+    assert captured["namespace"].include_account is False

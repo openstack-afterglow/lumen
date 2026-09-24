@@ -22,6 +22,7 @@ from lumen.models.chat_jobs import ChatJob
 from lumen.models.chat_runs import ChatRun
 from lumen.services import credit, litellm_client, title_summary
 from lumen.services.providers import routing as ps
+from lumen.services.usage_breakdown import CACHE_USAGE_KEYS, UsageBreakdown
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +343,9 @@ async def _store_result(job: dict[str, Any], result: title_summary.TitleResult) 
             "title": result.title,
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
+            "cache_read_input_tokens": result.cache_read_input_tokens,
+            "cache_creation_5m_input_tokens": result.cache_creation_5m_input_tokens,
+            "cache_creation_1h_input_tokens": result.cache_creation_1h_input_tokens,
             "model_name": result.model_name,
         }
         row.payload = _enc_payload(payload)
@@ -436,14 +440,29 @@ async def _apply_result(job: dict[str, Any]) -> bool:
             pricing = payload.get("pricing_snapshot")
             pricing = pricing if isinstance(pricing, dict) else {}
             model_name = str(result.get("model_name") or payload.get("summary_route", {}).get("model_name") or "")
-            usage_cost = litellm_client.cost_from_usage(
-                model_name,
+            # Results stored before cache accounting carry no split; their cache shares are 0.
+            breakdown = UsageBreakdown.from_totals(
                 int(result.get("prompt_tokens", 0)),
                 int(result.get("completion_tokens", 0)),
+                **{key: result.get(key, 0) for key in CACHE_USAGE_KEYS},
+            )
+            usage_cost = litellm_client.cost_from_usage(
+                model_name,
+                breakdown.input_tokens,
+                breakdown.output_tokens,
                 input_price_per_token=_decimal_or_none(pricing.get("input_price_per_token")),
                 output_price_per_token=_decimal_or_none(pricing.get("output_price_per_token")),
                 price_source=pricing.get("price_source"),
-                provider_type=payload.get("summary_route", {}).get("provider_type"),
+                breakdown=breakdown,
+                cache_read_price_per_token=_decimal_or_none(pricing.get("cache_read_price_per_token")),
+                cache_write_price_per_token=_decimal_or_none(pricing.get("cache_write_price_per_token")),
+                cache_write_1h_price_per_token=_decimal_or_none(pricing.get("cache_write_1h_price_per_token")),
+                cache_read_price_per_token_above_200k=_decimal_or_none(pricing.get("cache_read_price_per_token_above_200k")),
+                cache_write_price_per_token_above_200k=_decimal_or_none(pricing.get("cache_write_price_per_token_above_200k")),
+                cache_write_1h_price_per_token_above_200k=_decimal_or_none(pricing.get("cache_write_1h_price_per_token_above_200k")),
+                cache_price_sources=pricing.get("cache_price_sources"),
+                allow_catalog_cache=False,
+                allow_catalog_prices=False,
             )
             await credit.apply_usage_in_transaction(
                 session,
@@ -452,8 +471,8 @@ async def _apply_result(job: dict[str, Any]) -> bool:
                 project_id=str(payload["project_id"]),
                 model_name=model_name,
                 provider=pricing.get("provider_name") or payload.get("summary_route", {}).get("provider_name"),
-                prompt_tokens=int(result.get("prompt_tokens", 0)),
-                completion_tokens=int(result.get("completion_tokens", 0)),
+                prompt_tokens=breakdown.input_tokens,
+                completion_tokens=breakdown.output_tokens,
                 usage_cost=usage_cost,
                 margin_multiplier=_decimal_or_none(pricing.get("margin_multiplier")) or Decimal("1"),
                 credit_per_usd=_decimal_or_none(pricing.get("chat_credit_per_usd")),
@@ -465,15 +484,21 @@ async def _apply_result(job: dict[str, Any]) -> bool:
                 usage_components=[
                     {
                         "kind": "input_tokens",
-                        "quantity": int(result.get("prompt_tokens", 0)),
+                        "quantity": breakdown.uncached_input_tokens,
                         "metadata": {"operation": "title"},
                     },
                     {
                         "kind": "output_tokens",
-                        "quantity": int(result.get("completion_tokens", 0)),
+                        "quantity": breakdown.output_tokens,
                         "metadata": {"operation": "title"},
                     },
+                    *(
+                        {"kind": kind, "quantity": quantity, "metadata": {"operation": "title"}}
+                        for kind, quantity in breakdown.cache_fields().items()
+                        if quantity
+                    ),
                 ],
+                breakdown=breakdown,
             )
         row.status = "completed"
         row.error_code = None

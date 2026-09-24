@@ -35,10 +35,9 @@ on:
         required: false
         default: ''
         description: 'afterglow-crypto git ref override'
-  pull_request:
-    branches: [main, dev]
-  push:
-    branches: [main, dev]
+# No push/pull_request triggers: docker-build.yml calls this workflow once per
+# event and gates image publishing on it, so a direct trigger would run the same
+# test suite twice for every push and PR (see AGENTS.md CI rules 9 and 11).
 
 permissions:
   contents: read
@@ -46,6 +45,11 @@ permissions:
 jobs:
   service:
     name: Service tests
+    # Explicit status function: the caller's `test` job needs a `dedup` job that
+    # is skipped outside PRs, and an implicit success() may treat a skipped
+    # ancestor as a reason to skip (actions/runner#2205). No job here has
+    # `needs`, so this cannot hide a failure.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -68,8 +72,54 @@ jobs:
       - run: uv run ruff check lumen tests
       - run: uv run pytest -m "not integration and not system" tests
 
+  plugins:
+    name: Plugin conformance
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package:
+          - plugins/database-mariadb
+          - plugins/memory-default
+          - plugins/tools-default
+          - plugins/skills-default
+          - plugins/mcp-default
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.lumen_repository || github.repository }}
+          ref: ${{ inputs.lumen_ref || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - name: Build and test the package against its published contract only
+        run: |
+          uv sync --extra service --extra dev --frozen
+          uv build --wheel --out-dir dist ${{ matrix.package }}
+          uv run --project ${{ matrix.package }} --extra testing pytest -q ${{ matrix.package }}/tests
+
+  sandbox:
+    name: Sandbox daemon package
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.lumen_repository || github.repository }}
+          ref: ${{ inputs.lumen_ref || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - name: Build and test the standalone sandbox wheel
+        run: |
+          uv build --wheel --out-dir dist packages/lumen-sandbox
+          uv run --project packages/lumen-sandbox --extra testing pytest -q packages/lumen-sandbox/tests
+
   sdk:
     name: SDK tests and lint
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -90,6 +140,7 @@ jobs:
 
   kolla:
     name: Kolla packaging and asset tests
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -107,6 +158,7 @@ jobs:
 
   integration:
     name: Datastore integration
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     services:
       mariadb:
@@ -119,11 +171,13 @@ jobs:
         ports: ["3306:3306"]
         options: >-
           --health-cmd "healthcheck.sh --connect --innodb_initialized"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+          --health-interval 2s --health-timeout 5s --health-retries 50 --health-start-period 5s
       redis:
         image: redis:7
         ports: ["6379:6379"]
-        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 10
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 5s --health-retries 50 --health-start-period 5s
     env:
       DATABASE_URL: mysql+aiomysql://lumen:lumen@127.0.0.1:3306/lumen
       REDIS_URL: redis://127.0.0.1:6379/0
@@ -146,22 +200,20 @@ jobs:
           uv pip install --python .venv/bin/python --reinstall-package afterglow-crypto --no-deps "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@${AFTERGLOW_CRYPTO_REF}"
       - run: uv run lumen-migrate --apply
       - run: uv run lumen-migrate --apply
-      - run: uv run pytest -m integration
+      - run: uv run pytest -m integration tests
 
   system:
     name: Process-system integration
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
           repository: ${{ inputs.lumen_repository || github.repository }}
           ref: ${{ inputs.lumen_ref || github.sha }}
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: '3.12'
-          enable-cache: true
-      - run: uv sync --extra service --extra dev --frozen
+      # No setup-uv/uv sync: test_layers is stdlib-only and the images run
+      # their own uv sync, so a host venv would only add setup time here.
       - name: Run system integration tests
         env:
           AFTERGLOW_CRYPTO_REF: ${{ inputs.afterglow_crypto_ref }}
-        run: uv run lumen-test system
+        run: python3 -m lumen.scripts.test_layers system

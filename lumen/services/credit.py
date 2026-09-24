@@ -27,6 +27,7 @@ from lumen.services import quota_policy
 from lumen.services.api_key_store import calculate_effective_limit
 from lumen.services.litellm_client import UsageCost
 from lumen.services.quota_periods import month_start, week_start
+from lumen.services.usage_breakdown import UsageBreakdown
 
 logger = logging.getLogger(__name__)
 
@@ -69,30 +70,95 @@ def credits_for_cost(raw_cost_usd, margin_multiplier=1.0, credit_per_usd=None) -
     return value.quantize(_CREDIT_QUANTUM)
 
 
+_CACHE_SNAPSHOT_PRICES = (
+    ("cache_read", "cache_read_input_tokens", "cache_read_price_per_token", "cache_read_price_per_token_above_200k"),
+    ("cache_creation_5m", "cache_creation_5m_input_tokens", "cache_write_price_per_token", "cache_write_price_per_token_above_200k"),
+    ("cache_creation_1h", "cache_creation_1h_input_tokens", "cache_write_1h_price_per_token", "cache_write_1h_price_per_token_above_200k"),
+)
+
+
+def _snapshot_price(pricing_snapshot: dict, key: str, *, required: bool) -> Decimal | None:
+    value = pricing_snapshot.get(key) if not required else pricing_snapshot[key]
+    if value is None and not required:
+        return None
+    price = Decimal(str(value))
+    if not price.is_finite() or price < 0:
+        raise ValueError("durable pricing snapshot is invalid")
+    return price
+
+
 def usage_cost_from_pricing_snapshot(
     pricing_snapshot: dict,
     *,
     prompt_tokens: int,
     completion_tokens: int,
+    breakdown: UsageBreakdown | None = None,
 ) -> UsageCost:
-    """Calculate base-model usage exclusively from a durable run's frozen price pair."""
+    """Calculate base-model usage exclusively from a durable run's frozen prices.
+
+    ``prompt_tokens`` is total input; the input rate applies to its uncached
+    share. A cache category without a frozen rate — including every snapshot
+    frozen before cache rates existed — bills 0 and marks the usage partial.
+    """
     try:
-        input_price = Decimal(str(pricing_snapshot["input_price_per_token"]))
-        output_price = Decimal(str(pricing_snapshot["output_price_per_token"]))
+        input_price = _snapshot_price(pricing_snapshot, "input_price_per_token", required=True)
+        output_price = _snapshot_price(pricing_snapshot, "output_price_per_token", required=True)
+        cache_prices = {
+            name: (_snapshot_price(pricing_snapshot, key, required=False),
+                   _snapshot_price(pricing_snapshot, tier_key, required=False))
+            for name, _, key, tier_key in _CACHE_SNAPSHOT_PRICES
+        }
     except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
         raise ValueError("durable pricing snapshot is invalid") from exc
-    if not input_price.is_finite() or not output_price.is_finite() or input_price < 0 or output_price < 0:
-        raise ValueError("durable pricing snapshot is invalid")
-    prompt_tokens = max(0, int(prompt_tokens))
-    completion_tokens = max(0, int(completion_tokens))
-    input_cost = (input_price * prompt_tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN)
-    output_cost = (output_price * completion_tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN)
+    if breakdown is None:
+        breakdown = UsageBreakdown.from_totals(prompt_tokens, completion_tokens)
+    elif (breakdown.input_tokens, breakdown.output_tokens) != (
+        max(0, int(prompt_tokens)),
+        max(0, int(completion_tokens)),
+    ):
+        raise ValueError("usage breakdown totals do not match prompt/completion tokens")
+    uncached_tokens = breakdown.uncached_input_tokens
+    input_cost = (input_price * uncached_tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN)
+    output_cost = (output_price * breakdown.output_tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN)
+    components: dict[str, dict[str, object]] = {
+        "input": {
+            "tokens": uncached_tokens,
+            "price_per_token": format(input_price, "f"),
+            "cost": format(input_cost, "f"),
+        },
+        "output": {
+            "tokens": breakdown.output_tokens,
+            "price_per_token": format(output_price, "f"),
+            "cost": format(output_cost, "f"),
+        },
+    }
+    cache_costs: dict[str, Decimal] = {}
+    unpriced_cache = False
+    for name, token_field, _, _ in _CACHE_SNAPSHOT_PRICES:
+        tokens = getattr(breakdown, token_field)
+        rate, tier_rate = cache_prices[name]
+        source = (pricing_snapshot.get("cache_price_sources") or {}).get(name, "manual")
+        if breakdown.input_tokens > 200_000 and source == "litellm" and tier_rate is not None:
+            rate = tier_rate
+        cost = (rate * tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN) if rate is not None else Decimal("0")
+        unpriced_cache = unpriced_cache or (tokens > 0 and rate is None)
+        cache_costs[name] = cost
+        components[name] = {
+            "tokens": tokens,
+            "price_per_token": format(rate, "f") if rate is not None else None,
+            "cost": format(cost, "f"),
+            "source": source if rate is not None else None,
+        }
+    raw_cost = input_cost + output_cost + sum(cache_costs.values(), Decimal("0"))
     return UsageCost(
-        raw_cost=(input_cost + output_cost).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN),
+        raw_cost=raw_cost.quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN),
         input_cost=input_cost,
         output_cost=output_cost,
-        pricing_status="priced",
-        pricing_snapshot=dict(pricing_snapshot),
+        pricing_status="partial" if unpriced_cache else "priced",
+        pricing_snapshot={**pricing_snapshot, "token_components": components},
+        cache_read_cost=cache_costs["cache_read"],
+        cache_creation_5m_cost=cache_costs["cache_creation_5m"],
+        cache_creation_1h_cost=cache_costs["cache_creation_1h"],
     )
 
 
@@ -333,7 +399,10 @@ async def list_user_quotas(user_id: str | None = None) -> dict:
                     ),
                     "formula": (
                         "credited_cost = "
-                        "(prompt_tokens × input_price_per_token + "
+                        "(uncached_input_tokens × input_price_per_token + "
+                        "cache_read_input_tokens × cache_read_price_per_token + "
+                        "cache_creation_5m_input_tokens × cache_write_price_per_token + "
+                        "cache_creation_1h_input_tokens × cache_write_1h_price_per_token + "
                         "completion_tokens × output_price_per_token + tool_costs) "
                         "× provider_margin_multiplier × credit_per_usd"
                     ),
@@ -471,10 +540,18 @@ async def apply_usage_in_transaction(
     run_id: str | None = None,
     charge_wallet: bool = True,
     usage_components: list[dict[str, Any]] | None = None,
+    breakdown: UsageBreakdown | None = None,
 ) -> Decimal:
-    """Append usage and wallet delta in the caller's transaction."""
+    """Append usage and wallet delta in the caller's transaction.
+
+    ``prompt_tokens`` is total input. ``breakdown`` supplies the cache columns;
+    without it the row records no cache split (all input uncached).
+    """
     if not event_id or len(event_id) > 64:
         raise ValueError("event_id 값이 올바르지 않습니다")
+    if breakdown is not None and breakdown.input_tokens != int(prompt_tokens):
+        raise ValueError("usage breakdown total does not match prompt_tokens")
+    cache_columns = breakdown.cache_fields() if breakdown is not None else {}
     credited = credits_for_cost(usage_cost.raw_cost, margin_multiplier, credit_per_usd)
     pricing_snapshot = {
         **usage_cost.pricing_snapshot,
@@ -495,6 +572,7 @@ async def apply_usage_in_transaction(
             provider=provider,
             prompt_tokens=int(prompt_tokens),
             completion_tokens=int(completion_tokens),
+            **cache_columns,
             raw_cost=usage_cost.raw_cost,
             credited_cost=credited,
             source=source,
@@ -534,6 +612,7 @@ async def apply_usage(
     api_key_id: int | None = None,
     run_id: str | None = None,
     charge_wallet: bool = True,
+    breakdown: UsageBreakdown | None = None,
 ) -> Decimal:
     factory = _require_db()
     try:
@@ -557,6 +636,7 @@ async def apply_usage(
                         api_key_id=api_key_id,
                         charge_wallet=charge_wallet,
                         run_id=run_id,
+                        breakdown=breakdown,
                     )
             except IntegrityError as exc:
                 await session.rollback()

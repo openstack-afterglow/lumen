@@ -430,6 +430,12 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
         },
         execution_protocol_version=1,
         status="queued",
+        lease_owner="worker#1",
+        assigned_resource_id=None,
+        parent_run_id=None,
+        credit_ceiling=None,
+        sandbox_seconds_ceiling=None,
+        depth=0,
     )
 
     class _Session:
@@ -938,6 +944,7 @@ async def test_compaction_worker_uses_persisted_large_tool_schema_snapshot(monke
         capability_snapshot={},
         pricing_snapshot={},
         run_kind="compaction",
+        lease_owner="worker#1",
     )
 
     class _Session:

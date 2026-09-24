@@ -2,7 +2,7 @@
 
 Run with:
 AFTERGLOW_TEST_MEMORY_PGVECTOR_URL=postgresql://afterglow:dev@127.0.0.1:5432/afterglow_memory_test \
-  pytest tests/test_chat_memory_pgvector_integration.py -v
+  pytest tests/test_pgvector_integration.py -v
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ import os
 import uuid
 
 import pytest
-
-from lumen.services.memory_index import MemoryVector, PgVectorMemoryIndex
+from lumen_memory_default.index import PgVectorMemoryIndex
+from lumen_plugin_api.memory import MemoryVector
 
 pytestmark = pytest.mark.asyncio
 _ENV = "AFTERGLOW_TEST_MEMORY_PGVECTOR_URL"

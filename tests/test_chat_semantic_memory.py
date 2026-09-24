@@ -1,43 +1,28 @@
-from types import SimpleNamespace
-
 import pytest
 
 from lumen.services import semantic_memory
 
 
 @pytest.fixture(autouse=True)
-def clear_index_cache():
-    getattr(semantic_memory.configured_memory_index, "cache_clear", lambda: None)()
+def clear_ready_flag():
     semantic_memory._ready = False
     yield
-    getattr(semantic_memory.configured_memory_index, "cache_clear", lambda: None)()
     semantic_memory._ready = False
 
 
-def test_semantic_memory_is_unavailable_when_disabled(monkeypatch):
-    monkeypatch.setattr(
-        semantic_memory,
-        "get_settings",
-        lambda: SimpleNamespace(chat_semantic_memory_enabled=False),
-    )
+def test_semantic_memory_is_unavailable_when_the_plugin_index_is_not_configured(monkeypatch):
+    monkeypatch.setattr(semantic_memory.memory_host, "configured_index", lambda: None)
 
+    with pytest.raises(semantic_memory.SemanticMemoryUnavailable):
+        semantic_memory.configured_memory_index()
     assert semantic_memory.semantic_memory_available() is False
 
 
-def test_semantic_memory_uses_dedicated_pgvector_dsn(monkeypatch):
-    monkeypatch.setattr(
-        semantic_memory,
-        "get_settings",
-        lambda: SimpleNamespace(
-            chat_semantic_memory_enabled=True,
-            chat_memory_pgvector_url="postgresql://memory.example/afterglow_memory",
-            chat_memory_embedding_dimensions=1536,
-        ),
-    )
+def test_semantic_memory_uses_the_selected_plugins_index(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(semantic_memory.memory_host, "configured_index", lambda: sentinel)
 
-    index = semantic_memory.configured_memory_index()
-    assert index._dsn == "postgresql://memory.example/afterglow_memory"
-    assert index._dimensions == 1536
+    assert semantic_memory.configured_memory_index() is sentinel
 
 
 @pytest.mark.asyncio

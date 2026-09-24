@@ -63,6 +63,8 @@ _PROVIDER_PORTALS: dict[str, tuple[str, str | None]] = {
     "xai": ("https://console.x.ai/", "https://console.x.ai/"),
 }
 _ZERO_PERIODS = {"daily": "0", "weekly": "0", "monthly": "0", "total": "0"}
+# Anthropic organization usage report token categories, in report order.
+TOKEN_CATEGORIES = ("uncached_input", "cache_read", "cache_creation_5m", "cache_creation_1h", "output")
 
 
 def _is_direct_provider(provider_type: str, api_base: str | None) -> bool:
@@ -130,6 +132,7 @@ def _empty_local_usage() -> dict:
         "requests": dict(_ZERO_PERIODS),
         "tokens": dict(_ZERO_PERIODS),
         "raw_cost": dict(_ZERO_PERIODS),
+        "token_breakdown": {category: dict(_ZERO_PERIODS) for category in TOKEN_CATEGORIES},
     }
 
 
@@ -349,10 +352,11 @@ def _anthropic_cost_periods(payload: object, now: datetime) -> BillingPeriods:
     return _period_values(values, now, integer=False)
 
 
-def _anthropic_token_periods(payload: object, now: datetime) -> BillingPeriods:
-    values: list[tuple[datetime, Decimal]] = []
+def _anthropic_token_values(payload: object) -> list[tuple[datetime, dict[str, int]]]:
+    """Parse the organization usage report into per-bucket category totals."""
+    values: list[tuple[datetime, dict[str, int]]] = []
     for bucket in _payload_buckets(payload):
-        tokens = 0
+        tokens = dict.fromkeys(TOKEN_CATEGORIES, 0)
         results = bucket.get("results")
         if not isinstance(results, list):
             raise ValueError("invalid Anthropic usage results")
@@ -360,16 +364,33 @@ def _anthropic_token_periods(payload: object, now: datetime) -> BillingPeriods:
             if not isinstance(result, dict) or not isinstance(result.get("cache_creation"), dict):
                 raise ValueError("invalid Anthropic usage item")
             cache_creation = result["cache_creation"]
-            for field, value in (
-                ("uncached_input_tokens", result.get("uncached_input_tokens")),
-                ("cache_read_input_tokens", result.get("cache_read_input_tokens")),
-                ("ephemeral_1h_input_tokens", cache_creation.get("ephemeral_1h_input_tokens")),
-                ("ephemeral_5m_input_tokens", cache_creation.get("ephemeral_5m_input_tokens")),
-                ("output_tokens", result.get("output_tokens")),
+            for category, field, value in (
+                ("uncached_input", "uncached_input_tokens", result.get("uncached_input_tokens")),
+                ("cache_read", "cache_read_input_tokens", result.get("cache_read_input_tokens")),
+                ("cache_creation_1h", "ephemeral_1h_input_tokens", cache_creation.get("ephemeral_1h_input_tokens")),
+                ("cache_creation_5m", "ephemeral_5m_input_tokens", cache_creation.get("ephemeral_5m_input_tokens")),
+                ("output", "output_tokens", result.get("output_tokens")),
             ):
-                tokens += _nonnegative_int(value, field=field)
-        values.append((_bucket_start(bucket.get("starting_at")), Decimal(tokens)))
-    return _period_values(values, now, integer=True)
+                tokens[category] += _nonnegative_int(value, field=field)
+        values.append((_bucket_start(bucket.get("starting_at")), tokens))
+    return values
+
+
+def _anthropic_token_periods(payload: object, now: datetime) -> BillingPeriods:
+    values = _anthropic_token_values(payload)
+    return _period_values(
+        [(started_at, Decimal(sum(tokens.values()))) for started_at, tokens in values], now, integer=True
+    )
+
+
+def _anthropic_token_breakdown(payload: object, now: datetime) -> dict[str, BillingPeriods]:
+    values = _anthropic_token_values(payload)
+    return {
+        category: _period_values(
+            [(started_at, Decimal(tokens[category])) for started_at, tokens in values], now, integer=True
+        )
+        for category in TOKEN_CATEGORIES
+    }
 
 
 def _period_sum(condition, value):
@@ -388,6 +409,21 @@ async def _load_providers_and_usage() -> tuple[list[LlmProvider], dict[str, dict
             if not names:
                 return providers, {}
             tokens = ChatUsageLog.prompt_tokens + ChatUsageLog.completion_tokens
+            # prompt_tokens is total input; uncached input is derived per row
+            # and clamped so a legacy or inconsistent row never goes negative.
+            uncached = (
+                ChatUsageLog.prompt_tokens
+                - ChatUsageLog.cache_read_input_tokens
+                - ChatUsageLog.cache_creation_5m_input_tokens
+                - ChatUsageLog.cache_creation_1h_input_tokens
+            )
+            category_tokens = {
+                "uncached_input": case((uncached < 0, 0), else_=uncached),
+                "cache_read": ChatUsageLog.cache_read_input_tokens,
+                "cache_creation_5m": ChatUsageLog.cache_creation_5m_input_tokens,
+                "cache_creation_1h": ChatUsageLog.cache_creation_1h_input_tokens,
+                "output": ChatUsageLog.completion_tokens,
+            }
             rows = (
                 await session.execute(
                     select(
@@ -402,6 +438,18 @@ async def _load_providers_and_usage() -> tuple[list[LlmProvider], dict[str, dict
                                 _period_sum(ChatUsageLog.created_at >= starts[period], 1),
                                 _period_sum(ChatUsageLog.created_at >= starts[period], tokens),
                                 _period_sum(ChatUsageLog.created_at >= starts[period], ChatUsageLog.raw_cost),
+                            )
+                        ),
+                        # Appended after the legacy columns so their positions stay stable.
+                        *(
+                            expression
+                            for category in TOKEN_CATEGORIES
+                            for expression in (
+                                func.coalesce(func.sum(category_tokens[category]), 0),
+                                *(
+                                    _period_sum(ChatUsageLog.created_at >= starts[period], category_tokens[category])
+                                    for period in ("daily", "weekly", "monthly")
+                                ),
                             )
                         ),
                     )
@@ -425,11 +473,21 @@ async def _load_providers_and_usage() -> tuple[list[LlmProvider], dict[str, dict
             token_values[period] = str(int(row[offset + 1] or 0))
             cost_values[period] = _decimal_string(row[offset + 2] or 0, field=f"raw_cost_{period}")
             offset += 3
+        token_breakdown: dict[str, dict[str, str]] = {}
+        for category in TOKEN_CATEGORIES:
+            token_breakdown[category] = {
+                "total": str(int(row[offset] or 0)),
+                "daily": str(int(row[offset + 1] or 0)),
+                "weekly": str(int(row[offset + 2] or 0)),
+                "monthly": str(int(row[offset + 3] or 0)),
+            }
+            offset += 4
         usage_by_name[name] = {
             "currency": "USD",
             "requests": request_values,
             "tokens": token_values,
             "raw_cost": cost_values,
+            "token_breakdown": token_breakdown,
         }
     return providers, usage_by_name
 
@@ -479,6 +537,7 @@ async def _organization_usage_snapshot(
     cost_periods: BillingPeriods | None = None
     request_periods: BillingPeriods | None = None
     token_periods: BillingPeriods | None = None
+    token_breakdown: dict[str, BillingPeriods] | None = None
 
     if isinstance(raw_costs, asyncio.CancelledError):
         raise raw_costs
@@ -504,6 +563,7 @@ async def _organization_usage_snapshot(
                 request_periods, token_periods = _openai_usage_periods(raw_usage, now)
             else:
                 token_periods = _anthropic_token_periods(raw_usage, now)
+                token_breakdown = _anthropic_token_breakdown(raw_usage, now)
         except (ValueError, TypeError, KeyError) as exc:
             failures.append(exc)
 
@@ -519,6 +579,7 @@ async def _organization_usage_snapshot(
             "cost": cost_periods,
             "requests": request_periods,
             "tokens": token_periods,
+            "token_breakdown": token_breakdown,
         },
     }
 

@@ -22,14 +22,14 @@ class CompatDiscoveryAuthentication(BaseModel):
     compat_alternatives: list[str] = Field(default_factory=lambda: ["Authorization: Bearer", "X-API-Key"])
     native_auth: str = "Project-scoped Keystone token (Authorization: Bearer ... or X-Auth-Token) 또는 scoped API key"
     issue: str = "관리 API로 발급하거나 standalone Compose의 lumen-connection manifest를 사용하세요."
-    note: str = (
-        "호환 API(/v1/chat/completions, /v1/messages, /v1/models)에는 API 키가 필수이며 Keystone 토큰은 거부됩니다."
-    )
+    note: str = "호환 API(/v1/chat/completions, /v1/responses, /v1/messages, /v1/models)에는 API 키가 필수이며 Keystone 토큰은 거부됩니다."
 
 
 class CompatDiscoveryProfile(BaseModel):
     name: str
     chat_completions: str | None = None
+    responses: str | None = None
+    count_tokens: str | None = None
     messages: str | None = None
     conversations: str | None = None
     completions: str | None = None
@@ -46,6 +46,7 @@ class CompatDiscoveryEndpoints(BaseModel):
     openai: dict[str, str]
     anthropic: dict[str, str]
     native: dict[str, str]
+    gateway: dict[str, str]
 
 
 class CompatDiscoveryLinks(BaseModel):
@@ -72,6 +73,7 @@ class CompatDiscoverySSE(BaseModel):
     openai: str = "data: { ... } \\n\\n data: [DONE]"
     anthropic: str = "event: message_start \\n data: { ... } \\n\\n"
     native: str = "event: <ChatRunEvent.type> \\n data: ChatRunEvent JSON"
+    responses: str = "event: response.created|response.output_text.delta|response.completed \\n data: { ... }"
     error_note: str = (
         "Compat streams report post-handshake failures as in-band SSE errors; "
         "native durable failures use the terminal run.failed event."
@@ -80,7 +82,14 @@ class CompatDiscoverySSE(BaseModel):
 
 class CompatDiscoveryHostGate(BaseModel):
     gated_routes: list[str] = Field(
-        default_factory=lambda: ["/v1/compat", "/v1/chat/completions", "/v1/messages", "/v1/models"]
+        default_factory=lambda: [
+            "/v1/compat",
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/messages",
+            "/v1/models",
+            "/v1/claude-gateway/*",
+        ]
     )
     behavior: str = "chat_api_hosts 설정을 통해 허용된 Host 헤더 요청만 통과하며 미허용 시 404로 응답합니다."
 
@@ -101,6 +110,7 @@ class CompatDiscoveryResponse(BaseModel):
     models_endpoint: str
     features: list[str]
     notes: list[str]
+    clients: dict[str, dict[str, str]]
     idempotency: CompatDiscoveryIdempotency
     sse: CompatDiscoverySSE
     host_gate: CompatDiscoveryHostGate
@@ -108,13 +118,17 @@ class CompatDiscoveryResponse(BaseModel):
 
 @router.get("/compat", response_model=CompatDiscoveryResponse)
 async def discovery(request: Request) -> CompatDiscoveryResponse:
-    origin = (get_settings().public_api_base or str(request.base_url)).rstrip("/")
+    settings = get_settings()
+    origin = (settings.public_api_base or str(request.base_url)).rstrip("/")
+    gateway_base = getattr(settings, "claude_gateway_base_url", "").strip().rstrip("/")
+    if not gateway_base:
+        gateway_base = f"{origin}/v1/claude-gateway"
     return CompatDiscoveryResponse(
         version="1.0.0",
         contract_version="1.0.0",
         service="Lumen AI API",
         description="OpenAI / Anthropic 호환 및 Lumen 네이티브 대화 API. model='lumen'은 백엔드 durable execution으로 동작하며 provider model ID는 stateless로 중계됩니다.",
-        formats=["openai", "anthropic", "lumen_native"],
+        formats=["openai", "openai_responses", "anthropic", "lumen_native"],
         profiles={
             "openai_lumen": CompatDiscoveryProfile(
                 name="OpenAI-compatible Lumen durable completion",
@@ -132,10 +146,19 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
                 required_scopes=["compat:completions:write", "models:read"],
                 streaming="text/event-stream (data: JSON)",
             ),
+            "openai_responses": CompatDiscoveryProfile(
+                name="OpenAI Responses-compatible stateless provider completion",
+                responses=f"{origin}/v1/responses",
+                models=f"{origin}/v1/models",
+                sdk_base_url=f"{origin}/v1",
+                required_scopes=["compat:completions:write", "models:read"],
+                streaming="text/event-stream (native Responses semantic events)",
+            ),
             "anthropic_stateless": CompatDiscoveryProfile(
                 name="Anthropic-compatible stateless completion",
                 messages=f"{origin}/v1/messages",
                 models=f"{origin}/v1/models",
+                count_tokens=f"{origin}/v1/messages/count_tokens",
                 sdk_base_url=origin,
                 required_scopes=["compat:completions:write", "models:read"],
                 streaming="text/event-stream (event: <type>\\ndata: JSON)",
@@ -178,9 +201,11 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
                 "chat_completions": f"{origin}/v1/chat/completions",
                 "models": f"{origin}/v1/models",
                 "sdk_base_url": f"{origin}/v1",
+                "responses": f"{origin}/v1/responses",
             },
             anthropic={
                 "messages": f"{origin}/v1/messages",
+                "count_tokens": f"{origin}/v1/messages/count_tokens",
                 "sdk_base_url": origin,
             },
             native={
@@ -189,6 +214,16 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
                 "runs": f"{origin}/v1/runs",
                 "sdk_base_url": origin,
             },
+            gateway={
+                "protocol": "lumen_device_v1",
+                "claude_code_login_compatible": "false",
+                "base_url": gateway_base,
+                "metadata": f"{gateway_base}/.well-known/oauth-authorization-server",
+                "messages": f"{gateway_base}/v1/messages",
+                "count_tokens": f"{gateway_base}/v1/messages/count_tokens",
+                "models": f"{gateway_base}/v1/models",
+                "managed_settings": f"{gateway_base}/v1/managed-settings",
+            },
         ),
         models_endpoint=f"{origin}/v1/models",
         features=[
@@ -196,10 +231,26 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
             "provider model ID: tools(function calling) pass-through 및 vision 지원",
             "Idempotency-Key UUID 지원 (네이티브 202 멱등 재시도 및 쿼터 재검사 예외)",
         ],
+        clients={
+            "codex": {
+                "base_url": f"{origin}/v1",
+                "responses": f"{origin}/v1/responses",
+                "provider_header": "X-Lumen-Provider (optional, must not conflict with model prefix)",
+            },
+            "claude_code": {
+                "base_url": origin,
+                "messages": f"{origin}/v1/messages",
+                "count_tokens": f"{origin}/v1/messages/count_tokens",
+                "auth_env": "ANTHROPIC_AUTH_TOKEN (ordinary Lumen API key)",
+                "model_env": "ANTHROPIC_MODEL",
+                "provider_header": "X-Lumen-Provider via ANTHROPIC_CUSTOM_HEADERS (optional)",
+            },
+        },
         notes=[
             "OpenAI 호환 route에서 model='lumen'은 durable worker 실행으로 처리되며, provider model ID는 stateless 중계로 동작합니다.",
             "사용량은 발급 사용자의 지갑·월 쿼터에서 차감됩니다.",
             "사용량은 웹과 분리된 API 통계(키별)로 집계됩니다.",
+            "Configured gateway metadata describes the legacy Lumen custom device protocol, not current Claude Apps Gateway login.",
             "OpenAI 호환 오류는 최상위 {error: {message, type, code}} 구조를 사용합니다.",
         ],
         idempotency=CompatDiscoveryIdempotency(),

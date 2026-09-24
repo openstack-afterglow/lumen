@@ -5,6 +5,7 @@
 - 라우터는 store monkeypatch로 발급 평문 1회·목록 마스킹·폐기/한도 소유 컨텍스트를 검증한다.
 """
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -38,6 +39,12 @@ class TestStorePureLogic:
         h2 = aks._hash_key("sk-afgl-abc")
         assert h1 == h2 and len(h1) == 64
         assert h1 != aks._hash_key("sk-afgl-abd")
+
+    def test_expiry_handles_mysql_naive_timestamps(self):
+        now = datetime.now(UTC)
+        assert aks._is_expired(None, now=now) is False
+        assert aks._is_expired((now - timedelta(seconds=1)).replace(tzinfo=None), now=now) is True
+        assert aks._is_expired((now + timedelta(seconds=1)).replace(tzinfo=None), now=now) is False
 
     def test_public_never_leaks_hash(self):
         row = SimpleNamespace(
@@ -490,6 +497,8 @@ class TestPrincipalDependency:
                 skill_ids=[],
                 agent=None,
                 extension_selection={"tools": [], "mcp": []},
+                plugin_tool_snapshots=[],
+                plugin_skill_snapshots=[],
             )
         assert exc_info.value.status_code == 403
 
@@ -512,9 +521,48 @@ class TestPrincipalDependency:
                 skill_ids=[],
                 agent=None,
                 extension_selection={"tools": [], "mcp": []},
+                plugin_tool_snapshots=[],
+                plugin_skill_snapshots=[],
             )
         assert exc_info.value.status_code == 403
 
+
+    def test_plugin_tool_selection_requires_execute_scope(self):
+        """A frozen plugin tool needs both extension read and tool execute; a plugin skill only read."""
+        principal = {
+            "auth_type": "api_key",
+            "user_id": "u1",
+            "project_id": "p1",
+            "api_key_id": 7,
+            "scopes": ("native:memory:read", "native:memory:write", "native:extensions:read"),
+            "source": "api",
+            "roles": [],
+            "is_system_admin": False,
+        }
+        features = ChatFeatureOptions(tool_policy={"mode": "none"})
+        chat_admission._require_native_admission_scopes(
+            principal,
+            features,
+            parts=[TextPart(type="text", text="hello")],
+            execution_mode="chat",
+            skill_ids=[],
+            agent=None,
+            extension_selection={"tools": [], "mcp": []},
+            plugin_tool_snapshots=[],
+            plugin_skill_snapshots=[{"binding": {"id": "b"}}],
+        )
+        with pytest.raises(HTTPException, match="native:tools:execute"):
+            chat_admission._require_native_admission_scopes(
+                principal,
+                features,
+                parts=[TextPart(type="text", text="hello")],
+                execution_mode="chat",
+                skill_ids=[],
+                agent=None,
+                extension_selection={"tools": [], "mcp": []},
+                plugin_tool_snapshots=[{"binding": {"id": "b"}}],
+                plugin_skill_snapshots=[],
+            )
 
 class TestRouter:
     async def test_create_returns_plaintext_once(self, client, monkeypatch):

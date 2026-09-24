@@ -48,6 +48,35 @@ with Client("https://lumen.example", "sk-afgl-...") as client:
 
 위 예제 key는 `native:runs:write`, `native:runs:read`와 `models:read`가 필요하다. memory를 켜면 `native:memory:read`와 `native:memory:write`, tools를 켜면 `native:tools:execute`, skill/custom/MCP selection이면 `native:extensions:read`를 추가한다. `usage_records()`에는 `usage:read`가 필요하다.
 
+## Plugin binding과 native agent/child
+
+`Client`/Keystone proxy 모두 같은 transport-neutral method set을 제공한다: `plugin_bindings()`, `create_plugin_binding(**attrs)`, `update_plugin_binding(id, **attrs)`, `delete_plugin_binding(id)`, `run_children(run_id, limit=..., cursor=...)`, `get_run()`, `run_events()`, `cancel_run()`. Administrator는 Keystone client로 `admin_plugins()`, `admin_plugin_bindings()`, `admin_agent_project_quota(project_id)`, `admin_set_agent_project_quota(project_id, **attrs)`, `admin_runtime_pools()`, `admin_runtime_resources(**query)`를 사용한다. User binding API는 이미 설치·승인된 wheel의 `user_configurable` export만 설정하며 wheel 설치가 아니다. `plugin_tool_ids`/`plugin_skill_ids`에는 binding UUID를 넣고 DB custom tool/skill ID와 섞지 않는다.
+
+Managed `plan`/`code`는 영속 conversation에서 Keystone user로 실행한다. 먼저 운영자가 protocol v2·PostgreSQL checkpointer·해당 project의 nonzero agent quota·enabled sandbox pool(`code` 및 child에 필요)을 준비해야 한다. `agent_budget`은 root ceiling이며 `credit_ceiling`은 decimal 문자열이다. Temp completion에는 agent/code workspace를 지정할 수 없고 API-key native run은 text `chat` 전용이다. `delegate_agent`는 model이 승인된 agent를 budget 안에서 호출하는 서버 도구이고 SDK에 별도 child-create method는 없다.
+
+```python
+from uuid import uuid4
+
+# conn.lumen은 Keystone 인증 proxy; conversation_id와 agent_id는 소유한 기존 자원이다.
+run = conn.lumen.create_completion(
+    conversation_id,
+    idempotency_key=str(uuid4()),
+    model_id="provider-model",
+    parts=[{"type": "text", "text": "검토해줘"}],
+    agent_id=agent_id,
+    execution_mode="plan",
+    agent_budget={
+        "credit_ceiling": "2.00000000",
+        "sandbox_seconds_ceiling": 300,
+        "wall_time_seconds": 600,
+    },
+)
+page = conn.lumen.run_children(run["run_id"], limit=50)
+# page["next_cursor"]가 있으면 동일 parent에 cursor로 다음 page를 요청한다.
+```
+
+Child page는 생성 순서의 `children`, `next_cursor`를 반환하고 각 child의 `status`, `terminal`, `events_url`, `cancel_url`, 결과 요약을 포함한다. 부모와 child 모두 기존 SSE cursor replay를 사용한다. `run_children`에는 `native:runs:read`와 동일 user/project owner가 필요하고 child 취소는 `native:runs:write` 및 소유권에 따른다. `admin_runtime_resources()`는 운영 inventory이지 sandbox 명령 실행 경로가 아니다.
+
 ## Keystone/OpenStack transport
 
 기존 OpenStack connection에 등록하면 같은 method set을 쓴다. 인증과 service catalog는 Keystone가 담당한다.

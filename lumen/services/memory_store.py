@@ -228,6 +228,9 @@ async def _load_owned(
         raise MemoryForbidden("메모리에 접근할 권한이 없습니다")
     if not include_account and row.scope == "account":
         raise MemoryForbidden("계정 메모리에 접근할 권한이 없습니다")
+    if row.expires_at is not None and row.expires_at <= datetime.now(UTC):
+        # Expired rows are already invisible to list/hydrate; treat direct access the same way.
+        raise MemoryNotFound(f"메모리 {memory_id} 를 찾을 수 없습니다")
     return row
 
 
@@ -322,18 +325,10 @@ async def list_memories(
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def hydrate_candidate_ids(
-    *,
-    ids: list[int],
-    user_id: str,
-    scope: str,
-    project_id: str | None,
-    workspace_id: int | None,
-) -> list[dict]:
-    """Rehydrate vector candidates only after repeating exact MySQL namespace checks."""
+async def _hydrate_where(*, ids: list[int], user_id: str, predicate) -> list[dict]:
+    """Rehydrate candidate IDs only after repeating exact MySQL namespace/authorization checks."""
     if not ids:
         return []
-    predicate = _exact_scope_predicate(scope=scope, project_id=project_id, workspace_id=workspace_id)
     factory = _require_db()
     try:
         async with factory() as session:
@@ -355,6 +350,49 @@ async def hydrate_candidate_ids(
             )
             by_id = {row.id: _public(row) for row in rows}
             return [by_id[memory_id] for memory_id in ids if memory_id in by_id]
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def hydrate_candidate_ids(
+    *,
+    ids: list[int],
+    user_id: str,
+    scope: str,
+    project_id: str | None,
+    workspace_id: int | None,
+) -> list[dict]:
+    """Rehydrate vector candidates for one exact requested scope (used by the search API)."""
+    predicate = _exact_scope_predicate(scope=scope, project_id=project_id, workspace_id=workspace_id)
+    return await _hydrate_where(ids=ids, user_id=user_id, predicate=predicate)
+
+
+async def hydrate_namespace_ids(
+    *,
+    ids: list[int],
+    user_id: str,
+    project_id: str | None,
+    workspace_id: int | None,
+    include_account: bool = True,
+) -> list[dict]:
+    """Re-authorize provider-selected candidates across the full visible namespace before disclosure."""
+    predicate = (
+        _scope_predicate(project_id=project_id, workspace_id=workspace_id)
+        if include_account
+        else _project_scope_predicate(project_id=project_id, workspace_id=workspace_id)
+    )
+    return await _hydrate_where(ids=ids, user_id=user_id, predicate=predicate)
+
+
+async def get_memory(
+    memory_id: int, *, user_id: str, project_id: str | None = None, include_account: bool = True
+) -> dict:
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            row = await _load_owned(session, memory_id, user_id, project_id, include_account=include_account)
+            return _public(row)
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc

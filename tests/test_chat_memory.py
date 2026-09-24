@@ -285,6 +285,7 @@ class TestCrud:
             "user_id": "test-user-123",
             "project_id": "test-project-123",
             "patch": {"category": "preference"},
+            "include_account": True,
         }
 
     async def test_account_scope_rejects_workspace_namespace(self, client):
@@ -299,9 +300,6 @@ class TestCrud:
 
         captured = {}
 
-        async def fake_resolve_model(_model_name):
-            return {"model_name": "embedding"}
-
         async def fake_candidates(**kwargs):
             captured["candidate"] = kwargs
             return [9, 4]
@@ -313,14 +311,9 @@ class TestCrud:
         monkeypatch.setattr(
             memory,
             "get_settings",
-            lambda: SimpleNamespace(
-                chat_memory_embedding_model="embedding",
-                chat_memory_embedding_dimensions=3,
-                chat_memory_candidate_limit=20,
-            ),
+            lambda: SimpleNamespace(chat_memory_candidate_limit=20),
         )
         monkeypatch.setattr(memory, "semantic_memory_available", lambda: True)
-        monkeypatch.setattr(memory.ps, "resolve_model", fake_resolve_model)
         monkeypatch.setattr(memory.mr, "candidate_ids", fake_candidates)
         monkeypatch.setattr(memory.ms, "hydrate_candidate_ids", fake_hydrate)
 
@@ -329,6 +322,7 @@ class TestCrud:
         assert resp.status_code == 200
         assert captured["candidate"]["project_id"] == "test-project-123"
         assert captured["candidate"]["workspace_id"] is None
+        assert captured["candidate"]["limit"] == 20
         assert captured["hydrate"]["ids"] == [9, 4]
         assert captured["hydrate"]["scope"] == "project"
 
@@ -398,6 +392,8 @@ class TestCrud:
         assert captured == {
             "user_id": "test-user-123",
             "project_id": "test-project-123",
+            "workspace_id": None,
+            "include_account": True,
         }
 
     async def test_update_forbidden_403(self, client, monkeypatch):

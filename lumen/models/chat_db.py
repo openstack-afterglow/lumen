@@ -110,6 +110,11 @@ class LlmModel(Base):
     # 미지정 시 litellm 내장 단가 사용 (override용). 토큰당 USD 단가.
     input_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     output_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
+    # 프롬프트 캐시 토큰당 USD 단가(관리자 수동 설정 전용, catalog fallback 없음).
+    # 미설정 카테고리는 0원으로 과금하고 pricing_status=partial 로 남는다.
+    cache_read_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
+    cache_write_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # 5분 TTL cache write
+    cache_write_1h_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     # models.dev catalog mapping and the immutable provenance of the last import.
     models_dev_model_id: Mapped[str | None] = mapped_column(VARCHAR(190))
     price_source: Mapped[str | None] = mapped_column(VARCHAR(20))
@@ -144,6 +149,8 @@ class ChatConversation(Base):
     model_name: Mapped[str | None] = mapped_column(VARCHAR(190))
     # 버전 트리에서 현재 보이는 리프 메시지. 렌더 경로 = active_leaf → parent 역추적.
     active_leaf_id: Mapped[int | None] = mapped_column(BIGINT)
+    history_revision: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
+    history_index_ready: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
     # 분기(fork) 출처: 이 대화가 어느 대화의 어느 메시지에서 갈라졌는지(감사·표시용).
     parent_conversation_id: Mapped[str | None] = mapped_column(CHAR(36))
     forked_from_message_id: Mapped[int | None] = mapped_column(BIGINT)
@@ -214,8 +221,27 @@ class ChatMessage(Base):
 
     __table_args__ = (
         Index("idx_chat_messages_conversation", "conversation_id", "created_at"),
+        Index("idx_chat_messages_branch", "conversation_id", "parent_id", "role", "created_at", "id"),
         Index("idx_chat_messages_conversation_id", "conversation_id", "id"),
         Index("idx_chat_messages_parent", "parent_id"),
+    )
+
+
+class ChatConversationActivePath(Base):
+    """Indexed root-to-active-leaf projection; message rows remain the immutable graph."""
+
+    __tablename__ = "chat_conversation_active_path"
+
+    conversation_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("chat_conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    position: Mapped[int] = mapped_column(BIGINT, primary_key=True)
+    message_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("chat_messages.id", ondelete="CASCADE"), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "message_id", name="uq_chat_conversation_active_path_message"),
+        CheckConstraint("position >= 0", name="chk_chat_active_path_position"),
+        Index("idx_chat_active_path_message", "message_id"),
     )
 
 
@@ -228,8 +254,13 @@ class ChatUsageLog(Base):
     conversation_id: Mapped[str | None] = mapped_column(CHAR(36))  # 대화 삭제 후에도 원장 보존 — FK 없음
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     provider: Mapped[str | None] = mapped_column(VARCHAR(100))
+    # prompt_tokens 는 캐시 read/creation 을 포함한 총 입력이다.
+    # uncached = prompt_tokens - cache_read - cache_creation_5m - cache_creation_1h (파생, 음수 없음).
     prompt_tokens: Mapped[int] = mapped_column(INT, nullable=False, default=0)
     completion_tokens: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    cache_read_input_tokens: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    cache_creation_5m_input_tokens: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    cache_creation_1h_input_tokens: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
     raw_cost: Mapped[Decimal] = mapped_column(Numeric(20, 10), nullable=False, default=Decimal("0"))
     credited_cost: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     source: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="web")  # web | api
@@ -399,6 +430,8 @@ class ChatApiKey(Base):
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    credential_kind: Mapped[str] = mapped_column(VARCHAR(32), nullable=False, default="api_key")
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
@@ -417,7 +450,46 @@ class ChatApiKey(Base):
             "admin_monthly_credit_limit IS NULL OR admin_monthly_credit_limit > 0",
             name="chk_chat_api_keys_admin_monthly_credit_limit",
         ),
+        CheckConstraint(
+            "credential_kind IN ('api_key', 'claude_gateway')",
+            name="chk_chat_api_keys_credential_kind",
+        ),
         Index("idx_chat_api_keys_owner", "owner_user_id", "owner_project_id"),
+    )
+
+
+class ChatGatewayDeviceGrant(Base):
+    """Short-lived OAuth device grant; raw device and user codes are never stored."""
+
+    __tablename__ = "chat_gateway_device_grants"
+
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    device_code_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False, unique=True)
+    user_code_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False, unique=True)
+    client_id_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    status: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    next_poll_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    poll_interval_seconds: Mapped[int] = mapped_column(INT, nullable=False, default=5)
+    owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    owner_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    issued_api_key_id: Mapped[int | None] = mapped_column(BIGINT, ForeignKey("chat_api_keys.id", ondelete="SET NULL"))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    denied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'denied', 'consumed')",
+            name="chk_chat_gateway_device_status",
+        ),
+        CheckConstraint(
+            "poll_interval_seconds BETWEEN 1 AND 60",
+            name="chk_chat_gateway_device_poll_interval",
+        ),
+        Index("idx_chat_gateway_device_expiry", "status", "expires_at"),
+        Index("idx_chat_gateway_device_owner", "owner_project_id", "owner_user_id", "status"),
     )
 
 
@@ -496,6 +568,32 @@ class ChatSkill(Base):
     )
 
 
+class ChatPluginBinding(Base):
+    """Approved installed export, distinct from HTTP extension records."""
+
+    __tablename__ = "chat_plugin_bindings"
+
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(VARCHAR(10), nullable=False)
+    plugin_id: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
+    export_key: Mapped[str] = mapped_column(VARCHAR(128), nullable=False)
+    name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
+    scope: Mapped[str] = mapped_column(VARCHAR(10), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    owner_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    encrypted_config: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
+    config_version: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
+    is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('tool', 'skill')", name="ck_plugin_binding_kind"),
+        CheckConstraint("(scope = 'global' AND owner_user_id IS NULL AND owner_project_id IS NULL) OR (scope = 'user' AND owner_user_id IS NOT NULL AND owner_project_id IS NOT NULL)", name="ck_plugin_binding_owner"),
+        Index("idx_plugin_binding_catalog", "scope", "owner_user_id", "owner_project_id", "is_active"),
+    )
+
+
 class ChatAgent(Base):
     """사용자 정의 에이전트 — 프롬프트(instructions) + 모델 + 파라미터 + MCP/툴 묶음.
 
@@ -519,6 +617,8 @@ class ChatAgent(Base):
     mcp_ids: Mapped[list | None] = mapped_column(JSON)  # 바인딩된 ChatMcpServer id 목록
     tool_ids: Mapped[list | None] = mapped_column(JSON)  # 바인딩된 ChatCustomTool id 목록
     skill_ids: Mapped[list | None] = mapped_column(JSON)
+    plugin_tool_ids: Mapped[list | None] = mapped_column(JSON)
+    plugin_skill_ids: Mapped[list | None] = mapped_column(JSON)
     visibility: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="private")  # private|public
     role: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="general")
     execution_policy: Mapped[dict | None] = mapped_column(JSON)

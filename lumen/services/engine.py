@@ -45,10 +45,15 @@ async def stream(
     allowed_direct_effects: tuple[str, ...] | None = None,
     lumen_snapshot: dict[str, object] | None = None,
     lumen_snapshot_frozen: bool = False,
-    resume: list[dict[str, str]] | None = None,
+    native_compaction_options: dict | None = None,
+    resume: dict | None = None,
+    plugin_tool_snapshots: tuple[dict, ...] = (),
+    delegation_enabled: bool = False,
+    sandbox_lease: tuple[str, int] | None = None,
 ) -> AsyncIterator[dict]:
     async for ev in graph.stream(
         model=model,
+        native_compaction_options=native_compaction_options,
         messages=messages,
         project_id=project_id,
         user_id=user_id,
@@ -80,5 +85,8 @@ async def stream(
         lumen_snapshot=lumen_snapshot,
         lumen_snapshot_frozen=lumen_snapshot_frozen,
         resume=resume,
+        plugin_tool_snapshots=plugin_tool_snapshots,
+        delegation_enabled=delegation_enabled,
+        sandbox_lease=sandbox_lease,
     ):
         yield ev

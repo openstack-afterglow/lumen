@@ -31,6 +31,7 @@ from .pricing import (
     _per_token_price,
     _provider_public,
     _to_decimal,
+    _validate_cache_prices,
     _validate_price_pair,
 )
 from .routing import _lock_mutable_route, _require_db
@@ -260,6 +261,9 @@ async def create_model(
     display_name: str | None = None,
     input_price_per_million=None,
     output_price_per_million=None,
+    cache_read_price_per_million=None,
+    cache_write_price_per_million=None,
+    cache_write_1h_price_per_million=None,
     capabilities: dict | None = None,
     is_active: bool = True,
 ) -> dict:
@@ -267,6 +271,14 @@ async def create_model(
     if not model_name or not model_name.strip():
         raise ProviderValidationError("model_name 은 필수입니다")
     input_price, output_price = _validate_price_pair(input_price_per_million, output_price_per_million)
+    # Cache rates are optional and independent of each other and of the input/output pair.
+    cache_prices = _validate_cache_prices(
+        {
+            "cache_read_price_per_million": cache_read_price_per_million,
+            "cache_write_price_per_million": cache_write_price_per_million,
+            "cache_write_1h_price_per_million": cache_write_1h_price_per_million,
+        }
+    )
     try:
         async with factory() as session, session.begin():
             subscription_providers = await _lock_subscription_namespaces(session)
@@ -300,6 +312,7 @@ async def create_model(
                 display_name=(display_name or None),
                 input_price=input_price,
                 output_price=output_price,
+                **cache_prices,
                 price_source="manual" if input_price is not None else None,
                 capabilities=(capabilities or None),
                 capability_source=("override" if capabilities else None),
@@ -377,6 +390,8 @@ async def update_model(model_id: int, patch: dict) -> dict:
     has_output_price = "output_price_per_million" in patch
     if has_input_price != has_output_price:
         raise ProviderValidationError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
+    # Present key → set (null clears); absent key → unchanged.
+    cache_prices = _validate_cache_prices(patch)
     try:
         async with factory() as session, session.begin():
             subscription_providers = await _lock_subscription_namespaces(session)
@@ -429,6 +444,8 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 row.output_price = output_price
                 row.price_source = "manual" if input_price is not None else None
                 row.price_metadata = None
+            for column, price in cache_prices.items():
+                setattr(row, column, price)
             if "capabilities" in patch:
                 row.capabilities = patch["capabilities"] or None
                 row.capability_source = "override" if patch["capabilities"] else None

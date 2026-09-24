@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from lumen.auth import get_token_info
+from lumen.models.chat_contracts import validate_plugin_binding_ids
 from lumen.services import agent_store as ags
 
 router = APIRouter()
@@ -27,6 +28,13 @@ class AgentCreate(BaseModel):
     mcp_ids: list[int] | None = None
     tool_ids: list[int] | None = None
     skill_ids: list[int] | None = None
+    plugin_tool_ids: list[str] = Field(default_factory=list, max_length=100)
+    plugin_skill_ids: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("plugin_tool_ids", "plugin_skill_ids")
+    @classmethod
+    def validate_plugin_ids(cls, value: list[str]) -> list[str]:
+        return validate_plugin_binding_ids(value)
     visibility: str = Field(default="private")
 
     model_config = {"protected_namespaces": ()}
@@ -49,6 +57,13 @@ class AgentUpdate(BaseModel):
     mcp_ids: list[int] | None = None
     tool_ids: list[int] | None = None
     skill_ids: list[int] | None = None
+    plugin_tool_ids: list[str] = Field(default_factory=list, max_length=100)
+    plugin_skill_ids: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("plugin_tool_ids", "plugin_skill_ids")
+    @classmethod
+    def validate_plugin_ids(cls, value: list[str]) -> list[str]:
+        return validate_plugin_binding_ids(value)
     visibility: str | None = None
 
     model_config = {"protected_namespaces": ()}

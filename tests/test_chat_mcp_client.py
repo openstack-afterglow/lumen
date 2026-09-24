@@ -1,145 +1,99 @@
-"""MCP streamable-HTTP transport hardening tests."""
+"""Core MCP client lane: delegates to the started remote-mcp plugin via the registry.
+
+Transport hardening, streamable-HTTP validation, and result projection are owned by
+the plugins/mcp-default package and exercised by its own test suite. Core only owns
+the fail-closed delegation and exception-to-fallback-value behavior below.
+"""
 
 from __future__ import annotations
 
-import httpx
 import pytest
 
-from lumen.services import mcp_client, ssrf
+from lumen.services import mcp_client
 
 
-def test_connection_rejects_legacy_sse_and_non_https():
-    with pytest.raises(ValueError, match="streamable HTTP"):
-        mcp_client._connection({"transport": "sse", "url": "https://mcp.example"})
-    with pytest.raises(ValueError, match="HTTPS"):
-        mcp_client._connection({"transport": "http", "url": "http://mcp.example"})
+class _FakeProvider:
+    def __init__(self, *, tools=None, output=None, raise_list=False, raise_call=False):
+        self._tools = tools or []
+        self._output = output
+        self._raise_list = raise_list
+        self._raise_call = raise_call
+        self.list_calls: list[dict] = []
+        self.call_calls: list[tuple] = []
+
+    async def list_tools(self, server):
+        self.list_calls.append(server)
+        if self._raise_list:
+            raise RuntimeError("boom")
+        return self._tools
+
+    async def call_tool(self, server, tool_name, arguments):
+        self.call_calls.append((server, tool_name, arguments))
+        if self._raise_call:
+            raise RuntimeError("boom")
+        return self._output
 
 
-def test_connection_passes_hardened_factory_to_langchain_adapter():
-    connection = mcp_client._connection(
-        {"transport": "streamable_http", "url": "https://mcp.example/api", "headers": {"Authorization": "Bearer x"}}
+@pytest.fixture(autouse=True)
+def _provider(monkeypatch):
+    holder: dict[str, _FakeProvider] = {}
+
+    def factory():
+        return holder["provider"]
+
+    monkeypatch.setattr(mcp_client, "_provider", factory)
+
+    def _set(provider: _FakeProvider) -> _FakeProvider:
+        holder["provider"] = provider
+        return provider
+
+    yield _set
+
+
+async def test_list_tools_delegates_to_started_plugin(_provider):
+    server = {"id": 1, "name": "srv"}
+    provider = _provider(_FakeProvider(tools=[{"name": "search", "description": "", "input_schema": {}}]))
+
+    result = await mcp_client.list_tools(server)
+
+    assert result == [{"name": "search", "description": "", "input_schema": {}}]
+    assert provider.list_calls == [server]
+
+
+async def test_list_tools_fails_closed_to_empty_list_on_plugin_error(_provider):
+    provider = _provider(_FakeProvider(raise_list=True))
+
+    assert await mcp_client.list_tools({"id": 1}) == []
+    assert provider.list_calls == [{"id": 1}]
+
+
+async def test_call_tool_returns_text_when_no_generated_files(_provider):
+    provider = _provider(
+        _FakeProvider(output=mcp_client.McpToolOutput(text="result", files=()))
     )
 
-    assert connection == {
-        "transport": "streamable_http",
-        "url": "https://mcp.example/api",
-        "headers": {"Authorization": "Bearer x"},
-        "timeout": mcp_client._TIMEOUT_SECONDS,
-        "httpx_client_factory": mcp_client._safe_http_client,
-    }
+    result = await mcp_client.call_tool({"id": 1}, "search", {"query": "x"})
+
+    assert result == "result"
+    assert provider.call_calls == [({"id": 1}, "search", {"query": "x"})]
 
 
-def test_result_projection_is_bounded():
-    class TextBlock:
-        text = "x" * (mcp_client._MAX_RESULT_CHARS + 1)
-
-    assert mcp_client._result_to_text([TextBlock()]) == "x" * mcp_client._MAX_RESULT_CHARS
-
-
-def test_result_projection_preserves_embedded_mcp_files():
-    output = mcp_client._result_to_output(
-        (
-            [
-                {"type": "text", "text": "Created the report."},
-                {
-                    "type": "file",
-                    "base64": "bmFtZSx2YWx1ZQpsYXRlbmN5LDEyCg==",
-                    "mime_type": "text/csv",
-                },
-            ],
-            {"structured_content": {"rows": 1}},
-        ),
-        tool_name="report_data",
+async def test_call_tool_returns_output_object_when_files_are_present(_provider):
+    output = mcp_client.McpToolOutput(
+        text="Created chart.",
+        files=(mcp_client.McpGeneratedFile(name="chart.png", media_type="image/png", data=b"\x89PNG"),),
     )
+    _provider(_FakeProvider(output=output))
 
-    assert output.text == "Created the report."
-    assert output.files == (
-        mcp_client.McpGeneratedFile(
-            name="report_data-1.csv",
-            media_type="text/csv",
-            data=b"name,value\nlatency,12\n",
-        ),
-    )
+    result = await mcp_client.call_tool({"id": 1}, "render_chart", {})
+
+    assert result is output
 
 
-def test_result_projection_rejects_invalid_embedded_file_data():
-    with pytest.raises(ValueError, match="invalid embedded file data"):
-        mcp_client._result_to_output(
-            [{"type": "file", "base64": "not base64!", "mime_type": "text/plain"}],
-            tool_name="report",
-        )
+async def test_call_tool_fails_closed_to_safe_message_on_plugin_error(_provider):
+    provider = _provider(_FakeProvider(raise_call=True))
 
+    result = await mcp_client.call_tool({"id": 1}, "search", {})
 
-async def test_mcp_http_factory_uses_pinned_transport_and_identity_encoding():
-    client = mcp_client._safe_http_client({"Accept-Encoding": "gzip", "Authorization": "Bearer x"})
-    try:
-        assert isinstance(client._transport, ssrf.SafeAsyncTransport)
-        assert client.headers["accept-encoding"] == "identity"
-        assert client.follow_redirects is False
-        assert client.trust_env is False
-        assert client.timeout == httpx.Timeout(mcp_client._TIMEOUT_SECONDS)
-    finally:
-        await client.aclose()
-
-
-async def test_langchain_adapter_lists_and_invokes_stateless_tools(monkeypatch):
-    class ArgsSchema:
-        @staticmethod
-        def model_json_schema():
-            return {"type": "object", "properties": {"query": {"type": "string"}}}
-
-    class Tool:
-        name = "search"
-        description = "Search the remote index"
-        args_schema = ArgsSchema
-
-        async def ainvoke(self, args):
-            assert args == {"query": "Afterglow"}
-            return [{"text": "result"}]
-
-    class Client:
-        async def get_tools(self, *, server_name):
-            assert server_name == "remote"
-            return [Tool()]
-
-    monkeypatch.setattr(mcp_client, "_client", lambda _server: Client())
-    server = {"name": "public", "transport": "http", "url": "https://mcp.example"}
-
-    assert await mcp_client.list_tools(server) == [
-        {
-            "name": "search",
-            "description": "Search the remote index",
-            "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
-        }
-    ]
-    assert await mcp_client.call_tool(server, "search", {"query": "Afterglow"}) == "result"
-
-
-async def test_langchain_adapter_returns_embedded_files_to_the_runtime(monkeypatch):
-    class Tool:
-        name = "render_chart"
-        description = "Render a chart"
-        args_schema = {"type": "object", "properties": {}}
-
-        async def ainvoke(self, _args):
-            return [
-                {"type": "text", "text": "Created chart."},
-                {"type": "image", "base64": "iVBORw0KGgo=", "mime_type": "image/png"},
-            ]
-
-    class Client:
-        async def get_tools(self, *, server_name):
-            assert server_name == "remote"
-            return [Tool()]
-
-    monkeypatch.setattr(mcp_client, "_client", lambda _server: Client())
-    result = await mcp_client.call_tool(
-        {"name": "public", "transport": "http", "url": "https://mcp.example"},
-        "render_chart",
-        {},
-    )
-
-    assert isinstance(result, mcp_client.McpToolOutput)
-    assert result.text == "Created chart."
-    assert result.files[0].name == "render_chart-1.png"
-    assert result.files[0].data == b"\x89PNG\r\n\x1a\n"
+    assert result == "MCP 도구 실행 중 오류가 발생했습니다."
+    assert provider.call_calls == [({"id": 1}, "search", {})]

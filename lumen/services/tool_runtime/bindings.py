@@ -6,13 +6,14 @@ import json
 import logging
 import re
 
-from lumen.models.chat_contracts import TextPart
+from lumen_plugin_api.contracts import PluginError
+from lumen_plugin_api.tools import GeneratedToolFile, ToolBinding, ToolDefinition, ToolTextPart
+from lumen_plugin_api.tools import ToolExecutionResult as V2ToolExecutionResult
+
 from lumen.services import mcp_adapter as mcp_ledger
 from lumen.services import mcp_adapter as mcp_lumen
 from lumen.services import mcp_adapter as mcp_registry
 from lumen.services import mcp_client
-from lumen.services.agent_protocol import GeneratedToolFile, ToolBinding, ToolDefinition
-from lumen.services.agent_protocol import ToolExecutionResult as V2ToolExecutionResult
 from lumen.services.tools import ToolContext
 
 from .contracts import (
@@ -23,7 +24,7 @@ from .contracts import (
     _v2_effect,
     _v2_provider_name,
     _v2_result,
-    custom_tool_function_schema,
+    execution_context,
     v2_builtin_tool_bindings,
 )
 from .selection import _load_custom, _load_mcp
@@ -37,7 +38,7 @@ def _v2_mcp_result(value: str | mcp_client.McpToolOutput) -> V2ToolExecutionResu
     return V2ToolExecutionResult(
         status="completed",
         model_content=value.text,
-        display=[TextPart(type="text", text=value.text)] if value.text else [],
+        display=[ToolTextPart(text=value.text)] if value.text else [],
         generated_files=[
             GeneratedToolFile(data=file.data, name=file.name, media_type=file.media_type) for file in value.files
         ],
@@ -193,7 +194,7 @@ async def _lumen_registry_bindings(ctx: ToolContext) -> tuple[ToolBinding, ...]:
                 return V2ToolExecutionResult(
                     status="completed",
                     model_content=content,
-                    display=[TextPart(type="text", text=content)],
+                    display=[ToolTextPart(text=content)],
                 )
             except Exception:
                 logger.warning("Lumen cloud registry call failed tool=%s", registry_entry.name, exc_info=True)
@@ -229,7 +230,7 @@ async def _lumen_registry_bindings(ctx: ToolContext) -> tuple[ToolBinding, ...]:
                 f" (current state: {plan.current_state})" if plan.current_state else ""
             )
             return {
-                "preview": [TextPart(type="text", text=detail).model_dump(mode="json")],
+                "preview": [ToolTextPart(text=detail).model_dump(mode="json")],
                 "expected_state_revision": None,
                 "writer_fence": None,
             }
@@ -367,7 +368,7 @@ async def _search_and_load_bindings(
             ensure_ascii=False,
             separators=(",", ":"),
         ),
-        display=[TextPart(type="text", text=f"도구 후보 {len(catalog)}개를 확인하고 기술을 로드했습니다.")],
+        display=[ToolTextPart(text=f"도구 후보 {len(catalog)}개를 확인하고 기술을 로드했습니다.")],
     )
 
 
@@ -419,7 +420,7 @@ async def v2_tool_bindings(
     """Resolve tenant-scoped bindings, optionally restricted to one extension load policy."""
     if not ctx.tools_enabled:
         return {}
-    bindings = v2_builtin_tool_bindings() if include_platform else {}
+    bindings = await v2_builtin_tool_bindings(ctx) if include_platform else {}
 
     def add(binding: ToolBinding) -> None:
         if binding.definition.name in bindings:
@@ -440,66 +441,31 @@ async def v2_tool_bindings(
         if destination_origin is None:
             logger.warning("custom tool without a canonical destination excluded from v2 bindings id=%s", identifier)
             continue
+        from lumen.plugins.tools_host import bind_default_tool
+
         try:
-            projection = custom_tool_function_schema(
-                identifier,
-                custom.get("name"),
-                custom.get("description"),
-                custom.get("params_schema"),
-            )
-            definition = ToolDefinition(
-                name=projection["name"],
-                description=projection["description"],
-                input_schema=projection["parameters"],
-                effect=_v2_effect(custom.get("effect")),
-                source="custom_http",
-                activity_category="커스텀 도구",
-            )
-        except (TypeError, ValueError):
+            bound = await bind_default_tool("custom_http", execution_context(ctx), custom)
+        except (PluginError, TypeError, ValueError):
             logger.warning("invalid custom tool excluded from v2 bindings id=%s", identifier)
             continue
 
         async def execute(
-            arguments: dict[str, object], context: object, *, tool_id=identifier
+            arguments: dict[str, object], context: object, *, tool_id=identifier, original=custom, binding=bound
         ) -> V2ToolExecutionResult:
             if not isinstance(context, ToolContext):
-                return V2ToolExecutionResult(
-                    status="failed",
-                    model_content="Tool execution context is invalid.",
-                    error_code="invalid_tool_context",
-                )
+                return V2ToolExecutionResult(status="failed", model_content="Tool execution context is invalid.", error_code="invalid_tool_context")
             current = next((item for item in await _load_custom(context) if item.get("id") == tool_id), None)
-            if current is None:
-                return V2ToolExecutionResult(
-                    status="failed",
-                    model_content="The selected custom tool is no longer available.",
-                    error_code="extension_unavailable",
-                )
-            from .dispatch import _execute_custom_http_tool
+            if current is None or current != original:
+                return V2ToolExecutionResult(status="failed", model_content="The selected custom tool is no longer available.", error_code="extension_unavailable")
+            return await binding.execute(arguments, execution_context(context))
 
-            return _v2_result(await _execute_custom_http_tool(current, arguments, context))
-
-        add(
-            ToolBinding(
-                definition=definition,
-                execute=execute,
-                config_fingerprint=_v2_config_fingerprint(
-                    {
-                        "id": identifier,
-                        "name": custom.get("name"),
-                        "url": custom.get("url"),
-                        "method": custom.get("method"),
-                        "params_schema": custom.get("params_schema"),
-                        "effect": custom.get("effect"),
-                        "config_version": custom.get("config_version"),
-                    }
-                ),
-                destination_origin=destination_origin,
-                load_policy=custom.get("load_policy")
-                if custom.get("load_policy") in {"preloaded", "on_demand"}
-                else None,
-            )
-        )
+        add(ToolBinding(
+            definition=bound.definition,
+            execute=execute,
+            config_fingerprint=_v2_config_fingerprint(custom),
+            destination_origin=destination_origin,
+            load_policy=custom.get("load_policy") if custom.get("load_policy") in {"preloaded", "on_demand"} else None,
+        ))
 
     for server in await _load_mcp(ctx):
         if extension_load_policy is not None and server.get("load_policy") != extension_load_policy:
@@ -577,6 +543,14 @@ async def v2_tool_bindings(
                     else None,
                 )
             )
+    if include_platform and extension_load_policy in {None, "preloaded"}:
+        from lumen.plugins.bindings import bind_tool
+
+        for snapshot in ctx.plugin_tool_snapshots:
+            # Admission owns freezing; bind_tool revalidates identity, schema and
+            # owner scope before dispatch and again at each actual invocation.
+            add(await bind_tool(snapshot, execution_context(ctx)))
+
 
     if (
         include_platform

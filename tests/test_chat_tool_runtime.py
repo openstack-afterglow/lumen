@@ -7,15 +7,38 @@
 
 import json
 
+import pytest
+from lumen_plugin_api.contracts import ExecutionContext, PluginError
+from lumen_plugin_api.tools import ToolBinding, ToolDefinition
+from lumen_plugin_api.tools import ToolExecutionResult as V2ToolExecutionResult
+
 from lumen.services import conversation_store as cs
-from lumen.services import ssrf
-from lumen.services.agent_protocol import ToolBinding, ToolDefinition
-from lumen.services.agent_protocol import ToolExecutionResult as V2ToolExecutionResult
-from lumen.services.tool_runtime import bindings, contracts, managed, selection
+from lumen.services.tool_runtime import bindings, contracts, selection
 from lumen.services.tool_runtime import dispatch as tool_runtime
 from lumen.services.tools import ToolContext
 
 _CTX = ToolContext(project_id="p1", user_id="u1")
+
+def _custom_row(**overrides):
+    return {
+        "id": 1, "name": "weather", "description": "날씨", "method": "GET",
+        "url": "https://api.example/w", "timeout_seconds": 5,
+        "params_schema": {"type": "object", "properties": {}}, "effect": "read",
+        "config_version": 1, "load_policy": "preloaded", "is_active": True,
+        **overrides,
+    }
+
+
+def _custom_host(monkeypatch, rows):
+    from lumen.plugins.tools_host import ToolsExtensionAccess
+
+    rows = rows if isinstance(rows, list) else [rows]
+
+    async def resolve(self, kind, identifier, namespace):
+        assert kind == "tool" and namespace.user_id == "u1" and namespace.project_id == "p1"
+        return next(row for row in rows if row["id"] == identifier)
+
+    monkeypatch.setattr(ToolsExtensionAccess, "resolve", resolve)
 
 
 class _Resp:
@@ -66,14 +89,34 @@ class _ManagedHooks:
 
 class TestSchemas:
     async def test_builtin_plus_custom(self, monkeypatch):
+        row = _custom_row()
+        _custom_host(monkeypatch, row)
+
         async def fake_load(ctx):
-            return [{"name": "weather", "description": "날씨", "params_schema": None}]
+            return [row]
 
         monkeypatch.setattr(selection, "_load_custom", fake_load)
+        monkeypatch.setattr(bindings, "_load_custom", fake_load)
+
+        async def no_mcp(_ctx):
+            return []
+
+        monkeypatch.setattr(bindings, "_load_mcp", no_mcp)
         schemas = await selection.context_tool_schemas(_CTX)
         names = {s["function"]["name"] for s in schemas}
-        assert "list_my_conversations" in names  # 내장
-        assert "weather" in names  # 커스텀
+        assert "list_my_conversations" in names
+        assert any(name.startswith("custom__1__weather_") for name in names)
+        runtime = await bindings.v2_tool_bindings(_CTX, include_platform=False)
+        custom = next(binding for binding in runtime.values() if binding.definition.source == "custom_http")
+        projected = next(schema["function"] for schema in schemas if schema["function"]["name"] == custom.definition.name)
+        assert projected == {
+            "name": custom.definition.name,
+            "description": custom.definition.description,
+            "parameters": custom.definition.input_schema,
+        }
+        assert await selection.context_tool_activity_metadata(custom.definition.name, _CTX) == (
+            "custom_http", "커스텀 도구"
+        )
 
     async def test_graceful_when_storage_fails(self, monkeypatch):
         # _load_custom 내부 예외 → 내장 툴만 (graph 가 죽지 않게)
@@ -102,10 +145,12 @@ class TestManagedTools:
         names = {schema["function"]["name"] for schema in await selection.context_tool_schemas(ctx)}
         assert {"managed_web_search", "managed_web_fetch"} <= names
 
-        async def fake_search(*args, **kwargs):
-            return [managed.web_search.SearchCitation(url="https://docs.example/a", title="A", snippet="B")]
+        from lumen.plugins import tools_host
 
-        monkeypatch.setattr(managed.web_search, "search_with_route", fake_search)
+        async def fake_search(*args, **kwargs):
+            return [tools_host.web_search.SearchCitation(url="https://docs.example/a", title="A", snippet="B")]
+
+        monkeypatch.setattr(tools_host.web_search, "search_with_route", fake_search)
         result = await tool_runtime.context_execute("managed_web_search", {"query": "docs"}, ctx)
         assert json.loads(result)["sources"][0]["url"] == "https://docs.example/a"
         assert hooks.calls == [("managed_web_search", 2)]
@@ -125,18 +170,10 @@ class TestManagedTools:
         async def unexpected(*args, **kwargs):
             raise AssertionError("provider must not be called after durable limit")
 
-        monkeypatch.setattr(managed.web_search, "search_with_route", unexpected)
-        assert "한도" in await tool_runtime.context_execute("managed_web_search", {"query": "docs"}, ctx)
+        from lumen.plugins import tools_host
 
-    def test_managed_search_result_is_bounded_for_multibyte_content(self):
-        result = managed._bounded_search_result(
-            [
-                managed.web_search.SearchCitation(
-                    url="https://docs.example/a", title="제목" * 1_000, snippet="한글" * 30_000
-                )
-            ]
-        )
-        assert len(result.encode("utf-8")) <= managed._MAX_MANAGED_RESULT_BYTES
+        monkeypatch.setattr(tools_host.web_search, "search_with_route", unexpected)
+        assert "한도" in await tool_runtime.context_execute("managed_web_search", {"query": "docs"}, ctx)
 
     async def test_managed_advisor_result_stays_private_from_graph_projection(self, monkeypatch):
         async def no_custom(ctx):
@@ -164,7 +201,9 @@ class TestManagedTools:
             assert kwargs["visible_messages"] == [{"role": "user", "content": "visible context"}]
             return _Result()
 
-        monkeypatch.setattr(managed.advisor, "ask_with_route", fake_advisor)
+        from lumen.plugins import tools_host
+
+        monkeypatch.setattr(tools_host.advisor_service, "ask_with_route", fake_advisor)
         names = {schema["function"]["name"] for schema in await selection.context_tool_schemas(ctx)}
         assert "managed_advisor" in names
         result = await tool_runtime.context_execute_result("managed_advisor", {"goal": "review"}, ctx)
@@ -191,69 +230,69 @@ class TestDispatch:
         assert "알 수 없는" in out
 
     async def test_custom_tool_dispatch_success(self, monkeypatch):
+        row = _custom_row()
+        _custom_host(monkeypatch, row)
+
         async def fake_load(ctx):
-            return [{"name": "weather", "method": "GET", "url": "https://api.example/w", "timeout_seconds": 5}]
+            return [row]
 
         monkeypatch.setattr(selection, "_load_custom", fake_load)
-        monkeypatch.setattr(ssrf, "validate_url", lambda url: url)  # SSRF 통과
         monkeypatch.setattr("httpx.AsyncClient", _Client)
-        out = await tool_runtime.context_execute("weather", {"city": "seoul"}, _CTX)
+        schema = next(item for item in await selection.context_tool_schemas(_CTX) if item["function"]["name"].startswith("custom__"))
+        out = await tool_runtime.context_execute(schema["function"]["name"], {}, _CTX)
         assert out.startswith("[200]")
         assert "hello world" in out
 
 
-class TestCustomExecution:
-    async def test_ssrf_blocked_returns_safe_string(self, monkeypatch):
-        out = await tool_runtime._execute_custom_http_tool(
-            {"name": "x", "url": "http://169.254.169.254/", "method": "GET"}, {}, _CTX
+
+class TestRegistryToolBindings:
+    async def test_unknown_default_export_fails_closed(self):
+        from lumen.plugins.tools_host import bind_default_tool
+
+        with pytest.raises(PluginError) as exc:
+            await bind_default_tool("not_an_installed_export", ExecutionContext(user_id="u1", project_id="p1"))
+        assert exc.value.code == "plugin_unavailable"
+
+    async def test_selected_plugin_snapshot_dispatches_with_plugin_source(self, monkeypatch):
+        from lumen.plugins import bindings as plugin_bindings
+        from lumen.services.agent_runtime_v2 import dispatch_tool_call
+
+        identifier = "123e4567-e89b-12d3-a456-426614174000"
+        row = {
+            "id": identifier, "kind": "tool", "plugin_id": "default-tools",
+            "export_key": "list_my_conversations", "name": "Selected conversations",
+            "scope": "user", "owner_user_id": "u1", "owner_project_id": "p1",
+            "config": {}, "config_version": 1, "is_active": True,
+        }
+
+        async def resolve_binding(value, *, kind, namespace):
+            assert value == identifier and kind == "tool"
+            assert namespace.user_id == "u1" and namespace.project_id == "p1"
+            return row
+
+        async def list_conversations(**kwargs):
+            assert kwargs["user_id"] == "u1" and kwargs["project_id"] == "p1"
+            return [{"id": "c1", "title": "Mine", "model_name": "m"}]
+
+        async def no_extensions(_ctx):
+            return []
+
+        monkeypatch.setattr(plugin_bindings, "resolve_binding", resolve_binding)
+        monkeypatch.setattr(cs, "list_conversations", list_conversations)
+        monkeypatch.setattr(bindings, "_load_custom", no_extensions)
+        monkeypatch.setattr(bindings, "_load_mcp", no_extensions)
+        snapshot, = await plugin_bindings.freeze_bindings(
+            [identifier], kind="tool", user_id="u1", project_id="p1"
         )
-        assert "허용되지 않은" in out
+        ctx = ToolContext(project_id="p1", user_id="u1", plugin_tool_snapshots=(snapshot,))
+        bound = await bindings.v2_tool_bindings(ctx)
+        plugin_binding = next(binding for binding in bound.values() if binding.definition.source == "plugin")
 
-    async def test_http_error_returns_safe_string(self, monkeypatch):
-        class _BadClient(_Client):
-            def stream(self, method, url, **kwargs):
-                raise RuntimeError("connection refused")
+        result = await dispatch_tool_call(plugin_binding, {}, ctx)
 
-        monkeypatch.setattr("httpx.AsyncClient", _BadClient)
-        out = await tool_runtime._execute_custom_http_tool(
-            {"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX
-        )
-        assert "오류" in out
-
-    async def test_large_http_response_is_not_materialized(self, monkeypatch):
-        class _LargeResponse(_Resp):
-            async def aiter_bytes(self):
-                yield b"x" * (selection._MAX_RESPONSE_BYTES + 1)
-
-        class _LargeClient(_Client):
-            def stream(self, method, url, **kwargs):
-                return _Stream(_LargeResponse())
-
-        monkeypatch.setattr("httpx.AsyncClient", _LargeClient)
-        out = await tool_runtime._execute_custom_http_tool(
-            {"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX
-        )
-        assert "허용 크기" in out
-
-    async def test_compressed_http_response_is_rejected_before_iteration(self, monkeypatch):
-        class _CompressedResponse(_Resp):
-            def __init__(self):
-                super().__init__()
-                self.headers = {"content-encoding": "gzip"}
-
-            async def aiter_bytes(self):
-                raise AssertionError("compressed content must not be decompressed")
-                yield b""  # pragma: no cover
-
-        class _CompressedClient(_Client):
-            def stream(self, method, url, **kwargs):
-                return _Stream(_CompressedResponse())
-
-        monkeypatch.setattr("httpx.AsyncClient", _CompressedClient)
-        out = await tool_runtime._execute_custom_http_tool(
-            {"name": "x", "url": "https://api.example", "method": "GET"}, {}, _CTX
-        )
-        assert "압축된" in out
+        assert plugin_binding.definition.name.startswith("plugin__")
+        assert result.status == "completed"
+        assert "Mine" in result.model_content
 
 
 class TestSelectionFilter:
@@ -442,8 +481,9 @@ class TestDeferredToolBinding:
                 "effect": "read",
                 "config_version": 1,
                 "load_policy": "on_demand",
+                "is_active": True,
             }
-            for identifier in range(10)
+            for identifier in range(1, 11)
         ]
 
         async def fake_custom(_ctx):
@@ -452,6 +492,7 @@ class TestDeferredToolBinding:
         async def fake_mcp(_ctx):
             return []
 
+        _custom_host(monkeypatch, tools)
         monkeypatch.setattr(bindings, "_load_custom", fake_custom)
         monkeypatch.setattr(bindings, "_load_mcp", fake_mcp)
         ctx = ToolContext(
@@ -554,8 +595,10 @@ class TestDeferredToolBinding:
             "effect": "read",
             "config_version": 1,
             "load_policy": "on_demand",
+            "is_active": True,
         }
         current = dict(original)
+        _custom_host(monkeypatch, current)
 
         async def fake_custom(context):
             return selection._frozen_selection([current], context, "tool")
@@ -563,12 +606,13 @@ class TestDeferredToolBinding:
         async def fake_mcp(_ctx):
             return []
 
-        async def unexpected_network(*_args, **_kwargs):
+        def unexpected_network(*_args, **_kwargs):
             raise AssertionError("changed extension must not dispatch")
 
         monkeypatch.setattr(bindings, "_load_custom", fake_custom)
         monkeypatch.setattr(bindings, "_load_mcp", fake_mcp)
-        monkeypatch.setattr(tool_runtime, "_execute_custom_http_tool", unexpected_network)
+        from lumen.plugins.tools_host import ToolsPublicHttpAccess
+        monkeypatch.setattr(ToolsPublicHttpAccess, "client", unexpected_network)
         ctx = ToolContext(
             project_id="p1",
             user_id="u1",

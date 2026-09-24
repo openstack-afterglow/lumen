@@ -30,21 +30,26 @@ def _request(text: str = "hello", **extra):
 
 
 async def test_selected_skills_are_loaded_once_from_owned_active_extensions(monkeypatch):
+    """Selected DB skills resolve exactly once through the selected skills provider and freeze a digest."""
+    calls: list[tuple[str, str, bool]] = []
+
     async def fake_list(kind, **kwargs):
         assert kind == "skill"
-        assert kwargs == {"user_id": "u1", "project_id": "p1", "active_only": True}
+        calls.append((kwargs["user_id"], kwargs["project_id"], kwargs["active_only"]))
         return [
-            {"id": 1, "name": "safe", "instructions": "first"},
-            {"id": 2, "name": "unused", "instructions": "second"},
+            {"id": 1, "name": "safe", "instructions": "first", "scope": "user", "is_active": True},
+            {"id": 2, "name": "unused", "instructions": "second", "scope": "user", "is_active": True},
         ]
 
     monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
-    instructions, provenance = await chat_admission._load_skill_snapshot(None, [1], "u1", "p1")
+    instructions, provenance = await chat_admission._load_skill_snapshot(None, [1], [], "u1", "p1")
 
     assert instructions == ["first"]
     assert provenance[0]["id"] == 1
     assert provenance[0]["name"] == "safe"
     assert len(provenance[0]["content_hash"]) == 64
+    assert provenance[0]["snapshot"]["content_digest"] == provenance[0]["content_hash"]
+    assert calls == [("u1", "p1", True)]
 
 
 async def test_extension_selection_expands_omitted_ids_for_default_chat(monkeypatch):
@@ -146,9 +151,9 @@ async def test_extension_selection_rejects_agent_allowlist_bypass(monkeypatch):
         )
 
 
-async def test_preview_tool_schemas_match_the_first_provider_request():
+async def test_preview_tool_schemas_match_the_first_provider_request(monkeypatch):
     """Preview must emit the exact schemas bindings would build, not raw admin names."""
-    from lumen.services.tool_runtime import bindings, contracts
+    from lumen.services.tool_runtime import contracts
 
     preloaded = {
         "id": 1,
@@ -185,9 +190,27 @@ async def test_preview_tool_schemas_match_the_first_provider_request():
         web_fetch={"enabled": True},
     )
 
-    schemas = await chat_admission._preview_tool_schemas(features, selection)
+    async def resolve(self, kind, identifier, namespace):
+        row = {1: preloaded, 2: selection["tools"][1], 3: selection["tools"][2]}[identifier]
+        return {
+            **row,
+            "url": row["destination_origin"] and f"{row['destination_origin']}/run",
+            "method": "GET",
+            "timeout_seconds": 10,
+            "effect": "read",
+            "config_version": 1,
+            "is_active": True,
+        }
+
+    from lumen.plugins import tools_host
+
+    monkeypatch.setattr(tools_host.ToolsExtensionAccess, "resolve", resolve)
+
+    schemas = await chat_admission._preview_tool_schemas(features, selection, user_id="user-A", project_id="proj-A")
     names = {schema["function"]["name"] for schema in schemas}
-    projected = contracts.custom_tool_function_schema(1, "preloaded tool", "d", preloaded["params_schema"])
+    from lumen.services.tools import ToolContext
+
+    projected = await contracts.custom_tool_function_schema(preloaded, ToolContext(project_id="proj-A", user_id="user-A"))
 
     # Identical to the runtime binding projection: mangled provider name and closed schema.
     assert projected["name"] == "custom__1__preloaded_tool_" + projected["name"].rsplit("_", 1)[1]
@@ -195,7 +218,6 @@ async def test_preview_tool_schemas_match_the_first_provider_request():
     assert next(schema for schema in schemas if schema["function"]["name"] == projected["name"])["function"] == (
         projected
     )
-    assert bindings.custom_tool_function_schema is contracts.custom_tool_function_schema
     assert "list_available_tools" in names
     assert projected["name"] in names
     # On-demand extensions, destination-blocked tools, managed tools, and undiscovered
@@ -203,7 +225,12 @@ async def test_preview_tool_schemas_match_the_first_provider_request():
     assert not any(name.startswith("custom__2__") or name.startswith("custom__3__") for name in names)
     assert not {"managed_web_search", "managed_web_fetch"} & names
     assert not any(name.startswith("mcp__") for name in names)
-    assert await chat_admission._preview_tool_schemas(ChatFeatureOptions(tool_policy={"mode": "none"}), selection) == []
+    assert (
+        await chat_admission._preview_tool_schemas(
+            ChatFeatureOptions(tool_policy={"mode": "none"}), selection, user_id="user-A", project_id="proj-A"
+        )
+        == []
+    )
 
 
 async def _ok_precheck(user_id, project_id=None, api_key_id=None):
@@ -258,7 +285,7 @@ async def _patch_text_execution(monkeypatch):
     monkeypatch.setattr(ps, "resolve_title_model", lambda *args, **kwargs: _return(None))
     monkeypatch.setattr(admission, "existing_run_for_intent", lambda *args, **kwargs: _return(None))
     monkeypatch.setattr(completions, "_active_context_compaction_run_id", lambda **_kwargs: _return(None))
-    monkeypatch.setattr(chat_admission.ms, "active_contents_for_run", lambda *args, **kwargs: _return([]))
+    monkeypatch.setattr(chat_admission.memory_host, "recall_for_run", lambda *args, **kwargs: _return([]))
     monkeypatch.setattr(
         chat_admission,
         "_resolve_feature_routes",
@@ -311,6 +338,7 @@ async def test_context_planner_does_not_duplicate_saved_regenerate_input(monkeyp
     )
     monkeypatch.setattr(chat_admission, "_resolve_feature_routes", lambda *_args, **_kwargs: _return({}))
     monkeypatch.setattr(chat_admission, "resolve_summary_route", lambda route: _return(route))
+    monkeypatch.setattr(chat_admission.memory_host, "recall_for_run", lambda *args, **kwargs: _return([]))
 
     parts = [{"type": "text", "text": "saved turn"}]
     features = ChatFeatureOptions(tool_policy={"mode": "none"})
@@ -583,7 +611,7 @@ class TestExecutionCapabilityGate:
         monkeypatch.setattr(
             chat_admission.ws, "get_instructions_for_run", lambda *_args, **_kwargs: _return("workspace rule")
         )
-        monkeypatch.setattr(chat_admission.ms, "active_contents_for_run", fail_memory_lookup)
+        monkeypatch.setattr(chat_admission.memory_host, "recall_for_run", fail_memory_lookup)
 
         workspace, memories = await chat_admission._load_context({"workspace_id": 7}, "u1", "p1", include_memory=False)
 
@@ -686,7 +714,7 @@ class TestExecutionCapabilityGate:
             return ["사용자는 Python을 선호합니다."]
 
         monkeypatch.setattr(chat_admission.ws, "get_instructions_for_run", lambda *_args, **_kwargs: _return(None))
-        monkeypatch.setattr(chat_admission.ms, "active_contents_for_run", load_memory)
+        monkeypatch.setattr(chat_admission.memory_host, "recall_for_run", load_memory)
 
         workspace, memories = await chat_admission._load_context(
             {"workspace_id": None}, "u1", "p1", include_memory=True
@@ -694,7 +722,17 @@ class TestExecutionCapabilityGate:
 
         assert workspace is None
         assert memories == ["사용자는 Python을 선호합니다."]
-        assert captured == {"user_id": "u1", "project_id": "p1", "workspace_id": None}
+        # Recency is the default strategy and keeps today's unbounded 30-row hydration.
+        assert captured == {
+            "user_id": "u1",
+            "project_id": "p1",
+            "workspace_id": None,
+            "include_account": True,
+            "strategy": "recency",
+            "query": "",
+            "limit": 30,
+            "token_budget": 0,
+        }
 
 
 class TestActiveRunRecovery:
@@ -939,6 +977,9 @@ class TestRetryFailedRun:
             model_name = "gpt-3.5-turbo"
             agent_id = 7
             execution_mode = "chat"
+            credit_ceiling = None
+            sandbox_seconds_ceiling = None
+            wall_time_seconds = None
             request_payload = cs._enc(
                 json.dumps(
                     {
@@ -1367,6 +1408,18 @@ class TestContextPreviewRoutes:
             "_load_skill_snapshot",
             lambda *_args, **_kwargs: _return((["skill body"], [{"id": 3, "name": "Docs", "content_hash": "h"}])),
         )
+
+        async def fake_custom_schema(item, *, user_id, project_id):
+            return {
+                "type": "function",
+                "function": {
+                    "name": chat_admission._custom_tool_identity(item),
+                    "description": item["description"],
+                    "parameters": {**item["params_schema"], "additionalProperties": False},
+                },
+            }
+
+        monkeypatch.setattr(chat_admission, "custom_tool_schema", fake_custom_schema)
         monkeypatch.setattr(
             chat_admission,
             "_resolve_extension_selection",

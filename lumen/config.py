@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from functools import lru_cache
@@ -9,8 +10,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from lumen.plugins.config import PluginRuntimeConfig
+from lumen.services.infrastructure.config import RuntimeConfig
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -88,6 +92,14 @@ def _load_toml() -> dict[str, Any]:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
 
+    plugin_config: PluginRuntimeConfig = Field(default_factory=PluginRuntimeConfig)
+    runtime_config: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    worker_concurrency: int = Field(default=4, ge=1, le=64)
+    worker_heartbeat_seconds: int = Field(default=5, ge=1, le=30)
+    worker_drain_seconds: int = Field(default=300, ge=0, le=3600)
+    api_max_active_requests: int = Field(default=256, ge=1)
+    api_max_sse_connections: int = Field(default=256, ge=1)
+
     # Infrastructure & Auth
     keystone_auth_url: str = "http://localhost:5000/v3"
     keystone_admin_username: str = "admin"
@@ -125,8 +137,20 @@ class Settings(BaseSettings):
     chat_stream_enabled: bool = True
     chat_api_hosts: str = ""
     chat_reasoning_effort: str = "auto"
+    # Provider-native server-side compaction, armed only on transports whose
+    # pinned LiteLLM chat config actually forwards `context_management`.
+    # Turning this off leaves Lumen's own durable compaction untouched.
+    chat_native_compaction_enabled: bool = True
+    # The same feature on the stateless compatibility proxies, which have a
+    # different blast radius: they carry no durable run, so a caller that does
+    # not replay the compaction block pays for a fresh compaction each turn.
+    # A caller that sends its own `context_management` is never overridden.
+    chat_native_compaction_passthrough_enabled: bool = True
     chat_mcp_oauth_callback_url: str = ""
     chat_checkpointer_postgres_url: str = ""
+    claude_gateway_base_url: str = ""
+    claude_gateway_model: str = ""
+    claude_gateway_provider: str = ""
     chat_run_event_retention_hours: int = 24
     chat_checkpoint_retention_days: int = 7
     chat_semantic_memory_enabled: bool = False
@@ -177,6 +201,42 @@ class Settings(BaseSettings):
             raise ValueError("chat_mcp_oauth_callback_url must start with http:// or https://")
         return value
 
+    @field_validator("claude_gateway_base_url")
+    @classmethod
+    def validate_claude_gateway_base_url(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            return ""
+        try:
+            parsed = urlsplit(value)
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("claude_gateway_base_url must be a valid URL") from exc
+        if (
+            parsed.path != "/v1/claude-gateway"
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or not parsed.netloc
+        ):
+            raise ValueError("claude_gateway_base_url must be an origin plus /v1/claude-gateway")
+        if parsed.scheme != "https" and not is_development_loopback_http_url(value):
+            raise ValueError("claude_gateway_base_url must use HTTPS outside development loopback")
+        return value
+
+    @field_validator("claude_gateway_provider")
+    @classmethod
+    def validate_claude_gateway_provider(cls, value: str) -> str:
+        value = value.strip()
+        if value and (
+            len(value) > 40
+            or not value[0].isalnum()
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in value)
+        ):
+            raise ValueError("claude_gateway_provider is invalid")
+        return value
+
     @field_validator("chat_compat_run_timeout_seconds")
     @classmethod
     def validate_chat_compat_run_timeout_seconds(cls, value: int) -> int:
@@ -210,5 +270,5 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     for key, value in _load_toml().items():
         if not os.environ.get(key.upper()):
-            os.environ[key.upper()] = str(value)
+            os.environ[key.upper()] = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
     return Settings()

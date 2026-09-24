@@ -3,6 +3,7 @@
 completion_api 코어와 api_key_store.verify_key 를 monkeypatch 해 실제 litellm/DB 없이 검증한다.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from lumen.api.compat import openai as oa
 from lumen.auth import get_principal
 from lumen.main import app
 from lumen.services import completion_api as core
+from lumen.services import litellm_client, openai_compat
 
 _H = {"Authorization": "Bearer sk-afgl-test"}
 
@@ -95,51 +97,41 @@ class TestOpenAITranslate:
         assert item.providers == []
 
 
-class TestAnthropicTranslate:
-    def test_system_and_text_to_internal(self):
-        body = an.AnthropicMessagesRequest(
-            model="claude", system="you are x", messages=[{"role": "user", "content": "hi"}]
-        )
-        msgs = an.to_internal_messages(body)
-        assert msgs[0] == {"role": "system", "content": "you are x"}
-        assert msgs[1] == {"role": "user", "content": "hi"}
-
-    def test_tool_result_and_tool_use_roundtrip(self):
+class TestAnthropicNativeContract:
+    def test_request_preserves_native_blocks(self):
+        system = [{"type": "text", "text": "system", "cache_control": {"type": "ephemeral"}}]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
+                ],
+            }
+        ]
         body = an.AnthropicMessagesRequest(
             model="claude",
-            messages=[
-                {"role": "assistant", "content": [{"type": "tool_use", "id": "tu1", "name": "f", "input": {"a": 1}}]},
-                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu1", "content": "42"}]},
-            ],
+            system=system,
+            messages=messages,
+            max_tokens=100,
+            thinking={"type": "enabled", "budget_tokens": 32},
+            context_management={"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+            output_config={"effort": "high"},
         )
-        msgs = an.to_internal_messages(body)
-        assert msgs[0]["tool_calls"][0]["id"] == "tu1"
-        assert msgs[1] == {"role": "tool", "tool_call_id": "tu1", "content": "42"}
-
-    def test_nonstream_response_tool_use(self):
-        result = {
-            "model": "claude",
-            "content": "ok",
-            "prompt_tokens": 2,
-            "completion_tokens": 3,
-            "credited_cost": 0.0,
-            "tool_calls": [{"id": "tu1", "function": {"name": "f", "arguments": '{"a":1}'}}],
+        dumped = body.model_dump(exclude_none=True)
+        assert dumped["system"] == system
+        assert dumped["messages"] == messages
+        assert dumped["thinking"] == {"type": "enabled", "budget_tokens": 32}
+        assert dumped["context_management"] == {
+            "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
         }
-        r = an.nonstream_response(result, msg_id="msg_1")
-        assert r["type"] == "message" and r["stop_reason"] == "tool_use"
-        assert r["content"][0] == {"type": "text", "text": "ok"}
-        assert r["content"][1]["type"] == "tool_use" and r["content"][1]["input"] == {"a": 1}
-        assert r["usage"] == {"input_tokens": 2, "output_tokens": 3}
+        assert dumped["output_config"] == {"effort": "high"}
 
-    def test_accumulate_tool_calls(self):
-        acc: dict = {}
-        an._accumulate_tool_calls(acc, [{"index": 0, "id": "t", "function": {"name": "f", "arguments": '{"a'}}])
-        an._accumulate_tool_calls(acc, [{"index": 0, "function": {"arguments": '":1}'}}])
-        assert acc[0] == {"id": "t", "name": "f", "arguments": '{"a":1}'}
-
-    def test_anthropic_tools_to_openai(self):
-        out = an._anthropic_tools_to_openai([{"name": "f", "description": "d", "input_schema": {"type": "object"}}])
-        assert out[0]["function"]["name"] == "f" and out[0]["type"] == "function"
+    def test_error_envelope_is_top_level_anthropic_shape(self):
+        assert an.anthropic_error(429, "slow") == {
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": "slow"},
+        }
 
 
 class TestCompletionCoreContract:
@@ -269,6 +261,59 @@ def _core(monkeypatch):
             "credited_cost": 0.02,
         }
 
+    async def fake_anthropic(**kw):
+        if not kw["stream"]:
+            return {
+                "id": "msg_native",
+                "type": "message",
+                "role": "assistant",
+                "model": kw["resolved"]["api_model_name"],
+                "content": [{"type": "text", "text": "hello"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 4, "output_tokens": 2},
+            }
+
+        async def events():
+            yield {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_native",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": kw["resolved"]["api_model_name"],
+                    "content": [],
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 4, "output_tokens": 0},
+                },
+            }
+            yield {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hello"}}
+            yield {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}
+            yield {"type": "message_stop"}
+
+        return events()
+
+    async def fake_responses(**kw):
+        completed = {
+            "id": "resp_native",
+            "object": "response",
+            "status": "completed",
+            "model": kw["resolved"]["api_model_name"],
+            "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}],
+            "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+        }
+        if not kw["stream"]:
+            return completed
+
+        async def events():
+            yield {"type": "response.created", "sequence_number": 0, "response": {**completed, "status": "in_progress"}}
+            yield {"type": "response.output_text.delta", "sequence_number": 1, "delta": "hello"}
+            yield {"type": "response.completed", "sequence_number": 2, "response": completed}
+
+        return events()
+
+    monkeypatch.setattr(core, "complete_anthropic", fake_anthropic)
+    monkeypatch.setattr(core, "complete_responses", fake_responses)
     monkeypatch.setattr(core, "resolve_api", fake_resolve)
     monkeypatch.setattr(core, "precheck", fake_precheck)
     monkeypatch.setattr(core, "complete_once", fake_once)
@@ -782,7 +827,14 @@ class TestOpenAILumenVirtualModel:
                 SimpleNamespace(
                     seq=3,
                     type="usage.updated",
-                    payload=SimpleNamespace(model_dump=lambda: {"prompt_tokens": 10, "completion_tokens": 5}),
+                    payload=SimpleNamespace(model_dump=lambda: {
+                        "prompt_tokens": 10, "completion_tokens": 5,
+                        "components": [
+                            {"source": "executor", "kind": "cache_read_input_tokens", "quantity": "3"},
+                            {"source": "advisor", "kind": "cache_read_input_tokens", "quantity": "7"},
+                            {"source": "executor", "kind": "input_tokens", "quantity": "7"},
+                        ],
+                    }),
                 ),
                 SimpleNamespace(
                     seq=4,
@@ -813,6 +865,7 @@ class TestOpenAILumenVirtualModel:
         assert body["usage"]["prompt_tokens"] == 10
         assert body["usage"]["completion_tokens"] == 5
         assert body["usage"]["total_tokens"] == 15
+        assert body["usage"]["prompt_tokens_details"] == {"cached_tokens": 3}
 
     async def test_lumen_stream_success(self, client, _auth, monkeypatch):
         from lumen.config import get_settings
@@ -847,7 +900,13 @@ class TestOpenAILumenVirtualModel:
                 SimpleNamespace(
                     seq=2,
                     type="usage.updated",
-                    payload=SimpleNamespace(model_dump=lambda: {"prompt_tokens": 4, "completion_tokens": 2}),
+                    payload=SimpleNamespace(model_dump=lambda: {
+                        "prompt_tokens": 4, "completion_tokens": 2,
+                        "components": [
+                            {"source": "executor", "kind": "cache_read_input_tokens", "quantity": "2"},
+                            {"source": "advisor", "kind": "advisor_cache_read_tokens", "quantity": "20"},
+                        ],
+                    }),
                 ),
                 SimpleNamespace(
                     seq=3,
@@ -880,6 +939,12 @@ class TestOpenAILumenVirtualModel:
         text = resp.text
         assert "Stream text" in text
         assert "data: [DONE]" in text
+        usage_chunk = next(
+            json.loads(line[6:]) for line in text.splitlines()
+            if line.startswith("data: {") and '"usage"' in line
+        )
+        assert usage_chunk["usage"]["prompt_tokens_details"] == {"cached_tokens": 2}
+        assert usage_chunk["usage"]["total_tokens"] == 6
 
     async def test_lumen_timeout_cancels_run(self, client, _auth, monkeypatch):
         from lumen.config import get_settings
@@ -1057,6 +1122,12 @@ class TestOpenAILumenVirtualModel:
         assert resp.status_code == 400
         assert "Too many messages" in resp.json()["error"]["message"]
 
+    def test_lumen_preserves_explicit_large_token_budget(self):
+        _messages, _last, max_tokens, _temperature = openai_compat.validate_and_normalize_transcript(
+            [{"role": "user", "content": "hi"}], max_tokens=20000
+        )
+        assert max_tokens == 20000
+
     async def test_lumen_validates_max_tokens_and_temperature(self, client, _auth, monkeypatch):
         resp_neg_tokens = await client.post(
             "/v1/chat/completions",
@@ -1201,7 +1272,7 @@ class TestDiscoveryAndHostGate:
         assert body["version"] == "1.0.0"
         assert body["contract_version"] == "1.0.0"
         assert body["service"] == "Lumen AI API"
-        assert set(body["formats"]) == {"openai", "anthropic", "lumen_native"}
+        assert set(body["formats"]) == {"openai", "openai_responses", "anthropic", "lumen_native"}
         assert "/v1/chat/completions" in body["endpoints"]["openai"]["chat_completions"]
         assert "/v1/messages" in body["endpoints"]["anthropic"]["messages"]
         assert "/v1/conversations" in body["endpoints"]["native"]["conversations"]
@@ -1209,6 +1280,12 @@ class TestDiscoveryAndHostGate:
         assert body["profiles"]["openai_lumen"]["sdk_base_url"].endswith("/v1")
         assert not body["profiles"]["anthropic_stateless"]["sdk_base_url"].endswith("/v1")
         assert not body["profiles"]["lumen_native"]["sdk_base_url"].endswith("/v1")
+        assert body["profiles"]["openai_responses"]["responses"].endswith("/v1/responses")
+        assert body["clients"]["codex"]["responses"].endswith("/v1/responses")
+        assert not body["clients"]["claude_code"]["base_url"].endswith("/v1")
+        assert body["clients"]["claude_code"]["messages"].endswith("/v1/messages")
+        assert "device_authorization" not in body["clients"]["claude_code"]
+        assert body["endpoints"]["gateway"]["claude_code_login_compatible"] == "false"
         assert "openapi" in body["links"]
         assert "health" in body["links"]
         assert "host_gate" in body
@@ -1248,26 +1325,45 @@ class TestDiscoveryAndHostGate:
         assert (await client.get("/v1/compat")).status_code == 200
 
 
+class TestAnthropicTransport:
+    async def test_raw_sse_bytes_are_incrementally_decoded_into_native_events(self):
+        async def chunks():
+            yield b'event: message_start\r\ndata: {"type":"message_start"}\r'
+            yield (
+                b"\n\r\nevent: content_block_delta\ndata: "
+                b'{"type":"content_block_delta","delta":{"type":"text_delta","text":"h\xc3'
+            )
+            yield b'\xa9"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}'
+
+        events = [event async for event in litellm_client._anthropic_stream_events(chunks())]
+
+        assert [event["type"] for event in events] == [
+            "message_start",
+            "content_block_delta",
+            "message_stop",
+        ]
+        assert events[1]["delta"]["text"] == "hé"
+
+
 class TestAnthropicEndpoint:
     async def test_requires_api_key(self, client):
-        resp = await client.post(
-            "/v1/messages", json={"model": "claude", "messages": [{"role": "user", "content": "hi"}]}
+        response = await client.post(
+            "/v1/messages",
+            json={"model": "claude", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
         )
-        assert resp.status_code == 401
+        assert response.status_code == 401
 
-    async def test_nonstream(self, client, _auth, _core):
-        resp = await client.post(
+    async def test_nonstream_preserves_native_response(self, client, _auth, _core):
+        response = await client.post(
             "/v1/messages",
             json={"model": "claude", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]},
             headers=_H,
         )
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["type"] == "message" and body["role"] == "assistant"
-        assert body["content"][0] == {"type": "text", "text": "hello"}
+        assert response.status_code == 200
+        assert response.json()["content"] == [{"type": "text", "text": "hello"}]
 
-    async def test_stream(self, client, _auth, _core):
-        resp = await client.post(
+    async def test_stream_forwards_native_lifecycle(self, client, _auth, _core):
+        response = await client.post(
             "/v1/messages",
             json={
                 "model": "claude",
@@ -1277,221 +1373,271 @@ class TestAnthropicEndpoint:
             },
             headers=_H,
         )
-        assert resp.status_code == 200
-        text = resp.text
-        assert "event: message_start" in text
-        assert "content_block_delta" in text
-        assert "event: message_stop" in text
+        assert response.status_code == 200
+        assert "event: message_start" in response.text
+        assert "event: content_block_delta" in response.text
+        assert "event: message_stop" in response.text
 
-    async def test_provider_selects_route_and_canonicalizes_anthropic_models(self, client, _auth, _core, monkeypatch):
+    async def test_provider_header_selects_route_and_conflict_is_400(self, client, _auth, _core, monkeypatch):
         calls = []
-        canonical = "anthropic/claude-sonnet-4-6"
 
         async def resolve(model, *, provider=None):
             calls.append((model, provider))
-            return {
-                "model_name": f"perplexity/{model}",
-                "api_model_name": model,
-                "api_provider": provider,
-                "provider_name": "Perplexity Agent",
-            }
+            return {"model_name": model, "api_model_name": model, "api_provider": provider, "provider_name": provider}
 
         monkeypatch.setattr(core, "resolve_api", resolve)
-
-        nonstream = await client.post(
+        selected = await client.post(
+            "/v1/messages",
+            json={"model": "claude", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
+            headers={**_H, "X-Lumen-Provider": "anthropic"},
+        )
+        conflict = await client.post(
             "/v1/messages",
             json={
-                "model": canonical,
-                "provider": "perplexity",
-                "max_tokens": 128,
+                "model": "claude",
+                "provider": "openai",
+                "max_tokens": 10,
                 "messages": [{"role": "user", "content": "hi"}],
             },
-            headers=_H,
+            headers={**_H, "X-Lumen-Provider": "anthropic"},
         )
-        stream = await client.post(
-            "/v1/messages",
-            json={
-                "model": canonical,
-                "provider": "perplexity",
-                "max_tokens": 128,
-                "stream": True,
-                "messages": [{"role": "user", "content": "hi"}],
-            },
-            headers=_H,
-        )
+        assert selected.status_code == 200
+        assert calls == [("claude", "anthropic")]
+        assert conflict.status_code == 400
+        assert conflict.json()["type"] == "error"
 
-        assert nonstream.status_code == 200
-        assert nonstream.json()["model"] == canonical
-        assert stream.status_code == 200
-        assert f'"model": "{canonical}"' in stream.text
-        assert calls == [(canonical, "perplexity"), (canonical, "perplexity")]
-
-    async def test_anthropic_provider_stream_error_has_no_success_terminal(self, client, _auth, _core, monkeypatch):
-        async def failed_stream(**_kwargs):
-            yield {"type": "error", "message": "safe upstream failure"}
-
-        monkeypatch.setattr(core, "complete_stream", failed_stream)
-
+    async def test_model_prefix_conflict_is_400(self, client, _auth):
         response = await client.post(
             "/v1/messages",
             json={
-                "model": "anthropic/claude-sonnet-4-6",
-                "stream": True,
+                "model": "openai/gpt-4o",
+                "max_tokens": 10,
                 "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers={**_H, "X-Lumen-Provider": "anthropic"},
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["message"] == "provider_header_conflict"
+
+    async def test_native_request_options_are_not_lossily_converted(self, client, _auth, monkeypatch):
+        captured = {}
+
+        async def resolve(model, *, provider=None):
+            return {
+                "model_name": model,
+                "api_model_name": model,
+                "api_provider": "anthropic",
+                "provider_name": "anthropic",
+            }
+
+        async def complete(**kwargs):
+            captured.update(kwargs)
+            return {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "thinking", "thinking": "x", "signature": "sig"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        monkeypatch.setattr(core, "resolve_api", resolve)
+        monkeypatch.setattr(core, "precheck", lambda *_args, **_kwargs: None)
+
+        async def precheck(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(core, "precheck", precheck)
+        monkeypatch.setattr(core, "complete_anthropic", complete)
+        system = [{"type": "text", "text": "cache", "cache_control": {"type": "ephemeral"}}]
+        tool_choice = {"type": "tool", "name": "lookup"}
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "claude",
+                "max_tokens": 128,
+                "system": system,
+                "thinking": {"type": "enabled", "budget_tokens": 32},
+                "tool_choice": tool_choice,
+                "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+                "output_config": {"effort": "high"},
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            },
+            headers={
+                **_H,
+                "anthropic-beta": "context-management-2025-06-27",
+                "anthropic-version": "2023-06-01",
+            },
+        )
+        assert response.status_code == 200
+        assert captured["options"]["system"] == system
+        assert captured["options"]["tool_choice"] == tool_choice
+        assert captured["options"]["thinking"] == {"type": "enabled", "budget_tokens": 32}
+        assert captured["options"]["context_management"]["edits"][0]["keep"] == "all"
+        assert captured["options"]["output_config"] == {"effort": "high"}
+        assert captured["options"]["anthropic_headers"] == {
+            "anthropic-beta": "context-management-2025-06-27",
+            "anthropic-version": "2023-06-01",
+        }
+        assert "authorization" not in captured["options"]["anthropic_headers"]
+        assert response.json()["content"][0]["signature"] == "sig"
+
+    async def test_quota_error_is_top_level_and_provider_not_called(self, client, _auth, monkeypatch):
+        async def resolve(model, *, provider=None):
+            return {"model_name": model, "api_model_name": model, "provider_name": provider}
+
+        async def precheck(*_args, **_kwargs):
+            raise core.CompletionError(429, "quota exceeded")
+
+        async def forbidden(**_kwargs):
+            raise AssertionError("provider must not be called")
+
+        monkeypatch.setattr(core, "resolve_api", resolve)
+        monkeypatch.setattr(core, "precheck", precheck)
+        monkeypatch.setattr(core, "complete_anthropic", forbidden)
+        response = await client.post(
+            "/v1/messages",
+            json={"model": "claude", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert response.status_code == 429
+        assert response.json() == {
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": "quota exceeded"},
+        }
+
+    async def test_count_tokens_preserves_anthropic_protocol_headers(self, client, _auth, monkeypatch):
+        async def resolve(model, *, provider=None):
+            return {"model_name": model, "provider_name": provider or "anthropic"}
+
+        async def count(*, resolved, payload, anthropic_headers):
+            assert resolved["model_name"] == "claude"
+            assert payload["messages"][0]["content"] == "hi"
+            assert anthropic_headers == {
+                "anthropic-beta": "context-management-2025-06-27",
+                "anthropic-version": "2023-06-01",
+            }
+            return {"input_tokens": 7}
+
+        monkeypatch.setattr(core, "resolve_api", resolve)
+        monkeypatch.setattr(core, "count_anthropic_tokens", count)
+        response = await client.post(
+            "/v1/messages/count_tokens",
+            json={"model": "claude", "messages": [{"role": "user", "content": "hi"}]},
+            headers={
+                **_H,
+                "anthropic-beta": "context-management-2025-06-27",
+                "anthropic-version": "2023-06-01",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == {"input_tokens": 7}
+
+
+    async def test_max_tokens_is_required_and_positive(self, client, _auth):
+        missing = await client.post(
+            "/v1/messages",
+            json={"model": "claude", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        negative = await client.post(
+            "/v1/messages",
+            json={"model": "claude", "max_tokens": 0, "messages": [{"role": "user", "content": "hi"}]},
+            headers=_H,
+        )
+        assert missing.status_code == 422
+        assert negative.status_code == 422
+
+
+class TestResponsesEndpoint:
+    async def test_nonstream_and_stream_preserve_native_shapes(self, client, _auth, _core):
+        nonstream = await client.post(
+            "/v1/responses",
+            json={"model": "gpt", "input": "hello"},
+            headers=_H,
+        )
+        stream = await client.post(
+            "/v1/responses",
+            json={"model": "gpt", "input": "hello", "stream": True},
+            headers=_H,
+        )
+        assert nonstream.status_code == 200
+        assert nonstream.json()["output"][0]["content"][0]["type"] == "output_text"
+        assert "event: response.created" in stream.text
+        assert "response.output_text.delta" in stream.text
+        assert "event: response.completed" in stream.text
+
+    async def test_codex_extensions_forward_cache_key_and_strip_client_metadata(
+        self, client, _auth, _core, monkeypatch
+    ):
+        captured = {}
+
+        async def complete(**kwargs):
+            captured.update(kwargs)
+            return {"id": "resp_codex", "object": "response", "status": "completed", "output": []}
+
+        monkeypatch.setattr(core, "complete_responses", complete)
+        response = await client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt",
+                "input": [{"role": "user", "content": "hello"}],
+                "prompt_cache_key": "session:codex",
+                "client_metadata": {"thread_id": "thread-local", "turn_id": "turn-local"},
             },
             headers=_H,
         )
 
         assert response.status_code == 200
-        assert "safe upstream failure" in response.text
-        assert "event: message_stop" not in response.text
+        assert captured["options"]["prompt_cache_key"] == "session:codex"
+        assert "client_metadata" not in captured["options"]
 
-    async def test_forwards_api_key_id_to_precheck(self, client, _auth, monkeypatch):
-        calls = []
-
-        async def fake_precheck(user_id, project_id, api_key_id=None):
-            calls.append((user_id, project_id, api_key_id))
-
-        async def fake_resolve(model, *, provider=None):
-            return {
-                "model_name": model,
-                "api_model_name": model,
-                "api_provider": provider or "openai",
-                "provider_name": "openai",
-            }
-
-        async def fake_once(**kw):
-            return {
-                "model": "claude",
-                "content": "ok",
-                "prompt_tokens": 1,
-                "completion_tokens": 1,
-                "credited_cost": 0,
-                "tool_calls": None,
-                "finish_reason": "stop",
-            }
-
-        monkeypatch.setattr(core, "resolve_api", fake_resolve)
-        monkeypatch.setattr(core, "precheck", fake_precheck)
-        monkeypatch.setattr(core, "complete_once", fake_once)
-
-        resp = await client.post(
-            "/v1/messages",
-            json={"model": "claude", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
-            headers=_H,
-        )
-        assert resp.status_code == 200
-        assert len(calls) == 1
-        assert calls[0] == ("u1", "p1", 7)
-
-    async def test_key_quota_exceeded_returns_429_before_provider(self, client, _auth, monkeypatch):
-        async def quota_precheck(user_id, project_id, api_key_id=None):
-            raise core.CompletionError(429, "API 키 월 사용 한도를 초과했습니다")
-
-        async def forbidden_provider(**kw):
-            raise AssertionError("provider complete_once/complete_stream must not be called")
-
-        async def fake_resolve(model, *, provider=None):
-            return {
-                "model_name": model,
-                "api_model_name": model,
-                "api_provider": provider or "openai",
-                "provider_name": "openai",
-            }
-
-        monkeypatch.setattr(core, "resolve_api", fake_resolve)
-        monkeypatch.setattr(core, "precheck", quota_precheck)
-        monkeypatch.setattr(core, "complete_once", forbidden_provider)
-        monkeypatch.setattr(core, "complete_stream", forbidden_provider)
-
-        resp = await client.post(
-            "/v1/messages",
-            json={"model": "claude", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
-            headers=_H,
-        )
-        assert resp.status_code == 429
-        assert "API 키 월 사용 한도를 초과했습니다" in resp.json()["detail"]["error"]["message"]
-
-        resp_stream = await client.post(
-            "/v1/messages",
-            json={"model": "claude", "stream": True, "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
-            headers=_H,
-        )
-        assert resp_stream.status_code == 429
-        assert "API 키 월 사용 한도를 초과했습니다" in resp_stream.json()["detail"]["error"]["message"]
-
-    async def test_anthropic_tool_choice_conversion(self, client, _auth, monkeypatch):
-        received_kw = {}
-
-        async def fake_resolve(model, *, provider=None):
-            return {
-                "model_name": model,
-                "api_model_name": model,
-                "api_provider": provider or "anthropic",
-                "provider_name": "anthropic",
-            }
-
-        async def fake_once(**kw):
-            nonlocal received_kw
-            received_kw = kw
-            return {
-                "model": "claude-3-5-sonnet",
-                "content": "ok",
-                "prompt_tokens": 1,
-                "completion_tokens": 1,
-                "credited_cost": 0,
-                "tool_calls": None,
-                "finish_reason": "stop",
-            }
-
-        async def fake_precheck(*_args, **_kwargs):
-            return None
-
-        monkeypatch.setattr(core, "resolve_api", fake_resolve)
-        monkeypatch.setattr(core, "precheck", fake_precheck)
-        monkeypatch.setattr(core, "complete_once", fake_once)
-
-        # Test tool choice conversion cases
-        cases = [
-            ({"type": "auto"}, "auto"),
-            ({"type": "any"}, "required"),
-            ({"type": "none"}, "none"),
-            ({"type": "tool", "name": "get_weather"}, {"type": "function", "function": {"name": "get_weather"}}),
-        ]
-        for input_tc, expected_tc in cases:
-            resp = await client.post(
-                "/v1/messages",
-                json={"model": "claude", "messages": [{"role": "user", "content": "hi"}], "tool_choice": input_tc},
+    async def test_stateful_and_background_modes_are_rejected(self, client, _auth):
+        for extra in ({"store": True}, {"previous_response_id": "resp_old"}, {"background": True}):
+            response = await client.post(
+                "/v1/responses",
+                json={"model": "gpt", "input": "hello", **extra},
                 headers=_H,
             )
-            assert resp.status_code == 200
-            assert received_kw["tool_choice"] == expected_tc
 
-    async def test_malformed_anthropic_tool_choice_returns_422(self, client, _auth, monkeypatch):
-        async def fake_resolve(model, *, provider=None):
-            return {
-                "model_name": model,
-                "api_model_name": model,
-                "api_provider": provider or "anthropic",
-                "provider_name": "anthropic",
-            }
+            assert response.status_code == 400
+            assert response.json()["error"]["type"] == "invalid_request_error"
 
-        async def fake_precheck(*_args, **_kwargs):
-            return None
+    async def test_provider_header_conflict_and_positive_budget(self, client, _auth):
+        conflict = await client.post(
+            "/v1/responses",
+            json={"model": "gpt", "provider": "openai", "input": "hello"},
+            headers={**_H, "X-Lumen-Provider": "anthropic"},
+        )
+        invalid_budget = await client.post(
+            "/v1/responses",
+            json={"model": "gpt", "input": "hello", "max_output_tokens": 0},
+            headers=_H,
+        )
+        assert conflict.status_code == 400
+        assert invalid_budget.status_code == 422
 
-        monkeypatch.setattr(core, "resolve_api", fake_resolve)
-        monkeypatch.setattr(core, "precheck", fake_precheck)
 
-        bad_choices = [
-            {"type": "tool"},  # missing name
-            {"type": "invalid_type"},
-            123,
-        ]
-        for bad_tc in bad_choices:
-            resp = await client.post(
-                "/v1/messages",
-                json={"model": "claude", "messages": [{"role": "user", "content": "hi"}], "tool_choice": bad_tc},
-                headers=_H,
-            )
-            assert resp.status_code == 422
-            assert resp.json()["detail"]["type"] == "error"
+async def test_native_ping_does_not_cancel_pending_upstream_read():
+    import asyncio
+
+    from lumen.api.compat.streaming import events_with_ping
+
+    cancelled = False
+
+    async def upstream():
+        nonlocal cancelled
+        try:
+            await asyncio.sleep(0.02)
+            yield {"type": "response.completed"}
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    events = events_with_ping(upstream(), ping_seconds=0.001)
+    assert await anext(events) is None
+    while (event := await anext(events)) is None:
+        pass
+    assert event == {"type": "response.completed"}
+    assert cancelled is False

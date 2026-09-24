@@ -7,6 +7,7 @@ from typing import Any
 
 from lumen.services import litellm_client
 from lumen.services.providers import routing as ps
+from lumen.services.usage_breakdown import UsageBreakdown
 
 _MAX_VISIBLE_MESSAGES = 12
 _MAX_VISIBLE_CHARS = 12_000
@@ -23,6 +24,8 @@ class AdvisorResult:
     route: dict[str, Any]
     prompt_tokens: int
     completion_tokens: int
+    # ``prompt_tokens`` is total input; the breakdown carries its cache split.
+    breakdown: UsageBreakdown | None = None
 
 
 def _bounded_visible_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -83,7 +86,7 @@ async def ask_with_route(
     advice = _response_text(response)
     if advice is None:
         raise AdvisorError("selected advisor returned no text")
-    prompt_tokens, completion_tokens = litellm_client.extract_usage(
+    breakdown = litellm_client.extract_usage_breakdown(
         route["model_name"],
         messages,
         advice,
@@ -92,8 +95,9 @@ async def ask_with_route(
     return AdvisorResult(
         advice=advice,
         route=route,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
+        prompt_tokens=breakdown.input_tokens,
+        completion_tokens=breakdown.output_tokens,
+        breakdown=breakdown,
     )
 
 

@@ -8,7 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +19,9 @@ from pydantic import BaseModel
 from lumen.cache import close_cache
 from lumen.config import get_settings
 from lumen.db import close_db, init_db
+from lumen.plugins.host import build_host
+from lumen.plugins.registry import get_registry
+from lumen.services.infrastructure.api_load import ApiLoadMeter, ApiLoadMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,10 @@ class HealthResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    registry = get_registry()
+    # Approved distributions/versions are checked before any entry point is imported;
+    # an incompatible or missing required plugin stops the process instead of falling back.
+    registry.load()
     if settings.database_url:
         init_db(
             settings.database_url,
@@ -60,6 +67,7 @@ async def lifespan(app: FastAPI):
             pool_timeout=settings.database_pool_timeout,
             unhealthy_seconds=settings.database_unhealthy_seconds,
         )
+    await registry.start(build_host())
 
     if settings.chat_checkpointer_postgres_url:
         from lumen.services.checkpointer import chat_checkpointer
@@ -81,6 +89,10 @@ async def lifespan(app: FastAPI):
         await chat_checkpointer.close()
     except Exception:
         pass
+    try:
+        await registry.close()
+    except Exception:
+        logger.exception("plugin shutdown failed")
     await close_cache()
     await close_db()
 
@@ -91,6 +103,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+api_load_meter = ApiLoadMeter()
+app.add_middleware(ApiLoadMiddleware, meter=api_load_meter)
 
 settings = get_settings()
 origins = settings.cors_origin_list
@@ -156,6 +170,33 @@ async def health():
     return {"status": "ok"}
 
 
+class ReadyResponse(BaseModel):
+    status: str
+    database: bool
+    plugins: bool
+    checkpointer: bool | None = None
+
+
+@app.get("/v1/ready", tags=["Health"], response_model=ReadyResponse)
+async def ready(request: Request, include_load: bool = False):
+    """Dependency readiness; guest-only load details require a loopback connection."""
+    if include_load and (request.client is None or request.client.host not in {"127.0.0.1", "::1"}):
+        raise HTTPException(status_code=403, detail="local readiness metrics only")
+    from lumen.db import check_db
+    from lumen.services.checkpointer import chat_checkpointer
+
+    database = await check_db()
+    plugins = get_registry().ready
+    checkpointer = chat_checkpointer.available if get_settings().chat_checkpointer_postgres_url else None
+    ok = database and plugins and checkpointer is not False
+    body = ReadyResponse(status="ok" if ok else "unavailable", database=database, plugins=plugins, checkpointer=checkpointer)
+    content = body.model_dump(mode="json")
+    if include_load:
+        content.update(api_load_meter.snapshot())
+    return JSONResponse(status_code=200 if ok else 503, content=content)
+
+
+from lumen.api import agent_runtime as agent_runtime_routes
 from lumen.api import (
     chat_admin_router,
     chat_agents_router,
@@ -172,14 +213,21 @@ from lumen.api import (
     chat_stats_router,
     chat_usage_router,
     chat_workspaces_router,
+    claude_gateway,
 )
+from lumen.api import plugins as plugin_routes
 from lumen.api.compat import anthropic as compat_anthropic
 from lumen.api.compat import discovery as compat_discovery
 from lumen.api.compat import openai as compat_openai
+from lumen.api.compat import responses as compat_responses
 from lumen.auth import require_chat_api_host
 
 # Chat routers already declare their complete route paths. Mount once at `/v1`
 # so the SDK and Afterglow BFF preserve the public contract exactly.
+app.include_router(plugin_routes.admin_router, prefix="/v1", tags=["Plugin Administration"])
+app.include_router(plugin_routes.router, prefix="/v1", tags=["Plugin Catalogue"])
+app.include_router(agent_runtime_routes.admin_router, prefix="/v1", tags=["Agent Runtime Administration"])
+app.include_router(agent_runtime_routes.router, prefix="/v1", tags=["Agent Runtime"])
 for router, tag in (
     (chat_conversations_router, "Chat Conversations"),
     (chat_completions_router, "Chat Completions"),
@@ -205,8 +253,24 @@ for router, tag in (
     (compat_discovery.router, "AI Compat Discovery"),
     (compat_openai.router, "OpenAI Compat"),
     (compat_anthropic.router, "Anthropic Compat"),
+    (compat_responses.router, "OpenAI Responses Compat"),
 ):
     app.include_router(router, prefix="/v1", tags=[tag], dependencies=[Depends(require_chat_api_host)])
+
+# Claude Code's public machine protocol is host-gated with the other direct
+# compatibility APIs. The Keystone-only browser authorization handoff is
+# intentionally mounted without that public-host dependency for the internal BFF.
+app.include_router(
+    claude_gateway.public_router,
+    prefix="/v1/claude-gateway",
+    tags=["Claude Gateway"],
+    dependencies=[Depends(require_chat_api_host)],
+)
+app.include_router(
+    claude_gateway.internal_router,
+    prefix="/v1/claude-gateway",
+    tags=["Claude Gateway Authorization"],
+)
 
 
 def custom_openapi() -> dict:
@@ -220,8 +284,10 @@ def custom_openapi() -> dict:
     schema["x-profiles"] = {
         "openai_lumen": "OpenAI-compatible Lumen durable completion (/v1/chat/completions, model='lumen')",
         "openai_stateless": "OpenAI-compatible stateless provider completion (/v1/chat/completions, provider model IDs)",
+        "openai_responses": "OpenAI Responses-compatible stateless completion (/v1/responses)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
         "lumen_native": "Lumen native durable runs (/v1/conversations/{conversation_id}/completions, /v1/temp-completions, /v1/runs/...)",
+        "claude_gateway": "Claude Code device-authenticated Anthropic gateway (/v1/claude-gateway)",
     }
 
     security_schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
@@ -243,13 +309,29 @@ def custom_openapi() -> dict:
         "description": "API key header (x-api-key: <key>)",
     }
     api_key_security = [{"APIKeyBearer": []}, {"XApiKey": []}]
-    for path, method in (("/v1/chat/completions", "post"), ("/v1/messages", "post"), ("/v1/models", "get")):
+    for path, method in (
+        ("/v1/chat/completions", "post"),
+        ("/v1/responses", "post"),
+        ("/v1/messages", "post"),
+        ("/v1/messages/count_tokens", "post"),
+        ("/v1/models", "get"),
+        ("/v1/claude-gateway/v1/messages", "post"),
+        ("/v1/claude-gateway/v1/messages/count_tokens", "post"),
+        ("/v1/claude-gateway/v1/models", "get"),
+        ("/v1/claude-gateway/v1/managed-settings", "get"),
+    ):
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             schema["paths"][path][method]["security"] = api_key_security
 
     route_scopes: dict[tuple[str, str], list[str]] = {
         ("/v1/chat/completions", "post"): ["compat:completions:write"],
+        ("/v1/responses", "post"): ["compat:completions:write"],
         ("/v1/messages", "post"): ["compat:completions:write"],
+        ("/v1/messages/count_tokens", "post"): ["compat:completions:write"],
+        ("/v1/claude-gateway/v1/messages", "post"): ["compat:completions:write"],
+        ("/v1/claude-gateway/v1/messages/count_tokens", "post"): ["compat:completions:write"],
+        ("/v1/claude-gateway/v1/models", "get"): ["models:read"],
+        ("/v1/claude-gateway/v1/managed-settings", "get"): ["models:read"],
         ("/v1/models", "get"): ["models:read"],
         ("/v1/chat/models", "get"): ["models:read"],
         ("/v1/capabilities", "get"): ["models:read"],
@@ -309,7 +391,9 @@ def custom_openapi() -> dict:
                 op["x-conditional-api-key-scopes"] = conditional_scopes
     sse_routes = [
         ("/v1/chat/completions", "post", "OpenAI SSE stream (data: JSON \\n\\n data: [DONE])"),
+        ("/v1/responses", "post", "OpenAI Responses semantic SSE events"),
         ("/v1/messages", "post", "Anthropic SSE stream (event: <type> \\n data: JSON)"),
+        ("/v1/claude-gateway/v1/messages", "post", "Anthropic SSE stream (event: <type> \\n data: JSON)"),
         ("/v1/runs/{run_id}/events", "get", "Native ChatRunEvent journal stream"),
     ]
     for path, method, stream_desc in sse_routes:

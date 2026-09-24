@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from lumen.services.agent_protocol import AgentExecutionPolicy
+from lumen_plugin_api.tools import AgentExecutionPolicy
+
 from lumen.services.subagents import merge_policy
 
 _SERVER_POLICY = AgentExecutionPolicy(

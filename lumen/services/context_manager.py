@@ -12,8 +12,15 @@ from lumen.models.chat_contracts import ContextState
 from lumen.services import context_inspector
 from lumen.services.litellm_client import ContextTokenCount, count_context_tokens
 
+# Public so provider-native compaction resolves its own trigger from the same
+# occupancy threshold instead of restating it.  The denominators are not
+# interchangeable: this fence divides by ``input_budget`` while a native trigger
+# is an absolute count against the raw window, which is exactly what keeps this
+# fence the first of the two to fire.
+COMPACTION_REQUIRED = 0.80
+
 _COMPACTION_RECOMMENDATION = 0.70
-_COMPACTION_REQUIRED = 0.80
+_COMPACTION_REQUIRED = COMPACTION_REQUIRED
 _COMPACTION_TARGET = 0.60
 _SAFETY_RESERVE = 2_048
 _MAX_CHUNKS = 16

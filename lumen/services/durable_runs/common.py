@@ -13,6 +13,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from lumen_plugin_api.tools import AgentExecutionPolicy
+
 from lumen.crypto import decrypt_chat_content
 from lumen.db import get_session_factory, is_db_available
 from lumen.models.chat_contracts import (
@@ -25,7 +27,6 @@ from lumen.models.chat_runs import (
     ChatRun,
 )
 from lumen.services.agent_policy import default_execution_policy, resolve_direct_effects
-from lumen.services.agent_protocol import AgentExecutionPolicy
 from lumen.services.checkpointer import chat_checkpointer
 from lumen.services.execution_protocol import SUPPORTED_EXECUTION_PROTOCOL_VERSIONS, is_supported
 from lumen.services.message_timestamps import message_timestamps

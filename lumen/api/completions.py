@@ -22,6 +22,7 @@ from sqlalchemy import select
 from lumen.auth import Principal, require_scopes
 from lumen.config import get_settings
 from lumen.models.chat_contracts import (
+    AgentBudget,
     ChatFeatureOptions,
     ChatRunDescriptor,
     ChatRunResponse,
@@ -151,6 +152,9 @@ async def create_completion(
             "code_workspace_id": payload.code_workspace_id,
             "reasoning_effort": payload.reasoning_effort,
             "skill_ids": payload.skill_ids,
+            "agent_budget": payload.agent_budget.model_dump(mode="json") if payload.agent_budget else None,
+            "plugin_tool_ids": payload.plugin_tool_ids,
+            "plugin_skill_ids": payload.plugin_skill_ids,
             "client_timezone": payload.client_timezone,
         }
         intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
@@ -185,7 +189,10 @@ async def create_completion(
         features=payload.features,
         agent_id=int(payload.agent_id) if payload.agent_id else None,
         skill_ids=payload.skill_ids,
+        plugin_tool_ids=payload.plugin_tool_ids,
+        plugin_skill_ids=payload.plugin_skill_ids,
         execution_mode=payload.execution_mode,
+        agent_budget=payload.agent_budget,
         reasoning_effort=payload.reasoning_effort,
         code_workspace_id=payload.code_workspace_id,
         client_timezone=payload.client_timezone,
@@ -236,6 +243,9 @@ async def create_completion(
                 "reasoning_effort": planned["reasoning_effort"],
                 "client_timezone": payload.client_timezone,
                 "skill_ids": payload.skill_ids,
+                "plugin_tool_ids": payload.plugin_tool_ids,
+                "plugin_skill_ids": payload.plugin_skill_ids,
+                "plugin_tool_snapshots": planned["plugin_tool_snapshots"],
                 "extension_snapshot": planned["extension_selection"],
                 "context_source": planned["source"],
                 "tool_schemas": planned["tool_schemas"],
@@ -255,6 +265,8 @@ async def create_completion(
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
             expected_parent_id=expected_active_leaf_id,
+            agent_budget=planned["agent_budget"],
+            execution_mode=payload.execution_mode,
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
@@ -472,6 +484,21 @@ async def retry_failed_run(
     features_dict = _features_payload(features_obj)
     reasoning_effort = payload_dict.get("reasoning_effort", "auto")
     skill_ids = payload_dict.get("skill_ids", [])
+    plugin_tool_ids = payload_dict.get("plugin_tool_ids", [])
+    plugin_skill_ids = payload_dict.get("plugin_skill_ids", [])
+    if not isinstance(plugin_tool_ids, list) or not isinstance(plugin_skill_ids, list):
+        raise HTTPException(status_code=422, detail="저장된 플러그인 선택이 유효하지 않습니다")
+    source_budget = (
+        AgentBudget(
+            credit_ceiling=format(source_run.credit_ceiling, "f"),
+            sandbox_seconds_ceiling=int(source_run.sandbox_seconds_ceiling),
+            wall_time_seconds=int(source_run.wall_time_seconds),
+        )
+        if source_run.credit_ceiling is not None
+        and source_run.sandbox_seconds_ceiling is not None
+        and source_run.wall_time_seconds is not None
+        else None
+    )
     raw_parts = payload_dict.get("input_parts")
     path_messages = await cs.path_ending_at(
         conversation_id, user_id=user_id, project_id=project_id, message_id=message_id
@@ -502,6 +529,8 @@ async def retry_failed_run(
         features=features_obj,
         agent_id=agent_id,
         skill_ids=skill_ids if isinstance(skill_ids, list) else [],
+        plugin_tool_ids=plugin_tool_ids,
+        plugin_skill_ids=plugin_skill_ids,
         execution_mode=source_run.execution_mode,
         reasoning_effort=reasoning_effort,
         code_workspace_id=None,
@@ -509,6 +538,7 @@ async def retry_failed_run(
         token_info=token_info,
         is_preview=False,
         append_draft=False,
+        agent_budget=source_budget,
     )
 
     agent = planned["agent"]
@@ -545,6 +575,9 @@ async def retry_failed_run(
                 "temperature": planned["temperature"],
                 "reasoning_effort": planned["reasoning_effort"],
                 "skill_ids": skill_ids,
+                "plugin_tool_ids": plugin_tool_ids,
+                "plugin_skill_ids": plugin_skill_ids,
+                "plugin_tool_snapshots": planned["plugin_tool_snapshots"],
                 "extension_snapshot": planned["extension_selection"],
                 "context_source": planned["source"],
                 "tool_schemas": planned["tool_schemas"],
@@ -564,6 +597,8 @@ async def retry_failed_run(
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
             expected_parent_id=expected_active_leaf_id,
+            agent_budget=planned["agent_budget"],
+            execution_mode=source_run.execution_mode,
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
@@ -590,6 +625,8 @@ async def temp_completion(
         "features": features,
         "reasoning_effort": payload.reasoning_effort,
         "skill_ids": payload.skill_ids,
+        "plugin_tool_ids": payload.plugin_tool_ids,
+        "plugin_skill_ids": payload.plugin_skill_ids,
         "execution_mode": payload.execution_mode,
         "code_workspace_id": payload.code_workspace_id,
     }
@@ -622,6 +659,8 @@ async def temp_completion(
         features=payload.features,
         agent_id=None,
         skill_ids=payload.skill_ids,
+        plugin_tool_ids=payload.plugin_tool_ids,
+        plugin_skill_ids=payload.plugin_skill_ids,
         execution_mode=payload.execution_mode,
         reasoning_effort=payload.reasoning_effort,
         code_workspace_id=payload.code_workspace_id,
@@ -652,6 +691,9 @@ async def temp_completion(
                 "reasoning_effort": planned["reasoning_effort"],
                 "skill_snapshot": planned["skill_snapshot"],
                 "skill_ids": payload.skill_ids,
+                "plugin_tool_ids": payload.plugin_tool_ids,
+                "plugin_skill_ids": payload.plugin_skill_ids,
+                "plugin_tool_snapshots": planned["plugin_tool_snapshots"],
                 "extension_snapshot": planned["extension_selection"],
                 "context_source": planned["source"],
                 "tool_schemas": planned["tool_schemas"],
@@ -710,6 +752,8 @@ async def preview_conversation_context(
         features=payload.features,
         agent_id=int(payload.agent_id) if payload.agent_id else None,
         skill_ids=payload.skill_ids,
+        plugin_tool_ids=payload.plugin_tool_ids,
+        plugin_skill_ids=payload.plugin_skill_ids,
         execution_mode=payload.execution_mode,
         reasoning_effort=payload.reasoning_effort,
         code_workspace_id=payload.code_workspace_id,
@@ -763,6 +807,8 @@ async def preview_temp_context(
         features=payload.features,
         agent_id=None,
         skill_ids=payload.skill_ids,
+        plugin_tool_ids=payload.plugin_tool_ids,
+        plugin_skill_ids=payload.plugin_skill_ids,
         execution_mode=payload.execution_mode,
         reasoning_effort=payload.reasoning_effort,
         code_workspace_id=None,
@@ -854,6 +900,8 @@ async def compact_conversation(
         features=payload.features,
         agent_id=int(payload.agent_id) if payload.agent_id else None,
         skill_ids=payload.skill_ids,
+        plugin_tool_ids=payload.plugin_tool_ids,
+        plugin_skill_ids=payload.plugin_skill_ids,
         execution_mode=payload.execution_mode,
         reasoning_effort=payload.reasoning_effort,
         code_workspace_id=payload.code_workspace_id,
@@ -992,6 +1040,8 @@ async def compact_temp_thread(
         features=payload.features,
         agent_id=None,
         skill_ids=payload.skill_ids,
+        plugin_tool_ids=payload.plugin_tool_ids,
+        plugin_skill_ids=payload.plugin_skill_ids,
         execution_mode=payload.execution_mode,
         reasoning_effort=payload.reasoning_effort,
         code_workspace_id=None,

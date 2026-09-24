@@ -22,10 +22,21 @@ redis_url = "{{ lumen_redis_url }}"
 lumen_encryption_key = "{{ lumen_encryption_key }}"
 mcp_control_plane_url = "{{ lumen_mcp_control_plane_url }}"
 public_api_base = "{{ lumen_public_api_base }}"
+frontend_base_url = "{{ lumen_frontend_base_url }}"
+worker_concurrency = {{ lumen_worker_concurrency }}
+worker_heartbeat_seconds = {{ lumen_worker_heartbeat_seconds }}
+worker_drain_seconds = {{ lumen_worker_drain_seconds }}
+{% if lumen_runtime_enabled | bool %}
+# Typed RuntimeConfig supplied by the operator; validated at API/worker/controller startup.
+runtime_config = {{ ((lumen_runtime_config | combine({'enabled': true, 'listen_host': lumen_controller_listen_address, 'listen_port': lumen_controller_listen_port})) | to_json) | to_json }}
+{% endif %}
 
 [chat]
 chat_default_model = "{{ lumen_chat_default_model }}"
 chat_compat_run_timeout_seconds = {{ lumen_chat_compat_run_timeout_seconds }}
+claude_gateway_base_url = "{{ lumen_claude_gateway_base_url }}"
+claude_gateway_model = "{{ lumen_claude_gateway_model }}"
+claude_gateway_provider = "{{ lumen_claude_gateway_provider }}"
 chat_checkpointer_postgres_url = "{{ lumen_checkpointer_postgres_url }}"
 chat_memory_pgvector_url = "{{ lumen_memory_pgvector_url }}"
 chat_asset_s3_endpoint = "{{ lumen_s3_endpoint_url }}"

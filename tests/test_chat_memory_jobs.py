@@ -411,16 +411,18 @@ async def test_title_completed_result_replays_without_provider(monkeypatch):
     assert applied == ["job-1"]
 
 
-async def test_title_late_result_after_manual_edit_records_usage_but_does_not_overwrite(monkeypatch):
+async def test_title_late_result_on_custom_route_does_not_bill_public_catalog(monkeypatch):
     payload = {
         "conversation_id": "conversation-1",
         "project_id": "project-1",
         "user_id": "user-1",
         "run_id": "run-1",
         "expected_title_revision": 1,
-        "summary_route": {"model_name": "title-model", "provider_name": "provider"},
-        "pricing_snapshot": {"input_price_per_token": "0", "output_price_per_token": "0", "margin_multiplier": "1"},
-        "result": {"title": "오래된 제목", "prompt_tokens": 3, "completion_tokens": 2, "model_name": "title-model"},
+        "summary_route": {"model_name": "gemini/gemini-2.5-flash-lite", "provider_name": "private-provider",
+                          "provider_type": "gemini", "api_base": "https://custom.example/v1"},
+        "pricing_snapshot": {"input_price_per_token": None, "output_price_per_token": None, "margin_multiplier": "1"},
+        "result": {"title": "오래된 제목", "prompt_tokens": 3, "completion_tokens": 2,
+                   "model_name": "gemini/gemini-2.5-flash-lite"},
     }
 
     class Session:
@@ -463,11 +465,13 @@ async def test_title_late_result_after_manual_edit_records_usage_but_does_not_ov
     session = Session()
     monkeypatch.setattr("lumen.db.get_session_factory", lambda: lambda: session)
     monkeypatch.setattr(title_jobs, "_json_load", lambda _ciphertext: payload)
-    monkeypatch.setattr(title_jobs.litellm_client, "cost_from_usage", lambda *_args, **_kwargs: object())
     usage = []
 
     async def fake_apply_usage(_session, **kwargs):
         usage.append(kwargs["event_id"])
+        usage_cost = kwargs["usage_cost"]
+        assert usage_cost.raw_cost == 0
+        assert usage_cost.pricing_status == "unpriced"
         return 0
 
     monkeypatch.setattr(title_jobs.credit, "apply_usage_in_transaction", fake_apply_usage)

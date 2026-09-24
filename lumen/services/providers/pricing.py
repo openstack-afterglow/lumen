@@ -11,7 +11,7 @@ from lumen.services.capabilities import (
     litellm_capabilities,
     normalize_capabilities,
 )
-from lumen.services.litellm_client import effective_prices_per_million, official_price_source
+from lumen.services.litellm_client import bundled_cache_rates, effective_prices_per_million, official_price_source
 
 from .billing import billing_capability_for
 from .credentials import api_key_source, api_model_name
@@ -56,6 +56,38 @@ def _validate_price_pair(input_price_per_million, output_price_per_million) -> t
 
 def _per_million_price(value: Decimal | None) -> Decimal | None:
     return value * _TOKENS_PER_MILLION if value is not None else None
+
+
+# (admin per-million field, LlmModel per-token column, resolved per-token key)
+CACHE_PRICE_FIELDS = (
+    ("cache_read_price_per_million", "cache_read_price", "cache_read_price_per_token"),
+    ("cache_write_price_per_million", "cache_write_price", "cache_write_price_per_token"),
+    ("cache_write_1h_price_per_million", "cache_write_1h_price", "cache_write_1h_price_per_token"),
+)
+
+
+def _resolved_cache_prices(model: LlmModel, provider: LlmProvider) -> dict[str, Decimal | None]:
+    """Manual rates override exact direct-provider catalog rates per category."""
+    catalog = bundled_cache_rates(model.model_name, provider.provider_type, provider.api_base)
+    prices: dict[str, Decimal | None] = {}
+    for _, column, resolved_key in CACHE_PRICE_FIELDS:
+        value = getattr(model, column, None)
+        rate = Decimal(value) if value is not None else catalog.get(resolved_key)
+        prices[resolved_key] = (
+            rate.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else None
+        )
+        tier_rate = catalog.get(f"{resolved_key}_above_200k") if value is None else None
+        prices[f"{resolved_key}_above_200k"] = (
+            tier_rate.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if tier_rate is not None else None
+        )
+    return prices
+
+
+def _validate_cache_prices(values: dict) -> dict[str, Decimal | None]:
+    """Convert present admin per-million cache prices to per-token column values."""
+    return {
+        column: _per_token_price(values[field], field) for field, column, _ in CACHE_PRICE_FIELDS if field in values
+    }
 
 
 def _json_decimal_strings(value):
@@ -179,6 +211,7 @@ def _model_public(
         "effective_input_price_per_million": effective_input_price_per_million,
         "effective_output_price_per_million": effective_output_price_per_million,
         "effective_price_source": effective_price_source,
+        **{field: _per_million_price(getattr(row, column, None)) for field, column, _ in CACHE_PRICE_FIELDS},
         "models_dev_model_id": row.models_dev_model_id,
         "price_source": row.price_source,
         "capabilities": row.capabilities,
