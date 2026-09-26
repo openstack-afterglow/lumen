@@ -427,6 +427,35 @@ def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode
     return normalized
 
 
+def reasoning_can_be_disabled(capabilities: dict[str, Any] | None, provider_type: str | None) -> bool:
+    """Whether an explicit ``reasoning_effort="none"`` is a valid request, not only a value LiteLLM forwards.
+
+    LiteLLM 1.93 passes ``none`` unchanged to OpenAI (gpt-5 and o3 reject it) and maps it to
+    ``thinkingBudget: 0`` for Gemini (below gemini-2.5-pro's minimum). Only models.dev metadata
+    that advertises disabling qualifies: an effort list with ``none``, a ``toggle``, or a
+    ``budget_tokens`` minimum of exactly 0. Anthropic thinking is opt-in and LiteLLM sends no
+    thinking block for ``none``, so its ``budget_tokens`` minimum is not a floor on disabling.
+    Chat admission and the user model catalog share this rule.
+    """
+    capabilities = capabilities or {}
+    if not capabilities.get("reasoning"):
+        return False
+    if provider_type == "anthropic":
+        return True
+    for option in capabilities.get("reasoning_options") or []:
+        if not isinstance(option, dict):
+            continue
+        kind = option.get("type")
+        if kind == "toggle":
+            return True
+        if kind == "effort" and "none" in {str(item).strip().lower() for item in option.get("values") or []}:
+            return True
+        minimum = option.get("min")
+        if kind == "budget_tokens" and minimum == 0 and not isinstance(minimum, bool):
+            return True
+    return False
+
+
 def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, Any]) -> dict[str, Any]:
     """Upgrade legacy models.dev/override shapes to canonical feature gates."""
     if not stored:

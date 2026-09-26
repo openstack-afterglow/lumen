@@ -36,6 +36,8 @@ class AvailableModel(BaseModel):
     # 키·가격은 미포함이지만 능력은 배지·게이팅용으로 노출.
     capabilities: dict | None = None
     context_limit: int | None = None
+    # Whether reasoning_effort="none" passes chat admission for this model (same rule).
+    reasoning_none_supported: bool = False
 
     model_config = {"protected_namespaces": ()}
 
@@ -63,6 +65,9 @@ async def list_available_models(token_info: dict = Depends(require_scopes("model
                 "provider_api_key_configured": bool(provider and provider.get("has_api_key")),
                 "capabilities": caps or None,
                 "context_limit": caps.get("context_limit") if isinstance(caps, dict) else None,
+                "reasoning_none_supported": capabilities.reasoning_can_be_disabled(
+                    caps if isinstance(caps, dict) else None, m["api_provider"]
+                ),
             }
         )
     return result

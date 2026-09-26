@@ -67,6 +67,10 @@ def _price(value: object, field: str) -> Decimal:
     return parsed
 
 
+# Generous ceiling for models.dev budget_tokens bounds (largest published max is far below this).
+_MAX_REASONING_BUDGET_BOUND = 100_000_000
+
+
 def _str_list(value: object) -> list[str]:
     return [str(x) for x in value] if isinstance(value, list) else []
 
@@ -87,12 +91,25 @@ def _model_capabilities(model_data: dict[str, object]) -> dict[str, object]:
     except (TypeError, ValueError):
         context_limit = None
     # reasoning_options: [{"type":"effort","values":["low","medium","high"]}] — values를 문자열로 고정.
+    # budget_tokens의 정수 min/max는 보존한다: min 0만 추론 끄기(none)가 유효하다는 근거다.
     raw_options = model_data.get("reasoning_options")
     reasoning_options: list[dict[str, object]] = []
     if isinstance(raw_options, list):
         for opt in raw_options:
             if isinstance(opt, dict):
-                reasoning_options.append({"type": str(opt.get("type") or ""), "values": _str_list(opt.get("values"))})
+                option: dict[str, object] = {"type": str(opt.get("type") or ""), "values": _str_list(opt.get("values"))}
+                for bound in ("min", "max"):
+                    # parse_catalog decodes JSON numbers as Decimal; bound the value before int()
+                    # so an exponent such as 1e5000 cannot build a huge integer.
+                    value = opt.get(bound)
+                    if (
+                        isinstance(value, (int, Decimal))
+                        and not isinstance(value, bool)
+                        and 0 <= value <= _MAX_REASONING_BUDGET_BOUND
+                        and value == int(value)
+                    ):
+                        option[bound] = int(value)
+                reasoning_options.append(option)
     return {
         "vision": "image" in inp,
         "reasoning": bool(model_data.get("reasoning")),

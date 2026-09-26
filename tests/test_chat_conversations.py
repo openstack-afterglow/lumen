@@ -178,9 +178,45 @@ class TestAvailableModels:
         assert body[0]["capabilities"] == {"vision": True, "reasoning": False, "context_limit": 128000}
         assert body[0]["context_limit"] == 128000
         assert body[0]["provider_api_key_configured"] is False
+        assert body[0]["reasoning_none_supported"] is False
         assert "input_price" not in body[0]
         assert "api_key" not in body[0]
         assert body[0]["id"] == 1
+
+    async def test_reasoning_none_supported_follows_the_admission_rule(self, client, monkeypatch):
+        cases = [
+            ("openai", "gpt-5", [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}], False),
+            ("openai", "gpt-5.1", [{"type": "effort", "values": ["none", "low", "medium", "high"]}], True),
+            ("gemini", "gemini-2.5-pro", [{"type": "budget_tokens", "min": 128, "max": 32768}], False),
+            ("gemini", "gemini-2.5-flash", [{"type": "budget_tokens", "min": 0, "max": 24576}], True),
+            ("anthropic", "claude-sonnet-4-5", [{"type": "budget_tokens", "min": 1024}], True),
+        ]
+
+        async def fake_models(*, active_only=False):
+            return [
+                {
+                    "id": index,
+                    "provider_id": 1,
+                    "model_name": model_name,
+                    "api_model_name": model_name,
+                    "api_provider": provider_type,
+                    "display_name": model_name,
+                    "effective_capabilities": {"reasoning": True, "reasoning_options": options},
+                }
+                for index, (provider_type, model_name, options, _) in enumerate(cases, start=1)
+            ]
+
+        async def fake_providers():
+            return [{"id": 1, "name": "provider", "has_api_key": True}]
+
+        monkeypatch.setattr(repository, "list_models", fake_models)
+        monkeypatch.setattr(repository, "list_providers", fake_providers)
+        resp = await client.get("/api/v1/chat/models")
+
+        assert resp.status_code == 200
+        assert {item["model_name"]: item["reasoning_none_supported"] for item in resp.json()} == {
+            model_name: expected for _, model_name, _, expected in cases
+        }
 
     async def test_graceful_empty_on_storage_unavailable(self, client, monkeypatch):
         async def fake_models(*, active_only=False):

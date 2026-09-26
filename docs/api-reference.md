@@ -63,7 +63,7 @@ Current Claude Apps Gateway login은 administrator-managed `forceLoginGatewayUrl
 
 ## Provider credential 상태
 
-`GET /v1/chat/models`의 각 모델은 공개 `api_model_name`/`api_provider`, 운영용 내부 `model_name`, secret 없는 `provider_api_key_configured`를 반환한다. 클라이언트는 공개 필드만 SDK의 `model`/`provider`로 사용한다. `provider_api_key_configured=true`는 암호화 DB key 또는 `api_key_env`가 가리키는 비어 있지 않은 환경 변수 중 하나가 현재 API process에 있음을 뜻한다. `false`는 Lumen에 명시적 provider API key가 없다는 뜻이며 provider 도달 가능성이나 keyless provider의 실행 가능성까지 판정하지는 않는다.
+`GET /v1/chat/models`의 각 모델은 공개 `api_model_name`/`api_provider`, 운영용 내부 `model_name`, secret 없는 `provider_api_key_configured`, admission과 같은 규칙으로 계산한 `reasoning_none_supported`(명시 `reasoning_effort="none"` 허용 여부)를 반환한다. 클라이언트는 공개 필드만 SDK의 `model`/`provider`로 사용한다. `provider_api_key_configured=true`는 암호화 DB key 또는 `api_key_env`가 가리키는 비어 있지 않은 환경 변수 중 하나가 현재 API process에 있음을 뜻한다. `false`는 Lumen에 명시적 provider API key가 없다는 뜻이며 provider 도달 가능성이나 keyless provider의 실행 가능성까지 판정하지는 않는다.
 
 관리자 `GET /v1/admin/providers` 응답은 `has_api_key`, `api_key_source`(`database`/`environment`/`null`), `api_key_env`, `has_billing_admin_key`를 반환한다. `api_key_env` 이름만 설정하고 실제 환경 변수가 비어 있으면 `has_api_key=false`, `api_key_source=null`이다. `POST /v1/admin/providers`와 `PATCH /v1/admin/providers/{provider_id}`의 선택적 `billing_admin_key`는 direct OpenAI API 또는 Anthropic API provider의 조직 보고서 조회용 별도 관리자 키다. 빈 문자열/`null` PATCH는 기존 관리자 키를 제거한다. Subscription auth, Gemini, Perplexity, custom OpenAI-compatible/Anthropic base에는 이 키를 설정할 수 없다. 평문 key와 암호문은 어떤 응답에도 포함되지 않는다.
 
@@ -163,6 +163,8 @@ API 키 발급 및 한도 관리는 Keystone token 인증 전용(Keystone-only)�
 `POST /v1/temp-completions`와 conversation completion route에는 구문상 유효한 UUID `Idempotency-Key`가 필요하다 (UUIDv4 권장, non-UUID 시 422). 응답은 `run_id`, `status`, `events_url`, `cancel_url`을 담은 202 `ChatRunDescriptor`다. 동일 idempotency key에 다른 intent를 재사용하면 409 conflict가 발생하며, 동일 intent 재전송은 precheck 우회 202 replay다.
 
 `CompletionRequest`/`TempCompletionRequest`는 text/asset `parts`, `model_id`, `features`, `reasoning_effort`, `skill_ids`, execution 설정을 받는다. 기본값은 보안 계약이다. `features.memory=true`, `tool_policy.mode="agent_default"`이므로 해당 scope가 없는 least-privilege key는 `{"memory": false, "tool_policy": {"mode": "none"}}`을 명시해야 한다. Provider 출력 `max_tokens`는 최대 4096으로 제한된다.
+
+`reasoning_effort`는 `auto`(기본, provider 기본값에 맡기고 파라미터를 보내지 않음), `none`, 또는 모델 `reasoning_options`의 `{"type":"effort","values":[...]}`에 나열된 이름(`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`)이다. `reasoning`이 false인 모델에서 `auto` 외 값은 422다. `none`은 추론을 끄라는 명시 요청이므로 provider 기본값으로 대체하지 않는다. 모델 capability가 끄기를 광고할 때만 허용한다. 즉 effort 목록에 `none`이 있거나(예: gpt-5.1 이상), `toggle` 옵션이 있거나, `budget_tokens`의 `min`이 0이거나(예: gemini-2.5-flash), provider가 thinking이 opt-in인 `anthropic`이어야 한다. 그 외(예: gpt-5는 minimal부터, o3는 low부터, gemini-2.5-pro는 budget 최소 128, capability 미확인·빈 `reasoning_options`)에는 422를 반환한다. models.dev 동기화는 `budget_tokens`의 정수 `min`/`max`를 보존한다. 이전에 저장된 `min` 없는 항목은 재동기화 전까지 끄기 불가로 본다. OpenAI `gpt-5*`에서 도구가 켜진 요청은 추가로 `auto`와 (모델이 지원하면) `none`만 받는다. `GET /v1/chat/models`의 `reasoning_none_supported`는 같은 판정(`capabilities.reasoning_can_be_disabled`)의 결과이므로, client는 규칙을 복제하지 말고 이 값이 true일 때만 `none` 선택지를 노출한다.
 
 ### Plugin binding과 agent/child 실행
 

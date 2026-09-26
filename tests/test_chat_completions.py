@@ -452,14 +452,83 @@ class TestReasoningEffortValidation:
         with pytest.raises(HTTPException, match="지원하지 않습니다"):
             chat_admission._validated_reasoning_effort("low", resolved)
 
+    @pytest.mark.parametrize(
+        ("provider_type", "options"),
+        [
+            # models.dev shapes: gpt-5, o3, gemini-2.5-pro, then unknown or stale metadata.
+            ("openai", [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}]),
+            ("openai", [{"type": "effort", "values": ["low", "medium", "high"]}]),
+            ("gemini", [{"type": "budget_tokens", "min": 128, "max": 32768}]),
+            ("gemini", [{"type": "budget_tokens"}]),
+            ("gemini", [{"type": "budget_tokens", "min": False}]),
+            ("openai", []),
+            ("openai", None),
+        ],
+    )
+    def test_none_is_rejected_unless_the_model_advertises_disabling(self, provider_type, options):
+        resolved = {"provider_type": provider_type, "capabilities": {"reasoning": True, "reasoning_options": options}}
+        with pytest.raises(HTTPException) as exc_info:
+            chat_admission._validated_reasoning_effort("none", resolved)
+        assert exc_info.value.status_code == 422
+        assert "'none'" in exc_info.value.detail
+        assert chat_admission._validated_reasoning_effort("auto", resolved) == "auto"
+
+    @pytest.mark.parametrize(
+        ("provider_type", "options"),
+        [
+            # models.dev shapes: gpt-5.1, a toggle model, gemini-2.5-flash, then Anthropic budget models.
+            ("openai", [{"type": "effort", "values": ["none", "low", "medium", "high"]}]),
+            ("deepinfra", [{"type": "toggle"}]),
+            ("gemini", [{"type": "toggle"}, {"type": "budget_tokens", "min": 0, "max": 24576}]),
+            ("gemini", [{"type": "budget_tokens", "min": 0, "max": 24576}]),
+            ("anthropic", [{"type": "budget_tokens", "min": 1024}]),
+            ("anthropic", []),
+        ],
+    )
+    def test_none_is_accepted_when_disabling_thinking_is_valid(self, provider_type, options):
+        resolved = {"provider_type": provider_type, "capabilities": {"reasoning": True, "reasoning_options": options}}
+        assert chat_admission._validated_reasoning_effort(" None ", resolved) == "none"
+
+    def test_none_is_rejected_for_non_reasoning_models(self):
+        resolved = {"provider_type": "anthropic", "capabilities": {"reasoning": False}}
+        with pytest.raises(HTTPException, match="추론 강도를 지원하지 않습니다"):
+            chat_admission._validated_reasoning_effort("none", resolved)
+
     def test_gpt5_tools_reject_explicit_reasoning_but_allow_auto_or_none(self):
-        resolved = {"provider_type": "openai", "model_name": "gpt-5.6-luna"}
+        resolved = {
+            "provider_type": "openai",
+            "model_name": "gpt-5.6-luna",
+            "capabilities": {
+                "reasoning": True,
+                "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high"]}],
+            },
+        }
         tools_enabled = ChatFeatureOptions()
 
         chat_admission._validate_tool_reasoning_compatibility("auto", resolved, tools_enabled)
+        assert chat_admission._validated_reasoning_effort("none", resolved) == "none"
         chat_admission._validate_tool_reasoning_compatibility("none", resolved, tools_enabled)
-        with pytest.raises(HTTPException, match="도구 사용과 명시적 추론 강도"):
+        with pytest.raises(HTTPException, match="자동 또는 없음으로") as exc_info:
             chat_admission._validate_tool_reasoning_compatibility("high", resolved, tools_enabled)
+        assert exc_info.value.status_code == 422
+
+    def test_gpt5_tools_hint_omits_none_when_the_model_cannot_disable_reasoning(self):
+        resolved = {
+            "provider_type": "openai",
+            "model_name": "gpt-5",
+            "capabilities": {
+                "reasoning": True,
+                "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
+            },
+        }
+        tools_enabled = ChatFeatureOptions()
+
+        with pytest.raises(HTTPException, match="'none'"):
+            chat_admission._validated_reasoning_effort("none", resolved)
+        with pytest.raises(HTTPException) as exc_info:
+            chat_admission._validate_tool_reasoning_compatibility("high", resolved, tools_enabled)
+        assert exc_info.value.detail.endswith("추론 강도를 자동으로 선택하세요.")
+        assert "없음" not in exc_info.value.detail
 
     def test_gpt5_explicit_reasoning_is_allowed_when_tools_are_disabled(self):
         resolved = {"provider_type": "openai", "model_name": "gpt-5.6-luna"}
