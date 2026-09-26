@@ -25,6 +25,8 @@ _TITLE_SYSTEM = (
     "at most 6 words and 80 characters, without quotes, punctuation, or explanation."
 )
 _OMISSION = "[…생략…]"
+# Cheapest first; values outside this list are never sent.
+_TITLE_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,31 @@ def _context_limit(route: Mapping[str, Any]) -> int | None:
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
+
+
+def _title_reasoning_effort(route: Mapping[str, Any]) -> str | None:
+    """Pick the cheapest effort the route's models.dev metadata advertises.
+
+    Accepted values differ per model (gpt-5: minimal+, o3: low+, gpt-5.1: none+,
+    claude-opus-5-5: low+), so a fixed ``none`` can be rejected or mapped to an
+    invalid budget.  Budget/toggle-only or missing metadata omits the effort and
+    leaves the provider default in place.  Unlike chat admission, an
+    unadvertised ``none`` is never sent.
+    """
+    capabilities = _route_capabilities(route)
+    if not capabilities.get("reasoning"):
+        return None
+    options = capabilities.get("reasoning_options")
+    if not isinstance(options, Sequence) or isinstance(options, str):
+        return None
+    values = next(
+        (option.get("values") for option in options if isinstance(option, Mapping) and option.get("type") == "effort"),
+        None,
+    )
+    if not isinstance(values, Sequence) or isinstance(values, str):
+        return None
+    advertised = {str(value).strip().lower() for value in values}
+    return next((effort for effort in _TITLE_EFFORT_ORDER if effort in advertised), None)
 
 
 def _fit_text(model: str, role: str, text: str, token_budget: int) -> str:
@@ -238,11 +265,12 @@ async def generate_title(*, exchange: Sequence[Mapping[str, Any]], route: Mappin
         "temperature": 0.0,
     }
     params = {key: value for key, value in params.items() if value is not None}
-    # none is the least expensive supported reasoning mode.  The wrapper
-    # omits it for providers which do not support reasoning parameters.
+    # Send only an effort the frozen route advertises; the wrapper still drops
+    # it when LiteLLM/ChatGPT metadata reports no reasoning support.
+    effort = _title_reasoning_effort(route)
     reasoning_params = getattr(litellm_client, "_reasoning_params", None)
-    if callable(reasoning_params):
-        params.update(reasoning_params(model, "none", route.get("provider_type")))
+    if effort is not None and callable(reasoning_params):
+        params.update(reasoning_params(model, effort, route.get("provider_type")))
     response = await litellm_client.acompletion(model, messages, **params)
     raw = _resp_text(response)
     title = _clean(raw)
