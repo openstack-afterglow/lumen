@@ -30,6 +30,7 @@ from lumen.services import (
     native_compaction,
 )
 from lumen.services import conversation_store as cs
+from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.litellm_client import UsageCost
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
 from lumen.services.providers import routing as ps
@@ -2280,6 +2281,9 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
             max_tokens=payload.get("max_tokens"),
             temperature=payload.get("temperature"),
             reasoning_effort=payload.get("reasoning_effort"),
+            reasoning_can_be_disabled=reasoning_can_be_disabled(
+                resolved.get("capabilities"), resolved.get("provider_type")
+            ),
             response_format=_provider_response_format(payload.get("features")),
             selected_tool_ids=selected_tool_ids,
             selected_mcp_ids=selected_mcp_ids,

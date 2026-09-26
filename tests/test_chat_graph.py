@@ -597,6 +597,7 @@ class TestGraphStream:
 
     async def test_gpt5_tools_auto_starts_with_explicit_none_before_durable_boundary(self, monkeypatch):
         model = "gpt-5.6-luna"
+        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
         calls: list[dict] = []
 
         async def fake_schemas(_ctx):
@@ -625,12 +626,279 @@ class TestGraphStream:
                 user_id="u1",
                 custom_llm_provider="openai",
                 reasoning_effort="auto",
+                reasoning_can_be_disabled=True,
                 execution_hooks=Hooks(),
             )
         ]
 
         assert any(event["type"] == "token" for event in events)
         assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
+
+    @pytest.mark.parametrize("effort", ["auto", None])
+    async def test_gpt5_tools_without_advertised_none_keep_provider_default(self, monkeypatch, effort):
+        """gpt-5/gpt-5-mini list minimal..high only; LiteLLM would forward `none` and fail the round."""
+        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
+        calls: list[dict] = []
+
+        async def fake_schemas(_ctx):
+            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+        async def fake_stream(**kwargs):
+            calls.append(kwargs)
+            if (kwargs.get("extra") or {}).get("reasoning_effort") == "none":
+                raise RuntimeError("Unsupported value: 'reasoning_effort' does not support 'none' with this model.")
+            return _aiter([_Chunk("답변")])
+
+        class Hooks:
+            async def provider_started(self, **_payload):
+                return None
+
+            async def provider_failed(self, **_payload):
+                raise AssertionError("a model without advertised none must not record a failed provider call")
+
+        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+
+        events = [
+            ev
+            async for ev in graph.stream(
+                model="gpt-5-mini",
+                messages=_MSGS,
+                project_id="p1",
+                user_id="u1",
+                custom_llm_provider="openai",
+                reasoning_effort=effort,
+                reasoning_can_be_disabled=False,
+                execution_hooks=Hooks(),
+            )
+        ]
+
+        assert any(event["type"] == "token" for event in events)
+        assert [call.get("extra") for call in calls] == [None]
+        assert [call.get("reasoning_effort") for call in calls] == [effort]
+
+    @pytest.mark.parametrize("effort", ["auto", None])
+    async def test_durable_rejected_implicit_none_fails_once_then_is_memoized(self, monkeypatch, effort):
+        """Durable hooks abort at provider_failed, so stale `none` metadata costs one failed run per process."""
+        model = "gpt-5-stale-metadata"
+        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
+        calls: list[dict] = []
+        failed: list[dict] = []
+
+        async def fake_schemas(_ctx):
+            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+        async def fake_stream(**kwargs):
+            calls.append(kwargs)
+            if (kwargs.get("extra") or {}).get("reasoning_effort") == "none":
+                raise RuntimeError("Unsupported value: 'reasoning_effort' does not support 'none' with this model.")
+            return _aiter([_Chunk("답변")])
+
+        class DurableHooks:
+            async def provider_started(self, **_payload):
+                return None
+
+            async def provider_failed(self, **payload):
+                # Same contract as durable_runs.execution._DurableExecutionHooks._fail.
+                failed.append(payload)
+                return {"_boundary_abort": "provider_result_unknown"}
+
+        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+
+        async def run_once():
+            return [
+                ev
+                async for ev in graph.stream(
+                    model=model,
+                    messages=_MSGS,
+                    project_id="p1",
+                    user_id="u1",
+                    custom_llm_provider="openai",
+                    reasoning_effort=effort,
+                    reasoning_can_be_disabled=True,
+                    execution_hooks=DurableHooks(),
+                )
+            ]
+
+        first = await run_once()
+        assert [event.get("code") for event in first if event["type"] == "error"] == ["provider_result_unknown"]
+        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
+        assert model in graph._TOOL_REASONING_NONE_REJECTED
+        # The reasoning-capable model must not be demoted for later explicit efforts.
+        assert model not in graph._REASONING_UNSUPPORTED
+
+        calls.clear()
+        second = await run_once()
+        assert any(event["type"] == "token" for event in second)
+        assert not any(event["type"] == "error" for event in second)
+        assert [call.get("extra") for call in calls] == [None]
+        assert [call.get("reasoning_effort") for call in calls] == [effort]
+        assert len(failed) == 1
+
+    async def test_hookless_rejected_implicit_none_retries_default_in_same_round(self, monkeypatch):
+        model = "gpt-5-stale-metadata"
+        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
+        calls: list[dict] = []
+
+        async def fake_schemas(_ctx):
+            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+        async def fake_stream(**kwargs):
+            calls.append(kwargs)
+            if (kwargs.get("extra") or {}).get("reasoning_effort") == "none":
+                raise RuntimeError("Unsupported value: 'reasoning_effort' does not support 'none' with this model.")
+            return _aiter([_Chunk("답변")])
+
+        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+
+        events = [
+            ev
+            async for ev in graph.stream(
+                model=model,
+                messages=_MSGS,
+                project_id="p1",
+                user_id="u1",
+                custom_llm_provider="openai",
+                reasoning_effort="auto",
+                reasoning_can_be_disabled=True,
+            )
+        ]
+
+        assert any(event["type"] == "token" for event in events)
+        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}, None]
+        assert [call.get("reasoning_effort") for call in calls] == [None, "auto"]
+        assert model in graph._TOOL_REASONING_NONE_REJECTED
+        assert model not in graph._REASONING_UNSUPPORTED
+
+    async def test_implicit_none_transient_failure_is_not_memoized_or_retried(self, monkeypatch):
+        model = "gpt-5.1-flaky"
+        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
+        calls: list[dict] = []
+
+        async def fake_schemas(_ctx):
+            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+        async def fake_stream(**kwargs):
+            calls.append(kwargs)
+            raise RuntimeError("upstream connection reset")
+
+        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+
+        events = [
+            ev
+            async for ev in graph.stream(
+                model=model,
+                messages=_MSGS,
+                project_id="p1",
+                user_id="u1",
+                custom_llm_provider="openai",
+                reasoning_effort="auto",
+                reasoning_can_be_disabled=True,
+            )
+        ]
+
+        assert any(event["type"] == "error" for event in events)
+        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
+        assert model not in graph._TOOL_REASONING_NONE_REJECTED
+        assert model not in graph._REASONING_UNSUPPORTED
+
+    async def test_durable_tool_conflict_without_metadata_fails_once_then_sends_none(self, monkeypatch):
+        """A gpt-5.x route without advertised `none` that needs it learns from one failed run."""
+        model = "gpt-5.6-no-metadata"
+        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
+        calls: list[dict] = []
+
+        async def fake_schemas(_ctx):
+            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+        async def fake_stream(**kwargs):
+            calls.append(kwargs)
+            if kwargs.get("extra") is None:
+                raise RuntimeError("Function tools with reasoning_effort are not supported")
+            return _aiter([_Chunk("답변")])
+
+        class DurableHooks:
+            async def provider_started(self, **_payload):
+                return None
+
+            async def provider_failed(self, **_payload):
+                return {"_boundary_abort": "provider_result_unknown"}
+
+        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+
+        async def run_once():
+            return [
+                ev
+                async for ev in graph.stream(
+                    model=model,
+                    messages=_MSGS,
+                    project_id="p1",
+                    user_id="u1",
+                    custom_llm_provider="openai",
+                    reasoning_effort="auto",
+                    reasoning_can_be_disabled=False,
+                    execution_hooks=DurableHooks(),
+                )
+            ]
+
+        first = await run_once()
+        assert [event.get("code") for event in first if event["type"] == "error"] == ["provider_result_unknown"]
+        assert model in graph._TOOL_REASONING_EXPLICIT_NONE
+
+        calls.clear()
+        second = await run_once()
+        assert any(event["type"] == "token" for event in second)
+        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
+
+    async def test_tool_conflict_after_rejected_none_restores_explicit_none(self, monkeypatch):
+        model = "gpt-5.6-luna"
+        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", {model})
+        calls: list[dict] = []
+
+        async def fake_schemas(_ctx):
+            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+        async def fake_stream(**kwargs):
+            calls.append(kwargs)
+            if kwargs.get("extra") is None:
+                raise RuntimeError("Function tools with reasoning_effort are not supported")
+            return _aiter([_Chunk("답변")])
+
+        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+
+        _ = [
+            ev
+            async for ev in graph.stream(
+                model=model,
+                messages=_MSGS,
+                project_id="p1",
+                user_id="u1",
+                custom_llm_provider="openai",
+                reasoning_effort="auto",
+                reasoning_can_be_disabled=True,
+            )
+        ]
+
+        assert [call.get("extra") for call in calls] == [None, {"reasoning_effort": "none"}]
+        assert model in graph._TOOL_REASONING_EXPLICIT_NONE
+        assert model not in graph._TOOL_REASONING_NONE_REJECTED
 
     async def test_gpt5_tools_preserve_explicit_reasoning_effort(self, monkeypatch):
         calls: list[dict] = []

@@ -513,6 +513,93 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
     assert closed.is_set()
 
 
+@pytest.mark.parametrize(
+    ("efforts", "expected"),
+    [
+        (["minimal", "low", "medium", "high"], False),  # gpt-5 / gpt-5-mini
+        (["none", "low", "medium", "high"], True),  # gpt-5.1+
+    ],
+)
+async def test_worker_passes_frozen_reasoning_disable_capability_to_engine(monkeypatch, efforts, expected):
+    run = SimpleNamespace(
+        id="run-1",
+        model_name="gpt-5",
+        project_id="project-1",
+        user_id="user-1",
+        conversation_id=None,
+        user_message_id=None,
+        assistant_message_id=None,
+        capability_snapshot={},
+        pricing_snapshot={"component_prices": {}, "margin_multiplier": "1", "chat_credit_per_usd": "1"},
+        execution_protocol_version=1,
+        status="queued",
+        lease_owner="worker#1",
+        assigned_resource_id=None,
+        parent_run_id=None,
+        credit_ceiling=None,
+        sandbox_seconds_ceiling=None,
+        depth=0,
+    )
+    resolved = {
+        "model_name": "gpt-5",
+        "provider_name": "openai",
+        "provider_type": "openai",
+        "capabilities": {"reasoning": True, "reasoning_options": [{"type": "effort", "values": efforts}]},
+    }
+    captured: dict = {}
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def begin(self):
+            return self
+
+    async def engine_stream(**kwargs):
+        captured.update(kwargs)
+        yield {"type": "token", "text": "ok"}
+        yield {"type": "usage", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    def usage_cost(*_args, **_kwargs):
+        return SimpleNamespace(
+            raw_cost=Decimal("0"), input_cost=Decimal("0"), output_cost=Decimal("0"), pricing_snapshot={}
+        )
+
+    async def _return(value):
+        return value
+
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: _Session())
+    monkeypatch.setattr(execution, "claim_queued_run", lambda *_args, **_kwargs: _return(run))
+    monkeypatch.setattr(
+        execution,
+        "_payload",
+        lambda _run: {
+            "input_messages": [{"role": "user", "content": "x"}],
+            "features": {},
+            "reasoning_effort": "auto",
+        },
+    )
+    monkeypatch.setattr(execution, "_validate_run_protocol_payload", lambda *_args: True)
+    monkeypatch.setattr(execution.ps, "resolve_model_snapshot", lambda *_args, **_kwargs: _return(resolved))
+    monkeypatch.setattr(execution, "_managed_tool_configs", lambda *_args, **_kwargs: _return((None, None, None)))
+    monkeypatch.setattr(execution.engine, "stream", engine_stream)
+    monkeypatch.setattr(execution, "_append", lambda *_args, **_kwargs: _return(None))
+    monkeypatch.setattr(execution, "_finish", lambda *_args, **_kwargs: _return(None))
+    monkeypatch.setattr(execution, "_set_stage", lambda *_args, **_kwargs: _return(None))
+    monkeypatch.setattr(execution, "_cancel_requested", lambda *_args: _return(False))
+    monkeypatch.setattr(execution, "_renew_lease", lambda *_args, **_kwargs: _return(True))
+    monkeypatch.setattr(execution.credit, "precheck", lambda *_args, **_kwargs: _return(None))
+    monkeypatch.setattr(execution.credit, "usage_cost_from_pricing_snapshot", usage_cost)
+    monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
+
+    assert await execution.execute_queued_run("run-1", owner="worker-1") is True
+    assert captured["reasoning_effort"] == "auto"
+    assert captured["reasoning_can_be_disabled"] is expected
+
+
 async def test_summary_compactor_fences_map_and_reduce_segments_and_records_usage(monkeypatch):
     run = SimpleNamespace(id="run-1", user_id="user-1", project_id="project-1", api_key_id=None)
 

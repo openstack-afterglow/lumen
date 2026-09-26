@@ -43,18 +43,29 @@ _MAX_TOOL_STEPS = 4  # 툴 실행 라운드 상한(무한 루프 방지) — 초
 _REASONING_UNSUPPORTED: set[str] = set()
 # OpenAI Chat Completions models that require the explicit `none` value when tools are sent.
 _TOOL_REASONING_EXPLICIT_NONE: set[str] = set()
+# Models whose implicit tool-round `none` was rejected; later rounds keep the provider default.
+_TOOL_REASONING_NONE_REJECTED: set[str] = set()
 _MAX_INTERNAL_TOOL_CALL_ID = 190
 _DELEGATE_TOOL_NAME = "delegate_agent"
 
 
 def _requires_explicit_none_for_tools(
-    model: str, custom_llm_provider: str | None, reasoning_effort: str | None
+    model: str,
+    custom_llm_provider: str | None,
+    reasoning_effort: str | None,
+    reasoning_can_be_disabled: bool,
 ) -> bool:
-    """Make OpenAI's implicit automatic reasoning explicit only for tool requests."""
+    """Make OpenAI's implicit automatic reasoning explicit only for tool requests.
+
+    The route's frozen capabilities must advertise disabling: gpt-5 and gpt-5-mini list
+    only minimal..high, and LiteLLM forwards ``none`` to them unchanged.
+    """
     normalized_effort = reasoning_effort.strip().lower() if isinstance(reasoning_effort, str) else None
     return (
         custom_llm_provider == "openai"
+        and reasoning_can_be_disabled
         and model.strip().lower().startswith("gpt-5")
+        and model not in _TOOL_REASONING_NONE_REJECTED
         and normalized_effort in {None, "", "auto"}
     )
 
@@ -73,6 +84,12 @@ def _is_tool_reasoning_conflict(error: Exception) -> bool:
     """OpenAI Chat Completions가 tool+기본 추론을 거부했는지 판별한다."""
     message = str(error).lower()
     return "function tools" in message and "reasoning_effort" in message
+
+
+def _is_reasoning_none_rejection(error: Exception) -> bool:
+    """The provider rejected the `none` value itself (gpt-5: minimal..high only), not the request."""
+    message = str(error).lower()
+    return "reasoning_effort" in message and "none" in message and not _is_tool_reasoning_conflict(error)
 
 
 class ChatState(TypedDict, total=False):
@@ -608,9 +625,19 @@ def _build_graph(params: dict, ctx: ToolContext):
         await boundary("revalidate_skills")
 
         reasoning_effort = None if params["model"] in _REASONING_UNSUPPORTED else params.get("reasoning_effort")
-        disable_reasoning_for_tools = bool(schemas) and (
-            params["model"] in _TOOL_REASONING_EXPLICIT_NONE
-            or _requires_explicit_none_for_tools(params["model"], params.get("custom_llm_provider"), reasoning_effort)
+        # A capability-derived `none` is a guess; a conflict-proven one is not.
+        implicit_none_for_tools = (
+            bool(schemas)
+            and params["model"] not in _TOOL_REASONING_EXPLICIT_NONE
+            and _requires_explicit_none_for_tools(
+                params["model"],
+                params.get("custom_llm_provider"),
+                reasoning_effort,
+                bool(params.get("reasoning_can_be_disabled")),
+            )
+        )
+        disable_reasoning_for_tools = implicit_none_for_tools or (
+            bool(schemas) and params["model"] in _TOOL_REASONING_EXPLICIT_NONE
         )
         attempt = 0
 
@@ -652,8 +679,16 @@ def _build_graph(params: dict, ctx: ToolContext):
                     ),
                     None,
                 )
-            except BaseException:
+            except BaseException as exc:
                 logger.warning("litellm 스트림 초기화 오류 model=%s", params.get("model"), exc_info=True)
+                # Durable hooks abort the round at provider_failed, so learn before the boundary:
+                # the next round or run then avoids the rejected shape instead of repeating it.
+                if schemas and isinstance(exc, Exception):
+                    if disable_reasoning and implicit_none_for_tools and _is_reasoning_none_rejection(exc):
+                        _TOOL_REASONING_NONE_REJECTED.add(params["model"])
+                    elif not disable_reasoning and _is_tool_reasoning_conflict(exc):
+                        _TOOL_REASONING_EXPLICIT_NONE.add(params["model"])
+                        _TOOL_REASONING_NONE_REJECTED.discard(params["model"])
                 failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
                 if _abort_code(failure) is not None:
                     raise _BoundaryAbort(_abort_code(failure))
@@ -677,7 +712,28 @@ def _build_graph(params: dict, ctx: ToolContext):
             if isinstance(exc, ProviderSubscriptionError):
                 writer({"type": "error", "code": exc.code, "message": exc.message})
                 return {"model_failed": True, "pending_tool_calls": []}
-            if schemas and _is_tool_reasoning_conflict(exc):
+            if implicit_none_for_tools and not _is_reasoning_none_rejection(exc):
+                # A guessed `none` must not fall into the generic branch, which would
+                # demote a reasoning-capable model into _REASONING_UNSUPPORTED.
+                logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
+                writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
+                return {"model_failed": True, "pending_tool_calls": []}
+            if implicit_none_for_tools:
+                logger.warning(
+                    "tool 요청의 암묵적 reasoning none 거부 — provider 기본값으로 재시도 model=%s",
+                    params["model"],
+                    exc_info=True,
+                )
+                try:
+                    response, replay_payload = await open_stream(reasoning_effort)
+                except ProviderSubscriptionError as retry_error:
+                    writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
+                    return {"model_failed": True, "pending_tool_calls": []}
+                except Exception:
+                    logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
+                    writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
+                    return {"model_failed": True, "pending_tool_calls": []}
+            elif schemas and _is_tool_reasoning_conflict(exc):
                 logger.warning("tool 요청의 기본 reasoning을 명시적으로 비활성화해 재시도 model=%s", params["model"])
                 try:
                     response, replay_payload = await open_stream(None, disable_reasoning=True)
@@ -688,7 +744,6 @@ def _build_graph(params: dict, ctx: ToolContext):
                     logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
                     writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
                     return {"model_failed": True, "pending_tool_calls": []}
-                _TOOL_REASONING_EXPLICIT_NONE.add(params["model"])
             elif reasoning_effort:
                 logger.warning(
                     "reasoning 포함 요청 실패 — reasoning 없이 재시도 model=%s", params.get("model"), exc_info=True
@@ -1623,6 +1678,7 @@ async def stream(
     max_tokens: int | None = None,
     temperature: float | None = None,
     reasoning_effort: str | None = None,
+    reasoning_can_be_disabled: bool = False,
     selected_tool_ids: tuple[int, ...] | None = None,
     selected_mcp_ids: tuple[int, ...] | None = None,
     expected_mcp_credential_versions: tuple[tuple[int, int], ...] | None = None,
@@ -1660,6 +1716,7 @@ async def stream(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "reasoning_effort": reasoning_effort,
+        "reasoning_can_be_disabled": reasoning_can_be_disabled,
         "execution_hooks": execution_hooks,
         "response_format": response_format,
         "execution_protocol_version": execution_protocol_version,
