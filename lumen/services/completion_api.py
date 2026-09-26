@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from lumen.config import get_settings
 from lumen.services import context_manager, credit, litellm_client, native_compaction
+from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
 from lumen.services.usage_breakdown import UsageBreakdown
@@ -189,8 +190,24 @@ def _norm_tool_calls(raw: Any) -> list[dict] | None:
     return out
 
 
-def _reasoning_effort(explicit: str | None) -> str | None:
-    return explicit or get_settings().chat_reasoning_effort
+def _reasoning_effort(explicit: str | None, resolved: dict | None = None) -> str | None:
+    """Explicit effort, else the operator default.
+
+    An operator ``none`` carries no per-request intent, so it takes the omission path
+    (provider default) for models that cannot disable reasoning instead of sending a
+    value such as gpt-5/o3 reject.
+    """
+    if explicit:
+        return explicit
+    effort = get_settings().chat_reasoning_effort
+    if (
+        resolved is not None
+        and isinstance(effort, str)
+        and effort.strip().lower() == "none"
+        and not reasoning_can_be_disabled(resolved.get("capabilities"), resolved.get("provider_type"))
+    ):
+        return None
+    return effort
 
 
 async def complete_once(
@@ -291,7 +308,7 @@ async def complete_stream(
             temperature=temperature,
             tools=tools,
             extra=extra_kwargs or None,
-            reasoning_effort=_reasoning_effort(None),
+            reasoning_effort=_reasoning_effort(None, resolved),
             provider_auth=resolved.get("provider_auth"),
         )
         async for chunk in gen:

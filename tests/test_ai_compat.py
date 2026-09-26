@@ -1641,3 +1641,35 @@ async def test_native_ping_does_not_cancel_pending_upstream_read():
         pass
     assert event == {"type": "response.completed"}
     assert cancelled is False
+
+
+class TestOperatorReasoningDefault:
+    _GPT5 = {
+        "provider_type": "openai",
+        "capabilities": {
+            "reasoning": True,
+            "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
+        },
+    }
+    _GPT51 = {
+        "provider_type": "openai",
+        "capabilities": {
+            "reasoning": True,
+            "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high"]}],
+        },
+    }
+
+    def _configure(self, monkeypatch, effort):
+        monkeypatch.setattr(core, "get_settings", lambda: SimpleNamespace(chat_reasoning_effort=effort))
+
+    def test_operator_none_is_omitted_for_models_that_cannot_disable_reasoning(self, monkeypatch):
+        self._configure(monkeypatch, "none")
+        assert core._reasoning_effort(None, self._GPT5) is None
+        assert core._reasoning_effort(None, self._GPT51) == "none"
+        assert core._reasoning_effort(None, {"provider_type": "anthropic", "capabilities": {"reasoning": True}}) == "none"
+
+    def test_explicit_and_non_none_defaults_are_unchanged(self, monkeypatch):
+        self._configure(monkeypatch, "auto")
+        assert core._reasoning_effort(None, self._GPT5) == "auto"
+        self._configure(monkeypatch, "none")
+        assert core._reasoning_effort("low", self._GPT5) == "low"

@@ -976,6 +976,50 @@ class TestCanonicalCompletionRequests:
         assert response.status_code == 422
         assert "image" in response.json()["detail"]
 
+    @pytest.mark.parametrize(
+        ("effort_values", "expected_status"),
+        [(["minimal", "low", "medium", "high"], 422), (["none", "low", "medium", "high"], 202)],
+    )
+    async def test_explicit_none_is_admitted_only_when_the_model_advertises_it(
+        self, client, monkeypatch, effort_values, expected_status
+    ):
+        await _patch_text_execution(monkeypatch)
+        resolved = {
+            **_resolved(),
+            "model_name": "gpt-5",
+            "provider_type": "openai",
+            "capabilities": {
+                **_resolved()["capabilities"],
+                "reasoning": True,
+                "reasoning_options": [{"type": "effort", "values": effort_values}],
+            },
+        }
+        monkeypatch.setattr(ps, "resolve_model", lambda *args, **kwargs: _return(resolved))
+        seen = {}
+
+        async def create_persistent_run(**kwargs):
+            seen.update(kwargs)
+            return ChatRunDescriptor(
+                run_id="run-none",
+                status="queued",
+                events_url="/api/v1/chat/runs/run-none/events",
+                cancel_url="/api/v1/chat/runs/run-none/cancel",
+            )
+
+        monkeypatch.setattr(admission, "create_persistent_run", create_persistent_run)
+        response = await client.post(
+            f"{_BASE}/c1/completions",
+            headers=_HEADERS,
+            json=_request(reasoning_effort="none", features={"memory": False, "tool_policy": {"mode": "none"}}),
+        )
+
+        assert response.status_code == expected_status
+        if expected_status == 422:
+            assert "'none'" in response.json()["detail"]
+            assert seen == {}
+        else:
+            assert seen["request_payload"]["reasoning_effort"] == "none"
+
     async def test_clean_image_part_enters_durable_request_payload(self, client, monkeypatch):
         await _patch_text_execution(monkeypatch)
         resolved = {

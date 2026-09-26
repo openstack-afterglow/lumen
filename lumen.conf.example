@@ -96,6 +96,8 @@ chat_api_hosts = "lumen.example"
 claude_gateway_base_url = "https://lumen.example/v1/claude-gateway"
 claude_gateway_model = "claude-sonnet-4-6"
 claude_gateway_provider = "anthropic"
+# "none" is omitted (provider default) for models that cannot disable reasoning,
+# including models whose disable support is unknown (no models.dev reasoning_options).
 chat_reasoning_effort = "auto"
 # Provider-native server-side compaction. Armed only on routes whose transport
 # forwards `context_management` (Anthropic today) and whose context window is
