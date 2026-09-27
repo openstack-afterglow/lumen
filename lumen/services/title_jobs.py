@@ -20,7 +20,7 @@ from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_db import ChatConversation, ChatMessage, ChatUsageLog
 from lumen.models.chat_jobs import ChatJob
 from lumen.models.chat_runs import ChatRun
-from lumen.services import credit, litellm_client, title_summary
+from lumen.services import credit, litellm_client, message_graph, title_summary
 from lumen.services.providers import routing as ps
 from lumen.services.usage_breakdown import CACHE_USAGE_KEYS, UsageBreakdown
 
@@ -157,13 +157,23 @@ async def enqueue_completed_run_in_transaction(session, run: ChatRun) -> bool:
     ).scalar_one_or_none()
     if existing is not None:
         return False
-    user_message = await session.get(ChatMessage, run.user_message_id)
-    assistant_message = await session.get(ChatMessage, run.assistant_message_id)
+    user_message = await session.scalar(
+        select(ChatMessage).where(
+            ChatMessage.id == run.user_message_id,
+            message_graph.reachable_message_clause(run.conversation_id),
+        )
+    )
+    assistant_message = await session.scalar(
+        select(ChatMessage).where(
+            ChatMessage.id == run.assistant_message_id,
+            message_graph.reachable_message_clause(run.conversation_id),
+        )
+    )
     if (
         user_message is None
         or assistant_message is None
-        or user_message.conversation_id != run.conversation_id
-        or assistant_message.conversation_id != run.conversation_id
+        or user_message.graph_id != conversation.graph_id
+        or assistant_message.graph_id != conversation.graph_id
         or user_message.role != "user"
         or assistant_message.role != "assistant"
         or user_message.status not in {"complete", "completed"}
