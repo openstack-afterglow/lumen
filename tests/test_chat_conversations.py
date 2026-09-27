@@ -6,6 +6,8 @@ DB 없이 conversation_store 를 monkeypatch 하여:
 - 저장소 장애 시 503
 """
 
+import pytest
+
 from lumen.services import conversation_store as cs
 from lumen.services.providers import errors, repository
 
@@ -278,6 +280,31 @@ class TestForkAndActiveLeaf:
         monkeypatch.setattr(cs, "fork_conversation", fake_fork)
         resp = await client.post(f"{_URL}/c1/fork", json={"message_id": 999})
         assert resp.status_code == 404
+
+    @pytest.mark.parametrize(
+        ("error", "status", "detail"),
+        [
+            (cs.ConversationRunActive, 409, "conversation_run_active"),
+            (cs.HistoryIndexUnavailable, 503, "history_index_unavailable"),
+        ],
+    )
+    async def test_fork_returns_retryable_graph_conflicts(self, client, monkeypatch, error, status, detail):
+        async def unavailable(*_args, **_kwargs):
+            raise error("fork unavailable")
+
+        monkeypatch.setattr(cs, "fork_conversation", unavailable)
+        response = await client.post(f"{_URL}/c1/fork", json={"message_id": 5})
+        assert response.status_code == status
+        assert response.json()["detail"] == detail
+
+    async def test_delete_rejects_active_run(self, client, monkeypatch):
+        async def active(*_args, **_kwargs):
+            raise cs.ConversationRunActive("conversation has an active run")
+
+        monkeypatch.setattr(cs, "delete_conversation", active)
+        response = await client.delete(f"{_URL}/c1")
+        assert response.status_code == 409
+        assert response.json()["detail"] == "conversation_run_active"
 
 
 async def test_messages_uses_anchor_and_returns_signed_page_cursors(client, monkeypatch):

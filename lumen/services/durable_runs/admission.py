@@ -13,7 +13,7 @@ from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
 from lumen.models.chat_contracts import ChatRunDescriptor, validate_user_input_parts
 from lumen.models.chat_db import ChatConversation, ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatRunProvider, ChatTempThread
-from lumen.services.message_graph import append_active_message
+from lumen.services.message_graph import append_active_message, reachable_message_clause, register_message
 from lumen.services.message_parts import serialize_parts
 from lumen.services.message_timestamps import message_timestamps
 from lumen.services.providers import routing as ps
@@ -386,6 +386,7 @@ async def create_persistent_run(
         # same transaction, so no accepted run can lack its input ownership.
         created_at, created_at_local, created_timezone = message_timestamps(client_timezone)
         user_message = ChatMessage(
+            graph_id=conversation.graph_id,
             conversation_id=conversation_id,
             role="user",
             parent_id=conversation.active_leaf_id,
@@ -399,6 +400,7 @@ async def create_persistent_run(
         )
         session.add(user_message)
         await session.flush()
+        await register_message(session, conversation_id=conversation_id, message_id=user_message.id)
         await append_active_message(
             session,
             conversation_id=conversation_id,
@@ -570,6 +572,17 @@ async def create_run(
             return descriptor(existing)
 
         if conversation_id is not None:
+            if not conv.history_index_ready:
+                raise DurableRunConflict("history_index_unavailable")
+            if user_message_id is not None:
+                user_message = await session.scalar(
+                    select(ChatMessage.id).where(
+                        ChatMessage.id == user_message_id,
+                        reachable_message_clause(conversation_id),
+                    )
+                )
+                if user_message is None:
+                    raise DurableRunNotFound("user message was not found in conversation")
             active = (
                 await session.execute(
                     select(ChatRun.id)

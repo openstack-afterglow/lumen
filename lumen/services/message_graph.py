@@ -10,11 +10,64 @@ from __future__ import annotations
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from lumen.models import ChatConversationActivePath, ChatMessage
+from lumen.models import (
+    ChatConversation,
+    ChatConversationActivePath,
+    ChatConversationMessage,
+    ChatMessage,
+    ChatMessageGraph,
+)
 
 
 class MessageGraphError(ValueError):
     """The requested leaf does not form a valid path in its conversation."""
+
+
+def reachable_message_clause(conversation_id: str, message=ChatMessage):
+    """Restrict a message to an explicitly granted conversation view.
+
+    Callers authorize the target conversation's user AND project first. Origin
+    conversation IDs are provenance, never a grant (and may become NULL).
+    """
+    return (
+        select(ChatConversationMessage.message_id)
+        .join(ChatConversation, ChatConversation.id == ChatConversationMessage.conversation_id)
+        .join(ChatMessageGraph, ChatMessageGraph.id == ChatConversation.graph_id)
+        .where(
+            ChatConversationMessage.conversation_id == conversation_id,
+            ChatConversationMessage.message_id == message.id,
+            message.graph_id == ChatMessageGraph.id,
+            ChatMessageGraph.user_id == ChatConversation.user_id,
+            ChatMessageGraph.project_id == ChatConversation.project_id,
+        )
+        .correlate(message)
+        .exists()
+    )
+
+
+async def register_message(session: AsyncSession, *, conversation_id: str, message_id: int) -> None:
+    """Grant a newly authored message, under the destination conversation lock."""
+    message = await session.get(ChatMessage, message_id)
+    if message is None or message.conversation_id != conversation_id:
+        raise MessageGraphError("only an original message can be registered")
+    conversation = await session.get(ChatConversation, conversation_id)
+    graph = await session.get(ChatMessageGraph, message.graph_id)
+    if (
+        conversation is None or graph is None or conversation.graph_id != graph.id
+        or conversation.user_id != graph.user_id or conversation.project_id != graph.project_id
+    ):
+        raise MessageGraphError("message graph is outside the conversation owner scope")
+    if message.parent_id is not None:
+        parent = await session.scalar(
+            select(ChatMessage.id).where(
+                ChatMessage.id == message.parent_id, reachable_message_clause(conversation_id)
+            )
+        )
+        if parent is None:
+            raise MessageGraphError("message parent is outside the conversation view")
+    if await session.get(ChatConversationMessage, (conversation_id, message_id)) is None:
+        session.add(ChatConversationMessage(conversation_id=conversation_id, message_id=message_id))
+        await session.flush()
 
 
 async def ancestor_message_ids(
@@ -23,7 +76,7 @@ async def ancestor_message_ids(
     conversation_id: str,
     leaf_id: int | None,
 ) -> list[int]:
-    """Return root-to-leaf ids, rejecting missing parents, cross-session links, and cycles."""
+    """Return root-to-leaf IDs, rejecting missing/ungranted parents and cycles."""
     if leaf_id is None:
         return []
 
@@ -36,15 +89,14 @@ async def ancestor_message_ids(
         seen.add(current_id)
         row = (
             await session.execute(
-                select(ChatMessage.id, ChatMessage.parent_id, ChatMessage.conversation_id).where(
-                    ChatMessage.id == current_id
+                select(ChatMessage.id, ChatMessage.parent_id).where(
+                    ChatMessage.id == current_id,
+                    reachable_message_clause(conversation_id),
                 )
             )
         ).one_or_none()
         if row is None:
-            raise MessageGraphError("message ancestry contains a missing parent")
-        if row.conversation_id != conversation_id:
-            raise MessageGraphError("message ancestry crosses conversations")
+            raise MessageGraphError("message ancestry contains a missing or ungranted parent")
         reversed_ids.append(int(row.id))
         current_id = row.parent_id
 
@@ -59,7 +111,11 @@ async def projected_message_ids(
 ) -> list[int]:
     rows = await session.execute(
         select(ChatConversationActivePath.message_id)
-        .where(ChatConversationActivePath.conversation_id == conversation_id)
+        .join(ChatMessage, ChatMessage.id == ChatConversationActivePath.message_id)
+        .where(
+            ChatConversationActivePath.conversation_id == conversation_id,
+            reachable_message_clause(conversation_id),
+        )
         .order_by(ChatConversationActivePath.position.asc())
     )
     return [int(message_id) for message_id in rows.scalars().all()]
@@ -114,6 +170,11 @@ async def append_active_message(
     The caller owns the conversation lock and has already validated that the
     conversation's ``active_leaf_id`` equals ``parent_id``.
     """
+    message = await session.scalar(
+        select(ChatMessage).where(ChatMessage.id == message_id, reachable_message_clause(conversation_id))
+    )
+    if message is None or message.parent_id != parent_id:
+        raise MessageGraphError("append message is outside the conversation view or has a different parent")
     terminal = (
         await session.execute(
             select(

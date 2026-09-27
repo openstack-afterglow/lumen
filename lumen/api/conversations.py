@@ -321,7 +321,12 @@ async def delete_conversation(
         await cs.delete_conversation(
             conversation_id, user_id=token_info["user_id"], project_id=token_info["project_id"]
         )
-    except (cs.ConversationNotFound, cs.ConversationForbidden, cs.ChatStorageUnavailable) as exc:
+    except (
+        cs.ConversationNotFound,
+        cs.ConversationForbidden,
+        cs.ConversationRunActive,
+        cs.ChatStorageUnavailable,
+    ) as exc:
         raise _map_error(exc) from exc
 
 
@@ -422,7 +427,7 @@ async def set_active_leaf(
 async def fork_conversation(
     conversation_id: str, payload: ForkRequest, token_info: dict = Depends(require_scopes("native:conversations:write"))
 ):
-    """지정 메시지까지의 경로를 새 대화로 복사(분기). 소유자 동일, 원본 독립."""
+    """Create an independent conversation view sharing the selected immutable ancestry."""
     try:
         return await cs.fork_conversation(
             conversation_id,
@@ -430,5 +435,11 @@ async def fork_conversation(
             project_id=token_info["project_id"],
             message_id=payload.message_id,
         )
-    except (cs.ConversationNotFound, cs.ConversationForbidden, cs.ChatStorageUnavailable) as exc:
+    except (
+        cs.ConversationNotFound,
+        cs.ConversationForbidden,
+        cs.ConversationRunActive,
+        cs.HistoryIndexUnavailable,
+        cs.ChatStorageUnavailable,
+    ) as exc:
         raise _map_error(exc) from exc

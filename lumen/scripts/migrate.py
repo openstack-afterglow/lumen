@@ -76,9 +76,66 @@ def _statements(path: Path) -> list[str]:
     return [statement.strip() for statement in sql.split(";") if statement.strip()]
 
 
+async def _verify_graph_backfill(connection) -> None:
+    """Reject incomplete ownership before nullable graph columns become constrained."""
+    checks = (
+        (
+            """
+            SELECT conversation.id
+            FROM chat_conversations AS conversation
+            LEFT JOIN chat_message_graphs AS graph ON graph.id = conversation.graph_id
+            WHERE conversation.graph_id IS NULL OR conversation.graph_id IN ('', '0')
+               OR graph.id IS NULL OR graph.user_id <> conversation.user_id
+               OR graph.project_id <> conversation.project_id
+            LIMIT 1
+            """,
+            "conversation graph ownership is invalid",
+        ),
+        (
+            """
+            SELECT message.id
+            FROM chat_messages AS message
+            LEFT JOIN chat_message_graphs AS graph ON graph.id = message.graph_id
+            LEFT JOIN chat_conversations AS origin ON origin.id = message.conversation_id
+            WHERE message.graph_id IS NULL OR message.graph_id IN ('', '0') OR graph.id IS NULL
+               OR (message.conversation_id IS NOT NULL
+                   AND (origin.id IS NULL OR origin.graph_id <> message.graph_id))
+            LIMIT 1
+            """,
+            "message graph ownership is invalid",
+        ),
+        (
+            """
+            SELECT graph.id
+            FROM chat_message_graphs AS graph
+            LEFT JOIN chat_conversations AS conversation ON conversation.graph_id = graph.id
+            WHERE conversation.id IS NULL
+            LIMIT 1
+            """,
+            "message graph has no conversation mapping",
+        ),
+    )
+    for statement, reason in checks:
+        row = (await connection.exec_driver_sql(statement)).first()
+        if row is not None:
+            raise MigrationLedgerError(f"{reason}: id={row[0]}")
+
+
 async def _verify_active_paths(connection) -> None:
     """Fail closed when the additive active-path projection does not match immutable ancestry."""
+    await _verify_graph_backfill(connection)
     checks = (
+        (
+            """
+            SELECT membership.conversation_id
+            FROM chat_conversation_messages AS membership
+            JOIN chat_conversations AS conversation ON conversation.id = membership.conversation_id
+            JOIN chat_messages AS message ON message.id = membership.message_id
+            WHERE message.graph_id <> conversation.graph_id
+            LIMIT 1
+            """,
+            "message membership crosses graph ownership",
+        ),
         (
             """
             SELECT conversation.id
@@ -88,7 +145,7 @@ async def _verify_active_paths(connection) -> None:
             GROUP BY conversation.id, conversation.active_leaf_id
             HAVING (conversation.active_leaf_id IS NULL AND COUNT(path.message_id) <> 0)
                 OR (conversation.active_leaf_id IS NOT NULL
-                    AND SUM(path.message_id = conversation.active_leaf_id) <> 1)
+                    AND COALESCE(SUM(path.message_id = conversation.active_leaf_id), 0) <> 1)
             LIMIT 1
             """,
             "active leaf membership is invalid",
@@ -97,11 +154,14 @@ async def _verify_active_paths(connection) -> None:
             """
             SELECT path.conversation_id
             FROM chat_conversation_active_path AS path
-            JOIN chat_messages AS message ON message.id = path.message_id
-            WHERE message.conversation_id <> path.conversation_id
+            LEFT JOIN chat_messages AS message ON message.id = path.message_id
+            LEFT JOIN chat_conversation_messages AS membership
+              ON membership.conversation_id = path.conversation_id
+             AND membership.message_id = path.message_id
+            WHERE membership.message_id IS NULL OR message.id IS NULL
             LIMIT 1
             """,
-            "projected message belongs to another conversation",
+            "projected message has no reachable membership",
         ),
         (
             """
@@ -124,6 +184,7 @@ async def _verify_active_paths(connection) -> None:
             WHERE (current_path.position = 0 AND current_message.parent_id IS NOT NULL)
                OR (current_path.position > 0
                    AND (previous_path.message_id IS NULL
+                        OR current_message.parent_id IS NULL
                         OR current_message.parent_id <> previous_path.message_id))
             LIMIT 1
             """,
@@ -151,6 +212,20 @@ async def _verify_active_paths(connection) -> None:
         row = (await connection.exec_driver_sql(statement)).first()
         if row is not None:
             raise MigrationLedgerError(f"{reason}: conversation_id={row[0]}")
+
+
+async def _record_migration(connection, migration: Migration) -> None:
+    await connection.execute(
+        text(
+            "INSERT INTO schema_migrations (logical_id, relative_path, sha256, applied_at) "
+            "VALUES (:logical_id, :relative_path, :sha256, NOW(6))"
+        ),
+        {
+            "logical_id": migration.logical_id,
+            "relative_path": migration.relative_path,
+            "sha256": migration.sha256,
+        },
+    )
 
 
 async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
@@ -189,28 +264,35 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
                     continue
                 for statement in _statements(MIGRATIONS / migration.relative_path):
                     await connection.exec_driver_sql(statement)
-                await connection.execute(
-                    text(
-                        "INSERT INTO schema_migrations (logical_id, relative_path, sha256, applied_at) "
-                        "VALUES (:logical_id, :relative_path, :sha256, NOW(6))"
-                    ),
-                    {
-                        "logical_id": migration.logical_id,
-                        "relative_path": migration.relative_path,
-                        "sha256": migration.sha256,
-                    },
-                )
+                    if migration.logical_id == "019-shared-message-membership" and statement.startswith(
+                        "UPDATE chat_messages AS message"
+                    ):
+                        await _verify_graph_backfill(connection)
+                if migration.logical_id != "019-shared-message-membership":
+                    await _record_migration(connection, migration)
+                    continue
+            # DDL commits implicitly. Commit the data backfill before projecting
+            # unready histories, then verify everything before recording success.
+            await backfill_history(engine)
+            async with engine.begin() as connection:
+                await _verify_active_paths(connection)
+                await _record_migration(connection, migration)
         async with engine.begin() as connection:
             active_path_applied = (
                 await connection.execute(
                     text("SELECT 1 FROM schema_migrations WHERE logical_id = '012-chat-history-path'")
                 )
             ).scalar_one_or_none()
+            membership_applied = (
+                await connection.execute(
+                    text("SELECT 1 FROM schema_migrations WHERE logical_id = '019-shared-message-membership'")
+                )
+            ).scalar_one_or_none()
         if active_path_applied is not None:
             if apply:
                 await backfill_history(engine)
             unready = await count_unready(engine)
-            if unready == 0:
+            if unready == 0 and membership_applied is not None:
                 async with engine.begin() as connection:
                     await _verify_active_paths(connection)
         else:
