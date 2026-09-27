@@ -18,7 +18,7 @@ from lumen.services.infrastructure import bootstrap
 from lumen.services.infrastructure.transport import InternalTransport, InternalTransportError, resource_identity
 
 
-def _certificate(key, issuer, signer, *, san=None, client=False):
+def _certificate(key, issuer, signer, *, san=None, client=False, subject_key_id=None):
     subject = issuer if signer is key else x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, "Lumen test guest")])
     builder = (x509.CertificateBuilder().subject_name(subject)
@@ -27,7 +27,9 @@ def _certificate(key, issuer, signer, *, san=None, client=False):
         .not_valid_after(datetime.now(UTC) + timedelta(minutes=10)))
     if signer is key:
         builder = builder.add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        builder = builder.add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        builder = builder.add_extension(x509.SubjectKeyIdentifier(
+            subject_key_id if subject_key_id is not None else
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()).digest), critical=False)
         builder = builder.add_extension(x509.KeyUsage(
             digital_signature=True, content_commitment=False, key_encipherment=False,
             data_encipherment=False, key_agreement=False, key_cert_sign=True,
@@ -135,7 +137,8 @@ async def test_internal_transport_never_sends_capability_before_pin_and_san(tmp_
 async def test_controller_issued_sandbox_certificate_binds_the_signing_ca(monkeypatch):
     ca_key = ec.generate_private_key(ec.SECP256R1())
     ca_cert = _certificate(ca_key, x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, "Lumen test CA")]), ca_key)
+        x509.NameAttribute(NameOID.COMMON_NAME, "Lumen test CA")]), ca_key,
+        subject_key_id=b"\x12" * 20)
     now = datetime.now(UTC)
     token = "test-token-" + "a" * 48
     resource = SimpleNamespace(
