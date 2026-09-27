@@ -127,7 +127,7 @@ CI는 다음 7개 병렬 자동화 게이트로 구성된다.
   - trigger, dedup 조건(실제 step script를 stub `gh`로 실행), gate 식, `ci.yml` 잡 목록과 각 잡의 `!cancelled()`, cache export ref, health-check 창.
   - system 잡의 stdlib-only 실행 전제, 모든 uv COPY의 tag+digest 고정, Dockerfile layer 순서와 `COPY --chown`.
   - `tests/test_test_layers.py`는 compose 명령을 정확히 고정한다.
-- 규칙과 측정 기준선은 `AGENTS.md`의 "CI 파이프라인 성능 규정"을 따른다.
+- 규칙과 측정 기준선은 [CI 실행·성능 spec](../openspec/specs/ci-execution-performance/spec.md)을 따른다.
 
 ### Reusable Workflow 활용 예시 (Exact Refs)
 

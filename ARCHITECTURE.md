@@ -283,7 +283,7 @@ CI 형태(2026-09-24, source-reviewed, contract-tested, CI-unverified):
 
 변경 전 기준선(워크플로우별 최근 성공 20회):
 
-- docker-build 테스트 구간(실행 생성부터 마지막 `test / *` 잡 종료, 2026-09-11~09-23): 중앙값 176초, p90 217초. `AGENTS.md` 12번 규칙의 비교 기준이다.
+- docker-build 테스트 구간(실행 생성부터 마지막 `test / *` 잡 종료, 2026-09-11~09-23): 중앙값 176초, p90 217초. [CI 실행·성능 spec](openspec/specs/ci-execution-performance/spec.md)의 회귀 비교 기준이다.
 - docker-build 전체(같은 20회): 중앙값 558초, p90 665초.
 - 과거 지표인 독립 `ci.yml` 크리티컬 패스(2026-09-07~09-23)는 중앙값 171초, p90 194초였다. 이제 `ci.yml` 단독 push/PR 실행이 없어 다시 잴 수 없다.
 
@@ -311,7 +311,7 @@ docker 검증 상태:
 | auth/project scope | `lumen/auth.py`, API dependencies, SDK proxy | Keystone/API-key matrix, target-project invariant, security docs and auth tests |
 | deployment/config | `pyproject.toml`, `docker/Dockerfile`, `docker-compose*.yml`, `lumen/config.py`, `deploy/kolla/ansible/roles/lumen/` | root wheel shared data, service-extra boundary, root build context/stages, migration/bootstrap order, independent image defaults, operations docs and Kolla tests |
 | SDK surface | `sdk/lumen_sdk/{client,proxy,_api}.py`, `sdk/pyproject.toml` | package version, route mixin/transport tests, `docs/sdk.md` and this Code map |
-| CI workflow/test harness | `.github/workflows/docker-build.yml`, `.github/workflows/ci.yml`, `lumen/scripts/test_layers.py`, `docker/Dockerfile`, `docker-compose.system.yml` | `AGENTS.md` CI 파이프라인 성능 규정(전후 실측 median/p90), `tests/test_ci_shape.py`, `tests/test_test_layers.py`, `actionlint`, `docs/testing.md`, `docs/operations.md` |
+| CI workflow/test harness | `.github/workflows/docker-build.yml`, `.github/workflows/ci.yml`, `lumen/scripts/test_layers.py`, `docker/Dockerfile`, `docker-compose.system.yml` | [CI 실행·성능 spec](openspec/specs/ci-execution-performance/spec.md)의 전후 실측 median/p90, `tests/test_ci_shape.py`, `tests/test_test_layers.py`, `actionlint`, `docs/testing.md`, `docs/operations.md` |
 | bugfix/refactor with no architecture change | actual source and affected tests | root architecture Maintenance marker summary must state why ownership/flow/store contracts are unchanged; still run guard before completion/commit |
 
 ## Maintenance
@@ -330,9 +330,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9fcd3787be0cad2a4957d69a00525a07b31e29e74e5ce4a1b6c9024c90530d7a",
-  "reviewed_at": "2026-09-27T14:41:45Z",
-  "summary": "Migration 019 shared-message membership, provider-compliant title prompts, and haiku compaction exclusion verified with real MariaDB and live Anthropic API."
+  "source_sha256": "c3046a10c5c990606cb4f88a044d36c340e781e7f399ba2c4dbe9263fa9dcb27",
+  "reviewed_at": "2026-09-27T16:26:24Z",
+  "summary": "AGENTS.md 안내를 축약하고 ARCHITECTURE.md 및 docs/testing.md의 CI 참조를 durable OpenSpec으로 이동; 서비스 source/schema/책임 경계 변경 없음"
 }
 ```
 <!-- architecture-review:end -->
