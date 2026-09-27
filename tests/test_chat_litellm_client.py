@@ -367,6 +367,48 @@ async def test_anthropic_subscription_pins_oauth_transport_parameters(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_anthropic_subscription_drops_unsupported_sampling_parameters(monkeypatch):
+    """Exercise the installed mapper rather than only inspecting a global flag."""
+    provider_auth = {"provider_id": 8, "generation": 4, "auth_mode": "anthropic_subscription"}
+    wire_params = {}
+
+    async def resolve(ref):
+        return {"access_token": "sk-ant-oat01-request-local-token", "_fingerprint": "fingerprint"}
+
+    import litellm
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    monkeypatch.setitem(litellm.model_cost, "claude-opus-5-5", {"supports_sampling_params": False})
+
+    async def complete(**kwargs):
+        wire_params.update(
+            AnthropicConfig().map_openai_params(
+                non_default_params={"temperature": kwargs["temperature"], "max_tokens": kwargs["max_tokens"]},
+                optional_params={},
+                model=kwargs["model"],
+                drop_params=False,
+            )
+        )
+        return SimpleNamespace(choices=[])
+
+    monkeypatch.setattr(subscriptions, "resolve_subscription_credential", resolve)
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    monkeypatch.setattr(litellm, "drop_params", False)
+
+    await litellm_client.acompletion(
+        "anthropic-subscription/claude-opus-5-5",
+        [{"role": "user", "content": "hello"}],
+        custom_llm_provider="anthropic",
+        provider_auth=provider_auth,
+        temperature=0,
+        max_tokens=512,
+    )
+
+    assert "temperature" not in wire_params
+    assert wire_params["max_tokens"] == 512
+
+
+@pytest.mark.asyncio
 async def test_native_anthropic_forwards_claude_code_fields_and_protocol_headers(monkeypatch):
     captured = {}
 

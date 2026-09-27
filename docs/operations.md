@@ -32,7 +32,24 @@ Local/system Compose는 관리형 runtime이 비활성화된 `RUNTIME_CONFIG={}`
 | retention | run event/checkpoint/memory retention | 24h / 7d / 365d |
 | optional stores | `chat_checkpointer_postgres_url`, `chat_memory_pgvector_url`, `chat_asset_s3_*` | configured feature에만 필요 |
 | TLS/auth | `os_cacert`, `insecure`, Keystone fields | TLS verify 기본 활성; `insecure`는 예외적 개발 설정 |
-| Claude Gateway | `claude_gateway_base_url`, `claude_gateway_model`, `claude_gateway_provider`, `frontend_base_url` | public base는 origin + `/v1/claude-gateway`; loopback 외 HTTPS 필수; model/provider 모두 설정해야 inference 가능 |
+| Claude Gateway | `claude_gateway_base_url`, `claude_gateway_model`, `claude_gateway_provider`, `frontend_base_url` | public base는 origin + `/v1/claude-gateway`; loopback 외 HTTPS 필수; model/provider 모두 설정해야 inference 가능. 예시 기본 model은 `claude-opus-5-5`이며 provider catalog에 같은 model이 등록되어 있어야 한다 |
+
+`claude-opus-5-5`의 request 제약:
+- thinking을 끌 수 없다.
+- `temperature` 같은 sampling 파라미터를 받지 않는다.
+- 강제 `tool_choice`(`any`/`tool`)를 거부한다.
+
+Lumen의 chat/agent·title·compaction은 설치된 LiteLLM 1.93의 parameter mapping을 사용한다. 다음은 source 계약이며 live provider 수용 증거가 아니다.
+- 지원하는 `reasoning_effort`는 LiteLLM이 `thinking: {type: "adaptive"}`와 `output_config.effort`로 변환한다.
+- API-key와 subscription 경로 모두 `drop_params`로 지원하지 않는 `temperature`를 제거한다.
+- 이 모델에서 LiteLLM에 전달된 `reasoning_effort="none"`은 thinking을 끄지 않고 effort를 생략한다. 실제 비활성화를 보장하는 값으로 사용하지 않는다. Native admission의 Anthropic 예외와 별개로 title은 frozen route가 광고한 effort만 선택하므로 `low`가 광고되면 `low`, effort metadata가 없으면 provider 기본값을 사용한다.
+- 다른 provider의 명시 `none`은 disable capability가 없으면 422다. Operator 기본 `chat_reasoning_effort="none"`은 그런 모델에서 생략하며, GPT-5 tool round의 암묵 `none`도 frozen route의 disable capability가 있어야 보낸다. 오래된 models.dev import는 budget `min`/`max`를 얻도록 재등록해야 한다.
+- Worker가 고정한 provider/model `config_version_hash`별로 reasoning 오류를 기억한다. 이름이 같은 다른 route나 새 configuration에 memo를 공유하지 않으며, frozen identity가 없는 호출은 process-wide memo를 재사용하지 않는다. 검증된 명시 `none`은 stale LiteLLM probe 때문에 생략하거나 오류 후 provider 기본 reasoning으로 바꾸지 않는다.
+- OpenAI wire에서는 explicit `none`의 `reasoning_effort`만 LiteLLM whitelist에 추가해 unknown model에서 `drop_params`가 조용히 삭제하지 못하게 한다. Provider가 이 값을 실제 거부하면 실패를 그대로 처리하며, 이 OpenAI override를 Anthropic/Gemini native mapping에 적용하지 않는다.
+
+Caller가 파라미터를 소유하는 compat 경로는 Opus 5.5 제약을 대신 맞춰 주지 않는다.
+- Anthropic-native `/v1/messages` passthrough는 caller 파라미터를 바꾸지 않는다. `thinking.type: "disabled"`, `budget_tokens`, 강제 `tool_choice`를 보내면 provider의 400이 그대로 반환된다.
+- OpenAI-compatible `/v1/chat/completions`도 caller의 `tool_choice`를 전달한다. LiteLLM은 `required`를 제거하지 않고 Anthropic `{"type": "any"}`로 변환하므로 역시 provider 400이 된다.
 
 ### Chat asset S3 contract
 
@@ -57,6 +74,8 @@ Cloud profile은 project/region/interface/CA/Keystone application credential(env
 Sandbox guest의 cgroup v2 parent는 `cgroup.controllers`에 `cpu memory pids`가 보이는 것만으로 충분하지 않다. 관리자 프로세스를 별도 leaf cgroup으로 이동하고 지정한 `SANDBOX_CGROUP_PARENT/cgroup.subtree_control`에서 세 controller가 실제 활성화되었는지 확인한다. 누락 시 daemon/workload는 workspace tmpfs mount 이전에 실패한다. `packages/lumen-sandbox/IMAGE.md`의 disposable Docker 양쪽 아키텍처 검증은 namespace/메모리/PID/디스크/네트워크 한계의 **로컬** 증거일 뿐, 운영 Nova/KVM security group·bootstrap mTLS 검증을 대체하지 않는다.
 
 Cloud provider의 `ACTIVE`는 서비스 readiness가 아니다. Controller는 소유권 label과 generation, 1회용 bootstrap token(10분), controller CA로 검증된 CSR 서명, certificate fingerprint, worker registration/heartbeat 또는 API guest 전용 mTLS `/v1/ready`·sandbox `/readyz`를 별도로 확인한다. Nova API image는 `guest_bootstrap --role api -- COMMAND`를 **foreground** entrypoint로 사용해야 한다. Guest entrypoint는 별도 mTLS readiness port에서 loopback public HTTP `/v1/ready` 응답의 database/plugins/checkpointer 상태를 검증한다; operator probe client certificate와 해당 port에 접근 가능한 managed-network security group, public HTTP command의 `ingress_member_port` 일치가 필수다. Octavia 공개 member port를 mTLS probe port와 혼동하거나 guest command를 daemonize하지 않는다. Trusted certificate는 1시간이며 boot timeout + max lifetime + drain grace + 60초 안전 여유가 이 안에 들어가야 한다. Controller는 새 ingress admission을 막고 resource 삭제를 요청하며, API guest supervisor는 certificate 만료 최소 60초 전에 public process group을 종료한다. Controller/Octavia 장애 시에도 이 foreground supervisor가 실행 중이어야 만료 후 외부 admission을 막을 수 있다. Sandbox는 run deadline을 포함한 인증서를 받아야 하고 인바운드 mTLS/권한 검증 외의 네트워크와 서비스 credential을 갖지 않는다. `GET /v1/admin/runtime-pools`, `/v1/admin/runtime-resources`, `/v1/admin/agent-project-quotas/{project_id}`(Keystone admin)로 inventory/기본 0의 project cap과 reservation을 관측한다. 이는 provider 실측 smoke를 대신하지 않는다.
+
+Managed runtime의 controller CA에는 `BasicConstraints CA=true`, `KeyUsage keyCertSign`, `SubjectKeyIdentifier`가 필요하다. Bootstrap이 서명한 guest leaf에는 CA 공개키에서 계산한 `AuthorityKeyIdentifier`가 들어간다. 최신 OpenSSL의 strict X.509 검증은 이 식별자가 없으면 dispatch 전에 TLS 연결을 거부한다. 기존 CA를 자동 교체하지 말고 실제 운영 CA 확장과 guest mTLS 연결을 확인한다.
 
 Octavia member create/re-enable는 MariaDB pool lease fence 아래에서 실행되지만 SDK가 Octavia에 반영한 뒤 응답 전에 실패하면 member ID가 원장에 기록되지 않을 수 있다. API guest를 제거하거나 해당 pool을 정상 완료로 판단하기 전 Octavia pool에서 `lumen-<resource_id>` member를 조회하고 남은 enabled member를 operator가 disable/delete한다. Name 조회가 일시적으로 비어 있는 경우에도 실제 cloud 상태 확인 없이 삭제 완료나 traffic 차단을 추정하지 않는다.
 
@@ -151,11 +170,11 @@ Lumen의 root `lumen` wheel은 Kolla 역할을 shared data로 포함한다. Koll
 - **PostgreSQL 모드 선택**: 기본값 `lumen_postgres_mode="external"`은 `lumen_external_postgres_url`이 반드시 필요하다. 역할이 PostgreSQL을 관리하게 하려면 `/etc/kolla/config/afterglow/globals.yml`에서 `lumen_postgres_mode: "bundled"`를 선택하고 `secrets.yml`에 강한 `lumen_postgres_password`를 제공한다. 둘 중 하나를 명시하지 않은 stock defaults는 precheck에서 fail-closed 한다.
 
 ### 2. 독립 wheel/image release
-- **root package release**: `v0.3.0` tag push 시 `.github/workflows/release.yml`은 `lumen.__version__ == 0.3.0` lockstep을 확인하고 root·plugin·sandbox wheel을 GitHub Release에 첨부한다. `workflow_dispatch`는 tag 비교와 Release 첨부를 수행하지 않는다. `uv.lock`의 root distribution도 0.3.0이어야 한다.
-- **runtime image tag**: Kolla 역할의 API/worker/controller `lumen_image_tag` 기본값은 `0.3.0`이다. `.github/workflows/docker-build.yml`의 별도 `v0.3.0` 실행이 `linux/amd64,linux/arm64` 이미지를 GHCR에 성공적으로 게시하기 전에는 해당 ref를 사용해 배포하지 않는다. Wheel Release 성공만으로 이미지 게시가 보장되지 않는다. 게시 전에는 이미 확인한 이미지 tag/digest로 명시적으로 override한다. `lumen_source_version`은 별도 source-build commit pin이므로 release tag와 동기화하지 않는다.
+- **root package release**: `v0.3.1` tag push 시 `.github/workflows/release.yml`은 `lumen.__version__ == 0.3.1` lockstep을 확인하고 root·plugin·sandbox wheel을 GitHub Release에 첨부한다. `workflow_dispatch`는 tag 비교와 Release 첨부를 수행하지 않는다. `uv.lock`의 root distribution도 0.3.1이어야 한다.
+- **runtime image tag**: Kolla 역할의 API/worker/controller `lumen_image_tag` 기본값은 `0.3.1`이다. `.github/workflows/docker-build.yml`의 별도 `v0.3.1` 실행이 `linux/amd64,linux/arm64` 이미지를 GHCR에 성공적으로 게시하기 전에는 해당 ref를 사용해 배포하지 않는다. Wheel Release 성공만으로 이미지 게시가 보장되지 않는다. 게시 전에는 이미 확인한 이미지 tag/digest로 명시적으로 override한다. `lumen_source_version`은 별도 source-build commit pin이므로 release tag와 동기화하지 않는다.
 - **기본 이미지 네임스페이스**: Kolla 역할은 `ghcr.io/openstack-afterglow/lumen-api:<image-tag>`, `ghcr.io/openstack-afterglow/lumen-worker:<image-tag>`, runtime-enabled일 때 `ghcr.io/openstack-afterglow/lumen-controller:<image-tag>`를 사용한다. `ghcr.io/openstack-afterglow/lumen-sandbox`는 별도 게시 이미지이며 Kolla 서비스 컨테이너가 아니라 운영자가 sandbox cloud pool `image`에 정확한 ref로 지정한다. Operator는 역할의 exact digest ref override를 그대로 유지할 수 있다.
 
-0.3.0 게시 계약: release commit에서 root manifest·`lumen.__version__`·`uv.lock`이 모두 `0.3.0`인지 확인하고, `uv sync --extra service --extra dev --frozen` 및 `uv run lumen-test contract`, `uv run lumen-test integration`, `uv run lumen-test system`을 실행한다. 추가 CI gate는 `.github/workflows/ci.yml`의 plugin conformance 5개, sandbox wheel/test, SDK test/lint, Kolla asset test다. Root wheel `uv build --wheel`과 독립 plugin/sandbox wheels, Kolla shared-data asset 검증은 `release.yml`이 소유한다. 승인된 release commit에 `v0.3.0` tag를 붙여 push하면 두 tag-triggered workflow가 각각 `ci.yml`을 호출한다(중복 실행). `release-package`는 root version/tag 일치 시 wheels를 GitHub Release에 첨부하고, `build-and-push`는 통과한 test job 뒤 API/worker/controller/sandbox 멀티 아키텍처 이미지를 GHCR `0.3.0`과 `sha-<short-sha>`로 게시한다. 두 workflow 결과·각 이미지의 두 플랫폼 manifest·운영 환경의 readiness/migration을 별도로 확인한 뒤 wheel/Kolla 기본값을 배포한다. 이번 version metadata 변경 자체는 이러한 빌드·테스트·게시·실환경 배포를 수행했다는 증거가 아니다.
+0.3.1 게시 계약: release commit에서 root manifest·`lumen.__version__`·`uv.lock`이 모두 `0.3.1`인지 확인하고, `uv sync --extra service --extra dev --frozen` 및 `uv run lumen-test contract`, `uv run lumen-test integration`, `uv run lumen-test system`을 실행한다. 추가 CI gate는 `.github/workflows/ci.yml`의 plugin conformance 5개, sandbox wheel/test, SDK test/lint, Kolla asset test다. Root wheel `uv build --wheel`과 독립 plugin/sandbox wheels, Kolla shared-data asset 검증은 `release.yml`이 소유한다. 승인된 release commit에 `v0.3.1` tag를 붙여 push하면 두 tag-triggered workflow가 각각 `ci.yml`을 호출한다(중복 실행). `release-package`는 root version/tag 일치 시 wheels를 GitHub Release에 첨부하고, `build-and-push`는 통과한 test job 뒤 API/worker/controller/sandbox 멀티 아키텍처 이미지를 GHCR `0.3.1`과 `sha-<short-sha>`로 게시한다. 두 workflow 결과·각 이미지의 두 플랫폼 manifest·운영 환경의 readiness/migration을 별도로 확인한 뒤 wheel/Kolla 기본값을 배포한다. 이번 version metadata 변경 자체는 이러한 빌드·테스트·게시·실환경 배포를 수행했다는 증거가 아니다.
 
 ### 3. 운영자 동기화
 - **역할 업데이트**: 새 root wheel을 Kolla environment에 재설치하여 `share/kolla-ansible/ansible/roles/lumen` 자산을 동기화한다.

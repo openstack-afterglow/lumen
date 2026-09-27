@@ -145,6 +145,8 @@ async def exchange_bootstrap_token(token: str, csr_pem: str, config: RuntimeConf
                                              key_encipherment=False, data_encipherment=False,
                                              key_agreement=False, key_cert_sign=False, crl_sign=False,
                                              encipher_only=False, decipher_only=False), critical=True)
+                .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_certificate.public_key()),
+                               critical=False)
                 .add_extension(x509.ExtendedKeyUsage(usages), critical=False)
                 .add_extension(x509.SubjectAlternativeName(names), critical=False)
                 .sign(ca_key, None if isinstance(ca_key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)) else hashes.SHA256()))

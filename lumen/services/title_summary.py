@@ -265,12 +265,14 @@ async def generate_title(*, exchange: Sequence[Mapping[str, Any]], route: Mappin
         "temperature": 0.0,
     }
     params = {key: value for key, value in params.items() if value is not None}
-    # Send only an effort the frozen route advertises; the wrapper still drops
-    # it when LiteLLM/ChatGPT metadata reports no reasoning support.
+    # Send only an effort the frozen route advertises, through the wrapper's
+    # extra options rather than an unsupported top-level keyword argument.
     effort = _title_reasoning_effort(route)
     reasoning_params = getattr(litellm_client, "_reasoning_params", None)
     if effort is not None and callable(reasoning_params):
-        params.update(reasoning_params(model, effort, route.get("provider_type")))
+        reasoning = reasoning_params(model, effort, route.get("provider_type"))
+        if reasoning:
+            params["extra"] = reasoning
     response = await litellm_client.acompletion(model, messages, **params)
     raw = _resp_text(response)
     title = _clean(raw)

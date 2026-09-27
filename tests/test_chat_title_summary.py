@@ -131,13 +131,15 @@ def _effort_caps(*values):
 async def _title_kwargs(monkeypatch, route, *, supports_reasoning=True):
     observed = {}
 
-    async def fake_acompletion(_model, _messages, **kwargs):
+    async def fake_acompletion(**kwargs):
         observed.update(kwargs)
         return _resp("배포 권한 점검")
 
     monkeypatch.setattr("litellm.supports_reasoning", lambda **_kwargs: supports_reasoning)
-    monkeypatch.setattr(ts.litellm_client, "acompletion", fake_acompletion)
-    await ts.generate_title(exchange=_EXCHANGE, route=route)
+    monkeypatch.setattr("litellm.drop_params", False)
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    result = await ts.generate_title(exchange=_EXCHANGE, route=route)
+    assert result.title == "배포 권한 점검"
     return observed
 
 
@@ -205,3 +207,13 @@ async def test_title_omits_advertised_effort_when_provider_probe_rejects_reasoni
     )
 
     assert "reasoning_effort" not in kwargs
+
+
+async def test_title_preserves_advertised_none_with_stale_provider_catalogue(monkeypatch):
+    kwargs = await _title_kwargs(
+        monkeypatch,
+        {"model_name": "new-reasoning-model", "provider_type": "openai", "capabilities": _effort_caps("none", "low")},
+        supports_reasoning=False,
+    )
+
+    assert kwargs["reasoning_effort"] == "none"

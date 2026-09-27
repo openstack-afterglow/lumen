@@ -39,11 +39,11 @@ logger = logging.getLogger(__name__)
 
 _MAX_TOOL_STEPS = 4  # 툴 실행 라운드 상한(무한 루프 방지) — 초과 시 마지막 턴을 최종 답변으로
 
-# Generic reasoning rejections are retried without the parameter.
+# Frozen route configuration hashes whose reasoning parameters were rejected.
 _REASONING_UNSUPPORTED: set[str] = set()
-# OpenAI Chat Completions models that require the explicit `none` value when tools are sent.
+# Frozen route configuration hashes that require explicit none for tool requests.
 _TOOL_REASONING_EXPLICIT_NONE: set[str] = set()
-# Models whose implicit tool-round `none` was rejected; later rounds keep the provider default.
+# Frozen routes whose implicit none was rejected; other routes/versions are unaffected.
 _TOOL_REASONING_NONE_REJECTED: set[str] = set()
 _MAX_INTERNAL_TOOL_CALL_ID = 190
 _DELEGATE_TOOL_NAME = "delegate_agent"
@@ -65,7 +65,6 @@ def _requires_explicit_none_for_tools(
         custom_llm_provider == "openai"
         and reasoning_can_be_disabled
         and model.strip().lower().startswith("gpt-5")
-        and model not in _TOOL_REASONING_NONE_REJECTED
         and normalized_effort in {None, "", "auto"}
     )
 
@@ -624,11 +623,15 @@ def _build_graph(params: dict, ctx: ToolContext):
         # Do not send its instructions to another model call before rechecking.
         await boundary("revalidate_skills")
 
-        reasoning_effort = None if params["model"] in _REASONING_UNSUPPORTED else params.get("reasoning_effort")
+        reasoning_route_key = params.get("reasoning_route_key")
+        reasoning_effort = params.get("reasoning_effort")
+        if reasoning_effort != "none" and reasoning_route_key in _REASONING_UNSUPPORTED:
+            reasoning_effort = None
         # A capability-derived `none` is a guess; a conflict-proven one is not.
         implicit_none_for_tools = (
             bool(schemas)
-            and params["model"] not in _TOOL_REASONING_EXPLICIT_NONE
+            and reasoning_route_key not in _TOOL_REASONING_EXPLICIT_NONE
+            and reasoning_route_key not in _TOOL_REASONING_NONE_REJECTED
             and _requires_explicit_none_for_tools(
                 params["model"],
                 params.get("custom_llm_provider"),
@@ -637,7 +640,7 @@ def _build_graph(params: dict, ctx: ToolContext):
             )
         )
         disable_reasoning_for_tools = implicit_none_for_tools or (
-            bool(schemas) and params["model"] in _TOOL_REASONING_EXPLICIT_NONE
+            bool(schemas) and reasoning_route_key in _TOOL_REASONING_EXPLICIT_NONE
         )
         attempt = 0
 
@@ -683,12 +686,12 @@ def _build_graph(params: dict, ctx: ToolContext):
                 logger.warning("litellm 스트림 초기화 오류 model=%s", params.get("model"), exc_info=True)
                 # Durable hooks abort the round at provider_failed, so learn before the boundary:
                 # the next round or run then avoids the rejected shape instead of repeating it.
-                if schemas and isinstance(exc, Exception):
+                if schemas and reasoning_route_key and isinstance(exc, Exception):
                     if disable_reasoning and implicit_none_for_tools and _is_reasoning_none_rejection(exc):
-                        _TOOL_REASONING_NONE_REJECTED.add(params["model"])
+                        _TOOL_REASONING_NONE_REJECTED.add(reasoning_route_key)
                     elif not disable_reasoning and _is_tool_reasoning_conflict(exc):
-                        _TOOL_REASONING_EXPLICIT_NONE.add(params["model"])
-                        _TOOL_REASONING_NONE_REJECTED.discard(params["model"])
+                        _TOOL_REASONING_EXPLICIT_NONE.add(reasoning_route_key)
+                        _TOOL_REASONING_NONE_REJECTED.discard(reasoning_route_key)
                 failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
                 if _abort_code(failure) is not None:
                     raise _BoundaryAbort(_abort_code(failure))
@@ -744,7 +747,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                     logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
                     writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
                     return {"model_failed": True, "pending_tool_calls": []}
-            elif reasoning_effort:
+            elif reasoning_effort and reasoning_effort != "none":
                 logger.warning(
                     "reasoning 포함 요청 실패 — reasoning 없이 재시도 model=%s", params.get("model"), exc_info=True
                 )
@@ -757,7 +760,8 @@ def _build_graph(params: dict, ctx: ToolContext):
                     logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
                     writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
                     return {"model_failed": True, "pending_tool_calls": []}
-                _REASONING_UNSUPPORTED.add(params["model"])
+                if reasoning_route_key:
+                    _REASONING_UNSUPPORTED.add(reasoning_route_key)
             else:
                 logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
                 writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
@@ -1679,6 +1683,7 @@ async def stream(
     temperature: float | None = None,
     reasoning_effort: str | None = None,
     reasoning_can_be_disabled: bool = False,
+    reasoning_route_key: str | None = None,
     selected_tool_ids: tuple[int, ...] | None = None,
     selected_mcp_ids: tuple[int, ...] | None = None,
     expected_mcp_credential_versions: tuple[tuple[int, int], ...] | None = None,
@@ -1717,6 +1722,7 @@ async def stream(
         "temperature": temperature,
         "reasoning_effort": reasoning_effort,
         "reasoning_can_be_disabled": reasoning_can_be_disabled,
+        "reasoning_route_key": reasoning_route_key,
         "execution_hooks": execution_hooks,
         "response_format": response_format,
         "execution_protocol_version": execution_protocol_version,

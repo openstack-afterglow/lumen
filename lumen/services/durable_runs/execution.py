@@ -2284,6 +2284,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
             reasoning_can_be_disabled=reasoning_can_be_disabled(
                 resolved.get("capabilities"), resolved.get("provider_type")
             ),
+            reasoning_route_key=resolved.get("config_version_hash"),
             response_format=_provider_response_format(payload.get("features")),
             selected_tool_ids=selected_tool_ids,
             selected_mcp_ids=selected_mcp_ids,

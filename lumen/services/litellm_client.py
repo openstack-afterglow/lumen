@@ -283,7 +283,9 @@ def _litellm_component_rates(
     for candidate in _pricing_model_candidates(model, provider_type):
         # Provider calculators can return zero for unknown IDs. A successful
         # calculation is not evidence of a published (including explicitly free) price.
-        catalog_key = f"{provider_type}/{candidate}" if provider_type else candidate
+        catalog_key = candidate
+        if provider_type and not candidate.startswith(f"{provider_type}/"):
+            catalog_key = f"{provider_type}/{candidate}"
         metadata = litellm.model_cost.get(catalog_key) or litellm.model_cost.get(candidate)
         if not isinstance(metadata, dict):
             continue
@@ -519,13 +521,17 @@ _OMIT_EFFORTS = {"", "auto", "off", "disabled", "false"}
 
 
 def _reasoning_params(model: str, effort: str | None, custom_llm_provider: str | None) -> dict[str, Any]:
-    """Attach reasoning only when side-effect-free metadata or provider probes support it."""
+    """Preserve explicit none; probe metadata before enabling other reasoning efforts."""
     if effort is None:
         return {}
     normalized = effort.strip().lower()
     if normalized in _OMIT_EFFORTS:
         return {}
-    if normalized != "none" and normalized not in _VALID_EFFORTS:
+    # Admission validates explicit none against the frozen route. A stale
+    # LiteLLM catalogue must not turn that choice back into provider-default reasoning.
+    if normalized == "none":
+        return {"reasoning_effort": "none"}
+    if normalized not in _VALID_EFFORTS:
         return {}
     normalized_model = litellm_model_name(model)
     if custom_llm_provider == "chatgpt" or model.startswith("chatgpt/"):
@@ -632,6 +638,13 @@ def _build_params(
         params["tools"] = tools
     if extra:
         params.update(extra)
+    if custom_llm_provider == "openai" and params.get("reasoning_effort") == "none":
+        # Opaque OpenAI routes can advertise none before LiteLLM knows the model.
+        # Preserve that exact wire option despite drop_params, without overriding
+        # native Anthropic/Gemini mappings or allowing unrelated parameters.
+        allowed = params.get("allowed_openai_params") or ()
+        if "reasoning_effort" not in allowed:
+            params["allowed_openai_params"] = [*allowed, "reasoning_effort"]
     return params
 
 
@@ -793,6 +806,9 @@ async def _subscription_completion(
         if not isinstance(access_token, str) or not access_token:
             raise ProviderSubscriptionError("subscription_auth_required", 502)
         normalized_model = litellm_model_name(model)
+        # Same contract as the API-key path: let LiteLLM drop sampling params it knows
+        # the model rejects (e.g. temperature != 1 on claude-opus-5-5) instead of raising.
+        litellm.drop_params = True
         logging_obj = SubscriptionLogging(
             model=normalized_model,
             provider="anthropic",

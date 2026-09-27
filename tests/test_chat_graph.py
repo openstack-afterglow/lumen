@@ -556,10 +556,49 @@ class TestGraphStream:
         ]
         assert captured.get("reasoning_effort") == "high"
 
+    @pytest.mark.parametrize("probe_raises", [False, True])
+    async def test_explicit_none_survives_stale_probe_and_installed_openai_mapper(self, monkeypatch, probe_raises):
+        from litellm.utils import get_optional_params
+
+        provider_calls = []
+
+        def supports_reasoning(**_kwargs):
+            if probe_raises:
+                raise RuntimeError("catalogue unavailable")
+            return False
+
+        async def provider_completion(**kwargs):
+            # Exercise the installed whitelist/mapper, not merely the wrapper kwargs.
+            provider_calls.append(
+                get_optional_params(
+                    model=kwargs["model"],
+                    custom_llm_provider=kwargs["custom_llm_provider"],
+                    reasoning_effort=kwargs.get("reasoning_effort"),
+                    allowed_openai_params=kwargs.get("allowed_openai_params"),
+                    drop_params=True,
+                )
+            )
+            return _aiter([_Chunk("답변"), _Chunk(None, usage={"prompt_tokens": 1, "completion_tokens": 1})])
+
+        monkeypatch.setattr("litellm.supports_reasoning", supports_reasoning)
+        monkeypatch.setattr("litellm.drop_params", False)
+        monkeypatch.setattr("litellm.acompletion", provider_completion)
+        events = [
+            event
+            async for event in graph.stream(
+                model="new-reasoning-model", messages=_MSGS, project_id="p1", user_id="u1",
+                custom_llm_provider="openai", reasoning_effort="none",
+                reasoning_can_be_disabled=True, reasoning_route_key="new-route-v1",
+            )
+        ]
+
+        assert [call.get("reasoning_effort") for call in provider_calls] == ["none"]
+        assert any(event["type"] == "token" for event in events)
+
     async def test_tool_reasoning_conflict_retries_with_explicit_none(self, monkeypatch):
         model = "gpt-tool-reasoning-conflict"
-        graph._REASONING_UNSUPPORTED.discard(model)
-        graph._TOOL_REASONING_EXPLICIT_NONE.discard(model)
+        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
         calls: list[dict] = []
 
         async def fake_schemas(_ctx):
@@ -576,24 +615,24 @@ class TestGraphStream:
         events = [
             ev
             async for ev in graph.stream(
-                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="high"
+                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="high",
+                reasoning_route_key="route-a-v1",
             )
         ]
 
         assert any(event["type"] == "token" for event in events)
         assert [call.get("extra") for call in calls] == [None, {"reasoning_effort": "none"}]
-        assert model in graph._TOOL_REASONING_EXPLICIT_NONE
 
         calls.clear()
         _ = [
             ev
             async for ev in graph.stream(
-                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="high"
+                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="high",
+                reasoning_route_key="route-a-v1",
             )
         ]
         assert [call.get("reasoning_effort") for call in calls] == [None]
         assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
-        graph._TOOL_REASONING_EXPLICIT_NONE.discard(model)
 
     async def test_gpt5_tools_auto_starts_with_explicit_none_before_durable_boundary(self, monkeypatch):
         model = "gpt-5.6-luna"
@@ -710,7 +749,7 @@ class TestGraphStream:
         monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
 
-        async def run_once():
+        async def run_once(route_key="route-a-v1"):
             return [
                 ev
                 async for ev in graph.stream(
@@ -721,6 +760,7 @@ class TestGraphStream:
                     custom_llm_provider="openai",
                     reasoning_effort=effort,
                     reasoning_can_be_disabled=True,
+                    reasoning_route_key=route_key,
                     execution_hooks=DurableHooks(),
                 )
             ]
@@ -728,9 +768,6 @@ class TestGraphStream:
         first = await run_once()
         assert [event.get("code") for event in first if event["type"] == "error"] == ["provider_result_unknown"]
         assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
-        assert model in graph._TOOL_REASONING_NONE_REJECTED
-        # The reasoning-capable model must not be demoted for later explicit efforts.
-        assert model not in graph._REASONING_UNSUPPORTED
 
         calls.clear()
         second = await run_once()
@@ -739,6 +776,12 @@ class TestGraphStream:
         assert [call.get("extra") for call in calls] == [None]
         assert [call.get("reasoning_effort") for call in calls] == [effort]
         assert len(failed) == 1
+
+        # Another provider/model row or a new frozen version must not inherit the rejection.
+        calls.clear()
+        other = await run_once("route-b-v1")
+        assert [event.get("code") for event in other if event["type"] == "error"] == ["provider_result_unknown"]
+        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
 
     async def test_hookless_rejected_implicit_none_retries_default_in_same_round(self, monkeypatch):
         model = "gpt-5-stale-metadata"
@@ -775,8 +818,6 @@ class TestGraphStream:
         assert any(event["type"] == "token" for event in events)
         assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}, None]
         assert [call.get("reasoning_effort") for call in calls] == [None, "auto"]
-        assert model in graph._TOOL_REASONING_NONE_REJECTED
-        assert model not in graph._REASONING_UNSUPPORTED
 
     async def test_implicit_none_transient_failure_is_not_memoized_or_retried(self, monkeypatch):
         model = "gpt-5.1-flaky"
@@ -810,8 +851,6 @@ class TestGraphStream:
 
         assert any(event["type"] == "error" for event in events)
         assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
-        assert model not in graph._TOOL_REASONING_NONE_REJECTED
-        assert model not in graph._REASONING_UNSUPPORTED
 
     async def test_durable_tool_conflict_without_metadata_fails_once_then_sends_none(self, monkeypatch):
         """A gpt-5.x route without advertised `none` that needs it learns from one failed run."""
@@ -840,7 +879,7 @@ class TestGraphStream:
         monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
 
-        async def run_once():
+        async def run_once(route_key="route-a-v1"):
             return [
                 ev
                 async for ev in graph.stream(
@@ -851,24 +890,29 @@ class TestGraphStream:
                     custom_llm_provider="openai",
                     reasoning_effort="auto",
                     reasoning_can_be_disabled=False,
+                    reasoning_route_key=route_key,
                     execution_hooks=DurableHooks(),
                 )
             ]
 
         first = await run_once()
         assert [event.get("code") for event in first if event["type"] == "error"] == ["provider_result_unknown"]
-        assert model in graph._TOOL_REASONING_EXPLICIT_NONE
 
         calls.clear()
         second = await run_once()
         assert any(event["type"] == "token" for event in second)
         assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
 
+        for route_key in ("route-b-v1", "route-a-v2", None):
+            calls.clear()
+            other = await run_once(route_key)
+            assert [event.get("code") for event in other if event["type"] == "error"] == ["provider_result_unknown"]
+            assert [call.get("extra") for call in calls] == [None]
+
     async def test_tool_conflict_after_rejected_none_restores_explicit_none(self, monkeypatch):
-        model = "gpt-5.6-luna"
         monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
         monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", {model})
+        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
         calls: list[dict] = []
 
         async def fake_schemas(_ctx):
@@ -876,29 +920,29 @@ class TestGraphStream:
 
         async def fake_stream(**kwargs):
             calls.append(kwargs)
-            if kwargs.get("extra") is None:
+            if len(calls) == 1:
+                raise RuntimeError("Unsupported value: reasoning_effort does not support none")
+            if len(calls) == 3:
                 raise RuntimeError("Function tools with reasoning_effort are not supported")
             return _aiter([_Chunk("답변")])
 
         monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
 
-        _ = [
-            ev
-            async for ev in graph.stream(
-                model=model,
-                messages=_MSGS,
-                project_id="p1",
-                user_id="u1",
-                custom_llm_provider="openai",
-                reasoning_effort="auto",
-                reasoning_can_be_disabled=True,
-            )
-        ]
+        for _ in range(2):
+            events = [
+                ev
+                async for ev in graph.stream(
+                    model="gpt-5.6-luna", messages=_MSGS, project_id="p1", user_id="u1",
+                    custom_llm_provider="openai", reasoning_effort="auto",
+                    reasoning_can_be_disabled=True, reasoning_route_key="route-a-v1",
+                )
+            ]
+            assert any(event["type"] == "token" for event in events)
 
-        assert [call.get("extra") for call in calls] == [None, {"reasoning_effort": "none"}]
-        assert model in graph._TOOL_REASONING_EXPLICIT_NONE
-        assert model not in graph._TOOL_REASONING_NONE_REJECTED
+        assert [call.get("extra") for call in calls] == [
+            {"reasoning_effort": "none"}, None, None, {"reasoning_effort": "none"},
+        ]
 
     async def test_gpt5_tools_preserve_explicit_reasoning_effort(self, monkeypatch):
         calls: list[dict] = []
@@ -932,8 +976,8 @@ class TestGraphStream:
         """reasoning 파라미터 400(예: Claude thinking.type 불일치) → reasoning 없이 재시도해 채팅 유지 +
         해당 모델을 캐시해 이후 요청은 처음부터 reasoning 생략."""
         model = "claude-fallback-test"
-        graph._REASONING_UNSUPPORTED.discard(model)
-        graph._TOOL_REASONING_EXPLICIT_NONE.discard(model)
+        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
+        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
         calls: list[dict] = []
 
         async def fake_stream(**kwargs):
@@ -946,27 +990,47 @@ class TestGraphStream:
         events = [
             ev
             async for ev in graph.stream(
-                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="low"
+                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="low",
+                reasoning_route_key="route-a-v1",
             )
         ]
         # 재시도로 정상 응답, error 이벤트 없음
         assert any(e["type"] == "token" for e in events)
         assert not any(e["type"] == "error" for e in events)
         assert [call.get("reasoning_effort") for call in calls] == ["low", None]
-        assert model in graph._REASONING_UNSUPPORTED
 
         # 캐시 이후: 다음 요청은 처음부터 reasoning 없이(실패 요청 반복 안 함)
         calls.clear()
         _ = [
             ev
             async for ev in graph.stream(
-                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="low"
+                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="low",
+                reasoning_route_key="route-a-v1",
             )
         ]
         assert [call.get("reasoning_effort") for call in calls] == [None]
         assert [call.get("extra") for call in calls] == [None]
-        graph._REASONING_UNSUPPORTED.discard(model)
-        graph._TOOL_REASONING_EXPLICIT_NONE.discard(model)
+        calls.clear()
+        _ = [
+            ev
+            async for ev in graph.stream(
+                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="low",
+                reasoning_route_key="route-a-v2",
+            )
+        ]
+        assert [call.get("reasoning_effort") for call in calls] == ["low", None]
+
+        # Explicit disable intent is not silently replaced with provider-default reasoning.
+        calls.clear()
+        events = [
+            ev
+            async for ev in graph.stream(
+                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="none",
+                reasoning_route_key="route-a-v1",
+            )
+        ]
+        assert [call.get("reasoning_effort") for call in calls] == ["none"]
+        assert any(event["type"] == "error" for event in events)
 
     async def test_error_on_start_failure(self, monkeypatch):
         async def fake_fail(**kwargs):
