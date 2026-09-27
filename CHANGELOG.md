@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Native conversations now share an owner-scoped immutable message graph on new forks. Each fork owns title, active path, revision and explicit ancestor memberships; unchanged encrypted message/asset data is no longer copied. Removing a source preserves surviving forks; removing the last view collects the graph. Latest-first cursor pages, durable run replay, inherited title exchange and owner/project isolation retain their native API contracts.
+- Additive migration `019_shared_message_membership.sql` and a resumable integrity/backfill guard require a **stopped-writer, backed-up** MariaDB cutover before starting matching API/worker images. Old writers cannot run against this schema and downgrade requires restoring the pre-cutover database and old images together. Isolated MariaDB migration (twice), complete 70-test integration layer and direct graph lifecycle smoke passed; public provider inference and production rollout remain unverified.
+
 ## 0.3.1 (development release candidate)
 
 Changes since `v0.3.0`:

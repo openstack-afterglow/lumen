@@ -7,7 +7,7 @@ Lumen의 테스트 시스템은 로컬 개발부터 외부 배포 검증까지 �
 | 계층 (Layer) | 주요 실행 명령 (Primary Command) | Real (실제 구성요소) | Faked (모의 구성요소) | 경계 (Boundary Covered) | 사용 목적 및 비용 (Expected Use & Cost) |
 | --- | --- | --- | --- | --- | --- |
 | **Contract** | `uv run lumen-test contract`; plugin/sandbox package tests separately | 실제 Python 서비스 로직, in-process ASGI, plugin conformance kit/standalone sandbox unit logic | MariaDB, Redis, 외부 Provider, Keystone, 실제 cloud/guest | plugin manifest/allowlist, API/SDK schema, controller fencing/scheduler 및 sandbox capability/isolation logic, Ruff | 빠른 피드백; 실제 cloud provisioning/host 격리를 증명하지 않음 |
-| **Integration** | `uv run lumen-test integration` | 실제 MariaDB 11, Redis 7, 마이그레이션 | in-process API/직접 worker 실행, 모의 Provider/Keystone | durable journal·ledger, migration-twice, pool operation fencing/unknown create와 registration heartbeat/staleness | 데이터스토어 연동; 실제 Nova/Zun/Octavia/CA guest는 없음 |
+| **Integration** | `uv run lumen-test integration` | 실제 MariaDB 11, Redis 7, 마이그레이션 | in-process API/직접 worker 실행, 모의 Provider/Keystone | durable journal·ledger, migration-twice 및 019 legacy/partial-DDL graph backfill, owner+membership/fork/delete/leaf-cursor/title 경계, pool fencing/unknown create와 worker registration | 데이터스토어 연동; 실제 paid provider, Nova/Zun/Octavia/CA guest는 없음 |
 | **System** | `uv run lumen-test system` | 컨테이너화된 lumen-api, lumen-worker, MariaDB, Redis, PostgreSQL checkpointer, 마이그레이션, 실제 HTTP 소켓 | fake OpenAI/Anthropic/Responses HTTP provider, 자동 생성 connection manifest/API key | Chat Completions/Responses/Anthropic, native worker·SSE·usage/Redis wakeup, legacy device | 풀 스택 프로세스 연동; controller/OpenStack/sandbox guest와 실제 Keystone는 증명하지 않음 |
 | **Deployment** *(외부)* | 외부 CI/운영 검증 (`afterglow` 및 OpenStack 환경) | 실제 Keystone, OpenStack Nova/Octavia, trusted worker/controller, sandbox host, Afterglow 공개 API; Zun은 격리 강제 구현 이후 별도 승격 | 없음 | 설치 이미지/CA/bootstrap/mTLS, ingress/drain, namespace·cgroup·network 격리, parent→child→artifact와 restore/rollout | 최종 승격; 이 저장소의 unit/system green으로 대체 불가 |
 
@@ -86,6 +86,8 @@ uv run pytest -m "not integration and not system" tests
 | `LUMEN_TEST_COMPOSE_PROJECT` | Compose 프로젝트 이름 고정 | `lumen-{layer}-{pid}-{hex}` |
 
 > **경고:** `LUMEN_TEST_COMPOSE_PROJECT`를 사용하여 프로젝트 이름을 고정 오버라이드할 경우, 테스트 종료 시 해당 프로젝트의 볼륨 정리(`down -v`)가 실행된다. 따라서 오버라이드 프로젝트 이름은 반드시 테스트 전용 환경으로만 지정해야 하며 개발용/운영용 Compose 프로젝트 이름을 사용해서는 안 된다.
+
+2026-09-27 별도 `lumen-chat-graph-qa` fixture에 migration 019를 두 번 적용했고 `pytest -m integration tests` 70건이 통과했다. 신규 `test_shared_history_migration.py`는 기존 복제 fork를 임의 dedup하지 않는 backfill, 중단된 DDL 재실행, owner/path/member 무결성을 실제 MariaDB에서 검증한다. `test_history_gateway_flow.py`와 `test_title_fork.py`는 공유 prefix ID, 원본 삭제 뒤 fork 존속, 최종 graph GC, cursor revision, run replay와 manual title CAS를 검사한다. 독립 서비스 smoke 및 backup→별도 schema restore→graph 무결성 0행 검사도 통과했다. 로컬 DB·fake provider 검증은 운영의 기존 run/backup, GPT/Claude/title 추론 또는 Kolla cutover 증거가 아니다.
 
 ---
 
