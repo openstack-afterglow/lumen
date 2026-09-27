@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.1 (development release candidate)
+## 0.3.1
 
 Changes since `v0.3.0`:
 
@@ -13,7 +13,9 @@ Changes since `v0.3.0`:
 - **Managed runtime mTLS:** Issued sandbox/API/worker certificates include an Authority Key Identifier matching the signing CA's Subject Key Identifier, including CAs with a non-derived key identifier; CAs without that extension retain the public-key-derived identifier. The deterministic pin/SAN transport test CA and leaf certificates carry strict-X.509-required key identifiers and usages, so current OpenSSL verification reaches the authenticated transport rather than failing the handshake.
 - **Reasoning `none` admission:** An explicit `reasoning_effort="none"` now returns 422 unless the model advertises disabling reasoning (models.dev effort list with `none`, a `toggle`, `budget_tokens` minimum 0, or an Anthropic provider). Previously it was forwarded to models such as gpt-5, o3 and gemini-2.5-pro that reject it. `GET /v1/chat/models` adds `reasoning_none_supported` for clients. models.dev imports now keep `budget_tokens` `min`/`max`; models imported earlier reject `none` until re-imported. An operator `chat_reasoning_effort="none"` default is omitted for such models instead of being sent.
 
-**Release boundaries:** Root manifest, runtime version, lock entry and packaged Kolla API/worker/controller defaults target `0.3.1`. SDK `0.2.1`, plugin API/default plugins `0.1.0`, sandbox distribution and source-build commit pin remain independent. This is a release candidate, not a published tag or image. Local contract (1,369), SDK (125), datastore integration (40), Compose fake-provider system (9), Ruff and installed wheel checks passed; API/worker/controller/sandbox images were built and executed on linux/amd64 and linux/arm64. Cloud rollout and tag workflows remain pending. Existing discovery is unchanged; real Anthropic/OpenAI inventory, approved paid native/compat inference and usage acceptance remain open in OpenSpec and must not be inferred from synthetic evidence.
+**Release boundaries:** Root manifest, runtime version, lock entry and packaged Kolla API/worker/controller defaults target `0.3.1`. SDK `0.2.1`, plugin API/default plugins `0.1.0`, sandbox distribution and source-build commit pin remain independent. The `v0.3.1` package workflow published eight GitHub Release wheels, and its separate image workflow published four linux/amd64+linux/arm64 images, all from `9eed5d170bc3fad3dae658e6119cb80e5831052e`; neither workflow is production deployment. Local contract (1,369), SDK (125), datastore integration (40), Compose fake-provider system (9), Ruff and installed wheel checks passed; API/worker/controller/sandbox images were built and executed on linux/amd64 and linux/arm64. Existing discovery is unchanged; real Anthropic/OpenAI inventory, approved paid native/compat inference and usage acceptance remain open in OpenSpec and must not be inferred from synthetic evidence.
+
+**Publication receipts:** [package workflow](https://github.com/openstack-afterglow/lumen/actions/runs/36304246657), [image workflow](https://github.com/openstack-afterglow/lumen/actions/runs/36304246702), [GitHub Release](https://github.com/openstack-afterglow/lumen/releases/tag/v0.3.1). Verified OCI indexes (`:0.3.1`): `lumen-api@sha256:66e6e709b9d168b1f2b7cfca6345a688e7a3568144bcc50493e89f42fe73712f`, `lumen-worker@sha256:e47e030b588ce40adb61967719d02ac7a3b0045120d2899f25d612d5405b8217`, `lumen-controller@sha256:099c94abba32889832b110a72434d5b300288402a14eb5542499036e0fa97012`, `lumen-sandbox@sha256:6909ba3ef7bdd6750046b2daa50b6600166818834774497a0245b5127f3008da`. These are registry proofs, not cloud rollout receipts.
 
 ## 0.3.0 (release candidate)
 

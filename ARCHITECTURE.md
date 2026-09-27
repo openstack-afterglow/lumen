@@ -6,7 +6,7 @@ Lumen은 LiteLLM provider 실행, LangGraph/LangChain agent runtime, 대화·dur
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: root `lumen` package `0.3.1` (`pyproject.toml`, `lumen/__init__.py`, `uv.lock`), 독립 `lumen-sdk` `0.2.1` (`sdk/pyproject.toml`), discovery/API contract `1.0.0` (`lumen/api/compat/discovery.py`). Kolla의 package-owned API/worker/controller image default는 `0.3.1` tag를 가리키며, 실제 게시와 배포 수용은 tag workflow와 운영자 검증 전까지 미확인이다. `lumen_source_version`은 별도 source-build commit pin이다.
+- 버전: root `lumen` package `0.3.1` (`pyproject.toml`, `lumen/__init__.py`, `uv.lock`), 독립 `lumen-sdk` `0.2.1` (`sdk/pyproject.toml`), discovery/API contract `1.0.0` (`lumen/api/compat/discovery.py`). Kolla의 package-owned API/worker/controller image default는 `0.3.1` tag를 가리킨다. `v0.3.1` package 및 네 이미지 tag workflow는 source `9eed5d170bc3fad3dae658e6119cb80e5831052e`에서 성공했고 각 multi-architecture manifest의 OCI revision을 확인했다. 이는 Kolla 운영 설치·cloud acceptance가 아니다. `lumen_source_version`은 별도 source-build commit pin이다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 wakeup 최적화일 뿐 queue 정본이 아니다.
@@ -200,7 +200,7 @@ Built-in remote MCP connector bundles (`mcp_bundles.py`) are declarative presets
 - **API contracts**: native `/v1`은 run descriptor, UUID idempotency, active-path cursor, owner-scoped run/event, replay cursor와 terminal event를 계약으로 한다. Compat는 OpenAI Chat Completions/Responses와 Anthropic Messages/count_tokens를 stateless로 제공하고 discovery의 `clients.claude_code`는 ordinary-key direct Anthropic base를 가리킨다. Legacy Lumen device surface는 custom OAuth grant와 24시간 fixed-scope credential이며 current Claude Apps Gateway compatibility를 주장하지 않는다. discovery/API contract version은 `1.0.0`; root package `0.3.1`와 SDK `0.2.1`은 별개 release value다.
 - **SDK transports**: `lumen_sdk.Client`와 OpenStack SDK `Proxy`는 opaque history cursor를 변환하지 않고 같은 native page contract를 전달한다. 이 둘은 Lumen API transport이며 provider credential transport가 아니다.
 - **Protocol invariant**: accepted durable run에는 admission snapshot, pricing/provenance, selected extension/config fingerprint가 있어야 하며 worker가 mutable configuration을 재검증한다. `model="lumen"` bridge는 tools/memory가 없는 text-only 입력만 accepted한다. Compat provider request는 Lumen conversation/active-path에 저장되지 않는다.
-- **0.3.1 integration boundary**: `origin/dev`의 title/admission/operator/graph reasoning 수정과 기존 subscription sampling·operations 변경을 별도 worktree에서 통합했다. Legacy Perplexity Sonar의 정확한 bundled 가격 키를 synthetic Agent 중복 접두보다 우선해 서로 다른 tariff를 유지한다. Managed runtime guest 인증서의 Authority Key Identifier는 controller CA의 Subject Key Identifier가 있으면 그 값을 사용하고, 없으면 CA 공개키에서 유도한다. 기존 CA material·소유권은 변경하지 않는다. 서비스·schema·dependency·저장소 소유권 변경은 없으며 root/runtime/lock 및 packaged Kolla image default만 patch version으로 맞춘다. 기존 discovery는 변경하지 않았다. 0.3.1 candidate에서 contract 1,369건, SDK 125건, 실제 MariaDB/Redis integration 40건, local Compose fake-provider system 9건, Ruff와 wheel build, API/worker/controller/sandbox linux/amd64·linux/arm64 이미지 build 및 각 이미지의 offline import/platform smoke를 통과했다. live provider·production rollout·tag 게시 증거는 아직 없다.
+- **0.3.1 integration boundary**: `origin/dev`의 title/admission/operator/graph reasoning 수정과 기존 subscription sampling·operations 변경을 별도 worktree에서 통합했다. Legacy Perplexity Sonar의 정확한 bundled 가격 키를 synthetic Agent 중복 접두보다 우선해 서로 다른 tariff를 유지한다. Managed runtime guest 인증서의 Authority Key Identifier는 controller CA의 Subject Key Identifier가 있으면 그 값을 사용하고, 없으면 CA 공개키에서 유도한다. 기존 CA material·소유권은 변경하지 않는다. 서비스·schema·dependency·저장소 소유권 변경은 없으며 root/runtime/lock 및 packaged Kolla image default만 patch version으로 맞춘다. 기존 discovery는 변경하지 않았다. 0.3.1 candidate에서 contract 1,369건, SDK 125건, 실제 MariaDB/Redis integration 40건, local Compose fake-provider system 9건, Ruff와 wheel build, API/worker/controller/sandbox linux/amd64·linux/arm64 이미지 build 및 각 이미지의 offline import/platform smoke를 통과했다. `v0.3.1` package/image workflows와 네 tag image의 linux/amd64·linux/arm64 manifest/OCI revision은 게시 후 확인했다. live Anthropic/OpenAI provider·production rollout은 아직 검증하지 않았다.
 
 ### Provider model onboarding
 
@@ -323,8 +323,8 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 {
   "schema_version": 1,
   "source_sha256": "be5469ffa5ae9c828ee0b6907f8c6f1d48a11d5e0aedc34c950e826463ae3a7f",
-  "reviewed_at": "2026-09-27T07:22:54Z",
-  "summary": "Reviewed CA SKI to guest AKI mapping and custom-identifier regression; preserves signer, scope, stores and no-SKI fallback; live cloud/provider remain unverified"
+  "reviewed_at": "2026-09-27T07:56:23Z",
+  "summary": "Reviewed published v0.3.1 package and four OCI indexes at 9eed5d1; documentation-only publication receipts, no source flow/store change; paid provider and Kolla cloud rollout remain unverified"
 }
 ```
 <!-- architecture-review:end -->
