@@ -224,6 +224,7 @@ Built-in remote MCP connector bundles (`mcp_bundles.py`) are declarative presets
 - **API contracts**: native `/v1`은 run descriptor, UUID idempotency, active-path cursor, owner-scoped run/event, replay cursor와 terminal event를 계약으로 한다. Text compat의 OpenAI Chat Completions/Responses와 Anthropic Messages/count_tokens는 stateless지만 image/audio/realtime compat는 별도 durable media run/usage를 생성한다. Discovery의 `clients.claude_code`는 ordinary-key direct Anthropic base를 가리킨다. Legacy Lumen device surface는 custom OAuth grant와 24시간 fixed-scope credential이며 current Claude Apps Gateway compatibility를 주장하지 않는다. discovery/API contract version은 `1.0.0`; root package `0.4.0`와 SDK `0.2.1`은 별개 release value다.
 - **SDK transports**: `lumen_sdk.Client`와 OpenStack SDK `Proxy`는 opaque history cursor를 변환하지 않고 같은 native page contract를 전달한다. 이 둘은 Lumen API transport이며 provider credential transport가 아니다.
 - **Protocol invariant**: accepted durable run에는 admission snapshot, pricing/provenance, selected extension/config fingerprint가 있어야 하며 worker가 mutable configuration을 재검증한다. `model="lumen"` bridge는 tools/memory가 없는 text-only 입력만 accepted한다. Compat provider request는 Lumen conversation/active-path에 저장되지 않는다.
+- **Release snapshot compatibility**: Migration 019의 기존 text model `model_kind=text`·`media_pricing=NULL`은 v0.3.1의 route HMAC 직렬화에 추가하지 않는다. 정지 시 남은 queued text run은 설정이 실제로 바뀌지 않았다면 기존 frozen hash로 재개하며, 이미지·오디오·realtime route는 kind와 media 가격을 hash에 포함해 변경을 차단한다. 고정된 v0.3.1 HMAC/실제 ORM 조회 회귀가 이 경계를 검증한다.
 - **0.3.1 integration boundary**: `origin/dev`의 title/admission/operator/graph reasoning 수정과 기존 subscription sampling·operations 변경을 별도 worktree에서 통합했다. Legacy Perplexity Sonar의 정확한 bundled 가격 키를 synthetic Agent 중복 접두보다 우선해 서로 다른 tariff를 유지한다. Managed runtime guest 인증서의 Authority Key Identifier는 controller CA의 Subject Key Identifier가 있으면 그 값을 사용하고, 없으면 CA 공개키에서 유도한다. 기존 CA material·소유권은 변경하지 않는다. 서비스·schema·dependency·저장소 소유권 변경은 없으며 root/runtime/lock 및 packaged Kolla image default만 patch version으로 맞춘다. 기존 discovery는 변경하지 않았다. 0.3.1 candidate에서 contract 1,369건, SDK 125건, 실제 MariaDB/Redis integration 40건, local Compose fake-provider system 9건, Ruff와 wheel build, API/worker/controller/sandbox linux/amd64·linux/arm64 이미지 build 및 각 이미지의 offline import/platform smoke를 통과했다. `v0.3.1` package/image workflows와 네 tag image의 linux/amd64·linux/arm64 manifest/OCI revision은 게시 후 확인했다. live Anthropic/OpenAI provider·production rollout은 아직 검증하지 않았다.
 
 ### Provider model onboarding
@@ -348,9 +349,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "85aada5986f08147416c7ed282f31dfc9c083d3cd47012ae3c5ef64a325e3c07",
-  "reviewed_at": "2026-09-29T23:25:35Z",
-  "summary": "0.4.0 with upstream 0.3.1; 1448 service, 125 SDK, 43 integration, 9 system and four dual-arch image smokes passed; Kolla production rollout pending"
+  "source_sha256": "172729960f6f669b48021e379e23609c9d1b4bf64f6293a87475157de1bb9450",
+  "reviewed_at": "2026-09-29T23:39:01Z",
+  "summary": "Preserved published 0.3.1 text route HMAC across 019 media migration; pinned real persisted snapshot regression; contract 1449 and integration 43 passed"
 }
 ```
 <!-- architecture-review:end -->

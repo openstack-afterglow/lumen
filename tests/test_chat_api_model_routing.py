@@ -150,6 +150,20 @@ def provider_db(monkeypatch):
     engine.dispose()
 
 
+async def test_pre_0_4_text_run_snapshot_survives_media_migration(provider_db):
+    add_provider, add_model, _model_name = provider_db
+    add_provider(provider_type="openai")
+    add_model("legacy-text-contract")
+    # Published v0.3.1's HMAC for this exact route and the fixture's fixed key.
+    legacy_hash = "b1f4f048f540ce3bd822c4c35f66c5e2975962b725d5d3a172324727df62190c"
+    current = await routing.resolve_model("legacy-text-contract")
+    assert current["config_version_hash"] == legacy_hash
+    restored = await routing.resolve_model_snapshot(
+        {"provider_id": 1, "model_id": 10, "config_version_hash": legacy_hash}
+    )
+    assert restored is not None and restored["model_id"] == 10
+
+
 async def test_perplexity_create_stores_transport_route_and_rejects_public_duplicate(provider_db):
     add_provider, _add_model, model_name = provider_db
     add_provider()

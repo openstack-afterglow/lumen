@@ -105,6 +105,8 @@ Worker lease는 45초다. run이 `running`이 아니거나 lease owner/expiry가
 
 적용된 SQL migration/checksum은 immutable이다. 유지보수 cutover는 admission 차단·API/worker/controller stop → backup/DB readiness → `lumen-migrate --apply` → 호환 API/worker/controller start 순서다. 적용 뒤 동일 command를 다시 실행해 pending migration이 없는지 확인한다. Kolla의 migration-before-start 자동화만으로 **기존 실행 중인 컨테이너를 중지했다는 뜻은 아니다**. rolling mixed-version deployment는 지원 전제가 아니다.
 
+0.4.0의 migration 019가 기존 text model에 채우는 `model_kind=text`·`media_pricing=NULL`은 그 자체로 v0.3.1의 frozen route HMAC을 변경하지 않는다. 중단 시 queued run은 동일한 provider/model/key/가격·capabilities를 유지하면 재개할 수 있고, 실제 설정 변경으로 hash가 달라지면 종전처럼 실행을 거부한다. Media route의 kind·가격 변경은 별도 hash에 포함한다. ORM DB fixture에 v0.3.1의 고정 HMAC을 핀한 회귀를 적용한 후 rollout한다.
+
 Migration `010_quota_policy_and_inheritance.sql`은 `user_wallets.max_quota_monthly/max_quota_weekly`를 nullable inheritance column으로 전환하고 singleton `chat_quota_policies`를 만든다. 기존 `0` 값은 명시적 무제한으로 보존되므로 자동으로 기본값 상속으로 바뀌지 않는다. 관리자가 해당 사용자를 reset해야 두 column이 `NULL`이 된다. API와 worker가 새 nullable 의미를 함께 사용하므로 이 migration도 mixed-version rolling deployment 없이 적용한다.
 
 Migration `011_provider_billing_admin_key.sql`은 `llm_providers.encrypted_billing_admin_key` nullable column을 추가한다. Direct OpenAI/Anthropic 조직 보고서 연동을 배포할 때는 Lumen API/worker를 중지하고 migration을 먼저 적용한 뒤 호환되는 Lumen API와 Afterglow UI를 순서대로 배포한다. 구 Lumen에서 Afterglow의 bulk `GET /admin/providers/billing`을 호출하면 동적 provider PATCH route와 충돌해 405가 나타날 수 있으므로 mixed-version 상태를 정상 기능으로 해석하지 않는다.

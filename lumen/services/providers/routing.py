@@ -214,6 +214,8 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         input_price=input_price,
         output_price=output_price,
     )
+    model_kind = _kind(model)
+    media_pricing = getattr(model, "media_pricing", None)
     config_fingerprint = {
         "provider_id": provider.id,
         "model_id": model.id,
@@ -221,8 +223,6 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "provider_type": provider.provider_type,
         "provider_active": provider.is_active,
         "api_base": api_base,
-        "model_kind": _kind(model),
-        "media_pricing": getattr(model, "media_pricing", None),
         "model_name": model.model_name,
         "model_active": model.is_active,
         "margin_multiplier": str(provider.margin_multiplier),
@@ -234,6 +234,11 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "capabilities": capabilities,
         "api_key": api_key,
     }
+    # Keep persisted 0.3.1 text-run hashes valid after migration 019 adds default
+    # text/NULL columns; media routes still fence kind and pricing mutations.
+    if model_kind != "text" or media_pricing is not None:
+        config_fingerprint["model_kind"] = model_kind
+        config_fingerprint["media_pricing"] = media_pricing
     cache_prices = _resolved_cache_prices(model, provider)
     cache_price_sources = {
         category: "manual" if getattr(model, column, None) is not None else "litellm"
@@ -263,8 +268,8 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
     ).hexdigest()
     return {
         "model_name": model.model_name,
-        "model_kind": _kind(model),
-        "media_pricing": getattr(model, "media_pricing", None),
+        "model_kind": model_kind,
+        "media_pricing": media_pricing,
         "api_model_name": api_model_name(model.model_name, provider.provider_type),
         "api_provider": provider.provider_type,
         "provider_name": provider.name,
