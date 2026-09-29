@@ -29,3 +29,16 @@
 ## 0.3.0 release boundary
 
 Candidate discovery and explicitly priced onboarding are in the root 0.3.0 release candidate; tag publication has not been verified. The unchecked real Anthropic/OpenAI inventory and paid inference task remains open; synthetic upstream and local container verification are not external-provider acceptance. See `CHANGELOG.md` for release notes.
+
+## 0.3.1 preparation review — 2026-09-27
+
+The checked-in rapid-schema task list and `openspec instructions apply --change live-provider-model-onboarding --json` report **11/12 complete**, not the reported 13/14. Planning artifact completion is not live acceptance. The single unchecked task above remains unchanged; discovery implementation is already present and is not rewritten for this patch release.
+
+To close it, an operator must provide real API-key credentials for **both Anthropic and OpenAI**, an authenticated Lumen administrator/client scope, and explicit approval for a priced text model and bounded paid requests. Subscription credentials or synthetic providers do not satisfy this prerequisite. Using the existing discovery/CRUD/native/compat paths, record separately for each provider:
+
+1. Credential-scoped live inventory success with provider ID, fetched timestamp, complete API source/status and exact candidate ID; retain redacted metadata only and confirm discovery itself did not create or mutate model rows.
+2. Explicit registration/activation with reviewed input/output prices, followed by immediate list/route visibility without an API/worker restart. Inventory alone proves neither pricing nor advanced capabilities.
+3. An approved native text run and a compatibility text request that actually reach the provider. Record model/provider and request/run IDs, successful output/terminal state, provider-reported token usage and the matching persisted Lumen usage/pricing records. State which compatibility protocol was exercised.
+4. Keep actual-provider usage/billing evidence distinct from synthetic test counts and Lumen's estimated cost; do not claim invoice reconciliation without a provider billing comparison. Remove only disposable acceptance records according to the operator's retention policy.
+
+No credentials were accessed and no provider calls, tests, formatters, image builds, commits or pushes were performed during this preparation. Prior 2026-09-23 verification remains historical evidence, not a pass for the integrated 0.3.1 tree. Keep this change open until the live task has the evidence above.

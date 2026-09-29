@@ -133,6 +133,13 @@ async def exchange_bootstrap_token(token: str, csr_pem: str, config: RuntimeConf
         usages = [ExtendedKeyUsageOID.SERVER_AUTH]
         if resource.role in {"api", "worker"}:
             usages.append(ExtendedKeyUsageOID.CLIENT_AUTH)
+        try:
+            issuer_ski = ca_certificate.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
+        except x509.ExtensionNotFound:
+            authority_key_identifier = x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                ca_certificate.public_key())
+        else:
+            authority_key_identifier = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(issuer_ski)
         cert = (x509.CertificateBuilder()
                 .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, identity)]))
                 .issuer_name(ca_certificate.subject)
@@ -145,6 +152,7 @@ async def exchange_bootstrap_token(token: str, csr_pem: str, config: RuntimeConf
                                              key_encipherment=False, data_encipherment=False,
                                              key_agreement=False, key_cert_sign=False, crl_sign=False,
                                              encipher_only=False, decipher_only=False), critical=True)
+                .add_extension(authority_key_identifier, critical=False)
                 .add_extension(x509.ExtendedKeyUsage(usages), critical=False)
                 .add_extension(x509.SubjectAlternativeName(names), critical=False)
                 .sign(ca_key, None if isinstance(ca_key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)) else hashes.SHA256()))

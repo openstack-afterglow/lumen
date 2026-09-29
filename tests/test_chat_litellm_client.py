@@ -367,18 +367,30 @@ async def test_anthropic_subscription_pins_oauth_transport_parameters(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_anthropic_subscription_enables_litellm_drop_params(monkeypatch):
-    """claude-opus-5-5 rejects temperature != 1; the subscription path must drop it like the key path."""
+async def test_anthropic_subscription_drops_unsupported_sampling_parameters(monkeypatch):
+    """Subscription calls must let LiteLLM drop unsupported sampling options, not the token cap."""
     provider_auth = {"provider_id": 8, "generation": 4, "auth_mode": "anthropic_subscription"}
     drop_params_at_call = []
+    wire_params = {}
 
     async def resolve(ref):
         return {"access_token": "sk-ant-oat01-request-local-token", "_fingerprint": "fingerprint"}
 
     import litellm
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    monkeypatch.setitem(litellm.model_cost, "claude-opus-5-5", {"supports_sampling_params": False})
 
     async def complete(**kwargs):
         drop_params_at_call.append(litellm.drop_params)
+        wire_params.update(
+            AnthropicConfig().map_openai_params(
+                non_default_params={"temperature": kwargs["temperature"], "max_tokens": kwargs["max_tokens"]},
+                optional_params={},
+                model=kwargs["model"],
+                drop_params=False,
+            )
+        )
         return SimpleNamespace(choices=[])
 
     monkeypatch.setattr(subscriptions, "resolve_subscription_credential", resolve)
@@ -391,9 +403,12 @@ async def test_anthropic_subscription_enables_litellm_drop_params(monkeypatch):
         custom_llm_provider="anthropic",
         provider_auth=provider_auth,
         temperature=0,
+        max_tokens=512,
     )
 
     assert drop_params_at_call == [True]
+    assert "temperature" not in wire_params
+    assert wire_params["max_tokens"] == 512
 
 
 @pytest.mark.asyncio

@@ -59,6 +59,8 @@ Direct Codex provider의 영구 contract는 system gate의 Responses tool-call/f
 
 별도 원격 `lumen.dmslab.re.kr` 검증에서 발급된 ordinary Lumen API key로 `/v1/models`, `/v1/chat/models`, Anthropic `POST /v1/messages`가 각각 HTTP 200을 반환했고 활성 `claude-haiku-4-5` 모델이 텍스트 `SERVER_OK`를 반환했습니다. Claude Code 2.1.280을 비어 있는 임시 `HOME`과 `CLAUDE_CONFIG_DIR`로 격리하고 `ANTHROPIC_BASE_URL=https://lumen.dmslab.re.kr`, `ANTHROPIC_AUTH_TOKEN` 및 모델/tier 환경변수만 child process에 전달했습니다. 실제 local `Bash`의 `printf CLI_TOOL_OK` tool result (`is_error=false`) 뒤 최종 `CLI_FINAL_OK`, CLI exit 0을 관찰했습니다. Init의 `apiKeySource=none`은 토큰 출처 증거가 아니며 원격 usage ledger는 조회하지 못했습니다. 이 CLI·direct API 증거는 아직 새 0.4.0 이미지의 운영 배포나 Afterglow 브라우저의 실제 인증 성공 증거가 아닙니다.
 
+0.4.0 후보와 upstream 0.3.1 수정을 병합한 뒤 `uv lock --check`, `uv run lumen-test contract`(service 1,448·SDK 125 및 Ruff), `uv run lumen-test integration`(MariaDB/Redis 43), `uv run lumen-test system`(실제 Docker API/worker 9)을 통과했습니다. Root wheel `dist/lumen-0.4.0-py3-none-any.whl`을 빌드하고 API/worker/controller/sandbox 각 이미지의 `linux/amd64,linux/arm64` 로컬 manifest를 빌드·실행해 Python machine/0.4.0과 sandbox Node v24.21.0을 확인했습니다. 이 local 증거는 0.4.0 GHCR 게시, Kolla 운영 migration/rollout, Afterglow 실제 dashboard 성공을 증명하지 않습니다.
+
 ### 디버깅을 위한 집중(Focused) pytest 실행
 
 특정 파일이나 마커를 대상으로 빠르게 디버깅할 때는 `pytest`를 직접 호출할 수 있습니다.

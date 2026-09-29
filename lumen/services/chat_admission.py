@@ -27,6 +27,7 @@ from lumen.services import conversation_store as cs
 from lumen.services import extensions_store as es
 from lumen.services import memory_store as ms
 from lumen.services import workspace_store as ws
+from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
 from lumen.services.providers.pricing import _has_component_prices
@@ -490,6 +491,11 @@ def _validated_reasoning_effort(value: str, resolved: dict) -> str:
     if not capabilities.get("reasoning"):
         raise HTTPException(status_code=422, detail="선택한 모델은 추론 강도를 지원하지 않습니다")
     if effort == "none":
+        if not reasoning_can_be_disabled(capabilities, resolved.get("provider_type")):
+            raise HTTPException(
+                status_code=422,
+                detail="선택한 모델은 추론 끄기('none')를 지원하지 않습니다. 자동 또는 모델이 지원하는 추론 강도를 선택하세요",
+            )
         return effort
     options = capabilities.get("reasoning_options") or []
     supported = next(
@@ -506,17 +512,23 @@ def _validated_reasoning_effort(value: str, resolved: dict) -> str:
 
 
 def _validate_tool_reasoning_compatibility(effort: str, resolved: dict, features: ChatFeatureOptions) -> None:
-    """Reject explicit reasoning levels the OpenAI GPT-5 Chat Completions tools route cannot execute."""
+    """Reject explicit reasoning levels the OpenAI GPT-5 Chat Completions tools route cannot execute.
+
+    ``none`` reaches this check only after ``_validated_reasoning_effort`` confirmed the model
+    advertises it, so it stays allowed here.
+    """
     if (
         resolved.get("provider_type") == "openai"
         and str(resolved.get("model_name") or "").strip().lower().startswith("gpt-5")
         and features.tool_policy.mode != "none"
         and effort not in {"auto", "none"}
     ):
+        can_disable = reasoning_can_be_disabled(resolved.get("capabilities"), resolved.get("provider_type"))
+        choices = "자동 또는 없음" if can_disable else "자동"
         raise HTTPException(
             status_code=422,
             detail="선택한 모델은 도구 사용과 명시적 추론 강도를 함께 지원하지 않습니다. "
-            "도구를 끄거나 추론 강도를 자동 또는 없음으로 선택하세요.",
+            f"도구를 끄거나 추론 강도를 {choices}으로 선택하세요.",
         )
 
 

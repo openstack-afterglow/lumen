@@ -145,7 +145,7 @@ with Client("https://lumen.example", "sk-afgl-...") as client:
 ## 문서
 
 - [문서 안내](docs/index.md)
-- [변경 이력과 0.3.0 릴리스 노트](CHANGELOG.md)
+- [변경 이력과 0.3.1 릴리스 노트](CHANGELOG.md)
 - [정본 아키텍처](ARCHITECTURE.md)
 - [아키텍처 상세 안내](docs/architecture.md)
 - [Afterglow 연동 가이드](docs/afterglow-integration.md)
