@@ -14,6 +14,7 @@ from lumen.crypto import derive_encryption_subkey
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun, ChatRunProvider
+from lumen.services.capabilities import reasoning_explicitly_unsupported
 from lumen.services.run_store import NONTERMINAL
 
 from .credentials import ProviderAuthRef, api_model_name, resolve_api_key, short_model_name
@@ -26,6 +27,7 @@ from .errors import (
 )
 from .pricing import (
     _effective_capabilities,
+    _kind,
     _pricing_aware_capabilities,
     _resolved_base_prices,
     _resolved_cache_prices,
@@ -203,6 +205,8 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         model,
         provider.provider_type,
         getattr(provider, "auth_mode", "api_key"),
+        api_key_configured=bool(api_key),
+        api_base=api_base,
     )
     capabilities = _pricing_aware_capabilities(
         model,
@@ -217,6 +221,8 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "provider_type": provider.provider_type,
         "provider_active": provider.is_active,
         "api_base": api_base,
+        "model_kind": _kind(model),
+        "media_pricing": getattr(model, "media_pricing", None),
         "model_name": model.model_name,
         "model_active": model.is_active,
         "margin_multiplier": str(provider.margin_multiplier),
@@ -257,6 +263,8 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
     ).hexdigest()
     return {
         "model_name": model.model_name,
+        "model_kind": _kind(model),
+        "media_pricing": getattr(model, "media_pricing", None),
         "api_model_name": api_model_name(model.model_name, provider.provider_type),
         "api_provider": provider.provider_type,
         "provider_name": provider.name,
@@ -276,6 +284,9 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "model_id": model.id,
         "config_version_hash": config_version_hash,
         "capabilities": capabilities,
+        "reasoning_unsupported": reasoning_explicitly_unsupported(
+            model.model_name, model.capability_source, model.capabilities
+        ),
     }
 
 
@@ -332,6 +343,7 @@ async def resolve_model(model_name: str) -> dict | None:
                     .where(
                         LlmModel.model_name == model_name,
                         LlmModel.is_active.is_(True),
+                        LlmModel.model_kind == "text",
                         LlmProvider.is_active.is_(True),
                     )
                 )
@@ -345,7 +357,8 @@ async def resolve_model(model_name: str) -> dict | None:
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def resolve_api_model(model_name: str, *, provider: str | None = None) -> dict | None:
+async def resolve_api_model(model_name: str, *, provider: str | None = None, model_kind: str = "text",
+                            provider_id: int | None = None) -> dict | None:
     """Resolve one external API model/provider pair without exposing route encoding."""
     candidates = {
         model_name,
@@ -375,6 +388,7 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None) -> 
                 .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
                 .where(
                     LlmModel.model_name.in_(candidates),
+                    LlmModel.model_kind == model_kind,
                     LlmModel.is_active.is_(True),
                     LlmProvider.is_active.is_(True),
                 )
@@ -382,6 +396,8 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None) -> 
             )
             if provider is not None:
                 stmt = stmt.where(LlmProvider.provider_type == provider)
+            if provider_id is not None:
+                stmt = stmt.where(LlmProvider.id == provider_id)
             rows = (await session.execute(stmt)).all()
 
             def _row_matches(model_row: LlmModel, provider_row: LlmProvider) -> bool:
@@ -440,7 +456,7 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None) -> 
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def list_api_models() -> list[dict]:
+async def list_api_models(*, model_kind: str = "text") -> list[dict]:
     """List active public model identities without decrypting credentials or pricing."""
     factory = _require_db()
     try:
@@ -451,6 +467,7 @@ async def list_api_models() -> list[dict]:
                     .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
                     .where(
                         LlmModel.is_active.is_(True),
+                        LlmModel.model_kind == model_kind,
                         LlmProvider.is_active.is_(True),
                     )
                     .order_by(LlmModel.id)
@@ -469,7 +486,7 @@ async def list_api_models() -> list[dict]:
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def resolve_model_by_id(model_id: int) -> dict | None:
+async def resolve_model_by_id(model_id: int, *, model_kind: str = "text") -> dict | None:
     """Resolve one active configured model by its stable local identifier."""
 
     factory = _require_db()
@@ -483,6 +500,7 @@ async def resolve_model_by_id(model_id: int) -> dict | None:
                         LlmModel.id == model_id,
                         LlmModel.is_active.is_(True),
                         LlmProvider.is_active.is_(True),
+                        LlmModel.model_kind == model_kind,
                     )
                 )
             ).first()
@@ -512,6 +530,7 @@ async def resolve_model_snapshot(capability_snapshot: dict) -> dict | None:
                     .where(
                         LlmModel.id == model_id,
                         LlmModel.provider_id == provider_id,
+                        LlmModel.model_kind == capability_snapshot.get("model_kind", "text"),
                         LlmModel.is_active.is_(True),
                         LlmProvider.is_active.is_(True),
                     )
@@ -564,6 +583,7 @@ async def resolve_title_model() -> dict | None:
                 .where(
                     LlmModel.is_title_model.is_(True),
                     LlmModel.is_active.is_(True),
+                    LlmModel.model_kind == "text",
                     LlmProvider.is_active.is_(True),
                 )
                 .limit(1)
@@ -590,6 +610,7 @@ async def resolve_memory_model() -> dict | None:
                 select(LlmModel, LlmProvider)
                 .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
                 .where(
+                    LlmModel.model_kind == "text",
                     LlmModel.is_memory_model.is_(True),
                     LlmModel.is_active.is_(True),
                     LlmProvider.is_active.is_(True),

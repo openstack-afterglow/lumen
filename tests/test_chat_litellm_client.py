@@ -367,6 +367,36 @@ async def test_anthropic_subscription_pins_oauth_transport_parameters(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_anthropic_subscription_enables_litellm_drop_params(monkeypatch):
+    """claude-opus-5-5 rejects temperature != 1; the subscription path must drop it like the key path."""
+    provider_auth = {"provider_id": 8, "generation": 4, "auth_mode": "anthropic_subscription"}
+    drop_params_at_call = []
+
+    async def resolve(ref):
+        return {"access_token": "sk-ant-oat01-request-local-token", "_fingerprint": "fingerprint"}
+
+    import litellm
+
+    async def complete(**kwargs):
+        drop_params_at_call.append(litellm.drop_params)
+        return SimpleNamespace(choices=[])
+
+    monkeypatch.setattr(subscriptions, "resolve_subscription_credential", resolve)
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    monkeypatch.setattr(litellm, "drop_params", False)
+
+    await litellm_client.acompletion(
+        "anthropic-subscription/claude-opus-5-5",
+        [{"role": "user", "content": "hello"}],
+        custom_llm_provider="anthropic",
+        provider_auth=provider_auth,
+        temperature=0,
+    )
+
+    assert drop_params_at_call == [True]
+
+
+@pytest.mark.asyncio
 async def test_native_anthropic_forwards_claude_code_fields_and_protocol_headers(monkeypatch):
     captured = {}
 

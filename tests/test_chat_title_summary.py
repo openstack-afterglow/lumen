@@ -46,6 +46,34 @@ async def test_title_uses_both_first_exchange_messages_and_safe_limits(monkeypat
     assert result.completion_tokens == 4
 
 
+async def test_title_reasoning_params_bind_to_real_acompletion_signature(monkeypatch):
+    """Reasoning models (e.g. claude-opus-5-5) must not pass kwargs acompletion does not accept."""
+    import inspect
+
+    real_signature = inspect.signature(ts.litellm_client.acompletion)
+    observed = {}
+
+    async def fake_acompletion(model, messages, **kwargs):
+        real_signature.bind(model, messages, **kwargs)
+        observed.update(kwargs)
+        return _resp("추론 모델 제목")
+
+    monkeypatch.setattr(ts.litellm_client, "acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        ts.litellm_client, "_reasoning_params", lambda model, effort, provider: {"reasoning_effort": effort}
+    )
+    result = await ts.generate_title(
+        exchange=[
+            {"role": "user", "content": "배포 장애를 분석해 줘"},
+            {"role": "assistant", "content": "로그부터 확인해 보세요"},
+        ],
+        route={"model_name": "claude-opus-5-5", "provider_type": "anthropic"},
+    )
+
+    assert result.title == "추론 모델 제목"
+    assert observed["extra"] == {"reasoning_effort": "none"}
+
+
 async def test_title_input_truncates_each_role_front_three_quarters_back_quarter(monkeypatch):
     calls = []
 

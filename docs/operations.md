@@ -32,7 +32,21 @@ Local/system Compose는 관리형 runtime이 비활성화된 `RUNTIME_CONFIG={}`
 | retention | run event/checkpoint/memory retention | 24h / 7d / 365d |
 | optional stores | `chat_checkpointer_postgres_url`, `chat_memory_pgvector_url`, `chat_asset_s3_*` | configured feature에만 필요 |
 | TLS/auth | `os_cacert`, `insecure`, Keystone fields | TLS verify 기본 활성; `insecure`는 예외적 개발 설정 |
-| Claude Gateway | `claude_gateway_base_url`, `claude_gateway_model`, `claude_gateway_provider`, `frontend_base_url` | public base는 origin + `/v1/claude-gateway`; loopback 외 HTTPS 필수; model/provider 모두 설정해야 inference 가능 |
+| Claude Gateway | `claude_gateway_base_url`, `claude_gateway_model`, `claude_gateway_provider`, `frontend_base_url` | public base는 origin + `/v1/claude-gateway`; loopback 외 HTTPS 필수; model/provider 모두 설정해야 inference 가능. 예시 기본 model은 `claude-opus-5-5`이며 provider catalog에 같은 model이 등록되어 있어야 한다 |
+
+`claude-opus-5-5`의 request 제약:
+- thinking을 끌 수 없다.
+- `temperature` 같은 sampling 파라미터를 받지 않는다.
+- 강제 `tool_choice`(`any`/`tool`)를 거부한다.
+
+Lumen이 요청을 구성하는 chat/agent·title·compaction 경로는 이 제약에 맞게 동작한다.
+- `reasoning_effort`는 LiteLLM이 `thinking: {type: "adaptive"}`와 `output_config.effort`로 변환한다(LiteLLM 1.93 기준).
+- `drop_params`가 `temperature`를 제거한다.
+- `reasoning_effort="none"`은 thinking을 끄지 않는다. effort 필드를 생략하므로 model 기본 effort(Opus 5.5는 `medium`)로 실행된다. 빠른 응답이 목적이면 `low`를 쓴다.
+
+Caller가 파라미터를 소유하는 compat 경로는 Opus 5.5 제약을 대신 맞춰 주지 않는다.
+- Anthropic-native `/v1/messages` passthrough는 caller 파라미터를 바꾸지 않는다. `thinking.type: "disabled"`, `budget_tokens`, 강제 `tool_choice`를 보내면 provider의 400이 그대로 반환된다.
+- OpenAI-compatible `/v1/chat/completions`도 caller의 `tool_choice`를 전달한다. LiteLLM은 `required`를 제거하지 않고 Anthropic `{"type": "any"}`로 변환하므로 역시 provider 400이 된다.
 
 ### Chat asset S3 contract
 
@@ -59,6 +73,20 @@ Sandbox guest의 cgroup v2 parent는 `cgroup.controllers`에 `cpu memory pids`�
 Cloud provider의 `ACTIVE`는 서비스 readiness가 아니다. Controller는 소유권 label과 generation, 1회용 bootstrap token(10분), controller CA로 검증된 CSR 서명, certificate fingerprint, worker registration/heartbeat 또는 API guest 전용 mTLS `/v1/ready`·sandbox `/readyz`를 별도로 확인한다. Nova API image는 `guest_bootstrap --role api -- COMMAND`를 **foreground** entrypoint로 사용해야 한다. Guest entrypoint는 별도 mTLS readiness port에서 loopback public HTTP `/v1/ready` 응답의 database/plugins/checkpointer 상태를 검증한다; operator probe client certificate와 해당 port에 접근 가능한 managed-network security group, public HTTP command의 `ingress_member_port` 일치가 필수다. Octavia 공개 member port를 mTLS probe port와 혼동하거나 guest command를 daemonize하지 않는다. Trusted certificate는 1시간이며 boot timeout + max lifetime + drain grace + 60초 안전 여유가 이 안에 들어가야 한다. Controller는 새 ingress admission을 막고 resource 삭제를 요청하며, API guest supervisor는 certificate 만료 최소 60초 전에 public process group을 종료한다. Controller/Octavia 장애 시에도 이 foreground supervisor가 실행 중이어야 만료 후 외부 admission을 막을 수 있다. Sandbox는 run deadline을 포함한 인증서를 받아야 하고 인바운드 mTLS/권한 검증 외의 네트워크와 서비스 credential을 갖지 않는다. `GET /v1/admin/runtime-pools`, `/v1/admin/runtime-resources`, `/v1/admin/agent-project-quotas/{project_id}`(Keystone admin)로 inventory/기본 0의 project cap과 reservation을 관측한다. 이는 provider 실측 smoke를 대신하지 않는다.
 
 Octavia member create/re-enable는 MariaDB pool lease fence 아래에서 실행되지만 SDK가 Octavia에 반영한 뒤 응답 전에 실패하면 member ID가 원장에 기록되지 않을 수 있다. API guest를 제거하거나 해당 pool을 정상 완료로 판단하기 전 Octavia pool에서 `lumen-<resource_id>` member를 조회하고 남은 enabled member를 operator가 disable/delete한다. Name 조회가 일시적으로 비어 있는 경우에도 실제 cloud 상태 확인 없이 삭제 완료나 traffic 차단을 추정하지 않는다.
+
+## Media 모델 운영과 realtime 장애 대응
+
+Migration `019_media_model_registry.sql`로 model kind/media 가격을 준비한 뒤 Lumen API·worker, Afterglow BFF·frontend를 호환 버전으로 함께 전환한다. 생성 asset 소유권은 기존 asset/run 원장을 사용한다. 공식 direct provider 키는 환경 변수 자동 bootstrap 또는 Admin UI로 공급하고, 지원 모델 ID·kind·정확한 가격은 Admin UI나 명시적 bootstrap JSON으로 등록한다. Image/TTS/STT에는 S3 소유 bucket·ClamAV scanner·output asset download 경로가 필수다. Realtime에는 S3가 필요 없지만 admission 60초 ticket 저장소 Redis와 WS upgrade가 가능한 BFF→Lumen reverse proxy가 필수이며 Redis 장애 시 503 fail-closed다. API process가 realtime socket을 직접 소유하고 lease를 갱신하므로 worker polling이 realtime queued run을 대신 연결하지 않는다. API 인스턴스 재시작·provider WS disconnect 후 미정산 호출은 stale recovery가 `unknown`으로 남겨 자동 재연결·중복 provider 요청을 피한다.
+
+키 기반 provider 자동 등록은 DB migration **이후**, API·worker 시작 **이전**에 `python -m lumen.scripts.seed_providers`를 한 번 실행한다. Bootstrap, API, worker 모두 `OPENAI_API_KEY`/`GEMINI_API_KEY`를 같은 값으로 받는다. 로컬 Compose는 `seed-local`에서 같은 함수를 실행하고, Kolla는 deploy/reconfigure bootstrap task에서 별도 일회용 컨테이너를 사용한다. DB에는 secret 대신 `api_key_env` 변수 이름만 기록한다. 키가 없으면 해당 provider를 새로 만들지 않으며, 기존 관리자 DB 키·binding·base·가격은 재배포해도 교체하지 않는다. `LUMEN_BOOTSTRAP_MODELS_JSON`은 정확한 media pricing을 운영자가 제공할 때만 추가 모델을 생성하며 기존 모델은 불변이다. Secret inventory/log·Docker inspection 접근을 제한하고 `docker compose config`의 환경 변수 확장 출력을 공유하지 않는다. Provider key 교체는 같은 env 이름의 값을 교체하고 API·worker를 재생성하며 Admin `api_key_source`와 모델 readiness를 확인한다.
+
+2026-09-28 실계정으로 direct transport의 OpenAI `gpt-image-1-mini` PNG, `gpt-4o-mini-tts` PCM WAV, `gpt-4o-mini-transcribe` 음성 전사와 Gemini `gemini-3.1-flash-image` JPEG, `gemini-3.8-flash-tts` WAV, `gemini-2.5-flash` 음성 전사를 각 1회 확인했다. 두 이미지 모델은 128px 입력 PNG를 받아 1024px 편집 결과도 반환했다. OpenAI의 실응답 WAV는 RIFF/data 크기가 `0xffffffff`인 streaming header이므로 Lumen은 실제 수신 크기와 PCM alignment를 검사한 뒤 정상 길이 header로 교체해 asset에 보관한다. 파일 검사기는 provider WAV의 `audio/wave` 탐지를 canonical `audio/wav`로 정규화하며 Linux child 검사도 이 generated MIME을 받아들였다. 이 direct transport 검증은 임시 메모리 내 positive rate만 사용한 계층 검증이다.
+
+2026-09-29 격리된 로컬 Compose에 일회용 자체 서명 CA로 신뢰한 HTTPS MinIO와 실제 ClamAV scanner를 연결하고, 임시 test-only `image_variants` $0.01/image 및 audio $0.001/second를 seed한 다음 API/worker를 통해 두 공급자 각각의 호환 `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions`를 실계정 호출했다. 이미지 4개를 1024px decoder로, WAV 2개를 24 kHz PCM으로 검증했고 전사 2개가 “blue lantern”을 포함했다. DB 조회에서 8개 completed run 각각 usage row 하나와 settled hold 하나, clean asset 총 10개를 확인했다. HTTP 응답 이미지/음성은 소유 S3 asset에서 다시 읽혔고, 업로드 이미지/WAV는 scanner 경유 후 worker가 처리했다. 기본 Compose와 로컬 `.env`만으로는 S3/ClamAV가 없어서 같은 media ingress가 fail-closed다. 임시 모델 가격은 **실제 공급자 가격이 아니며**, 로컬 사용량 원장과 조직 invoice 간 금액 일치, 운영용 Kolla 배포, 브라우저/마이크 및 Live WS는 별도 검증이 필요하다.
+
+공개 ingress에서 Origin allowlist, HTTPS/WSS, WS `Upgrade`, 긴 세션(최대 900초)의 idle proxy timeout, `CHAT_API_HOSTS` compat host gate를 확인한다. BFF→Lumen은 internal service discovery의 endpoint만 사용하고 사용자 전달 URL로 연결하지 않는다. Access log에는 one-use `ticket` 및 native `token` query, `Authorization`, `X-Realtime-Token`, audio WS body를 기록하지 않는다. **공식 Gemini Live upstream WS는 서버에서 `?key=` query로 인증하므로 그 URL·접속 예외·APM trace도 절대 기록하지 않는다**; OpenAI upstream은 Bearer header다. Lumen/Afterglow가 보관하지 않는 raw realtime audio/transcript라도 upstream provider의 데이터 처리 조건은 별도로 고지한다. 실제 사용자 acceptance는 **이미지 생성/편집+scanned asset 다운로드 → TTS WAV/MP3+STT → OpenAI/Gemini 16/24k WS 양방향 audio, interruption, quota/credit ledger, disconnect/unknown recovery** 순서로 provider credential과 조직 invoice에 대조한다. Fake provider와 MariaDB/Redis 통합 검사는 live upstream inference/보존 정책 검증이 아니다.
+
+Media reservation은 provider I/O 직전에 user wallet row lock으로 월·주·API-key 사용액과 `reserved|unknown` bound를 합산한다. 비용이 확정되면 actual usage ledger와 `settled` 상태가 같은 transaction에 기록된다. Provider result 불확실 시 자동 release 금지: `chat_runs`, `chat_run_segments`, `chat_model_call_reservations`, `chat_usage_logs`의 run_id와 provider 청구 내역을 대조하고 비용·asset 상태를 결정한 뒤 관리 승인 하에 원장/hold를 일관되게 수동 조정한다. Realtime admission 후 Redis ticket 발급 실패 시 queued run은 동일 `Idempotency-Key`로 재요청해 ticket을 다시 발급할 수 있지만 사용된 ticket/진행 중 session은 재사용할 수 없다. Browser ticket은 60초 단일 소비이며 회전·로그아웃·project 전환에서 WS와 마이크를 닫는다.
 
 ## Queue, lease, recovery
 
@@ -147,24 +175,24 @@ Lumen의 root `lumen` wheel은 Kolla 역할을 shared data로 포함한다. Koll
 ### 1. 휠 패키징 및 최초 배포
 - **휠 빌드**: repository root에서 `uv build --wheel`로 `lumen-<release-version>-py3-none-any.whl` 아티팩트를 생성한다.
 - **Kolla 환경 설치**: Kolla Ansible environment에 `pip install --no-deps lumen-<release-version>-py3-none-any.whl`을 수행하면 역할 자산이 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
-- **최초 배포 명령어**: `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 precheck, config, database/Keystone preconditions, DB migration(`lumen_bootstrap`), container startup을 순차 실행한다.
+- **최초 배포 명령어**: 새 bootstrap CLI를 포함한 이미지/source pin을 준비한 뒤 `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 precheck, config, database/Keystone preconditions, DB migration(`lumen_bootstrap`), provider 등록(`lumen_provider_bootstrap`), container startup을 순차 실행한다.
 - **PostgreSQL 모드 선택**: 기본값 `lumen_postgres_mode="external"`은 `lumen_external_postgres_url`이 반드시 필요하다. 역할이 PostgreSQL을 관리하게 하려면 `/etc/kolla/config/afterglow/globals.yml`에서 `lumen_postgres_mode: "bundled"`를 선택하고 `secrets.yml`에 강한 `lumen_postgres_password`를 제공한다. 둘 중 하나를 명시하지 않은 stock defaults는 precheck에서 fail-closed 한다.
 
 ### 2. 독립 wheel/image release
-- **root package release**: `v0.3.0` tag push 시 `.github/workflows/release.yml`은 `lumen.__version__ == 0.3.0` lockstep을 확인하고 root·plugin·sandbox wheel을 GitHub Release에 첨부한다. `workflow_dispatch`는 tag 비교와 Release 첨부를 수행하지 않는다. `uv.lock`의 root distribution도 0.3.0이어야 한다.
-- **runtime image tag**: Kolla 역할의 API/worker/controller `lumen_image_tag` 기본값은 `0.3.0`이다. `.github/workflows/docker-build.yml`의 별도 `v0.3.0` 실행이 `linux/amd64,linux/arm64` 이미지를 GHCR에 성공적으로 게시하기 전에는 해당 ref를 사용해 배포하지 않는다. Wheel Release 성공만으로 이미지 게시가 보장되지 않는다. 게시 전에는 이미 확인한 이미지 tag/digest로 명시적으로 override한다. `lumen_source_version`은 별도 source-build commit pin이므로 release tag와 동기화하지 않는다.
+- **root package release**: `v0.4.0` tag push 시 `.github/workflows/release.yml`은 `lumen.__version__ == 0.4.0`과 root `uv.lock` 버전 일치를 확인하고 root·plugin·sandbox wheel을 GitHub Release에 첨부한다. `workflow_dispatch`는 release 첨부를 수행하지 않는다.
+- **runtime image tag**: Kolla 역할의 API/worker/controller `lumen_image_tag` 기본값은 `0.4.0`이다. `.github/workflows/docker-build.yml`의 별도 `v0.4.0` 실행이 `linux/amd64,linux/arm64` 이미지를 GHCR에 게시하기 전에는 이 ref로 배포하지 않는다. Wheel Release 성공만으로 이미지 게시나 Kolla 배포가 보장되지 않는다. `lumen_source_version`은 별도 source-build commit pin이며 기본값 `c561a155...`는 이번 릴리스가 아니므로 운영자는 정확한 검증 commit으로 override해야 한다.
 - **기본 이미지 네임스페이스**: Kolla 역할은 `ghcr.io/openstack-afterglow/lumen-api:<image-tag>`, `ghcr.io/openstack-afterglow/lumen-worker:<image-tag>`, runtime-enabled일 때 `ghcr.io/openstack-afterglow/lumen-controller:<image-tag>`를 사용한다. `ghcr.io/openstack-afterglow/lumen-sandbox`는 별도 게시 이미지이며 Kolla 서비스 컨테이너가 아니라 운영자가 sandbox cloud pool `image`에 정확한 ref로 지정한다. Operator는 역할의 exact digest ref override를 그대로 유지할 수 있다.
 
-0.3.0 게시 계약: release commit에서 root manifest·`lumen.__version__`·`uv.lock`이 모두 `0.3.0`인지 확인하고, `uv sync --extra service --extra dev --frozen` 및 `uv run lumen-test contract`, `uv run lumen-test integration`, `uv run lumen-test system`을 실행한다. 추가 CI gate는 `.github/workflows/ci.yml`의 plugin conformance 5개, sandbox wheel/test, SDK test/lint, Kolla asset test다. Root wheel `uv build --wheel`과 독립 plugin/sandbox wheels, Kolla shared-data asset 검증은 `release.yml`이 소유한다. 승인된 release commit에 `v0.3.0` tag를 붙여 push하면 두 tag-triggered workflow가 각각 `ci.yml`을 호출한다(중복 실행). `release-package`는 root version/tag 일치 시 wheels를 GitHub Release에 첨부하고, `build-and-push`는 통과한 test job 뒤 API/worker/controller/sandbox 멀티 아키텍처 이미지를 GHCR `0.3.0`과 `sha-<short-sha>`로 게시한다. 두 workflow 결과·각 이미지의 두 플랫폼 manifest·운영 환경의 readiness/migration을 별도로 확인한 뒤 wheel/Kolla 기본값을 배포한다. 이번 version metadata 변경 자체는 이러한 빌드·테스트·게시·실환경 배포를 수행했다는 증거가 아니다.
+0.4.0 게시 계약: release commit에서 root manifest·`lumen.__version__`·`uv.lock`의 `0.4.0` 일치를 확인하고 `uv sync --extra service --extra dev --frozen`, `uv run lumen-test contract`, `uv run lumen-test integration`, `uv run lumen-test system`, `uv build --wheel`을 수행한다. `v0.4.0` tag workflow가 CI 이후 두 플랫폼의 API/worker/controller/sandbox 이미지를 GHCR `0.4.0`·`sha-<short-sha>`에 게시하는지 확인한다. 기존 API/worker/controller를 중지하고 DB 백업과 migration 정합성을 확인한 뒤 새 이미지를 함께 기동한다. CI·이미지 게시·wheel release는 운영 Kolla 배포를 대체하지 않는다.
 
 ### 3. 운영자 동기화
 - **역할 업데이트**: 새 root wheel을 Kolla environment에 재설치하여 `share/kolla-ansible/ansible/roles/lumen` 자산을 동기화한다.
 
 ### 4. Upgrade vs. Reconfigure 동작 및 마이그레이션 보장
-- **Reconfigure 명령어 및 순서 (`reconfigure.yml`)**: `kolla-ansible -i <inventory> reconfigure --tags lumen` (`precheck` → `pull` → `config` → `bootstrap_service` (DB migration) → `start`)
+- **Reconfigure 명령어 및 순서 (`reconfigure.yml`)**: `kolla-ansible -i <inventory> reconfigure --tags lumen` (`precheck` → `pull` → `config` → `bootstrap_service` (DB migration → provider registration) → `start`)
   - Reconfigure 실행 시 최신 갱신 이미지를 먼저 pull하여, `bootstrap_service` 단계의 DB 마이그레이션이 항상 갱신된 최신 이미지 코드로 실행되도록 보장한다.
-- **Upgrade 명령어 및 순서 (`upgrade.yml`)**: `kolla-ansible -i <inventory> upgrade --tags lumen` (`pull` → `config` → `bootstrap_service` (DB migration) → `start`)
-- **마이그레이션 선행 보장**: `deploy`, `upgrade`, `reconfigure` 모두 관리하는 API/Worker/Controller 서비스 컨테이너 start 단계 전에 migration을 수행한다. 혼합 버전 회피를 위한 기존 컨테이너 admission 중지/정지는 운영자가 cutover에서 확인한다.
+- **Upgrade 명령어 및 순서 (`upgrade.yml`)**: `kolla-ansible -i <inventory> upgrade --tags lumen` (`pull` → `config` → `bootstrap_service` (DB migration → provider registration) → `start`)
+- **기동 선행 보장**: `deploy`, `upgrade`, `reconfigure` 모두 관리하는 API/Worker/Controller 서비스 컨테이너 start 단계 전에 migration과 provider bootstrap을 수행한다. 혼합 버전 회피를 위한 기존 컨테이너 admission 중지/정지는 운영자가 cutover에서 확인한다.
 
 ## 보존, backup, restore
 

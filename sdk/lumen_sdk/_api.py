@@ -147,6 +147,29 @@ class _LumenApiMixin:
     def run_children(self, run_id, **query):
         return self._json_request("GET", f"/v1/runs/{_segment(run_id)}/children", params=_query(**query))
 
+    # -- Media ----------------------------------------------------------
+
+    def generate_image(self, *, idempotency_key: str, **attrs):
+        return self._json_request("POST", "/v1/chat/images/generations", body=attrs,
+                                  headers={"Idempotency-Key": idempotency_key})
+
+    def edit_image(self, *, idempotency_key: str, **attrs):
+        return self._json_request("POST", "/v1/chat/images/edits", body=attrs,
+                                  headers={"Idempotency-Key": idempotency_key})
+
+    def speech(self, *, idempotency_key: str, **attrs) -> bytes:
+        response = self.request("/v1/chat/audio/speech", "POST", raise_exc=True, json=attrs,
+                                headers={"Idempotency-Key": idempotency_key})
+        return response.content
+
+    def transcribe(self, *, idempotency_key: str, **attrs):
+        return self._json_request("POST", "/v1/chat/audio/transcriptions", body=attrs,
+                                  headers={"Idempotency-Key": idempotency_key})
+
+    def create_realtime_session(self, *, idempotency_key: str, **attrs):
+        return self._json_request("POST", "/v1/chat/realtime/sessions", body=attrs,
+                                  headers={"Idempotency-Key": idempotency_key})
+
     # -- Models & Capabilities ------------------------------------------
 
     def discovery(self):

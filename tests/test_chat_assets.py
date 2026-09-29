@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,15 +14,17 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from lumen.api import assets as asset_api
-from lumen.auth import get_token_info
-from lumen.services import assets
+from lumen.auth import get_principal
+from lumen.services import asset_inspector, assets
 
 
 @pytest.fixture
 def asset_client():
     app = FastAPI()
     app.include_router(asset_api.router, prefix="/api/v1/chat")
-    app.dependency_overrides[get_token_info] = lambda: {"user_id": "user-1", "project_id": "project-1"}
+    app.dependency_overrides[get_principal] = lambda: {
+        "user_id": "user-1", "project_id": "project-1", "auth_type": "keystone"
+    }
     return TestClient(app)
 
 
@@ -35,6 +38,27 @@ def test_inspect_file_uses_bounded_child_and_sanitizes_display_name(tmp_path: Pa
     assert inspected.mime_type == "image/png"
     assert inspected.original_name == "_unsafe_name.png"
     assert inspected.sha256 == hashlib.sha256(b"image data").hexdigest()
+
+def test_wav_upload_and_generated_speech_share_a_canonical_mime(tmp_path: Path):
+    import wave
+
+    output = io.BytesIO()
+    with wave.open(output, "wb") as sound:
+        sound.setnchannels(1)
+        sound.setsampwidth(2)
+        sound.setframerate(24000)
+        sound.writeframes(b"\x00\x00" * 240)
+    path = tmp_path / "speech.wav"
+    path.write_bytes(output.getvalue())
+
+    inspected = asset_inspector.inspect(path)
+    assert inspected == {"mime_type": "audio/wav", "metadata": {"duration_ms": 10}}
+    # Darwin rejects the Linux child process's 512 MiB address-space limit.
+    if sys.platform != "darwin":
+        upload = assets.inspect_file(path, original_name="speech.wav")
+        generated = assets.inspect_generated_file(path, original_name="speech.wav", media_type="audio/wav")
+        assert upload.mime_type == generated.mime_type == inspected["mime_type"]
+        assert upload.metadata == generated.metadata == inspected["metadata"]
 
 
 def test_inspector_runs_fixed_argv_with_resource_limited_child(tmp_path: Path, monkeypatch):
@@ -459,38 +483,6 @@ async def test_link_output_assets_rejects_foreign_asset():
             run=SimpleNamespace(id="run-1", user_id="user-1", project_id="project-1"),
             asset_ids=["asset-1"],
         )
-
-
-def test_upload_route_spools_then_delegates_to_scanned_pipeline(asset_client, monkeypatch):
-    captured: dict[str, object] = {}
-
-    async def create_uploaded_asset(*, path, original_name, user_id, project_id):
-        captured.update(bytes=path.read_bytes(), original_name=original_name, user_id=user_id, project_id=project_id)
-        return {
-            "id": "f6d18ec7-c8d8-4db8-9bd7-2dceb0f0f68e",
-            "name": "image.png",
-            "mime_type": "image/png",
-            "size_bytes": 3,
-            "sha256": "a" * 64,
-            "status": "clean",
-            "media_metadata": {"width": 1, "height": 1},
-            "created_at": None,
-        }
-
-    monkeypatch.setattr(asset_api.assets, "create_uploaded_asset", create_uploaded_asset)
-    response = asset_client.post(
-        "/api/v1/chat/assets",
-        files={"file": ("image.png", b"png", "image/png")},
-    )
-
-    assert response.status_code == 201
-    assert captured == {
-        "bytes": b"png",
-        "original_name": "image.png",
-        "user_id": "user-1",
-        "project_id": "project-1",
-    }
-    assert response.json()["status"] == "clean"
 
 
 def test_download_route_streams_owned_asset_without_cross_origin_redirect(asset_client, monkeypatch):

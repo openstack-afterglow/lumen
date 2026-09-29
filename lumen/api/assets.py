@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from lumen.auth import get_token_info
+from lumen.auth import Principal, require_scopes
 from lumen.services import assets
 from lumen.services.conversation_store import ChatStorageUnavailable
 
@@ -59,7 +59,7 @@ async def _spool_upload(upload: UploadFile) -> Path:
 
 
 @router.post("/assets", response_model=AssetResponse, status_code=201)
-async def upload_asset(file: UploadFile = File(...), token_info: dict = Depends(get_token_info)):
+async def upload_asset(file: UploadFile = File(...), token_info: Principal = Depends(require_scopes("native:assets:write"))):
     path = await _spool_upload(file)
     try:
         result = await assets.create_uploaded_asset(
@@ -77,7 +77,7 @@ async def upload_asset(file: UploadFile = File(...), token_info: dict = Depends(
 
 
 @router.get("/assets/{asset_id}/download")
-async def download_asset(asset_id: UUID, token_info: dict = Depends(get_token_info)):
+async def download_asset(asset_id: UUID, token_info: Principal = Depends(require_scopes("native:assets:read"))):
     try:
         download = await assets.open_download(
             asset_id=str(asset_id),
@@ -100,7 +100,7 @@ async def download_asset(asset_id: UUID, token_info: dict = Depends(get_token_in
 
 
 @router.get("/assets/{asset_id}", response_model=AssetResponse)
-async def get_asset(asset_id: UUID, token_info: dict = Depends(get_token_info)):
+async def get_asset(asset_id: UUID, token_info: Principal = Depends(require_scopes("native:assets:read"))):
     try:
         return await assets.get_asset(
             asset_id=str(asset_id), user_id=token_info["user_id"], project_id=token_info["project_id"]
@@ -110,7 +110,7 @@ async def get_asset(asset_id: UUID, token_info: dict = Depends(get_token_info)):
 
 
 @router.delete("/assets/{asset_id}", status_code=202)
-async def delete_asset(asset_id: UUID, token_info: dict = Depends(get_token_info)):
+async def delete_asset(asset_id: UUID, token_info: Principal = Depends(require_scopes("native:assets:write"))):
     try:
         return await assets.delete_asset(
             asset_id=str(asset_id), user_id=token_info["user_id"], project_id=token_info["project_id"]

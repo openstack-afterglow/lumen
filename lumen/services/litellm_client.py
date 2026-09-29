@@ -793,6 +793,9 @@ async def _subscription_completion(
         if not isinstance(access_token, str) or not access_token:
             raise ProviderSubscriptionError("subscription_auth_required", 502)
         normalized_model = litellm_model_name(model)
+        # Same contract as the API-key path: let LiteLLM drop sampling params it knows
+        # the model rejects (e.g. temperature != 1 on claude-opus-5-5) instead of raising.
+        litellm.drop_params = True
         logging_obj = SubscriptionLogging(
             model=normalized_model,
             provider="anthropic",

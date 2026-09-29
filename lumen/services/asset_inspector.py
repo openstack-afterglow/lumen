@@ -19,7 +19,8 @@ def _mime(path: Path) -> str:
     matches = puremagic.magic_file(str(path))
     if not matches or not isinstance(getattr(matches[0], "mime_type", None), str):
         raise ValueError("unsupported file type")
-    return matches[0].mime_type.lower()
+    mime = matches[0].mime_type.lower()
+    return "audio/wav" if mime in {"audio/wave", "audio/x-wav", "audio/vnd.wave"} else mime
 
 
 def _image(path: Path) -> dict[str, int]:

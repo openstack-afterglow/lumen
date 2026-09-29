@@ -1,3 +1,7 @@
+x-provider-keys: &provider-keys
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+
 services:
   mariadb:
     image: mariadb:11
@@ -38,7 +42,8 @@ services:
       RUNTIME_CONFIG: '${RUNTIME_CONFIG:-{}}'
       CHAT_MCP_OAUTH_CALLBACK_URL: http://localhost:${LUMEN_API_PORT:-8012}/api/v1/chat/mcp-oauth/callback
       CHAT_API_HOSTS: localhost,127.0.0.1,lumen-api
-      CHAT_DEFAULT_MODEL: ${LUMEN_LOCAL_MODEL:-gpt-4.1-mini}
+      # The default text model is OpenAI; Gemini-only stacks set CHAT_DEFAULT_MODEL explicitly.
+      CHAT_DEFAULT_MODEL: ${CHAT_DEFAULT_MODEL:-${LUMEN_LOCAL_MODEL:-gpt-4.1-mini}}
       CHAT_COMPAT_RUN_TIMEOUT_SECONDS: ${CHAT_COMPAT_RUN_TIMEOUT_SECONDS:-300}
       CLAUDE_GATEWAY_BASE_URL: http://localhost:${LUMEN_API_PORT:-8012}/v1/claude-gateway
       CLAUDE_GATEWAY_MODEL: ${LUMEN_LOCAL_MODEL:-gpt-4.1-mini}
@@ -55,12 +60,12 @@ services:
     image: ${COMPOSE_PROJECT_NAME:-lumen}-runtime
     command: ["lumen-seed-local"]
     environment:
-      <<: *lumen-environment
-      LUMEN_LOCAL_PROVIDER_API_KEY: ${LUMEN_LOCAL_PROVIDER_API_KEY:-}
+      <<: [*lumen-environment, *provider-keys]
+      LUMEN_BOOTSTRAP_MODELS_JSON: '${LUMEN_BOOTSTRAP_MODELS_JSON:-[]}'
       LUMEN_LOCAL_PROVIDER_NAME: ${LUMEN_LOCAL_PROVIDER_NAME:-local-openai}
       LUMEN_LOCAL_PROVIDER_TYPE: ${LUMEN_LOCAL_PROVIDER_TYPE:-openai}
       LUMEN_LOCAL_PROVIDER_BASE_URL: ${LUMEN_LOCAL_PROVIDER_BASE_URL:-}
-      LUMEN_LOCAL_MODEL: ${LUMEN_LOCAL_MODEL:-gpt-4.1-mini}
+      LUMEN_LOCAL_MODEL: ${LUMEN_LOCAL_MODEL:-}
       LUMEN_LOCAL_INPUT_PRICE_PER_MILLION: ${LUMEN_LOCAL_INPUT_PRICE_PER_MILLION:-1}
       LUMEN_LOCAL_OUTPUT_PRICE_PER_MILLION: ${LUMEN_LOCAL_OUTPUT_PRICE_PER_MILLION:-3}
       LUMEN_LOCAL_SEED_PATH: /seed/api-key
@@ -93,8 +98,7 @@ services:
       dockerfile: docker/Dockerfile
       target: lumen-api
     environment:
-      <<: *lumen-environment
-      LUMEN_LOCAL_PROVIDER_API_KEY: ${LUMEN_LOCAL_PROVIDER_API_KEY:-}
+      <<: [*lumen-environment, *provider-keys]
     depends_on:
       seed-local:
         condition: service_completed_successfully
@@ -114,8 +118,7 @@ services:
       dockerfile: docker/Dockerfile
       target: lumen-worker
     environment:
-      <<: *lumen-environment
-      LUMEN_LOCAL_PROVIDER_API_KEY: ${LUMEN_LOCAL_PROVIDER_API_KEY:-}
+      <<: [*lumen-environment, *provider-keys]
     depends_on:
       seed-local:
         condition: service_completed_successfully

@@ -21,7 +21,7 @@
     network_mode: host
     volumes:
       - "{{ lumen_config_dir }}/lumen.conf:/etc/lumen/lumen.conf:ro"
-    env:
+    env: &lumen_migration_env
       LUMEN_CONFIG_FILE: "/etc/lumen/lumen.conf"
       DATABASE_URL: "{{ lumen_database_url }}"
       REDIS_URL: "{{ lumen_redis_url }}"
@@ -39,5 +39,26 @@
       CHAT_SANDBOX_API_KEY: "{{ lumen_sandbox_api_key }}"
   no_log: true
   register: lumen_bootstrap_result
+  run_once: true
+  delegate_to: "{{ groups['lumen'] | first }}"
+
+- name: Bootstrap | Register configured Lumen providers
+  become: true
+  community.docker.docker_container:
+    name: lumen_provider_bootstrap
+    image: "{{ lumen_api_image_ref }}"
+    command: ["python", "-m", "lumen.scripts.seed_providers"]
+    state: started
+    detach: false
+    cleanup: true
+    network_mode: host
+    volumes:
+      - "{{ lumen_config_dir }}/lumen.conf:/etc/lumen/lumen.conf:ro"
+    env:
+      <<: *lumen_migration_env
+      OPENAI_API_KEY: "{{ lumen_openai_api_key }}"
+      GEMINI_API_KEY: "{{ lumen_gemini_api_key }}"
+      LUMEN_BOOTSTRAP_MODELS_JSON: "{{ lumen_bootstrap_models_json }}"
+  no_log: true
   run_once: true
   delegate_to: "{{ groups['lumen'] | first }}"

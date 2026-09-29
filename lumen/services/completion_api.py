@@ -16,6 +16,8 @@ from dataclasses import replace
 from decimal import Decimal
 from typing import Any, Literal
 
+from litellm.exceptions import BadRequestError
+
 from lumen.config import get_settings
 from lumen.services import context_manager, credit, litellm_client, native_compaction
 from lumen.services.providers import errors
@@ -450,6 +452,14 @@ async def complete_responses(
     """Execute the native Responses protocol and preserve every upstream item/event."""
     event_id = str(uuid.uuid4())
     options = _with_passthrough_compaction(options, resolved=resolved, protocol="responses")
+    if resolved.get("reasoning_unsupported") is True:
+        options.pop("reasoning", None)
+        if include := options.get("include"):
+            filtered = [item for item in include if not item.startswith("reasoning.")]
+            if filtered:
+                options["include"] = filtered
+            else:
+                options.pop("include")
     try:
         response = await litellm_client.aresponses(
             model=resolved["model_name"],
@@ -463,6 +473,9 @@ async def complete_responses(
         )
     except errors.ProviderSubscriptionError as exc:
         raise CompletionError(exc.status_code, exc.message) from None
+    except BadRequestError:
+        logger.info("Responses provider rejected request model=%s", resolved.get("model_name"))
+        raise CompletionError(400, "upstream model rejected request") from None
     except Exception as exc:
         logger.warning("Responses upstream request failed model=%s", resolved.get("model_name"), exc_info=True)
         raise CompletionError(502, "upstream model error") from exc

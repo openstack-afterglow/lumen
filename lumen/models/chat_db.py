@@ -102,6 +102,8 @@ class LlmModel(Base):
     provider_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_providers.id", ondelete="CASCADE"), nullable=False)
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     display_name: Mapped[str | None] = mapped_column(VARCHAR(150))
+    model_kind: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="text", server_default="text")
+    media_pricing: Mapped[dict | None] = mapped_column(JSON)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     # 대화 제목 자동 요약에 쓸 모델. 앱 레벨에서 최대 1개만 True 로 유지(set_title_model).
     is_title_model: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)

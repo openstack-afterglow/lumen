@@ -276,6 +276,24 @@ async def _finish_transaction(
         _require_owned_running_lease(run, owner)
         if run.status not in NONTERMINAL:
             return
+        if run.run_kind in {"image", "tts", "stt", "realtime"}:
+            from lumen.models.chat_runs import ChatModelCallReservation
+
+            reservation = (await session.execute(select(ChatModelCallReservation).where(
+                ChatModelCallReservation.run_id == run.id,
+                ChatModelCallReservation.segment_id == f"{run.run_kind}:1"
+            ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+            if status == "completed" and (reservation is None or reservation.status != "settled"
+                                          or run.usage_reconciled_at is None):
+                raise DurableRunProviderResultUnknown("unsettled media run cannot complete")
+            if reservation is not None and reservation.status == "reserved" and status != "completed":
+                segment = (await session.execute(select(ChatRunSegment).where(
+                    ChatRunSegment.run_id == run.id, ChatRunSegment.segment_id == f"{run.run_kind}:1"
+                ).with_for_update())).scalar_one()
+                if segment.status == "provider_started":
+                    fail_unresolved_segment(segment, error_code="provider_result_unknown")
+                reservation.status = "unknown"
+                reservation.settled_at = _now()
         await append_event(session, run, _event(run, "run.stage.changed", {"stage": "finalizing"}))
         run.status = "finalizing"
         if usage_record is not None:
@@ -1879,8 +1897,23 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
         capability_snapshot = run.capability_snapshot
         pricing_snapshot = run.pricing_snapshot
         existing_message_id = run.assistant_message_id
+    run_kind = getattr(run, "run_kind", "completion")
 
-    if getattr(run, "run_kind", "completion") == "compaction":
+    if run_kind == "image":
+        from .images import execute_image_run
+
+        return await execute_image_run(run_id, owner=owner,
+                                       payload={**payload, "user_id": user_id, "project_id": project_id},
+                                       capability_snapshot=capability_snapshot, pricing_snapshot=pricing_snapshot)
+
+    if run_kind in {"tts", "stt"}:
+        from .audio import execute_audio_run
+
+        return await execute_audio_run(run_id, owner=owner,
+                                       payload={**payload, "user_id": user_id, "project_id": project_id},
+                                       capability_snapshot=capability_snapshot, pricing_snapshot=pricing_snapshot)
+
+    if run_kind == "compaction":
         input_messages = [dict(m) for m in (payload.get("input_messages") or [])]
         raw_tool_schemas = payload.get("tool_schemas")
         if not isinstance(raw_tool_schemas, list) or not all(isinstance(schema, dict) for schema in raw_tool_schemas):
@@ -2764,7 +2797,8 @@ async def queued_run_ids(*, limit: int = 4) -> list[str]:
         return list(
             (
                 await session.execute(
-                    select(ChatRun.id).where(ChatRun.status == "queued").order_by(ChatRun.created_at).limit(limit)
+                    select(ChatRun.id).where(ChatRun.status == "queued", ChatRun.run_kind != "realtime")
+                    .order_by(ChatRun.created_at).limit(limit)
                 )
             ).scalars()
         )

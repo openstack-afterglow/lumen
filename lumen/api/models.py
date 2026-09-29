@@ -286,6 +286,8 @@ class ModelCreateRequest(BaseModel):
     provider_id: int
     model_name: str = Field(..., max_length=190)
     display_name: str | None = Field(default=None, max_length=150)
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
+    media_pricing: dict | None = None
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
     # Optional prompt-cache rates, independent of each other and of the input/output pair.
@@ -295,6 +297,17 @@ class ModelCreateRequest(BaseModel):
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
     capabilities: CapabilitiesInput | None = None
     is_active: bool = True
+    @model_validator(mode="after")
+    def _kind_prices(self):
+        if self.model_kind != "text" and any(getattr(self, field) is not None for field in (
+            "input_price_per_million", "output_price_per_million", "cache_read_price_per_million",
+            "cache_write_price_per_million", "cache_write_1h_price_per_million",
+        )):
+            raise ValueError("media 모델에는 text token 가격을 설정할 수 없습니다")
+        if self.model_kind == "text" and self.media_pricing is not None:
+            raise ValueError("text 모델에는 media_pricing을 설정할 수 없습니다")
+        return self
+
 
     model_config = {"protected_namespaces": (), "extra": "forbid"}
 
@@ -327,6 +340,8 @@ class ModelCreateRequest(BaseModel):
 class ModelUpdateRequest(BaseModel):
     model_name: str | None = Field(default=None, max_length=190)
     display_name: str | None = Field(default=None, max_length=150)
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
+    media_pricing: dict | None = None
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
     # Optional prompt-cache rates, independent of each other and of the input/output pair.
@@ -373,6 +388,8 @@ class ModelResponse(BaseModel):
     id: int
     provider_id: int
     model_name: str
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
+    media_pricing: dict | None = None
     api_model_name: str
     api_provider: str
     display_name: str | None
@@ -771,6 +788,8 @@ async def set_title_model(payload: TitleModelRequest):
         await repository.set_title_model(payload.model_id)
     except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except errors.ProviderValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
@@ -782,6 +801,8 @@ async def set_memory_model(payload: MemoryModelRequest):
         await repository.set_memory_model(payload.model_id)
     except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except errors.ProviderValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 

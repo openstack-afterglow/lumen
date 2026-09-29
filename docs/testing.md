@@ -39,9 +39,25 @@ uv run lumen-test integration
 uv run lumen-test system
 ```
 
+`contract`/`integration`/`system`은 `.env`의 `OPENAI_API_KEY`/`GEMINI_API_KEY`를 live provider 호출에 사용하지 않는다. System은 fake HTTP provider를 사용한다. 실제 유료 호출은 로컬 Compose에서 별도로 migration→provider bootstrap→API/worker 기동, native model registry의 선택 kind·가격·credential 상태 확인 후 실행한다. 호환 `/v1/models`는 text 모델 목록이므로 media route readiness를 증명하지 않는다. OpenAI·Gemini의 짧은 text completion을 각각 1건씩, media는 명시된 `LUMEN_BOOTSTRAP_MODELS_JSON` 모델/가격·S3/scanner 준비가 있는 경우에만 경계별로 수행한다. 출력은 provider response/status와 Lumen ledger 사용량만 요약하고 key 또는 전체 `docker compose config`를 로그에 남기지 않는다. 실제 provider의 모델 접근 거절/과금 정책은 계정마다 다르며 synthetic green으로 실증을 대체하지 않는다.
+
+실제 미디어 transport 수용은 operator가 승인한 키로 지원 ID당 짧은 이미지·발화 1건을 직접 요청하고, 반환 PNG/JPEG를 decoder로 열고, TTS WAV의 RIFF/data 길이와 PCM duration을 확인한 뒤 그 WAV를 STT에 넣어 발화 문자열이 보존되는지 확인한다. 임시 in-memory rate는 전송 계층 실행 gate만 통과시키며 DB에 저장하거나 vendor 청구 단가로 광고하지 않는다. Durable HTTP/compat 수용은 **별도로** HTTPS S3, ClamAV, 명시된 가격, API/worker와 scan/download, reservation·usage ledger가 모두 준비된 환경에서 실행한다. 임시 격리 stack의 test-only 가격은 vendor rate 정확도를 증명하지 않으며 운영 승격에는 확인된 가격과 invoice 대조가 필요하다. `GET /models`에 ID가 있다는 사실만으로 해당 계정의 실제 호출 권한이나 Lumen route 지원을 증명하지 않는다.
+
+2026-09-29 로컬 수용은 TLS MinIO/ClamAV를 일회용 Compose override로 연결하고 OpenAI/Gemini 각각 이미지 생성·편집, WAV 음성·전사를 호환 HTTP API로 실호출했다. 응답 검증 후 `chat_runs`, `chat_usage_logs`, `chat_model_call_reservations`, `chat_assets`의 상태를 조회하여 completed 8건, settled/usage 각 8건, clean asset 10건을 확인했다. Gemini HTTP STT는 기존 `gemini-2.5-flash` text binding을 보존하기 위해 별도 `gemini-2.5-pro` STT route로 실행했다(transport 직접 검증은 `gemini-2.5-flash`). 이 성공을 실청구 가격, 운영 배포, Live WS 또는 Afterglow 실제 사용자 브라우저 증거로 승격하지 않는다.
+
 ### 실제 Codex CLI 확인
 
 Direct Codex provider의 영구 contract는 system gate의 Responses tool-call/full-input 시나리오가 담당합니다. Codex binary 자체는 repository dependency가 아니므로 gate에서 설치하지 않습니다. 2026-09-20에는 별도로 설치된 `codex-cli 0.154.0`을 격리된 `CODEX_HOME`과 `--strict-config`로 containerized Lumen에 연결해 text turn과 `exec_command` → local output → `function_call_output` 후속 turn을 실행했습니다. 정확한 설정과 이 증거의 한계는 [Afterglow 연동 가이드](afterglow-integration.md#45-codex-cli-direct-responses-provider)에 기록합니다.
+
+2026-09-29에는 사용자 Codex 설정의 `lumen` provider를 명시적으로 선택하고 별도 Compose `127.0.0.1:18012`에서 scoped seed key와 실제 OpenAI `gpt-4.1-mini`로 `codex-cli 0.159.0`을 실행했습니다. `/v1/responses` 두 요청이 200, CLI `exec_command`가 `CODEX_TOOL_OK` (exit 0), 최종 메시지가 `CODEX_TOOL_CONTINUATION_OK`였습니다. 이 로컬 실행만으로는 원격 배포가 검증되지 않습니다.
+
+같은 날 기존 8012의 Afterglow 서비스를 유지한 채 `LUMEN_API_PORT=18012`, `LUMEN_LOCAL_MODEL=gpt-6-luna`로 별도 Compose를 기동했습니다. 설치된 LiteLLM의 exact catalog 입력/출력 가격을 smoke 용도로만 명시했습니다. `/v1/models`의 `gpt-6-luna` provider `openai`, Codex `exec_command` 출력 `LUNA_TOOL_OK` (exit 0) 및 후속 완료 `LUNA_CODEX_CONTINUATION_OK`, `/v1/responses` HTTP 200 세 건과 동일 모델의 scoped ledger 세 건을 관찰했습니다. 가격의 vendor invoice 정확도는 확인하지 않았습니다.
+
+별도 실제 원격 `lumen.dmslab.re.kr` 수용에서 health/ready, 배포 key의 모델 목록, `gpt-6-luna` non-stream/SSE Responses 완료를 확인했습니다. Codex CLI 0.159.0의 기본 CA 설정은 원격 TLS 연결에 실패했으나 `CODEX_CA_CERTIFICATE=/private/etc/ssl/cert.pem`로 **현재 사용자 설정**의 `lumen` provider와 `-m gpt-6-luna`를 선택하자 `exec_command` 출력 `REMOTE_LUNA_TOOL_OK` (exit 0), 최종 `REMOTE_LUNA_CODEX_OK`로 완료됐습니다. 모델 override 없이 기본 `gpt-6-sol`의 Codex text 턴도 `REMOTE_SOL_OK.`로 완료됐습니다(tool continuation은 미검증). 이 key는 `usage:read`가 없어 원격 사용량 원장은 검사하지 못했습니다. 실행 명령과 경계는 [Afterglow 연동 가이드](afterglow-integration.md#45-codex-cli-direct-responses-provider)에 기록합니다.
+
+일반 터미널 사용 경로도 확인했습니다. `~/.codex/lumen.config.toml`의 Luna provider/model 프로필, 대화형 zsh의 `CODEX_CA_CERTIFICATE` 및 `codex` 셸 함수를 한 번 설정한 뒤, **명령별 provider/model/CA override 없이** `codex exec`가 원격 `/v1/responses` 200, `exec_command`의 `ORDINARY_LUMEN_TOOL_OK` (exit 0), 최종 `ORDINARY_LUMEN_CODEX_OK`로 완료됐습니다. 일반 `codex` TUI도 Luna 기본 모델을 표시하고 텍스트 응답을 반환했습니다. TUI의 기존 `SessionStart` hook 경고는 모델 응답을 막지 않았습니다. 데스크톱 앱의 기존 `codex-lb` 기본값과 다른 셸의 동작은 변경하지 않았습니다.
+
+별도 원격 `lumen.dmslab.re.kr` 검증에서 발급된 ordinary Lumen API key로 `/v1/models`, `/v1/chat/models`, Anthropic `POST /v1/messages`가 각각 HTTP 200을 반환했고 활성 `claude-haiku-4-5` 모델이 텍스트 `SERVER_OK`를 반환했습니다. Claude Code 2.1.280을 비어 있는 임시 `HOME`과 `CLAUDE_CONFIG_DIR`로 격리하고 `ANTHROPIC_BASE_URL=https://lumen.dmslab.re.kr`, `ANTHROPIC_AUTH_TOKEN` 및 모델/tier 환경변수만 child process에 전달했습니다. 실제 local `Bash`의 `printf CLI_TOOL_OK` tool result (`is_error=false`) 뒤 최종 `CLI_FINAL_OK`, CLI exit 0을 관찰했습니다. Init의 `apiKeySource=none`은 토큰 출처 증거가 아니며 원격 usage ledger는 조회하지 못했습니다. 이 CLI·direct API 증거는 아직 새 0.4.0 이미지의 운영 배포나 Afterglow 브라우저의 실제 인증 성공 증거가 아닙니다.
 
 ### 디버깅을 위한 집중(Focused) pytest 실행
 
@@ -125,7 +141,7 @@ CI는 다음 7개 병렬 자동화 게이트로 구성된다.
   - trigger, dedup 조건(실제 step script를 stub `gh`로 실행), gate 식, `ci.yml` 잡 목록과 각 잡의 `!cancelled()`, cache export ref, health-check 창.
   - system 잡의 stdlib-only 실행 전제, 모든 uv COPY의 tag+digest 고정, Dockerfile layer 순서와 `COPY --chown`.
   - `tests/test_test_layers.py`는 compose 명령을 정확히 고정한다.
-- 규칙과 측정 기준선은 `AGENTS.md`의 "CI 파이프라인 성능 규정"을 따른다.
+- 규칙과 측정 기준선은 [CI 성능 spec](../openspec/specs/ci-performance/spec.md)을 따른다. 첫 `dev` push의 실제 잡·이미지 게시 및 non-duplicate PR `dedup` 비용은 [진행 중인 증거](../openspec/changes/ci-review-round-1/tasks.md)에서 확인한다.
 
 ### Reusable Workflow 활용 예시 (Exact Refs)
 

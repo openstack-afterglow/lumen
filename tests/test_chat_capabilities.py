@@ -556,3 +556,14 @@ def test_subscription_capability_limits_disable_native_web_search(auth_mode):
         "reason_code": "provider_unsupported",
         "pricing_available": False,
     }
+
+
+def test_image_variant_pricing_requires_exact_size_and_quality_without_base_fallback():
+    pricing = {
+        "image_per_unit": "0.04",
+        "image_variants": {"1024x1024:high": "0.08"},
+    }
+    assert provider_pricing.exact_media_price(pricing, "image_per_unit", variant="1024x1024:high") == Decimal("0.08")
+    assert provider_pricing.exact_media_price(pricing, "image_per_unit", variant="1024x1024:low") is None
+    assert provider_pricing.exact_media_price(pricing, "image_per_unit") is None
+    assert provider_pricing.exact_media_price({"image_per_unit": "0"}, "image_per_unit", variant="1024x1024:low") == Decimal("0")

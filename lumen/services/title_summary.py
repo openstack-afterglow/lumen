@@ -240,9 +240,13 @@ async def generate_title(*, exchange: Sequence[Mapping[str, Any]], route: Mappin
     params = {key: value for key, value in params.items() if value is not None}
     # none is the least expensive supported reasoning mode.  The wrapper
     # omits it for providers which do not support reasoning parameters.
+    # acompletion has no reasoning_effort argument, so it travels in extra
+    # exactly as acompletion_stream merges it.
     reasoning_params = getattr(litellm_client, "_reasoning_params", None)
     if callable(reasoning_params):
-        params.update(reasoning_params(model, "none", route.get("provider_type")))
+        reasoning = reasoning_params(model, "none", route.get("provider_type"))
+        if reasoning:
+            params["extra"] = reasoning
     response = await litellm_client.acompletion(model, messages, **params)
     raw = _resp_text(response)
     title = _clean(raw)

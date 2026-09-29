@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
@@ -19,6 +20,72 @@ from .errors import ProviderValidationError
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
+MODEL_KINDS = frozenset({"text", "image", "tts", "stt", "realtime"})
+MEDIA_PRICE_FIELDS = {
+    "image": ("image_per_unit", "image_variants"),
+    "tts": ("audio_per_character", "audio_per_second", "audio_output_per_second"),
+    "stt": ("audio_per_minute", "audio_input_per_second"),
+    "realtime": ("realtime_input_per_minute", "realtime_output_per_minute"),
+}
+
+
+def validate_media_pricing(model_kind: str, pricing: dict | None) -> dict | None:
+    """Validate and serialize explicit per-kind USD rates without token-price fallback."""
+    if model_kind not in MODEL_KINDS:
+        raise ProviderValidationError("지원하지 않는 model_kind 입니다")
+    if pricing is None:
+        return None
+    if not isinstance(pricing, dict) or model_kind == "text":
+        raise ProviderValidationError("media_pricing은 media 모델의 객체여야 합니다")
+    allowed = set(MEDIA_PRICE_FIELDS[model_kind])
+    if set(pricing) - allowed:
+        raise ProviderValidationError("model_kind에 맞지 않는 media_pricing 항목입니다")
+    result: dict[str, str | dict[str, str]] = {}
+    for key, value in pricing.items():
+        if key == "image_variants":
+            if not isinstance(value, dict) or len(value) > 500:
+                raise ProviderValidationError("image_variants는 variant 가격 객체여야 합니다")
+            variants: dict[str, str] = {}
+            for variant, amount in value.items():
+                if not isinstance(variant, str) or not re.fullmatch(r"(auto|[1-9][0-9]*x[1-9][0-9]*):[A-Za-z0-9][A-Za-z0-9_-]*", variant):
+                    raise ProviderValidationError("image_variants는 size:quality 정확한 키를 사용해야 합니다")
+                variants[variant] = str(_to_decimal(amount, key))
+            result[key] = variants
+        else:
+            result[key] = str(_to_decimal(value, key))
+    return result or None
+
+
+def exact_media_price(pricing: dict | None, field: str, *, variant: str | None = None) -> Decimal | None:
+    """Select an image rate: configured variants demand exact size:quality; otherwise universal base."""
+    if not isinstance(pricing, dict):
+        return None
+    variants = pricing.get("image_variants") if field == "image_per_unit" else None
+    if isinstance(variants, dict) and variants:
+        value = variants.get(variant) if variant is not None else None
+    else:
+        value = pricing.get(field)
+    try:
+        price = Decimal(str(value)) if value is not None else None
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return price if price is not None and price.is_finite() and price >= 0 else None
+
+def media_pricing_available(kind: str, pricing: dict | None) -> bool:
+    if not isinstance(pricing, dict):
+        return False
+    if kind == "image":
+        variants = pricing.get("image_variants")
+        return bool(variants) if isinstance(variants, dict) else exact_media_price(pricing, "image_per_unit") is not None
+    if kind in {"tts", "stt"}:
+        return any(exact_media_price(pricing, field) is not None for field in MEDIA_PRICE_FIELDS[kind])
+    if kind == "realtime":
+        return all(exact_media_price(pricing, field) is not None for field in MEDIA_PRICE_FIELDS[kind])
+    return False
+
+
+def _kind(row: LlmModel) -> str:
+    return getattr(row, "model_kind", None) or "text"
 
 
 def _iso(dt) -> str | None:
@@ -68,6 +135,8 @@ CACHE_PRICE_FIELDS = (
 
 def _resolved_cache_prices(model: LlmModel, provider: LlmProvider) -> dict[str, Decimal | None]:
     """Manual rates override exact direct-provider catalog rates per category."""
+    if _kind(model) != "text":
+        return {key: None for _, _, resolved in CACHE_PRICE_FIELDS for key in (resolved, f"{resolved}_above_200k")}
     catalog = bundled_cache_rates(model.model_name, provider.provider_type, provider.api_base)
     prices: dict[str, Decimal | None] = {}
     for _, column, resolved_key in CACHE_PRICE_FIELDS:
@@ -151,8 +220,62 @@ def _effective_capabilities(
     row: LlmModel,
     provider_type: str | None,
     auth_mode: str = "api_key",
+    *,
+    api_key_configured: bool = False,
+    api_base: str | None = None,
 ) -> tuple[dict, str]:
     """Stored override/models.dev data wins before transport limits are applied."""
+    if _kind(row) != "text":
+        # Media metadata does not imply an executable route. A real direct
+        # provider, configured API key, supported price and asset pipeline matter.
+        route_available = False
+        kind = _kind(row)
+        if kind in {"image", "tts", "stt", "realtime"} and auth_mode == "api_key" and api_key_configured:
+            route = {
+                "model_kind": kind, "provider_type": provider_type,
+                "api_model_name": api_model_name(row.model_name, provider_type or ""),
+                "api_base": api_base, "api_key": "configured",
+                "media_pricing": getattr(row, "media_pricing", None),
+                "provider_auth": None,
+            }
+            if kind == "image":
+                from .image_transport import image_route_ready
+                route_available = image_route_ready(route)
+            elif kind == "realtime":
+                from .realtime_transport import realtime_route_ready
+                route_available = realtime_route_ready(route)
+            else:
+                from .audio_transport import audio_route_ready
+                route_available = audio_route_ready(route)
+        from lumen.services.assets import asset_pipeline_available
+
+        needs_assets = kind != "realtime"
+        ready = route_available and (asset_pipeline_available() if needs_assets else True)
+        features = {
+            "image": ("image_output",),
+            "tts": ("audio_output",),
+            "stt": ("audio_input",),
+            "realtime": ("audio_input", "audio_output"),
+        }.get(kind, ())
+        return {
+            "feature_gates": {
+                name: {
+                    "available": ready if name in features else False,
+                    "mode": "native" if ready and name in features else "none",
+                    "reason_code": (
+                        None
+                        if ready
+                        else "asset_pipeline_unavailable"
+                        if route_available and needs_assets
+                        else "route_unavailable"
+                    )
+                    if name in features
+                    else "route_unavailable",
+                    "pricing_available": route_available if name in features else False,
+                }
+                for name in ("text", "image_output", "audio_input", "audio_output")
+            }
+        }, "registry"
     detected = litellm_capabilities(row.model_name, provider_type)
     if row.capabilities:
         effective = normalize_capabilities(row.capabilities, detected)
@@ -168,8 +291,12 @@ def _model_public(
     effective_price_source: str | None = None,
     provider_type: str | None = None,
     auth_mode: str = "api_key",
+    api_key_configured: bool = False,
+    api_base: str | None = None,
 ) -> dict:
-    eff_caps, eff_caps_source = _effective_capabilities(row, provider_type, auth_mode)
+    eff_caps, eff_caps_source = _effective_capabilities(
+        row, provider_type, auth_mode, api_key_configured=api_key_configured, api_base=api_base,
+    )
     public_model_name = api_model_name(row.model_name, provider_type or "")
     display_name = row.display_name
     if (
@@ -196,12 +323,18 @@ def _model_public(
         input_price=effective_input,
         output_price=effective_output,
     )
+    if _kind(row) != "text":
+        effective_price_source = (
+            "manual" if media_pricing_available(_kind(row), getattr(row, "media_pricing", None)) else "unpriced"
+        )
     return {
         "id": row.id,
         "provider_id": row.provider_id,
         "model_name": row.model_name,
         "api_model_name": public_model_name,
         "api_provider": provider_type,
+        "model_kind": _kind(row),
+        "media_pricing": getattr(row, "media_pricing", None),
         "display_name": display_name,
         "is_active": row.is_active,
         "is_title_model": row.is_title_model,
@@ -244,6 +377,17 @@ def _pricing_aware_capabilities(
     input_price: Decimal | None = None,
     output_price: Decimal | None = None,
 ) -> dict:
+    if _kind(model) != "text":
+        normalized = dict(capabilities)
+        gates = {name: dict(gate) for name, gate in (capabilities.get("feature_gates") or {}).items()}
+        kind = _kind(model)
+        feature = {"image": "image_output", "tts": "audio_output", "stt": "audio_input", "realtime": "audio_input"}[kind]
+        available = (gates.get(feature) or {}).get("pricing_available", False)
+        for feature in {"image": ("image_output",), "tts": ("audio_output",),
+                        "stt": ("audio_input",), "realtime": ("audio_input", "audio_output")}[kind]:
+            gates[feature]["pricing_available"] = available
+        normalized["feature_gates"] = gates
+        return normalized
     metadata = model.price_metadata if isinstance(model.price_metadata, dict) else {}
     metadata = metadata.get("cost", metadata) if isinstance(metadata.get("cost", metadata), dict) else {}
 
@@ -311,6 +455,10 @@ def _pricing_aware_capabilities(
 def _resolved_base_prices(
     model: LlmModel, provider: LlmProvider
 ) -> tuple[Decimal | None, Decimal | None, str, str | None]:
+    if _kind(model) != "text":
+        pricing = getattr(model, "media_pricing", None)
+        priced = media_pricing_available(_kind(model), pricing)
+        return None, None, "manual" if priced else "unpriced", str(getattr(model, "updated_at", None)) if priced else None
     input_price = Decimal(model.input_price) if model.input_price is not None else None
     output_price = Decimal(model.output_price) if model.output_price is not None else None
     fallback_input, fallback_output = (
