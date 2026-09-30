@@ -215,23 +215,30 @@ async def reserve_media_credit_in_transaction(session, *, user_id: str, project_
                                               api_key_id: int | None, bound: Decimal) -> None:
     """Serialize media starts on the wallet and count unsettled holds before provider I/O.
 
-    A failed or uncertain call retains its bound until reconciled; settled calls
-    instead contribute through the wallet/usage ledger. No remote I/O runs under
-    this row lock.
+    Call only from a READ COMMITTED transaction set before its first statement:
+    earlier run reads otherwise pin a stale REPEATABLE READ snapshot. Held and
+    ledger aggregates must stay nonlocking: their unindexed FOR UPDATE scans
+    can block another user's text reservation insert. Failed or uncertain calls
+    retain their bound until reconciliation; settled calls enter the ledger.
+    No remote I/O runs under this row lock.
     """
     from lumen.models.chat_runs import ChatModelCallReservation, ChatRun
 
     if not bound.is_finite() or bound <= 0:
         raise QuotaExceeded("미디어 사용 한도가 올바르지 않습니다")
-    await _get_or_create_wallet(session, user_id, project_id)
+    # A plain session.get() before this lock pins a REPEATABLE READ snapshot and
+    # can miss a competing reservation committed while waiting for the wallet.
     wallet = (await session.execute(select(UserWallet).where(UserWallet.user_id == user_id)
-              .with_for_update().execution_options(populate_existing=True))).scalar_one()
+              .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    if wallet is None:
+        wallet = await _get_or_create_wallet(session, user_id, project_id)
     _maybe_reset_month(wallet)
     if not wallet.is_active:
         raise QuotaExceeded("비활성 지갑입니다")
     held = select(func.coalesce(func.sum(ChatModelCallReservation.bound_credits), Decimal("0"))).join(
         ChatRun, ChatRun.id == ChatModelCallReservation.run_id).where(
-        ChatRun.user_id == user_id, ChatModelCallReservation.status.in_(("reserved", "unknown")))
+        ChatRun.user_id == user_id, ChatModelCallReservation.status.in_(("reserved", "unknown"))
+    )
     pending = Decimal(str((await session.execute(held)).scalar_one()))
     system = await quota_policy.get_system_quota(session, user_id)
     if system.monthly > 0 and wallet.used_quota_this_month + pending + bound > system.monthly:

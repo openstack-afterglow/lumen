@@ -7,7 +7,7 @@ import json
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from lumen.config import get_settings
@@ -192,6 +192,7 @@ async def _read_source(asset_id: str, *, user_id: str, project_id: str, expected
 async def _start(run_id: str, *, owner: str, bound: Decimal, kind: str) -> str:
     async def transaction():
         async with _factory()() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
                 .with_for_update().execution_options(populate_existing=True))).scalar_one()
             _require_owned_running_lease(run, owner)

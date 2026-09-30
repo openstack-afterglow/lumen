@@ -13,7 +13,7 @@ import secrets
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from lumen.cache import _get_redis
@@ -189,6 +189,7 @@ async def _response(run: ChatRun, *, user_id: str, project_id: str) -> dict:
 async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> tuple[dict, dict, dict, str]:
     async def transaction():
         async with _factory()() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             run = await claim_queued_run(session, run_id, owner=owner, lease_seconds=45)
             if run is None or run.user_id != user_id or run.project_id != project_id:
                 raise DurableRunNotFound("realtime session is unavailable")

@@ -33,6 +33,7 @@ from lumen.services import conversation_store as cs
 from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.litellm_client import UsageCost
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
+from lumen.services.message_graph import reachable_message_clause, register_message
 from lumen.services.providers import routing as ps
 from lumen.services.run_store import (
     NONTERMINAL,
@@ -152,10 +153,22 @@ async def _append_temp_history(
 
 
 async def _cancel_streaming_assistant_message(session, run: ChatRun) -> str | None:
-    if run.assistant_message_id is None:
+    if run.assistant_message_id is None or run.conversation_id is None:
         return None
+    await session.execute(
+        select(ChatConversation.id).where(ChatConversation.id == run.conversation_id).with_for_update()
+    )
     message = (
-        await session.execute(select(ChatMessage).where(ChatMessage.id == run.assistant_message_id).with_for_update())
+        await session.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.id == run.assistant_message_id,
+                ChatMessage.conversation_id == run.conversation_id,
+                ChatMessage.status == "streaming",
+                reachable_message_clause(run.conversation_id),
+            )
+            .with_for_update()
+        )
     ).scalar_one_or_none()
     if message is None:
         return None
@@ -403,7 +416,14 @@ async def _finish_transaction(
                     ):
                         deltas[event_message_id][part_type].append(delta)
                 messages = (
-                    (await session.execute(select(ChatMessage).where(ChatMessage.id.in_(turn_message_ids))))
+                    (await session.execute(
+                        select(ChatMessage).where(
+                            ChatMessage.id.in_(turn_message_ids),
+                            ChatMessage.conversation_id == run.conversation_id,
+                            ChatMessage.status == "streaming",
+                            reachable_message_clause(run.conversation_id),
+                        )
+                    ))
                     .scalars()
                     .all()
                 )
@@ -1238,7 +1258,11 @@ class _DurableExecutionHooks:
                 )
             ).scalar_one_or_none()
             created_at, created_at_local, created_timezone = _message_timestamps_for_run(run)
+            graph_id = await session.scalar(
+                select(ChatConversation.graph_id).where(ChatConversation.id == run.conversation_id)
+            )
             placeholder = ChatMessage(
+                graph_id=graph_id,
                 conversation_id=run.conversation_id,
                 role="assistant",
                 parent_id=previous_message_id or run.user_message_id,
@@ -1251,6 +1275,7 @@ class _DurableExecutionHooks:
             )
             session.add(placeholder)
             await session.flush()
+            await register_message(session, conversation_id=run.conversation_id, message_id=placeholder.id)
             turn = ChatRunTurn(
                 run_id=run.id,
                 ordinal=turn_ordinal,
@@ -1875,6 +1900,7 @@ def _native_compaction_options(capability_snapshot: dict[str, Any], resolved: di
         return None
     return native_compaction.compaction_options(
         provider_type=resolved.get("provider_type"),
+        model=resolved.get("model_name"),
         context_limit=_route_context_limit(capability_snapshot),
         ratio=context_manager.COMPACTION_REQUIRED,
     )
@@ -2022,7 +2048,11 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
             run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one()
             _require_owned_running_lease(run, owner)
             created_at, created_at_local, created_timezone = _message_timestamps_for_run(run)
+            graph_id = await session.scalar(
+                select(ChatConversation.graph_id).where(ChatConversation.id == conversation_id)
+            )
             placeholder = ChatMessage(
+                graph_id=graph_id,
                 conversation_id=conversation_id,
                 role="assistant",
                 parent_id=parent_id,
@@ -2035,6 +2065,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
             )
             session.add(placeholder)
             await session.flush()
+            await register_message(session, conversation_id=conversation_id, message_id=placeholder.id)
             message_id = str(placeholder.id)
             run.assistant_message_id = placeholder.id
             run.current_ordinal = 0

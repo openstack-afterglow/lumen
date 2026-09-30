@@ -8,6 +8,7 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import get_args
 
 import pytest
 from fastapi import HTTPException
@@ -31,6 +32,15 @@ def _request(**headers: str) -> Request:
             "headers": [(key.replace("_", "-").lower().encode(), value.encode()) for key, value in headers.items()],
         }
     )
+
+
+def test_public_api_key_scope_schema_accepts_realtime_and_matches_store():
+    from lumen.api.api_keys import ApiKeyCreateBody, ApiKeyScope
+
+    assert set(get_args(ApiKeyScope)) == aks.API_KEY_SCOPES
+    scopes = ["compat:realtime:write", "native:realtime:write"]
+    issued = ApiKeyCreateBody.model_validate({"name": "realtime-client", "scopes": scopes})
+    assert issued.scopes == scopes
 
 
 class TestStorePureLogic:

@@ -9,7 +9,7 @@ import uuid
 from datetime import UTC
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from lumen.config import get_settings
@@ -148,6 +148,7 @@ async def _image_segment_start(run_id: str, *, owner: str, bound: Decimal) -> st
     factory = _factory()
     async def transaction():
         async with factory() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
                    .with_for_update().execution_options(populate_existing=True))).scalar_one()
             _require_owned_running_lease(run, owner)

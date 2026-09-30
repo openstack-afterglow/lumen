@@ -37,7 +37,7 @@ async def test_title_uses_both_first_exchange_messages_and_safe_limits(monkeypat
     )
 
     assert result.title == "배포 장애 원인 분석"
-    assert [message["role"] for message in observed["messages"]] == ["system", "user", "assistant"]
+    assert [message["role"] for message in observed["messages"]] == ["system", "user", "assistant", "user"]
     assert "배포가 실패" in observed["messages"][1]["content"]
     assert "권한" in observed["messages"][2]["content"]
     assert observed["kwargs"]["max_tokens"] == 512

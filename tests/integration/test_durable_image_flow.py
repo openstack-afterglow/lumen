@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import os
 import uuid
+from contextlib import suppress
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, event, func, select, text
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment
 from lumen.services import assets, credit
-from lumen.services.durable_runs import images, queries
+from lumen.services.durable_runs import budgets, images, queries
 from lumen.services.durable_runs.errors import DurableRunConflict, DurableRunInputError
 from lumen.services.providers import routing
 from lumen.services.run_store import claim_queued_run
@@ -158,4 +160,168 @@ async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
                 ChatUsageLog.run_id == third.run_id))).scalars().all() == []
         assert invoked == ["A cobalt cube"]
     finally:
+        await close_db()
+
+
+@pytest.mark.parametrize("snapshot_isolation", ["OFF", "ON"])
+async def test_concurrent_media_holds_observe_committed_reservations(monkeypatch, request, snapshot_isolation):
+    """A second request must not reserve against a snapshot predating the wallet lock."""
+    from sqlalchemy.pool import Pool
+
+    def pin_isolation(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f"SET SESSION innodb_snapshot_isolation={snapshot_isolation}")
+        cursor.close()
+
+    event.listen(Pool, "connect", pin_isolation)
+    request.addfinalizer(lambda: event.remove(Pool, "connect", pin_isolation))
+    init_db(os.environ["DATABASE_URL"], pool_size=3, max_overflow=0)
+    factory = get_session_factory()
+    assert factory is not None
+    nonce = uuid.uuid4().hex
+    user_id, project_id = f"media-user-{nonce}", f"media-project-{nonce}"
+    first_id, second_id = str(uuid.uuid4()), str(uuid.uuid4())
+    bound = Decimal("6")
+    snapshot_seen = asyncio.Event()
+    second_task = None
+
+    async def quota(_session, _user_id):
+        return type("Quota", (), {"monthly": Decimal("10"), "weekly": Decimal("0")})()
+
+    monkeypatch.setattr(credit.quota_policy, "get_system_quota", quota)
+
+    async def reserve_second():
+        async def transaction():
+            async with factory() as session, session.begin():
+                await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+                isolation = (await session.execute(text("SELECT @@SESSION.innodb_snapshot_isolation"))).scalar_one()
+                assert int(isolation) == (snapshot_isolation == "ON")
+                # The run was read before the competing reservation commits.
+                await session.execute(select(ChatRun.id).where(ChatRun.id == second_id))
+                snapshot_seen.set()
+                await credit.reserve_media_credit_in_transaction(
+                    session, user_id=user_id, project_id=project_id, api_key_id=None, bound=bound,
+                )
+                session.add(ChatModelCallReservation(
+                    run_id=second_id, segment_id="image:1", bound_credits=bound, status="reserved",
+                ))
+        return await budgets.retry_deadlocks(transaction)
+
+    try:
+        async with factory() as session, session.begin():
+            await credit._get_or_create_wallet(session, user_id, project_id)
+            for run_id in (first_id, second_id):
+                session.add(ChatRun(
+                    id=run_id, run_scope="image", run_kind="image", project_id=project_id,
+                    user_id=user_id, model_name="hold-race", status="running",
+                    capability_snapshot={}, pricing_snapshot={}, client_request_id=str(uuid.uuid4()),
+                    request_fingerprint=nonce, fingerprint_version=1, execution_protocol_version=1,
+                ))
+        async with factory() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await credit.reserve_media_credit_in_transaction(
+                session, user_id=user_id, project_id=project_id, api_key_id=None, bound=bound,
+            )
+            session.add(ChatModelCallReservation(
+                run_id=first_id, segment_id="image:1", bound_credits=bound, status="reserved",
+            ))
+            await session.flush()
+            second_task = asyncio.create_task(reserve_second())
+            await asyncio.wait_for(snapshot_seen.wait(), 10)
+        with pytest.raises(credit.QuotaExceeded, match="월"):
+            await asyncio.wait_for(second_task, 10)
+        async with factory() as session:
+            held = (await session.execute(select(func.sum(ChatModelCallReservation.bound_credits)).where(
+                ChatModelCallReservation.run_id.in_((first_id, second_id)),
+            ))).scalar_one()
+            assert held == bound
+    finally:
+        if second_task is not None and not second_task.done():
+            second_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await second_task
+        async with factory() as session, session.begin():
+            await session.execute(delete(ChatModelCallReservation).where(
+                ChatModelCallReservation.run_id.in_((first_id, second_id)),
+            ))
+            await session.execute(delete(ChatRun).where(ChatRun.id.in_((first_id, second_id))))
+            await session.execute(delete(credit.UserWallet).where(credit.UserWallet.user_id == user_id))
+        await close_db()
+
+
+@pytest.mark.parametrize("snapshot_isolation", ["OFF", "ON"])
+async def test_media_start_does_not_block_another_users_text_start(monkeypatch, request, snapshot_isolation):
+    """A media wallet hold must not lock another user's reservation insert."""
+    from sqlalchemy.pool import Pool
+
+    def pin_isolation(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f"SET SESSION innodb_snapshot_isolation={snapshot_isolation}")
+        cursor.close()
+
+    event.listen(Pool, "connect", pin_isolation)
+    request.addfinalizer(lambda: event.remove(Pool, "connect", pin_isolation))
+    init_db(os.environ["DATABASE_URL"], pool_size=2, max_overflow=0)
+    factory = get_session_factory()
+    assert factory is not None
+    nonce = uuid.uuid4().hex
+    media_id, text_id = str(uuid.uuid4()), str(uuid.uuid4())
+    media_user, text_user = f"media-user-{nonce}", f"text-user-{nonce}"
+    media_project, text_project = f"media-project-{nonce}", f"text-project-{nonce}"
+    text_task = None
+
+    async def quota(_session, _user_id):
+        return type("Quota", (), {"monthly": Decimal("10"), "weekly": Decimal("0")})()
+
+    monkeypatch.setattr(credit.quota_policy, "get_system_quota", quota)
+
+    async def start_text():
+        async with factory() as session, session.begin():
+            await session.execute(select(ChatRun).where(ChatRun.id == text_id).with_for_update())
+            session.add(ChatModelCallReservation(
+                run_id=text_id, segment_id="provider:0:1", bound_credits=Decimal("1"), status="reserved",
+            ))
+            await session.flush()
+
+    try:
+        async with factory() as session, session.begin():
+            await credit._get_or_create_wallet(session, media_user, media_project)
+            for run_id, run_scope, run_kind, user_id, project_id in (
+                (media_id, "image", "image", media_user, media_project),
+                (text_id, "temp", "completion", text_user, text_project),
+            ):
+                session.add(ChatRun(
+                    id=run_id, run_scope=run_scope, run_kind=run_kind, project_id=project_id,
+                    user_id=user_id, model_name="hold-race", status="running",
+                    capability_snapshot={}, pricing_snapshot={}, client_request_id=str(uuid.uuid4()),
+                    request_fingerprint=nonce, fingerprint_version=1, execution_protocol_version=1,
+                ))
+        async with factory() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await credit.reserve_media_credit_in_transaction(
+                session, user_id=media_user, project_id=media_project,
+                api_key_id=None, bound=Decimal("1"),
+            )
+            text_task = asyncio.create_task(start_text())
+            # The text run must commit while the media transaction still owns its wallet lock.
+            await asyncio.wait_for(text_task, 10)
+            session.add(ChatModelCallReservation(
+                run_id=media_id, segment_id="image:1", bound_credits=Decimal("1"), status="reserved",
+            ))
+        async with factory() as session:
+            held = (await session.execute(select(func.sum(ChatModelCallReservation.bound_credits)).where(
+                ChatModelCallReservation.run_id.in_((media_id, text_id)),
+            ))).scalar_one()
+            assert held == Decimal("2")
+    finally:
+        if text_task is not None and not text_task.done():
+            text_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await text_task
+        async with factory() as session, session.begin():
+            await session.execute(delete(ChatModelCallReservation).where(
+                ChatModelCallReservation.run_id.in_((media_id, text_id)),
+            ))
+            await session.execute(delete(ChatRun).where(ChatRun.id.in_((media_id, text_id))))
+            await session.execute(delete(credit.UserWallet).where(credit.UserWallet.user_id == media_user))
         await close_db()

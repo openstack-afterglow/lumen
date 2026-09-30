@@ -234,7 +234,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "capabilities": capabilities,
         "api_key": api_key,
     }
-    # Keep persisted 0.3.1 text-run hashes valid after migration 019 adds default
+    # Keep persisted 0.3.1 text-run hashes valid after migration 020 adds default
     # text/NULL columns; media routes still fence kind and pricing mutations.
     if model_kind != "text" or media_pricing is not None:
         config_fingerprint["model_kind"] = model_kind

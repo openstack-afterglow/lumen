@@ -58,10 +58,13 @@ _MAX_BLOCK_CHARS = 200_000
 _MAX_BLOCKS = 8
 
 
-def supported(provider_type: str | None) -> bool:
+def supported(provider_type: str | None, model: str | None = None) -> bool:
     """Return whether this transport can actually activate native compaction."""
-    return provider_type in SUPPORTED_PROVIDERS
-
+    if provider_type not in SUPPORTED_PROVIDERS:
+        return False
+    if provider_type == "anthropic" and model and "haiku" in model.lower():
+        return False
+    return True
 
 def responses_supported(provider_type: str | None) -> bool:
     """Return whether the Responses transport forwards ``context_management``."""
@@ -91,10 +94,11 @@ def compaction_options(
     provider_type: str | None,
     context_limit: object,
     ratio: float,
+    model: str | None = None,
     enabled: bool = True,
 ) -> dict[str, Any] | None:
     """Return the ``context_management`` request value, or ``None`` when unarmed."""
-    if not enabled or not supported(provider_type):
+    if not enabled or not supported(provider_type, model=model):
         return None
     value = trigger_tokens(context_limit, ratio)
     if value is None:
@@ -151,10 +155,12 @@ def anthropic_passthrough_options(
 ) -> dict[str, Any]:
     """Arm compaction on an Anthropic passthrough request the caller left unset."""
     provider_type = resolved.get("provider_type") if isinstance(resolved, dict) else None
+    model = resolved.get("model_name") if isinstance(resolved, dict) else None
     return _with_default(
         options,
         compaction_options(
             provider_type=provider_type,
+            model=model,
             context_limit=resolved_context_limit(resolved),
             ratio=ratio,
             enabled=enabled,
