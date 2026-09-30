@@ -11,6 +11,8 @@ Changes since `v0.3.1`:
 - **Queued text-run upgrade safety:** Migration 020's default `model_kind=text` and `media_pricing=NULL` preserve the published v0.3.1 route fingerprint for unchanged text providers/models, so persisted queued runs can resume. Media routes still include kind/pricing in their version hash and reject changed prices.
 - **Production shared-message lineage:** Merged the shared graph/fork ownership feature already running in production at revision `e2b2263`; its applied `019-shared-message-membership` SQL and checksum remain byte-identical. New forks share immutable encrypted ancestors while per-conversation owner/project membership gates access; deleting the source preserves surviving forks. The unreleased media migration is numbered 020, not another 019. A stopped-writer backup and coordinated API/worker upgrade remain required before deploying this combined release.
 
+- **Kolla 진단 로그:** API HTTP route template·상태 코드와 durable worker의 run ID·실패 코드를 Kolla 로그 볼륨의 분리된 프로세스 파일에 기록한다. 원문 URL/query·인증 정보·요청/응답 본문은 기록하지 않는다. Native completions의 HTTP 202는 실행 성공이 아니므로 이후 `run.failed` 이벤트와 worker 기록을 대조해야 한다. 이 진단 개선은 운영 OpenAI 모델 실패 원인 확인이나 실제 서비스 배포를 의미하지 않는다.
+
 **Release boundary:** Package and Kolla image default target `0.4.0`. Publish the `v0.4.0` multi-architecture GHCR images and root wheel, then perform a controlled migration-before-start Kolla cutover; publishing artifacts alone does not deploy them. SDK/plugins/sandbox retain independent versions, and source-build mode needs an explicitly updated commit pin. Verified remote text and local media calls do not prove production media, invoice accuracy, or a live Afterglow dashboard.
 
 ## 0.3.1

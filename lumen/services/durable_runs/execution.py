@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
@@ -236,6 +237,9 @@ async def _finish(
         safe_message=safe_message, usage_record=usage_record, message_finalization=message_finalization,
         completed_parts=completed_parts, child_result=child_result,
     ))
+    if status == "failed":
+        code = error_code if error_code and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code) else "run_failed"
+        logger.warning("durable chat run failed run_id=%s error_code=%s", run_id, code)
     if wake_parent is not None:
         from .common import wake_run
 
@@ -2792,12 +2796,12 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
             error_code=getattr(exc, "code", "context_limit_exceeded"),
             safe_message="context input exceeds the configured limit",
         )
-    except Exception:
+    except Exception as exc:
         try:
             await flush_deltas(check_cancel=False)
         except Exception:
             logger.exception("failed to persist buffered chat deltas run_id=%s", run_id)
-        logger.exception("durable chat provider execution failed run_id=%s", run_id)
+        logger.error("durable chat provider execution failed run_id=%s error_type=%s", run_id, type(exc).__name__)
         await _finish(
             run_id,
             status="failed",

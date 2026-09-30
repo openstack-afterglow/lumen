@@ -147,6 +147,7 @@ lumen_api_dynamic_ingress_vip: ""
 lumen_service_environments:
   lumen-api:
     LUMEN_CONFIG_FILE: "/etc/lumen/lumen.conf"
+    LUMEN_LOG_DIRECTORY: "/var/log/kolla/lumen"
     DATABASE_URL: "{{ lumen_database_url }}"
     REDIS_URL: "{{ lumen_redis_url }}"
     KEYSTONE_AUTH_URL: "{{ lumen_keystone_auth_url }}"
@@ -169,6 +170,7 @@ lumen_service_environments:
     LUMEN_BOOTSTRAP_MODELS_JSON: "{{ lumen_bootstrap_models_json }}"
   lumen-worker:
     LUMEN_CONFIG_FILE: "/etc/lumen/lumen.conf"
+    LUMEN_LOG_DIRECTORY: "/var/log/kolla/lumen"
     DATABASE_URL: "{{ lumen_database_url }}"
     REDIS_URL: "{{ lumen_redis_url }}"
     KEYSTONE_AUTH_URL: "{{ lumen_keystone_auth_url }}"
@@ -191,6 +193,7 @@ lumen_service_environments:
     LUMEN_BOOTSTRAP_MODELS_JSON: "{{ lumen_bootstrap_models_json }}"
   lumen-controller:
     LUMEN_CONFIG_FILE: "/etc/lumen/lumen.conf"
+    LUMEN_LOG_DIRECTORY: "/var/log/kolla/lumen"
     DATABASE_URL: "{{ lumen_database_url }}"
     REDIS_URL: "{{ lumen_redis_url }}"
     LUMEN_ENCRYPTION_KEY: "{{ lumen_encryption_key }}"

@@ -1166,3 +1166,20 @@ async def test_interaction_response_is_owner_scoped_and_validated(client, monkey
         json={"response": {"option_ids": ["yes", "yes"], "extra": True}},
     )
     assert invalid.status_code == 422
+
+
+async def test_durable_run_failure_log_has_run_id_and_safe_code(monkeypatch, caplog):
+    async def committed(_transaction):
+        return None
+
+    monkeypatch.setattr(execution.budgets, "retry_deadlocks", committed)
+    with caplog.at_level("WARNING", logger=execution.__name__):
+        await execution._finish(
+            "run-owned-1", status="failed", message_id=None, owner="worker-1",
+            error_code="provider_failed\nBearer secret", safe_message="private upstream response",
+        )
+
+    assert [(record.getMessage(), record.exc_info) for record in caplog.records] == [
+        ("durable chat run failed run_id=run-owned-1 error_code=run_failed", None),
+    ]
+    assert "private upstream response" not in caplog.text

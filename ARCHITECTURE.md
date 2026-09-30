@@ -104,6 +104,7 @@ flowchart LR
 | 경로 | 핵심 심볼/책임 | 의존 방향 |
 | --- | --- | --- |
 | `lumen/main.py`, `lumen/services/infrastructure/api_load.py` | FastAPI lifespan, discovery/health, `/v1` routes·host gate 및 SSE text TTFT/active-request meter | API → auth/config/service; loopback-only detail → mTLS guest readiness |
+| `lumen/request_logging.py`, `lumen/logging_config.py`, `deploy/kolla/ansible/roles/lumen/` | 인증/본문/실제 URL 없이 HTTP method·route template·status를 기록하고 API/worker/controller 로그를 Kolla volume의 별도 파일로 내보냄; durable run terminal 로그는 run ID·검증된 오류 코드만 기록 | ASGI send → root logger → opt-in Kolla file; worker journal commit → worker file |
 | `lumen/auth.py` | `Principal`, Keystone `validate_token`, API-key verification, scope와 project/target-project 경계 | route → auth; OpenStack connection은 Keystone principal에서만 생성 |
 | `lumen/api/completions.py` | native completion/temp completion, idempotency, run 조회·cancel·approval·SSE | route → `chat_admission`, `durable_runs` |
 | `lumen/services/chat_admission.py` | capability/feature gate, context·memory·skill·extension/model snapshot | API-independent preparation → stores/providers/tool runtime |
@@ -358,9 +359,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "7838790f264e3b23484db782fe329b5c7bb76ddd54cf65a413b05297070a36f5",
-  "reviewed_at": "2026-09-30T00:04:58Z",
-  "summary": "Reviewed production shared graph migration 019 checksum, additive media migration 020, read-committed wallet-only media starts, API key scopes, compatibility HMAC, integration and operations documentation; 1451 contract and 77 MariaDB integration passed"
+  "source_sha256": "125f91ea2fb8787cbc6c5f319dfc0eda49b903f7bcd6c32d4cfd865c0df77b75",
+  "reviewed_at": "2026-09-30T04:17:25Z",
+  "summary": "Reviewed Lumen HTTP template/status access records, durable run failure codes, Kolla volume ownership and three-process rotating log sinks; production OpenAI diagnosis and rollout remain pending"
 }
 ```
 <!-- architecture-review:end -->

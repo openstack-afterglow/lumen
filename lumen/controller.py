@@ -20,6 +20,7 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 
 from lumen.config import get_settings
 from lumen.db import close_db, init_db
+from lumen.logging_config import configure_logging
 from lumen.plugins.host import build_host
 from lumen.plugins.registry import get_registry
 from lumen.services.infrastructure.bootstrap import _ca, make_bootstrap_router
@@ -77,7 +78,7 @@ def internal_server(config: RuntimeConfig) -> Server:
         http=InternalH11Protocol, ws="none", proxy_headers=False,
         ssl_certfile=config.tls.cert_file, ssl_keyfile=config.tls.key_file,
         ssl_ca_certs=config.tls.ca_file, ssl_cert_reqs=ssl.CERT_OPTIONAL,
-        access_log=False, timeout_keep_alive=5,
+        access_log=False, timeout_keep_alive=5, log_config=None,
     )
     return Server(options)
 
@@ -190,5 +191,10 @@ async def _serve() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(_serve())
+    configure_logging("controller")
+    logger.info("controller starting")
+    try:
+        asyncio.run(_serve())
+    except Exception:
+        logger.exception("controller stopped with error")
+        raise

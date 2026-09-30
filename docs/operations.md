@@ -93,6 +93,12 @@ Migration `020_media_model_registry.sql`로 model kind/media 가격을 준비한
 
 Media reservation은 provider I/O 직전에 user wallet row lock으로 월·주·API-key 사용액과 `reserved|unknown` bound를 합산한다. 비용이 확정되면 actual usage ledger와 `settled` 상태가 같은 transaction에 기록된다. Provider result 불확실 시 자동 release 금지: `chat_runs`, `chat_run_segments`, `chat_model_call_reservations`, `chat_usage_logs`의 run_id와 provider 청구 내역을 대조하고 비용·asset 상태를 결정한 뒤 관리 승인 하에 원장/hold를 일관되게 수동 조정한다. Realtime admission 후 Redis ticket 발급 실패 시 queued run은 동일 `Idempotency-Key`로 재요청해 ticket을 다시 발급할 수 있지만 사용된 ticket/진행 중 session은 재사용할 수 없다. Browser ticket은 60초 단일 소비이며 회전·로그아웃·project 전환에서 WS와 마이크를 닫는다.
 
+## Kolla 로그와 비동기 채팅 실패 추적
+
+Kolla 역할은 API·worker·controller의 `LUMEN_LOG_DIRECTORY=/var/log/kolla/lumen`을 설정하고 `kolla_logs` 볼륨에 프로세스별 `api.log`, `worker.log`, `controller.log`를 남긴다. 디렉터리 소유권은 컨테이너의 비root API·worker 사용자에 맞춰 기동 전에 준비한다. 이 변수를 설정하지 않은 로컬 개발에서는 파일 로그를 만들지 않으며 기존 표준 출력/오류 로그를 유지한다. 운영 파일 접근 권한과 보존·수집 정책은 호스트 로그 관리자에게 위임한다.
+
+`api.log`의 HTTP 기록은 method, 매칭된 route template, 응답 상태만 담는다. 실제 URL path의 대화 ID, query string의 1회용 token, 인증 헤더·cookie, 요청·응답 본문은 기록하지 않는다. 채팅 completions의 `202`는 durable run 접수만 뜻한다. 실패를 판정할 때는 응답의 `run_id`로 소유자 인증을 거친 `/v1/runs/{run_id}/events`의 `run.failed` `error_code`·`safe_message`를 확인하고, 같은 ID의 `worker.log` terminal failure/error type을 대조한다. 일반적인 provider 실행 실패는 원문 예외·upstream 응답 본문을 로그에 쓰지 않는다. `/v1/ready`는 worker 추론 성공의 증거가 아니다.
+
 ## Queue, lease, recovery
 
 API는 MariaDB journal에 run을 commit한 뒤 Redis `afterglow:chat:runs`에 best-effort wakeup을 보낸다. Redis는 authoritative queue가 아니다. worker DB polling이 wakeup 유실을 복구한다.

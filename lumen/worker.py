@@ -21,6 +21,7 @@ from collections.abc import Awaitable, Callable
 from lumen.cache import _get_redis
 from lumen.config import get_settings
 from lumen.db import init_db
+from lumen.logging_config import configure_logging
 from lumen.plugins.host import build_host
 from lumen.plugins.registry import get_registry
 from lumen.services.agent_workspace_runtime import configured_workspace_policy
@@ -332,8 +333,13 @@ async def serve() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-    asyncio.run(serve())
+    configure_logging("worker")
+    logger.info("worker starting")
+    try:
+        asyncio.run(serve())
+    except Exception:
+        logger.exception("worker stopped with error")
+        raise
 
 
 if __name__ == "__main__":
