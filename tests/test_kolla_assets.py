@@ -291,6 +291,44 @@ def test_kolla_migration_ordering():
         assert bootstrap_idx < start_idx, f"In {action_name}, bootstrap_service.yml must precede start.yml"
 
 
+def test_kolla_provider_bootstrap_uses_inventory_environment(monkeypatch):
+    defaults = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
+    tasks = yaml.safe_load((ROLE_DIR / "tasks" / "bootstrap_service.yml").read_text(encoding="utf-8"))
+    migration = tasks[1]
+    seed = tasks[2]
+    migration_container = migration["community.docker.docker_container"]
+    seed_container = seed["community.docker.docker_container"]
+    assert seed_container["command"] == ["python", "-m", "lumen.scripts.seed_providers"]
+    assert seed_container["image"] == migration_container["image"] == "{{ lumen_api_image_ref }}"
+    assert seed_container["volumes"] == migration_container["volumes"]
+    assert seed_container["network_mode"] == migration_container["network_mode"]
+    for option in ("state", "detach", "cleanup"):
+        assert seed_container[option] == migration_container[option]
+    assert seed["no_log"] is True
+    assert seed["run_once"] is True
+    assert seed["delegate_to"] == migration["delegate_to"]
+
+    credentials = {
+        "OPENAI_API_KEY": "lumen_openai_api_key",
+        "GEMINI_API_KEY": "lumen_gemini_api_key",
+        "LUMEN_BOOTSTRAP_MODELS_JSON": "lumen_bootstrap_models_json",
+    }
+    monkeypatch.setenv("OPENAI_API_KEY", "host-shell-key-must-not-leak")
+    for env_name, inventory_name in credentials.items():
+        assert defaults[inventory_name] == ""
+        reference = "{{ " + inventory_name + " }}"
+        assert seed_container["env"][env_name] == reference
+        assert env_name not in migration_container["env"]
+        for service in ("lumen-api", "lumen-worker"):
+            assert defaults["lumen_service_environments"][service][env_name] == reference
+        assert jinja2.Template(reference).render(**{inventory_name: defaults[inventory_name]}) == ""
+        assert jinja2.Template(reference).render(**{inventory_name: "inventory-value"}) == "inventory-value"
+
+    config_template = (ROLE_DIR / "templates" / "lumen.conf.j2").read_text(encoding="utf-8")
+    for inventory_name in credentials.values():
+        assert inventory_name not in config_template
+
+
 def test_kolla_reconfigure_refresh_ordering():
     reconfigure_file = ROLE_DIR / "tasks" / "reconfigure.yml"
     included = get_included_tasks(reconfigure_file)

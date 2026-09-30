@@ -243,7 +243,7 @@ def inspect_generated_file(path: Path, *, original_name: str, media_type: str) -
     """Inspect bounded runtime output before it enters the scanned asset pipeline."""
     size = path.stat().st_size
     normalized_media_type = media_type.strip().lower()
-    if size <= 0 or size > _MAX_GENERATED_FILE_BYTES:
+    if size <= 0 or size > (_MAX_AUDIO_BYTES if normalized_media_type in _AUDIO_MIMES else _MAX_GENERATED_FILE_BYTES):
         raise AssetError("생성 파일 크기가 제한을 초과했습니다")
     if not _MEDIA_TYPE.fullmatch(normalized_media_type) or normalized_media_type not in _ALLOWED_GENERATED_MIMES:
         raise AssetError("지원하지 않는 생성 파일 형식입니다")
@@ -546,7 +546,7 @@ async def create_generated_asset_bytes(
     run_id: str,
 ) -> dict:
     """Ingest bounded in-memory output from a supported remote tool adapter."""
-    if not data or len(data) > _MAX_GENERATED_FILE_BYTES:
+    if not data or len(data) > (_MAX_AUDIO_BYTES if media_type in _AUDIO_MIMES else _MAX_GENERATED_FILE_BYTES):
         raise AssetError("생성 파일 크기가 제한을 초과했습니다")
     with tempfile.TemporaryDirectory(prefix="lumen-generated-") as directory:
         path = Path(directory) / "payload"

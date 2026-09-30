@@ -202,14 +202,17 @@ from lumen.api import (
     chat_agents_router,
     chat_api_keys_router,
     chat_assets_router,
+    chat_audio_router,
     chat_code_workspaces_router,
     chat_completions_router,
     chat_conversations_router,
     chat_extensions_admin_router,
     chat_extensions_user_router,
+    chat_images_router,
     chat_mcp_oauth_router,
     chat_memory_router,
     chat_quotas_router,
+    chat_realtime_router,
     chat_stats_router,
     chat_usage_router,
     chat_workspaces_router,
@@ -217,8 +220,11 @@ from lumen.api import (
 )
 from lumen.api import plugins as plugin_routes
 from lumen.api.compat import anthropic as compat_anthropic
+from lumen.api.compat import audio as compat_audio
 from lumen.api.compat import discovery as compat_discovery
+from lumen.api.compat import images as compat_images
 from lumen.api.compat import openai as compat_openai
+from lumen.api.compat import realtime as compat_realtime
 from lumen.api.compat import responses as compat_responses
 from lumen.auth import require_chat_api_host
 
@@ -236,6 +242,9 @@ for router, tag in (
     (chat_code_workspaces_router, "Chat Code Workspaces"),
     (chat_memory_router, "Chat Memory"),
     (chat_assets_router, "Chat Assets"),
+    (chat_images_router, "Images"),
+    (chat_audio_router, "Audio"),
+    (chat_realtime_router, "Realtime Voice"),
     (chat_api_keys_router, "Chat API Keys"),
     (chat_mcp_oauth_router, "Chat MCP OAuth"),
     (chat_extensions_admin_router, "Chat Extensions Admin"),
@@ -251,11 +260,14 @@ for router, tag in (
 # `/api/v1/chat/*` traffic remains an Afterglow proxy concern.
 for router, tag in (
     (compat_discovery.router, "AI Compat Discovery"),
+    (compat_images.router, "OpenAI Images Compat"),
+    (compat_audio.router, "OpenAI Audio Compat"),
     (compat_openai.router, "OpenAI Compat"),
     (compat_anthropic.router, "Anthropic Compat"),
     (compat_responses.router, "OpenAI Responses Compat"),
 ):
     app.include_router(router, prefix="/v1", tags=[tag], dependencies=[Depends(require_chat_api_host)])
+app.include_router(compat_realtime.router, tags=["Realtime Voice Compat"])
 
 # Claude Code's public machine protocol is host-gated with the other direct
 # compatibility APIs. The Keystone-only browser authorization handoff is
@@ -286,6 +298,9 @@ def custom_openapi() -> dict:
         "openai_stateless": "OpenAI-compatible stateless provider completion (/v1/chat/completions, provider model IDs)",
         "openai_responses": "OpenAI Responses-compatible stateless completion (/v1/responses)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
+        "openai_images": "OpenAI-compatible durable image generation and edits (/v1/images/generations, /v1/images/edits)",
+        "openai_realtime": "OpenAI-compatible durable realtime WebSocket (/v1/realtime)",
+        "gemini_live": "Google Gemini Live-compatible WebSocket (/v1beta/realtime)",
         "lumen_native": "Lumen native durable runs (/v1/conversations/{conversation_id}/completions, /v1/temp-completions, /v1/runs/...)",
         "claude_gateway": "Claude Code device-authenticated Anthropic gateway (/v1/claude-gateway)",
     }
@@ -311,6 +326,10 @@ def custom_openapi() -> dict:
     api_key_security = [{"APIKeyBearer": []}, {"XApiKey": []}]
     for path, method in (
         ("/v1/chat/completions", "post"),
+        ("/v1/images/generations", "post"),
+        ("/v1/images/edits", "post"),
+        ("/v1/audio/speech", "post"),
+        ("/v1/audio/transcriptions", "post"),
         ("/v1/responses", "post"),
         ("/v1/messages", "post"),
         ("/v1/messages/count_tokens", "post"),
@@ -324,6 +343,10 @@ def custom_openapi() -> dict:
             schema["paths"][path][method]["security"] = api_key_security
 
     route_scopes: dict[tuple[str, str], list[str]] = {
+        ("/v1/images/generations", "post"): ["compat:images:write"],
+        ("/v1/images/edits", "post"): ["compat:images:write", "native:assets:write"],
+        ("/v1/audio/speech", "post"): ["compat:audio:write"],
+        ("/v1/audio/transcriptions", "post"): ["compat:audio:write", "native:assets:write"],
         ("/v1/chat/completions", "post"): ["compat:completions:write"],
         ("/v1/responses", "post"): ["compat:completions:write"],
         ("/v1/messages", "post"): ["compat:completions:write"],
@@ -349,6 +372,11 @@ def custom_openapi() -> dict:
             "native:runs:write",
         ],
         ("/v1/temp-completions", "post"): ["native:runs:write"],
+        ("/v1/chat/images/generations", "post"): ["native:images:write"],
+        ("/v1/chat/images/edits", "post"): ["native:images:write", "native:assets:read"],
+        ("/v1/chat/audio/speech", "post"): ["native:audio:write"],
+        ("/v1/chat/audio/transcriptions", "post"): ["native:audio:write", "native:assets:read"],
+        ("/v1/chat/realtime/sessions", "post"): ["native:realtime:write"],
         ("/v1/conversations/{conversation_id}/messages/{message_id}/regenerate", "post"): [
             "native:conversations:write",
             "native:runs:write",
@@ -364,6 +392,10 @@ def custom_openapi() -> dict:
         ("/v1/temp-threads/{temp_thread_id}", "get"): ["native:runs:read"],
         ("/v1/runs/{run_id}/cancel", "post"): ["native:runs:write"],
         ("/v1/runs/{run_id}/approvals/{call_id}", "post"): ["native:runs:write"],
+        ("/v1/assets", "post"): ["native:assets:write"],
+        ("/v1/assets/{asset_id}", "get"): ["native:assets:read"],
+        ("/v1/assets/{asset_id}/download", "get"): ["native:assets:read"],
+        ("/v1/assets/{asset_id}", "delete"): ["native:assets:write"],
         ("/v1/runs/{run_id}/interactions/{interaction_id}", "post"): ["native:runs:write"],
         ("/v1/usage", "get"): ["usage:read"],
         ("/v1/usage/timeseries", "get"): ["usage:read"],

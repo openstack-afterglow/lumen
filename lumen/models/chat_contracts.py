@@ -611,7 +611,7 @@ class ChatRunDescriptor(_StrictModel):
     run_id: str = Field(min_length=1, max_length=36)
     conversation_id: str | None = Field(default=None, max_length=36)
     temp_thread_id: str | None = Field(default=None, max_length=36)
-    run_kind: Literal["completion", "compaction"] = "completion"
+    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime"] = "completion"
     status: Literal[
         "queued",
         "running",
@@ -644,9 +644,10 @@ class ChatRunResponse(_StrictModel):
     ]
     conversation_id: str | None = Field(default=None, max_length=36)
     temp_thread_id: str | None = Field(default=None, max_length=36)
-    run_kind: Literal["completion", "compaction"] = "completion"
+    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime"] = "completion"
     effective_features: dict[str, Any] = Field(default_factory=dict)
     public_history: list[dict[str, Any]] | None = None
+    output_assets: list[dict[str, Any]] = Field(default_factory=list)
     last_seq: int = Field(ge=0)
     terminal: bool
 
@@ -850,7 +851,7 @@ class RunStartedPayload(_StrictModel):
     temp_thread_id: str | None = None
     model_name: str = Field(min_length=1, max_length=190)
     effective_features: dict[str, Any]
-    run_kind: Literal["completion", "compaction"] = "completion"
+    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime"] = "completion"
 
 
 class ContextUpdatedPayload(_StrictModel):

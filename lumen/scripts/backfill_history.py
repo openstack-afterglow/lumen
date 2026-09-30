@@ -1,4 +1,4 @@
-"""Resumable active-history projection backfill for migration 012."""
+"""Resumable active-history backfill; apply migration 019 memberships before running."""
 
 from __future__ import annotations
 
@@ -36,7 +36,11 @@ async def backfill_history(
     conversation_batch_size: int = 100,
     insert_batch_size: int = 1000,
 ) -> int:
-    """Project unready conversations in keyset order and return the completed count."""
+    """Project only unready histories through explicit membership, preserving ready paths.
+
+    Migration 019 seeds legacy own-message memberships before this runs. Do not
+    infer additional grants from ancestry here: a missing grant must fail closed.
+    """
     if conversation_batch_size < 1:
         raise ValueError("conversation_batch_size must be positive")
     if not 1 <= insert_batch_size <= 1000:

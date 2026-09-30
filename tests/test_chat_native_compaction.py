@@ -101,6 +101,14 @@ class TestCompactionOptions:
             is None
         )
 
+    def test_haiku_model_is_unarmed_because_anthropic_rejects_it(self):
+        assert (
+            native_compaction.compaction_options(
+                provider_type="anthropic", model="claude-haiku-4-5", context_limit=200_000, ratio=0.80
+            )
+            is None
+        )
+
 
 class TestBlockSanitization:
     def test_well_formed_block_survives(self):

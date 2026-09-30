@@ -102,6 +102,8 @@ class LlmModel(Base):
     provider_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_providers.id", ondelete="CASCADE"), nullable=False)
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     display_name: Mapped[str | None] = mapped_column(VARCHAR(150))
+    model_kind: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="text", server_default="text")
+    media_pricing: Mapped[dict | None] = mapped_column(JSON)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     # 대화 제목 자동 요약에 쓸 모델. 앱 레벨에서 최대 1개만 True 로 유지(set_title_model).
     is_title_model: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
@@ -135,10 +137,25 @@ class LlmModel(Base):
     )
 
 
+class ChatMessageGraph(Base):
+    """Owner-scoped lifetime boundary shared by source and fork conversations."""
+
+    __tablename__ = "chat_message_graphs"
+
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+
+    __table_args__ = (Index("idx_chat_message_graphs_owner", "project_id", "user_id"),)
+
+
 class ChatConversation(Base):
     __tablename__ = "chat_conversations"
 
     id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    graph_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("chat_message_graphs.id", ondelete="RESTRICT"), nullable=False
+    )
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     # AES-256-GCM(도메인 chat_content) 암호문. 첫 메시지 요약 제목도 채팅 내용이라 암호화. TEXT(암호문 길이).
@@ -165,11 +182,13 @@ class ChatConversation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
+    # Origin provenance only; reachability and retention use ChatConversationMessage.
     messages: Mapped[list["ChatMessage"]] = relationship(
-        "ChatMessage", back_populates="conversation", cascade="all, delete-orphan"
+        "ChatMessage", back_populates="conversation", passive_deletes="all"
     )
 
     __table_args__ = (
+        Index("idx_chat_conversations_graph", "graph_id"),
         Index("idx_chat_conversations_owner", "project_id", "user_id"),
         Index("idx_chat_conversations_user_updated", "user_id", "updated_at"),  # 사용자별 목록(프로젝트 무관)
         Index("idx_chat_conversations_updated", "updated_at"),
@@ -181,8 +200,12 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
-    conversation_id: Mapped[str] = mapped_column(
-        CHAR(36), ForeignKey("chat_conversations.id", ondelete="CASCADE"), nullable=False
+    graph_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("chat_message_graphs.id", ondelete="CASCADE"), nullable=False
+    )
+    # Nullable origin provenance, never a conversation authorization predicate.
+    conversation_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("chat_conversations.id", ondelete="SET NULL")
     )
     role: Mapped[str] = mapped_column(VARCHAR(20), nullable=False)  # system | user | assistant | tool
     # 버전 트리 부모 메시지 id. 같은 parent_id 를 공유하는 형제 = 재생성 버전들. 루트는 NULL.
@@ -217,14 +240,31 @@ class ChatMessage(Base):
     )
     created_timezone: Mapped[str | None] = mapped_column(VARCHAR(64))
 
-    conversation: Mapped["ChatConversation"] = relationship("ChatConversation", back_populates="messages")
+    conversation: Mapped["ChatConversation | None"] = relationship("ChatConversation", back_populates="messages")
 
     __table_args__ = (
+        Index("idx_chat_messages_graph", "graph_id"),
+        Index("idx_chat_messages_graph_branch", "graph_id", "parent_id", "role", "created_at", "id"),
         Index("idx_chat_messages_conversation", "conversation_id", "created_at"),
         Index("idx_chat_messages_branch", "conversation_id", "parent_id", "role", "created_at", "id"),
         Index("idx_chat_messages_conversation_id", "conversation_id", "id"),
         Index("idx_chat_messages_parent", "parent_id"),
     )
+
+
+class ChatConversationMessage(Base):
+    """Explicit reachable messages in a conversation, including shared fork ancestors."""
+
+    __tablename__ = "chat_conversation_messages"
+
+    conversation_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("chat_conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    message_id: Mapped[int] = mapped_column(
+        BIGINT, ForeignKey("chat_messages.id", ondelete="CASCADE"), primary_key=True
+    )
+
+    __table_args__ = (Index("idx_chat_conversation_messages_message", "message_id"),)
 
 
 class ChatConversationActivePath(Base):

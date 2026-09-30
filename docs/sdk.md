@@ -94,4 +94,105 @@ run = conn.lumen.temp_completion(
 )
 ```
 
-`Client.close()`를 호출하거나 context manager를 사용한다. `run_events()`는 generator이므로 stream 소비를 중단하면 generator도 닫는다. API-key `Client`는 `/v1/api-keys`, admin, asset/code workspace/Git credential 관리처럼 Keystone-only surface를 사용할 수 없다.
+`Client.close()`를 호출하거나 context manager를 사용한다. `run_events()`는 generator이므로 stream 소비를 중단하면 generator도 닫는다. API-key `Client`는 `/v1/api-keys`, admin, code workspace/Git credential 관리처럼 Keystone-only surface를 사용할 수 없다. Asset 업로드/조회에는 해당 `native:assets:write|read` scope와 owner project가 필요하다.
+
+## 이미지·유한 오디오·실시간 음성 SDK
+
+`lumen_sdk.Client`와 Keystone `conn.lumen` 모두 `generate_image`, `edit_image`, `speech`(buffered bytes), `transcribe`, `create_realtime_session`을 제공한다. `idempotency_key`는 각 POST의 필수 UUID다. `model_id`는 해당 kind의 등록된 모델 ID 문자열이다. 이미지 응답은 durable descriptor이며 `get_run`의 terminal status/output asset을 확인한다. STT는 먼저 `upload_asset(file=...)`로 소유한 audio asset을 만든다. SDK의 `speech()`는 HTTP binary 응답을 메모리에 모아 반환하며 긴 오디오를 점진적으로 소비하려면 직접 HTTP streaming 또는 OpenAI SDK의 streaming response API를 사용한다.
+
+```python
+from time import monotonic, sleep
+from uuid import uuid4
+from lumen_sdk import Client
+
+with Client("https://lumen.example", "sk-afgl-...", timeout=180) as client:
+    admitted = client.generate_image(idempotency_key=str(uuid4()), model_id="42",
+                                      prompt="A red bicycle", size="1024x1024", quality="high", n=1)
+    deadline = monotonic() + 120
+    while True:
+        run = client.get_run(admitted["run_id"])
+        if run["status"] == "completed":
+            break
+        if run["status"] in {"failed", "canceled"} or monotonic() >= deadline:
+            raise RuntimeError(f"image run did not complete: {run['status']}")
+        sleep(0.5)
+    for item in run["output_assets"]:
+        with open(f"{item['asset_id']}.png", "wb") as output:
+            output.write(client.download_asset(item["asset_id"]))
+
+    audio = client.speech(idempotency_key=str(uuid4()), model_id="51",
+                          input="Hello", voice="alloy", response_format="wav")
+    with open("speech.wav", "wb") as output:
+        output.write(audio)
+    with open("input.wav", "rb") as source:
+        uploaded = client.upload_asset(file=("input.wav", source, "audio/wav"))
+    text = client.transcribe(idempotency_key=str(uuid4()), model_id="52",
+                             input_asset_id=uploaded["id"])
+    print(text["text"])
+```
+
+위 순서에 최소 `native:images:write`, `native:audio:write`, `native:assets:write`, `native:assets:read`, `native:runs:read`, `models:read`가 필요하다. `Client`의 `base_url`에는 `/v1`을 붙이지 않는다. OpenAI SDK에는 **반대로** `/v1` 포함 URL과 `compat:images:write`/`compat:audio:write`(multipart edit/STT는 `native:assets:write`)를 사용한다:
+
+```python
+from openai import OpenAI
+
+api = OpenAI(base_url="https://lumen.example/v1", api_key="sk-afgl-...", timeout=180)
+picture = api.images.generate(model="gpt-image-1", prompt="A red bicycle", response_format="b64_json")
+print(len(picture.data[0].b64_json))
+with api.audio.speech.with_streaming_response.create(model="gpt-4o-mini-tts", input="Hello", voice="alloy") as speech:
+    speech.stream_to_file("speech.mp3")
+with open("input.wav", "rb") as source:
+    print(api.audio.transcriptions.create(model="gpt-4o-transcribe", file=source).text)
+```
+
+실시간 native session은 먼저 `Client.create_realtime_session()`으로 ticket을 발급받고 WebSocket 라이브러리(`pip install websockets`)로 60초 내 한 번만 접속한다. 샘플은 로컬의 **mono 16-bit 24 kHz PCM WAV**를 보낸다. 실제 음성 입력이 아니거나 provider가 답하지 않으면 출력 WAV가 비어 있을 수 있다. 연결 재시도에는 같은 `Idempotency-Key`로 새 ticket을 발급받되 이미 연결된 run은 재시작할 수 없다.
+
+```python
+import base64
+import json
+import time
+import wave
+from uuid import uuid4
+from lumen_sdk import Client
+from websockets.exceptions import ConnectionClosedOK
+from websockets.sync.client import connect
+
+with Client("https://lumen.example", "sk-afgl-...") as client:
+    session = client.create_realtime_session(idempotency_key=str(uuid4()), model_id="53",
+                                              voice="alloy", max_duration_seconds=60)
+with wave.open("input.wav", "rb") as source:
+    assert (source.getnchannels(), source.getsampwidth(), source.getframerate()) == (1, 2, 24000)
+    with connect(f"wss://lumen.example/v1/chat/realtime/sessions/{session['session_id']}/ws",
+                 additional_headers={"X-Realtime-Token": session["connect_token"]}) as socket:
+        ready = json.loads(socket.recv(timeout=10))
+        assert ready["type"] == "session.ready"
+        for chunk in iter(lambda: source.readframes(2048), b""):
+            socket.send(json.dumps({"type": "audio.input.append", "audio": base64.b64encode(chunk).decode()}))
+        socket.send(json.dumps({"type": "audio.input.commit"}))
+        output = bytearray()
+        until = time.monotonic() + 20
+        while time.monotonic() < until:
+            try:
+                event = json.loads(socket.recv(timeout=1))
+            except TimeoutError:
+                continue
+            except ConnectionClosedOK:
+                break
+            if event.get("type") == "audio.output.delta":
+                output.extend(base64.b64decode(event["delta"]))
+            if event.get("type") == "transcript.output.delta":
+                print(event["delta"], end="", flush=True)
+            if event.get("type") in {"session.closed", "error"}:
+                break
+        try:
+            socket.send(json.dumps({"type": "session.close"}))
+        except ConnectionClosedOK:
+            pass
+with wave.open("output.wav", "wb") as result:
+    result.setnchannels(1)
+    result.setsampwidth(2)
+    result.setframerate(24000)
+    result.writeframes(output)
+```
+
+OpenAI SDK의 realtime `connect(model=...)`는 API-key-only `/v1/realtime`의 위 문서화된 음성 이벤트 subset을 사용한다. Gemini Live client는 `/v1beta/realtime`에서 반드시 먼저 `setup`을 보내야 하며 임의 provider payload, transcription 외 멀티모달 출력, 수정된 voice/rate는 허용하지 않는다. Afterglow browser는 SDK key를 보유하지 않고 BFF의 별도 ticket relay를 사용한다.

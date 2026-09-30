@@ -8,11 +8,12 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from lumen.crypto import encrypt_llm_provider_billing_admin_key, encrypt_llm_provider_key
 from lumen.db import mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
-from lumen.services.litellm_client import effective_prices_per_million, official_price_source
+from lumen.services.litellm_client import direct_provider_route, effective_prices_per_million, official_price_source
 from lumen.services.models_dev import ModelsDevCatalog
 
 from .billing import billing_admin_key_supported, billing_capability_for
 from .credentials import (
+    api_key_source,
     api_model_name,
     canonical_subscription_model_name,
     normalize_api_key_env,
@@ -25,6 +26,7 @@ from .errors import (
     ProviderValidationError,
 )
 from .pricing import (
+    MODEL_KINDS,
     _json_decimal_strings,
     _model_public,
     _per_million_price,
@@ -33,10 +35,27 @@ from .pricing import (
     _to_decimal,
     _validate_cache_prices,
     _validate_price_pair,
+    media_pricing_available,
+    validate_media_pricing,
 )
 from .routing import _lock_mutable_route, _require_db
 
 _AUTH_MODES = frozenset({"api_key", "chatgpt_device", "anthropic_subscription"})
+_MEDIA_PROVIDERS = frozenset({"openai", "gemini"})
+
+
+def _validate_model_kind(provider: LlmProvider, kind: str) -> None:
+    if kind not in MODEL_KINDS:
+        raise ProviderValidationError("지원하지 않는 model_kind 입니다")
+    if kind != "text" and (provider.provider_type not in _MEDIA_PROVIDERS or provider.auth_mode != "api_key" or not direct_provider_route(provider.provider_type, provider.api_base)):
+        raise ProviderValidationError("media 모델은 지원되는 direct API-key 프로바이더에서만 등록할 수 있습니다")
+
+
+def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: tuple) -> dict | None:
+    if kind != "text" and any(value is not None for value in token_prices):
+        raise ProviderValidationError("media 모델에는 text token 가격을 설정할 수 없습니다")
+    return validate_media_pricing(kind, media_pricing)
+
 
 
 def validate_provider_auth_configuration(
@@ -189,6 +208,13 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 target_auth_mode != current_auth_mode or target_provider_type != row.provider_type
             ):
                 raise ProviderValidationError("구독 인증 방식 또는 provider_type은 PATCH로 전환할 수 없습니다")
+            if target_provider_type != row.provider_type or target_auth_mode != current_auth_mode or "api_base" in patch:
+                media_kinds = (await session.execute(select(LlmModel.model_kind).where(
+                    LlmModel.provider_id == provider_id, LlmModel.model_kind != "text"
+                ))).scalars().all()
+                for kind in media_kinds:
+                    if kind not in MODEL_KINDS or target_provider_type not in _MEDIA_PROVIDERS or target_auth_mode != "api_key" or not direct_provider_route(target_provider_type, patch.get("api_base", row.api_base)):
+                        raise ProviderValidationError("media 모델이 있는 프로바이더는 지원하지 않는 인증/유형/base로 전환할 수 없습니다")
             validate_provider_auth_configuration(
                 provider_type=target_provider_type,
                 auth_mode=target_auth_mode,
@@ -259,6 +285,8 @@ async def create_model(
     provider_id: int,
     model_name: str,
     display_name: str | None = None,
+    model_kind: str = "text",
+    media_pricing: dict | None = None,
     input_price_per_million=None,
     output_price_per_million=None,
     cache_read_price_per_million=None,
@@ -270,6 +298,10 @@ async def create_model(
     factory = _require_db()
     if not model_name or not model_name.strip():
         raise ProviderValidationError("model_name 은 필수입니다")
+    media_pricing = _validate_kind_prices(model_kind, media_pricing, (
+        input_price_per_million, output_price_per_million, cache_read_price_per_million,
+        cache_write_price_per_million, cache_write_1h_price_per_million,
+    ))
     input_price, output_price = _validate_price_pair(input_price_per_million, output_price_per_million)
     # Cache rates are optional and independent of each other and of the input/output pair.
     cache_prices = _validate_cache_prices(
@@ -285,6 +317,12 @@ async def create_model(
             provider = subscription_providers.get(provider_id) or await session.get(LlmProvider, provider_id)
             if provider is None:
                 raise ProviderValidationError(f"프로바이더 {provider_id} 가 존재하지 않습니다")
+            if model_kind != "text":
+                provider = (await session.execute(
+                    select(LlmProvider).where(LlmProvider.id == provider_id).with_for_update()
+                    .execution_options(populate_existing=True)
+                )).scalar_one()
+            _validate_model_kind(provider, model_kind)
             if provider.provider_type == "perplexity" and getattr(provider, "auth_mode", "api_key") == "api_key":
                 provider = (
                     await session.execute(select(LlmProvider).where(LlmProvider.id == provider_id).with_for_update())
@@ -310,10 +348,12 @@ async def create_model(
                 provider_id=provider_id,
                 model_name=canonical_name,
                 display_name=(display_name or None),
+                model_kind=model_kind,
+                media_pricing=media_pricing,
                 input_price=input_price,
                 output_price=output_price,
                 **cache_prices,
-                price_source="manual" if input_price is not None else None,
+                price_source="manual" if input_price is not None or media_pricing else None,
                 capabilities=(capabilities or None),
                 capability_source=("override" if capabilities else None),
                 is_active=is_active,
@@ -324,6 +364,8 @@ async def create_model(
                 row,
                 provider_type=provider.provider_type,
                 auth_mode=auth_mode,
+                api_key_configured=api_key_source(provider) is not None,
+                api_base=provider.api_base,
             )
     except IntegrityError as exc:
         raise ProviderValidationError("프로바이더 내 model_name 이 중복됩니다") from exc
@@ -346,28 +388,34 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
             rows = (await session.execute(stmt)).all()
             public_models: list[dict] = []
             for model, provider in rows:
-                stored_input = _per_million_price(model.input_price)
-                stored_output = _per_million_price(model.output_price)
-                fallback_input, fallback_output = (
-                    (None, None)
-                    if stored_input is not None and stored_output is not None
-                    else effective_prices_per_million(
-                        model.model_name, provider.provider_type, api_base=provider.api_base
-                    )
-                )
-                effective_input = stored_input if stored_input is not None else fallback_input
-                effective_output = stored_output if stored_output is not None else fallback_output
-                if stored_input is not None and stored_output is not None:
-                    effective_source = model.price_source
-                elif effective_input is not None and effective_output is not None:
+                if getattr(model, "model_kind", "text") != "text":
+                    effective_input = effective_output = None
                     effective_source = (
-                        official_price_source(model.model_name, provider.provider_type, api_base=provider.api_base)
-                        or "litellm"
-                        if stored_input is None and stored_output is None
-                        else "partial"
+                        "manual" if media_pricing_available(model.model_kind, model.media_pricing) else "unpriced"
                     )
                 else:
-                    effective_source = "unpriced"
+                    stored_input = _per_million_price(model.input_price)
+                    stored_output = _per_million_price(model.output_price)
+                    fallback_input, fallback_output = (
+                        (None, None)
+                        if stored_input is not None and stored_output is not None
+                        else effective_prices_per_million(
+                            model.model_name, provider.provider_type, api_base=provider.api_base
+                        )
+                    )
+                    effective_input = stored_input if stored_input is not None else fallback_input
+                    effective_output = stored_output if stored_output is not None else fallback_output
+                    if stored_input is not None and stored_output is not None:
+                        effective_source = model.price_source
+                    elif effective_input is not None and effective_output is not None:
+                        effective_source = (
+                            official_price_source(model.model_name, provider.provider_type, api_base=provider.api_base)
+                            or "litellm"
+                            if stored_input is None and stored_output is None
+                            else "partial"
+                        )
+                    else:
+                        effective_source = "unpriced"
                 public_models.append(
                     _model_public(
                         model,
@@ -376,6 +424,8 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
                         effective_price_source=effective_source,
                         provider_type=provider.provider_type,
                         auth_mode=getattr(provider, "auth_mode", "api_key"),
+                        api_key_configured=api_key_source(provider) is not None,
+                        api_base=provider.api_base,
                     )
                 )
             return public_models
@@ -413,6 +463,32 @@ async def update_model(model_id: int, patch: dict) -> dict:
             if provider is None:
                 raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
             row = models[0]
+            target_kind = patch.get("model_kind", getattr(row, "model_kind", "text"))
+            _validate_model_kind(provider, target_kind)
+            media_pricing = patch.get("media_pricing", getattr(row, "media_pricing", None))
+            token_prices = (
+                patch.get("input_price_per_million", _per_million_price(row.input_price)),
+                patch.get("output_price_per_million", _per_million_price(row.output_price)),
+                *(patch.get(field, _per_million_price(getattr(row, column, None))) for field, column in (
+                    ("cache_read_price_per_million", "cache_read_price"),
+                    ("cache_write_price_per_million", "cache_write_price"),
+                    ("cache_write_1h_price_per_million", "cache_write_1h_price"),
+                )),
+            )
+            media_pricing = _validate_kind_prices(target_kind, media_pricing, token_prices)
+            if target_kind != getattr(row, "model_kind", "text"):
+                if row.is_title_model or row.is_memory_model:
+                    raise ProviderValidationError("title/memory 모델은 text 종류만 허용합니다")
+                if target_kind == "text" and media_pricing is not None:
+                    raise ProviderValidationError("text 모델에는 media_pricing을 설정할 수 없습니다")
+                row.model_kind = target_kind
+                row.models_dev_model_id = None
+                row.price_metadata = None
+                row.price_source = None
+            if "media_pricing" in patch:
+                row.media_pricing = media_pricing
+                if target_kind != "text":
+                    row.price_source = "manual" if media_pricing else None
             if patch.get("model_name"):
                 canonical_name = canonical_subscription_model_name(str(patch["model_name"]), auth_mode)
                 if provider.provider_type == "perplexity" and auth_mode == "api_key":
@@ -456,6 +532,8 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 row,
                 provider_type=provider.provider_type,
                 auth_mode=auth_mode,
+                api_key_configured=api_key_source(provider) is not None,
+                api_base=provider.api_base,
             )
     except IntegrityError as exc:
         raise ProviderValidationError("프로바이더 내 model_name 이 중복됩니다") from exc
@@ -501,6 +579,8 @@ async def import_models_dev_prices(
             )
             if provider is None:
                 raise ProviderNotFoundError(f"프로바이더 {local_provider_id} 를 찾을 수 없습니다")
+            if any(getattr(model, "model_kind", "text") != "text" for model in local_models):
+                raise ProviderValidationError("models.dev 가격 import는 text 모델만 지원합니다")
             if any(model.price_source == "manual" for model in local_models):
                 raise ModelsDevImportConflictError("수동 확정 가격 모델은 models.dev import로 덮어쓸 수 없습니다")
 
@@ -555,6 +635,8 @@ async def import_models_dev_prices(
                     rows_by_id[local_model_id],
                     provider_type=provider.provider_type,
                     auth_mode=getattr(provider, "auth_mode", "api_key"),
+                    api_key_configured=api_key_source(provider) is not None,
+                    api_base=provider.api_base,
                 )
                 for local_model_id in selected_external
             ]
@@ -593,6 +675,8 @@ async def set_title_model(model_id: int | None) -> None:
                 target = await session.get(LlmModel, model_id)
                 if target is None:
                     raise ProviderNotFoundError(f"모델 {model_id} 를 찾을 수 없습니다")
+                if getattr(target, "model_kind", "text") != "text":
+                    raise ProviderValidationError("제목 요약은 text 모델만 사용할 수 있습니다")
             # 먼저 전부 해제 후 대상만 True (단일 보장)
             await session.execute(update(LlmModel).values(is_title_model=False))
             if model_id is not None:
@@ -611,6 +695,8 @@ async def set_memory_model(model_id: int | None) -> None:
                 target = await session.get(LlmModel, model_id)
                 if target is None:
                     raise ProviderNotFoundError(f"모델 {model_id} 를 찾을 수 없습니다")
+                if getattr(target, "model_kind", "text") != "text":
+                    raise ProviderValidationError("메모리 추출은 text 모델만 사용할 수 있습니다")
             await session.execute(update(LlmModel).values(is_memory_model=False))
             if model_id is not None:
                 await session.execute(update(LlmModel).where(LlmModel.id == model_id).values(is_memory_model=True))

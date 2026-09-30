@@ -177,6 +177,20 @@ def _probe(name: str, *, model_name: str, provider_type: str | None) -> bool:
         return False
 
 
+def reasoning_explicitly_unsupported(model_name: str, source: str | None, overrides: dict | None) -> bool:
+    """Unknown LiteLLM probes are false too; only a known denial can discard input."""
+    if source == "override" and isinstance(overrides, dict) and overrides.get("reasoning") is False:
+        return True
+    try:
+        import litellm
+
+        catalog = litellm.model_cost
+        metadata = catalog.get(litellm_model_name(model_name)) if isinstance(catalog, dict) else None
+        return isinstance(metadata, dict) and not bool(metadata.get("supports_reasoning"))
+    except Exception:
+        return False
+
+
 _NATIVE_WEB_SEARCH_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "perplexity"})
 
 

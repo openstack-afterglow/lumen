@@ -211,6 +211,62 @@ async def _ledger_credited_since(
     return Decimal(str((await session.execute(stmt)).scalar_one()))
 
 
+async def reserve_media_credit_in_transaction(session, *, user_id: str, project_id: str,
+                                              api_key_id: int | None, bound: Decimal) -> None:
+    """Serialize media starts on the wallet and count unsettled holds before provider I/O.
+
+    Call only from a READ COMMITTED transaction set before its first statement:
+    earlier run reads otherwise pin a stale REPEATABLE READ snapshot. Held and
+    ledger aggregates must stay nonlocking: their unindexed FOR UPDATE scans
+    can block another user's text reservation insert. Failed or uncertain calls
+    retain their bound until reconciliation; settled calls enter the ledger.
+    No remote I/O runs under this row lock.
+    """
+    from lumen.models.chat_runs import ChatModelCallReservation, ChatRun
+
+    if not bound.is_finite() or bound <= 0:
+        raise QuotaExceeded("미디어 사용 한도가 올바르지 않습니다")
+    # A plain session.get() before this lock pins a REPEATABLE READ snapshot and
+    # can miss a competing reservation committed while waiting for the wallet.
+    wallet = (await session.execute(select(UserWallet).where(UserWallet.user_id == user_id)
+              .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    if wallet is None:
+        wallet = await _get_or_create_wallet(session, user_id, project_id)
+    _maybe_reset_month(wallet)
+    if not wallet.is_active:
+        raise QuotaExceeded("비활성 지갑입니다")
+    held = select(func.coalesce(func.sum(ChatModelCallReservation.bound_credits), Decimal("0"))).join(
+        ChatRun, ChatRun.id == ChatModelCallReservation.run_id).where(
+        ChatRun.user_id == user_id, ChatModelCallReservation.status.in_(("reserved", "unknown"))
+    )
+    pending = Decimal(str((await session.execute(held)).scalar_one()))
+    system = await quota_policy.get_system_quota(session, user_id)
+    if system.monthly > 0 and wallet.used_quota_this_month + pending + bound > system.monthly:
+        raise QuotaExceeded("월 사용 한도를 초과했습니다")
+    if system.weekly > 0:
+        usage = await _ledger_credited_since(session, since=week_start(), user_id=user_id)
+        if usage + pending + bound > system.weekly:
+            raise QuotaExceeded("주간 사용 한도를 초과했습니다")
+    if api_key_id is not None:
+        key = await session.get(ChatApiKey, api_key_id)
+        if (key is None or key.owner_user_id != user_id or key.owner_project_id != project_id
+                or not key.is_active or key.revoked_at is not None):
+            raise ChatStorageUnavailable("chat DB 오류")
+        held_key = held.where(ChatRun.api_key_id == api_key_id)
+        key_pending = Decimal(str((await session.execute(held_key)).scalar_one()))
+        monthly = calculate_effective_limit(key.owner_monthly_credit_limit,
+                                            key.admin_monthly_credit_limit, system.monthly)
+        if monthly is not None:
+            usage = await _ledger_credited_since(session, since=month_start(), api_key_id=api_key_id, api_only=True)
+            if usage + key_pending + bound > monthly:
+                raise QuotaExceeded("API 키 월 사용 한도를 초과했습니다")
+        weekly = calculate_effective_limit(key.owner_weekly_credit_limit, None, system.weekly)
+        if weekly is not None:
+            usage = await _ledger_credited_since(session, since=week_start(), api_key_id=api_key_id, api_only=True)
+            if usage + key_pending + bound > weekly:
+                raise QuotaExceeded("API 키 주간 사용 한도를 초과했습니다")
+
+
 async def precheck(user_id: str, project_id: str | None = None, api_key_id: int | None = None) -> None:
     """Reject exhausted monthly or weekly quotas; storage failures fail closed.
 

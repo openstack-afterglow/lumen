@@ -35,18 +35,19 @@ docker pull ghcr.io/openstack-afterglow/lumen-worker:latest
 
 - **휠 빌드**: `uv build --wheel`로 `lumen-<version>-py3-none-any.whl`을 생성한다.
 - **역할 설치 경로**: `pip install --no-deps lumen-<version>-py3-none-any.whl`은 Kolla 환경의 `share/kolla-ansible/ansible/roles/lumen`에 역할 자산을 설치한다.
-- **릴리스 이미지 기본값**: 0.3.1 root wheel의 `lumen_image_tag` 기본값은 `0.3.1`이다. 실제 게시 여부를 tag workflow에서 확인한 뒤 배포하고, 이미지가 아직 없거나 이전 이미지를 유지해야 하면 operator가 검증된 tag/digest로 명시적으로 override한다. Source-build commit pin과 SDK/플러그인 버전은 독립적이다.
+- **릴리스 이미지 기본값**: 0.4.0 root wheel의 `lumen_image_tag` 기본값은 `0.4.0`이다. 두 아키텍처 이미지 게시를 확인한 뒤 배포하고, 게시 전에는 운영자가 검증된 tag/digest를 명시한다. Source-build commit pin과 SDK/플러그인 버전은 독립적이다.
 - **첫 배포 및 운영자 동기화**: `kolla-ansible -i <inventory> deploy --tags lumen`으로 최초 기동하며, root wheel 재설치로 패키지 역할을 동기화한다.
 - **PostgreSQL 전제**: 기본 `lumen_postgres_mode="external"`은 운영자가 `lumen_external_postgres_url`을 secret 설정에 제공해야 한다. 자체 PostgreSQL을 만들려면 `bundled`와 강한 `lumen_postgres_password`를 명시한다.
-- **업그레이드 및 Reconfigure 검증**: `kolla-ansible -i <inventory> reconfigure --tags lumen`은 이미지 pull (`pull.yml`) → 설정 렌더링 (`config.yml`) → DB 마이그레이션 (`bootstrap_service.yml`) → 서비스 기동 (`start.yml`) 순서로 실행되어 API/Worker 서비스가 기동되기 전 마이그레이션과 이미지 갱신을 보장한다.
+- **업그레이드 및 Reconfigure 검증**: `kolla-ansible -i <inventory> reconfigure --tags lumen`은 이미지 pull (`pull.yml`) → 설정 렌더링 (`config.yml`) → DB 마이그레이션과 provider bootstrap (`bootstrap_service.yml`) → 서비스 기동 (`start.yml`) 순서다. Bootstrap CLI가 포함된 새 이미지 또는 source-build pin을 먼저 준비해야 한다.
 
 ### 독립형 컨테이너 API + 로컬 Console (개발자/운영자 툴링)
 
 Afterglow/Keystone 없이도 Compose stack만으로 OpenAI 호환 API와 browser Console을 실행할 수 있다:
 
 ```bash
-cp .env.example .env
-# 실제 completion에는 .env의 LUMEN_LOCAL_PROVIDER_API_KEY가 필요하다.
+test -e .env || cp .env.example .env
+# 기존 .env는 덮어쓰지 않는다. 실제 호출은 OPENAI_API_KEY 또는 GEMINI_API_KEY를 설정한다.
+# 로컬 .env는 Git 제외 대상이며 chmod 600 권장; 키를 출력하거나 커밋하지 않는다.
 docker compose up -d --build --wait --wait-timeout 180
 
 # 자동 생성된 SDK URL, Lumen API key, model을 JSON으로 확인
@@ -55,7 +56,7 @@ docker compose run --rm --no-deps -T lumen-connection
 
 출력의 `base_url`과 `api_key`를 OpenAI SDK에 넣으면 `/v1/models`, 비스트리밍/스트리밍 `/v1/chat/completions`, 실제 provider 응답과 token usage를 사용할 수 있다. 같은 Compose network의 다른 container는 `container_base_url`을 사용한다. Browser Console은 `http://127.0.0.1:7010`이다.
 
-Provider key 없이도 stack을 시작해 계정·연결·모델 상태를 확인할 수 있지만 실제 completion은 실행되지 않는다. Console에는 `provider API key 없음`이 표시된다. Console은 Afterglow 제품 프론트엔드가 아닌 localhost 개발자/운영자 툴링(operator tooling)이다. 상세 사용법과 secret 수명은 [로컬 Console 가이드](docs/local-console.md)를 참고한다.
+`OPENAI_API_KEY`/`GEMINI_API_KEY`가 있으면 migration 후 공식 direct provider가 환경 변수 이름만 참조하도록 자동 등록된다. 키가 비어 있어도 stack과 Console은 시작되지만 실제 completion은 실행되지 않는다. Console에는 `provider API key 없음`이 표시된다. 기존 관리자 DB 키·설정은 bootstrap이 덮어쓰지 않는다. Console은 Afterglow 제품 프론트엔드가 아닌 localhost 개발자/운영자 툴링이다. 로컬 모델과 secret 수명은 [로컬 Console 가이드](docs/local-console.md)를 참고한다.
 
 ### 테스트
 
@@ -80,10 +81,14 @@ uv run lumen-test system
 | --- | --- | --- |
 | OpenAI/Anthropic compat | `model="lumen"`: Lumen 백엔드 durable execution (text-only, tools/memory 비활성화); provider model ID: stateless completion | `models:read`, `compat:completions:write` API key |
 | Native `/v1` | durable run, server tool/skill/memory, replay/approval | native least-privilege scope |
+| Native image/audio/realtime | durable image assets, streamed finite speech/transcription, API-owned realtime PCM WebSocket | `native:images:write` / `native:audio:write` / `native:realtime:write` 및 asset read/write |
+| OpenAI-compatible media | image generate/edit, TTS/STT, scoped realtime and Gemini Live subset | `compat:images:write` / `compat:audio:write` / `compat:realtime:write` API key |
 | `lumen_sdk.Client` | direct native API-key transport | 필요한 native scope |
 | `lumen_sdk.register(openstack.Connection)` | Keystone/OpenStack transport | Keystone principal |
 
 server-managed tool, skill, memory가 필요하면 compat completion이 아니라 native durable API를 사용한다. 자세한 연동 스펙 및 Base URL 규칙은 [Afterglow 연동 가이드](docs/afterglow-integration.md)를 참고한다.
+
+이미지·유한 음성·실시간 PCM을 쓰려면 공식 direct provider 키 외에 **지원 모델 ID, kind별 정확한 가격**을 Admin 또는 `LUMEN_BOOTSTRAP_MODELS_JSON`으로 등록해야 한다. 키만으로 media 모델/가격을 추정하거나 호출하지 않는다. 실시간 연결은 Redis one-use ticket 및 공식 OpenAI/Gemini WSS만 지원한다. [API 계약](docs/api-reference.md#이미지유한-오디오실시간-음성), [Python SDK 예제](docs/sdk.md#이미지유한-오디오실시간-음성-sdk), [운영 절차](docs/operations.md#media-모델-운영과-realtime-장애-대응)를 참조한다. Provider 실사용·조직 청구서는 별도 검증해야 한다.
 
 ### OpenAI compat
 

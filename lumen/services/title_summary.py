@@ -24,6 +24,7 @@ _TITLE_SYSTEM = (
     "conversation title. Use the conversation's primary language. Return only a title, "
     "at most 6 words and 80 characters, without quotes, punctuation, or explanation."
 )
+_TITLE_PROMPT = "Summarize this conversation into a concise title."
 _OMISSION = "[…생략…]"
 # Cheapest first; values outside this list are never sent.
 _TITLE_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -165,33 +166,35 @@ def _fit_messages_to_budget(*, model: str, messages: list[dict[str, Any]], budge
     if litellm_client.count_tokens(model, messages=messages) <= budget:
         return messages
     system = messages[0]
-    roles = messages[1:]
-    system_tokens = litellm_client.count_tokens(model, messages=[system])
-    if system_tokens > budget:
+    prompt = messages[-1] if len(messages) > 3 else None
+    roles = messages[1:-1] if prompt is not None else messages[1:]
+    fixed = [system, prompt] if prompt is not None else [system]
+    fixed_tokens = litellm_client.count_tokens(model, messages=fixed)
+    if fixed_tokens > budget:
         raise ValueError("title context budget exceeded")
     empty_roles = [system, *({"role": item["role"], "content": ""} for item in roles)]
+    if prompt is not None:
+        empty_roles.append(prompt)
     framing_tokens = max(
         0,
-        litellm_client.count_tokens(model, messages=empty_roles) - system_tokens,
+        litellm_client.count_tokens(model, messages=empty_roles) - fixed_tokens,
     )
-    available = max(0, budget - system_tokens - framing_tokens)
+    available = max(0, budget - fixed_tokens - framing_tokens)
     # Allocate the remaining content budget equally before any role-specific trim.
     high = available // max(1, len(roles))
 
     def build(role_budget: int) -> list[dict[str, Any]]:
-        if role_budget <= 0:
-            return [system, *({"role": item["role"], "content": ""} for item in roles)]
-        return [
-            system,
-            *(
-                {
-                    "role": item["role"],
-                    "content": _fit_text(model, item["role"], str(item["content"]), role_budget),
-                }
-                for item in roles
-            ),
+        fitted_roles = [
+            {
+                "role": item["role"],
+                "content": _fit_text(model, item["role"], str(item["content"]), role_budget) if role_budget > 0 else "",
+            }
+            for item in roles
         ]
-
+        res = [system, *fitted_roles]
+        if prompt is not None:
+            res.append(prompt)
+        return res
     candidate = build(high)
     if litellm_client.count_tokens(model, messages=candidate) <= budget:
         return candidate
@@ -233,6 +236,7 @@ def build_title_messages(*, exchange: Sequence[Mapping[str, Any]], route: Mappin
         {"role": "system", "content": _TITLE_SYSTEM},
         {"role": "user", "content": user[1]},
         {"role": "assistant", "content": assistant[1]},
+        {"role": "user", "content": _TITLE_PROMPT},
     ]
     limit = _context_limit(route)
     if limit is None:
