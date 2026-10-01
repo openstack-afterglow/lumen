@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -91,7 +93,7 @@ async def test_worker_owns_checkpointer_lifecycle(monkeypatch):
     assert fake.closed is True
 
 
-async def test_slow_maintenance_never_blocks_claims(monkeypatch):
+async def test_slow_maintenance_never_blocks_claims(monkeypatch, caplog):
     """A stuck maintenance iteration must not delay polling or dispatch of queued runs."""
     fake = _FakeCheckpointer()
     _patch_serve_dependencies(monkeypatch, fake)
@@ -124,12 +126,84 @@ async def test_slow_maintenance_never_blocks_claims(monkeypatch):
 
     monkeypatch.setattr("lumen.db.close_db", close_db)
 
-    with pytest.raises(asyncio.CancelledError):
-        await chat_worker.serve()
+    with caplog.at_level(logging.INFO, logger="lumen.worker"):
+        with pytest.raises(asyncio.CancelledError):
+            await chat_worker.serve()
 
     assert sweeps == [1]
     assert executed == ["run-1"]
     assert len(claims) == 2
+    messages = [record.getMessage() for record in caplog.records]
+    assert "worker ready capacity=4" in messages
+    # Shutdown begins with the claimed run in flight and completes only after it returns.
+    started = messages.index("worker shutdown started active=1 draining=False")
+    returned = messages.index("worker run execution returned run_id=invalid claimed=True")
+    assert started < returned < messages.index("worker shutdown complete")
+
+
+async def test_worker_run_logs_dispatch_and_claim_without_claimed_success(monkeypatch, caplog):
+    run_id = str(uuid.uuid4())
+
+    async def rejected_claim(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(chat_worker, "execute_queued_run", rejected_claim)
+    with caplog.at_level(logging.DEBUG, logger="lumen.worker"):
+        loop = chat_worker.WorkerLoop(owner="host:1", capacity=1, heartbeat_seconds=5, drain_seconds=30)
+        loop.launch(run_id)
+        await asyncio.gather(loop.active[run_id])
+        loop.start_drain()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert f"worker run dispatched run_id={run_id} active=1" in messages
+    assert f"worker run execution returned run_id={run_id} claimed=False" in messages
+    assert "worker drain started active=0" in messages
+    assert not any("success" in message or "completed" in message for message in messages)
+    assert not any("host:1" in message for message in messages)
+
+
+async def test_worker_provider_error_does_not_log_secret_or_untrusted_run_id(monkeypatch, caplog):
+    malicious_run_id = "secret-prompt\nAuthorization: Bearer secret-token"
+
+    async def provider_failure(*_args, **_kwargs):
+        raise RuntimeError("provider secret-token prompt and SQL parameters")
+
+    monkeypatch.setattr(chat_worker, "execute_queued_run", provider_failure)
+    with caplog.at_level(logging.DEBUG, logger="lumen.worker"):
+        loop = chat_worker.WorkerLoop(owner="host:1", capacity=1, heartbeat_seconds=5, drain_seconds=30)
+        loop.launch(malicious_run_id)
+        await asyncio.gather(loop.active[malicious_run_id])
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "worker run dispatched run_id=invalid active=1" in messages
+    assert "durable chat run execution failed run_id=invalid" in messages
+    assert "secret" not in messages
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+async def test_worker_title_and_maintenance_errors_do_not_log_provider_text(caplog):
+    async def provider_failure(*_args, **_kwargs):
+        raise RuntimeError("secret-provider-response")
+
+    title_called = asyncio.Event()
+
+    async def title_failure(*_args, **_kwargs):
+        title_called.set()
+        raise RuntimeError("secret-provider-response")
+
+    with caplog.at_level(logging.DEBUG, logger="lumen.worker"):
+        maintenance = chat_worker._Maintenance("heartbeat", provider_failure, interval=1)
+        await maintenance._run()
+        title_task = asyncio.create_task(chat_worker._title_processor_loop(title_failure, owner="worker"))
+        await title_called.wait()
+        title_task.cancel()
+        await asyncio.gather(title_task, return_exceptions=True)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "worker maintenance job failed name=heartbeat" in messages
+    assert "durable title generation job failed" in messages
+    assert "secret" not in messages
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 async def test_worker_dispatches_independent_title_job_task(monkeypatch):

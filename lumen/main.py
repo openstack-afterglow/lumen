@@ -84,6 +84,14 @@ async def lifespan(app: FastAPI):
 
         await setup_semantic_memory()
 
+    logger.info("api ready")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "api state database_configured=%s checkpointer_configured=%s semantic_memory_enabled=%s",
+            bool(settings.database_url), bool(settings.chat_checkpointer_postgres_url),
+            settings.chat_semantic_memory_enabled,
+        )
+
     yield
 
     try:
@@ -95,9 +103,10 @@ async def lifespan(app: FastAPI):
     try:
         await registry.close()
     except Exception:
-        logger.exception("plugin shutdown failed")
+        logger.error("plugin shutdown failed")
     await close_cache()
     await close_db()
+    logger.info("api stopped")
 
 
 app = FastAPI(

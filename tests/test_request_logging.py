@@ -2,6 +2,7 @@
 
 import logging
 
+import pytest
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
@@ -43,3 +44,30 @@ async def test_access_log_records_route_status_without_sensitive_request_data(ca
         secret in caplog.text
         for secret in ("secret-conversation", "secret-ticket", "secret-unknown", "secret-token", "sensitive-value")
     )
+
+
+async def test_access_log_distinguishes_incomplete_response_from_success(caplog):
+    async def interrupted(scope, receive, send):
+        await send({"type": "http.response.start", "status": 202, "headers": []})
+        raise RuntimeError("private upstream response")
+
+    middleware = RequestLoggingMiddleware(interrupted)
+    scope = {"type": "http", "method": "POST", "path": "/v1/private-id?token=secret-token"}
+    messages = []
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        messages.append(message)
+
+    with caplog.at_level(logging.INFO, logger="lumen.request_logging"):
+        with pytest.raises(RuntimeError, match="private upstream response"):
+            await middleware(scope, receive, send)
+
+    assert messages[0]["status"] == 202
+    assert [(record.getMessage(), record.exc_info) for record in caplog.records] == [
+        ("http request method=POST route=<unmatched> status=incomplete", None),
+    ]
+    assert "private upstream response" not in caplog.text
+    assert "secret-token" not in caplog.text
