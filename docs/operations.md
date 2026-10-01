@@ -223,7 +223,7 @@ Lumen의 root `lumen` wheel은 Kolla 역할을 shared data로 포함한다. Koll
 0.3.1 게시 계약: release commit에서 root manifest·`lumen.__version__`·`uv.lock`이 모두 `0.3.1`인지 확인하고, `uv sync --extra service --extra dev --frozen` 및 `uv run lumen-test contract`, `uv run lumen-test integration`, `uv run lumen-test system`을 실행한다. 추가 CI gate는 `.github/workflows/ci.yml`의 plugin conformance 5개, sandbox wheel/test, SDK test/lint, Kolla asset test다. Root wheel `uv build --wheel`과 독립 plugin/sandbox wheels, Kolla shared-data asset 검증은 `release.yml`이 소유한다. 승인된 release commit에 `v0.3.1` tag를 붙여 push하면 두 tag-triggered workflow가 각각 `ci.yml`을 호출한다(중복 실행). `release-package`는 root version/tag 일치 시 wheels를 GitHub Release에 첨부하고, `build-and-push`는 통과한 test job 뒤 API/worker/controller/sandbox 멀티 아키텍처 이미지를 GHCR `0.3.1`과 `sha-<short-sha>`로 게시한다. 두 workflow 결과·각 이미지의 두 플랫폼 manifest·운영 환경의 readiness/migration을 별도로 확인한 뒤 wheel/Kolla 기본값을 배포한다. 이번 version metadata 변경 자체는 이러한 빌드·테스트·게시·실환경 배포를 수행했다는 증거가 아니다.
 
 ### 3. 운영자 동기화
-- **역할 업데이트**: 새 root wheel을 Kolla environment에 재설치하여 `share/kolla-ansible/ansible/roles/lumen` 자산을 동기화한다.
+- **역할 업데이트**: 새 root wheel을 Kolla environment에 재설치하여 `share/kolla-ansible/ansible/roles/lumen` 자산을 동기화한다. 설치는 Kolla config owner로 `pip install --no-deps --force-reinstall`을 실행한다. 이전 wheel을 root로 설치했다면 owner 설치 뒤 pip가 root 소유 stash(`site-packages/~umen*`, role의 `~*` 디렉터리)를 지우지 못해 `pip show lumen`이 실패하므로 그 stash만 제거한다(0.5.0 rollout에서 확인·정리).
 
 ### 4. Upgrade vs. Reconfigure 동작 및 마이그레이션 보장
 - **Reconfigure 명령어 및 순서 (`reconfigure.yml`)**: `kolla-ansible -i <inventory> reconfigure --tags lumen` (`precheck` → `pull` → `config` → `bootstrap_service` (DB migration → provider registration) → `start`)
