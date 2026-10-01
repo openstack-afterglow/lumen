@@ -206,13 +206,13 @@ Lumen의 root `lumen` wheel은 Kolla 역할을 shared data로 포함한다. Koll
 - **PostgreSQL 모드 선택**: 기본값 `lumen_postgres_mode="external"`은 `lumen_external_postgres_url`이 반드시 필요하다. 역할이 PostgreSQL을 관리하게 하려면 `/etc/kolla/config/afterglow/globals.yml`에서 `lumen_postgres_mode: "bundled"`를 선택하고 `secrets.yml`에 강한 `lumen_postgres_password`를 제공한다. 둘 중 하나를 명시하지 않은 stock defaults는 precheck에서 fail-closed 한다.
 
 ### 2. 독립 wheel/image release
-#### 0.4.0 현재 목표
+#### 0.5.0 현재 목표
 
-- **root package release**: `v0.4.0` tag push 시 `.github/workflows/release.yml`은 `lumen.__version__ == 0.4.0`과 root `uv.lock` 버전 일치를 확인하고 root·plugin·sandbox wheel을 GitHub Release에 첨부한다. `workflow_dispatch`는 release 첨부를 수행하지 않는다.
-- **runtime image tag**: Kolla 역할의 API/worker/controller `lumen_image_tag` 기본값은 `0.4.0`이다. `.github/workflows/docker-build.yml`의 별도 `v0.4.0` 실행이 `linux/amd64,linux/arm64` 이미지를 GHCR에 게시하기 전에는 이 ref로 배포하지 않는다. Wheel Release 성공만으로 이미지 게시나 Kolla 배포가 보장되지 않는다. `lumen_source_version`은 별도 source-build commit pin이며 기본값 `c561a155...`는 이번 릴리스가 아니므로 운영자는 정확한 검증 commit으로 override해야 한다.
+- **root package release**: `v0.5.0` tag push 시 `.github/workflows/release.yml`은 `lumen.__version__ == 0.5.0`과 root `uv.lock` 버전 일치를 확인하고 root·plugin·sandbox wheel을 GitHub Release에 첨부한다. `workflow_dispatch`는 release 첨부를 수행하지 않는다.
+- **runtime image tag**: Kolla 역할의 API/worker/controller `lumen_image_tag` 기본값은 `0.5.0`이다. `.github/workflows/docker-build.yml`의 별도 `v0.5.0` 실행이 `linux/amd64,linux/arm64` 이미지를 GHCR에 게시하기 전에는 이 ref로 배포하지 않는다. Wheel Release 성공만으로 이미지 게시나 Kolla 배포가 보장되지 않는다. `lumen_source_version`은 별도 source-build commit pin이며 기본값 `c561a155...`는 이번 릴리스가 아니므로 운영자는 정확한 검증 commit으로 override해야 한다.
 - **기본 이미지 네임스페이스**: Kolla 역할은 `ghcr.io/openstack-afterglow/lumen-api:<image-tag>`, `ghcr.io/openstack-afterglow/lumen-worker:<image-tag>`, runtime-enabled일 때 `ghcr.io/openstack-afterglow/lumen-controller:<image-tag>`를 사용한다. `ghcr.io/openstack-afterglow/lumen-sandbox`는 별도 게시 이미지이며 Kolla 서비스 컨테이너가 아니라 운영자가 sandbox cloud pool `image`에 정확한 ref로 지정한다. Operator는 역할의 exact digest ref override를 그대로 유지할 수 있다.
 
-0.4.0 게시 계약: release commit에서 root manifest·`lumen.__version__`·`uv.lock`의 `0.4.0` 일치를 확인하고 `uv sync --extra service --extra dev --frozen`, `uv run lumen-test contract`, `uv run lumen-test integration`, `uv run lumen-test system`, `uv build --wheel`을 수행한다. `v0.4.0` tag workflow가 CI 이후 두 플랫폼의 API/worker/controller/sandbox 이미지를 GHCR `0.4.0`·`sha-<short-sha>`에 게시하는지 확인한다. 기존 API/worker/controller를 중지하고 DB 백업과 migration 정합성을 확인한 뒤 새 이미지를 함께 기동한다. CI·이미지 게시·wheel release는 운영 Kolla 배포를 대체하지 않는다.
+0.5.0 게시 계약: release commit에서 root manifest·`lumen.__version__`·`uv.lock`의 `0.5.0` 일치를 확인하고 `uv sync --extra service --extra dev --frozen`, `uv run lumen-test contract`, `uv run lumen-test integration`, `uv run lumen-test system`, `uv build --wheel`을 수행한다. `v0.5.0` tag workflow가 CI 이후 두 플랫폼의 API/worker/controller/sandbox 이미지를 GHCR `0.5.0`·`sha-<short-sha>`에 게시하는지 확인한다. `v0.4.0` 이후 추가 SQL migration은 없지만 기존 API/worker/controller를 중지하고 DB 백업과 migration 재실행 no-op을 확인한 뒤 새 이미지를 함께 기동한다. CI·이미지 게시·wheel release는 운영 Kolla 배포를 대체하지 않는다.
 
 #### v0.3.1 당시 운영 가이드 (현재 기본값이 아님)
 

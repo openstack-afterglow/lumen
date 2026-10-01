@@ -6,7 +6,7 @@ Lumen은 LiteLLM provider 실행, LangGraph/LangChain agent runtime, 대화·dur
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: root `lumen` package `0.4.0` (`pyproject.toml`, `lumen/__init__.py`, `uv.lock`), 독립 `lumen-sdk` `0.2.1` (`sdk/pyproject.toml`), discovery/API contract `1.0.0` (`lumen/api/compat/discovery.py`). Kolla의 package-owned API/worker/controller image default는 `0.4.0` tag를 가리키지만 이번 후보 이미지 게시·운영 배포는 아직 검증하지 않았다. 앞선 `v0.3.1` package 및 네 이미지 tag workflow는 source `9eed5d170bc3fad3dae658e6119cb80e5831052e`에서 성공했고 multi-architecture manifest의 OCI revision을 확인했다. 이것은 Kolla 운영 설치·cloud acceptance가 아니다. `lumen_source_version`은 별도 source-build commit pin이다.
+- 버전: root `lumen` package `0.5.0` (`pyproject.toml`, `lumen/__init__.py`, `uv.lock`), 독립 `lumen-sdk` `0.2.1` (`sdk/pyproject.toml`), discovery/API contract `1.0.0` (`lumen/api/compat/discovery.py`). Kolla의 package-owned API/worker/controller image default는 `0.5.0` tag다. 2026-10-01 운영 Kolla globals는 이전 `v0.4.0` API/worker index digest(`lumen-api@sha256:b78b0551…`, `lumen-worker@sha256:17e4a5b8…`)를 고정하며, `0.5.0` 이미지 게시·운영 배포는 별도 기록 전까지 주장하지 않는다. `lumen_source_version`은 별도 source-build commit pin이다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
@@ -366,9 +366,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c0e7c6b94ab9f10a9b098de7c96ace656c40b65164581425969c748bdc688b42",
-  "reviewed_at": "2026-10-01T04:57:51Z",
-  "summary": "Scoped temporary-index review of exact historical media migration 019-to-020 adoption: path/checksum/schema must match before adding only canonical ledger identity; immutable SQL and service/storage boundaries unchanged. Covered dry-run, fresh migration, repeated application and fail-closed drift on real isolated MariaDB. Existing unrelated working-tree changes are excluded and not certified; local Compose smoke is not production rollout or paid media acceptance."
+  "source_sha256": "11dc3bb5658505679d0b09d04ff8f286a6454a9f866e497aefad157bb5a66492",
+  "reviewed_at": "2026-10-01T12:14:08Z",
+  "summary": "Lumen 0.5.0 release review: lifecycle logging (worker/main/controller, request logging), modality pricing (api/models, providers/pricing+repository, usage_breakdown, credit, chat_admission, completion_api, graph, durable_runs execution/images/audio/realtime, image/audio/realtime transports), official OpenAI Responses routing (litellm_client, graph), native whisper-1 segment timestamps (api/audio, conversations, audio transport/durable), 019-to-020 media migration identity adoption (scripts/migrate.py), version 0.5.0 in pyproject/lumen/uv.lock and Kolla lumen_image_tag. No new SQL migration. contract 1615+SDK 125, native integration 102, system 9 passed."
 }
 ```
 <!-- architecture-review:end -->

@@ -53,7 +53,7 @@ Media credit concurrency 회귀는 `tests/integration/test_durable_image_flow.py
 
 Actual durable hook smoke는 image/audio 입력·캐시 입력·출력 각각 1 credit을 계산했고, 실제 graph의 image tool round→text-only compaction round는 2 provider-boundary 호출의 media share를 보존해 `1.01400000` credits를 계산했다. Upstream은 synthetic이며 provider·extensions storage는 격리했다. Throwaway UI/API/probe 파일과 서비스는 제거했다. 회귀는 `tests/test_modality_pricing.py`, `test_chat_credit_reservations.py`, `test_chat_graph.py`, `test_chat_run_store.py` 및 media transport/datastore suites에 있다. 운영 인증·paid provider·invoice·배포 실증은 포함하지 않는다.
 
-전체 working-tree architecture guard는 다른 작업의 dirty source가 포함되어 stale이며 해당 source를 stamp하지 않았다. Gate green과 scoped consumer/runtime proof를 구분한다. 최종 suite 결과와 남은 gate는 `openspec/changes/modality-model-pricing/tasks.md`에 기록한다.
+0.5.0 release tree에서 `uv run lumen-test contract -q`(service 1,615·SDK 125·Ruff), native arm64 `integration`(MariaDB/Redis 102), `system`(Docker process stack 9)이 통과했고 staged architecture guard를 갱신했다. Gate green과 scoped consumer/runtime proof를 구분한다. 세부 증거는 `openspec/changes/archive/2026-10-01-modality-model-pricing/tasks.md`에 기록한다.
 
 
 ### 실제 Codex CLI 확인
