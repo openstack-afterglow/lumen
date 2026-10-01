@@ -153,6 +153,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
                 return stream()
 
             monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_litellm_stream)
+            monkeypatch.setattr(graph.litellm_client, "direct_openai_stream_completed", lambda _stream: True)
             assert await execution.execute_queued_run(run_id, owner=run_owner) is True
 
             events = await client.get(f"/v1/runs/{run_id}/events", headers={"X-Api-Key": key["key"]})

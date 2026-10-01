@@ -16,7 +16,8 @@ import codecs
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
@@ -29,7 +30,7 @@ from lumen.services.providers.credentials import (
     perplexity_route_model_name,
 )
 from lumen.services.providers.errors import ProviderSubscriptionError
-from lumen.services.usage_breakdown import UsageBreakdown
+from lumen.services.usage_breakdown import UsageBreakdown, modality_token_charges
 
 logger = logging.getLogger(__name__)
 
@@ -416,11 +417,15 @@ def cost_from_usage(
     cache_price_sources: Mapping[str, str] | None = None,
     allow_catalog_cache: bool = True,
     allow_catalog_prices: bool = True,
+    token_rates: Mapping[str, Any] | None = None,
+    required_modalities: Iterable[str] = (),
 ) -> UsageCost:
     """Bill provider-reported token totals using manual or exact catalog prices.
 
     A direct provider's known cache rates fill only unset categories. A custom
     base requires configured prices; missing categories remain visibly partial.
+    Configured ``token_rates`` bill reported image/audio shares at their own
+    per-million rates; text prices apply to the residual only.
     """
     if breakdown is None:
         breakdown = UsageBreakdown.from_totals(prompt_tokens, completion_tokens)
@@ -431,7 +436,8 @@ def cost_from_usage(
         raise ValueError("usage breakdown totals do not match prompt/completion tokens")
     prompt_tokens = breakdown.input_tokens
     completion_tokens = breakdown.output_tokens
-    uncached_tokens = breakdown.uncached_input_tokens
+    text, modality_charges = modality_token_charges(breakdown, token_rates, required_modalities)
+    uncached_tokens = text.uncached_input_tokens
     fallback_input, fallback_output, fallback_source = (
         _fallback_component_rates(model, prompt_tokens, completion_tokens, provider_type, api_base)
         if allow_catalog_prices and (input_price_per_token is None or output_price_per_token is None)
@@ -445,7 +451,7 @@ def cost_from_usage(
         fallback_source=fallback_source,
     )
     output_cost, output_rate, output_source, output_priced = _component_cost(
-        tokens=completion_tokens,
+        tokens=text.output_tokens,
         stored_rate=output_price_per_token,
         stored_source=price_source,
         fallback_rate=fallback_output,
@@ -471,9 +477,9 @@ def cost_from_usage(
     cache_sources: dict[str, str | None] = dict(cache_price_sources or {})
     cache_components: dict[str, tuple[int, Decimal | None, Decimal]] = {}
     for name, tokens in (
-        ("cache_read", breakdown.cache_read_input_tokens),
-        ("cache_creation_5m", breakdown.cache_creation_5m_input_tokens),
-        ("cache_creation_1h", breakdown.cache_creation_1h_input_tokens),
+        ("cache_read", text.cache_read_input_tokens),
+        ("cache_creation_5m", text.cache_creation_5m_input_tokens),
+        ("cache_creation_1h", text.cache_creation_1h_input_tokens),
     ):
         configured, catalog, configured_tier, catalog_tier = cache_rates[name]
         rate = configured if configured is not None else catalog
@@ -500,17 +506,28 @@ def cost_from_usage(
         "input": _snapshot_component(
             uncached_tokens, input_rate, input_cost, input_source, provider_type=provider_type
         ),
-        "output": _snapshot_component(completion_tokens, output_rate, output_cost, output_source),
+        "output": _snapshot_component(text.output_tokens, output_rate, output_cost, output_source),
     }
     for name, (tokens, rate, cost) in cache_components.items():
         snapshot[name] = _snapshot_component(tokens, rate, cost, cache_sources.get(name))
+    cache_read_cost = cache_components["cache_read"][2]
+    for charge in modality_charges:
+        cost = (charge.price_per_token * charge.tokens).quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
+        raw_cost += cost
+        if charge.name.endswith("_cache_read"):
+            cache_read_cost += cost
+        elif charge.name.endswith("_input"):
+            input_cost += cost
+        else:
+            output_cost += cost
+        snapshot[charge.name] = _snapshot_component(charge.tokens, charge.price_per_token, cost, "manual")
     return UsageCost(
         raw_cost=raw_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP),
         input_cost=input_cost,
         output_cost=output_cost,
         pricing_status=pricing_status,
         pricing_snapshot=snapshot,
-        cache_read_cost=cache_components["cache_read"][2],
+        cache_read_cost=cache_read_cost,
         cache_creation_5m_cost=cache_components["cache_creation_5m"][2],
         cache_creation_1h_cost=cache_components["cache_creation_1h"][2],
     )
@@ -611,6 +628,44 @@ def _anthropic_cached_messages(
     return messages
 
 
+_NATIVE_OPENAI_STREAM_MODEL: ContextVar[str | None] = ContextVar("native_openai_stream_model", default=None)
+
+
+def _enable_uncatalogued_openai_streaming(litellm: Any) -> None:
+    """An unknown model is not evidence that the official Responses API cannot stream.
+
+    LiteLLM's pinned fallback fabricates a stream from a non-streaming response
+    whenever its price catalogue lacks the model. Limit the override to this
+    request's direct OpenAI route; known non-streaming models keep their policy.
+    """
+    original = litellm.utils.supports_native_streaming
+    if getattr(original, "_lumen_direct_openai_streaming", False):
+        return
+
+    def supported(model: str, custom_llm_provider: str | None) -> bool:
+        bare = model.removeprefix("openai/").removeprefix("responses/")
+        if (
+            custom_llm_provider == "openai"
+            and _NATIVE_OPENAI_STREAM_MODEL.get() == bare
+            and bare not in litellm.model_cost
+            and f"openai/{bare}" not in litellm.model_cost
+        ):
+            return True
+        return original(model=model, custom_llm_provider=custom_llm_provider)
+
+    supported._lumen_direct_openai_streaming = True  # type: ignore[attr-defined]
+    litellm.utils.supports_native_streaming = supported
+
+
+def direct_openai_stream_completed(stream: Any) -> bool:
+    """The Chat bridge fabricates a terminal chunk on EOF; require the raw Responses event."""
+    bridge = getattr(stream, "completion_stream", None)
+    source = getattr(bridge, "streaming_response", None)
+    event = getattr(source, "completed_response", None)
+    response = getattr(event, "response", None)
+    return getattr(event, "type", None) == "response.completed" and getattr(response, "status", None) == "completed"
+
+
 def _build_params(
     model: str,
     messages: list[dict],
@@ -623,6 +678,10 @@ def _build_params(
     tools: list[dict] | None = None,
     extra: dict | None,
 ) -> dict[str, Any]:
+    # The pinned LiteLLM bridge recognizes responses/ independently of the
+    # mutable remote model catalog. Leave compatible third-party bases on chat.
+    if custom_llm_provider == "openai" and direct_provider_route(custom_llm_provider, api_base):
+        model = f"openai/responses/{model.removeprefix('openai/').removeprefix('responses/')}"
     params: dict[str, Any] = {"model": model, "messages": messages}
     if custom_llm_provider:
         params["custom_llm_provider"] = custom_llm_provider
@@ -1332,6 +1391,13 @@ async def acompletion_stream(
     )
     params["stream"] = True
     params["stream_options"] = {"include_usage": True}
+    if custom_llm_provider == "openai" and direct_provider_route(custom_llm_provider, api_base):
+        _enable_uncatalogued_openai_streaming(litellm)
+        token = _NATIVE_OPENAI_STREAM_MODEL.set(model.removeprefix("openai/").removeprefix("responses/"))
+        try:
+            return await litellm.acompletion(**params)
+        finally:
+            _NATIVE_OPENAI_STREAM_MODEL.reset(token)
     return await litellm.acompletion(**params)
 
 

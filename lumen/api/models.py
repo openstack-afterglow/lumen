@@ -299,13 +299,12 @@ class ModelCreateRequest(BaseModel):
     is_active: bool = True
     @model_validator(mode="after")
     def _kind_prices(self):
+        # Media models may price text input/output/cache-read for a token basis; the
+        # repository validates media_pricing per kind (text allows token_rates only).
         if self.model_kind != "text" and any(getattr(self, field) is not None for field in (
-            "input_price_per_million", "output_price_per_million", "cache_read_price_per_million",
             "cache_write_price_per_million", "cache_write_1h_price_per_million",
         )):
-            raise ValueError("media 모델에는 text token 가격을 설정할 수 없습니다")
-        if self.model_kind == "text" and self.media_pricing is not None:
-            raise ValueError("text 모델에는 media_pricing을 설정할 수 없습니다")
+            raise ValueError("media 모델에는 cache write 가격을 설정할 수 없습니다")
         return self
 
 
@@ -332,7 +331,9 @@ class ModelCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _price_pair(self):
-        if (self.input_price_per_million is None) != (self.output_price_per_million is None):
+        if self.model_kind == "text" and (self.input_price_per_million is None) != (
+            self.output_price_per_million is None
+        ):
             raise ValueError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
         return self
 
@@ -375,10 +376,13 @@ class ModelUpdateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _price_pair(self):
+        # A PATCH may target a media model whose text directions are priced
+        # independently; the repository enforces the text pair on the stored kind.
         price_fields = {"input_price_per_million", "output_price_per_million"}
-        if self.model_fields_set & price_fields and (
-            not price_fields <= self.model_fields_set
-            or (self.input_price_per_million is None) != (self.output_price_per_million is None)
+        if self.model_kind != "text" or not self.model_fields_set & price_fields:
+            return self
+        if not price_fields <= self.model_fields_set or (
+            (self.input_price_per_million is None) != (self.output_price_per_million is None)
         ):
             raise ValueError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
         return self
@@ -662,6 +666,8 @@ class AvailableModelCandidate(BaseModel):
     generation_methods: list[str] = Field(default_factory=list)
     input_token_limit: int | None = None
     output_token_limit: int | None = None
+    # Classified from the exact installed catalog mode; ``None`` stays manually selectable.
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
 
     model_config = {"protected_namespaces": ()}
 

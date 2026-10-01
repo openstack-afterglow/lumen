@@ -1,6 +1,19 @@
 # Changelog
 
-## 0.4.0 (release candidate)
+## 0.5.0
+
+Changes since `v0.4.0`:
+
+- **Explicit modality pricing:** Image-model discovery/registration and independent text/image/audio input, cached-input and output rates use the existing media JSON and text columns. Exact second/minute/hour, character, image-unit, whole-session and provider-token billing remain separate; omitted basis preserves legacy behavior. Actual reported modality/cache usage settles at frozen prices, with whole-request token envelopes and early encrypted usage checkpoints preserving unknown holds on uncertain or downstream-failed results. No new migration; vendor price accuracy and paid-provider invoices are not verified.
+- **Multimodal chat settlement:** Canonical image/audio token usage survives checkpoints without cache-creation fields. Text-only rounds after compaction retain earlier media charges; only validated media absence contributes zero to aggregation. Requested media with missing or ambiguous usage is never estimated.
+- **Timed native transcription:** Native `POST /v1/chat/audio/transcriptions` accepts optional `timestamp_granularities: ["segment"]`, only on executable direct OpenAI `whisper-1` (capabilities expose `available_timestamp_granularities`). Lumen sends `verbose_json` with `timestamp_granularities[]=segment`, keeps only validated provider start/end seconds and text, and returns `segments` with `text`; Lumen never infers timing. Explicit timing is part of the idempotent intent, while omitted or empty requests keep the legacy intent hash and `{text}` response. Compat transcription formats are unchanged. No migration.
+- **Kolla 진단 로그:** API HTTP route template·상태 코드와 durable worker의 run ID·실패 코드를 Kolla 로그 볼륨의 분리된 프로세스 파일에 기록한다. 원문 URL/query·인증 정보·요청/응답 본문은 기록하지 않는다. Native completions의 HTTP 202는 실행 성공이 아니므로 이후 `run.failed` 이벤트와 worker 기록을 대조해야 한다. 이 진단 개선은 운영 OpenAI 모델 실패 원인 확인이나 실제 서비스 배포를 의미하지 않는다.
+- **공식 OpenAI Responses 라우팅:** Native 대화와 chat-shaped stateless 호출의 공식 OpenAI direct route를 LiteLLM Responses bridge로 전환한다. Provider-neutral 이벤트와 tool 결과/usage는 유지하며 외부 OpenAI-compatible URL과 subscription은 바꾸지 않는다. Catalog 미등록 모델도 native SSE를 사용하고 `response.completed`가 없는 native run은 성공 처리하지 않는다. Fake provider의 text/tool/usage·wire 경계 검증은 운영 대시보드 모델 성공 증거가 아니다.
+- **Media migration identity:** A database that applied the early `019-media-model-registry` candidate receives the canonical `020-media-model-registry` ledger row without repeating DDL only when both SQL checksums, `model_kind` and the JSON-validated nullable `media_pricing` column match exactly. Any other drift fails closed; existing ledger rows and data stay untouched, and dry-run reports the adoption as pending.
+
+**Release boundary:** Package and Kolla API/worker/controller image defaults target `0.5.0`; no SQL migration was added after `v0.4.0`. Publish the `v0.5.0` multi-architecture GHCR images and root wheel, back up MariaDB and PostgreSQL, then replace API and worker together; publishing artifacts alone does not deploy them. SDK `0.2.1`, plugins and sandbox keep independent versions. Fake-provider and isolated local evidence do not prove vendor invoices, production media models or the Afterglow pricing UI.
+
+## 0.4.0
 
 Changes since `v0.3.1`:
 

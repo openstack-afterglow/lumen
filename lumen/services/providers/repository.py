@@ -35,7 +35,7 @@ from .pricing import (
     _to_decimal,
     _validate_cache_prices,
     _validate_price_pair,
-    media_pricing_available,
+    model_media_pricing_available,
     validate_media_pricing,
 )
 from .routing import _lock_mutable_route, _require_db
@@ -52,9 +52,20 @@ def _validate_model_kind(provider: LlmProvider, kind: str) -> None:
 
 
 def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: tuple) -> dict | None:
-    if kind != "text" and any(value is not None for value in token_prices):
-        raise ProviderValidationError("media 모델에는 text token 가격을 설정할 수 없습니다")
+    """Media models may carry text input/output/cache-read rates for a token basis, never cache writes."""
+    if kind != "text" and any(value is not None for value in token_prices[3:]):
+        raise ProviderValidationError("media 모델에는 cache write 가격을 설정할 수 없습니다")
     return validate_media_pricing(kind, media_pricing)
+
+
+def _validate_text_prices(kind: str, input_price_per_million, output_price_per_million):
+    """Text keeps its paired input/output rule; media prices only its applicable directions."""
+    if kind == "text":
+        return _validate_price_pair(input_price_per_million, output_price_per_million)
+    return (
+        _per_token_price(input_price_per_million, "input_price_per_million"),
+        _per_token_price(output_price_per_million, "output_price_per_million"),
+    )
 
 
 
@@ -302,7 +313,7 @@ async def create_model(
         input_price_per_million, output_price_per_million, cache_read_price_per_million,
         cache_write_price_per_million, cache_write_1h_price_per_million,
     ))
-    input_price, output_price = _validate_price_pair(input_price_per_million, output_price_per_million)
+    input_price, output_price = _validate_text_prices(model_kind, input_price_per_million, output_price_per_million)
     # Cache rates are optional and independent of each other and of the input/output pair.
     cache_prices = _validate_cache_prices(
         {
@@ -353,7 +364,11 @@ async def create_model(
                 input_price=input_price,
                 output_price=output_price,
                 **cache_prices,
-                price_source="manual" if input_price is not None or media_pricing else None,
+                price_source=(
+                    ("manual" if media_pricing else None)
+                    if model_kind != "text"
+                    else "manual" if input_price is not None else None
+                ),
                 capabilities=(capabilities or None),
                 capability_source=("override" if capabilities else None),
                 is_active=is_active,
@@ -389,9 +404,10 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
             public_models: list[dict] = []
             for model, provider in rows:
                 if getattr(model, "model_kind", "text") != "text":
-                    effective_input = effective_output = None
+                    effective_input = _per_million_price(model.input_price)
+                    effective_output = _per_million_price(model.output_price)
                     effective_source = (
-                        "manual" if media_pricing_available(model.model_kind, model.media_pricing) else "unpriced"
+                        "manual" if model_media_pricing_available(model) else "unpriced"
                     )
                 else:
                     stored_input = _per_million_price(model.input_price)
@@ -438,8 +454,6 @@ async def update_model(model_id: int, patch: dict) -> dict:
     factory = _require_db()
     has_input_price = "input_price_per_million" in patch
     has_output_price = "output_price_per_million" in patch
-    if has_input_price != has_output_price:
-        raise ProviderValidationError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
     # Present key → set (null clears); absent key → unchanged.
     cache_prices = _validate_cache_prices(patch)
     try:
@@ -476,11 +490,13 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 )),
             )
             media_pricing = _validate_kind_prices(target_kind, media_pricing, token_prices)
+            if target_kind == "text" and (
+                has_input_price != has_output_price or (token_prices[0] is None) != (token_prices[1] is None)
+            ):
+                raise ProviderValidationError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
             if target_kind != getattr(row, "model_kind", "text"):
                 if row.is_title_model or row.is_memory_model:
                     raise ProviderValidationError("title/memory 모델은 text 종류만 허용합니다")
-                if target_kind == "text" and media_pricing is not None:
-                    raise ProviderValidationError("text 모델에는 media_pricing을 설정할 수 없습니다")
                 row.model_kind = target_kind
                 row.models_dev_model_id = None
                 row.price_metadata = None
@@ -512,14 +528,15 @@ async def update_model(model_id: int, patch: dict) -> dict:
                     row.model_name = canonical_name
             if "display_name" in patch:
                 row.display_name = patch["display_name"] or None
-            if has_input_price:
-                input_price, output_price = _validate_price_pair(
-                    patch["input_price_per_million"], patch["output_price_per_million"]
-                )
-                row.input_price = input_price
-                row.output_price = output_price
-                row.price_source = "manual" if input_price is not None else None
-                row.price_metadata = None
+            if has_input_price or has_output_price:
+                input_price, output_price = _validate_text_prices(target_kind, token_prices[0], token_prices[1])
+                if has_input_price:
+                    row.input_price = input_price
+                if has_output_price:
+                    row.output_price = output_price
+                if target_kind == "text":
+                    row.price_source = "manual" if input_price is not None else None
+                    row.price_metadata = None
             for column, price in cache_prices.items():
                 setattr(row, column, price)
             if "capabilities" in patch:

@@ -19,8 +19,10 @@ from pydantic import BaseModel
 from lumen.cache import close_cache
 from lumen.config import get_settings
 from lumen.db import close_db, init_db
+from lumen.logging_config import configure_logging
 from lumen.plugins.host import build_host
 from lumen.plugins.registry import get_registry
+from lumen.request_logging import RequestLoggingMiddleware
 from lumen.services.infrastructure.api_load import ApiLoadMeter, ApiLoadMiddleware
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,7 @@ class HealthResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging("api")
     settings = get_settings()
     registry = get_registry()
     # Approved distributions/versions are checked before any entry point is imported;
@@ -81,6 +84,14 @@ async def lifespan(app: FastAPI):
 
         await setup_semantic_memory()
 
+    logger.info("api ready")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "api state database_configured=%s checkpointer_configured=%s semantic_memory_enabled=%s",
+            bool(settings.database_url), bool(settings.chat_checkpointer_postgres_url),
+            settings.chat_semantic_memory_enabled,
+        )
+
     yield
 
     try:
@@ -92,9 +103,10 @@ async def lifespan(app: FastAPI):
     try:
         await registry.close()
     except Exception:
-        logger.exception("plugin shutdown failed")
+        logger.error("plugin shutdown failed")
     await close_cache()
     await close_db()
+    logger.info("api stopped")
 
 
 app = FastAPI(
@@ -116,6 +128,7 @@ if origins:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+app.add_middleware(RequestLoggingMiddleware)
 
 
 @app.exception_handler(RequestValidationError)
@@ -476,8 +489,10 @@ app.openapi = custom_openapi
 
 def run() -> None:
     import uvicorn
+    configure_logging("api")
 
-    uvicorn.run("lumen.main:app", host="0.0.0.0", port=8012, reload=False)
+    uvicorn.run("lumen.main:app", host="0.0.0.0", port=8012, reload=False,
+                log_config=None, access_log=False)
 
 
 if __name__ == "__main__":

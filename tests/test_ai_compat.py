@@ -388,6 +388,35 @@ def _core(monkeypatch):
 
 
 class TestOpenAIEndpoint:
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_priced_media_without_metering_returns_http_422_before_provider_io(self, client, _auth, monkeypatch, stream):
+        async def resolve(model, **kwargs):
+            return {
+                "model_name": model, "api_model_name": model, "provider_type": "anthropic",
+                "media_pricing": {"token_rates": {"image": {"input_per_million": "10"}}},
+            }
+
+        async def precheck(*args, **kwargs):
+            return None
+
+        async def forbidden(*args, **kwargs):
+            pytest.fail("rejected media reached provider or ledger")
+
+        monkeypatch.setattr(core, "resolve_api", resolve)
+        monkeypatch.setattr(core, "precheck", precheck)
+        monkeypatch.setattr(core.litellm_client, "acompletion", forbidden)
+        monkeypatch.setattr(core.litellm_client, "acompletion_stream", forbidden)
+        monkeypatch.setattr(core.credit, "apply_usage", forbidden)
+        response = await client.post("/v1/chat/completions", headers=_H, json={
+            "model": "saved-model", "stream": stream,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://asset.example/image"}},
+            ]}],
+        })
+        assert response.status_code == 422
+        assert response.headers["content-type"].startswith("application/json")
+        assert "modality_usage_unavailable" in response.json()["error"]["message"]
+
     async def test_requires_api_key(self, client):
         resp = await client.post(
             "/v1/chat/completions", json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}

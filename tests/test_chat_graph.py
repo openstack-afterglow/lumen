@@ -89,6 +89,79 @@ async def _aiter(chunks):
         yield c
 
 
+@pytest.mark.parametrize("replay", [False, True])
+async def test_modality_call_requires_split_only_while_actual_media_is_present(monkeypatch, replay):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from lumen.services.durable_runs.execution import _DurableExecutionHooks
+
+    image_messages = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}]}]
+    rates = {"image": {"input_per_million": "100000", "output_per_million": "100000"}}
+    calls = []
+    rounds = [
+        [_ChunkTC(_DeltaTC(tool_calls=[_ToolCallDelta(0, "call_1", "list_my_conversations", "{}")])),
+         _ChunkTC(_DeltaTC(), usage={"prompt_tokens": 10, "completion_tokens": 1,
+                                   "modality_tokens": {"image": {"input_tokens": 10, "output_tokens": 0,
+                                                                  "cache_read_input_tokens": 0}}})],
+        [_ChunkTC(_DeltaTC(content="done"), usage={"prompt_tokens": 10, "completion_tokens": 1})],
+    ]
+    async def fake_stream(**kwargs):
+        calls.append(kwargs["messages"])
+        return _aiter(rounds[len(calls) - 1])
+    async def fake_execute(*_args):
+        return contracts.ToolExecutionResult("result")
+    class Hooks:
+        completed = []
+        async def prepare_context(self, *, messages, round_index, **_kwargs):
+            return messages if round_index == 0 else [{"role": "user", "content": "summary without media"}]
+        async def provider_started(self, *, round_index, **_kwargs):
+            if replay and round_index == 0:
+                return {"text": "", "tool_calls": [{"id": "call_1", "name": "list_my_conversations", "args": {}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 1, "required_token_modalities": ["image_input"],
+                                  "modality_tokens": {"image": {"input_tokens": 10, "output_tokens": 0,
+                                                                 "cache_read_input_tokens": 0}}}}
+        async def provider_completed(self, **kwargs):
+            self.completed.append(kwargs["usage"])
+    if replay:
+        rounds.pop(0)
+    monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+    monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
+    hooks = Hooks()
+    events = [event async for event in graph.stream(model="model", messages=image_messages,
+        project_id="p1", user_id="u1", execution_hooks=hooks, token_rates=rates)]
+    assert hooks.completed[-1]["required_token_modalities"] == []
+    assert calls[-1] == [{"role": "user", "content": "summary without media"}]
+    aggregate = next(event["usage"] for event in events if event["type"] == "usage")
+    run = SimpleNamespace(pricing_snapshot={"input_price_per_token": "0.001", "output_price_per_token": "0.002",
+        "margin_multiplier": "1", "chat_credit_per_usd": "1", "token_rates": rates,
+        "required_token_modalities": ["image_input"]})
+    assert _DurableExecutionHooks(run_id="root", owner="worker")._actual_credit(
+        run, "chat_completions", aggregate, None) == Decimal("1.014")
+
+
+@pytest.mark.parametrize("replay", [False, True])
+async def test_actual_priced_image_without_split_is_not_completed_or_replayed(monkeypatch, replay):
+    completed = []
+    class Hooks:
+        async def provider_started(self, **_kwargs):
+            if replay:
+                return {"text": "answer", "tool_calls": [], "usage": {
+                    "prompt_tokens": 10, "completion_tokens": 1, "required_token_modalities": ["image_input"]}}
+        async def provider_completed(self, **kwargs):
+            completed.append(kwargs)
+    async def fake_stream(**_kwargs):
+        return _aiter([_Chunk("answer", usage={"prompt_tokens": 10, "completion_tokens": 1})])
+    monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+    with pytest.raises(ValueError, match="image_input"):
+        async for _event in graph.stream(model="model", project_id="p1", user_id="u1", execution_hooks=Hooks(),
+            token_rates={"image": {"input_per_million": "100000"}},
+            messages=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "image"}}]}]):
+            pass
+    assert completed == []
+
+
+
 class TestGraphStream:
     async def test_emits_tokens_then_usage(self, monkeypatch):
         chunks = [
@@ -557,9 +630,7 @@ class TestGraphStream:
         assert captured.get("reasoning_effort") == "high"
 
     @pytest.mark.parametrize("probe_raises", [False, True])
-    async def test_explicit_none_survives_stale_probe_and_installed_openai_mapper(self, monkeypatch, probe_raises):
-        from litellm.utils import get_optional_params
-
+    async def test_direct_openai_explicit_none_uses_responses_and_reports_usage(self, monkeypatch, probe_raises):
         provider_calls = []
 
         def supports_reasoning(**_kwargs):
@@ -567,33 +638,139 @@ class TestGraphStream:
                 raise RuntimeError("catalogue unavailable")
             return False
 
-        async def provider_completion(**kwargs):
-            # Exercise the installed whitelist/mapper, not merely the wrapper kwargs.
-            provider_calls.append(
-                get_optional_params(
-                    model=kwargs["model"],
-                    custom_llm_provider=kwargs["custom_llm_provider"],
-                    reasoning_effort=kwargs.get("reasoning_effort"),
-                    allowed_openai_params=kwargs.get("allowed_openai_params"),
-                    drop_params=True,
-                )
+        async def provider_post(_sender, *, url, headers, **kwargs):
+            provider_calls.append((url, kwargs["json"]))
+            response = {
+                "id": "resp_test", "object": "response", "created_at": 1, "status": "completed",
+                "model": "new-reasoning-model", "output": [{
+                    "id": "msg_1", "type": "message", "status": "completed", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "답변", "annotations": []}],
+                }],
+                "usage": {"input_tokens": 7, "output_tokens": 2, "total_tokens": 9},
+                "error": None, "incomplete_details": None, "instructions": None, "metadata": {},
+            }
+            events = [
+                {"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0,
+                 "content_index": 0, "delta": "답변"},
+                {"type": "response.completed", "response": response},
+            ]
+            data = "".join(f"event: {ev['type']}\ndata: {json.dumps(ev)}\n\n" for ev in events)
+            return httpx.Response(
+                200, request=httpx.Request("POST", url), headers={"content-type": "text/event-stream"},
+                content=(data + "data: [DONE]\n\n").encode(),
             )
-            return _aiter([_Chunk("답변"), _Chunk(None, usage={"prompt_tokens": 1, "completion_tokens": 1})])
 
         monkeypatch.setattr("litellm.supports_reasoning", supports_reasoning)
-        monkeypatch.setattr("litellm.drop_params", False)
-        monkeypatch.setattr("litellm.acompletion", provider_completion)
+        monkeypatch.setattr(
+            "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+            lambda **_kwargs: type("Sender", (), {"post": provider_post})(),
+        )
         events = [
-            event
-            async for event in graph.stream(
+            event async for event in graph.stream(
                 model="new-reasoning-model", messages=_MSGS, project_id="p1", user_id="u1",
-                custom_llm_provider="openai", reasoning_effort="none",
+                custom_llm_provider="openai", api_key="test-key", reasoning_effort="none",
                 reasoning_can_be_disabled=True, reasoning_route_key="new-route-v1",
             )
         ]
+        assert len(provider_calls) == 1
+        assert provider_calls[0][0] == "https://api.openai.com/v1/responses"
+        assert provider_calls[0][1]["reasoning"] == {"effort": "none"}
+        assert provider_calls[0][1]["stream"] is True
+        assert "".join(e["text"] for e in events if e["type"] == "token") == "답변"
+        assert [e for e in events if e["type"] == "usage"][-1]["usage"] == {
+            "prompt_tokens": 7, "completion_tokens": 2, **_NO_CACHE,
+        }
 
-        assert [call.get("reasoning_effort") for call in provider_calls] == ["none"]
-        assert any(event["type"] == "token" for event in events)
+    async def test_direct_openai_truncated_responses_stream_fails_without_committing_usage(self, monkeypatch):
+        class Sender:
+            async def post(self, *, url, headers, **kwargs):
+                assert url == "https://api.openai.com/v1/responses"
+                assert kwargs["json"]["stream"] is True
+                event = {"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0,
+                         "content_index": 0, "delta": "부분"}
+                return httpx.Response(
+                    200, request=httpx.Request("POST", url), headers={"content-type": "text/event-stream"},
+                    content=f"event: response.output_text.delta\ndata: {json.dumps(event)}\n\n".encode(),
+                )
+
+        monkeypatch.setattr(
+            "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+            lambda **_kwargs: Sender(),
+        )
+        events = [event async for event in graph.stream(
+            model="gpt-4.1-mini", messages=_MSGS, project_id="p1", user_id="u1",
+            custom_llm_provider="openai", api_key="test-key",
+        )]
+        assert any(event["type"] == "error" for event in events), events
+        assert not any(event["type"] == "usage" for event in events)
+
+    async def test_direct_openai_responses_tool_result_continues_into_second_round(self, monkeypatch):
+        requests = []
+
+        async def fake_schemas(_ctx):
+            return [{"type": "function", "function": {
+                "name": "list_my_conversations", "description": "List owned conversations",
+                "parameters": {"type": "object", "properties": {}},
+            }}]
+
+        async def fake_execute(name, args, ctx):
+            assert name == "list_my_conversations" and ctx.project_id == "p1"
+            return contracts.ToolExecutionResult("대화 3개")
+
+        class Sender:
+            async def post(self, *, url, headers, **kwargs):
+                assert url == "https://api.openai.com/v1/responses"
+                body = kwargs["json"]
+                requests.append(body)
+                second = len(requests) == 2
+                item = (
+                    {"id": "msg_2", "type": "message", "status": "completed", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "대화는 3개입니다", "annotations": []}]}
+                    if second else
+                    {"id": "fc_1", "type": "function_call", "status": "completed",
+                     "call_id": "call_Qx7Lm2", "name": "list_my_conversations", "arguments": "{}"}
+                )
+                response = {
+                    "id": f"resp_{len(requests)}", "object": "response", "created_at": 1,
+                    "status": "completed", "model": "gpt-4.1-mini", "output": [item],
+                    "usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13},
+                    "error": None, "incomplete_details": None, "instructions": None, "metadata": {},
+                }
+                stream_events = (
+                    [{"type": "response.output_text.delta", "item_id": "msg_2", "output_index": 0,
+                      "content_index": 0, "delta": "대화는 3개입니다"}]
+                    if second else [
+                        {"type": "response.output_item.added", "output_index": 0,
+                         "item": {**item, "status": "in_progress", "arguments": ""}},
+                        {"type": "response.function_call_arguments.delta", "item_id": "fc_1",
+                         "output_index": 0, "delta": "{}"},
+                    ]
+                )
+                stream_events.append({"type": "response.completed", "response": response})
+                data = "".join(f"event: {ev['type']}\ndata: {json.dumps(ev)}\n\n" for ev in stream_events)
+                return httpx.Response(
+                    200, request=httpx.Request("POST", url), headers={"content-type": "text/event-stream"},
+                    content=(data + "data: [DONE]\n\n").encode(),
+                )
+
+        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
+        monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
+        monkeypatch.setattr(
+            "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+            lambda **_kwargs: Sender(),
+        )
+        events = [event async for event in graph.stream(
+            model="gpt-4.1-mini", messages=_MSGS, project_id="p1", user_id="u1",
+            custom_llm_provider="openai", api_key="test-key",
+        )]
+        assert len(requests) == 2, events
+        assert requests[0]["tools"][0]["name"] == "list_my_conversations"
+        assert {item["type"] for item in requests[1]["input"]} >= {"function_call", "function_call_output"}
+        assert all(item.get("call_id") == "call_Qx7Lm2" for item in requests[1]["input"] if item["type"].startswith("function_call"))
+        assert "".join(e["text"] for e in events if e["type"] == "token") == "대화는 3개입니다"
+        assert [e for e in events if e["type"] == "usage"][-1]["usage"] == {
+            "prompt_tokens": 20, "completion_tokens": 6, **_NO_CACHE,
+        }
 
     async def test_tool_reasoning_conflict_retries_with_explicit_none(self, monkeypatch):
         model = "gpt-tool-reasoning-conflict"
@@ -655,6 +832,7 @@ class TestGraphStream:
 
         monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(litellm_client, "direct_openai_stream_completed", lambda _stream: True)
 
         events = [
             ev
@@ -699,6 +877,7 @@ class TestGraphStream:
 
         monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(litellm_client, "direct_openai_stream_completed", lambda _stream: True)
 
         events = [
             ev
@@ -748,6 +927,7 @@ class TestGraphStream:
 
         monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(litellm_client, "direct_openai_stream_completed", lambda _stream: True)
 
         async def run_once(route_key="route-a-v1"):
             return [
@@ -1032,14 +1212,17 @@ class TestGraphStream:
         assert [call.get("reasoning_effort") for call in calls] == ["none"]
         assert any(event["type"] == "error" for event in events)
 
-    async def test_error_on_start_failure(self, monkeypatch):
+    async def test_error_on_start_failure(self, monkeypatch, caplog):
         async def fake_fail(**kwargs):
-            raise RuntimeError("boom")
+            raise RuntimeError("secret-provider-response-body")
 
         monkeypatch.setattr(litellm_client, "acompletion_stream", fake_fail)
         events = [ev async for ev in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
         assert any(e["type"] == "error" for e in events)
         assert not any(e["type"] == "token" for e in events)
+        assert "secret-provider-response-body" not in caplog.text
+        assert "secret-provider-response-body" not in str(events)
+        assert "error_type=RuntimeError" in caplog.text
 
     async def test_indeterminate_provider_boundary_never_retries(self, monkeypatch):
         calls = 0

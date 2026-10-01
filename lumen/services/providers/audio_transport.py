@@ -1,8 +1,7 @@
-"""Bounded direct OpenAI/Gemini speech with exact Lumen product-unit pricing.
+"""Bounded direct speech with explicit frozen duration, character or token billing.
 
-Configured USD/second is the customer's frozen media-duration rate. It is not
-a claim that the provider invoices in the same unit (some invoice tokens or
-characters). Unsupported models, formats and missing prices fail before I/O.
+Absent billing_basis retains legacy duration billing. Provider token usage is
+canonicalized once and returned alongside output for durable settlement.
 """
 
 from __future__ import annotations
@@ -10,21 +9,43 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 
 import httpx
 
+from lumen.services.usage_breakdown import UsageBreakdown
+
 from .errors import ProviderValidationError
-from .pricing import exact_media_price
+from .pricing import (
+    exact_duration_price,
+    exact_media_price,
+    media_billing_basis,
+    media_reservation_usd,
+    route_media_pricing_available,
+)
 
 _MAX_INPUT_BYTES = 24_000_000  # Multipart overhead stays below OpenAI's 25 MB upload limit.
 _MAX_GEMINI_INLINE_BYTES = 14 * 1024 * 1024  # Base64 JSON request stays below 20 MB.
 _MAX_OUTPUT_BYTES = 10 * 1024 * 1024
 _MAX_TEXT_CHARS = 4096
 _MAX_TRANSCRIPT_BYTES = 256 * 1024
+# verbose_json carries per-segment token ids and decoder statistics that Lumen
+# discards; the response bound covers them while kept text stays bounded below.
+_MAX_VERBOSE_TRANSCRIPT_BYTES = 4 * 1024 * 1024
+_MAX_TRANSCRIPT_SEGMENTS = 4096
+_MAX_SEGMENT_TEXT_CHARS = 65536
+# Durable STT sources are at most 30 minutes; provider timing beyond that is invalid.
+_MAX_SEGMENT_SECONDS = 30 * 60
 _MAX_INLINE_JSON_BYTES = (_MAX_OUTPUT_BYTES * 4 // 3) + 65536
 _TIMEOUT = httpx.Timeout(120.0, connect=10.0, read=120.0, write=30.0, pool=10.0)
 _OPENAI_STT_MODELS = frozenset({"whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"})
+# Only whisper-1 offers verbose_json with timestamp_granularities on the
+# direct OpenAI transcription endpoint; no other route advertises timing.
+_OPENAI_TIMED_STT_MODELS = frozenset({"whisper-1"})
+_TIMESTAMP_GRANULARITIES = ("segment",)
 _OPENAI_TTS_MODELS = frozenset({"tts-1", "tts-1-hd", "gpt-4o-mini-tts"})
 _GEMINI_STT_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-pro", "gemini-3-flash-preview"})
 _GEMINI_TTS_MODELS = frozenset({"gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts", "gemini-3.8-flash-tts"})
@@ -51,6 +72,31 @@ class AudioTransportError(RuntimeError):
     """The direct provider failed or produced an invalid bounded result."""
 
 
+@dataclass(frozen=True)
+class SpeechResult:
+    data: bytes
+    mime_type: str
+    usage: UsageBreakdown | None = None
+
+
+@dataclass(frozen=True)
+class TranscriptSegment:
+    """Provider-reported segment bounds in seconds; never estimated by Lumen."""
+
+    start: float
+    end: float
+    text: str
+
+
+@dataclass(frozen=True)
+class TranscriptionResult:
+    text: str
+    usage: UsageBreakdown | None = None
+    # None: timing was not requested. A tuple (possibly empty) is the complete
+    # validated provider segment list for an explicitly timed request.
+    segments: tuple[TranscriptSegment, ...] | None = None
+
+
 def _model(route: dict, kind: str) -> tuple[str, str]:
     if not isinstance(route, dict) or route.get("model_kind") != kind or route.get("provider_auth") is not None:
         raise ProviderValidationError("audio route is not directly executable")
@@ -71,34 +117,61 @@ def _model(route: dict, kind: str) -> tuple[str, str]:
     return provider, model
 
 
-def validate_audio_request(route: dict, *, kind: str, format: str | None = None) -> Decimal:
-    """Resolve the route's exact configured Lumen USD/second rate before I/O."""
+def normalize_timestamp_granularities(value: object) -> tuple[str, ...]:
+    """Normalize an optional unique granularity list; omitted and empty mean untimed."""
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or len(value) > len(_TIMESTAMP_GRANULARITIES) or any(
+            not isinstance(item, str) or item not in _TIMESTAMP_GRANULARITIES for item in value) or len(set(value)) != len(value):
+        raise ProviderValidationError("invalid transcription timestamp granularities")
+    return tuple(value)
+
+
+def available_timestamp_granularities(route: dict) -> list[str]:
+    """Expose timing only for a directly executable route that returns provider segments."""
+    try:
+        validate_audio_request(route, kind="stt", timestamp_granularities=_TIMESTAMP_GRANULARITIES)
+    except ProviderValidationError:
+        return []
+    return list(_TIMESTAMP_GRANULARITIES)
+
+
+def validate_audio_request(route: dict, *, kind: str, format: str | None = None,
+                           timestamp_granularities: Sequence[str] | None = None) -> Decimal:
+    """Validate before I/O; return duration USD/second, USD/character or token envelope."""
     if not isinstance(kind, str) or kind not in ("stt", "tts"):
         raise ProviderValidationError("unsupported audio operation")
-    provider, _ = _model(route, kind)
+    provider, model = _model(route, kind)
     if kind == "tts":
         if not isinstance(format, str) or format not in _OUTPUT_FORMATS or (provider == "gemini" and format != "wav"):
             raise ProviderValidationError("unsupported speech output format")
-        field = "audio_output_per_second"
     else:
         if format is not None and (not isinstance(format, str) or format not in _INPUT_FORMATS):
             raise ProviderValidationError("unsupported audio input format")
-        field = "audio_input_per_second"
+    if normalize_timestamp_granularities(timestamp_granularities) and (
+            kind != "stt" or provider != "openai" or model not in _OPENAI_TIMED_STT_MODELS):
+        raise ProviderValidationError("transcription timestamps are unsupported for this audio model")
     pricing = route.get("media_pricing")
-    rate = exact_media_price(pricing, field)
-    # Legacy registry entries are accepted only where their unit converts
-    # exactly to the product second. Never silently choose conflicting prices.
-    legacy_field = "audio_per_second" if kind == "tts" else "audio_per_minute"
-    legacy = exact_media_price(pricing, legacy_field)
-    if legacy is not None:
-        legacy = legacy if kind == "tts" else legacy / 60
-    if rate is not None and legacy is not None and rate != legacy:
-        raise ProviderValidationError("conflicting audio duration prices")
-    seconds = rate if rate is not None else legacy
-    if (seconds is None or seconds <= 0 or seconds >= Decimal("100000000")
-            or seconds != seconds.quantize(Decimal("0.0000000001"))):
+    basis = media_billing_basis(kind, pricing)
+    if basis == "tokens":
+        if provider == "openai" and (kind == "tts" or model == "whisper-1"):
+            raise ProviderValidationError("audio provider cannot report token usage for this model")
+        envelope = media_reservation_usd(pricing)
+        if envelope is None or not envelope.is_finite() or envelope <= 0:
+            raise ProviderValidationError("audio token reservation is unavailable")
+        if not route_media_pricing_available(route):
+            raise ProviderValidationError("audio token prices are unavailable")
+        return envelope
+    if basis == "characters" and kind != "tts":
+        raise ProviderValidationError("character billing is available only for speech")
+    if basis == "characters":
+        rate = exact_media_price(pricing, "audio_per_character")
+    else:
+        duration = exact_duration_price(pricing, "audio_output" if kind == "tts" else "audio_input")
+        rate = duration[0] / duration[1] if duration is not None else None
+    if rate is None or rate <= 0 or rate >= Decimal("100000000"):
         raise ProviderValidationError("exact configured audio price is unavailable")
-    return seconds
+    return rate
 
 
 def audio_route_ready(route: dict) -> bool:
@@ -301,7 +374,7 @@ def _gemini_output(result: dict, content_type: str) -> dict:
     return contents[0]
 
 
-async def generate_speech(route: dict, *, text: str, voice: str, format: str = "mp3") -> tuple[bytes, str]:
+async def generate_speech(route: dict, *, text: str, voice: str, format: str = "mp3") -> SpeechResult:
     """Generate one bounded, signature-validated speech result on a priced route."""
     validate_audio_request(route, kind="tts", format=format)
     provider, model = _model(route, "tts")
@@ -315,7 +388,8 @@ async def generate_speech(route: dict, *, text: str, voice: str, format: str = "
             headers={"Authorization": f"Bearer {route['api_key']}"}, max_bytes=_MAX_OUTPUT_BYTES,
             json_body={"model": model, "input": text, "voice": voice, "response_format": format},
         )
-        return _output_audio(result, format)
+        data, mime = _output_audio(result, format)
+        return SpeechResult(data, mime)
     result = _json(await _post(
         "https://generativelanguage.googleapis.com/v1beta/interactions",
         headers={"x-goog-api-key": route["api_key"]}, max_bytes=_MAX_INLINE_JSON_BYTES,
@@ -326,13 +400,49 @@ async def generate_speech(route: dict, *, text: str, voice: str, format: str = "
         },
     ))
     audio = _gemini_output(result, "audio")
-    return _decode_audio(audio.get("data"), format, audio.get("mime_type"))
+    data, mime = _decode_audio(audio.get("data"), format, audio.get("mime_type"))
+    return SpeechResult(data, mime, UsageBreakdown.from_gemini_interactions(result.get("usage")))
+
+
+def _segment_seconds(value: object) -> float | None:
+    # bool is an int subclass and must not become a timestamp.
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= _MAX_SEGMENT_SECONDS:
+        return None
+    return float(value)
+
+
+def _transcript_segments(value: object, text: object) -> tuple[TranscriptSegment, ...]:
+    """Keep only provider start/end/text; reject instead of repairing or inferring timing."""
+    if not isinstance(value, list) or len(value) > _MAX_TRANSCRIPT_SEGMENTS:
+        raise AudioTransportError("audio provider returned invalid transcription segments")
+    # Requested timing never silently degrades to untimed speech; only silence
+    # (empty text) may legitimately have no segments.
+    if not value and isinstance(text, str) and text.strip():
+        raise AudioTransportError("audio provider returned invalid transcription segments")
+    segments: list[TranscriptSegment] = []
+    text_chars = 0
+    previous_end = 0.0
+    for item in value:
+        if not isinstance(item, dict):
+            raise AudioTransportError("audio provider returned invalid transcription segments")
+        start, end, segment_text = _segment_seconds(item.get("start")), _segment_seconds(item.get("end")), item.get("text")
+        # Chronological and non-overlapping: each range starts at or after the previous end.
+        if start is None or end is None or not isinstance(segment_text, str) or end < start or start < previous_end:
+            raise AudioTransportError("audio provider returned invalid transcription segments")
+        text_chars += len(segment_text)
+        if text_chars > _MAX_SEGMENT_TEXT_CHARS:
+            raise AudioTransportError("audio provider returned invalid transcription segments")
+        segments.append(TranscriptSegment(start, end, segment_text))
+        previous_end = end
+    return tuple(segments)
 
 
 async def transcribe_audio(route: dict, *, data: bytes, mime_type: str,
-                           language: str | None = None, prompt: str | None = None) -> str:
-    """Transcribe bounded inline audio with a real, configured duration rate."""
-    validate_audio_request(route, kind="stt", format=mime_type)
+                           language: str | None = None, prompt: str | None = None,
+                           timestamp_granularities: Sequence[str] | None = None) -> TranscriptionResult:
+    """Transcribe bounded inline audio and retain actual canonical provider usage."""
+    validate_audio_request(route, kind="stt", format=mime_type, timestamp_granularities=timestamp_granularities)
+    granularities = normalize_timestamp_granularities(timestamp_granularities)
     provider, model = _model(route, "stt")
     extension = _source_audio(data, mime_type)
     if provider == "gemini" and len(data) > _MAX_GEMINI_INLINE_BYTES:
@@ -341,18 +451,25 @@ async def transcribe_audio(route: dict, *, data: bytes, mime_type: str,
         raise ProviderValidationError("invalid transcription language")
     if prompt is not None and (not isinstance(prompt, str) or len(prompt) > _MAX_TEXT_CHARS):
         raise ProviderValidationError("invalid transcription prompt")
+    segments = None
     if provider == "openai":
-        form = {"model": model, "response_format": "json"}
+        form: dict = {"model": model, "response_format": "verbose_json" if granularities else "json"}
+        if granularities:
+            form["timestamp_granularities[]"] = list(granularities)
         if language:
             form["language"] = language
         if prompt:
             form["prompt"] = prompt
         result = _json(await _post(
             "https://api.openai.com/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {route['api_key']}"}, max_bytes=_MAX_TRANSCRIPT_BYTES,
+            headers={"Authorization": f"Bearer {route['api_key']}"},
+            max_bytes=_MAX_VERBOSE_TRANSCRIPT_BYTES if granularities else _MAX_TRANSCRIPT_BYTES,
             form=form, files={"file": (f"audio.{extension}", data, mime_type)},
         ))
         text = result.get("text")
+        usage = UsageBreakdown.from_openai_media(result.get("usage"))
+        if granularities:
+            segments = _transcript_segments(result.get("segments"), text)
     else:
         instruction = "Generate a transcript of the speech."
         if language:
@@ -368,6 +485,7 @@ async def transcribe_audio(route: dict, *, data: bytes, mime_type: str,
             ], "store": False},
         ))
         text = _gemini_output(result, "text").get("text")
+        usage = UsageBreakdown.from_gemini_interactions(result.get("usage"))
     if not isinstance(text, str) or len(text.encode("utf-8")) > _MAX_TRANSCRIPT_BYTES:
         raise AudioTransportError("audio provider returned invalid transcription text")
-    return text
+    return TranscriptionResult(text, usage, segments)

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -424,6 +425,8 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
         assistant_message_id=None,
         capability_snapshot={},
         pricing_snapshot={
+            "input_price_per_token": "0",
+            "output_price_per_token": "0",
             "component_prices": {},
             "margin_multiplier": "1",
             "chat_credit_per_usd": "1",
@@ -469,13 +472,6 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
     async def finish(_run_id, **kwargs):
         finished.append(kwargs)
 
-    def usage_cost(*_args, **_kwargs):
-        return SimpleNamespace(
-            raw_cost=Decimal("0"),
-            input_cost=Decimal("0"),
-            output_cost=Decimal("0"),
-            pricing_snapshot={},
-        )
 
     async def no_cancel(_run_id):
         return False
@@ -504,7 +500,6 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
     monkeypatch.setattr(execution, "_cancel_requested", no_cancel)
     monkeypatch.setattr(execution, "_renew_lease", lambda *_args, **_kwargs: _return(True))
     monkeypatch.setattr(execution.credit, "precheck", lambda *_args, **_kwargs: _return(None))
-    monkeypatch.setattr(execution.credit, "usage_cost_from_pricing_snapshot", usage_cost)
     monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
 
     assert await execution.execute_queued_run("run-1", owner="worker-1") is True
@@ -601,7 +596,7 @@ async def test_worker_passes_frozen_reasoning_disable_capability_to_engine(monke
 
 
 async def test_summary_compactor_fences_map_and_reduce_segments_and_records_usage(monkeypatch):
-    run = SimpleNamespace(id="run-1", user_id="user-1", project_id="project-1", api_key_id=None)
+    run = SimpleNamespace(id="run-1", user_id="user-1", project_id="project-1", api_key_id=None, pricing_snapshot={})
 
     class _Result:
         def scalar_one(self):
@@ -765,11 +760,6 @@ async def test_summary_usage_keeps_the_originating_run_association(monkeypatch):
 
     monkeypatch.setattr(execution, "_factory", lambda: lambda: _Session())
     monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *_args: None)
-    monkeypatch.setattr(
-        execution.credit,
-        "usage_cost_from_pricing_snapshot",
-        lambda *_args, **_kwargs: SimpleNamespace(input_cost=Decimal("0.01"), output_cost=Decimal("0.02")),
-    )
     monkeypatch.setattr(execution.credit, "apply_usage_in_transaction", apply_usage)
 
     await execution._DurableExecutionHooks(run_id="run-1", owner="worker-1")._record_summary_usage(
@@ -1166,3 +1156,104 @@ async def test_interaction_response_is_owner_scoped_and_validated(client, monkey
         json={"response": {"option_ids": ["yes", "yes"], "extra": True}},
     )
     assert invalid.status_code == 422
+
+
+async def test_durable_run_terminal_logs_only_committed_state_and_validated_code(monkeypatch, caplog):
+    committed = False
+
+    async def finish_transaction(*_args, **_kwargs):
+        nonlocal committed
+        assert not [record for record in caplog.records if "run terminal" in record.getMessage()]
+        committed = True
+        return True, None
+
+    monkeypatch.setattr(execution, "_finish_transaction", finish_transaction)
+    with caplog.at_level(logging.DEBUG, logger=execution.__name__):
+        await execution._finish(
+            "run-owned-1", status="failed", message_id=None, owner="worker-1",
+            error_code="provider_failed\nBearer secret", safe_message="private upstream response",
+            usage_record={"secret field": "private upstream response"},
+        )
+
+    assert committed
+    assert any(
+        record.getMessage() == "durable chat run terminal run_id=run-owned-1 status=failed error_code=run_failed"
+        for record in caplog.records
+    )
+    assert "private upstream response" not in caplog.text
+    assert "Bearer secret" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+    caplog.clear()
+
+    async def rollback(*_args, **_kwargs):
+        raise RuntimeError("private upstream response")
+
+    monkeypatch.setattr(execution, "_finish_transaction", rollback)
+    with caplog.at_level(logging.DEBUG, logger=execution.__name__):
+        with pytest.raises(RuntimeError):
+            await execution._finish("run-owned-1", status="completed", message_id=None, owner="worker-1")
+    assert not caplog.records
+
+
+@pytest.mark.parametrize(
+    ("status", "error_code"),
+    [("completed", "none"), ("canceled", "canceled"), ("failed", "provider_result_unknown")],
+)
+async def test_durable_run_terminal_log_reflects_status_not_request_acceptance(
+    monkeypatch, caplog, status, error_code
+):
+    async def committed(*_args, **_kwargs):
+        return True, None
+
+    monkeypatch.setattr(execution, "_finish_transaction", committed)
+    with caplog.at_level(logging.INFO, logger=execution.__name__):
+        await execution._finish(
+            "run-owned-1", status=status, message_id=None, owner="worker-1",
+            error_code=None if status == "completed" else error_code,
+        )
+
+    assert any(
+        record.getMessage() == f"durable chat run terminal run_id=run-owned-1 status={status} error_code={error_code}"
+        for record in caplog.records
+    )
+    assert "202" not in caplog.text
+
+
+async def test_durable_journal_debug_log_is_post_commit_and_metadata_only(monkeypatch, caplog):
+    payload = {"secret field": "private prompt and bind value", "status": "completed"}
+    committed = False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, *_args):
+            nonlocal committed
+            if exc_type is None:
+                assert not caplog.records
+                committed = True
+
+        def begin(self):
+            return self
+
+        async def execute(self, _query):
+            return SimpleNamespace(scalar_one_or_none=lambda: SimpleNamespace(id="run-owned-1"))
+
+    async def append(_session, _run, _event):
+        return None
+
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: Session())
+    monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *_args: None)
+    monkeypatch.setattr(execution, "append_event", append)
+    monkeypatch.setattr(execution, "_event", lambda _run, _event_type, value: value)
+
+    with caplog.at_level(logging.DEBUG, logger=execution.__name__):
+        await execution._append("run-owned-1", "run.stage.changed", payload, owner="worker-1")
+
+    assert committed
+    assert [record.getMessage() for record in caplog.records] == [
+        "durable chat journal committed run_id=run-owned-1 event=run.stage.changed fields=2",
+    ]
+    assert "private prompt and bind value" not in caplog.text
+    assert "secret field" not in caplog.text

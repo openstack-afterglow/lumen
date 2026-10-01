@@ -30,8 +30,9 @@ from lumen.services import workspace_store as ws
 from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
-from lumen.services.providers.pricing import _has_component_prices
+from lumen.services.providers.pricing import _has_component_prices, frozen_token_pricing
 from lumen.services.tool_runtime import contracts
+from lumen.services.usage_breakdown import required_modalities_for_request
 
 _MAX_TOKENS_CAP = 4096
 _MAX_MESSAGE_CHARS = 32000
@@ -263,12 +264,35 @@ async def _resolve_feature_routes(features: ChatFeatureOptions) -> dict[str, dic
     return routes
 
 
+# Chat usage from these LiteLLM transports reports per-modality input counts.
+# Elsewhere a modality-priced input could only be billed at the text rate.
+_MODALITY_INPUT_REPORTING_PROVIDERS = {"gemini": frozenset({"image", "audio"})}
+
+
+def _required_token_modalities(
+    resolved: dict, token_rates: dict, *, parts: list[UserInputPart] | None
+) -> list[str]:
+    """Priced input modalities of the current turn (the only materialized media); reject unmeterable ones."""
+    required = required_modalities_for_request(
+        token_rates, messages=[{"content": [{"type": part.type} for part in parts or []]}]
+    )
+    reporting = _MODALITY_INPUT_REPORTING_PROVIDERS.get(str(resolved.get("provider_type") or ""), frozenset())
+    for item in required:
+        if item.removesuffix("_input") not in reporting:
+            raise HTTPException(
+                status_code=422,
+                detail=f"requested chat capability is not available: {item} (modality_usage_unavailable)",
+            )
+    return required
+
+
 def _run_snapshots(
     resolved: dict,
     features: dict[str, Any],
     *,
     feature_routes: dict[str, dict[str, Any]] | None = None,
     summary_route: dict[str, Any] | None = None,
+    parts: list[UserInputPart] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Persist immutable execution, summary-route, and pricing inputs for a run."""
     price_metadata = resolved.get("price_metadata")
@@ -329,20 +353,26 @@ def _run_snapshots(
         "rounding_version": "half_even_v1",
         **_cache_price_snapshot(resolved),
     }
+    try:
+        token_pricing = frozen_token_pricing(resolved)
+        summary_token_pricing = frozen_token_pricing(summary_route) if summary_route is not None else None
+        token_rates = token_pricing["token_rates"]
+    except errors.ProviderValidationError as exc:
+        raise HTTPException(status_code=422, detail="model token pricing is invalid") from exc
+    if token_rates:
+        # Frozen with the run: later model price edits never reprice it.
+        pricing_snapshot["token_rates"] = token_rates
+        pricing_snapshot["required_token_modalities"] = _required_token_modalities(
+            resolved, token_rates, parts=parts
+        )
     if summary_route is not None:
         capability_snapshot["summary_route"] = _feature_route_snapshot(summary_route, purpose="summary")
         pricing_snapshot["summary_route"] = {
-            "input_price_per_token": str(summary_route.get("input_price_per_token"))
-            if summary_route.get("input_price_per_token") is not None
-            else None,
-            "output_price_per_token": str(summary_route.get("output_price_per_token"))
-            if summary_route.get("output_price_per_token") is not None
-            else None,
+            **summary_token_pricing,
             "price_source": summary_route.get("price_source"),
             "price_version": summary_route.get("price_version"),
             "provider_name": summary_route.get("provider_name"),
             "model_name": summary_route.get("model_name"),
-            **_cache_price_snapshot(summary_route),
         }
     return capability_snapshot, pricing_snapshot
 
@@ -1163,6 +1193,7 @@ async def prepare_context_input(
         features.model_dump(mode="json", by_alias=True),
         feature_routes=feature_routes,
         summary_route=summary_route,
+        parts=parts,
     )
     capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
     if plugin_tool_snapshots or plugin_skill_snapshots:

@@ -2,7 +2,9 @@
 
 Realtime voice sessions connect directly to canonical upstream WebSocket endpoints
 using configured API keys only. Subscription auth and custom proxies are rejected.
-Configured per-minute input/output audio prices are frozen at session admission.
+The explicit billing plan (separate PCM input/output duration rates, provider-connected
+session time, or token rates plus a funding envelope) is frozen at session admission
+and re-validated before connection.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from urllib.parse import quote
 
 from .audio_transport import _GEMINI_VOICES, _OPENAI_VOICES
 from .errors import ProviderValidationError
-from .pricing import exact_media_price
+from .pricing import exact_duration_price, frozen_token_pricing, media_billing_basis, media_reservation_usd
 
 _OPENAI_REALTIME_MODELS = frozenset({
     "gpt-realtime",
@@ -31,10 +33,17 @@ _DEFAULT_MAX_DURATION_SECONDS = 300
 _MAX_DURATION_SECONDS = 900
 _MIN_DURATION_SECONDS = 10
 _MAX_INSTRUCTIONS_CHARS = 4096
+# Upstream close-handshake timeout, not additional session funding.
+CLOSE_TIMEOUT_SECONDS = 5
+_DURATION_FAMILIES = {"duration": ("realtime_input", "realtime_output"), "session": ("realtime_session",)}
 
 
 class RealtimeTransportError(RuntimeError):
     """The direct realtime provider WebSocket failed or returned invalid messages."""
+
+    def __init__(self, message: str, *, meter: object | None = None) -> None:
+        super().__init__(message)
+        self.meter = meter
 
 
 def _model(route: dict) -> tuple[str, str]:
@@ -57,14 +66,68 @@ def _model(route: dict) -> tuple[str, str]:
     return provider, model
 
 
+def _checked_rate(value: Decimal | None) -> Decimal:
+    if (
+        value is None
+        or value <= 0
+        or value >= Decimal("100000000")
+        or value != value.quantize(Decimal("0.0000000001"))
+    ):
+        raise ProviderValidationError("exact configured realtime price is unavailable")
+    return value
+
+
+def _billing_plan(route: dict) -> dict:
+    """Freeze exactly one billing basis; never mix duration, session and token rates."""
+    pricing = route.get("media_pricing")
+    try:
+        basis = media_billing_basis("realtime", pricing)
+    except (ProviderValidationError, ValueError) as exc:
+        raise ProviderValidationError("exact configured realtime price is unavailable") from exc
+    if basis in _DURATION_FAMILIES:
+        rates = {}
+        for family in _DURATION_FAMILIES[basis]:
+            try:
+                exact = exact_duration_price(pricing, family)
+            except (ProviderValidationError, ValueError) as exc:
+                raise ProviderValidationError("exact configured realtime price is unavailable") from exc
+            if exact is None:
+                raise ProviderValidationError("exact configured realtime price is unavailable")
+            rate, unit_seconds = exact
+            _checked_rate(rate)
+            if type(unit_seconds) is not int or unit_seconds not in {1, 60, 3600}:
+                raise ProviderValidationError("exact configured realtime price is unavailable")
+            rates[family] = {"rate": format(rate, "f"), "unit_seconds": unit_seconds}
+        # The requested-unit JSON is frozen verbatim; Decimal conversion happens only at settlement.
+        return {"billing_basis": basis, "media_pricing": dict(pricing), "duration_rates": rates}
+    if basis != "tokens":
+        raise ProviderValidationError("unsupported realtime billing basis")
+    try:
+        envelope = media_reservation_usd(pricing)
+        token_pricing = frozen_token_pricing(route)
+    except (ProviderValidationError, ValueError) as exc:
+        raise ProviderValidationError("exact configured realtime token price is unavailable") from exc
+    if envelope is None or envelope <= 0 or envelope >= Decimal("100000000"):
+        raise ProviderValidationError("realtime token billing requires a positive reservation_usd")
+    audio = (token_pricing.get("token_rates") or {}).get("audio") or {}
+    # Realtime needs both text and audio directions, including explicit free rates.
+    # Cache policy belongs to the shared calculator: optional modality cache uses its
+    # frozen input rate; cached text without an explicit cache rate fails settlement closed.
+    if (any(token_pricing.get(key) is None for key in (
+            "input_price_per_token", "output_price_per_token"))
+            or any(audio.get(key) is None for key in ("input_per_million", "output_per_million"))):
+        raise ProviderValidationError("exact configured realtime token price is unavailable")
+    return {"billing_basis": "tokens", "reservation_usd": format(envelope, "f"), "token_pricing": token_pricing}
+
+
 def validate_realtime_request(
     route: dict,
     *,
     voice: str | None = None,
     instructions: str | None = None,
     max_duration_seconds: int = _DEFAULT_MAX_DURATION_SECONDS,
-) -> tuple[Decimal, Decimal]:
-    """Return exact configured (input_per_minute, output_per_minute) USD rates before I/O."""
+) -> dict:
+    """Return the JSON-serializable billing plan to freeze before any provider I/O."""
     provider, _ = _model(route)
     if type(max_duration_seconds) is not int or not _MIN_DURATION_SECONDS <= max_duration_seconds <= _MAX_DURATION_SECONDS:
         raise ProviderValidationError("unsupported realtime session duration")
@@ -73,22 +136,11 @@ def validate_realtime_request(
     allowed_voices = _OPENAI_VOICES if provider == "openai" else _GEMINI_VOICES
     if voice is not None and (not isinstance(voice, str) or voice not in allowed_voices):
         raise ProviderValidationError("unsupported realtime voice")
-    pricing = route.get("media_pricing")
-    in_rate = exact_media_price(pricing, "realtime_input_per_minute")
-    out_rate = exact_media_price(pricing, "realtime_output_per_minute")
-    for rate in (in_rate, out_rate):
-        if (
-            rate is None
-            or rate <= 0
-            or rate >= Decimal("100000000")
-            or rate != rate.quantize(Decimal("0.0000000001"))
-        ):
-            raise ProviderValidationError("exact configured realtime price is unavailable")
-    return in_rate, out_rate
+    return _billing_plan(route)
 
 
 def realtime_route_ready(route: dict) -> bool:
-    """Advertise only supported direct realtime routes with both input and output rates."""
+    """Advertise only supported direct realtime routes with a complete explicit billing plan."""
     if not isinstance(route, dict):
         return False
     try:

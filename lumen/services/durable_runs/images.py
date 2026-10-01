@@ -20,13 +20,16 @@ from lumen.services import assets, credit
 from lumen.services.litellm_client import UsageCost
 from lumen.services.providers import image_transport, routing
 from lumen.services.providers.errors import AmbiguousModelRouteError
+from lumen.services.providers.pricing import frozen_token_pricing
 from lumen.services.run_store import (
     append_event,
     begin_segment_io,
     complete_segment_io,
     load_segment_payload,
     prepare_segment,
+    record_segment_usage,
 )
+from lumen.services.usage_breakdown import UsageBreakdown
 
 from . import budgets
 from .common import _event, _factory, _fingerprint, _now, descriptor, wake_run
@@ -88,19 +91,27 @@ async def admit_image_run(request: dict, *, project_id: str, user_id: str, clien
     quality = request.get("quality", "auto")
     n = request.get("n", 1)
     unit_price = image_transport.validate_image_request(route, size=size, quality=quality, n=n, edit=source_asset_id is not None)
+    basis = image_transport.image_billing_basis(route)
     if not assets.asset_pipeline_available():
         raise DurableRunInputError("image asset storage or scanner is unavailable")
     await credit.precheck(user_id, project_id, api_key_id)
     per_usd = Decimal(str(get_settings().chat_credit_per_usd))
     margin = Decimal(str(route["margin_multiplier"]))
-    cost = unit_price * n
+    cost = unit_price if basis == "tokens" else unit_price * n
     bound = credit.credits_for_cost(cost, margin, per_usd)
     if bound <= 0:
         raise DurableRunInputError("image pricing must be a positive exact variant")
     capability = {key: route[key] for key in ("provider_id", "model_id", "provider_name", "model_name", "model_kind", "config_version_hash")}
     capability["effective_features"] = {}
-    pricing = {"image_per_unit": format(unit_price, "f"), "size": size, "quality": quality,
+    pricing = {"billing_basis": basis, "size": size, "quality": quality,
                "count": n, "margin_multiplier": format(margin, "f"), "credit_per_usd": format(per_usd, "f")}
+    if basis == "tokens":
+        pricing.update(frozen_token_pricing(route))
+        pricing["reservation_usd"] = format(unit_price, "f")
+        pricing["media_pricing"] = json.loads(json.dumps(route["media_pricing"]))
+        pricing["required_token_modalities"] = ["image_output", *(["image_input"] if source_asset_id is not None else [])]
+    else:
+        pricing["image_per_unit"] = format(unit_price, "f")
     factory = _factory()
     try:
         async with factory() as session, session.begin():
@@ -175,7 +186,7 @@ async def _image_segment_start(run_id: str, *, owner: str, bound: Decimal) -> st
     return await budgets.retry_deadlocks(transaction)
 
 
-async def _image_checkpoint(run_id: str, *, owner: str, asset_ids: list[str]) -> None:
+async def _image_checkpoint(run_id: str, *, owner: str, asset_ids: list[str], usage: UsageBreakdown | None) -> None:
     factory = _factory()
     async with factory() as session, session.begin():
         run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one()
@@ -184,8 +195,25 @@ async def _image_checkpoint(run_id: str, *, owner: str, asset_ids: list[str]) ->
                           ChatRunSegment.segment_id == _SEGMENT).with_for_update())).scalar_one()
         if segment.status != "provider_started":
             raise DurableRunProviderResultUnknown("image provider boundary is no longer owned")
-        complete_segment_io(segment, result_payload={"asset_ids": asset_ids}, usage_payload={"count": len(asset_ids)})
+        complete_segment_io(segment, result_payload={"asset_ids": asset_ids},
+                            usage_payload=_image_usage_payload(len(asset_ids), usage))
         await append_event(session, run, _event(run, "run.stage.changed", {"stage": "model_response"}))
+
+
+def _image_usage_payload(count: int, usage: UsageBreakdown | None) -> dict:
+    return {"count": count, "token_usage": usage.as_usage_dict() if usage is not None else None}
+
+
+async def _record_image_usage(run_id: str, *, owner: str, count: int, usage: UsageBreakdown) -> None:
+    """Persist paid provider usage before asset I/O so an ingestion failure keeps the evidence."""
+    async with _factory()() as session, session.begin():
+        run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one()
+        _require_owned_running_lease(run, owner)
+        segment = (await session.execute(select(ChatRunSegment).where(ChatRunSegment.run_id == run_id,
+                          ChatRunSegment.segment_id == _SEGMENT).with_for_update())).scalar_one()
+        if segment.status != "provider_started":
+            raise DurableRunProviderResultUnknown("image provider boundary is no longer owned")
+        record_segment_usage(segment, _image_usage_payload(count, usage))
 
 
 async def _settle_image(run_id: str, *, owner: str) -> None:
@@ -219,27 +247,53 @@ async def _settle_image(run_id: str, *, owner: str) -> None:
                 return
             if reservation.status != "reserved":
                 raise DurableRunProviderResultUnknown("image credit reservation is not payable")
-            price = Decimal(pricing["image_per_unit"])
-            total = price * count
-            component = {"segment_id": _SEGMENT, "kind": "image_units", "quantity": str(count), "unit": "image",
-                         "unit_price_usd": str(price), "cost_usd": str(total), "source": "media",
-                         "model_name": run.model_name, "metadata": {"size": pricing["size"], "quality": pricing["quality"]}}
+            token_mode = pricing.get("billing_basis", "unit") == "tokens"
+            breakdown = None
+            if token_mode:
+                usage = load_segment_payload(segment.usage_payload)
+                try:
+                    breakdown = UsageBreakdown.from_canonical(usage.get("token_usage") if isinstance(usage, dict) else None)
+                    if not breakdown.reported("image", "output"):
+                        raise ValueError("image output token usage is missing")
+                    usage_cost = credit.usage_cost_from_pricing_snapshot(pricing,
+                        prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens,
+                        breakdown=breakdown)
+                    if usage_cost.pricing_status != "priced" or usage_cost.raw_cost > Decimal(pricing["reservation_usd"]):
+                        raise ValueError("image token usage is unpriced or exceeds reservation")
+                except (ValueError, TypeError, KeyError) as exc:
+                    raise DurableRunProviderResultUnknown("image token usage cannot safely be settled") from exc
+                components = credit.token_usage_components(usage_cost, segment_id=_SEGMENT,
+                    source="media", model_name=run.model_name, metadata={"size": pricing["size"], "quality": pricing["quality"]})
+            else:
+                price = Decimal(pricing["image_per_unit"])
+                total = price * count
+                components = [{"segment_id": _SEGMENT, "kind": "image_units", "quantity": str(count), "unit": "image",
+                               "unit_price_usd": str(price), "cost_usd": str(total), "source": "media",
+                               "model_name": run.model_name, "metadata": {"size": pricing["size"], "quality": pricing["quality"]}}]
+                usage_cost = UsageCost(raw_cost=total, input_cost=Decimal(0), output_cost=total,
+                                       pricing_status="priced", pricing_snapshot=pricing)
+            prompt_tokens = breakdown.input_tokens if breakdown is not None else 0
+            completion_tokens = breakdown.output_tokens if breakdown is not None else 0
+            expected_credits = credit.credits_for_cost(usage_cost.raw_cost,
+                Decimal(pricing["margin_multiplier"]), Decimal(pricing["credit_per_usd"]))
+            if expected_credits > Decimal(str(reservation.bound_credits)):
+                raise DurableRunProviderResultUnknown("image token usage exceeds reserved credits")
             credited = await credit.apply_usage_in_transaction(session, event_id=f"run:{run.id}",
                         user_id=run.user_id, project_id=run.project_id, model_name=run.model_name,
-                        provider=run.capability_snapshot["provider_name"], prompt_tokens=0, completion_tokens=0,
-                        usage_cost=UsageCost(raw_cost=total, input_cost=Decimal(0), output_cost=total,
-                              pricing_status="priced", pricing_snapshot=pricing),
+                        provider=run.capability_snapshot["provider_name"], prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                        usage_cost=usage_cost, breakdown=breakdown,
                         margin_multiplier=Decimal(pricing["margin_multiplier"]),
                         credit_per_usd=Decimal(pricing["credit_per_usd"]), source=run.source,
-                        api_key_id=run.api_key_id, run_id=run.id, usage_components=[component])
-            if credited != Decimal(str(reservation.bound_credits)):
+                        api_key_id=run.api_key_id, run_id=run.id, usage_components=components)
+            if not token_mode and credited != Decimal(str(reservation.bound_credits)):
                 raise DurableRunError("settled image usage differs from reserved exact price")
             reservation.actual_credits = credited
             reservation.status = "settled"
             reservation.settled_at = _now()
             run.usage_reconciled_at = _now()
-            await append_event(session, run, _event(run, "usage.updated", {"components": [component],
-                "prompt_tokens": 0, "completion_tokens": 0, "raw_cost": str(total), "credited_cost": str(credited)}))
+            await append_event(session, run, _event(run, "usage.updated", {"components": components,
+                "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                "raw_cost": str(usage_cost.raw_cost), "credited_cost": str(credited)}))
     await budgets.retry_deadlocks(transaction)
 
 
@@ -314,11 +368,18 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
         source_data = source_mime = None
         if source_id:
             source_data, source_mime = await _read_source(asset_id=source_id, user_id=payload["user_id"], project_id=payload["project_id"])
+        token_mode = pricing_snapshot.get("billing_basis", "unit") == "tokens"
+        if token_mode:
+            # Preflight against admission-frozen prices; the resolver fence above still rejects config changes.
+            route = {**route, "media_pricing": pricing_snapshot["media_pricing"],
+                     **{key: pricing_snapshot.get(key) for key in (
+                         "input_price_per_token", "output_price_per_token", "cache_read_price_per_token")}}
         price = image_transport.validate_image_request(route, size=pricing_snapshot["size"],
                     quality=pricing_snapshot["quality"], n=pricing_snapshot["count"], edit=bool(source_id))
-        if price != Decimal(pricing_snapshot["image_per_unit"]):
+        expected_price = Decimal(pricing_snapshot["reservation_usd"] if token_mode else pricing_snapshot["image_per_unit"])
+        if price != expected_price:
             raise DurableRunInputError("image price changed after admission")
-        bound = credit.credits_for_cost(price * pricing_snapshot["count"],
+        bound = credit.credits_for_cost(price if token_mode else price * pricing_snapshot["count"],
                        Decimal(pricing_snapshot["margin_multiplier"]), Decimal(pricing_snapshot["credit_per_usd"]))
         state = await _image_segment_start(run_id, owner=owner, bound=bound)
         if state == "canceled":
@@ -327,11 +388,14 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
         if state == "unknown":
             raise DurableRunProviderResultUnknown("image provider result cannot be replayed")
         if state == "started":
-            outputs = await image_transport.generate_images(route, prompt=payload["prompt"], size=pricing_snapshot["size"],
+            generated = await image_transport.generate_images(route, prompt=payload["prompt"], size=pricing_snapshot["size"],
                          quality=pricing_snapshot["quality"], n=pricing_snapshot["count"],
                          source_image=source_data, source_mime=source_mime)
+            outputs = generated.images
             if len(outputs) != pricing_snapshot["count"]:
                 raise DurableRunProviderResultUnknown("provider returned a different image count")
+            if generated.usage is not None:
+                await _record_image_usage(run_id, owner=owner, count=len(outputs), usage=generated.usage)
             stored_ids = []
             for index, (image_bytes, mime_type) in enumerate(outputs):
                 extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(mime_type)
@@ -340,7 +404,7 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
                 stored = await assets.create_generated_asset_bytes(data=image_bytes, original_name=f"image-{index + 1}.{extension}",
                               media_type=mime_type, user_id=payload["user_id"], project_id=payload["project_id"], run_id=run_id)
                 stored_ids.append(stored["id"])
-            await _image_checkpoint(run_id, owner=owner, asset_ids=stored_ids)
+            await _image_checkpoint(run_id, owner=owner, asset_ids=stored_ids, usage=generated.usage)
         await _settle_image(run_id, owner=owner)
         canceled = await _cancel_requested(run_id)
         await _finish(run_id, status="canceled" if canceled else "completed", message_id=None, owner=owner,

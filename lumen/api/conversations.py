@@ -120,6 +120,11 @@ async def get_chat_capabilities(
             voices, formats = [], []
         result["available_voices"] = voices
         result["available_formats"] = formats
+    if model_kind == "stt":
+        audio_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("audio_input") or {}
+        result["available_timestamp_granularities"] = (
+            audio_transport.available_timestamp_granularities(resolved) if audio_gate.get("available") is True else []
+        )
     if model_kind == "realtime":
         gates = (resolved.get("capabilities") or {}).get("feature_gates") or {}
         if all((gates.get(name) or {}).get("available") is True for name in ("audio_input", "audio_output")):

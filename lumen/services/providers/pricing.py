@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.services.capabilities import (
@@ -19,28 +19,118 @@ from .credentials import api_key_source, api_model_name
 from .errors import ProviderValidationError
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
+_USD_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
+_MAX_RATE = Decimal("100000000")
 MODEL_KINDS = frozenset({"text", "image", "tts", "stt", "realtime"})
-MEDIA_PRICE_FIELDS = {
-    "image": ("image_per_unit", "image_variants"),
-    "tts": ("audio_per_character", "audio_per_second", "audio_output_per_second"),
-    "stt": ("audio_per_minute", "audio_input_per_second"),
-    "realtime": ("realtime_input_per_minute", "realtime_output_per_minute"),
+_UNIT_SECONDS = {"second": 1, "minute": 60, "hour": 3600}
+# Duration family -> (JSON key, seconds per priced unit). Legacy aliases stay accepted.
+DURATION_PRICE_FAMILIES: dict[str, tuple[tuple[str, int], ...]] = {
+    **{
+        family: tuple((f"{family}_per_{unit}", seconds) for unit, seconds in _UNIT_SECONDS.items())
+        for family in ("audio_input", "audio_output", "realtime_input", "realtime_output", "realtime_session")
+    },
 }
+DURATION_PRICE_FAMILIES["audio_input"] += (("audio_per_minute", 60),)
+DURATION_PRICE_FAMILIES["audio_output"] += (("audio_per_second", 1),)
+_KIND_DURATION_FAMILIES = {
+    "tts": ("audio_output",),
+    "stt": ("audio_input",),
+    "realtime": ("realtime_input", "realtime_output", "realtime_session"),
+}
+BILLING_BASES = {
+    "image": frozenset({"unit", "tokens"}),
+    "tts": frozenset({"duration", "characters", "tokens"}),
+    "stt": frozenset({"duration", "tokens"}),
+    "realtime": frozenset({"duration", "session", "tokens"}),
+}
+_DEFAULT_BASIS = {"text": "tokens", "image": "unit", "tts": "duration", "stt": "duration", "realtime": "duration"}
+TOKEN_RATE_MODALITIES = ("image", "audio")
+TOKEN_RATE_FIELDS = ("input_per_million", "cache_read_per_million", "output_per_million")
+MEDIA_PRICE_FIELDS = {
+    "text": ("token_rates",),
+    "image": ("image_per_unit", "image_variants"),
+    "tts": ("audio_per_character",),
+    "stt": (),
+    "realtime": (),
+}
+for _kind_name, _families in _KIND_DURATION_FAMILIES.items():
+    MEDIA_PRICE_FIELDS[_kind_name] += tuple(key for family in _families for key, _ in DURATION_PRICE_FAMILIES[family])
+for _kind_name in BILLING_BASES:
+    MEDIA_PRICE_FIELDS[_kind_name] += ("billing_basis", "reservation_usd", "token_rates")
+# Text-price columns a media model may carry for its token basis; cache writes are never reported.
+MEDIA_TEXT_PRICE_FIELDS = ("input_price_per_million", "output_price_per_million", "cache_read_price_per_million")
+
+
+def _strict_decimal(value, field: str) -> Decimal:
+    """Exact decimal from a string or integer; floats and bools never become money."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+        raise ProviderValidationError(f"{field} 값은 10진수 문자열이어야 합니다")
+    if isinstance(value, str) and not re.fullmatch(r"[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?", value):
+        raise ProviderValidationError(f"{field} 값이 올바르지 않습니다")
+    try:
+        parsed = Decimal(value) if not isinstance(value, Decimal) else value
+    except (InvalidOperation, ValueError) as exc:
+        raise ProviderValidationError(f"{field} 값이 올바르지 않습니다") from exc
+    if not parsed.is_finite() or parsed < 0 or parsed >= _MAX_RATE or parsed.as_tuple().exponent < -18:
+        raise ProviderValidationError(f"{field} 값은 유한한 0 이상의 숫자여야 합니다")
+    return parsed
+
+
+def _decimal_text(value: Decimal) -> str:
+    return format(value.normalize() if value else Decimal("0"), "f")
+
+
+def _validate_token_rates(value) -> dict[str, dict[str, str]]:
+    if not isinstance(value, dict) or set(value) - set(TOKEN_RATE_MODALITIES):
+        raise ProviderValidationError("token_rates는 image/audio 가격 객체여야 합니다")
+    result: dict[str, dict[str, str]] = {}
+    for modality, rates in value.items():
+        if not isinstance(rates, dict) or not rates or set(rates) - set(TOKEN_RATE_FIELDS):
+            raise ProviderValidationError(f"token_rates.{modality} 항목이 올바르지 않습니다")
+        if "cache_read_per_million" in rates and "input_per_million" not in rates:
+            raise ProviderValidationError(f"token_rates.{modality} 캐시 입력 가격에는 입력 가격이 필요합니다")
+        parsed = {key: _strict_decimal(amount, f"token_rates.{modality}.{key}") for key, amount in rates.items()}
+        for key, amount in parsed.items():
+            if amount and (amount / _TOKENS_PER_MILLION).quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) == 0:
+                raise ProviderValidationError(f"token_rates.{modality}.{key} 값이 저장 정밀도보다 작습니다")
+        result[modality] = {key: _decimal_text(amount) for key, amount in parsed.items()}
+    return result
+
+
+def _check_duration_aliases(pricing: dict, family: str) -> tuple[Decimal, int] | None:
+    """Return the family's first configured ``(rate, unit_seconds)``; unequal aliases conflict."""
+    configured = [
+        (_strict_decimal(pricing[key], key), seconds) for key, seconds in DURATION_PRICE_FAMILIES[family] if key in pricing
+    ]
+    if not configured:
+        return None
+    rate, seconds = configured[0]
+    with localcontext() as context:
+        context.prec = 80
+        for other_rate, other_seconds in configured[1:]:
+            # Cross-multiply: equal per-second prices without lossy division.
+            if rate * other_seconds != other_rate * seconds:
+                raise ProviderValidationError(f"{family} 시간 단위 가격이 서로 충돌합니다")
+    return rate, seconds
 
 
 def validate_media_pricing(model_kind: str, pricing: dict | None) -> dict | None:
-    """Validate and serialize explicit per-kind USD rates without token-price fallback."""
+    """Validate and serialize explicit per-kind USD rates without token-price fallback.
+
+    Absent keys stay absent (unpriced); an explicit zero is a real free rate.
+    Requested time units are retained; conversion happens only at calculation.
+    """
     if model_kind not in MODEL_KINDS:
         raise ProviderValidationError("지원하지 않는 model_kind 입니다")
     if pricing is None:
         return None
-    if not isinstance(pricing, dict) or model_kind == "text":
-        raise ProviderValidationError("media_pricing은 media 모델의 객체여야 합니다")
+    if not isinstance(pricing, dict):
+        raise ProviderValidationError("media_pricing은 객체여야 합니다")
     allowed = set(MEDIA_PRICE_FIELDS[model_kind])
     if set(pricing) - allowed:
         raise ProviderValidationError("model_kind에 맞지 않는 media_pricing 항목입니다")
-    result: dict[str, str | dict[str, str]] = {}
+    result: dict[str, str | dict] = {}
     for key, value in pricing.items():
         if key == "image_variants":
             if not isinstance(value, dict) or len(value) > 500:
@@ -49,11 +139,101 @@ def validate_media_pricing(model_kind: str, pricing: dict | None) -> dict | None
             for variant, amount in value.items():
                 if not isinstance(variant, str) or not re.fullmatch(r"(auto|[1-9][0-9]*x[1-9][0-9]*):[A-Za-z0-9][A-Za-z0-9_-]*", variant):
                     raise ProviderValidationError("image_variants는 size:quality 정확한 키를 사용해야 합니다")
-                variants[variant] = str(_to_decimal(amount, key))
+                variants[variant] = _decimal_text(_strict_decimal(amount, key))
             result[key] = variants
+        elif key == "token_rates":
+            result[key] = _validate_token_rates(value)
+        elif key == "billing_basis":
+            if not isinstance(value, str) or value not in BILLING_BASES.get(model_kind, ()):
+                raise ProviderValidationError("model_kind에 맞지 않는 billing_basis 입니다")
+            result[key] = value
         else:
-            result[key] = str(_to_decimal(value, key))
+            result[key] = _decimal_text(_strict_decimal(value, key))
+    for family in _KIND_DURATION_FAMILIES.get(model_kind, ()):
+        _check_duration_aliases(result, family)
+    basis = result.get("billing_basis")
+    if "reservation_usd" in result:
+        if basis != "tokens":
+            raise ProviderValidationError("reservation_usd는 tokens 과금 기준에서만 사용합니다")
+        if Decimal(str(result["reservation_usd"])) <= 0:
+            raise ProviderValidationError("reservation_usd는 0보다 커야 합니다")
+    elif basis == "tokens":
+        raise ProviderValidationError("tokens 과금 기준에는 양수 reservation_usd가 필요합니다")
     return result or None
+
+
+def media_billing_basis(kind: str, pricing: dict | None) -> str:
+    """Explicit ``billing_basis`` or the kind's historical unit/duration basis."""
+    if kind not in MODEL_KINDS:
+        raise ProviderValidationError("지원하지 않는 model_kind 입니다")
+    basis = pricing.get("billing_basis") if isinstance(pricing, dict) else None
+    if basis is None:
+        return _DEFAULT_BASIS[kind]
+    if kind == "text" or basis not in BILLING_BASES[kind]:
+        raise ProviderValidationError("model_kind에 맞지 않는 billing_basis 입니다")
+    return basis
+
+
+def exact_duration_price(pricing: dict | None, family: str) -> tuple[Decimal, int] | None:
+    """``(rate, unit_seconds)`` exactly as configured; conflicting aliases raise."""
+    if family not in DURATION_PRICE_FAMILIES:
+        raise ProviderValidationError("지원하지 않는 시간 가격 항목입니다")
+    if not isinstance(pricing, dict):
+        return None
+    return _check_duration_aliases(pricing, family)
+
+
+def duration_cost_usd(pricing: dict | None, family: str, seconds: Decimal | int) -> Decimal | None:
+    """Exact USD for elapsed seconds: multiply before dividing, then round once."""
+    price = exact_duration_price(pricing, family)
+    if price is None:
+        return None
+    elapsed = Decimal(seconds)
+    if not elapsed.is_finite() or elapsed < 0:
+        raise ProviderValidationError("시간 사용량이 올바르지 않습니다")
+    rate, unit_seconds = price
+    with localcontext() as context:
+        context.prec = 80
+        return (rate * elapsed / unit_seconds).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN)
+
+
+def media_reservation_usd(pricing: dict | None) -> Decimal | None:
+    """The explicit positive token-basis funding envelope, never a derived bound."""
+    if not isinstance(pricing, dict) or "reservation_usd" not in pricing:
+        return None
+    try:
+        amount = _strict_decimal(pricing["reservation_usd"], "reservation_usd")
+    except ProviderValidationError:
+        return None
+    return amount if amount > 0 else None
+
+
+def route_token_rates(route: dict) -> dict[str, dict[str, str]]:
+    """Validated per-million image/audio token rates of a resolved route (possibly empty)."""
+    pricing = route.get("media_pricing") if isinstance(route, dict) else None
+    if not isinstance(pricing, dict) or pricing.get("token_rates") is None:
+        return {}
+    return _validate_token_rates(pricing["token_rates"])
+
+
+def frozen_token_pricing(route: dict) -> dict:
+    """Admission-time token prices for snapshot billing; missing rates stay ``None``."""
+
+    def text(value) -> str | None:
+        return format(Decimal(str(value)), "f") if value is not None else None
+
+    return {
+        # Media snapshots never bill an unpriced cache category at zero.
+        "model_kind": route.get("model_kind") or "text",
+        "input_price_per_token": text(route.get("input_price_per_token")),
+        "output_price_per_token": text(route.get("output_price_per_token")),
+        **{key: text(route.get(key)) for _, _, resolved in CACHE_PRICE_FIELDS
+           for key in (resolved, f"{resolved}_above_200k")},
+        "cache_price_sources": dict(route.get("cache_price_sources") or {}),
+        "price_source": route.get("price_source"),
+        "price_version": route.get("price_version"),
+        "token_rates": route_token_rates(route),
+    }
 
 
 def exact_media_price(pricing: dict | None, field: str, *, variant: str | None = None) -> Decimal | None:
@@ -71,17 +251,83 @@ def exact_media_price(pricing: dict | None, field: str, *, variant: str | None =
         return None
     return price if price is not None and price.is_finite() and price >= 0 else None
 
-def media_pricing_available(kind: str, pricing: dict | None) -> bool:
+
+def _duration_available(pricing: dict, family: str) -> bool:
+    try:
+        return exact_duration_price(pricing, family) is not None
+    except ProviderValidationError:
+        return False
+
+
+# Text directions every token-basis request consumes: prompts/speech text are
+# text input, transcripts text output; image text output may stay unpriced.
+_TOKEN_BASIS_TEXT_DIRECTIONS = {
+    "image": ("input",),
+    "tts": ("input",),
+    "stt": ("output",),
+    "realtime": ("input", "output"),
+}
+
+
+def media_pricing_available(
+    kind: str, pricing: dict | None, *, text_input_priced: bool = False, text_output_priced: bool = False
+) -> bool:
+    """Whether the selected billing basis has every rate its execution needs.
+
+    The token basis also needs the model's text rates for the text it always
+    consumes; callers pass whether those columns are set.
+    """
     if not isinstance(pricing, dict):
         return False
-    if kind == "image":
+    try:
+        basis = media_billing_basis(kind, pricing)
+        rates = route_token_rates({"media_pricing": pricing})
+    except ProviderValidationError:
+        return False
+    if basis == "tokens":
+        needed = {
+            "image": (("image", "output_per_million"),),
+            "tts": (("audio", "output_per_million"),),
+            "stt": (("audio", "input_per_million"),),
+            "realtime": (("audio", "input_per_million"), ("audio", "output_per_million")),
+        }.get(kind)
+        text_priced = {"input": text_input_priced, "output": text_output_priced}
+        return (
+            bool(needed)
+            and media_reservation_usd(pricing) is not None
+            and all(field in rates.get(modality, {}) for modality, field in needed)
+            and all(text_priced[direction] for direction in _TOKEN_BASIS_TEXT_DIRECTIONS[kind])
+        )
+    if basis == "unit":
         variants = pricing.get("image_variants")
         return bool(variants) if isinstance(variants, dict) else exact_media_price(pricing, "image_per_unit") is not None
-    if kind in {"tts", "stt"}:
-        return any(exact_media_price(pricing, field) is not None for field in MEDIA_PRICE_FIELDS[kind])
-    if kind == "realtime":
-        return all(exact_media_price(pricing, field) is not None for field in MEDIA_PRICE_FIELDS[kind])
+    if basis == "characters":
+        return exact_media_price(pricing, "audio_per_character") is not None
+    if basis == "session":
+        return _duration_available(pricing, "realtime_session")
+    if basis == "duration":
+        return all(_duration_available(pricing, family) for family in _KIND_DURATION_FAMILIES[kind][:2])
     return False
+
+
+def model_media_pricing_available(model: LlmModel) -> bool:
+    """``media_pricing_available`` for a stored media model, including its text columns."""
+    return media_pricing_available(
+        _kind(model),
+        getattr(model, "media_pricing", None),
+        text_input_priced=getattr(model, "input_price", None) is not None,
+        text_output_priced=getattr(model, "output_price", None) is not None,
+    )
+
+
+def route_media_pricing_available(route: dict) -> bool:
+    """``media_pricing_available`` for a resolved route, including its frozen text rates."""
+    return media_pricing_available(
+        str(route.get("model_kind") or "text"),
+        route.get("media_pricing"),
+        text_input_priced=route.get("input_price_per_token") is not None,
+        text_output_priced=route.get("output_price_per_token") is not None,
+    )
 
 
 def _kind(row: LlmModel) -> str:
@@ -136,7 +382,12 @@ CACHE_PRICE_FIELDS = (
 def _resolved_cache_prices(model: LlmModel, provider: LlmProvider) -> dict[str, Decimal | None]:
     """Manual rates override exact direct-provider catalog rates per category."""
     if _kind(model) != "text":
-        return {key: None for _, _, resolved in CACHE_PRICE_FIELDS for key in (resolved, f"{resolved}_above_200k")}
+        # Media models carry only a manual cache-read rate; no catalog fallback.
+        prices = {key: None for _, _, resolved in CACHE_PRICE_FIELDS for key in (resolved, f"{resolved}_above_200k")}
+        value = getattr(model, "cache_read_price", None)
+        if value is not None:
+            prices["cache_read_price_per_token"] = Decimal(value).quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP)
+        return prices
     catalog = bundled_cache_rates(model.model_name, provider.provider_type, provider.api_base)
     prices: dict[str, Decimal | None] = {}
     for _, column, resolved_key in CACHE_PRICE_FIELDS:
@@ -236,6 +487,9 @@ def _effective_capabilities(
                 "api_model_name": api_model_name(row.model_name, provider_type or ""),
                 "api_base": api_base, "api_key": "configured",
                 "media_pricing": getattr(row, "media_pricing", None),
+                "input_price_per_token": getattr(row, "input_price", None),
+                "output_price_per_token": getattr(row, "output_price", None),
+                "cache_read_price_per_token": getattr(row, "cache_read_price", None),
                 "provider_auth": None,
             }
             if kind == "image":
@@ -325,7 +579,7 @@ def _model_public(
     )
     if _kind(row) != "text":
         effective_price_source = (
-            "manual" if media_pricing_available(_kind(row), getattr(row, "media_pricing", None)) else "unpriced"
+            "manual" if model_media_pricing_available(row) else "unpriced"
         )
     return {
         "id": row.id,
@@ -456,9 +710,14 @@ def _resolved_base_prices(
     model: LlmModel, provider: LlmProvider
 ) -> tuple[Decimal | None, Decimal | None, str, str | None]:
     if _kind(model) != "text":
-        pricing = getattr(model, "media_pricing", None)
-        priced = media_pricing_available(_kind(model), pricing)
-        return None, None, "manual" if priced else "unpriced", str(getattr(model, "updated_at", None)) if priced else None
+        # Manual text rates only price a token basis; media never borrows catalog prices.
+        priced = model_media_pricing_available(model)
+        return (
+            Decimal(model.input_price) if model.input_price is not None else None,
+            Decimal(model.output_price) if model.output_price is not None else None,
+            "manual" if priced else "unpriced",
+            str(getattr(model, "updated_at", None)) if priced else None,
+        )
     input_price = Decimal(model.input_price) if model.input_price is not None else None
     output_price = Decimal(model.output_price) if model.output_price is not None else None
     fallback_input, fallback_output = (

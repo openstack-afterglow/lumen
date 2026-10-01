@@ -434,8 +434,8 @@ class TestUsageComponents:
         cost = credit.usage_cost_from_pricing_snapshot(
             _frozen_snapshot(_CACHE_PRICES), prompt_tokens=1000, completion_tokens=100, breakdown=breakdown
         )
-        components = execution._token_usage_components(
-            breakdown, cost, segment_id="executor:aggregate", source="executor", model_name=_MODEL, metadata={}
+        components = credit.token_usage_components(
+            cost, segment_id="executor:aggregate", source="executor", model_name=_MODEL, metadata={}
         )
 
         assert {item["kind"]: item["quantity"] for item in components} == {
@@ -457,12 +457,11 @@ class TestUsageComponents:
         )
 
     def test_components_omit_cache_categories_without_tokens(self):
-        breakdown = UsageBreakdown(10, 5)
         cost = credit.usage_cost_from_pricing_snapshot(
             _frozen_snapshot(_NO_CACHE_PRICES), prompt_tokens=10, completion_tokens=5
         )
-        components = execution._token_usage_components(
-            breakdown, cost, segment_id="s", source="executor", model_name=_MODEL, metadata={}
+        components = credit.token_usage_components(
+            cost, segment_id="s", source="executor", model_name=_MODEL, metadata={}
         )
         assert [item["kind"] for item in components] == ["input_tokens", "output_tokens"]
 

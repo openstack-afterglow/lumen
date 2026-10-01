@@ -58,6 +58,11 @@ _DEFAULT_BASES: dict[str, str] = {
 # azure 는 제외: 동일 이름이라도 실제 deployment discovery 는 api-version query 와 별도 경로가
 # 필요해 일반 OpenAI 호환 /models 계약으로 라이브 조회를 대표할 수 없다(정적 참고 목록만 제공).
 _OPENAI_COMPATIBLE = set(_DEFAULT_BASES)
+_MODEL_MODES: dict[str, Literal["text", "image", "tts", "stt", "realtime"]] = {
+    "chat": "text", "completion": "text", "responses": "text",
+    "image_generation": "image", "audio_speech": "tts",
+    "audio_transcription": "stt", "realtime": "realtime",
+}
 
 
 def _models_url(provider_type: str, api_base: str | None) -> str | None:
@@ -85,6 +90,7 @@ class DiscoveredCandidate:
     generation_methods: tuple[str, ...] = ()
     input_token_limit: int | None = None
     output_token_limit: int | None = None
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +133,7 @@ def _serialize_candidate(candidate: DiscoveredCandidate) -> dict[str, Any]:
         "generation_methods": list(candidate.generation_methods),
         "input_token_limit": candidate.input_token_limit,
         "output_token_limit": candidate.output_token_limit,
+        "model_kind": candidate.model_kind,
     }
 
 
@@ -279,6 +286,7 @@ def _anthropic_candidate(item: dict) -> DiscoveredCandidate | None:
         purpose="chat",  # /v1/models 는 Messages API에서 쓰는 모델만 나열한다(공식 문서 기준)
         generation_methods=(),
         input_token_limit=input_limit,
+        model_kind="text",
         output_token_limit=output_limit,
     )
 
@@ -336,6 +344,23 @@ def _gemini_parse_page(payload: Any) -> _PageResult:
     return _PageResult(items=items, next_cursor=next_token or None, more=bool(next_token))
 
 
+
+def _catalog_kind(provider_type: str, model_id: str) -> Literal["text", "image", "tts", "stt", "realtime"] | None:
+    """Exact catalog operation hint, never an execution or price guarantee."""
+    import litellm
+
+    for key in (f"{provider_type}/{model_id}", model_id):
+        entry = litellm.model_cost.get(key)
+        if isinstance(entry, dict) and entry.get("litellm_provider") == provider_type:
+            return _MODEL_MODES.get(entry.get("mode"))
+    return None
+
+
+def _catalog_candidate(provider_type: str, model_id: str) -> DiscoveredCandidate:
+    kind = _catalog_kind(provider_type, model_id)
+    purpose = "chat" if kind == "text" else "non_chat" if kind else "unknown"
+    return DiscoveredCandidate(id=model_id, purpose=purpose, model_kind=kind)
+
 def _gemini_candidate(item: dict) -> DiscoveredCandidate | None:
     name = item.get("name")
     if not isinstance(name, str) or not name or name != name.strip():
@@ -357,13 +382,15 @@ def _gemini_candidate(item: dict) -> DiscoveredCandidate | None:
     output_limit = item.get("outputTokenLimit")
     input_limit = input_limit if type(input_limit) is int and input_limit > 0 else None
     output_limit = output_limit if type(output_limit) is int and output_limit > 0 else None
+    kind = "realtime" if "bidiGenerateContent" in methods else _catalog_kind("gemini", model_id)
     return DiscoveredCandidate(
         id=model_id,
         display_name=display_name,
-        purpose=_gemini_purpose(methods),
+        purpose="non_chat" if kind and kind != "text" else _gemini_purpose(methods),
         generation_methods=methods,
         input_token_limit=input_limit,
         output_token_limit=output_limit,
+        model_kind=kind,
     )
 
 
@@ -428,7 +455,7 @@ async def _fetch_openai_compatible_models(
                 if len(candidates) >= _MAX_MODELS:
                     raise _DiscoveryFailure("discovery_model_limit", "모델 목록 조회 한도를 초과했습니다")
                 seen.add(projected)
-                candidates.append(DiscoveredCandidate(id=projected))
+                candidates.append(_catalog_candidate(provider_type, projected))
             return _FetchOutcome("success" if candidates else "empty", tuple(candidates))
     except TimeoutError:
         return _error_outcome("discovery_timeout", "모델 목록 조회 시간이 초과되었습니다", True)
@@ -459,7 +486,7 @@ def _static_candidates(provider_type: str) -> tuple[DiscoveredCandidate, ...]:
     if provider_type == "perplexity":
         static = [api_model_name(model, "perplexity") for model in static if not model.startswith("preset/")]
     ids = sorted({m for m in static if m and len(m) <= _MAX_MODEL_ID_LEN})
-    return tuple(DiscoveredCandidate(id=i) for i in ids)
+    return tuple(_catalog_candidate(provider_type, i) for i in ids)
 
 
 def _wrap_ids(ids: list[str]) -> tuple[DiscoveredCandidate, ...]:

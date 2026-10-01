@@ -652,7 +652,7 @@ class ChatRunResponse(_StrictModel):
     terminal: bool
 
 
-_DECIMAL_UNITS = {"token", "request", "context", "image", "second", "usd"}
+_DECIMAL_UNITS = {"token", "request", "context", "image", "second", "character", "usd"}
 _USAGE_KINDS = {
     "input_tokens",
     "output_tokens",
@@ -674,6 +674,14 @@ _USAGE_KINDS = {
     "advisor_cache_creation_5m_tokens",
     "advisor_cache_creation_1h_tokens",
     "image_units",
+    "image_input_tokens",
+    "image_cache_read_input_tokens",
+    "image_output_tokens",
+    "audio_input_tokens",
+    "audio_cache_read_input_tokens",
+    "audio_output_tokens",
+    "audio_input_characters",
+    "realtime_session_seconds",
     "audio_input_seconds",
     "audio_output_seconds",
     "video_seconds",

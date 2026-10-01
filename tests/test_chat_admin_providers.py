@@ -359,9 +359,9 @@ class TestModelPricingContract:
         with pytest.raises(errors.ProviderValidationError):
             pricing._per_token_price(Decimal("0.00004"), "price")
 
-    async def test_update_rejects_mixed_null_price_pair(self, admin_client):
+    async def test_update_rejects_explicit_text_mixed_null_price_pair(self, admin_client):
         response = await admin_client.patch(
             f"{_MODELS_URL}/5",
-            json={"input_price_per_million": None, "output_price_per_million": "8"},
+            json={"model_kind": "text", "input_price_per_million": None, "output_price_per_million": "8"},
         )
         assert response.status_code == 422

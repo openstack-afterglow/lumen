@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from lumen.api import audio as native
 from lumen.api.compat import audio as compat
 from lumen.auth import get_principal
+from lumen.services.providers.errors import ProviderValidationError
 
 
 def _principal():
@@ -111,6 +112,43 @@ def test_native_transcription_returns_text_and_rejects_invalid_source_before_adm
     bad = client.post("/v1/chat/audio/transcriptions", headers={"Idempotency-Key": key},
                       json={"model_id": "stt-model", "input_asset_id": "not-a-uuid"})
     assert bad.status_code == 422
+    assert len(admitted) == 1
+
+
+def test_native_timed_transcription_admits_explicit_timing_and_projects_segments(monkeypatch):
+    asset_id = str(uuid4())
+    admitted = []
+    segments = [{"start": 0.0, "end": 1.25, "text": " Actual"}, {"start": 1.25, "end": 2.5, "text": " words."}]
+
+    async def admit_audio_run(payload, **owner):
+        if payload["model_id"] == "gpt-4o-transcribe":
+            raise ProviderValidationError("transcription timestamps are unsupported for this audio model")
+        admitted.append(payload)
+        return SimpleNamespace(run_id="run-timed")
+
+    async def owned_run_response(**owner):
+        return SimpleNamespace(status="completed")
+
+    async def audio_result(**owner):
+        return {"kind": "stt", "text": "Actual words.", "segments": segments}
+
+    monkeypatch.setattr(native, "admit_audio_run", admit_audio_run)
+    monkeypatch.setattr(native.queries, "owned_run_response", owned_run_response)
+    monkeypatch.setattr(native, "audio_result", audio_result)
+    client, _ = _client()
+    url = "/v1/chat/audio/transcriptions"
+    body = {"model_id": "whisper-1", "input_asset_id": asset_id, "timestamp_granularities": ["segment"]}
+    response = client.post(url, headers={"Idempotency-Key": str(uuid4())}, json=body)
+    assert response.status_code == 200
+    assert response.json() == {"text": "Actual words.", "segments": segments}
+    assert admitted[0]["timestamp_granularities"] == ["segment"] and admitted[0]["kind"] == "stt"
+    for invalid in (["segment", "segment"], ["word"], "segment", [None]):
+        rejected = client.post(url, headers={"Idempotency-Key": str(uuid4())},
+                               json={**body, "timestamp_granularities": invalid})
+        assert rejected.status_code == 422
+    unsupported = client.post(url, headers={"Idempotency-Key": str(uuid4())},
+                              json={**body, "model_id": "gpt-4o-transcribe"})
+    assert unsupported.status_code == 422 and "unsupported" in unsupported.json()["detail"]
     assert len(admitted) == 1
 
 

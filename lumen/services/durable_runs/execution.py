@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
@@ -31,7 +32,6 @@ from lumen.services import (
 )
 from lumen.services import conversation_store as cs
 from lumen.services.capabilities import reasoning_can_be_disabled
-from lumen.services.litellm_client import UsageCost
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
 from lumen.services.message_graph import reachable_message_clause, register_message
 from lumen.services.providers import routing as ps
@@ -48,7 +48,7 @@ from lumen.services.run_store import (
     replay_events,
 )
 from lumen.services.structured_output import StructuredOutputError, parse_structured_output
-from lumen.services.usage_breakdown import CACHE_USAGE_KEYS, UsageBreakdown
+from lumen.services.usage_breakdown import UsageBreakdown, required_modalities_for_request
 
 from . import budgets, children
 from .common import (
@@ -115,6 +115,22 @@ def _delegation_enabled(run: ChatRun, payload: dict[str, Any]) -> bool:
     return runtime.enabled and any(pool.enabled and pool.role == "sandbox" for pool in runtime.pools)
 
 logger = logging.getLogger(__name__)
+
+def _safe_log_token(value: object, *, fallback: str = "<invalid>") -> str:
+    if isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}", value):
+        return value
+    return fallback
+
+
+def _safe_error_code(value: object, *, fallback: str = "run_failed") -> str:
+    if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value):
+        return value
+    return fallback
+
+
+def _field_count(value: object) -> int:
+    return len(value) if isinstance(value, dict) else 0
+
 
 
 async def _append_temp_history(
@@ -202,6 +218,11 @@ async def _append(run_id: str, event_type: str, payload: dict[str, Any], *, owne
             return
         _require_owned_running_lease(run, owner)
         await append_event(session, run, _event(run, event_type, payload))
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "durable chat journal committed run_id=%s event=%s fields=%d",
+            _safe_log_token(run_id), _safe_log_token(event_type), _field_count(payload),
+        )
 
 
 async def _set_stage(
@@ -231,11 +252,24 @@ async def _finish(
     child_result: dict[str, Any] | None = None,
 ) -> None:
     # Pure DB barrier; each attempt re-reads and re-locks with a fresh lock order (MariaDB 1020 retry).
-    wake_parent = await budgets.retry_deadlocks(lambda: _finish_transaction(
+    transitioned, wake_parent = await budgets.retry_deadlocks(lambda: _finish_transaction(
         run_id, status=status, message_id=message_id, owner=owner, error_code=error_code,
         safe_message=safe_message, usage_record=usage_record, message_finalization=message_finalization,
         completed_parts=completed_parts, child_result=child_result,
     ))
+    if not transitioned:
+        return
+    logger.info(
+        "durable chat run terminal run_id=%s status=%s error_code=%s",
+        _safe_log_token(run_id), status,
+        "none" if status == "completed" else _safe_error_code(error_code, fallback="canceled" if status == "canceled" else "run_failed"),
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "durable chat run result committed run_id=%s status=%s part_count=%d usage_fields=%d",
+            _safe_log_token(run_id), status, len(completed_parts) if completed_parts is not None else 0,
+            _field_count(usage_record),
+        )
     if wake_parent is not None:
         from .common import wake_run
 
@@ -254,7 +288,7 @@ async def _finish_transaction(
     message_finalization: dict[str, Any] | None,
     completed_parts: list[tuple[int, dict[str, Any]]] | None,
     child_result: dict[str, Any] | None,
-) -> str | None:
+) -> tuple[bool, str | None]:
     factory = _factory()
     order = budgets.LockOrder()
     wake_parent: str | None = None
@@ -263,7 +297,7 @@ async def _finish_transaction(
         # root -> ancestors -> children -> ledgers -> resources.
         unlocked_run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id))).scalar_one_or_none()
         if unlocked_run is None:
-            return
+            return False, None
         quota = None
         root = None
         has_children = (
@@ -289,7 +323,7 @@ async def _finish_transaction(
             root = run
         _require_owned_running_lease(run, owner)
         if run.status not in NONTERMINAL:
-            return
+            return False, None
         if run.run_kind in {"image", "tts", "stt", "realtime"}:
             from lumen.models.chat_runs import ChatModelCallReservation
 
@@ -444,7 +478,7 @@ async def _finish_transaction(
                 features = request.get("features")
                 memory_enabled = isinstance(features, dict) and features.get("memory") is True
             except DurableRunError:
-                logger.warning("completed chat run has unreadable memory feature setting run_id=%s", run.id)
+                logger.warning("chat run memory feature setting unreadable run_id=%s", _safe_log_token(run.id))
         if getattr(run, "run_kind", "completion") == "completion":
             await enqueue_completed_run_in_transaction(session, run, memory_enabled=memory_enabled)
             if (
@@ -496,25 +530,19 @@ async def _finish_transaction(
                 await infra_store.release_sandbox_intent(session, run_id=child_id, order=order)
             if run.execution_mode == "code":
                 await infra_store.release_sandbox_intent(session, run_id=run.id, order=order)
-    return wake_parent
+    return True, wake_parent
 
 
 
-def _bounded_credits(pricing: dict[str, Any], input_tokens: int, output_tokens: int, *,
-                     input_keys: tuple[str, ...], output_key: str) -> Decimal:
+def _bounded_credits(pricing: dict[str, Any], input_tokens: int, output_tokens: int) -> Decimal:
     """Round a worst-case frozen price upward, never a live catalog price."""
     try:
-        rates = [Decimal(str(pricing[key])) for key in input_keys if pricing.get(key) is not None]
-        output_rate = Decimal(str(pricing[output_key]))
-        if not rates or any(not rate.is_finite() or rate < 0 for rate in [*rates, output_rate]):
-            raise ValueError("missing or invalid frozen price")
+        input_rate, output_rate, cushion = credit.worst_case_token_rates(pricing)
         multiplier = Decimal(str(pricing["margin_multiplier"])) * Decimal(str(pricing["chat_credit_per_usd"]))
         if not multiplier.is_finite() or multiplier < 0:
             raise ValueError("invalid credit conversion")
-        cost = max(rates) * input_tokens + output_rate * output_tokens
-        # Each of the at most five billed token categories is rounded to 1e-10 USD.
-        # Cushion only nonzero estimates so their rounded sum cannot exceed the hold.
-        return ((cost + (Decimal("0.0000000005") if cost else 0)) * multiplier).quantize(
+        cost = input_rate * input_tokens + output_rate * output_tokens
+        return ((cost + (cushion if cost else 0)) * multiplier).quantize(
             Decimal("0.00000001"), rounding=ROUND_CEILING
         )
     except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
@@ -546,20 +574,19 @@ def _provider_credit_bound(run: ChatRun, *, messages: list[dict], tool_schemas: 
     count = litellm_client.count_context_tokens(
         str(route.get("model_name") or run.model_name), messages, tool_schemas
     )
-    input_keys = ("input_price_per_token", "cache_read_price_per_token",
-                  "cache_write_price_per_token", "cache_write_1h_price_per_token",
-                  "cache_read_price_per_token_above_200k", "cache_write_price_per_token_above_200k",
-                  "cache_write_1h_price_per_token_above_200k")
-    priced_input = any(Decimal(str(pricing.get(key) or 0)) > 0 for key in input_keys)
-    priced_output = Decimal(str(pricing.get("output_price_per_token") or 0)) > 0
+    try:
+        input_rate, output_rate, _ = credit.worst_case_token_rates(pricing)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise DurableRunError("bounded credit pricing is unavailable") from exc
+    priced_input = input_rate > 0
+    priced_output = output_rate > 0
     if priced_input and (type(limit) is not int or limit <= 0):
         raise DurableRunError("bounded provider input requires a frozen context limit")
     if priced_output and (type(max_tokens) is not int or max_tokens <= 0):
         raise DurableRunError("bounded provider output requires max_tokens")
     if count.tokens is not None and type(limit) is int and count.tokens > limit:
         raise DurableRunError("provider context exceeds frozen input bound")
-    return _bounded_credits(pricing, limit if priced_input else 0, max_tokens if priced_output else 0,
-                            input_keys=input_keys, output_key="output_price_per_token")
+    return _bounded_credits(pricing, limit if priced_input else 0, max_tokens if priced_output else 0)
 
 
 def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
@@ -681,7 +708,7 @@ class _DurableExecutionHooks:
                 return
             root_pricing = run.pricing_snapshot if isinstance(run.pricing_snapshot, dict) else {}
             summary_pricing = root_pricing.get("summary_route")
-            summary_pricing = summary_pricing if isinstance(summary_pricing, dict) else {}
+            summary_pricing = summary_pricing if isinstance(summary_pricing, dict) else root_pricing
             pricing = {
                 "input_price_per_token": summary_pricing.get(
                     "input_price_per_token", route.get("input_price_per_token")
@@ -708,6 +735,8 @@ class _DurableExecutionHooks:
                         "cache_write_1h_price_per_token_above_200k",
                     )
                 },
+                # Never inherit live modality edits, including on old snapshots.
+                "token_rates": summary_pricing.get("token_rates") or {},
             }
             if pricing["input_price_per_token"] is None or pricing["output_price_per_token"] is None:
                 raise DurableRunError("context compaction pricing is unavailable")
@@ -716,9 +745,9 @@ class _DurableExecutionHooks:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 breakdown=breakdown,
+                required_modalities=usage_payload.get("required_token_modalities"),
             )
-            components = _token_usage_components(
-                breakdown,
+            components = credit.token_usage_components(
                 usage_cost,
                 segment_id=segment_id,
                 source="system",
@@ -774,6 +803,11 @@ class _DurableExecutionHooks:
         messages = context.get("summary_messages")
         if not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
             messages = context_manager._summary_messages(chunks, system_prompt=system_prompt)
+        frozen_pricing = run.pricing_snapshot
+        summary_pricing = frozen_pricing.get("summary_route") or frozen_pricing
+        required_modalities = required_modalities_for_request(
+            summary_pricing.get("token_rates") or {}, messages=messages
+        )
         output_bound = min(4096, int(run_context.get("summary_output_reserve") or 512))
         started = await self._start(
             segment_id=segment_id,
@@ -849,6 +883,7 @@ class _DurableExecutionHooks:
                 observed_usage
                 or litellm_client.extract_usage_breakdown(resolved_route["model_name"], messages, content, None)
             ).as_usage_dict()
+            usage_payload["required_token_modalities"] = required_modalities
             await self._complete(
                 segment_id=segment_id,
                 ordinal=ordinal,
@@ -1165,7 +1200,7 @@ class _DurableExecutionHooks:
                     owner=self.owner,
                 )
             except Exception:
-                logger.exception("failed to persist context failure event run_id=%s", self.run_id)
+                logger.warning("failed to persist context failure event run_id=%s", _safe_log_token(self.run_id))
             raise
         except Exception as exc:
             if (
@@ -1188,7 +1223,7 @@ class _DurableExecutionHooks:
                         owner=self.owner,
                     )
                 except Exception:
-                    logger.exception("failed to persist context failure event run_id=%s", self.run_id)
+                    logger.warning("failed to persist context failure event run_id=%s", _safe_log_token(self.run_id))
                 return messages
             try:
                 await _append(
@@ -1204,7 +1239,7 @@ class _DurableExecutionHooks:
                     owner=self.owner,
                 )
             except Exception:
-                logger.exception("failed to persist context failure event run_id=%s", self.run_id)
+                logger.warning("failed to persist context failure event run_id=%s", _safe_log_token(self.run_id))
             if (
                 not self.force_compaction
                 and state.input_budget is not None
@@ -1342,6 +1377,7 @@ class _DurableExecutionHooks:
             cost = credit.usage_cost_from_pricing_snapshot(
                 pricing, prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens,
                 breakdown=breakdown,
+                required_modalities=usage.get("required_token_modalities"),
             ).raw_cost
         snapshot = run.pricing_snapshot
         return credit.credits_for_cost(cost, snapshot["margin_multiplier"], snapshot["chat_credit_per_usd"])
@@ -1452,6 +1488,12 @@ class _DurableExecutionHooks:
                 event_type, payload = journal_completed
                 event = await append_event(session, run, _event(run, event_type, payload))
                 segment.completed_event_seq = event.seq
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "durable chat segment committed run_id=%s segment=%s endpoint=%s status=completed result_fields=%d usage_fields=%d",
+                _safe_log_token(self.run_id), _safe_log_token(segment_id), _safe_log_token(endpoint),
+                _field_count(result_payload), _field_count(usage_payload),
+            )
 
     async def _fail(
         self,
@@ -1678,55 +1720,14 @@ class _DurableExecutionHooks:
 
 def _usage_payload_breakdown(value: dict[str, Any]) -> UsageBreakdown:
     """Read a journaled usage dict; entries written before cache accounting carry no split."""
-    return UsageBreakdown.from_totals(
-        max(0, int(value.get("prompt_tokens") or 0)),
-        max(0, int(value.get("completion_tokens") or 0)),
-        **{key: value.get(key) or 0 for key in CACHE_USAGE_KEYS},
-    )
-
-
-# (usage kind, breakdown token field, UsageCost cost field). ``input_tokens`` is
-# the UNCACHED quantity, matching Anthropic where input_tokens excludes cache.
-_TOKEN_USAGE_KINDS = (
-    ("input_tokens", "uncached_input_tokens", "input_cost"),
-    ("output_tokens", "output_tokens", "output_cost"),
-    ("cache_read_input_tokens", "cache_read_input_tokens", "cache_read_cost"),
-    ("cache_creation_5m_input_tokens", "cache_creation_5m_input_tokens", "cache_creation_5m_cost"),
-    ("cache_creation_1h_input_tokens", "cache_creation_1h_input_tokens", "cache_creation_1h_cost"),
-)
-
-
-def _token_usage_components(
-    breakdown: UsageBreakdown,
-    usage_cost: UsageCost,
-    *,
-    segment_id: str,
-    source: str,
-    model_name: str,
-    metadata: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Per-category token components; cache categories appear only with tokens."""
-    components: list[dict[str, Any]] = []
-    for kind, token_field, cost_field in _TOKEN_USAGE_KINDS:
-        quantity = getattr(breakdown, token_field)
-        if kind.startswith("cache_") and quantity == 0:
-            continue
-        cost = getattr(usage_cost, cost_field)
-        unit_price = cost / quantity if quantity else Decimal("0")
-        components.append(
-            {
-                "segment_id": segment_id,
-                "kind": kind,
-                "quantity": str(quantity),
-                "unit": "token",
-                "unit_price_usd": format(unit_price, "f"),
-                "cost_usd": format(cost, "f"),
-                "source": source,
-                "model_name": model_name,
-                "metadata": dict(metadata),
-            }
-        )
-    return components
+    breakdown = UsageBreakdown.from_runtime({
+        **value,
+        "prompt_tokens": value.get("prompt_tokens") or 0,
+        "completion_tokens": value.get("completion_tokens") or 0,
+    })
+    if breakdown is None:
+        raise ValueError("journaled token usage is invalid")
+    return breakdown
 
 
 _MANAGED_USAGE_KEYS = {
@@ -1924,6 +1925,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
         capability_snapshot = run.capability_snapshot
         pricing_snapshot = run.pricing_snapshot
         existing_message_id = run.assistant_message_id
+    logger.info("durable chat run claimed run_id=%s", _safe_log_token(run_id))
     run_kind = getattr(run, "run_kind", "completion")
 
     if run_kind == "image":
@@ -1960,7 +1962,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
                     try:
                         renewed = await _renew_lease(run_id, owner)
                     except Exception:
-                        logger.exception("durable compaction lease renewal failed run_id=%s owner=%s", run_id, owner)
+                        logger.warning("durable compaction lease renewal failed run_id=%s", _safe_log_token(run_id))
                         renewed = False
                     if not renewed:
                         lease_lost.set()
@@ -1986,14 +1988,13 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
             else:
                 await _finish(run_id, status="completed", message_id=None, owner=owner)
         except DurableRunLeaseLost:
-            logger.warning("stopped stale durable compaction run_id=%s owner=%s", run_id, owner)
+            logger.warning("stopped stale durable compaction run_id=%s", _safe_log_token(run_id))
         except asyncio.CancelledError:
             raise
         except context_manager.ContextLimitExceeded as exc:
             logger.warning(
-                "durable compaction rejected run_id=%s code=%s",
-                run_id,
-                getattr(exc, "code", "compaction_failed"),
+                "durable compaction rejected run_id=%s error_code=%s",
+                _safe_log_token(run_id), _safe_error_code(getattr(exc, "code", None), fallback="compaction_failed"),
             )
             if await _cancel_requested(run_id):
                 await _finish(
@@ -2014,7 +2015,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
                     safe_message="컨텍스트 압축을 완료하지 못했습니다",
                 )
         except Exception:
-            logger.exception("manual compaction failed run_id=%s", run_id)
+            logger.warning("manual compaction failed run_id=%s", _safe_log_token(run_id))
             if await _cancel_requested(run_id):
                 await _finish(
                     run_id,
@@ -2207,11 +2208,11 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
                 try:
                     renewed = await _renew_lease(run_id, owner)
                 except Exception:
-                    logger.exception("durable chat lease renewal failed run_id=%s owner=%s", run_id, owner)
+                    logger.warning("durable chat lease renewal failed run_id=%s", _safe_log_token(run_id))
                     renewed = False
                 if not renewed:
                     lease_lost.set()
-                    logger.warning("durable chat run lease was lost run_id=%s owner=%s", run_id, owner)
+                    logger.warning("durable chat run lease was lost run_id=%s", _safe_log_token(run_id))
                     return
 
     heartbeat_task = asyncio.create_task(heartbeat())
@@ -2342,6 +2343,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
             api_base=resolved.get("api_base"),
             api_key=resolved.get("api_key"),
             provider_auth=resolved.get("provider_auth"),
+            token_rates=pricing_snapshot.get("token_rates") or {},
             max_tokens=payload.get("max_tokens"),
             temperature=payload.get("temperature"),
             reasoning_effort=payload.get("reasoning_effort"),
@@ -2615,7 +2617,10 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
                     value = event.get("usage")
                     if isinstance(value, dict):
                         usage_breakdown = _usage_payload_breakdown(value)
-                        usage = usage_breakdown.as_usage_dict()
+                        usage = {**usage_breakdown.as_usage_dict(), **(
+                            {"required_token_modalities": value["required_token_modalities"]}
+                            if "required_token_modalities" in value else {}
+                        )}
                     emitted_tool_usage = event.get("tool_usage")
                     if isinstance(emitted_tool_usage, list):
                         managed_tool_usage = [item for item in emitted_tool_usage if isinstance(item, dict)]
@@ -2676,6 +2681,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
             prompt_tokens=usage["prompt_tokens"],
             completion_tokens=usage["completion_tokens"],
             breakdown=usage_breakdown,
+            required_modalities=usage.get("required_token_modalities"),
         )
         managed_cost, managed_components = _managed_usage_components(
             managed_tool_usage,
@@ -2694,8 +2700,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
             and usage_cost.pricing_status == "priced"
         ):
             usage_cost = replace(usage_cost, pricing_status="partial")
-        usage_components = _token_usage_components(
-            usage_breakdown,
+        usage_components = credit.token_usage_components(
             usage_cost,
             segment_id="executor:aggregate",
             source="executor",
@@ -2752,9 +2757,9 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
             child_result=child_result,
         )
     except DurableRunLeaseLost:
-        logger.warning("stopped stale durable chat worker run_id=%s owner=%s", run_id, owner)
+        logger.warning("stopped stale durable chat worker run_id=%s", _safe_log_token(run_id))
     except asyncio.CancelledError:
-        logger.info("durable chat worker interrupted; deferring run recovery run_id=%s owner=%s", run_id, owner)
+        logger.info("durable chat worker interrupted; deferring run recovery run_id=%s", _safe_log_token(run_id))
         raise
     except DurableRunProviderResultUnknown:
         await _finish(
@@ -2796,8 +2801,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
         try:
             await flush_deltas(check_cancel=False)
         except Exception:
-            logger.exception("failed to persist buffered chat deltas run_id=%s", run_id)
-        logger.exception("durable chat provider execution failed run_id=%s", run_id)
+            logger.warning("failed to persist buffered chat deltas run_id=%s", _safe_log_token(run_id))
         await _finish(
             run_id,
             status="failed",

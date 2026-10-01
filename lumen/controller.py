@@ -20,6 +20,7 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 
 from lumen.config import get_settings
 from lumen.db import close_db, init_db
+from lumen.logging_config import configure_logging
 from lumen.plugins.host import build_host
 from lumen.plugins.registry import get_registry
 from lumen.services.infrastructure.bootstrap import _ca, make_bootstrap_router
@@ -77,7 +78,7 @@ def internal_server(config: RuntimeConfig) -> Server:
         http=InternalH11Protocol, ws="none", proxy_headers=False,
         ssl_certfile=config.tls.cert_file, ssl_keyfile=config.tls.key_file,
         ssl_ca_certs=config.tls.ca_file, ssl_cert_reqs=ssl.CERT_OPTIONAL,
-        access_log=False, timeout_keep_alive=5,
+        access_log=False, timeout_keep_alive=5, log_config=None,
     )
     return Server(options)
 
@@ -134,11 +135,17 @@ async def run_controller(config: RuntimeConfig, providers: dict[str, object], *,
             or server_cert.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
             != server_key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)):
         raise ValueError("controller listener certificate does not match configured CA/key")
+    enabled_pools = sum(pool.enabled for pool in config.pools)
+    logger.info("controller preflight started enabled_pools=%d", enabled_pools)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("controller preflight state provider_count=%d tls_configured=%s",
+                     len(providers), config.tls is not None)
     for pool in config.pools:
         if pool.enabled:
             if pool.name not in providers:
                 raise ValueError(f"missing provider for pool {pool.name}")
             await asyncio.to_thread(providers[pool.name].preflight, pool)
+    logger.info("controller preflight complete enabled_pools=%d", enabled_pools)
     controller = ResourceController(config, providers, owner=f"{os.uname().nodename}-{uuid.uuid4()}",
                                     db_pool_size=db_pool_size, db_overflow=db_overflow)
     server = internal_server(config)
@@ -148,10 +155,22 @@ async def run_controller(config: RuntimeConfig, providers: dict[str, object], *,
     async def _watch() -> None:
         if stop is not None:
             await stop.wait()
+            logger.info("controller drain started")
             controller.stop()
             server.should_exit = True
 
+    async def _log_ready() -> None:
+        while not server_task.done() and not reconcile_task.done():
+            if server.started:
+                logger.info("controller listener ready enabled_pools=%d", enabled_pools)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("controller ready state listener_started=%s reconciliation_running=%s",
+                                 server.started, not reconcile_task.done())
+                return
+            await asyncio.sleep(0.05)
+
     watcher = asyncio.create_task(_watch()) if stop is not None else None
+    ready_watcher = asyncio.create_task(_log_ready())
     try:
         done, _ = await asyncio.wait({server_task, reconcile_task}, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
@@ -159,11 +178,15 @@ async def run_controller(config: RuntimeConfig, providers: dict[str, object], *,
         if server_task in done and not server.started and stop is None:
             raise RuntimeError("controller TLS listener did not start")
     finally:
+        logger.info("controller shutdown started")
         controller.stop()
         server.should_exit = True
         if watcher is not None:
             watcher.cancel()
+        ready_watcher.cancel()
         await asyncio.gather(server_task, reconcile_task, return_exceptions=True)
+        await asyncio.gather(ready_watcher, return_exceptions=True)
+        logger.info("controller shutdown complete")
 
 
 async def _serve() -> None:
@@ -190,5 +213,10 @@ async def _serve() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(_serve())
+    configure_logging("controller")
+    logger.info("controller starting")
+    try:
+        asyncio.run(_serve())
+    except Exception:
+        logger.error("controller stopped with error")
+        raise
