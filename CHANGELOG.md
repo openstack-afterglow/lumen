@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Explicit modality pricing:** Image-model discovery/registration and independent text/image/audio input, cached-input and output rates use the existing media JSON and text columns. Exact second/minute/hour, character, image-unit, whole-session and provider-token billing remain separate; omitted basis preserves legacy behavior. Actual reported modality/cache usage settles at frozen prices, with whole-request token envelopes and early encrypted usage checkpoints preserving unknown holds on uncertain or downstream-failed results. No new migration, publication, deployment or paid-provider pricing verification is included.
+- **Multimodal chat settlement:** Canonical image/audio token usage survives checkpoints without cache-creation fields. Text-only rounds after compaction retain earlier media charges; only validated media absence contributes zero to aggregation. Requested media with missing or ambiguous usage is never estimated.
+- **Timed native transcription:** Native `POST /v1/chat/audio/transcriptions` accepts optional `timestamp_granularities: ["segment"]`, only on executable direct OpenAI `whisper-1` (capabilities expose `available_timestamp_granularities`). Lumen sends `verbose_json` with `timestamp_granularities[]=segment`, keeps only validated provider start/end seconds and text, and returns `segments` with `text`; Lumen never infers timing. Explicit timing is part of the idempotent intent, while omitted or empty requests keep the legacy intent hash and `{text}` response. Compat transcription formats are unchanged. No migration.
+
 ## 0.4.0 (release candidate)
 
 Changes since `v0.3.1`:
@@ -12,6 +18,7 @@ Changes since `v0.3.1`:
 - **Production shared-message lineage:** Merged the shared graph/fork ownership feature already running in production at revision `e2b2263`; its applied `019-shared-message-membership` SQL and checksum remain byte-identical. New forks share immutable encrypted ancestors while per-conversation owner/project membership gates access; deleting the source preserves surviving forks. The unreleased media migration is numbered 020, not another 019. A stopped-writer backup and coordinated API/worker upgrade remain required before deploying this combined release.
 
 - **Kolla 진단 로그:** API HTTP route template·상태 코드와 durable worker의 run ID·실패 코드를 Kolla 로그 볼륨의 분리된 프로세스 파일에 기록한다. 원문 URL/query·인증 정보·요청/응답 본문은 기록하지 않는다. Native completions의 HTTP 202는 실행 성공이 아니므로 이후 `run.failed` 이벤트와 worker 기록을 대조해야 한다. 이 진단 개선은 운영 OpenAI 모델 실패 원인 확인이나 실제 서비스 배포를 의미하지 않는다.
+- **공식 OpenAI Responses 라우팅:** Native 대화와 chat-shaped stateless 호출의 공식 OpenAI direct route를 LiteLLM Responses bridge로 전환한다. Provider-neutral 이벤트와 tool 결과/usage는 유지하며 외부 OpenAI-compatible URL과 subscription은 바꾸지 않는다. Catalog 미등록 모델도 native SSE를 사용하고 `response.completed`가 없는 native run은 성공 처리하지 않는다. Fake provider의 text/tool/usage·wire 경계 검증은 운영 대시보드 모델 성공 증거가 아니다.
 
 **Release boundary:** Package and Kolla image default target `0.4.0`. Publish the `v0.4.0` multi-architecture GHCR images and root wheel, then perform a controlled migration-before-start Kolla cutover; publishing artifacts alone does not deploy them. SDK/plugins/sandbox retain independent versions, and source-build mode needs an explicitly updated commit pin. Verified remote text and local media calls do not prove production media, invoice accuracy, or a live Afterglow dashboard.
 

@@ -244,6 +244,17 @@ def begin_segment_io(segment: ChatRunSegment) -> None:
     segment.provider_started_at = datetime.now(UTC)
 
 
+def record_segment_usage(segment: ChatRunSegment, usage_payload: Mapping[str, Any] | None) -> None:
+    """Encrypt bounded observed usage without completing or reopening provider I/O.
+
+    Caller must hold the run/segment lock and prove its lease before committing.
+    This preserves usage if asset persistence fails after a paid provider call.
+    """
+    if segment.status != "provider_started":
+        raise RunStoreError(f"segment cannot record usage from {segment.status}")
+    segment.usage_payload = _encode_segment_payload(usage_payload, max_bytes=_MAX_SEGMENT_USAGE_BYTES)
+
+
 def complete_segment_io(
     segment: ChatRunSegment,
     *,
@@ -253,10 +264,14 @@ def complete_segment_io(
     """Encrypt bounded observed result/usage before the caller commits the checkpoint boundary."""
     if segment.status != "provider_started":
         raise RunStoreError(f"segment cannot complete from {segment.status}")
+    # Provider text checkpoints (chat output, bounded transcripts with optional
+    # segment timing) exceed the small tool/media-reference payload limit.
+    result_limit = (_MAX_PROVIDER_RESULT_BYTES if segment.endpoint in {"chat_completions", "audio_stt"}
+                    else _MAX_SEGMENT_RESULT_BYTES)
+    result = _encode_segment_payload(result_payload, max_bytes=result_limit)
+    record_segment_usage(segment, usage_payload)
+    segment.result_payload = result
     segment.status = "completed"
-    result_limit = _MAX_PROVIDER_RESULT_BYTES if segment.endpoint == "chat_completions" else _MAX_SEGMENT_RESULT_BYTES
-    segment.result_payload = _encode_segment_payload(result_payload, max_bytes=result_limit)
-    segment.usage_payload = _encode_segment_payload(usage_payload, max_bytes=_MAX_SEGMENT_USAGE_BYTES)
     segment.completed_at = datetime.now(UTC)
 
 

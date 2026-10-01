@@ -2,19 +2,23 @@
 
 import os
 from unittest.mock import MagicMock
+from urllib.parse import urlsplit
 
 os.environ.setdefault("LUMEN_ENCRYPTION_KEY", "0123456789abcdef" * 4)
 os.environ.setdefault("CORS_ORIGINS", "http://localhost:3080")
 
 import fakeredis.aioredis
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
+from starlette.testclient import _TestClientTransport
 
 from lumen.auth import get_os_conn, get_principal, require_token
 from lumen.config import get_settings
 from lumen.main import app
 from lumen.plugins.host import build_host
 from lumen.plugins.registry import get_registry
+from lumen.services.ssrf import SafeAsyncTransport
 
 
 class _LegacyChatPathAdapter:
@@ -32,6 +36,49 @@ class _LegacyChatPathAdapter:
                 )
                 scope = {**scope, "path": rewritten, "raw_path": rewritten.encode("ascii")}
         await self.application(scope, receive, send)
+
+
+@pytest.fixture(autouse=True)
+def _block_live_provider_requests(monkeypatch):
+    """Tests may use in-process transports and loopback, never paid APIs."""
+    for name in (
+        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY", "PERPLEXITYAI_API_KEY", "XAI_API_KEY", "DEEPSEEK_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    def allowed(client, request):
+        transport = getattr(client, "_transport", None)
+        if isinstance(transport, (httpx.ASGITransport, httpx.MockTransport, _TestClientTransport)):
+            return
+        host = urlsplit(str(request.url)).hostname
+        # The SSRF contract tests use these fixture hosts with a resolver that
+        # rejects before any socket is opened.
+        if isinstance(transport, SafeAsyncTransport) and host in {"example.com", "api.example"}:
+            return
+        # System tests run in a disposable Compose network, not on host loopback.
+        if (
+            os.environ.get("LUMEN_API_BASE_URL") == "http://lumen-api:8012"
+            and request.url.scheme == "http"
+            and (host, request.url.port) in {("lumen-api", 8012), ("fake-provider", 8080)}
+        ):
+            return
+        if host not in {"127.0.0.1", "::1", "localhost"}:
+            raise AssertionError(f"unmocked outbound HTTP in test: {host}")
+
+    original_async_send = httpx.AsyncClient.send
+    original_send = httpx.Client.send
+
+    async def guarded_async_send(client, request, *args, **kwargs):
+        allowed(client, request)
+        return await original_async_send(client, request, *args, **kwargs)
+
+    def guarded_send(client, request, *args, **kwargs):
+        allowed(client, request)
+        return original_send(client, request, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", guarded_async_send)
+    monkeypatch.setattr(httpx.Client, "send", guarded_send)
 
 
 @pytest.fixture(autouse=True)

@@ -10,12 +10,22 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+from dataclasses import dataclass
 from decimal import Decimal
 
 import httpx
 
+from lumen.services.usage_breakdown import UsageBreakdown
+
 from .errors import ProviderValidationError
-from .pricing import exact_media_price
+from .pricing import (
+    exact_media_price,
+    media_billing_basis,
+    media_reservation_usd,
+    route_media_pricing_available,
+    route_token_rates,
+    validate_media_pricing,
+)
 
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024  # Generated-asset persistence limit.
 _MAX_SOURCE_BYTES = 5 * 1024 * 1024
@@ -34,6 +44,38 @@ _MIMES = {"image/png", "image/jpeg", "image/webp"}
 
 class ImageTransportError(RuntimeError):
     """An image provider failed or returned an unusable bounded result."""
+
+
+@dataclass(frozen=True)
+class ImageResult:
+    images: list[tuple[bytes, str]]
+    usage: UsageBreakdown | None = None
+
+
+def _image_usage(route: dict, result: dict, provider: str) -> UsageBreakdown | None:
+    if image_billing_basis(route) != "tokens":
+        return None
+    raw = result.get("usage")
+    try:
+        if not isinstance(raw, dict):
+            raise ValueError("image usage is missing")
+        if provider == "openai":
+            output_details = raw.get("output_tokens_details")
+            if not isinstance(output_details, dict) or "image_tokens" not in output_details:
+                raise ValueError("image output modality usage is missing")
+            parsed = UsageBreakdown.from_openai_media(raw)
+        else:
+            output_details = raw.get("output_tokens_by_modality")
+            if not isinstance(output_details, list) or not any(
+                isinstance(item, dict) and item.get("modality") == "image" for item in output_details
+            ):
+                raise ValueError("image output modality usage is missing")
+            parsed = UsageBreakdown.from_gemini_interactions(raw)
+        if parsed is None or "image" not in parsed.modality_tokens:
+            raise ValueError("image modality usage is missing")
+        return parsed
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ImageTransportError("image provider token usage is unavailable or invalid") from exc
 
 
 def _model(route: dict) -> tuple[str, str]:
@@ -59,16 +101,20 @@ def _model(route: dict) -> tuple[str, str]:
     return provider, model
 
 
+def image_billing_basis(route: dict) -> str:
+    return media_billing_basis("image", route.get("media_pricing"))
+
+
 def validate_image_request(route: dict, *, size: str, quality: str, n: int, edit: bool) -> Decimal:
-    """Return exact configured USD per image; reject all unpriced or unsupported variants.
+    """Return USD per unit or the whole-request token envelope, before provider I/O.
 
     OpenAI GPT Image 1/1-mini/1.5: sizes auto, 1024x1024, 1536x1024,
     1024x1536; qualities auto, low, medium, high; count 1–10.
     Gemini 2.5 Flash Image: same sizes, quality auto, count 1. Gemini 3
     Pro/3.1 Flash Image: same sizes, quality auto/1k/2k/4k, count 1.
     Gemini dimension presets select output aspect ratio, not guaranteed pixels.
-    Every combination, including auto, requires an exact ``image_variants``
-    entry; ``image_per_unit`` is insufficient for variant-based billing.
+    Unit mode requires an exact ``image_variants`` entry for every requested
+    combination, including auto; token mode prices actual provider counts only.
     """
     provider, model = _model(route)
     if not isinstance(size, str) or size not in _SIZES or not isinstance(quality, str):
@@ -85,6 +131,14 @@ def validate_image_request(route: dict, *, size: str, quality: str, n: int, edit
         qualities = {"auto", "1k", "2k", "4k"}
     if quality not in qualities:
         raise ProviderValidationError("unsupported image quality")
+    if image_billing_basis(route) == "tokens":
+        pricing = validate_media_pricing("image", route.get("media_pricing"))
+        reservation = media_reservation_usd(pricing)
+        if reservation is None or not route_media_pricing_available({**route, "media_pricing": pricing}):
+            raise ProviderValidationError("image token pricing or reservation is unavailable")
+        if edit and "input_per_million" not in route_token_rates(route).get("image", {}):
+            raise ProviderValidationError("image input token price is unavailable")
+        return reservation
     pricing = route.get("media_pricing")
     variants = pricing.get("image_variants") if isinstance(pricing, dict) else None
     variant = f"{size}:{quality}"
@@ -108,10 +162,16 @@ def _image_mime(data: bytes) -> str:
 
 
 def available_image_variants(route: dict) -> list[str]:
-    """List only exact, positive, transport-supported priced size:quality keys."""
+    """List executable size:quality choices for the route's selected billing basis."""
     pricing = route.get("media_pricing")
-    variants = pricing.get("image_variants") if isinstance(pricing, dict) else None
-    if not isinstance(variants, dict):
+    try:
+        if image_billing_basis(route) == "tokens":
+            variants = {f"{size}:{quality}" for size in _SIZES for quality in ("auto", "low", "medium", "high", "1k", "2k", "4k")}
+        else:
+            variants = pricing.get("image_variants") if isinstance(pricing, dict) else None
+    except ProviderValidationError:
+        return []
+    if not isinstance(variants, (dict, set)):
         return []
     available = []
     for variant in variants:
@@ -182,8 +242,8 @@ async def _post(url: str, *, headers: dict, count: int, json_body: dict | None =
 
 
 async def generate_images(route: dict, *, prompt: str, size: str, quality: str, n: int,
-                          source_image: bytes | None = None, source_mime: str | None = None) -> list[tuple[bytes, str]]:
-    """Execute exactly one direct API call with bounded inline image outputs only."""
+                          source_image: bytes | None = None, source_mime: str | None = None) -> ImageResult:
+    """Execute one direct call, preserving provider usage alongside bounded image bytes."""
     validate_image_request(route, size=size, quality=quality, n=n, edit=source_image is not None)
     provider, model = _model(route)
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > _MAX_PROMPT_CHARS:
@@ -210,7 +270,7 @@ async def generate_images(route: dict, *, prompt: str, size: str, quality: str, 
             raise ImageTransportError("image provider returned an unexpected image count")
         if any(not isinstance(item, dict) or "url" in item for item in data):
             raise ImageTransportError("image provider returned a URL instead of inline data")
-        return [_decode_image(item.get("b64_json")) for item in data]
+        return ImageResult([_decode_image(item.get("b64_json")) for item in data], _image_usage(route, result, provider))
 
     inputs: list[dict] = [{"type": "text", "text": prompt}]
     if source_image is not None:
@@ -249,4 +309,4 @@ async def generate_images(route: dict, *, prompt: str, size: str, quality: str, 
                 images.append(_decode_image(content.get("data"), content.get("mime_type")))
     if len(images) != 1:
         raise ImageTransportError("image provider returned an unexpected image count")
-    return images
+    return ImageResult(images, _image_usage(route, result, provider))

@@ -47,6 +47,8 @@ Lumen의 chat/agent·title·compaction은 설치된 LiteLLM 1.93의 parameter ma
 - Worker가 고정한 provider/model `config_version_hash`별로 reasoning 오류를 기억한다. 이름이 같은 다른 route나 새 configuration에 memo를 공유하지 않으며, frozen identity가 없는 호출은 process-wide memo를 재사용하지 않는다. 검증된 명시 `none`은 stale LiteLLM probe 때문에 생략하거나 오류 후 provider 기본 reasoning으로 바꾸지 않는다.
 - OpenAI wire에서는 explicit `none`의 `reasoning_effort`만 LiteLLM whitelist에 추가해 unknown model에서 `drop_params`가 조용히 삭제하지 못하게 한다. Provider가 이 값을 실제 거부하면 실패를 그대로 처리하며, 이 OpenAI override를 Anthropic/Gemini native mapping에 적용하지 않는다.
 
+공식 OpenAI direct route(`provider_type=openai`, `api_base` 없음 또는 공식 `https://api.openai.com[/v1]`)의 native 대화, title 및 stateless Chat Completions 호환 입력은 LiteLLM의 explicit Responses bridge를 통해 upstream `/v1/responses`로 전송한다. 외부 OpenAI-compatible base에는 적용하지 않고 ChatGPT subscription도 별도 인증/transport를 유지한다. 이는 공개 Lumen endpoint나 `chat_conversation.completions` action 이름을 바꾸지 않는다. Catalog에 없는 공식 모델은 요청 범위에서 native SSE를 사용하며 알려진 non-streaming 모델의 LiteLLM 판단은 유지한다. Native graph는 실제 `response.completed` 없는 스트림을 실패로 기록하고 Chat Completions로 자동 재요청하지 않는다(중복 과금/툴 실행 방지). 이 계약은 로컬 synthetic provider를 통한 wire/graph 검증이며 운영 `gpt-6-sol` 완료 증거가 아니다.
+
 Caller가 파라미터를 소유하는 compat 경로는 Opus 5.5 제약을 대신 맞춰 주지 않는다.
 - Anthropic-native `/v1/messages` passthrough는 caller 파라미터를 바꾸지 않는다. `thinking.type: "disabled"`, `budget_tokens`, 강제 `tool_choice`를 보내면 provider의 400이 그대로 반환된다.
 - OpenAI-compatible `/v1/chat/completions`도 caller의 `tool_choice`를 전달한다. LiteLLM은 `required`를 제거하지 않고 Anthropic `{"type": "any"}`로 변환하므로 역시 provider 400이 된다.
@@ -97,6 +99,8 @@ Media reservation은 provider I/O 직전에 user wallet row lock으로 월·주�
 
 Kolla 역할은 API·worker·controller의 `LUMEN_LOG_DIRECTORY=/var/log/kolla/lumen`을 설정하고 `kolla_logs` 볼륨에 프로세스별 `api.log`, `worker.log`, `controller.log`를 남긴다. 디렉터리 소유권은 컨테이너의 비root API·worker 사용자에 맞춰 기동 전에 준비한다. 이 변수를 설정하지 않은 로컬 개발에서는 파일 로그를 만들지 않으며 기존 표준 출력/오류 로그를 유지한다. 운영 파일 접근 권한과 보존·수집 정책은 호스트 로그 관리자에게 위임한다.
 
+세 프로세스는 동일한 `LOG_LEVEL`(기본 `INFO`)을 적용한다. INFO에서 API는 ready/stopped·HTTP 결과, worker는 기동/claim/drain/종료와 commit된 run의 terminal status, controller는 기동/종료 상태를 남긴다. `LOG_LEVEL=DEBUG`는 장애 조사에만 일시적으로 사용한다. DEBUG 기록은 query/state/result의 상태·종류·개수 등 허용된 메타데이터로 한정한다. SQL 문장·bind 값, 원문 prompt, 사용자 제공 tool 인자, provider 응답·예외 문자열, 인증 정보는 DEBUG에서도 남기지 않는다. 로그 파일은 콘텐츠가 아니어도 run 식별자를 포함할 수 있으므로 운영 접근제어·보존 정책을 적용한다.
+
 `api.log`의 HTTP 기록은 method, 매칭된 route template, 응답 상태만 담는다. 실제 URL path의 대화 ID, query string의 1회용 token, 인증 헤더·cookie, 요청·응답 본문은 기록하지 않는다. 채팅 completions의 `202`는 durable run 접수만 뜻한다. 실패를 판정할 때는 응답의 `run_id`로 소유자 인증을 거친 `/v1/runs/{run_id}/events`의 `run.failed` `error_code`·`safe_message`를 확인하고, 같은 ID의 `worker.log` terminal failure/error type을 대조한다. 일반적인 provider 실행 실패는 원문 예외·upstream 응답 본문을 로그에 쓰지 않는다. `/v1/ready`는 worker 추론 성공의 증거가 아니다.
 
 ## Queue, lease, recovery
@@ -110,6 +114,10 @@ Worker lease는 45초다. run이 `running`이 아니거나 lease owner/expiry가
 ## Migration과 cutover
 
 적용된 SQL migration/checksum은 immutable이다. 유지보수 cutover는 admission 차단·API/worker/controller stop → backup/DB readiness → `lumen-migrate --apply` → 호환 API/worker/controller start 순서다. 적용 뒤 동일 command를 다시 실행해 pending migration이 없는지 확인한다. Kolla의 migration-before-start 자동화만으로 **기존 실행 중인 컨테이너를 중지했다는 뜻은 아니다**. rolling mixed-version deployment는 지원 전제가 아니다.
+
+초기 media 후보를 `019-media-model-registry` / `019_media_model_registry.sql`로 적용한 DB에서 canonical `020-media-model-registry`가 `Duplicate column name 'model_kind'`로 실패할 수 있다. Runner는 두 SQL의 SHA-256이 정확히 `51f2d55f7ec84b8273a8b16ae5c92dd0269cc8dac88b8ac4c7b763b127a98d05`이고 기존 `model_kind`가 `VARCHAR(16) NOT NULL DEFAULT 'text'`, `media_pricing`이 nullable JSON(MariaDB의 LONGTEXT + 정확한 JSON_VALID 제약)이면 DDL 없이 canonical 이력만 추가한다. 예전 이력과 모든 데이터는 그대로 보존한다. Dry-run은 이력을 추가하지 않고 pending으로 보고한다. 파일명·checksum·열·JSON 제약 불일치 또는 예전 ledger가 없는 duplicate column은 자동 승인하지 않는다.
+
+이 오류를 SQL 변경·ledger 삭제·`down --volumes`로 우회하지 않는다. 실제 build context의 수정된 API/worker 이미지를 다시 빌드하고 기존 DB에 `lumen-migrate --apply`를 실행한 뒤 같은 명령의 재실행과 `/v1/ready`를 확인한다. 이 adoption은 media migration의 정확한 과거 identity에만 해당하며 shared-message migration 019나 다른 migration을 별칭으로 처리하지 않는다.
 
 0.4.0의 migration 020이 기존 text model에 채우는 `model_kind=text`·`media_pricing=NULL`은 그 자체로 v0.3.1의 frozen route HMAC을 변경하지 않는다. 중단 시 queued run은 동일한 provider/model/key/가격·capabilities를 유지하면 재개할 수 있고, 실제 설정 변경으로 hash가 달라지면 종전처럼 실행을 거부한다. Media route의 kind·가격 변경은 별도 hash에 포함한다. ORM DB fixture에 v0.3.1의 고정 HMAC을 핀한 회귀를 적용한 후 rollout한다.
 

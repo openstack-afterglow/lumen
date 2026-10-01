@@ -471,3 +471,59 @@ async def test_media_provider_cannot_switch_to_custom_base_or_subscription(provi
             await repository.update_provider(1, patch)
     unchanged = await routing.resolve_api_model("gpt-image-1", model_kind="image")
     assert unchanged["config_version_hash"] == original["config_version_hash"]
+
+
+async def test_media_token_prices_survive_admin_roundtrip_and_frozen_settlement(provider_db, admin_client, monkeypatch):
+    from lumen.services import credit
+    from lumen.services.usage_breakdown import UsageBreakdown
+
+    add_provider, _add_model, _model_name = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr(routing, "_resolved_base_prices", pricing._resolved_base_prices)
+    monkeypatch.setattr(routing, "_effective_capabilities", pricing._effective_capabilities)
+    monkeypatch.setattr(routing, "_pricing_aware_capabilities", pricing._pricing_aware_capabilities)
+    token_rates = {"image": {"input_per_million": "8", "cache_read_per_million": "2", "output_per_million": "32"}}
+    # Reference image pricing: text input and cached input, no text output rate.
+    created = await admin_client.post("/api/v1/chat/admin/models", json={
+        "provider_id": 1, "model_name": "gpt-image-2", "model_kind": "image",
+        "input_price_per_million": "5", "cache_read_price_per_million": "1.25",
+        "media_pricing": {"billing_basis": "tokens", "reservation_usd": "1", "token_rates": token_rates},
+    })
+    assert created.status_code == 201, created.text
+    listed = next(row for row in (await admin_client.get("/api/v1/chat/admin/models")).json()
+                  if row["model_name"] == "gpt-image-2")
+    assert listed["media_pricing"]["token_rates"] == token_rates
+    assert Decimal(listed["input_price_per_million"]) == 5
+    assert listed["output_price_per_million"] is None
+    assert Decimal(listed["cache_read_price_per_million"]) == Decimal("1.25")
+
+    usage = UsageBreakdown.from_openai_media({
+        "input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500,
+        "input_tokens_details": {"text_tokens": 200, "image_tokens": 800, "cached_tokens": 300,
+                                 "cached_tokens_details": {"text_tokens": 100, "image_tokens": 200}},
+        "output_tokens_details": {"text_tokens": 0, "image_tokens": 500},
+    })
+    required = ("image_input", "image_output")
+
+    def settle(snapshot):
+        return credit.usage_cost_from_pricing_snapshot(
+            snapshot, prompt_tokens=1000, completion_tokens=500, breakdown=usage, required_modalities=required
+        )
+
+    admitted = pricing.frozen_token_pricing(await routing.resolve_api_model("gpt-image-2", model_kind="image"))
+    # text 100*5 + text cache 100*1.25 + image 600*8 + image cache 200*2 + image output 500*32 per million
+    assert settle(admitted).raw_cost == Decimal("0.021825")
+
+    # Changed-only PATCH without model_kind: media text input may change while output stays unpriced.
+    patched = await admin_client.patch(f"/api/v1/chat/admin/models/{created.json()['id']}", json={
+        "input_price_per_million": "6", "output_price_per_million": None,
+        "media_pricing": {"billing_basis": "tokens", "reservation_usd": "1",
+                          "token_rates": {"image": {**token_rates["image"], "output_per_million": "40"}}},
+    })
+    assert patched.status_code == 200, patched.text
+    current = pricing.frozen_token_pricing(await routing.resolve_api_model("gpt-image-2", model_kind="image"))
+    # text input now 100*6 and image output 500*40 per million
+    assert settle(current).raw_cost == Decimal("0.025925")
+    # The admission snapshot keeps settling at its frozen rates after the edit.
+    assert settle(admitted).raw_cost == Decimal("0.021825")

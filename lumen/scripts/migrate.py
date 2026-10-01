@@ -228,6 +228,74 @@ async def _record_migration(connection, migration: Migration) -> None:
     )
 
 
+async def _historical_media_registry_applied(connection, migration: Migration) -> bool:
+    """Accept only the byte-identical media SQL shipped under the old 019 identity."""
+    if migration.logical_id != "020-media-model-registry":
+        return False
+    row = (
+        await connection.execute(
+            text("SELECT relative_path, sha256 FROM schema_migrations WHERE logical_id = '019-media-model-registry'")
+        )
+    ).first()
+    if row is None:
+        return False
+    historical_checksum = "51f2d55f7ec84b8273a8b16ae5c92dd0269cc8dac88b8ac4c7b763b127a98d05"
+    if (
+        row.relative_path != "019_media_model_registry.sql"
+        or row.sha256 != historical_checksum
+        or migration.sha256 != historical_checksum
+    ):
+        raise MigrationLedgerError("historical media migration identity drift: 019-media-model-registry")
+
+    columns = {
+        column.COLUMN_NAME: column
+        for column in (
+            await connection.exec_driver_sql(
+                """
+                SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLUMN_DEFAULT
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'llm_models'
+                  AND COLUMN_NAME IN ('model_kind', 'media_pricing')
+                """
+            )
+        ).all()
+    }
+    kind = columns.get("model_kind")
+    pricing = columns.get("media_pricing")
+    if (
+        kind is None
+        or kind.DATA_TYPE != "varchar"
+        or kind.CHARACTER_MAXIMUM_LENGTH != 16
+        or kind.IS_NULLABLE != "NO"
+        or kind.COLUMN_DEFAULT not in ("text", "'text'")
+        or pricing is None
+        or pricing.DATA_TYPE not in ("json", "longtext")
+        or pricing.IS_NULLABLE != "YES"
+        or pricing.COLUMN_DEFAULT not in (None, "NULL")
+    ):
+        raise MigrationLedgerError("historical media migration schema drift: llm_models")
+    if pricing.DATA_TYPE == "longtext":
+        checks = (
+            (
+                await connection.exec_driver_sql(
+                    """
+                SELECT CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS
+                WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'llm_models'
+                """
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not any(
+            "".join(clause.lower().replace("`", "").split())
+            in {"json_valid(media_pricing)", "(json_valid(media_pricing))"}
+            for clause in checks
+        ):
+            raise MigrationLedgerError("historical media migration schema drift: media_pricing JSON constraint")
+    return True
+
+
 async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
     if not database_url:
         raise MigrationLedgerError("database URL is required")
@@ -260,7 +328,12 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
                         raise MigrationLedgerError(f"applied migration identity drift: {migration.logical_id}")
                     continue
                 pending.append(migration.logical_id)
+                historical_media_applied = await _historical_media_registry_applied(connection, migration)
                 if not apply:
+                    continue
+                if historical_media_applied:
+                    # Preserve the original ledger row; add the canonical identity without repeating DDL.
+                    await _record_migration(connection, migration)
                     continue
                 for statement in _statements(MIGRATIONS / migration.relative_path):
                     await connection.exec_driver_sql(statement)

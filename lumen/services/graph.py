@@ -33,7 +33,12 @@ from lumen.services.checkpointer import chat_checkpointer
 from lumen.services.providers.errors import ProviderSubscriptionError
 from lumen.services.tool_runtime import bindings, contracts, dispatch, selection
 from lumen.services.tools import ToolContext
-from lumen.services.usage_breakdown import CACHE_USAGE_KEYS, UsageBreakdown
+from lumen.services.usage_breakdown import (
+    ModalityTokens,
+    UsageBreakdown,
+    modality_token_charges,
+    required_modalities_for_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -374,11 +379,36 @@ def _usage_breakdown(usage) -> UsageBreakdown | None:
 def _replayed_usage(value: object) -> UsageBreakdown:
     """Journaled round usage; entries written before cache accounting carry no split."""
     value = value if isinstance(value, dict) else {}
-    return UsageBreakdown.from_totals(
-        max(0, int(value.get("prompt_tokens", 0))),
-        max(0, int(value.get("completion_tokens", 0))),
-        **{key: value.get(key, 0) for key in CACHE_USAGE_KEYS},
-    )
+    breakdown = UsageBreakdown.from_runtime({
+        **value,
+        "prompt_tokens": value.get("prompt_tokens") or 0,
+        "completion_tokens": value.get("completion_tokens") or 0,
+    })
+    if breakdown is None:
+        raise ValueError("journaled token usage is invalid")
+    return breakdown
+
+
+def _round_usage_for_sum(
+    usage: UsageBreakdown, token_rates: dict[str, dict[str, Any]], required: list[str],
+) -> UsageBreakdown:
+    """A validated text-only call contributes zero media, not an unknown split.
+
+    Keep checkpoints as reported. Only aggregation uses actual-call absence
+    evidence; missing shares on requested media still fail before this point.
+    """
+    if not token_rates:
+        return usage
+    modalities = dict(usage.modality_tokens)
+    for name, rates in token_rates.items():
+        tokens = modalities.get(name, ModalityTokens())
+        input_tokens, output_tokens = tokens.input_tokens, tokens.output_tokens
+        if input_tokens is None and "input_per_million" in rates and f"{name}_input" not in required:
+            input_tokens = 0
+        if output_tokens is None and "output_per_million" in rates and f"{name}_output" not in required:
+            output_tokens = 0
+        modalities[name] = ModalityTokens(input_tokens, output_tokens, tokens.cache_read_input_tokens)
+    return UsageBreakdown.with_modalities(usage, modalities, invalid=usage.modality_usage_invalid)
 
 
 def _compaction_blocks(chunk, delta) -> list[dict]:
@@ -619,6 +649,9 @@ def _build_graph(params: dict, ctx: ToolContext):
             if not isinstance(prepared_messages, list) or not all(isinstance(item, dict) for item in prepared_messages):
                 raise RuntimeError("context preparation returned invalid messages")
             messages = prepared_messages
+        required_modalities = required_modalities_for_request(
+            params.get("token_rates") or {}, messages=messages
+        )
         # A prior tool turn, approval or restart may have revoked a frozen skill.
         # Do not send its instructions to another model call before rechecking.
         await boundary("revalidate_skills")
@@ -683,7 +716,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                     None,
                 )
             except BaseException as exc:
-                logger.warning("litellm 스트림 초기화 오류 model=%s", params.get("model"), exc_info=True)
+                logger.warning("litellm 스트림 초기화 오류 model=%s error_type=%s", params.get("model"), type(exc).__name__)
                 # Durable hooks abort the round at provider_failed, so learn before the boundary:
                 # the next round or run then avoids the rejected shape instead of repeating it.
                 if schemas and reasoning_route_key and isinstance(exc, Exception):
@@ -718,22 +751,18 @@ def _build_graph(params: dict, ctx: ToolContext):
             if implicit_none_for_tools and not _is_reasoning_none_rejection(exc):
                 # A guessed `none` must not fall into the generic branch, which would
                 # demote a reasoning-capable model into _REASONING_UNSUPPORTED.
-                logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
+                logger.warning("litellm 스트리밍 오류 model=%s error_type=%s", params.get("model"), type(exc).__name__)
                 writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
                 return {"model_failed": True, "pending_tool_calls": []}
             if implicit_none_for_tools:
-                logger.warning(
-                    "tool 요청의 암묵적 reasoning none 거부 — provider 기본값으로 재시도 model=%s",
-                    params["model"],
-                    exc_info=True,
-                )
+                logger.warning("tool 요청의 암묵적 reasoning none 거부 — provider 기본값으로 재시도 model=%s", params["model"])
                 try:
                     response, replay_payload = await open_stream(reasoning_effort)
                 except ProviderSubscriptionError as retry_error:
                     writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
                     return {"model_failed": True, "pending_tool_calls": []}
-                except Exception:
-                    logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
+                except Exception as retry_error:
+                    logger.warning("litellm 스트리밍 오류 model=%s error_type=%s", params.get("model"), type(retry_error).__name__)
                     writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
                     return {"model_failed": True, "pending_tool_calls": []}
             elif schemas and _is_tool_reasoning_conflict(exc):
@@ -743,27 +772,25 @@ def _build_graph(params: dict, ctx: ToolContext):
                 except ProviderSubscriptionError as retry_error:
                     writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
                     return {"model_failed": True, "pending_tool_calls": []}
-                except Exception:
-                    logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
+                except Exception as retry_error:
+                    logger.warning("litellm 스트리밍 오류 model=%s error_type=%s", params.get("model"), type(retry_error).__name__)
                     writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
                     return {"model_failed": True, "pending_tool_calls": []}
             elif reasoning_effort and reasoning_effort != "none":
-                logger.warning(
-                    "reasoning 포함 요청 실패 — reasoning 없이 재시도 model=%s", params.get("model"), exc_info=True
-                )
+                logger.warning("reasoning 포함 요청 실패 — reasoning 없이 재시도 model=%s", params.get("model"))
                 try:
                     response, replay_payload = await open_stream(None)
                 except ProviderSubscriptionError as retry_error:
                     writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
                     return {"model_failed": True, "pending_tool_calls": []}
-                except Exception:
-                    logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
+                except Exception as retry_error:
+                    logger.warning("litellm 스트리밍 오류 model=%s error_type=%s", params.get("model"), type(retry_error).__name__)
                     writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
                     return {"model_failed": True, "pending_tool_calls": []}
                 if reasoning_route_key:
                     _REASONING_UNSUPPORTED.add(reasoning_route_key)
             else:
-                logger.warning("litellm 스트리밍 오류 model=%s", params.get("model"), exc_info=True)
+                logger.warning("litellm 스트리밍 오류 model=%s error_type=%s", params.get("model"), type(exc).__name__)
                 writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
                 return {"model_failed": True, "pending_tool_calls": []}
 
@@ -790,6 +817,10 @@ def _build_graph(params: dict, ctx: ToolContext):
                     token_event["_durable_replay"] = True
                 writer(token_event)
             round_usage = _replayed_usage(replay_payload.get("usage", {}))
+            replay_usage = replay_payload.get("usage", {})
+            if isinstance(replay_usage, dict) and "required_token_modalities" in replay_usage:
+                required_modalities = replay_usage["required_token_modalities"]
+            modality_token_charges(round_usage, params.get("token_rates"), required_modalities)
             # A replayed turn must carry the same compaction head the live turn
             # produced, or the resumed run re-sends the uncompacted prefix.
             round_compaction_blocks = native_compaction.sanitize_blocks(replay_payload.get("compaction_blocks"))
@@ -799,6 +830,10 @@ def _build_graph(params: dict, ctx: ToolContext):
             tool_acc: dict[int, dict] = {}
             final_usage = None
             round_compaction_blocks: list[dict] = []
+            requires_terminal = (
+                params.get("custom_llm_provider") == "openai"
+                and litellm_client.direct_provider_route("openai", params.get("api_base"))
+            )
             try:
                 async for chunk in response:
                     delta = _delta(chunk)
@@ -819,6 +854,8 @@ def _build_graph(params: dict, ctx: ToolContext):
                     usage = _get(chunk, "usage")
                     if usage is not None:
                         final_usage = usage
+                if requires_terminal and not litellm_client.direct_openai_stream_completed(response):
+                    raise RuntimeError("OpenAI Responses stream ended without response.completed")
             except ProviderSubscriptionError as exc:
                 failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
                 if _abort_code(failure) is not None:
@@ -832,8 +869,8 @@ def _build_graph(params: dict, ctx: ToolContext):
                     return {"model_failed": True, "pending_tool_calls": []}
                 writer({"type": "error", "code": exc.code, "message": exc.message})
                 return {"model_failed": True, "pending_tool_calls": []}
-            except Exception:
-                logger.warning("litellm 스트림 소비 오류 model=%s", params.get("model"), exc_info=True)
+            except Exception as error:
+                logger.warning("litellm 스트림 소비 오류 model=%s error_type=%s", params.get("model"), type(error).__name__)
                 failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
                 if _abort_code(failure) is not None:
                     writer(
@@ -859,24 +896,37 @@ def _build_graph(params: dict, ctx: ToolContext):
                     *litellm_client.extract_usage(params["model"], messages, "".join(text_parts) + tool_payload, None)
                 )
             response_text = "".join(text_parts)
+            # Validate each actual call before aggregation; a later split cannot
+            # conceal an earlier unmetered media request or release its hold.
+            modality_token_charges(round_usage, params.get("token_rates"), required_modalities)
+            round_usage_payload = {
+                **round_usage.as_usage_dict(), **(
+                    {"required_token_modalities": required_modalities} if params.get("token_rates") else {}
+                ),
+            }
             await boundary(
                 "provider_completed",
                 round_index=round_index,
                 attempt=attempt,
-                usage={**round_usage.as_usage_dict(), **({"_durable_estimated": True}
+                usage={**round_usage_payload, **({"_durable_estimated": True}
                     if getattr(hooks, "requires_credit_reservation", False) and not usage_observed else {})},
                 result_payload={
                     "text": response_text,
                     "reasoning": "".join(reasoning_parts),
                     "tool_calls": tool_calls,
                     "citations": list(citations_by_url.values()),
-                    "usage": round_usage.as_usage_dict(),
+                    "usage": round_usage_payload,
                     "compaction_blocks": round_compaction_blocks,
                 },
             )
 
         # Rounds sum per category, so the aggregate keeps prompt_tokens as total input.
-        total_usage = (_replayed_usage(state.get("usage", {})) + round_usage).as_usage_dict()
+        sum_usage = _round_usage_for_sum(round_usage, params.get("token_rates") or {}, required_modalities)
+        total_usage = (_replayed_usage(state.get("usage", {})) + sum_usage).as_usage_dict()
+        if params.get("token_rates"):
+            total_usage["required_token_modalities"] = sorted(set(
+                (state.get("usage") or {}).get("required_token_modalities", [])
+            ) | set(required_modalities))
         # Compaction accumulates for the lifetime of a run: once the provider has
         # compacted, every later round has to keep carrying that head.
         carried_compaction = native_compaction.sanitize_blocks(
@@ -1679,6 +1729,7 @@ async def stream(
     api_base: str | None = None,
     api_key: str | None = None,
     provider_auth: dict | None = None,
+    token_rates: dict | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
     reasoning_effort: str | None = None,
@@ -1718,6 +1769,7 @@ async def stream(
         "api_base": api_base,
         "api_key": api_key,
         "provider_auth": provider_auth,
+        "token_rates": token_rates or {},
         "max_tokens": max_tokens,
         "temperature": temperature,
         "reasoning_effort": reasoning_effort,

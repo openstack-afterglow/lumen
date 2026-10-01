@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -46,6 +47,8 @@ class TranscriptionRequest(BaseModel):
     input_asset_id: UUID
     language: str | None = Field(default=None, max_length=16, pattern=r"^[A-Za-z-]+$")
     prompt: str | None = Field(default=None, max_length=1024)
+    # Omitted/[] keeps the plain transcript contract. One entry also rejects duplicates.
+    timestamp_granularities: list[Literal["segment"]] = Field(default_factory=list, max_length=1)
 
     @field_validator("model_id")
     @classmethod
@@ -162,4 +165,6 @@ async def transcriptions(
     result = await completed_audio(run_id, principal=principal, request=request)
     if result.get("kind") != "stt":
         raise HTTPException(status_code=503, detail="transcript is unavailable")
-    return {"text": result["text"]}
+    if "segments" not in result:
+        return {"text": result["text"]}
+    return {"text": result["text"], "segments": result["segments"]}

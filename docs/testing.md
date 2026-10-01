@@ -47,6 +47,15 @@ uv run lumen-test system
 
 Media credit concurrency 회귀는 `tests/integration/test_durable_image_flow.py`에서 `innodb_snapshot_isolation=OFF|ON`을 각각 설정해 실행한다. 같은 사용자의 6+6 credit hold는 월 상한 10에서 두 번째가 거절되어야 하고, 다른 사용자의 text `ChatModelCallReservation` INSERT는 media transaction이 wallet을 쥐고 있는 동안에도 commit되어야 한다. 2026-09-29 결합 release integration 77건을 통과했고, 예전 `REPEATABLE READ` + `held FOR UPDATE`를 임시 복원하면 text 삽입 두 mode가 timeout으로 실패함을 확인한 뒤 되돌렸다. 이 DB 경합 gate는 real-provider 청구나 운영 배포를 대체하지 않는다.
 
+### 모달리티 가격 검증 (2026-10-01)
+
+가격 변경은 vendor 단가 인증이 아닌 저장·계산 계약이다. Synthetic identity/catalog의 실제 Afterglow component→Lumen HTTP→SQLite에서 image 등록·종류 필터·활성 전환·별도 token editor·save/reopen/no-op, 음성 second/minute/hour와 realtime session rate 문자열 보존을 관측했다. 390px modal의 scrollWidth는 380px였다. Frozen 계산은 image USD `0.0261125000`, 1.2초 TTS USD `0.0120411523`, 45초 session USD `0.0375000000`였고 선택하지 않은 PCM/unit 가격을 더하지 않았다.
+
+Actual durable hook smoke는 image/audio 입력·캐시 입력·출력 각각 1 credit을 계산했고, 실제 graph의 image tool round→text-only compaction round는 2 provider-boundary 호출의 media share를 보존해 `1.01400000` credits를 계산했다. Upstream은 synthetic이며 provider·extensions storage는 격리했다. Throwaway UI/API/probe 파일과 서비스는 제거했다. 회귀는 `tests/test_modality_pricing.py`, `test_chat_credit_reservations.py`, `test_chat_graph.py`, `test_chat_run_store.py` 및 media transport/datastore suites에 있다. 운영 인증·paid provider·invoice·배포 실증은 포함하지 않는다.
+
+전체 working-tree architecture guard는 다른 작업의 dirty source가 포함되어 stale이며 해당 source를 stamp하지 않았다. Gate green과 scoped consumer/runtime proof를 구분한다. 최종 suite 결과와 남은 gate는 `openspec/changes/modality-model-pricing/tasks.md`에 기록한다.
+
+
 ### 실제 Codex CLI 확인
 
 Direct Codex provider의 영구 contract는 system gate의 Responses tool-call/full-input 시나리오가 담당합니다. Codex binary 자체는 repository dependency가 아니므로 gate에서 설치하지 않습니다. 2026-09-20에는 별도로 설치된 `codex-cli 0.154.0`을 격리된 `CODEX_HOME`과 `--strict-config`로 containerized Lumen에 연결해 text turn과 `exec_command` → local output → `function_call_output` 후속 turn을 실행했습니다. 정확한 설정과 이 증거의 한계는 [Afterglow 연동 가이드](afterglow-integration.md#45-codex-cli-direct-responses-provider)에 기록합니다.
@@ -62,6 +71,8 @@ Direct Codex provider의 영구 contract는 system gate의 Responses tool-call/f
 별도 원격 `lumen.dmslab.re.kr` 검증에서 발급된 ordinary Lumen API key로 `/v1/models`, `/v1/chat/models`, Anthropic `POST /v1/messages`가 각각 HTTP 200을 반환했고 활성 `claude-haiku-4-5` 모델이 텍스트 `SERVER_OK`를 반환했습니다. Claude Code 2.1.280을 비어 있는 임시 `HOME`과 `CLAUDE_CONFIG_DIR`로 격리하고 `ANTHROPIC_BASE_URL=https://lumen.dmslab.re.kr`, `ANTHROPIC_AUTH_TOKEN` 및 모델/tier 환경변수만 child process에 전달했습니다. 실제 local `Bash`의 `printf CLI_TOOL_OK` tool result (`is_error=false`) 뒤 최종 `CLI_FINAL_OK`, CLI exit 0을 관찰했습니다. Init의 `apiKeySource=none`은 토큰 출처 증거가 아니며 원격 usage ledger는 조회하지 못했습니다. 이 CLI·direct API 증거는 아직 새 0.4.0 이미지의 운영 배포나 Afterglow 브라우저의 실제 인증 성공 증거가 아닙니다.
 
 0.4.0 후보와 upstream 0.3.1 수정을 병합한 뒤 `uv lock --check`, `uv run lumen-test contract`(service 1,448·SDK 125 및 Ruff), `uv run lumen-test integration`(MariaDB/Redis 43), `uv run lumen-test system`(실제 Docker API/worker 9)을 통과했습니다. Root wheel `dist/lumen-0.4.0-py3-none-any.whl`을 빌드하고 API/worker/controller/sandbox 각 이미지의 `linux/amd64,linux/arm64` 로컬 manifest를 빌드·실행해 Python machine/0.4.0과 sandbox Node v24.21.0을 확인했습니다. 이 local 증거는 0.4.0 GHCR 게시, Kolla 운영 migration/rollout, Afterglow 실제 dashboard 성공을 증명하지 않습니다.
+
+2026-09-30 공식 OpenAI direct chat-shaped Responses 전환은 설치된 LiteLLM의 fake Responses HTTP 응답을 통해 native graph text·tool continuation·usage·truncated SSE fail-closed와 외부 compatible Chat Completions 분리를 검사했다. 독립 실행 smoke에서 plugin 기동 후 실제 graph를 1회 실행해 upstream `/v1/responses`, token `wire smoke`, 4/2 token usage를 확인했다(로컬 DB·운영 credential 없음). 변경된 테스트의 외부 HTTP 가드는 in-process, loopback 및 격리된 Docker service만 허용한다. `uv run lumen-test contract`(service 1,457·SDK 125·Ruff), `uv run lumen-test integration`(MariaDB/Redis 77), `uv run lumen-test system`(Docker API/worker/fake provider 9)이 통과했다. 실제 OpenAI 계정의 selected model, 배포, 청구 원장은 확인하지 않았다.
 
 ### 디버깅을 위한 집중(Focused) pytest 실행
 

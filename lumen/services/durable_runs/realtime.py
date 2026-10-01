@@ -1,7 +1,8 @@
-"""Durable realtime session admission and PCM-duration settlement.
+"""Durable realtime session admission, usage checkpoint and exactly-once settlement.
 
-Only encrypted admission options, model snapshots and aggregate PCM byte counts persist.
-Provider audio and transcripts stay inside the WebSocket relay and are never journaled.
+Only encrypted admission options, the frozen billing plan, aggregate PCM byte counts,
+provider-connected session time and canonical provider token usage persist. Provider
+audio and transcripts stay inside the WebSocket relay and are never journaled.
 """
 
 from __future__ import annotations
@@ -22,15 +23,19 @@ from lumen.crypto import encrypt_chat_content
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import credit
 from lumen.services.litellm_client import UsageCost
+from lumen.services.providers import pricing as provider_pricing
 from lumen.services.providers import realtime_transport, routing
-from lumen.services.providers.errors import AmbiguousModelRouteError
+from lumen.services.providers.errors import AmbiguousModelRouteError, ProviderValidationError
 from lumen.services.run_store import (
     append_event,
     begin_segment_io,
     claim_queued_run,
     complete_segment_io,
+    load_segment_payload,
     prepare_segment,
+    record_segment_usage,
 )
+from lumen.services.usage_breakdown import UsageBreakdown
 
 from . import budgets
 from .common import _event, _factory, _fingerprint, _now, _payload
@@ -53,6 +58,154 @@ if not ok or value['digest'] ~= ARGV[1] then return nil end
 redis.call('DEL', KEYS[1])
 return raw
 """
+
+# Provider-connected session time; ledger schema kind owned by the usage contract.
+_SESSION_KIND = "realtime_session_seconds"
+
+
+def _duration_seconds_cost(plan: dict, family: str, seconds: Decimal) -> Decimal:
+    try:
+        cost = provider_pricing.duration_cost_usd(plan["media_pricing"], family, seconds)
+    except (KeyError, TypeError, ValueError, ProviderValidationError) as exc:
+        raise DurableRunProviderResultUnknown("frozen realtime duration price is invalid") from exc
+    if cost is None or cost < 0:
+        raise DurableRunProviderResultUnknown("frozen realtime duration price is invalid")
+    return cost
+
+
+def _pricing_snapshot(snapshot: dict) -> dict:
+    """Read admission snapshots predating billing_basis as their frozen legacy PCM plan."""
+    if "billing_basis" in snapshot:
+        return snapshot
+    try:
+        rates = {family: {"rate": snapshot[key], "unit_seconds": 60} for family, key in (
+            ("realtime_input", "input_per_minute"), ("realtime_output", "output_per_minute"))}
+    except KeyError as exc:
+        raise DurableRunProviderResultUnknown("frozen realtime duration price is unavailable") from exc
+    return {**snapshot, "billing_basis": "duration", "duration_rates": rates,
+            "media_pricing": {f"{family}_per_minute": item["rate"] for family, item in rates.items()}}
+
+
+def _plan_matches(snapshot: dict, current: dict | None) -> bool:
+    if current is None:
+        return False
+    if "billing_basis" in snapshot:
+        return all(snapshot.get(key) == value for key, value in current.items())
+    if current.get("billing_basis") != "duration":
+        return False
+    frozen = _pricing_snapshot(snapshot)["duration_rates"]
+    return all(Decimal(item["rate"]) * current["duration_rates"][family]["unit_seconds"]
+               == Decimal(current["duration_rates"][family]["rate"]) * item["unit_seconds"]
+               for family, item in frozen.items())
+
+
+def _envelope_usd(plan: dict, max_duration_seconds: int) -> Decimal:
+    """Whole-session USD funding bound reserved before any provider I/O."""
+    basis = plan["billing_basis"]
+    if basis == "tokens":
+        return Decimal(plan["reservation_usd"])
+    seconds = Decimal(max_duration_seconds)
+    try:
+        return sum((_duration_seconds_cost(plan, family, seconds) for family in plan["duration_rates"]), Decimal(0))
+    except DurableRunProviderResultUnknown as exc:
+        raise DurableRunInputError("exact configured realtime price is unavailable") from exc
+
+
+def _checkpoint(meter, basis: str) -> dict:
+    """Canonical observed usage persisted before any settlement decision."""
+    usage: dict = {"billing_basis": basis, "input_bytes": meter.input_bytes, "output_bytes": meter.output_bytes,
+                   "input_sample_rate_hz": meter.input_sample_rate_hz,
+                   "output_sample_rate_hz": meter.output_sample_rate_hz}
+    if basis == "session":
+        seconds = meter.connected_seconds
+        usage["connected_seconds"] = format(seconds, "f") if isinstance(seconds, Decimal) else None
+    if basis == "tokens":
+        usage["usage_state"] = meter.usage_state
+        usage["usage"] = meter.usage.as_usage_dict() if meter.usage is not None else None
+    return usage
+
+
+def _duration_bill(run: ChatRun, snapshot: dict, usage: dict):
+    duration = snapshot["max_duration_seconds"]
+    components = []
+    costs = []
+    summary = {}
+    for family, kind, summary_key, size, rate in (
+        ("realtime_input", "audio_input_seconds", "input_audio_seconds",
+         usage.get("input_bytes"), usage.get("input_sample_rate_hz")),
+        ("realtime_output", "audio_output_seconds", "output_audio_seconds",
+         usage.get("output_bytes"), usage.get("output_sample_rate_hz")),
+    ):
+        if type(size) is not int or type(rate) is not int or rate not in {16000, 24000} or size < 0 or size > 2 * rate * duration:
+            raise DurableRunProviderResultUnknown("realtime duration exceeds frozen reservation")
+        seconds = Decimal(size) / Decimal(2 * rate)
+        cost = _duration_seconds_cost(snapshot, family, seconds)
+        frozen = snapshot["duration_rates"][family]
+        costs.append(cost)
+        summary[summary_key] = format(seconds, "f")
+        components.append({"segment_id": _SEGMENT, "kind": kind, "quantity": format(seconds, "f"), "unit": "second",
+            "unit_price_usd": format(Decimal(frozen["rate"]) / frozen["unit_seconds"], "f"),
+            "cost_usd": format(cost, "f"), "source": "media", "model_name": run.model_name,
+            "metadata": {"billing_basis": "duration", "rate_unit_seconds": frozen["unit_seconds"]}})
+    usage_cost = UsageCost(raw_cost=costs[0] + costs[1], input_cost=costs[0], output_cost=costs[1],
+                           pricing_status="priced", pricing_snapshot=snapshot)
+    return usage_cost, components, None, summary
+
+
+def _session_bill(run: ChatRun, snapshot: dict, usage: dict):
+    raw = usage.get("connected_seconds")
+    try:
+        seconds = Decimal(raw) if isinstance(raw, str) else None
+    except ArithmeticError:
+        seconds = None
+    limit = Decimal(snapshot["max_duration_seconds"])
+    if seconds is None or not seconds.is_finite() or seconds < 0 or seconds > limit:
+        raise DurableRunProviderResultUnknown("realtime session time exceeds frozen reservation")
+    cost = _duration_seconds_cost(snapshot, "realtime_session", seconds)
+    frozen = snapshot["duration_rates"]["realtime_session"]
+    components = [{"segment_id": _SEGMENT, "kind": _SESSION_KIND, "quantity": format(seconds, "f"), "unit": "second",
+        "unit_price_usd": format(Decimal(frozen["rate"]) / frozen["unit_seconds"], "f"),
+        "cost_usd": format(cost, "f"), "source": "media", "model_name": run.model_name,
+        "metadata": {"billing_basis": "session", "rate_unit_seconds": frozen["unit_seconds"]}}]
+    usage_cost = UsageCost(raw_cost=cost, input_cost=cost, output_cost=Decimal(0),
+                           pricing_status="priced", pricing_snapshot=snapshot)
+    return usage_cost, components, None, {"session_seconds": format(seconds, "f")}
+
+
+def _token_bill(run: ChatRun, snapshot: dict, usage: dict):
+    """Price provider-reported tokens with admission-frozen rates; anything uncertain stays held."""
+    if usage.get("usage_state") != "complete":
+        raise DurableRunProviderResultUnknown("realtime provider token usage is incomplete")
+    observed = usage.get("usage")
+    required: tuple[str, ...] = ()
+    if observed is None:
+        # A truly idle session can be free; sent input without completion usage is uncertain.
+        if usage.get("input_bytes") != 0 or usage.get("output_bytes") != 0:
+            raise DurableRunProviderResultUnknown("realtime provider token usage is missing")
+        breakdown = UsageBreakdown.from_totals(0, 0)
+    else:
+        try:
+            breakdown = UsageBreakdown.from_canonical(observed)
+        except ValueError as exc:
+            raise DurableRunProviderResultUnknown("realtime provider token usage is invalid") from exc
+        # Observed PCM in a direction demands the provider's audio share for it.
+        required = tuple(name for name, size in (("audio_input", usage.get("input_bytes")),
+                                                 ("audio_output", usage.get("output_bytes"))) if size)
+    try:
+        usage_cost = credit.usage_cost_from_pricing_snapshot(snapshot["token_pricing"],
+            prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens,
+            breakdown=breakdown, required_modalities=required)
+        components = credit.token_usage_components(usage_cost, segment_id=_SEGMENT, source="media",
+            model_name=run.model_name, metadata={"billing_basis": "tokens"})
+    except ValueError as exc:
+        raise DurableRunProviderResultUnknown("realtime provider token usage cannot be priced") from exc
+    if usage_cost.pricing_status != "priced" or usage_cost.raw_cost > Decimal(snapshot["reservation_usd"]):
+        raise DurableRunProviderResultUnknown("realtime token usage exceeds the frozen reservation")
+    return usage_cost, components, breakdown, {"input_tokens": str(breakdown.input_tokens),
+                                               "output_tokens": str(breakdown.output_tokens)}
+
+
+_BILLS = {"duration": _duration_bill, "session": _session_bill, "tokens": _token_bill}
 
 
 def _intent(request: dict) -> dict:
@@ -129,19 +282,20 @@ async def admit_realtime_session(
         raise DurableRunInputError("realtime provider or model is unavailable")
     voices = realtime_transport.available_realtime_options(route)
     voice = intent["voice"] or voices["default_voice"]
-    in_rate, out_rate = realtime_transport.validate_realtime_request(route, voice=voice,
+    plan = realtime_transport.validate_realtime_request(route, voice=voice,
         instructions=intent["instructions"], max_duration_seconds=intent["max_duration_seconds"])
     payload = {**intent, "voice": voice}
     await credit.precheck(user_id, project_id, api_key_id)
     per_usd = Decimal(str(get_settings().chat_credit_per_usd))
     margin = Decimal(str(route["margin_multiplier"]))
-    bound = credit.credits_for_cost((in_rate + out_rate) * Decimal(intent["max_duration_seconds"]) / 60, margin, per_usd)
+    envelope = _envelope_usd(plan, intent["max_duration_seconds"])
+    bound = credit.credits_for_cost(envelope, margin, per_usd)
     if bound <= 0 or bound >= Decimal("10000000000"):
         raise DurableRunInputError("realtime credit reservation is invalid")
     capability = {key: route[key] for key in ("provider_id", "model_id", "provider_name", "provider_type", "model_name", "model_kind", "config_version_hash")}
     capability["effective_features"] = {}
-    pricing = {"input_per_minute": format(in_rate, "f"), "output_per_minute": format(out_rate, "f"),
-               "max_duration_seconds": intent["max_duration_seconds"], "bound_credits": format(bound, "f"),
+    pricing = {**plan, "max_duration_seconds": intent["max_duration_seconds"],
+               "reservation_usd": format(envelope, "f"), "bound_credits": format(bound, "f"),
                "margin_multiplier": format(margin, "f"), "credit_per_usd": format(per_usd, "f")}
     try:
         async with _factory()() as session, session.begin():
@@ -210,68 +364,76 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
     return await budgets.retry_deadlocks(transaction)
 
 
-async def _settle(run_id: str, *, owner: str, meter) -> tuple[str, str]:
-    """Checkpoint observed aggregate usage and debit the immutable ledger once."""
+async def _lock_settlement_rows(session, run_id: str, owner: str):
+    run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
+        .with_for_update().execution_options(populate_existing=True))).scalar_one()
+    if run.status != "running" or run.lease_owner != owner:
+        raise DurableRunProviderResultUnknown("realtime lease was lost")
+    segment = (await session.execute(select(ChatRunSegment).where(ChatRunSegment.run_id == run_id,
+        ChatRunSegment.segment_id == _SEGMENT).with_for_update().execution_options(populate_existing=True))).scalar_one()
+    reservation = (await session.execute(select(ChatModelCallReservation).where(
+        ChatModelCallReservation.run_id == run_id, ChatModelCallReservation.segment_id == _SEGMENT)
+        .with_for_update().execution_options(populate_existing=True))).scalar_one()
+    return run, segment, reservation
+
+
+async def _checkpoint_usage(run_id: str, *, owner: str, meter) -> None:
+    """Commit observed usage on the still-started segment before any settlement decision.
+
+    The segment stays ``provider_started``: a crash or an unknown outcome fails it closed
+    (keeping this evidence for audited resolution) and the hold stays unknown.
+    """
     async def transaction():
         async with _factory()() as session, session.begin():
-            run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
-                .with_for_update().execution_options(populate_existing=True))).scalar_one()
-            if run.status != "running" or run.lease_owner != owner:
-                raise DurableRunProviderResultUnknown("realtime lease was lost")
-            segment = (await session.execute(select(ChatRunSegment).where(ChatRunSegment.run_id == run_id,
-                ChatRunSegment.segment_id == _SEGMENT).with_for_update())).scalar_one()
-            reservation = (await session.execute(select(ChatModelCallReservation).where(
-                ChatModelCallReservation.run_id == run_id, ChatModelCallReservation.segment_id == _SEGMENT)
-                .with_for_update().execution_options(populate_existing=True))).scalar_one()
+            run, segment, reservation = await _lock_settlement_rows(session, run_id, owner)
             if reservation.status == "settled":
-                return "0", "0"
+                return
+            if segment.status != "provider_started" or reservation.status != "reserved":
+                raise DurableRunProviderResultUnknown("realtime measurement cannot be checkpointed")
+            if segment.usage_payload is not None:
+                return
+            record_segment_usage(segment, _checkpoint(meter, _pricing_snapshot(run.pricing_snapshot)["billing_basis"]))
+    await budgets.retry_deadlocks(transaction)
+
+
+async def _settle(run_id: str, *, owner: str, meter) -> dict[str, str]:
+    """Checkpoint observed usage, then price it from the checkpoint and debit the ledger once."""
+    await _checkpoint_usage(run_id, owner=owner, meter=meter)
+
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            run, segment, reservation = await _lock_settlement_rows(session, run_id, owner)
+            if reservation.status == "settled":
+                return {}
             if segment.status != "provider_started" or reservation.status != "reserved":
                 raise DurableRunProviderResultUnknown("realtime measurement cannot be settled")
-            snapshot = run.pricing_snapshot
-            duration = snapshot["max_duration_seconds"]
-            rates = (("audio_input_seconds", meter.input_bytes, meter.input_sample_rate_hz,
-                      Decimal(snapshot["input_per_minute"])),
-                     ("audio_output_seconds", meter.output_bytes, meter.output_sample_rate_hz,
-                      Decimal(snapshot["output_per_minute"])))
-            components = []
-            input_cost = output_cost = Decimal(0)
-            seconds_values = []
-            for kind, size, rate, minute_price in rates:
-                if type(size) is not int or size < 0 or size > 2 * rate * duration or rate not in {16000, 24000}:
-                    raise DurableRunProviderResultUnknown("realtime duration exceeds frozen reservation")
-                seconds = Decimal(size) / Decimal(2 * rate)
-                unit_price = minute_price / 60
-                cost = unit_price * seconds
-                seconds_values.append(format(seconds, "f"))
-                if kind == "audio_input_seconds":
-                    input_cost = cost
-                else:
-                    output_cost = cost
-                components.append({"segment_id": _SEGMENT, "kind": kind, "quantity": format(seconds, "f"),
-                    "unit": "second", "unit_price_usd": format(unit_price, "f"), "cost_usd": format(cost, "f"),
-                    "source": "media", "model_name": run.model_name, "metadata": {}})
-            total = input_cost + output_cost
-            complete_segment_io(segment, result_payload={"closed": True}, usage_payload={
-                "input_bytes": meter.input_bytes, "output_bytes": meter.output_bytes,
-                "input_sample_rate_hz": meter.input_sample_rate_hz, "output_sample_rate_hz": meter.output_sample_rate_hz})
+            usage = load_segment_payload(segment.usage_payload)
+            snapshot = _pricing_snapshot(run.pricing_snapshot)
+            bill = _BILLS.get(snapshot.get("billing_basis")) if isinstance(usage, dict) else None
+            if bill is None or usage.get("billing_basis") != snapshot.get("billing_basis"):
+                raise DurableRunProviderResultUnknown("realtime usage checkpoint is unavailable")
+            usage_cost, components, breakdown, summary = bill(run, snapshot, usage)
+            complete_segment_io(segment, result_payload={"closed": True}, usage_payload=usage)
+            prompt_tokens = breakdown.input_tokens if breakdown is not None else 0
+            completion_tokens = breakdown.output_tokens if breakdown is not None else 0
             credited = await credit.apply_usage_in_transaction(session, event_id=f"run:{run.id}",
                 user_id=run.user_id, project_id=run.project_id, model_name=run.model_name,
-                provider=run.capability_snapshot["provider_name"], prompt_tokens=0, completion_tokens=0,
-                usage_cost=UsageCost(raw_cost=total, input_cost=input_cost, output_cost=output_cost,
-                                     pricing_status="priced", pricing_snapshot=snapshot),
+                provider=run.capability_snapshot["provider_name"], prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens, usage_cost=usage_cost,
                 margin_multiplier=Decimal(snapshot["margin_multiplier"]),
                 credit_per_usd=Decimal(snapshot["credit_per_usd"]), source=run.source,
-                api_key_id=run.api_key_id, run_id=run.id, usage_components=components)
+                api_key_id=run.api_key_id, run_id=run.id, usage_components=components, breakdown=breakdown)
             if credited > Decimal(str(reservation.bound_credits)):
-                raise DurableRunError("realtime usage exceeds reserved price")
+                # Rolls back the debit; the committed checkpoint and the unknown hold remain.
+                raise DurableRunProviderResultUnknown("realtime usage exceeds the reserved envelope")
             reservation.actual_credits = credited
             reservation.status = "settled"
             reservation.settled_at = _now()
             run.usage_reconciled_at = _now()
             await append_event(session, run, _event(run, "usage.updated", {"components": components,
-                "prompt_tokens": 0, "completion_tokens": 0, "raw_cost": format(total, "f"),
-                "credited_cost": format(credited, "f")}))
-            return tuple(seconds_values)
+                "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                "raw_cost": format(usage_cost.raw_cost, "f"), "credited_cost": format(credited, "f")}))
+            return summary
     return await budgets.retry_deadlocks(transaction)
 
 
@@ -289,9 +451,12 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
         await _finish(run_id, status="failed", message_id=None, owner=owner,
                       error_code="provider_result_unknown", safe_message="realtime provider changed before connection")
         raise DurableRunProviderResultUnknown("realtime provider changed before connection")
-    current_rates = realtime_transport.validate_realtime_request(route, voice=payload["voice"],
-        instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"])
-    if tuple(map(Decimal, (pricing["input_per_minute"], pricing["output_per_minute"]))) != current_rates:
+    try:
+        current_plan = realtime_transport.validate_realtime_request(route, voice=payload["voice"],
+            instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"])
+    except ProviderValidationError:
+        current_plan = None
+    if not _plan_matches(pricing, current_plan):
         await _finish(run_id, status="failed", message_id=None, owner=owner,
                       error_code="provider_result_unknown", safe_message="realtime price changed before connection")
         raise DurableRunProviderResultUnknown("realtime price changed before connection")
@@ -317,18 +482,24 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
     try:
         meter = await relay_audio(websocket, route, session_id=run_id, voice=payload["voice"],
             instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"],
-            wire=wire, is_canceled=is_canceled)
-        seconds = await _settle(run_id, owner=owner, meter=meter)
+            wire=wire, is_canceled=is_canceled, token_usage=pricing.get("billing_basis", "duration") == "tokens",
+            session_time=pricing.get("billing_basis", "duration") == "session")
+        summary = await _settle(run_id, owner=owner, meter=meter)
         await _finish(run_id, status="canceled" if await is_canceled() else "completed", message_id=None, owner=owner)
         if wire == "native":
             try:
-                await websocket.send_json({"type": "session.closed", "input_audio_seconds": seconds[0],
-                                           "output_audio_seconds": seconds[1]})
+                await websocket.send_json({"type": "session.closed", **summary})
             except Exception:
                 pass
-    except Exception:
+    except Exception as exc:
         # Upstream WebSocket exceptions may contain Gemini's secret-bearing ?key= URL.
         logger.error("realtime relay failed run_id=%s", run_id)
+        partial = getattr(exc, "meter", None)
+        if partial is not None:
+            try:
+                await _checkpoint_usage(run_id, owner=owner, meter=partial)
+            except Exception:
+                logger.error("realtime partial usage checkpoint deferred run_id=%s", run_id)
         try:
             await _finish(run_id, status="failed", message_id=None, owner=owner,
                 error_code="provider_result_unknown", safe_message="realtime provider usage cannot safely be confirmed")

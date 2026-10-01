@@ -109,6 +109,7 @@ async def test_anthropic_second_page_unknown_id_exact_headers_and_metadata(monke
         "generation_methods": [],
         "input_token_limit": 123456,
         "output_token_limit": 9876,
+        "model_kind": "text",
     }
 
 
@@ -549,3 +550,44 @@ class TestDiscoveryEndpoint:
         monkeypatch.setattr(model_discovery, "discover_models", forbidden)
         response = await non_admin_client.get("/api/v1/chat/admin/providers/7/available-models")
         assert response.status_code == 403
+
+
+async def test_live_openai_discovery_separates_operations_without_name_guesses(monkeypatch):
+    import litellm
+
+    _provider(monkeypatch, provider_type="openai")
+    _no_static(monkeypatch)
+    modes = {"renderer": "image_generation", "speaker": "audio_speech",
+             "listener": "audio_transcription", "voice": "realtime", "assistant": "chat"}
+    catalog = {name: {"mode": mode, "litellm_provider": "openai"} for name, mode in modes.items()}
+    catalog["wrong-provider"] = {"mode": "image_generation", "litellm_provider": "gemini"}
+    monkeypatch.setattr(litellm, "model_cost", catalog)
+    ids = [*catalog, "unknown-image-looking"]
+    _transport(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": name} for name in ids]}))
+    result = await model_discovery.discover_models(1)
+    assert result["models"] == ids
+    assert {candidate["id"]: candidate["model_kind"] for candidate in result["candidates"]} == {
+        "renderer": "image", "speaker": "tts", "listener": "stt", "voice": "realtime", "assistant": "text",
+        "wrong-provider": None, "unknown-image-looking": None,
+    }
+    assert result["candidates"][0]["purpose"] == "non_chat"
+    assert result["candidates"][4]["purpose"] == "chat"
+    assert result["candidates"][-1]["purpose"] == "unknown"
+
+
+async def test_gemini_image_generation_and_bidi_are_not_registered_as_text(monkeypatch):
+    import litellm
+
+    _provider(monkeypatch, provider_type="gemini")
+    _no_static(monkeypatch)
+    monkeypatch.setattr(litellm, "model_cost", {
+        "gemini/opaque-renderer": {"mode": "image_generation", "litellm_provider": "gemini"},
+    })
+    _transport(monkeypatch, lambda request: httpx.Response(200, json={"models": [
+        {"name": "models/opaque-renderer", "supportedGenerationMethods": ["generateContent"]},
+        {"name": "models/opaque-voice", "supportedGenerationMethods": ["bidiGenerateContent"]},
+    ]}))
+    result = await model_discovery.discover_models(1)
+    assert [(candidate["model_kind"], candidate["purpose"]) for candidate in result["candidates"]] == [
+        ("image", "non_chat"), ("realtime", "non_chat"),
+    ]

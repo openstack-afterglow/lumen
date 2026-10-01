@@ -330,8 +330,8 @@ async def chat_completions(
             return openai_error_response(502, "업스트림 모델 오류")
         return nonstream_response(result, cmpl_id=cmpl_id, created=created)
 
-    async def gen() -> AsyncIterator[str]:
-        async for ev in core.complete_stream(
+    try:
+        stream = core.complete_stream(
             resolved=resolved,
             messages=body.messages,
             user_id=user_id,
@@ -341,7 +341,14 @@ async def chat_completions(
             temperature=body.temperature,
             tools=body.tools,
             tool_choice=body.tool_choice,
-        ):
+        )
+    except core.CompletionError as exc:
+        return openai_error_response(exc.status_code, exc.message)
+    except Exception:
+        return openai_error_response(502, "업스트림 모델 오류")
+
+    async def gen() -> AsyncIterator[str]:
+        async for ev in stream:
             if ev["type"] == "delta":
                 yield _sse(chunk_dict(ev, cmpl_id=cmpl_id, created=created, model=resolved["api_model_name"]))
             elif ev["type"] == "done":

@@ -190,3 +190,162 @@ async def test_child_parent_overrun_and_unknown_replay_preserve_headroom():
             segment=SimpleNamespace(run_id="root", segment_id="provider:0:2", status="prepared"),
             amount=Decimal("0.2"),
         )
+
+
+@pytest.mark.parametrize("modality", ["image", "audio"])
+@pytest.mark.parametrize("direction", ["input", "cache_read", "output"])
+@pytest.mark.asyncio
+async def test_modality_prices_bound_actual_child_usage_and_reject_underfunding(monkeypatch, modality, direction):
+    from lumen.services import litellm_client
+    from lumen.services.usage_breakdown import UsageBreakdown
+
+    monkeypatch.setattr(litellm_client, "count_context_tokens", lambda *_args:
+                        litellm_client.ContextTokenCount(tokens=1, measurement="known"))
+    root = SimpleNamespace(id="root", project_id="project", parent_run_id=None, root_run_id=None,
+                           credit_ceiling=Decimal("100"), reserved_credits=Decimal("0"),
+                           descendant_credits_reserved=Decimal("0.5"))
+    child = SimpleNamespace(
+        id="child", project_id="project", parent_run_id="root", root_run_id="root", model_name="model",
+        credit_ceiling=Decimal("0.5"), reserved_credits=Decimal("0"),
+        capability_snapshot={"capabilities": {"context_limit": 10}},
+        pricing_snapshot={"input_price_per_token": "0", "output_price_per_token": "0",
+                          "margin_multiplier": "1", "chat_credit_per_usd": "1",
+                          "token_rates": {modality: {"input_per_million": "0", "cache_read_per_million": "0",
+                                                     "output_per_million": "0", f"{direction}_per_million": "100000"}}},
+    )
+    bound = _provider_credit_bound(child, messages=[], tool_schemas=[], max_tokens=10)
+    counts = {"input_tokens": 0 if direction == "output" else 10,
+              "output_tokens": 10 if direction == "output" else 0,
+              "cache_read_input_tokens": 10 if direction == "cache_read" else 0}
+    usage = UsageBreakdown.from_runtime({"prompt_tokens": counts["input_tokens"],
+        "completion_tokens": counts["output_tokens"], "cache_read_input_tokens": counts["cache_read_input_tokens"],
+        "modality_tokens": {modality: counts}}).as_usage_dict()
+    actual = _DurableExecutionHooks(run_id="child", owner="worker")._actual_credit(child, "chat_completions", usage, None)
+    assert actual == Decimal("1")
+    assert Decimal("1") <= bound <= Decimal("1.00000001")
+    quota = SimpleNamespace(project_id="project", max_credit_reservation=Decimal("100"), credits_reserved=Decimal("0.5"))
+    allocation = SimpleNamespace(run_id="child", root_run_id="root", project_id="project",
+                                 status="reserved", amount=Decimal("0.5"))
+    session = _LedgerSession(allocation)
+    with pytest.raises(budgets.BudgetExceeded, match="child credit ceiling"):
+        await budgets.reserve_call_credit(session, run=child, root=root, quota=quota,
+            segment=SimpleNamespace(run_id="child", segment_id="provider:0:1", status="prepared"), amount=bound)
+    assert child.reserved_credits == 0
+
+
+def test_actual_call_requirements_allow_text_after_media_but_never_missing_split():
+    run = SimpleNamespace(model_name="model", pricing_snapshot={
+        "input_price_per_token": "0.001", "output_price_per_token": "0.002",
+        "margin_multiplier": "1", "chat_credit_per_usd": "1",
+        "token_rates": {"image": {"input_per_million": "100000"}},
+        "required_token_modalities": ["image_input"],
+    })
+    hooks = _DurableExecutionHooks(run_id="root", owner="worker")
+    text = {"prompt_tokens": 10, "completion_tokens": 2, "required_token_modalities": []}
+    assert hooks._actual_credit(run, "chat_completions", text, None) == Decimal("0.014")
+    with pytest.raises(ValueError, match="image_input"):
+        hooks._actual_credit(run, "chat_completions", {**text, "required_token_modalities": ["image_input"]}, None)
+    # Historical snapshots without actual-call evidence retain the fail-closed contract.
+    with pytest.raises(ValueError, match="image_input"):
+        hooks._actual_credit(run, "chat_completions", {"prompt_tokens": 10, "completion_tokens": 2}, None)
+
+
+def test_modality_only_prices_still_require_provider_capacity(monkeypatch):
+    from lumen.services import litellm_client
+    monkeypatch.setattr(litellm_client, "count_context_tokens", lambda *_args:
+                        litellm_client.ContextTokenCount(tokens=None, measurement="unknown"))
+    run = SimpleNamespace(model_name="model", capability_snapshot={"capabilities": {}}, pricing_snapshot={
+        "input_price_per_token": "0", "output_price_per_token": "0", "margin_multiplier": "1", "chat_credit_per_usd": "1",
+        "token_rates": {"audio": {"input_per_million": "100000"}},
+    })
+    with pytest.raises(Exception, match="context limit"):
+        _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=1)
+    run.capability_snapshot = {"capabilities": {"context_limit": 10}}
+    run.pricing_snapshot["token_rates"] = {"audio": {"output_per_million": "100000"}}
+    with pytest.raises(Exception, match="max_tokens"):
+        _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=None)
+
+
+@pytest.mark.asyncio
+async def test_frozen_main_summary_modality_rates_survive_edits_and_reach_ledger(monkeypatch):
+    from lumen.services import chat_admission, litellm_client
+    from lumen.services.durable_runs import execution
+
+    route = {"model_name": "main", "provider_id": 1, "model_id": 2, "provider_name": "gemini",
+             "provider_type": "gemini", "config_version_hash": "frozen", "capabilities": {"context_limit": 10},
+             "input_price_per_token": Decimal("0.001"), "output_price_per_token": Decimal("0.002"),
+             "media_pricing": {"token_rates": {"audio": {"input_per_million": "100000"}}}}
+    summary = {**route, "model_name": "summary", "media_pricing": {
+        "token_rates": {"audio": {"input_per_million": "200000"}}}}
+    capabilities, pricing = chat_admission._run_snapshots(route, {}, summary_route=summary)
+    pricing["chat_credit_per_usd"] = "1"
+    run = SimpleNamespace(id="root", user_id="user", project_id="project", conversation_id=None, api_key_id=None,
+                          model_name="main", pricing_snapshot=pricing, capability_snapshot=capabilities)
+    route["media_pricing"]["token_rates"]["audio"]["input_per_million"] = "9000000"
+    summary["media_pricing"]["token_rates"]["audio"]["input_per_million"] = "9000000"
+    usage = {"prompt_tokens": 10, "completion_tokens": 1, "required_token_modalities": ["audio_input"],
+             "modality_tokens": {"audio": {"input_tokens": 10, "output_tokens": 0, "cache_read_input_tokens": 0}}}
+    hooks = _DurableExecutionHooks(run_id="root", owner="worker")
+    assert hooks._actual_credit(run, "chat_completions", usage, None) == Decimal("1.002")
+    assert hooks._actual_credit(run, "context_compaction", usage, None) == Decimal("2.002")
+    # Optional summary rates do not require an absent audio split.
+    assert hooks._actual_credit(run, "context_compaction", {
+        "prompt_tokens": 10, "completion_tokens": 1, "required_token_modalities": []}, None) == Decimal("0.012")
+    monkeypatch.setattr(litellm_client, "count_context_tokens", lambda *_args:
+                        litellm_client.ContextTokenCount(tokens=10, measurement="known"))
+    assert _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=1) == Decimal("1.00200001")
+    assert _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=1, summary=True) == Decimal("2.00200001")
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+        def scalar_one(self):
+            return self.value
+        def scalar_one_or_none(self):
+            return self.value
+    class Session:
+        def __init__(self):
+            self.results = iter([Result(run), Result(None)])
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_args):
+            return None
+        def begin(self):
+            return self
+        async def execute(self, *_args):
+            return next(self.results)
+    recorded = []
+    async def apply_usage(_session, **kwargs):
+        recorded.append(kwargs)
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: Session())
+    monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *_args: None)
+    monkeypatch.setattr(execution.credit, "apply_usage_in_transaction", apply_usage)
+    await hooks._record_summary_usage(segment_id="context:0:0:map", usage_payload=usage, route=summary)
+    assert recorded[0]["usage_cost"].raw_cost == Decimal("2.002")
+    assert sum(Decimal(item["cost_usd"]) for item in recorded[0]["usage_components"]) == Decimal("2.002")
+
+
+def test_credit_hold_covers_rounding_of_all_text_and_modality_categories(monkeypatch):
+    from lumen.services import litellm_client
+    monkeypatch.setattr(litellm_client, "count_context_tokens", lambda *_args:
+                        litellm_client.ContextTokenCount(tokens=8, measurement="known"))
+    pricing = {key: "0.0000000000501" for key in (
+        "input_price_per_token", "output_price_per_token", "cache_read_price_per_token",
+        "cache_write_price_per_token", "cache_write_1h_price_per_token")}
+    pricing.update({"margin_multiplier": "1", "chat_credit_per_usd": "100000000", "token_rates": {
+        name: {direction: "0.0000501" for direction in ("input_per_million", "cache_read_per_million", "output_per_million")}
+        for name in ("image", "audio")}})
+    run = SimpleNamespace(model_name="model", pricing_snapshot=pricing,
+                          capability_snapshot={"capabilities": {"context_limit": 8}})
+    usage = {"prompt_tokens": 8, "completion_tokens": 3, "cache_read_input_tokens": 3,
+             "cache_creation_5m_input_tokens": 1, "cache_creation_1h_input_tokens": 1,
+             "modality_tokens": {name: {"input_tokens": 2, "output_tokens": 1, "cache_read_input_tokens": 1}
+                                 for name in ("image", "audio")}}
+    actual = _DurableExecutionHooks(run_id="root", owner="worker")._actual_credit(run, "chat_completions", usage, None)
+    bound = _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=3)
+    assert actual == Decimal("0.11")
+    assert bound == Decimal("0.16511")
+    assert actual <= bound
+
+
+
