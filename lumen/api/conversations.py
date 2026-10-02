@@ -19,7 +19,7 @@ from lumen.auth import require_scopes
 from lumen.config import get_settings
 from lumen.services import capabilities
 from lumen.services import conversation_store as cs
-from lumen.services.providers import errors, repository, routing
+from lumen.services.providers import audio_transport, errors, image_transport, realtime_transport, repository, routing
 
 router = APIRouter()
 
@@ -29,6 +29,11 @@ class AvailableModel(BaseModel):
     model_name: str
     api_model_name: str
     api_provider: str
+    provider_id: int
+    provider_type: str
+    provider_sort_order: int = 0
+    sort_order: int = 0
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
     display_name: str
     provider: str | None = None
     provider_api_key_configured: bool
@@ -36,12 +41,17 @@ class AvailableModel(BaseModel):
     # 키·가격은 미포함이지만 능력은 배지·게이팅용으로 노출.
     capabilities: dict | None = None
     context_limit: int | None = None
+    # Whether reasoning_effort="none" passes chat admission for this model (same rule).
+    reasoning_none_supported: bool = False
 
     model_config = {"protected_namespaces": ()}
 
 
 @router.get("/chat/models", response_model=list[AvailableModel])
-async def list_available_models(token_info: dict = Depends(require_scopes("models:read"))):
+async def list_available_models(
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text",
+    token_info: dict = Depends(require_scopes("models:read")),
+):
     """사용자용 활성 모델 카탈로그(키·가격 미포함, provider명·능력 포함). 저장소 장애 시 빈 목록(graceful)."""
     try:
         models = await repository.list_models(active_only=True)
@@ -50,19 +60,31 @@ async def list_available_models(token_info: dict = Depends(require_scopes("model
         return []
     result = []
     for m in models:
+        if m.get("model_kind", "text") != model_kind:
+            continue
         caps = m.get("effective_capabilities") or {}
         provider = providers.get(m["provider_id"])
+        provider_type = m.get("provider_type") or (provider.get("provider_type", "") if provider else "")
         result.append(
             {
                 "id": m["id"],
                 "model_name": m["model_name"],
                 "api_model_name": m["api_model_name"],
+                "model_kind": m.get("model_kind", "text"),
                 "api_provider": m["api_provider"],
+                "provider_id": m["provider_id"],
+                "provider_type": provider_type,
+                "provider_sort_order": m.get("provider_sort_order", 0),
+                "sort_order": m.get("sort_order", 0),
                 "display_name": m["display_name"],
                 "provider": provider.get("name") if provider else None,
                 "provider_api_key_configured": bool(provider and provider.get("has_api_key")),
                 "capabilities": caps or None,
                 "context_limit": caps.get("context_limit") if isinstance(caps, dict) else None,
+                "reasoning_none_supported": capabilities.reasoning_can_be_disabled(
+                    caps if isinstance(caps, dict) else None,
+                    provider_type,
+                ),
             }
         )
     return result
@@ -70,23 +92,57 @@ async def list_available_models(token_info: dict = Depends(require_scopes("model
 
 @router.get("/capabilities")
 async def get_chat_capabilities(
-    model_id: int = Query(..., ge=1), token_info: dict = Depends(require_scopes("models:read"))
+    model_id: int = Query(..., ge=1),
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text",
+    token_info: dict = Depends(require_scopes("models:read")),
 ):
     """Expose selected-model and deployment runtime gates without secrets."""
     del token_info
     try:
-        resolved = await routing.resolve_model_by_id(model_id)
+        resolved = (
+            await routing.resolve_model_by_id(model_id)
+            if model_kind == "text" else await routing.resolve_model_by_id(model_id, model_kind=model_kind)
+        )
     except errors.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail="chat model configuration is unavailable") from exc
     if resolved is None:
         raise HTTPException(status_code=404, detail="chat model not found")
     runtime = capabilities.runtime_capabilities()
     effective = capabilities.effective_runtime_capabilities(resolved.get("capabilities"), runtime)
-    return {
+    result = {
         "model_id": model_id,
         "model_name": resolved["model_name"],
         "runtime": effective,
     }
+    if model_kind != "text":
+        result["model_kind"] = model_kind
+        result["model_capabilities"] = resolved.get("capabilities")
+    if model_kind == "image":
+        image_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("image_output") or {}
+        routable = image_gate.get("available") is True
+        result["available_image_variants"] = image_transport.available_image_variants(resolved) if routable else []
+        result["max_image_count"] = image_transport.max_image_count(resolved) if routable else 0
+    if model_kind == "tts":
+        audio_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("audio_output") or {}
+        if audio_gate.get("available") is True:
+            voices, formats = audio_transport.available_speech_options(resolved)
+        else:
+            voices, formats = [], []
+        result["available_voices"] = voices
+        result["available_formats"] = formats
+    if model_kind == "stt":
+        audio_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("audio_input") or {}
+        result["available_timestamp_granularities"] = (
+            audio_transport.available_timestamp_granularities(resolved) if audio_gate.get("available") is True else []
+        )
+    if model_kind == "realtime":
+        gates = (resolved.get("capabilities") or {}).get("feature_gates") or {}
+        if all((gates.get(name) or {}).get("available") is True for name in ("audio_input", "audio_output")):
+            result.update(realtime_transport.available_realtime_options(resolved))
+        else:
+            result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,
+                          output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0)
+    return result
 
 
 class ConversationCreateRequest(BaseModel):
@@ -316,7 +372,12 @@ async def delete_conversation(
         await cs.delete_conversation(
             conversation_id, user_id=token_info["user_id"], project_id=token_info["project_id"]
         )
-    except (cs.ConversationNotFound, cs.ConversationForbidden, cs.ChatStorageUnavailable) as exc:
+    except (
+        cs.ConversationNotFound,
+        cs.ConversationForbidden,
+        cs.ConversationRunActive,
+        cs.ChatStorageUnavailable,
+    ) as exc:
         raise _map_error(exc) from exc
 
 
@@ -417,7 +478,7 @@ async def set_active_leaf(
 async def fork_conversation(
     conversation_id: str, payload: ForkRequest, token_info: dict = Depends(require_scopes("native:conversations:write"))
 ):
-    """지정 메시지까지의 경로를 새 대화로 복사(분기). 소유자 동일, 원본 독립."""
+    """Create an independent conversation view sharing the selected immutable ancestry."""
     try:
         return await cs.fork_conversation(
             conversation_id,
@@ -425,5 +486,11 @@ async def fork_conversation(
             project_id=token_info["project_id"],
             message_id=payload.message_id,
         )
-    except (cs.ConversationNotFound, cs.ConversationForbidden, cs.ChatStorageUnavailable) as exc:
+    except (
+        cs.ConversationNotFound,
+        cs.ConversationForbidden,
+        cs.ConversationRunActive,
+        cs.HistoryIndexUnavailable,
+        cs.ChatStorageUnavailable,
+    ) as exc:
         raise _map_error(exc) from exc

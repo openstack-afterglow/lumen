@@ -16,7 +16,8 @@ import codecs
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
@@ -29,7 +30,7 @@ from lumen.services.providers.credentials import (
     perplexity_route_model_name,
 )
 from lumen.services.providers.errors import ProviderSubscriptionError
-from lumen.services.usage_breakdown import UsageBreakdown
+from lumen.services.usage_breakdown import UsageBreakdown, modality_token_charges
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +284,9 @@ def _litellm_component_rates(
     for candidate in _pricing_model_candidates(model, provider_type):
         # Provider calculators can return zero for unknown IDs. A successful
         # calculation is not evidence of a published (including explicitly free) price.
-        catalog_key = f"{provider_type}/{candidate}" if provider_type else candidate
+        catalog_key = candidate
+        if provider_type and not candidate.startswith(f"{provider_type}/"):
+            catalog_key = f"{provider_type}/{candidate}"
         metadata = litellm.model_cost.get(catalog_key) or litellm.model_cost.get(candidate)
         if not isinstance(metadata, dict):
             continue
@@ -414,11 +417,17 @@ def cost_from_usage(
     cache_price_sources: Mapping[str, str] | None = None,
     allow_catalog_cache: bool = True,
     allow_catalog_prices: bool = True,
+    allow_cache_write_fallback: bool = True,
+    token_rates: Mapping[str, Any] | None = None,
+    required_modalities: Iterable[str] = (),
 ) -> UsageCost:
     """Bill provider-reported token totals using manual or exact catalog prices.
 
-    A direct provider's known cache rates fill only unset categories. A custom
-    base requires configured prices; missing categories remain visibly partial.
+    Direct-provider catalog rates fill unset categories. A missing 5m write
+    inherits the effective input rate, then a missing 1h write inherits the
+    effective 5m rate; cache reads still require their own rate.
+    Configured ``token_rates`` bill reported image/audio shares at their own
+    per-million rates; text prices apply to the residual only.
     """
     if breakdown is None:
         breakdown = UsageBreakdown.from_totals(prompt_tokens, completion_tokens)
@@ -429,7 +438,8 @@ def cost_from_usage(
         raise ValueError("usage breakdown totals do not match prompt/completion tokens")
     prompt_tokens = breakdown.input_tokens
     completion_tokens = breakdown.output_tokens
-    uncached_tokens = breakdown.uncached_input_tokens
+    text, modality_charges = modality_token_charges(breakdown, token_rates, required_modalities)
+    uncached_tokens = text.uncached_input_tokens
     fallback_input, fallback_output, fallback_source = (
         _fallback_component_rates(model, prompt_tokens, completion_tokens, provider_type, api_base)
         if allow_catalog_prices and (input_price_per_token is None or output_price_per_token is None)
@@ -443,7 +453,7 @@ def cost_from_usage(
         fallback_source=fallback_source,
     )
     output_cost, output_rate, output_source, output_priced = _component_cost(
-        tokens=completion_tokens,
+        tokens=text.output_tokens,
         stored_rate=output_price_per_token,
         stored_source=price_source,
         fallback_rate=fallback_output,
@@ -469,9 +479,9 @@ def cost_from_usage(
     cache_sources: dict[str, str | None] = dict(cache_price_sources or {})
     cache_components: dict[str, tuple[int, Decimal | None, Decimal]] = {}
     for name, tokens in (
-        ("cache_read", breakdown.cache_read_input_tokens),
-        ("cache_creation_5m", breakdown.cache_creation_5m_input_tokens),
-        ("cache_creation_1h", breakdown.cache_creation_1h_input_tokens),
+        ("cache_read", text.cache_read_input_tokens),
+        ("cache_creation_5m", text.cache_creation_5m_input_tokens),
+        ("cache_creation_1h", text.cache_creation_1h_input_tokens),
     ):
         configured, catalog, configured_tier, catalog_tier = cache_rates[name]
         rate = configured if configured is not None else catalog
@@ -479,7 +489,13 @@ def cost_from_usage(
         tier = configured_tier if configured_tier is not None else catalog_tier if source == "litellm" else None
         if prompt_tokens > 200_000 and tier is not None:
             rate = tier
-            source = source or "litellm"
+            # A fallback base and its real catalog tier carry separate provenance.
+            source = cache_sources.get(f"{name}_above_200k") or source or "litellm"
+        if allow_cache_write_fallback and rate is None and name == "cache_creation_5m" and input_rate is not None:
+            rate, source = input_rate, f"fallback_input:{input_source or 'unknown'}"
+        elif allow_cache_write_fallback and rate is None and name == "cache_creation_1h":
+            rate = cache_components["cache_creation_5m"][1]
+            source = f"fallback_5m:{cache_sources['cache_creation_5m']}" if rate is not None else None
         cost = (rate * tokens).quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else Decimal("0")
         cache_components[name] = (tokens, rate, cost)
         cache_sources[name] = source
@@ -498,17 +514,28 @@ def cost_from_usage(
         "input": _snapshot_component(
             uncached_tokens, input_rate, input_cost, input_source, provider_type=provider_type
         ),
-        "output": _snapshot_component(completion_tokens, output_rate, output_cost, output_source),
+        "output": _snapshot_component(text.output_tokens, output_rate, output_cost, output_source),
     }
     for name, (tokens, rate, cost) in cache_components.items():
         snapshot[name] = _snapshot_component(tokens, rate, cost, cache_sources.get(name))
+    cache_read_cost = cache_components["cache_read"][2]
+    for charge in modality_charges:
+        cost = (charge.price_per_token * charge.tokens).quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
+        raw_cost += cost
+        if charge.name.endswith("_cache_read"):
+            cache_read_cost += cost
+        elif charge.name.endswith("_input"):
+            input_cost += cost
+        else:
+            output_cost += cost
+        snapshot[charge.name] = _snapshot_component(charge.tokens, charge.price_per_token, cost, "manual")
     return UsageCost(
         raw_cost=raw_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP),
         input_cost=input_cost,
         output_cost=output_cost,
         pricing_status=pricing_status,
         pricing_snapshot=snapshot,
-        cache_read_cost=cache_components["cache_read"][2],
+        cache_read_cost=cache_read_cost,
         cache_creation_5m_cost=cache_components["cache_creation_5m"][2],
         cache_creation_1h_cost=cache_components["cache_creation_1h"][2],
     )
@@ -519,13 +546,17 @@ _OMIT_EFFORTS = {"", "auto", "off", "disabled", "false"}
 
 
 def _reasoning_params(model: str, effort: str | None, custom_llm_provider: str | None) -> dict[str, Any]:
-    """Attach reasoning only when side-effect-free metadata or provider probes support it."""
+    """Preserve explicit none; probe metadata before enabling other reasoning efforts."""
     if effort is None:
         return {}
     normalized = effort.strip().lower()
     if normalized in _OMIT_EFFORTS:
         return {}
-    if normalized != "none" and normalized not in _VALID_EFFORTS:
+    # Admission validates explicit none against the frozen route. A stale
+    # LiteLLM catalogue must not turn that choice back into provider-default reasoning.
+    if normalized == "none":
+        return {"reasoning_effort": "none"}
+    if normalized not in _VALID_EFFORTS:
         return {}
     normalized_model = litellm_model_name(model)
     if custom_llm_provider == "chatgpt" or model.startswith("chatgpt/"):
@@ -605,6 +636,44 @@ def _anthropic_cached_messages(
     return messages
 
 
+_NATIVE_OPENAI_STREAM_MODEL: ContextVar[str | None] = ContextVar("native_openai_stream_model", default=None)
+
+
+def _enable_uncatalogued_openai_streaming(litellm: Any) -> None:
+    """An unknown model is not evidence that the official Responses API cannot stream.
+
+    LiteLLM's pinned fallback fabricates a stream from a non-streaming response
+    whenever its price catalogue lacks the model. Limit the override to this
+    request's direct OpenAI route; known non-streaming models keep their policy.
+    """
+    original = litellm.utils.supports_native_streaming
+    if getattr(original, "_lumen_direct_openai_streaming", False):
+        return
+
+    def supported(model: str, custom_llm_provider: str | None) -> bool:
+        bare = model.removeprefix("openai/").removeprefix("responses/")
+        if (
+            custom_llm_provider == "openai"
+            and _NATIVE_OPENAI_STREAM_MODEL.get() == bare
+            and bare not in litellm.model_cost
+            and f"openai/{bare}" not in litellm.model_cost
+        ):
+            return True
+        return original(model=model, custom_llm_provider=custom_llm_provider)
+
+    supported._lumen_direct_openai_streaming = True  # type: ignore[attr-defined]
+    litellm.utils.supports_native_streaming = supported
+
+
+def direct_openai_stream_completed(stream: Any) -> bool:
+    """The Chat bridge fabricates a terminal chunk on EOF; require the raw Responses event."""
+    bridge = getattr(stream, "completion_stream", None)
+    source = getattr(bridge, "streaming_response", None)
+    event = getattr(source, "completed_response", None)
+    response = getattr(event, "response", None)
+    return getattr(event, "type", None) == "response.completed" and getattr(response, "status", None) == "completed"
+
+
 def _build_params(
     model: str,
     messages: list[dict],
@@ -617,6 +686,10 @@ def _build_params(
     tools: list[dict] | None = None,
     extra: dict | None,
 ) -> dict[str, Any]:
+    # The pinned LiteLLM bridge recognizes responses/ independently of the
+    # mutable remote model catalog. Leave compatible third-party bases on chat.
+    if custom_llm_provider == "openai" and direct_provider_route(custom_llm_provider, api_base):
+        model = f"openai/responses/{model.removeprefix('openai/').removeprefix('responses/')}"
     params: dict[str, Any] = {"model": model, "messages": messages}
     if custom_llm_provider:
         params["custom_llm_provider"] = custom_llm_provider
@@ -632,6 +705,13 @@ def _build_params(
         params["tools"] = tools
     if extra:
         params.update(extra)
+    if custom_llm_provider == "openai" and params.get("reasoning_effort") == "none":
+        # Opaque OpenAI routes can advertise none before LiteLLM knows the model.
+        # Preserve that exact wire option despite drop_params, without overriding
+        # native Anthropic/Gemini mappings or allowing unrelated parameters.
+        allowed = params.get("allowed_openai_params") or ()
+        if "reasoning_effort" not in allowed:
+            params["allowed_openai_params"] = [*allowed, "reasoning_effort"]
     return params
 
 
@@ -793,6 +873,9 @@ async def _subscription_completion(
         if not isinstance(access_token, str) or not access_token:
             raise ProviderSubscriptionError("subscription_auth_required", 502)
         normalized_model = litellm_model_name(model)
+        # Same contract as the API-key path: let LiteLLM drop sampling params it knows
+        # the model rejects (e.g. temperature != 1 on claude-opus-5-5) instead of raising.
+        litellm.drop_params = True
         logging_obj = SubscriptionLogging(
             model=normalized_model,
             provider="anthropic",
@@ -1316,6 +1399,13 @@ async def acompletion_stream(
     )
     params["stream"] = True
     params["stream_options"] = {"include_usage": True}
+    if custom_llm_provider == "openai" and direct_provider_route(custom_llm_provider, api_base):
+        _enable_uncatalogued_openai_streaming(litellm)
+        token = _NATIVE_OPENAI_STREAM_MODEL.set(model.removeprefix("openai/").removeprefix("responses/"))
+        try:
+            return await litellm.acompletion(**params)
+        finally:
+            _NATIVE_OPENAI_STREAM_MODEL.reset(token)
     return await litellm.acompletion(**params)
 
 

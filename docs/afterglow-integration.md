@@ -141,11 +141,18 @@ API Key 요청 시 필요한 최소 Scope 정의:
 
 ### 4.4 Claude Code direct Anthropic API
 
-Claude Code는 discovery의 Anthropic SDK base와 ordinary Lumen API key를 사용합니다. Current CLI가 `/v1/messages`를 결합하므로 base에 `/v1`을 직접 추가하지 않습니다.
+Claude Code는 discovery의 Anthropic SDK base와 ordinary Lumen API key를 사용합니다. 현재 CLI가 `/v1/messages`를 결합하므로 base에 `/v1`을 직접 추가하지 않습니다. 발급 목록의 마스킹된 key prefix는 인증에 사용할 수 없으므로 발급 직후 저장한 전체 key를 사용하거나 새로 발급합니다. 모델 선택창에서 **활성 Anthropic Messages 호환 모델**의 공개 API ID를 선택하고 아래 placeholder를 바꿉니다.
+
+먼저 이 한 줄만 셸에서 실행합니다. 표시되지 않는 프롬프트에 전체 키를 입력한 뒤 Enter를 누릅니다. 아래 명령까지 한 번에 붙여 넣으면 다음 명령이 키 값으로 들어갈 수 있습니다.
 
 ```bash
-export LUMEN_API_KEY="sk-afgl-..."
-export LUMEN_MODEL="provider-model-id"
+printf 'Lumen API key: '; read -rs LUMEN_API_KEY; printf '\n'; export LUMEN_API_KEY
+```
+
+그다음 placeholder를 실제 활성 모델 ID로 바꾸고 같은 셸에서 실행합니다.
+
+```bash
+export LUMEN_MODEL="replace-with-active-Anthropic-model-ID"
 export ANTHROPIC_BASE_URL="https://lumen.example"
 export ANTHROPIC_AUTH_TOKEN="$LUMEN_API_KEY"
 export ANTHROPIC_MODEL="$LUMEN_MODEL"
@@ -163,52 +170,120 @@ Configured `/v1/claude-gateway` device routes는 Lumen custom protocol입니다.
 
 ### 4.5 Codex CLI direct Responses provider
 
-Codex CLI의 custom provider는 Responses wire만 지원합니다. `~/.codex/config.toml`의 사용자 수준 설정에 다음을 추가합니다. 프로젝트의 `.codex/config.toml`은 provider redirect/auth 설정을 대체하지 않습니다.
+Codex CLI의 custom provider는 Responses wire만 지원합니다. 사용자 `~/.codex/config.toml`에 아래 **provider block만** 추가하고 기존 기본 `model_provider`/`model`은 보존합니다. 프로젝트 `.codex/config.toml`로는 provider redirect/auth 설정을 대체하지 않습니다.
 
 ```toml
-model_provider = "lumen"
-model = "provider-model-id"
-
 [model_providers.lumen]
 name = "Lumen Responses"
 base_url = "https://lumen.example/v1"
 env_key = "LUMEN_API_KEY"
 wire_api = "responses"
-request_max_retries = 4
-stream_max_retries = 5
-stream_idle_timeout_ms = 300000
 requires_openai_auth = false
+supports_websockets = false
 ```
 
-`provider-model-id`는 `GET /v1/models`의 공개 ID를 사용합니다. 같은 ID가 여러 provider에 있어 409가 날 수 있으면 provider를 추정하지 말고 해당 provider block에 비밀이 아닌 고정 selector를 추가합니다.
+`replace-with-active-Responses-model-ID`에는 활성 모델의 공개 `GET /v1/models` ID를 사용합니다. 같은 ID가 여러 provider에 있어 409가 날 수 있으면 provider를 추정하지 말고 해당 provider block에 비밀이 아닌 고정 selector를 추가합니다.
 
 ```toml
-http_headers = { "X-Lumen-Provider" = "openai" }
+http_headers = { "X-Lumen-Provider" = "replace-with-provider-id" }
 ```
 
-`LUMEN_API_KEY`에는 `models:read`와 `compat:completions:write` scope가 필요합니다. 실제 key를 TOML에 넣지 않습니다.
+`LUMEN_API_KEY`에는 `models:read`와 `compat:completions:write` scope가 필요합니다. 실제 key를 TOML에 넣지 않습니다. 먼저 아래 한 줄만 실행하고 보이지 않는 프롬프트에 발급 시 확인한 전체 key를 입력해 Enter를 누릅니다. 다음 명령과 한 번에 붙여 넣으면 다음 명령이 key로 입력될 수 있습니다.
 
 ```bash
-export LUMEN_API_KEY="sk-afgl-..."
-codex --strict-config
-codex exec "Inspect this repository and report one concrete finding"
+printf 'Lumen API key: '; read -rs LUMEN_API_KEY; printf '\n'; export LUMEN_API_KEY
 ```
+
+그다음 현재 활성 Responses 호환 공개 모델 ID로 placeholder를 바꿔 같은 셸에서 실행합니다. CLI override는 이번 실행에만 적용되어 앱과 다른 CLI 기본값을 보존합니다.
+
+```bash
+codex --strict-config -c model_provider=lumen -m "replace-with-active-Responses-model-ID"
+codex exec --strict-config -c model_provider=lumen -m "replace-with-active-Responses-model-ID" 'Inspect this repository and report one concrete finding'
+```
+
+`env_key`는 **현재 Codex 프로세스 환경**에서 읽으므로 key가 없는 셸은 `Missing environment variable: LUMEN_API_KEY`로 실패합니다. `GET /v1/models`의 목록과 실제 provider 호출 권한은 별도로 확인합니다.
+
+Standalone Compose의 로컬 key를 셸에서만 꺼내 쓰는 예시(출력·TOML·Git에 key를 남기지 않음):
+
+```bash
+docker compose up -d --wait lumen-api lumen-worker
+export LUMEN_API_KEY="$(docker compose run --rm --no-deps -T lumen-connection | python3 -c 'import json,sys; print(json.load(sys.stdin)["api_key"])')"
+codex exec --strict-config -c model_provider=lumen \
+  -c 'model_providers.lumen.base_url="http://127.0.0.1:8012/v1"' \
+  -m gpt-4.1-mini 'Use exec_command to print CODEX_TOOL_OK, then report the result'
+```
+
+`gpt-4.1-mini`는 로컬 기본 text route의 예시이며 `model_reasoning_effort` 설정이 있어도 reasoning 모델이 아닙니다. 고유 host port를 쓰면 `base_url`도 같은 port로 바꿉니다. 원격 Lumen의 key는 별도로 발급받아야 하며 로컬 seed key는 그 배포에 사용할 수 없습니다.
+
+`gpt-6-luna`를 사용하는 로컬 격리 테스트에서는 기존 8012 포트의 다른 Lumen을 건드리지 않고 다음처럼 별도 Compose project/port를 사용합니다. `.env`의 `OPENAI_API_KEY`가 실제 해당 모델에 접근할 수 있어야 합니다.
+
+```bash
+LUMEN_API_PORT=18012 LUMEN_LOCAL_MODEL=gpt-6-luna \
+  LUMEN_LOCAL_INPUT_PRICE_PER_MILLION=0.1 LUMEN_LOCAL_OUTPUT_PRICE_PER_MILLION=0.5 \
+  docker compose -p lumen-provider-smoke-20260928 up -d --build --wait lumen-api lumen-worker
+export LUMEN_API_KEY="$(docker compose -p lumen-provider-smoke-20260928 run --rm --no-deps -T lumen-connection | python3 -c 'import json,sys; print(json.load(sys.stdin)["api_key"])')"
+codex exec --strict-config -c model_provider=lumen \
+  -c 'model_providers.lumen.base_url="http://127.0.0.1:18012/v1"' \
+  -m gpt-6-luna 'Use exec_command to print LUNA_TOOL_OK, then report the result'
+```
+
+위 USD/million 단가는 이 격리 테스트에서 exact LiteLLM catalog를 참고해 입력한 **로컬 smoke 값**으로, 공급자 청구서나 운영 가격 검증이 아닙니다. 이미 등록된 모델의 가격은 seed가 덮어쓰지 않으므로 운영 DB에 이 명령을 적용하지 않습니다. 셸 환경에 key를 노출하는 범위는 해당 셸 세션으로 제한하고, 원격 Lumen에는 해당 배포가 발급한 별도 key를 사용합니다.
+
+원격 `lumen.dmslab.re.kr`에서는 **해당 배포가 발급한** `LUMEN_API_KEY`를 Codex 프로세스에 export하고 사용자 provider block의 `base_url = "https://lumen.dmslab.re.kr/v1"`을 사용합니다. 이 macOS 환경의 Codex CLI 0.159.0은 기본 인증서 설정으로 해당 호스트에 TCP 연결한 뒤 TLS 단계에서 `Connection failed: error sending request`를 반환했습니다. 같은 요청에 Codex 전용 CA 번들 경로를 지정하면 성공합니다(이 환경에서 확인한 PEM 경로; 다른 호스트에서는 실제 신뢰 번들 경로를 사용):
+
+```bash
+CODEX_CA_CERTIFICATE=/private/etc/ssl/cert.pem \
+  codex exec --strict-config --ephemeral --sandbox read-only \
+    -c model_provider=lumen -m gpt-6-luna \
+    'Use exec_command to run printf REMOTE_LUNA_TOOL_OK in the shell; after receiving its output, reply exactly REMOTE_LUNA_CODEX_OK.'
+```
+
+이 설정은 Codex 호출에만 적용하며 기본 provider/model을 변경하지 않습니다. 사용자 기본값이 `codex-lb`/`gpt-6-sol`이면 `-c model_provider=lumen -m gpt-6-luna` 둘 다 필요합니다. `CODEX_CA_CERTIFICATE`는 Codex 공식 환경 변수이며 `SSL_CERT_FILE`보다 우선합니다. API key 값이나 사설 인증서를 repository/TOML에 기록하지 않습니다.
+
+매번 인증서·provider·model 옵션을 입력하지 않고 **일반 터미널에서 `codex`/`codex exec`를 그대로 사용**하려면 이 macOS 사용자 환경에서 다음처럼 CLI 전용 프로필을 한 번 설정합니다. 기존 `~/.codex/config.toml`의 `codex-lb` 기본값은 Codex 데스크톱 앱용으로 그대로 둡니다. 위 `[model_providers.lumen]` block과 해당 배포의 셸 `LUMEN_API_KEY` export가 먼저 있어야 합니다.
+
+```toml
+# ~/.codex/lumen.config.toml
+model_provider = "lumen"
+model = "gpt-6-luna"
+```
+
+```zsh
+# ~/.zshrc (이미 export한 LUMEN_API_KEY 값은 여기서 반복하거나 기록하지 않음)
+export CODEX_CA_CERTIFICATE="/private/etc/ssl/cert.pem"
+codex() {
+  command codex --profile lumen "$@"
+}
+```
+
+새 대화형 zsh를 연 뒤 `codex` 또는 `codex exec '질문'`만 실행합니다. `CODEX_CA_CERTIFICATE`는 Codex가 신뢰할 PEM 번들을 읽도록 하는 공식 환경 변수이며, 서버 인증서 검증을 끄지 않습니다. 서버는 전체 인증서 체인을 제공하고 macOS/openssl 인증은 통과했지만 이 설치본의 Codex 기본 trust 경로는 실패했습니다. 이 경로와 셸 함수는 **이 Mac의 대화형 zsh CLI 전용**입니다. 다른 사용자는 본인 장치의 PEM 경로·셸에 맞춰 별도로 설정해야 하며, 데스크톱 앱·다른 셸·비대화형 자식 프로세스는 `.zshrc` 함수 설정을 자동으로 사용하지 않습니다. Codex의 [프로필 설정](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles)과 [CA 환경 변수](https://learn.chatgpt.com/docs/config-file/environment-variables) 계약을 따릅니다.
 
 `wire_api = "chat"`이나 `/v1/chat/completions` URL은 Codex direct provider에서 사용할 수 없습니다. Lumen의 `/v1/responses`가 text, function-call item, JSON Schema tool, `function_call_output`을 포함한 다음 full-input 요청을 native Responses 형태로 전달합니다. Codex HTTP transport는 후속 턴마다 전체 input을 다시 보내므로 Lumen은 `previous_response_id`를 구현하지 않고 stateless 상태를 유지할 수 있습니다. 실제 provider/model도 function calling과 충분한 context window를 지원해야 하며 Lumen은 Codex 도구를 대신 실행하지 않습니다.
 
 Codex의 `prompt_cache_key`는 provider transport로 전달합니다. 로컬 installation/session/turn 식별자가 포함된 `client_metadata`는 Lumen이 호환 입력으로 소비하되 외부 model provider에는 전달하지 않습니다. 알 수 없는 다른 request field는 계속 422로 거부합니다. 모델 catalog가 없을 때 Codex의 metadata fallback 경고는 비치명적이지만, 운영 설정에는 provider가 공개한 정확한 `model_context_window` 또는 검증된 `model_catalog_json`만 사용합니다.
 
+Codex의 알 수 없는 모델 metadata fallback은 실제 reasoning 지원 여부를 증명하지 않습니다. Responses transport는 관리자의 명시적 `reasoning=false` override 또는 LiteLLM의 **정확한 모델 ID** catalog에서 추론 미지원이 확인될 때만 `reasoning`과 `reasoning.*` include를 제외합니다. 카탈로그에 없는 모델은 probe 결과가 `false`여도 reasoning 요청을 보존하며, provider의 실제 400은 비밀 정보를 제거한 400으로 반환해 Codex의 502 재시도를 피합니다.
+
 2026-09-20에 설치된 `codex-cli 0.154.0`을 격리된 `CODEX_HOME`, `--strict-config`, bearer API key로 실제 containerized Lumen에 연결했습니다. Text turn이 성공했고 `exec_command` function call이 로컬에서 `CODEX_TOOL_OK`를 출력한 뒤, Codex가 `function_call_output`을 포함한 두 번째 full-input 요청을 보내 `CODEX_TOOL_CONTINUATION_OK`로 완료했습니다. 이 증거는 Lumen API와 synthetic provider의 wire/tool loop를 검증하며 live external model 품질이나 Keystone 배포를 증명하지 않습니다.
+
+2026-09-29에는 사용자 Codex 설정의 `lumen` provider를 CLI에서 명시적으로 선택하고, 로컬 Compose scoped key 및 OpenAI `gpt-4.1-mini` route를 사용해 설치된 `codex-cli 0.159.0`을 실행했습니다. 실제 upstream을 통한 `/v1/responses` 200 두 번, 로컬 `exec_command`의 `CODEX_TOOL_OK` (exit 0), 후속 응답 `CODEX_TOOL_CONTINUATION_OK`를 확인했습니다. 이 로컬 검증은 원격 배포의 동작을 증명하지 않습니다.
+
+같은 날 별도 Compose `127.0.0.1:18012`에서 `gpt-6-luna`를 active OpenAI text route로 등록하고 설치된 Codex CLI 0.159.0을 실제 OpenAI 계정에 연결했습니다. `/v1/models`에서 해당 공개 ID와 `openai` provider가 확인됐고, `/v1/responses` 3건이 모두 200이었습니다. `exec_command`의 `LUNA_TOOL_OK` (exit 0) 뒤 최종 응답 `LUNA_CODEX_CONTINUATION_OK`를 확인했으며 API-key 격리 usage ledger에도 `gpt-6-luna` 3건이 기록됐습니다. 로컬 smoke 단가는 vendor invoice 검증이 아닙니다.
+
+별도 원격 검증에서 `https://lumen.dmslab.re.kr/v1/health`와 `/v1/ready`는 정상, 인증된 `/v1/models`와 `/v1/chat/models`는 `gpt-6-luna` 및 `gpt-6-sol` active OpenAI route와 provider key 구성을 반환했습니다. 인증된 `gpt-6-luna` 직접 Responses non-stream/SSE는 완료됐습니다. 위 CA 번들을 적용한 **실제 사용자 Codex 설정**의 원격 `gpt-6-luna` 턴은 `exec_command`의 `REMOTE_LUNA_TOOL_OK` (exit 0) 및 `REMOTE_LUNA_CODEX_OK`로 완료됐습니다. `-c model_provider=lumen`만 지정해 사용자 기본 모델 `gpt-6-sol`로 실행한 별도 Codex text 턴도 `REMOTE_SOL_OK.`로 완료됐습니다(`sol`의 tool continuation은 미검증). CA 번들 없이 Codex 요청은 연결 오류였으므로 이 환경에서는 override가 필요합니다. 원격 key에 `usage:read` scope가 없어 원격 원장/청구는 확인하지 않았습니다.
+
+추가로 위 사용자 CLI 프로필/셸 설정을 적용한 뒤 별도 `-c model_provider`, `-m`, 일회성 CA 환경 변수 없이 대화형 zsh에서 `codex exec`를 실행했습니다. 원격 `POST /v1/responses` HTTP 200, `exec_command`의 `ORDINARY_LUMEN_TOOL_OK` (exit 0), 최종 `ORDINARY_LUMEN_CODEX_OK`, CLI 종료 코드 0을 관찰했습니다. 같은 셸의 `codex` TUI에서도 `GPT-6-Luna default`가 표시되고 텍스트 응답이 완료됐습니다. TUI에는 사용자 전체 설정의 `SessionStart` hook JSON 경고가 별도로 표시됐지만 모델 응답은 완료됐습니다. 이 CLI 증거를 Codex 데스크톱 앱, 다른 사용자 장치, Sol 도구 호출 또는 원격 사용량 원장의 검증으로 확장하지 않습니다.
 
 ---
 
 ## 5. 모델 디스커버리 및 Provider Credential 상태
 
-* `GET /v1/models` (OpenAI 호환 포맷): 표준 필드(`id`, `object`, `created`, `owned_by`)에 더해 같은 공개 ID를 제공하는 활성 provider type의 정렬된 `providers` 배열을 반환합니다. `id`는 SDK가 보내는 공개 `model` 값이며 내부 LiteLLM route key가 아닙니다.
-* `GET /v1/chat/models` (Native 상세 포맷): 각 모델의 공개 `api_model_name`, `api_provider`와 운영용 내부 `model_name`을 분리해 반환하고 `provider_api_key_configured` (`true`/`false`)를 포함합니다.
+* `GET /v1/models` (OpenAI 호환 포맷): 표준 필드(`id`, `object`, `created`, `owned_by`)에 더해 같은 공개 ID를 제공하는 활성 `api_provider` 선택자의 `providers` 배열을 반환합니다. `id`는 SDK가 보내는 공개 `model` 값이며 내부 LiteLLM route key가 아닙니다.
+* `GET /v1/chat/models` (Native 상세 포맷): 각 모델의 공개 `api_model_name`, `api_provider`, 표시 `provider`, 실제 연결 `provider_type`, stable `provider_id`와 운영용 내부 `model_name`을 분리합니다. Provider `provider_sort_order`·provider ID·model `sort_order`·model ID 순으로 반환하고 `provider_api_key_configured` 및 `reasoning_none_supported`를 포함합니다. `reasoning_none_supported=false`인 모델에 `reasoning_effort="none"`을 보내면 422이므로 UI는 이 값이 true일 때만 "없음"을 노출합니다.
   * `true`: 해당 모델의 provider API Key가 Lumen 서버에 정상 설정(DB 또는 환경 변수 `api_key_env`)되어 있음.
   * `false`: 명시적인 provider API Key가 등록되지 않음 (`false`인 모델 호출 시 completion 시점에 502/400 오류 발생 가능).
 * Keystone 전용 관리자 엔드포인트 `GET /v1/admin/providers`는 `has_api_key`, `api_key_source`(`database`/`environment`/`null`), `api_key_env`, `has_billing_admin_key` 정보를 제공하며 시크릿 값 자체는 반환하지 않습니다. `POST /v1/admin/providers`와 `PATCH /v1/admin/providers/{provider_id}`의 선택적 `billing_admin_key`는 direct OpenAI/Anthropic 조직 report용 별도 administrator credential입니다. Subscription auth, Gemini, Perplexity, custom base에는 설정할 수 없습니다.
+* 환경 키 bootstrap: Lumen migration 후 `OPENAI_API_KEY` 또는 `GEMINI_API_KEY`를 가진 일회용 bootstrap/API/worker에 동일 변수를 제공하면 `openai`/`gemini` direct provider가 자동 등록됩니다. DB에는 key 값이 아니라 `api_key_env`만 남고, 관리자 DB credential·기존 route/pricing은 덮어쓰지 않습니다. Afterglow 대시보드에 추론용 키를 다시 입력할 필요는 없습니다. 단, 키만으로 media model/pricing을 추정하지 않으므로 모델은 Admin 또는 명시적 `LUMEN_BOOTSTRAP_MODELS_JSON`에 지원 ID·가격을 등록해야 합니다. 로컬 개발과 Kolla 비밀 공급은 [로컬 가이드](local-console.md#provider-credential-configuration)와 [운영 절차](operations.md#media-모델-운영과-realtime-장애-대응)를 따릅니다.
 
 * Keystone 전용 `GET /v1/admin/providers/billing`은 모든 configured provider를 한 번에 반환합니다. 각 항목은 Lumen immutable usage ledger의 일·주·월·누적 request/token/raw USD cost를 포함합니다. OpenRouter/DeepSeek는 inference key로 live credit 한도·잔액을 조회합니다. Direct OpenAI/Anthropic은 별도 AES-GCM/HKDF domain에 저장한 administrator key로 공식 organization report를 조회해 현재 UTC 일·주·월 cost/usage를 반환합니다. Gemini는 console-only, Perplexity Enterprise Computer Analytics는 Sonar/API Platform billing과 제품 범위가 달라 해당 analytics API를 호출하지 않습니다. Subscription credential과 custom base에는 오인 가능한 vendor console URL을 반환하지 않습니다. Provider/report별 upstream 실패는 안전한 상태로 격리되어 다른 provider 항목이나 관리자 CRUD를 막지 않습니다.
 
@@ -218,13 +293,15 @@ Afterglow 관리자 모델 onboarding은 `GET /v1/admin/providers/{id}/available
 
 UI는 provider·exact ID·표시명·가격을 검토한 뒤 기존 `POST /v1/admin/models`로 등록·활성화하거나 비활성 저장합니다. 조회 metadata는 가격/고급 capability/실제 추론 성공의 증거가 아니며 수동 가격 또는 명시 models.dev mapping과 capability override를 별도로 적용합니다. Browser generation/provider/token/project fence가 오래된 조회와 bulk 등록의 provider 혼합을 막습니다. 등록/변경 후 열린 모델 선택기는 invalidation, focus/visible 복귀 또는 명시 새로고침으로 목록을 다시 읽되 유효한 선택은 보존합니다. API/worker의 route는 DB를 request-time에 읽으므로 새 ID 등록에 프로세스 재시작이나 정적 registry 수정이 필요하지 않습니다.
 
-호출별 token 수는 provider 응답의 `usage`를 우선하며 확정 USD 비용은 일반 inference API가 반환하지 않습니다. Lumen은 모델의 수동 단가를 우선 적용하고, direct provider의 exact LiteLLM bundled cache 단가가 있으면 미설정 cache 범주에만 적용합니다. 동일 model ID의 custom `api_base`에는 catalog 가격을 상속하지 않으므로 운영자가 입력·출력·cache 가격을 명시해야 합니다. `/v1/usage/records`의 `uncached_input_tokens`·`cache_read_input_tokens`·`cache_creation_5m_input_tokens`·`cache_creation_1h_input_tokens`와 `credited_cost`를 함께 표시할 수 있습니다. 관리자 `/v1/admin/stats/users/{user_id}`의 각 record는 `cache_costs_usd`와 `cache_price_sources`도 제공합니다. `/v1/chat/completions`의 `usage.prompt_tokens_details.cached_tokens`는 보고된 hit 수입니다. OpenAI/Gemini의 자동 캐싱 및 Anthropic direct chat의 stable-system breakpoint는 모두 **실제 cache counter가 있는 응답**에서만 hit로 판단하며, provider organization report와 Lumen per-request 원가는 범위·시차·tier가 다를 수 있습니다. 상세 운영 계약은 [API 참조](api-reference.md#모델-단가와-prompt-cache-단가)입니다.
+호출별 token 수는 provider 응답의 `usage`를 우선하며 확정 USD 비용은 일반 inference API가 반환하지 않습니다. Lumen은 모델의 수동 단가를 우선 적용하고, direct provider의 exact LiteLLM bundled cache 단가가 있으면 미설정 cache 범주에만 적용합니다. 동일 model ID의 custom `api_base`에는 catalog 가격을 상속하지 않으므로 운영자가 입력·출력과 필요한 cache-read 가격을 명시해야 합니다. Text 모델의 미설정 5분 write는 effective input, 1시간 write는 effective 5분 단가를 상속하며 명시적 0과 direct Anthropic의 별도 1시간 가격을 보존합니다. Cache-read fallback과 media write cascade는 없고 기존 frozen snapshot의 누락 가격을 소급하여 채우지 않습니다. `/v1/usage/records`의 `uncached_input_tokens`·`cache_read_input_tokens`·`cache_creation_5m_input_tokens`·`cache_creation_1h_input_tokens`와 `credited_cost`를 함께 표시할 수 있습니다. 관리자 `/v1/admin/stats/users/{user_id}`의 각 record는 `cache_costs_usd`와 `cache_price_sources`도 제공합니다. `/v1/chat/completions`의 `usage.prompt_tokens_details.cached_tokens`는 보고된 hit 수입니다. OpenAI/Gemini의 자동 캐싱 및 Anthropic direct chat의 stable-system breakpoint는 모두 실제 cache counter가 있는 응답에서만 hit로 판단하며, provider organization report와 Lumen per-request 원가는 범위·시차·tier가 다를 수 있습니다. 상세 운영 계약은 [API 참조](api-reference.md#모델-단가와-prompt-cache-단가)입니다.
+
+관리자 cache 편집에는 nullable raw `cache_*_price_per_million`, 목록 단가에는 별도 `effective_cache_*_price_per_million`과 `effective_cache_price_sources`를 사용합니다. 저장된 null은 자동 fallback이 있어도 null을 유지하며 effective null을 무료로 표시하지 않습니다.
 
 Direct Gemini/Anthropic에서 exact LiteLLM catalog의 cache 단가에 `above_200k_tokens` tier가 있으면 호출별 provider-reported prompt 총량이 200,000을 초과할 때만 그 tier가 적용됩니다. Run·요약·advisor 가격은 admission에 고정되고, 관리자가 수동 설정한 cache 단가는 두 문맥 tier 모두에서 우선합니다. Advisor 사용량은 호출별로 판단합니다. `model="lumen"`의 OpenAI 호환 `cached_tokens`는 해당 executor 호출의 cache-read만 포함하고 별도 advisor 사용량은 포함하지 않습니다. Frozen title job은 누락 가격을 public catalog로 채우지 않습니다.
 
 ### 5.1 공개 모델 ID와 실행 route
 
-호환 API 클라이언트는 `api_model_name`만 `model`로 보내고 필요할 때 `api_provider`를 `provider`로 보냅니다. 다른 provider와 겹치지 않는 고유 모델(예: Perplexity 단독의 `sonar`, `kimi-k3`, `deepseek-v4-flash-0731`)은 `provider`를 생략해도 정상적으로 라우팅됩니다. 동일한 공개 ID가 여러 provider type에 존재하는 경우에만 `provider`를 생략한 completion이 **HTTP 409 Conflict**로 실패합니다. 요청 body의 `provider`는 소문자 provider type이며 OpenAI/Anthropic Python SDK에서는 `extra_body={"provider": "perplexity"}`로 전달할 수 있습니다. 같은 provider type 안에서도 route가 둘 이상이면 선택자가 충분하지 않으므로 409를 유지합니다. Perplexity Agent API는 명시적으로 요청한 native search만 tool로 전달하며, 일반 Agent route에 검색 도구를 자동 주입하지 않습니다.
+호환 API 클라이언트는 `api_model_name`만 `model`로 보내고 필요할 때 관리자 설정 `api_provider`를 `provider`로 보냅니다. 다른 provider와 겹치지 않는 고유 모델(예: Perplexity 단독의 `sonar`, `kimi-k3`, `deepseek-v4-flash-0731`)은 `provider`를 생략해도 정상적으로 라우팅됩니다. 동일한 공개 ID가 여러 route에 존재하면 `provider`를 생략한 completion이 **HTTP 409 Conflict**로 실패합니다. OpenAI/Anthropic Python SDK에서는 `extra_body={"provider": "nvidia"}`처럼 공개 선택자를 전달할 수 있습니다. 같은 model/selector 안에서도 route가 둘 이상이면 409를 유지하며 표시 순서는 실행 선택에 쓰지 않습니다. 선택자 변경 후 외부 클라이언트는 새 값을 사용해야 하며 이전 값의 alias는 없습니다. Perplexity Agent API는 명시적으로 요청한 native search만 tool로 전달하며 일반 Agent route에 검색 도구를 자동 주입하지 않습니다.
 
 Perplexity provider는 base URL로 transport를 명시합니다.
 
@@ -279,6 +356,12 @@ Preview의 tool 스키마 집합은 실행기가 실제로 보내는 집합(내�
 
 모델 한도를 알 수 없거나(`context_window_unknown`) 토큰 계수가 불가능해도(`token_count_unavailable`) breakdown은 사라지지 않습니다. 계수가 가능하면 값이 있는 완전한 구성을 그대로 제공하고, 계수가 불가능하면 토큰만 `null`로 비운 뒤 이름·개수를 유지한 채 `complete=false`로 보고합니다. `items[]`는 128개로 제한되지만 `count`는 잘리기 전 실제 총계입니다. request scope에서 모델이 `list_available_tools`로 적재한 도구는 `deferred_tools`에서 제거되어 `tools`/`mcp_tools`로 계수되므로, 같은 도구가 포함과 지연에 동시에 나타나지 않습니다.
 
+### 5.3.1 Shared graph, native history window and fork
+
+Migration 019 changes each conversation to an independently titled and branched view of an owner/project-scoped immutable message graph. An existing copied fork remains a separate graph; a new `POST /v1/conversations/{id}/fork` with `{"message_id": <reachable-id>}` shares only selected ancestor message IDs, not cloned ciphertext/assets. Reachability requires the view's explicit membership; same graph, source origin ID, or a sibling branch does **not** confer access. A returned inherited message's `conversation_id` is the requested view. Deleting the source preserves a surviving fork; deleting the last mapping removes its graph messages and asset links. The source's run/retry affordance and usage attribution do not transfer to the fork. An inherited first user message followed by a completed assistant in the fork may enqueue that fork's first-title job; manual title revision still fences late model output.
+
+On opening a conversation, the BFF requests `GET /v1/conversations/{id}/messages?anchor=latest&limit=40` and forwards the opaque page fields. UI initially renders this page in chronological display order, then requests exactly one `before_cursor` when the user intentionally scrolls into the top boundary; it prepends deduplicated IDs while retaining the prior viewport anchor. Residual scroll momentum or the programmatic anchor-restoration scroll must not trigger chained requests. A 409 `history_revision_changed` invalidates the old cursor/page and requires a new latest page, not blind continuation; active-branch switching and run SSE updates must not be undone by an in-flight older response. Do not replay every historical page or replace this with first-page loading, page-number slicing or a wall of navigation buttons. `docs/api-reference.md` documents cursor errors and page fields.
+
 ### 5.4 Plugin bindings, managed agent/child와 BFF 경계
 
 Python plugin wheel은 관리자 이미지에 설치하고 `[lumen.plugin_config]`의 exact distribution/name/version/kind allowlist를 갱신한다. Afterglow 사용자에게 패키지 설치 UI/API를 제공하지 않는다. Keystone admin은 `GET /v1/admin/plugins` 및 `/v1/admin/plugin-bindings`로 승인된 manifest/export와 global tool/skill binding을 관리한다. `GET/POST/PATCH/DELETE /v1/plugin-bindings`는 이미 승인된 `user_configurable` export에 한해 사용자 설정을 관리하며 API key 사용 시 `native:extensions:read|write`가 필요하다. Native 요청/agent 정의의 `plugin_tool_ids`/`plugin_skill_ids`는 이 binding UUID이며 기존 `tool_ids`/`skill_ids`와 분리한다. 변경된 config/version/revoke가 active run의 재인가를 실패시킬 수 있으므로 화면에서 해당 오류를 임의로 재시도하거나 이전 설정을 복원해 실행하지 않는다.
@@ -297,7 +380,7 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
 
 * **OpenAI Chat Completions (`POST /v1/chat/completions`)**:
   - `model`: `lumen` virtual model 또는 공개 provider model ID (필수)
-  - `provider`: 같은 공개 model ID의 route 충돌을 해소하는 선택적 provider type
+  - `provider`: 같은 공개 model ID의 route 충돌을 해소하는 선택적 관리자 설정 `api_provider`
   - `messages`: 메시지 목록 (필수)
   - `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`, `stream_options`
   - `model="lumen"`은 문자열 content의 `system`/`developer`/`user`/`assistant` transcript만 받고 마지막 `user` message를 요구합니다. Caller tools/tool messages/multimodal content는 400으로 거부하며 Lumen memory/extensions/MCP/tool 실행은 비활성화됩니다.
@@ -309,7 +392,7 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
   - `model`, `messages`, 필수 양수 `max_tokens`, 선택적 `provider`, `system`, `temperature`, `stream`, `metadata`, `stop_sequences`, `thinking`, `tools`, `tool_choice`, `top_k`, `top_p`, `container`를 받습니다.
   - `POST /v1/messages/count_tokens`는 동일한 Anthropic input block을 native token-count transport로 전달합니다.
   - Streaming은 Anthropic event 이름과 body를 유지하고 약 15초 idle마다 `event: ping`을 보냅니다. OpenAI `[DONE]` sentinel로 변환하지 않습니다.
-* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르거나 header가 인식 가능한 `model` provider prefix와 충돌하면 400 `provider_header_conflict`입니다. Request schema에 없는 필드는 422로 거부합니다.
+* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르면 400 `provider_header_conflict`입니다. `model`의 transport prefix는 editable selector의 alias나 충돌 조건이 아닙니다. Request schema에 없는 필드는 422로 거부합니다.
 
 ### 6.2 Output token budget
 

@@ -134,7 +134,7 @@ async def _request_cancelled_transaction(
             root = run
         if run.status in NONTERMINAL and run.cancel_requested_at is None:
             run.cancel_requested_at = _now()
-        immediate = run.execution_protocol_version == 2 and run.status in {
+        immediate = (run.execution_protocol_version == 2 or run.run_kind in {"image", "tts", "stt", "realtime"}) and run.status in {
             "awaiting_input",
             "queued",
             "waiting_children",

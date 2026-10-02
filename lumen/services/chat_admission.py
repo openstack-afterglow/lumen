@@ -27,10 +27,12 @@ from lumen.services import conversation_store as cs
 from lumen.services import extensions_store as es
 from lumen.services import memory_store as ms
 from lumen.services import workspace_store as ws
+from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
-from lumen.services.providers.pricing import _has_component_prices
+from lumen.services.providers.pricing import _has_component_prices, frozen_token_pricing
 from lumen.services.tool_runtime import contracts
+from lumen.services.usage_breakdown import required_modalities_for_request
 
 _MAX_TOKENS_CAP = 4096
 _MAX_MESSAGE_CHARS = 32000
@@ -207,7 +209,7 @@ def _cache_price_snapshot(route: dict[str, Any]) -> dict[str, Any]:
     """Freeze resolved direct-provider or manual cache prices and provenance."""
     return {
         **{key: str(route[key]) if route.get(key) is not None else None for key in _CACHE_PRICE_KEYS},
-        "cache_price_sources": route.get("cache_price_sources") or {},
+        "cache_price_sources": dict(route.get("cache_price_sources") or {}),
     }
 
 
@@ -262,12 +264,35 @@ async def _resolve_feature_routes(features: ChatFeatureOptions) -> dict[str, dic
     return routes
 
 
+# Chat usage from these LiteLLM transports reports per-modality input counts.
+# Elsewhere a modality-priced input could only be billed at the text rate.
+_MODALITY_INPUT_REPORTING_PROVIDERS = {"gemini": frozenset({"image", "audio"})}
+
+
+def _required_token_modalities(
+    resolved: dict, token_rates: dict, *, parts: list[UserInputPart] | None
+) -> list[str]:
+    """Priced input modalities of the current turn (the only materialized media); reject unmeterable ones."""
+    required = required_modalities_for_request(
+        token_rates, messages=[{"content": [{"type": part.type} for part in parts or []]}]
+    )
+    reporting = _MODALITY_INPUT_REPORTING_PROVIDERS.get(str(resolved.get("provider_type") or ""), frozenset())
+    for item in required:
+        if item.removesuffix("_input") not in reporting:
+            raise HTTPException(
+                status_code=422,
+                detail=f"requested chat capability is not available: {item} (modality_usage_unavailable)",
+            )
+    return required
+
+
 def _run_snapshots(
     resolved: dict,
     features: dict[str, Any],
     *,
     feature_routes: dict[str, dict[str, Any]] | None = None,
     summary_route: dict[str, Any] | None = None,
+    parts: list[UserInputPart] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Persist immutable execution, summary-route, and pricing inputs for a run."""
     price_metadata = resolved.get("price_metadata")
@@ -319,6 +344,7 @@ def _run_snapshots(
         "input_price_per_token": str(resolved["input_price_per_token"]),
         "output_price_per_token": str(resolved["output_price_per_token"]),
         "component_prices": component_prices,
+        "advisor_cache_price_sources": dict((advisor_route or {}).get("cache_price_sources") or {}),
         "price_source": resolved.get("price_source"),
         "price_version": resolved.get("price_version"),
         "provider_name": resolved["provider_name"],
@@ -328,20 +354,26 @@ def _run_snapshots(
         "rounding_version": "half_even_v1",
         **_cache_price_snapshot(resolved),
     }
+    try:
+        token_pricing = frozen_token_pricing(resolved)
+        summary_token_pricing = frozen_token_pricing(summary_route) if summary_route is not None else None
+        token_rates = token_pricing["token_rates"]
+    except errors.ProviderValidationError as exc:
+        raise HTTPException(status_code=422, detail="model token pricing is invalid") from exc
+    if token_rates:
+        # Frozen with the run: later model price edits never reprice it.
+        pricing_snapshot["token_rates"] = token_rates
+        pricing_snapshot["required_token_modalities"] = _required_token_modalities(
+            resolved, token_rates, parts=parts
+        )
     if summary_route is not None:
         capability_snapshot["summary_route"] = _feature_route_snapshot(summary_route, purpose="summary")
         pricing_snapshot["summary_route"] = {
-            "input_price_per_token": str(summary_route.get("input_price_per_token"))
-            if summary_route.get("input_price_per_token") is not None
-            else None,
-            "output_price_per_token": str(summary_route.get("output_price_per_token"))
-            if summary_route.get("output_price_per_token") is not None
-            else None,
+            **summary_token_pricing,
             "price_source": summary_route.get("price_source"),
             "price_version": summary_route.get("price_version"),
             "provider_name": summary_route.get("provider_name"),
             "model_name": summary_route.get("model_name"),
-            **_cache_price_snapshot(summary_route),
         }
     return capability_snapshot, pricing_snapshot
 
@@ -475,6 +507,8 @@ async def _resolve_model(model_name: str) -> dict:
         raise HTTPException(status_code=400, detail="모델이 지정되지 않았습니다")
     try:
         resolved = await ps.resolve_model(model_name)
+    except errors.AmbiguousModelRouteError as exc:
+        raise HTTPException(status_code=409, detail="model_route_ambiguous") from exc
     except errors.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if resolved is None:
@@ -490,6 +524,11 @@ def _validated_reasoning_effort(value: str, resolved: dict) -> str:
     if not capabilities.get("reasoning"):
         raise HTTPException(status_code=422, detail="선택한 모델은 추론 강도를 지원하지 않습니다")
     if effort == "none":
+        if not reasoning_can_be_disabled(capabilities, resolved.get("provider_type")):
+            raise HTTPException(
+                status_code=422,
+                detail="선택한 모델은 추론 끄기('none')를 지원하지 않습니다. 자동 또는 모델이 지원하는 추론 강도를 선택하세요",
+            )
         return effort
     options = capabilities.get("reasoning_options") or []
     supported = next(
@@ -506,17 +545,23 @@ def _validated_reasoning_effort(value: str, resolved: dict) -> str:
 
 
 def _validate_tool_reasoning_compatibility(effort: str, resolved: dict, features: ChatFeatureOptions) -> None:
-    """Reject explicit reasoning levels the OpenAI GPT-5 Chat Completions tools route cannot execute."""
+    """Reject explicit reasoning levels the OpenAI GPT-5 Chat Completions tools route cannot execute.
+
+    ``none`` reaches this check only after ``_validated_reasoning_effort`` confirmed the model
+    advertises it, so it stays allowed here.
+    """
     if (
         resolved.get("provider_type") == "openai"
         and str(resolved.get("model_name") or "").strip().lower().startswith("gpt-5")
         and features.tool_policy.mode != "none"
         and effort not in {"auto", "none"}
     ):
+        can_disable = reasoning_can_be_disabled(resolved.get("capabilities"), resolved.get("provider_type"))
+        choices = "자동 또는 없음" if can_disable else "자동"
         raise HTTPException(
             status_code=422,
             detail="선택한 모델은 도구 사용과 명시적 추론 강도를 함께 지원하지 않습니다. "
-            "도구를 끄거나 추론 강도를 자동 또는 없음으로 선택하세요.",
+            f"도구를 끄거나 추론 강도를 {choices}으로 선택하세요.",
         )
 
 
@@ -1151,6 +1196,7 @@ async def prepare_context_input(
         features.model_dump(mode="json", by_alias=True),
         feature_routes=feature_routes,
         summary_route=summary_route,
+        parts=parts,
     )
     capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
     if plugin_tool_snapshots or plugin_skill_snapshots:

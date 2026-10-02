@@ -452,14 +452,83 @@ class TestReasoningEffortValidation:
         with pytest.raises(HTTPException, match="지원하지 않습니다"):
             chat_admission._validated_reasoning_effort("low", resolved)
 
+    @pytest.mark.parametrize(
+        ("provider_type", "options"),
+        [
+            # models.dev shapes: gpt-5, o3, gemini-2.5-pro, then unknown or stale metadata.
+            ("openai", [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}]),
+            ("openai", [{"type": "effort", "values": ["low", "medium", "high"]}]),
+            ("gemini", [{"type": "budget_tokens", "min": 128, "max": 32768}]),
+            ("gemini", [{"type": "budget_tokens"}]),
+            ("gemini", [{"type": "budget_tokens", "min": False}]),
+            ("openai", []),
+            ("openai", None),
+        ],
+    )
+    def test_none_is_rejected_unless_the_model_advertises_disabling(self, provider_type, options):
+        resolved = {"provider_type": provider_type, "capabilities": {"reasoning": True, "reasoning_options": options}}
+        with pytest.raises(HTTPException) as exc_info:
+            chat_admission._validated_reasoning_effort("none", resolved)
+        assert exc_info.value.status_code == 422
+        assert "'none'" in exc_info.value.detail
+        assert chat_admission._validated_reasoning_effort("auto", resolved) == "auto"
+
+    @pytest.mark.parametrize(
+        ("provider_type", "options"),
+        [
+            # models.dev shapes: gpt-5.1, a toggle model, gemini-2.5-flash, then Anthropic budget models.
+            ("openai", [{"type": "effort", "values": ["none", "low", "medium", "high"]}]),
+            ("deepinfra", [{"type": "toggle"}]),
+            ("gemini", [{"type": "toggle"}, {"type": "budget_tokens", "min": 0, "max": 24576}]),
+            ("gemini", [{"type": "budget_tokens", "min": 0, "max": 24576}]),
+            ("anthropic", [{"type": "budget_tokens", "min": 1024}]),
+            ("anthropic", []),
+        ],
+    )
+    def test_none_is_accepted_when_disabling_thinking_is_valid(self, provider_type, options):
+        resolved = {"provider_type": provider_type, "capabilities": {"reasoning": True, "reasoning_options": options}}
+        assert chat_admission._validated_reasoning_effort(" None ", resolved) == "none"
+
+    def test_none_is_rejected_for_non_reasoning_models(self):
+        resolved = {"provider_type": "anthropic", "capabilities": {"reasoning": False}}
+        with pytest.raises(HTTPException, match="추론 강도를 지원하지 않습니다"):
+            chat_admission._validated_reasoning_effort("none", resolved)
+
     def test_gpt5_tools_reject_explicit_reasoning_but_allow_auto_or_none(self):
-        resolved = {"provider_type": "openai", "model_name": "gpt-5.6-luna"}
+        resolved = {
+            "provider_type": "openai",
+            "model_name": "gpt-5.6-luna",
+            "capabilities": {
+                "reasoning": True,
+                "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high"]}],
+            },
+        }
         tools_enabled = ChatFeatureOptions()
 
         chat_admission._validate_tool_reasoning_compatibility("auto", resolved, tools_enabled)
+        assert chat_admission._validated_reasoning_effort("none", resolved) == "none"
         chat_admission._validate_tool_reasoning_compatibility("none", resolved, tools_enabled)
-        with pytest.raises(HTTPException, match="도구 사용과 명시적 추론 강도"):
+        with pytest.raises(HTTPException, match="자동 또는 없음으로") as exc_info:
             chat_admission._validate_tool_reasoning_compatibility("high", resolved, tools_enabled)
+        assert exc_info.value.status_code == 422
+
+    def test_gpt5_tools_hint_omits_none_when_the_model_cannot_disable_reasoning(self):
+        resolved = {
+            "provider_type": "openai",
+            "model_name": "gpt-5",
+            "capabilities": {
+                "reasoning": True,
+                "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
+            },
+        }
+        tools_enabled = ChatFeatureOptions()
+
+        with pytest.raises(HTTPException, match="'none'"):
+            chat_admission._validated_reasoning_effort("none", resolved)
+        with pytest.raises(HTTPException) as exc_info:
+            chat_admission._validate_tool_reasoning_compatibility("high", resolved, tools_enabled)
+        assert exc_info.value.detail.endswith("추론 강도를 자동으로 선택하세요.")
+        assert "없음" not in exc_info.value.detail
 
     def test_gpt5_explicit_reasoning_is_allowed_when_tools_are_disabled(self):
         resolved = {"provider_type": "openai", "model_name": "gpt-5.6-luna"}
@@ -907,6 +976,50 @@ class TestCanonicalCompletionRequests:
         assert response.status_code == 422
         assert "image" in response.json()["detail"]
 
+    @pytest.mark.parametrize(
+        ("effort_values", "expected_status"),
+        [(["minimal", "low", "medium", "high"], 422), (["none", "low", "medium", "high"], 202)],
+    )
+    async def test_explicit_none_is_admitted_only_when_the_model_advertises_it(
+        self, client, monkeypatch, effort_values, expected_status
+    ):
+        await _patch_text_execution(monkeypatch)
+        resolved = {
+            **_resolved(),
+            "model_name": "gpt-5",
+            "provider_type": "openai",
+            "capabilities": {
+                **_resolved()["capabilities"],
+                "reasoning": True,
+                "reasoning_options": [{"type": "effort", "values": effort_values}],
+            },
+        }
+        monkeypatch.setattr(ps, "resolve_model", lambda *args, **kwargs: _return(resolved))
+        seen = {}
+
+        async def create_persistent_run(**kwargs):
+            seen.update(kwargs)
+            return ChatRunDescriptor(
+                run_id="run-none",
+                status="queued",
+                events_url="/api/v1/chat/runs/run-none/events",
+                cancel_url="/api/v1/chat/runs/run-none/cancel",
+            )
+
+        monkeypatch.setattr(admission, "create_persistent_run", create_persistent_run)
+        response = await client.post(
+            f"{_BASE}/c1/completions",
+            headers=_HEADERS,
+            json=_request(reasoning_effort="none", features={"memory": False, "tool_policy": {"mode": "none"}}),
+        )
+
+        assert response.status_code == expected_status
+        if expected_status == 422:
+            assert "'none'" in response.json()["detail"]
+            assert seen == {}
+        else:
+            assert seen["request_payload"]["reasoning_effort"] == "none"
+
     async def test_clean_image_part_enters_durable_request_payload(self, client, monkeypatch):
         await _patch_text_execution(monkeypatch)
         resolved = {
@@ -1181,7 +1294,6 @@ class TestCanonicalTempCompletion:
         catalog_models = models_resp.json()
         assert len(catalog_models) == 1
         model_entry = catalog_models[0]
-        assert "provider_id" not in model_entry
         assert model_entry["capabilities"]["web_search"] is True
 
         monkeypatch.setattr(
@@ -1870,3 +1982,270 @@ class TestCompactionRoutes:
         )
         assert resp.status_code == 409
         assert resp.json()["detail"] == "conversation_run_active"
+
+
+class TestStatelessModalityBilling:
+    """Exercise real request → usage split → cost → ledger boundary, without provider I/O."""
+
+    @staticmethod
+    def route(modality="audio", provider="gemini"):
+        return {
+            "model_name": "operator-selected-model", "api_model_name": "public-model",
+            "provider_type": provider, "provider_name": "saved-provider",
+            "api_base": "https://private.example/v1", "api_key": "saved-key",
+            "margin_multiplier": Decimal("1"), "price_source": "manual",
+            "input_price_per_token": Decimal("0.000002"),
+            "output_price_per_token": Decimal("0.000004"),
+            "cache_read_price_per_token": Decimal("0.0000005"),
+            "media_pricing": {"token_rates": {modality: {
+                "input_per_million": "10", "cache_read_per_million": "1", "output_per_million": "20",
+            }}},
+        }
+
+    @staticmethod
+    def media_messages(modality):
+        part = (
+            {"type": "image_url", "image_url": {"url": "https://asset.example/image"}}
+            if modality == "image" else {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}
+        )
+        return [{"role": "user", "content": [{"type": "text", "text": "Describe"}, part]}]
+
+    @staticmethod
+    def usage(modality):
+        return {
+            "prompt_tokens": 1000, "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 400, f"{modality}_tokens": 800,
+                                      "cached_tokens_details": {f"{modality}_tokens": 300}},
+        }
+
+    @staticmethod
+    async def invoke(core, route, messages, protocol="chat", stream=False):
+        common = {"resolved": route, "user_id": "u1", "project_id": "p1", "api_key_id": 7}
+        if protocol == "chat":
+            if stream:
+                return [event async for event in core.complete_stream(
+                    **common, messages=messages, max_tokens=64, temperature=None,
+                )]
+            return await core.complete_once(**common, messages=messages, max_tokens=64, temperature=None)
+        if protocol == "responses":
+            response = await core.complete_responses(**common, input=messages, stream=stream, options={})
+        else:
+            response = await core.complete_anthropic(
+                **common, messages=messages, max_tokens=64, stream=stream, options={},
+            )
+        return [event async for event in response] if stream else response
+
+    @staticmethod
+    def ledger(monkeypatch, core):
+        recorded = []
+
+        async def apply_usage(**kwargs):
+            recorded.append(kwargs)
+            return kwargs["usage_cost"].raw_cost
+
+        monkeypatch.setattr(core.credit, "apply_usage", apply_usage)
+        monkeypatch.setattr(core, "_with_passthrough_compaction", lambda options, **_: dict(options))
+        return recorded
+
+    @pytest.mark.parametrize("modality", ["image", "audio"])
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_saved_modality_and_cache_rates_are_frozen_before_provider_call(self, monkeypatch, modality, stream):
+        from lumen.services import completion_api as core
+
+        route = self.route(modality)
+        usage = self.usage(modality)
+        recorded = self.ledger(monkeypatch, core)
+        calls = []
+
+        async def provider(model, messages, **kwargs):
+            calls.append((model, kwargs["api_base"], kwargs["api_key"]))
+            route["input_price_per_token"] = Decimal("99")
+            route["media_pricing"]["token_rates"][modality]["input_per_million"] = "999"
+            route["provider_name"] = "changed-provider"
+            route["margin_multiplier"] = Decimal("99")
+            if stream:
+                async def chunks():
+                    yield SimpleNamespace(usage=usage, choices=[])
+                return chunks()
+            return SimpleNamespace(
+                usage=usage, choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="OK", tool_calls=None), finish_reason="stop",
+                )],
+            )
+
+        monkeypatch.setattr(core.litellm_client, "acompletion_stream" if stream else "acompletion", provider)
+        result = await self.invoke(core, route, self.media_messages(modality), stream=stream)
+        assert calls == [("operator-selected-model", "https://private.example/v1", "saved-key")]
+        assert len(recorded) == 1
+        charge = recorded[0]
+        # Text 100*2 + cache 100*.5 + output 50*4; media 500*10 + cache 300*1 (per million).
+        assert charge["usage_cost"].raw_cost == Decimal("0.00575")
+        assert charge["usage_cost"].cache_read_cost == Decimal("0.00035")
+        assert charge["provider"] == "saved-provider"
+        assert charge["margin_multiplier"] == Decimal("1")
+        assert charge["breakdown"].modality_tokens[modality].cache_read_input_tokens == 300
+        assert (result[-1] if stream else result)["credited_cost"] == 0.00575
+
+    @pytest.mark.parametrize("protocol", ["chat", "responses", "anthropic"])
+    async def test_optional_prices_keep_text_only_requests_and_legacy_no_usage(self, monkeypatch, protocol):
+        from lumen.services import completion_api as core
+
+        recorded = self.ledger(monkeypatch, core)
+        calls = []
+
+        async def provider(*args, **kwargs):
+            calls.append(1)
+            if protocol == "chat":
+                return SimpleNamespace(usage=None, choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="OK", tool_calls=None), finish_reason="stop",
+                )])
+            return {"output": [], "content": [{"type": "text", "text": "OK"}]}
+
+        monkeypatch.setattr(core.litellm_client, {
+            "chat": "acompletion", "responses": "aresponses", "anthropic": "aanthropic_messages",
+        }[protocol], provider)
+        monkeypatch.setattr(core.litellm_client, "count_tokens", lambda model, **kw: 50 if "text" in kw else 1000)
+        await self.invoke(core, self.route(provider="anthropic"), [{"role": "user", "content": "text only"}], protocol)
+        assert calls == [1]
+        assert len(recorded) == 1
+        assert recorded[0]["usage_cost"].raw_cost == Decimal("0.0022")
+
+    @pytest.mark.parametrize("protocol", ["chat", "responses", "anthropic"])
+    @pytest.mark.parametrize("modality", ["image", "audio"])
+    async def test_unmeterable_priced_request_rejected_before_io(self, monkeypatch, protocol, modality):
+        from lumen.services import completion_api as core
+
+        recorded = self.ledger(monkeypatch, core)
+
+        async def forbidden(*args, **kwargs):
+            pytest.fail("unmeterable request reached provider")
+
+        monkeypatch.setattr(core.litellm_client, {
+            "chat": "acompletion", "responses": "aresponses", "anthropic": "aanthropic_messages",
+        }[protocol], forbidden)
+        with pytest.raises(core.CompletionError, match="modality_usage_unavailable") as failure:
+            await self.invoke(core, self.route(modality, provider="anthropic"), self.media_messages(modality), protocol)
+        assert failure.value.status_code == 422
+        assert recorded == []
+
+    @pytest.mark.parametrize("usage", [
+        None,
+        {"prompt_tokens": 1000, "completion_tokens": 50},
+        {"prompt_tokens": 0, "completion_tokens": 0},
+        {"prompt_tokens": "1000", "completion_tokens": 50,
+         "prompt_tokens_details": {"audio_tokens": 800}},
+        {"prompt_tokens": 1000, "completion_tokens": 50,
+         "prompt_tokens_details": {"audio_tokens": -1}},
+        {"prompt_tokens": 1000, "completion_tokens": 50,
+         "prompt_tokens_details": {"audio_tokens": 800, "cached_tokens": 400}},
+        {"prompt_tokens": 1000, "completion_tokens": 50,
+         "prompt_tokens_details": {"audio_tokens": 1001}},
+    ])
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_missing_or_malformed_expected_usage_never_estimated_or_charged(self, monkeypatch, usage, stream):
+        from lumen.services import completion_api as core
+
+        recorded = self.ledger(monkeypatch, core)
+        calls = []
+
+        def no_estimate(*args, **kwargs):
+            pytest.fail("expected media was counted locally")
+
+        async def provider(*args, **kwargs):
+            calls.append(1)
+            if stream:
+                async def chunks():
+                    yield SimpleNamespace(usage=usage, choices=[SimpleNamespace(
+                        delta=SimpleNamespace(content="partial", reasoning_content=None, tool_calls=None),
+                        finish_reason="stop",
+                    )])
+                return chunks()
+            return SimpleNamespace(usage=usage, choices=[SimpleNamespace(
+                message=SimpleNamespace(content="OK", tool_calls=None), finish_reason="stop",
+            )])
+
+        monkeypatch.setattr(core.litellm_client, "count_tokens", no_estimate)
+        monkeypatch.setattr(core.litellm_client, "acompletion_stream" if stream else "acompletion", provider)
+        with pytest.raises(core.CompletionError, match="modality_usage_unavailable"):
+            await self.invoke(core, self.route(), self.media_messages("audio"), stream=stream)
+        assert calls == [1]
+        assert recorded == []
+
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_native_responses_details_charged_without_rewriting_native_shape(self, monkeypatch, stream):
+        from lumen.services import completion_api as core
+
+        recorded = self.ledger(monkeypatch, core)
+        usage = {"input_tokens": 1000, "output_tokens": 50, "total_tokens": 1050,
+                 "input_tokens_details": {"cached_tokens": 400, "audio_tokens": 800,
+                                          "cached_tokens_details": {"audio_tokens": 300}},
+                 "output_tokens_details": {"audio_tokens": 25, "text_tokens": 25}}
+        payload = {"id": "resp-1", "usage": usage, "output": [{"type": "output_text", "text": "OK"}]}
+        calls = []
+
+        async def provider(**kwargs):
+            calls.append(1)
+            if stream:
+                async def events():
+                    yield {"type": "response.completed", "response": payload}
+                return events()
+            return payload
+
+        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
+        result = await self.invoke(core, self.route(provider="openai"), [{"role": "user", "content": "text"}],
+                                   "responses", stream=stream)
+        assert calls == [1]
+        assert (result[0]["response"] if stream else result) == payload
+        assert len(recorded) == 1
+        assert recorded[0]["usage_cost"].raw_cost == Decimal("0.00615")
+        assert recorded[0]["breakdown"].output_tokens == 50
+        assert recorded[0]["breakdown"].modality_tokens["audio"].output_tokens == 25
+
+    @pytest.mark.parametrize("protocol", ["responses", "anthropic"])
+    async def test_native_failed_settlement_does_not_retry_finally_as_local_text(self, monkeypatch, protocol):
+        from lumen.services import completion_api as core
+
+        recorded = self.ledger(monkeypatch, core)
+        calls = []
+
+        async def provider(**kwargs):
+            calls.append(1)
+            async def events():
+                if protocol == "responses":
+                    yield {"type": "response.output_text.delta", "delta": "partial"}
+                    yield {"type": "response.completed", "response": {
+                        "usage": {"input_tokens": True, "output_tokens": 1}, "output": [],
+                    }}
+                else:
+                    yield {"type": "message_start", "message": {"usage": {"input_tokens": -1, "output_tokens": 0}}}
+                    yield {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "partial"}}
+                    yield {"type": "message_stop"}
+            return events()
+
+        def no_estimate(*args, **kwargs):
+            pytest.fail("malformed native usage retried as local text")
+
+        monkeypatch.setattr(core.litellm_client, "count_tokens", no_estimate)
+        monkeypatch.setattr(core.litellm_client, "aresponses" if protocol == "responses" else "aanthropic_messages", provider)
+        with pytest.raises(core.CompletionError, match="modality_usage_unavailable"):
+            await self.invoke(core, self.route(provider="openai"), [{"role": "user", "content": "text"}],
+                              protocol, stream=True)
+        assert calls == [1]
+        assert recorded == []
+
+    @pytest.mark.parametrize("protocol,part", [
+        ("responses", {"type": "input_image", "image_url": "https://asset.example/image"}),
+        ("anthropic", {"type": "image", "source": {"type": "url", "url": "https://asset.example/image"}}),
+    ])
+    async def test_chat_metering_evidence_does_not_authorize_native_adapters(self, monkeypatch, protocol, part):
+        from lumen.services import completion_api as core
+
+        recorded = self.ledger(monkeypatch, core)
+
+        async def forbidden(*args, **kwargs):
+            pytest.fail("chat-only modality metering used for a native adapter")
+
+        monkeypatch.setattr(core.litellm_client, "aresponses" if protocol == "responses" else "aanthropic_messages", forbidden)
+        with pytest.raises(core.CompletionError, match="image_input.*modality_usage_unavailable"):
+            await self.invoke(core, self.route("image", provider="gemini"), [{"role": "user", "content": [part]}], protocol)
+        assert recorded == []

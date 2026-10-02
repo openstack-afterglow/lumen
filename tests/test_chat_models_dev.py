@@ -95,6 +95,54 @@ class TestModelsDevCatalog:
         detail = models_dev.provider_detail(catalog, "anthropic")
         assert detail["models"][0]["capabilities"]["vision"] is True
 
+    def test_budget_token_bounds_are_preserved_for_reasoning_disable_checks(self):
+        catalog = models_dev.parse_catalog(
+            json.dumps(
+                {
+                    "providers": {
+                        "google": {
+                            "id": "google",
+                            "name": "Google",
+                            "models": {
+                                "gemini-flash": {
+                                    "id": "gemini-flash",
+                                    "name": "Gemini Flash",
+                                    "reasoning": True,
+                                    "reasoning_options": [
+                                        {"type": "toggle"},
+                                        {"type": "budget_tokens", "min": 0, "max": 24576},
+                                    ],
+                                },
+                                "gemini-pro": {
+                                    "id": "gemini-pro",
+                                    "name": "Gemini Pro",
+                                    "reasoning": True,
+                                    "reasoning_options": [
+                                        {"type": "budget_tokens", "min": 128, "max": 32768, "extra": "x"},
+                                        {"type": "budget_tokens", "min": True, "max": -1},
+                                        {"type": "budget_tokens", "min": 0.5},
+                                        {"type": "budget_tokens", "min": 0.0, "max": "HUGE_EXPONENT"},
+                                    ],
+                                },
+                            },
+                        }
+                    }
+                }
+            ).replace('"HUGE_EXPONENT"', "1e5000"),
+            "2026-09-26T00:00:00+00:00",
+        )
+        models = catalog.providers["google"].models
+        assert models["gemini-flash"].capabilities["reasoning_options"] == [
+            {"type": "toggle", "values": []},
+            {"type": "budget_tokens", "values": [], "min": 0, "max": 24576},
+        ]
+        assert models["gemini-pro"].capabilities["reasoning_options"] == [
+            {"type": "budget_tokens", "values": [], "min": 128, "max": 32768},
+            {"type": "budget_tokens", "values": []},
+            {"type": "budget_tokens", "values": []},
+            {"type": "budget_tokens", "values": [], "min": 0},
+        ]
+
     def test_capabilities_defaults_when_missing(self):
         catalog = _catalog()
         caps = catalog.providers["openai"].models["openai/gpt-test"].capabilities

@@ -202,6 +202,8 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
                 "models": f"{origin}/v1/models",
                 "sdk_base_url": f"{origin}/v1",
                 "responses": f"{origin}/v1/responses",
+                "speech": f"{origin}/v1/audio/speech",
+                "transcriptions": f"{origin}/v1/audio/transcriptions",
             },
             anthropic={
                 "messages": f"{origin}/v1/messages",
@@ -212,6 +214,8 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
                 "conversations": f"{origin}/v1/conversations",
                 "temp_completions": f"{origin}/v1/temp-completions",
                 "runs": f"{origin}/v1/runs",
+                "audio_speech": f"{origin}/v1/chat/audio/speech",
+                "audio_transcriptions": f"{origin}/v1/chat/audio/transcriptions",
                 "sdk_base_url": origin,
             },
             gateway={
@@ -229,13 +233,15 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
         features=[
             "model='lumen': text-only durable worker streaming (caller tools/memory 비활성화)",
             "provider model ID: tools(function calling) pass-through 및 vision 지원",
+            "Finite audio: configured product USD/second rate times scanned media duration; provider invoice units may differ.",
+            "Audio speech streams owned scanned MP3/WAV; transcription accepts project-owned scanned audio, returns real text.",
             "Idempotency-Key UUID 지원 (네이티브 202 멱등 재시도 및 쿼터 재검사 예외)",
         ],
         clients={
             "codex": {
                 "base_url": f"{origin}/v1",
                 "responses": f"{origin}/v1/responses",
-                "provider_header": "X-Lumen-Provider (optional, must not conflict with model prefix)",
+                "provider_header": "X-Lumen-Provider (optional administrator-configured api_provider selector)",
             },
             "claude_code": {
                 "base_url": origin,

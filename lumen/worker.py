@@ -21,6 +21,7 @@ from collections.abc import Awaitable, Callable
 from lumen.cache import _get_redis
 from lumen.config import get_settings
 from lumen.db import init_db
+from lumen.logging_config import configure_logging
 from lumen.plugins.host import build_host
 from lumen.plugins.registry import get_registry
 from lumen.services.agent_workspace_runtime import configured_workspace_policy
@@ -34,6 +35,13 @@ logger = logging.getLogger(__name__)
 _QUEUE = "afterglow:chat:runs"
 _REGISTRATION_SCHEMA_VERSION = 1
 
+def _log_run_id(run_id: str) -> str:
+    """Only a canonical UUID may cross the untrusted wakeup-to-log boundary."""
+    try:
+        return str(uuid.UUID(run_id))
+    except (ValueError, AttributeError, TypeError):
+        return "invalid"
+
 
 async def _next_run_ids(limit: int) -> list[str]:
     if limit < 1:
@@ -46,7 +54,7 @@ async def _next_run_ids(limit: int) -> list[str]:
             _, value = item
             return [value.decode("utf-8") if isinstance(value, bytes) else str(value)]
     except Exception:
-        logger.debug("chat worker Redis wakeup unavailable", exc_info=True)
+        logger.debug("chat worker Redis wakeup unavailable")
     return await queued_run_ids(limit=limit)
 
 
@@ -58,7 +66,7 @@ async def _title_processor_loop(processor, *, owner: str) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("durable title generation job failed")
+            logger.warning("durable title generation job failed")
             worked = False
         if not worked:
             await asyncio.sleep(0.5)
@@ -86,7 +94,7 @@ class _Maintenance:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("worker maintenance job failed name=%s", self.name)
+            logger.warning("worker maintenance job failed name=%s", self.name)
 
     async def stop(self) -> None:
         if self.task is not None:
@@ -116,7 +124,10 @@ class WorkerLoop:
         if not self.draining.is_set():
             self.draining.set()
             self.drain_started_at = asyncio.get_running_loop().time()
-            logger.info("worker drain started owner=%s active=%d", self.owner, len(self.active))
+            logger.info("worker drain started active=%d", len(self.active))
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("worker drain state capacity=%d registration_active=%s", self.capacity,
+                             self.registration_id is not None)
 
     def drain_overdue(self) -> bool:
         return (
@@ -130,15 +141,20 @@ class WorkerLoop:
 
         async def execute() -> None:
             try:
-                await execute_queued_run(run_id, owner=self.owner, registration_id=self.registration_id)
+                claimed = await execute_queued_run(run_id, owner=self.owner, registration_id=self.registration_id)
+                # A processed claim can still have ended in a failed/interrupted run.
+                logger.info("worker run execution returned run_id=%s claimed=%s", _log_run_id(run_id), claimed)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("durable chat run failed run_id=%s", run_id)
+                logger.error("durable chat run execution failed run_id=%s", _log_run_id(run_id))
             finally:
                 self.active.pop(run_id, None)
 
         self.active[run_id] = asyncio.create_task(execute())
+        logger.info("worker run dispatched run_id=%s active=%d", _log_run_id(run_id), len(self.active))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("worker dispatch state capacity=%d draining=%s", self.capacity, self.draining.is_set())
 
     async def register(self) -> None:
         from lumen.services.infrastructure import store
@@ -187,7 +203,7 @@ class WorkerLoop:
         if not alive:
             # A lost registration means the controller may already count this worker as gone;
             # stop claiming so no run is dispatched to a worker nobody tracks.
-            logger.warning("worker registration lost owner=%s; entering drain", self.owner)
+            logger.warning("worker registration lost; entering drain")
             self.start_drain()
 
     async def mark_draining(self) -> None:
@@ -226,7 +242,7 @@ async def serve() -> None:
         try:
             await setup_semantic_memory()
         except Exception:
-            logger.warning("semantic memory worker is unavailable; retaining MySQL manual memory", exc_info=True)
+            logger.warning("semantic memory worker is unavailable; retaining MySQL manual memory")
 
     memory_outbox_enabled = semantic_memory_available()
     owner = f"{socket.gethostname()}:{os.getpid()}"
@@ -237,6 +253,10 @@ async def serve() -> None:
         drain_seconds=settings.worker_drain_seconds,
     )
     await loop.register()
+    logger.info("worker ready capacity=%d", loop.capacity)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("worker ready state maintenance_heartbeat_seconds=%d memory_outbox_enabled=%s",
+                     loop.heartbeat_seconds, memory_outbox_enabled)
 
     async def extract_memory() -> None:
         await process_memory_extraction(owner=owner)
@@ -280,6 +300,7 @@ async def serve() -> None:
             pass
 
     drain_recorded = False
+    drain_overdue_logged = False
     try:
         while True:
             now = running_loop.time()
@@ -291,13 +312,13 @@ async def serve() -> None:
                     try:
                         await loop.mark_draining()
                     except Exception:
-                        logger.exception("worker drain registration failed")
+                        logger.error("worker drain registration failed")
                 if not loop.active:
                     break
-                if loop.drain_overdue():
-                    # Overdue drain retains the worker and keeps renewing leases: indeterminate
-                    # calls are never force-reassigned to satisfy scale-in.
-                    logger.warning("worker drain overdue owner=%s active=%d", owner, len(loop.active))
+                if loop.drain_overdue() and not drain_overdue_logged:
+                    # Overdue drain retains leases; indeterminate calls are never force-reassigned.
+                    drain_overdue_logged = True
+                    logger.warning("worker drain overdue active=%d", len(loop.active))
                 await asyncio.wait(set(loop.active.values()), timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
                 continue
             if loop.free_slots < 1:
@@ -306,15 +327,18 @@ async def serve() -> None:
             try:
                 recovered_run_ids = await recover_stale_runs(owner=owner)
             except Exception:
-                logger.exception("stale durable chat run recovery failed")
+                logger.warning("stale durable chat run recovery failed")
                 recovered_run_ids = []
             run_ids = list(dict.fromkeys([*recovered_run_ids, *(await _next_run_ids(loop.free_slots))]))
+            if run_ids:
+                logger.info("worker run candidates discovered count=%d", len(run_ids))
             if not run_ids:
                 await asyncio.sleep(0.2)
                 continue
             for run_id in run_ids[: loop.free_slots]:
                 loop.launch(run_id)
     finally:
+        logger.info("worker shutdown started active=%d draining=%s", len(loop.active), loop.draining.is_set())
         for job in maintenance:
             await job.stop()
         title_job_task.cancel()
@@ -327,13 +351,19 @@ async def serve() -> None:
         try:
             await registry.close()
         except Exception:
-            logger.exception("plugin shutdown failed")
+            logger.error("plugin shutdown failed")
         await close_db()
+        logger.info("worker shutdown complete")
 
 
 def main() -> None:
-    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-    asyncio.run(serve())
+    configure_logging("worker")
+    logger.info("worker starting")
+    try:
+        asyncio.run(serve())
+    except Exception:
+        logger.error("worker stopped with error")
+        raise
 
 
 if __name__ == "__main__":

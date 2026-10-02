@@ -33,6 +33,10 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _default_api_provider(context) -> str:
+    return context.get_current_parameters().get("provider_type") or "openai"
+
+
 class LlmProvider(Base):
     __tablename__ = "llm_providers"
 
@@ -40,6 +44,9 @@ class LlmProvider(Base):
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
     # litellm custom_llm_provider (openai|anthropic|gemini|vertex_ai|azure|bedrock|ollama|...)
     provider_type: Mapped[str] = mapped_column(VARCHAR(40), nullable=False, default="openai")
+    # Public API selector is independent of the execution transport.
+    api_provider: Mapped[str] = mapped_column(VARCHAR(40), nullable=False, default=_default_api_provider)
+    sort_order: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
     api_base: Mapped[str | None] = mapped_column(VARCHAR(255))
     # AES-256-GCM(lumen_encryption_key, 도메인 llm_provider_key) 암호화 상태로 저장
     encrypted_api_key: Mapped[str | None] = mapped_column(TEXT)
@@ -69,7 +76,10 @@ class LlmProvider(Base):
         uselist=False,
     )
 
-    __table_args__ = (UniqueConstraint("name", name="uq_llm_providers_name"),)
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_llm_providers_name"),
+        CheckConstraint("sort_order >= 0", name="chk_llm_providers_sort_order"),
+    )
 
 
 class LlmProviderAuthAttempt(Base):
@@ -102,6 +112,9 @@ class LlmModel(Base):
     provider_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_providers.id", ondelete="CASCADE"), nullable=False)
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     display_name: Mapped[str | None] = mapped_column(VARCHAR(150))
+    sort_order: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    model_kind: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="text", server_default="text")
+    media_pricing: Mapped[dict | None] = mapped_column(JSON)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     # 대화 제목 자동 요약에 쓸 모델. 앱 레벨에서 최대 1개만 True 로 유지(set_title_model).
     is_title_model: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
@@ -110,8 +123,8 @@ class LlmModel(Base):
     # 미지정 시 litellm 내장 단가 사용 (override용). 토큰당 USD 단가.
     input_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     output_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
-    # 프롬프트 캐시 토큰당 USD 단가(관리자 수동 설정 전용, catalog fallback 없음).
-    # 미설정 카테고리는 0원으로 과금하고 pricing_status=partial 로 남는다.
+    # 관리자가 저장한 프롬프트 캐시 토큰당 USD 단가(nullable). 적용 단가는 routing이
+    # 수동값→direct provider exact catalog→text write cascade 순으로 해석하며 저장값을 채우지 않는다.
     cache_read_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     cache_write_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # 5분 TTL cache write
     cache_write_1h_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
@@ -132,13 +145,29 @@ class LlmModel(Base):
     __table_args__ = (
         UniqueConstraint("provider_id", "model_name", name="uq_llm_models_provider_model"),
         Index("idx_llm_models_active", "is_active"),
+        CheckConstraint("sort_order >= 0", name="chk_llm_models_sort_order"),
     )
+
+
+class ChatMessageGraph(Base):
+    """Owner-scoped lifetime boundary shared by source and fork conversations."""
+
+    __tablename__ = "chat_message_graphs"
+
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+
+    __table_args__ = (Index("idx_chat_message_graphs_owner", "project_id", "user_id"),)
 
 
 class ChatConversation(Base):
     __tablename__ = "chat_conversations"
 
     id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    graph_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("chat_message_graphs.id", ondelete="RESTRICT"), nullable=False
+    )
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     # AES-256-GCM(도메인 chat_content) 암호문. 첫 메시지 요약 제목도 채팅 내용이라 암호화. TEXT(암호문 길이).
@@ -165,11 +194,13 @@ class ChatConversation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
+    # Origin provenance only; reachability and retention use ChatConversationMessage.
     messages: Mapped[list["ChatMessage"]] = relationship(
-        "ChatMessage", back_populates="conversation", cascade="all, delete-orphan"
+        "ChatMessage", back_populates="conversation", passive_deletes="all"
     )
 
     __table_args__ = (
+        Index("idx_chat_conversations_graph", "graph_id"),
         Index("idx_chat_conversations_owner", "project_id", "user_id"),
         Index("idx_chat_conversations_user_updated", "user_id", "updated_at"),  # 사용자별 목록(프로젝트 무관)
         Index("idx_chat_conversations_updated", "updated_at"),
@@ -181,8 +212,12 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
-    conversation_id: Mapped[str] = mapped_column(
-        CHAR(36), ForeignKey("chat_conversations.id", ondelete="CASCADE"), nullable=False
+    graph_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("chat_message_graphs.id", ondelete="CASCADE"), nullable=False
+    )
+    # Nullable origin provenance, never a conversation authorization predicate.
+    conversation_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("chat_conversations.id", ondelete="SET NULL")
     )
     role: Mapped[str] = mapped_column(VARCHAR(20), nullable=False)  # system | user | assistant | tool
     # 버전 트리 부모 메시지 id. 같은 parent_id 를 공유하는 형제 = 재생성 버전들. 루트는 NULL.
@@ -217,14 +252,31 @@ class ChatMessage(Base):
     )
     created_timezone: Mapped[str | None] = mapped_column(VARCHAR(64))
 
-    conversation: Mapped["ChatConversation"] = relationship("ChatConversation", back_populates="messages")
+    conversation: Mapped["ChatConversation | None"] = relationship("ChatConversation", back_populates="messages")
 
     __table_args__ = (
+        Index("idx_chat_messages_graph", "graph_id"),
+        Index("idx_chat_messages_graph_branch", "graph_id", "parent_id", "role", "created_at", "id"),
         Index("idx_chat_messages_conversation", "conversation_id", "created_at"),
         Index("idx_chat_messages_branch", "conversation_id", "parent_id", "role", "created_at", "id"),
         Index("idx_chat_messages_conversation_id", "conversation_id", "id"),
         Index("idx_chat_messages_parent", "parent_id"),
     )
+
+
+class ChatConversationMessage(Base):
+    """Explicit reachable messages in a conversation, including shared fork ancestors."""
+
+    __tablename__ = "chat_conversation_messages"
+
+    conversation_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("chat_conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    message_id: Mapped[int] = mapped_column(
+        BIGINT, ForeignKey("chat_messages.id", ondelete="CASCADE"), primary_key=True
+    )
+
+    __table_args__ = (Index("idx_chat_conversation_messages_message", "message_id"),)
 
 
 class ChatConversationActivePath(Base):

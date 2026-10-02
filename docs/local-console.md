@@ -5,15 +5,18 @@ Lumen은 AI-chat 백엔드(LiteLLM, LangGraph/LangChain agent 실행, provider/m
 ## 실행
 
 ```bash
-cp .env.example .env
-# 실제 completion을 보낼 때 .env의 LUMEN_LOCAL_PROVIDER_API_KEY를 설정
+test -e .env || cp .env.example .env
+# .env에 OPENAI_API_KEY 및/또는 GEMINI_API_KEY 설정 (기존 파일은 덮어쓰지 않음)
+chmod 600 .env
 docker compose up -d --build --wait --wait-timeout 180
 # http://localhost:7010
 ```
 
-Provider key가 비어 있어도 stack과 Console은 시작된다. 이때 모델 선택기와 상태 영역에 `provider API key 없음`이 표시되므로 연결·계정·모델 설정을 먼저 점검할 수 있다. 실제 provider 호출 전에는 `.env`에 key를 넣고 API/worker를 재시작한다.
+키가 비어 있어도 stack과 Console은 시작된다. 이때 모델 선택기와 상태 영역에 `provider API key 없음`이 표시된다. 실제 provider 호출 전에는 `.env`에 키를 넣고 seed/API/worker를 재생성한다. `OPENAI_API_KEY`와 `GEMINI_API_KEY`가 있으면 migration 뒤 `seed-local`이 공식 direct `openai`/`gemini` provider를 자동 등록하고 DB에는 값 대신 각각의 환경 변수 이름만 저장한다. 둘 다 있으면 로컬 텍스트 테스트 경로를 제공하며 connection manifest는 OpenAI를 기본 선택한다.
 
-`seed-local`은 migration 뒤에 provider, priced model, local standalone용 scoped API key를 idempotent하게 만든다. Key에는 OpenAI 호환 `models:read`/`compat:completions:write`와 Console용 native/usage scope가 포함된다. 기존 seed key의 scope가 오래되었으면 폐기하고 새 key로 교체한다. Console은 read-only로 mount된 `/seed/api-key` 파일을 읽어 새 local operator session에 자동 연결한다.
+`seed-local`은 scoped local API key와 필요한 로컬 텍스트 모델을 재실행 안전하게 만든다. 기존 관리자 provider 키·base·가격을 덮어쓰지 않는다. Key에는 OpenAI 호환 `models:read`/`compat:completions:write`, media/asset의 필요한 native·compat scope와 Console용 native/usage scope가 포함된다. 기존 seed key의 scope가 부족하면 폐기하고 새 key로 교체한다. Console은 read-only로 mount된 `/seed/api-key` 파일을 읽어 새 local operator session에 자동 연결한다.
+
+로컬 기본 OpenAI 텍스트 모델의 `.env.example` 입력·출력 단가는 임시 개발용 원장 값이며 제공사 실제 단가가 아니다. 실제 비용 정산을 하려면 운영자가 제공사 단가를 확인해 설정한다. Gemini direct 텍스트 기본 모델은 임의 로컬 단가를 넣지 않고 번들된 exact catalog 가격 경로를 사용한다.
 
 `seed-local` 로그에는 provider key 설정 여부, model, SDK URL만 남고 Lumen API key는 남기지 않는다. Key가 필요할 때만 다음 one-shot service를 실행한다.
 
@@ -60,18 +63,13 @@ Provider key가 비어 있으면 manifest와 `/v1/models`는 설정 점검용으
 
 ## Provider credential configuration
 
-개발자는 Keystone admin 권한으로 `POST` 또는 `PATCH /v1/admin/providers`를 호출해 provider/model을 직접 등록·변경한다. `api_key`는 암호화해 DB에 저장하고, `api_key_env`에는 `LUMEN_LOCAL_PROVIDER_API_KEY`처럼 실제 secret이 들어 있는 환경 변수 이름만 저장한다. 실행 시 DB key가 우선이며 DB key가 비어 있을 때만 `api_key_env` 값을 사용한다.
+`OPENAI_API_KEY` 또는 `GEMINI_API_KEY`가 있으면 `openai`/`gemini` API-key provider를 자동 등록한다. API/worker와 bootstrap process에 동일한 환경 변수를 전달해야 한다. 암호화된 DB key가 이미 있으면 **DB key가 우선**하며 환경 변수는 관리자 credential을 교체하지 않는다. 기존 provider의 type/base/margin/active 또는 직접 등록한 모델·가격도 bootstrap이 덮어쓰지 않는다. 키를 제거해도 기록은 임의로 삭제하지 않지만 환경 변수 기반 모델은 credential이 없으면 호출할 수 없다. `api_key_env`에는 비밀 값이 아니라 `OPENAI_API_KEY` 같은 변수 이름만 저장된다.
 
-```json
-{
-  "name": "local-openai",
-  "provider_type": "openai",
-  "api_base": "https://api.openai.com/v1",
-  "api_key_env": "OPENAI_API_KEY"
-}
-```
+Media 모델은 키만으로 실행할 수 없다. 관리자 등록 또는 `LUMEN_BOOTSTRAP_MODELS_JSON`의 JSON 배열로 **지원되는 정확한 모델 ID, kind, 실제 공급자 가격에 맞춘 단위별 USD 값**을 명시한다. 각 항목의 `provider`는 `openai`/`gemini`, `model_name`은 transport가 지원하는 ID, `model_kind`는 `text|image|tts|stt|realtime`이다. 이미지 `media_pricing.image_variants`에는 `size:quality`별 가격(예: `1024x1024:auto`), TTS에는 `audio_output_per_second`, STT에는 `audio_input_per_second`, realtime에는 `realtime_input_per_minute`와 `realtime_output_per_minute`가 필요하다. 값은 공급자 최신 가격표와 단위를 확인해 직접 설정한다. 부정확한 기본 요율은 제공하지 않으며 지원되지 않거나 가격 없는 media entry는 bootstrap을 실패시킨다. 기존 모델은 이 설정으로 가격을 덮어쓰지 않는다. [Media API 계약](api-reference.md#이미지유한-오디오실시간-음성)을 따른다.
 
-이 방식으로 provider key를 DB에 보관하지 않고 API/worker container의 environment에서 공급할 수 있다. `api_key_env`에는 대문자 영문자, 숫자, 밑줄만 쓸 수 있으며 Lumen 설정에 사용하는 environment 이름은 거절된다. key 자체나 암호문은 API 응답에 포함되지 않는다.
+현재 direct transport는 모델 ID allowlist를 갖는다. `gpt-image-2`, `gpt-image-2.5`/날짜별 변형, `gpt-live-1`, `gemini-3.1-flash-lite-image`, `gemini-3.8-flash-lite-tts`는 키를 넣거나 JSON에 등록해도 실행 가능해지지 않는다. 해당 IDs에 대한 별도 protocol/가격 구현 전까지 지원을 광고하거나 다른 모델로 몰래 치환하지 않는다. 로컬 검증은 현재 지원되는 `gpt-image-1`, `gpt-4o-mini-tts`, `gpt-4o-mini-transcribe`, `gpt-realtime` 등 계정이 실제 허용하는 ID만 선택한다.
+
+`.env`는 Git에서 제외하고 mode `0600`으로 제한한다. 실제 키나 `docker compose config` 전체 출력(환경 변수 확장 결과)을 로그·채팅·commit에 넣지 않는다. provider key는 Lumen API key와 별개이며 browser/Afterglow에 전달하지 않는다.
 
 ## Backend-only deployment
 

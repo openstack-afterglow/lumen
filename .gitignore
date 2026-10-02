@@ -8,3 +8,4 @@ dist/
 .hatch/
 .pytest_cache/
 .lumen-venv/
+.env

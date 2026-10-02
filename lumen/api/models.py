@@ -29,6 +29,8 @@ _CLAUDE_SUBSCRIPTION_TOKEN = re.compile(r"sk-ant-oat[A-Za-z0-9._-]*\Z")
 class ProviderCreateRequest(BaseModel):
     name: str = Field(..., max_length=100)
     provider_type: str = Field(default="openai", max_length=40)  # litellm custom_llm_provider
+    api_provider: str = Field(default="openai", max_length=40)
+    sort_order: int = Field(default=0, strict=True, ge=0, le=2147483647)
     auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"] = "api_key"
     api_base: str | None = Field(default=None, max_length=255)
     api_key: str | None = Field(default=None, max_length=500)
@@ -39,6 +41,16 @@ class ProviderCreateRequest(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_name(cls, value):
+        return repository.validate_provider_name(value)
+
+    @field_validator("api_provider", mode="before")
+    @classmethod
+    def validate_api_provider(cls, value):
+        return repository.validate_api_provider(value)
+
     @field_validator("api_key_env")
     @classmethod
     def validate_api_key_env(cls, value: str | None) -> str | None:
@@ -46,6 +58,8 @@ class ProviderCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_auth_configuration(self):
+        if "api_provider" not in self.model_fields_set:
+            self.api_provider = repository.validate_api_provider(self.provider_type)
         try:
             repository.validate_provider_auth_configuration(
                 provider_type=self.provider_type.strip(),
@@ -63,6 +77,8 @@ class ProviderCreateRequest(BaseModel):
 class ProviderUpdateRequest(BaseModel):
     name: str | None = Field(default=None, max_length=100)
     provider_type: str | None = Field(default=None, max_length=40)
+    api_provider: str | None = Field(default=None, max_length=40)
+    sort_order: int | None = Field(default=None, strict=True, ge=0, le=2147483647)
     auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"] | None = None
     api_base: str | None = Field(default=None, max_length=255)
     api_key: str | None = Field(default=None, max_length=500)
@@ -72,6 +88,21 @@ class ProviderUpdateRequest(BaseModel):
     is_active: bool | None = None
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_name(cls, value):
+        return repository.validate_provider_name(value)
+
+    @field_validator("api_provider", mode="before")
+    @classmethod
+    def validate_api_provider(cls, value):
+        return repository.validate_api_provider(value)
+
+    @field_validator("sort_order", mode="before")
+    @classmethod
+    def validate_sort_order(cls, value):
+        return repository.validate_sort_order(value)
 
     @field_validator("api_key_env")
     @classmethod
@@ -92,6 +123,8 @@ class ProviderResponse(BaseModel):
     id: int
     name: str
     provider_type: str
+    api_provider: str
+    sort_order: int = 0
     api_base: str | None
     auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"] = "api_key"
     has_credentials: bool = False
@@ -286,15 +319,29 @@ class ModelCreateRequest(BaseModel):
     provider_id: int
     model_name: str = Field(..., max_length=190)
     display_name: str | None = Field(default=None, max_length=150)
+    sort_order: int = Field(default=0, strict=True, ge=0, le=2147483647)
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
+    media_pricing: dict | None = None
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
     # Optional prompt-cache rates, independent of each other and of the input/output pair.
-    # An unset rate bills that cache category at 0 USD (no catalog fallback).
+    # Unset rates use the exact direct-provider catalog; unset cache read then stays
+    # unpriced, while unset writes inherit input (5m) and then 5m (1h) for new runs.
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
     capabilities: CapabilitiesInput | None = None
     is_active: bool = True
+    @model_validator(mode="after")
+    def _kind_prices(self):
+        # Media models may price text input/output/cache-read for a token basis; the
+        # repository validates media_pricing per kind (text allows token_rates only).
+        if self.model_kind != "text" and any(getattr(self, field) is not None for field in (
+            "cache_write_price_per_million", "cache_write_1h_price_per_million",
+        )):
+            raise ValueError("media 모델에는 cache write 가격을 설정할 수 없습니다")
+        return self
+
 
     model_config = {"protected_namespaces": (), "extra": "forbid"}
 
@@ -319,7 +366,9 @@ class ModelCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _price_pair(self):
-        if (self.input_price_per_million is None) != (self.output_price_per_million is None):
+        if self.model_kind == "text" and (self.input_price_per_million is None) != (
+            self.output_price_per_million is None
+        ):
             raise ValueError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
         return self
 
@@ -327,10 +376,14 @@ class ModelCreateRequest(BaseModel):
 class ModelUpdateRequest(BaseModel):
     model_name: str | None = Field(default=None, max_length=190)
     display_name: str | None = Field(default=None, max_length=150)
+    sort_order: int | None = Field(default=None, strict=True, ge=0, le=2147483647)
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
+    media_pricing: dict | None = None
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
     # Optional prompt-cache rates, independent of each other and of the input/output pair.
-    # An unset rate bills that cache category at 0 USD (no catalog fallback).
+    # Unset rates use the exact direct-provider catalog; unset cache read then stays
+    # unpriced, while unset writes inherit input (5m) and then 5m (1h) for new runs.
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -339,6 +392,11 @@ class ModelUpdateRequest(BaseModel):
 
     model_config = {"protected_namespaces": (), "extra": "forbid"}
 
+    @field_validator("sort_order", mode="before")
+    @classmethod
+    def validate_sort_order(cls, value):
+        return repository.validate_sort_order(value)
+
     @field_validator(
         "input_price_per_million",
         "output_price_per_million",
@@ -360,10 +418,13 @@ class ModelUpdateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _price_pair(self):
+        # A PATCH may target a media model whose text directions are priced
+        # independently; the repository enforces the text pair on the stored kind.
         price_fields = {"input_price_per_million", "output_price_per_million"}
-        if self.model_fields_set & price_fields and (
-            not price_fields <= self.model_fields_set
-            or (self.input_price_per_million is None) != (self.output_price_per_million is None)
+        if self.model_kind != "text" or not self.model_fields_set & price_fields:
+            return self
+        if not price_fields <= self.model_fields_set or (
+            (self.input_price_per_million is None) != (self.output_price_per_million is None)
         ):
             raise ValueError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
         return self
@@ -373,8 +434,13 @@ class ModelResponse(BaseModel):
     id: int
     provider_id: int
     model_name: str
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
+    media_pricing: dict | None = None
     api_model_name: str
     api_provider: str
+    provider_type: str | None = None
+    provider_sort_order: int = 0
+    sort_order: int = 0
     display_name: str | None
     is_active: bool
     is_title_model: bool = False
@@ -387,6 +453,11 @@ class ModelResponse(BaseModel):
     cache_read_price_per_million: Decimal | None = None
     cache_write_price_per_million: Decimal | None = None
     cache_write_1h_price_per_million: Decimal | None = None
+    # Resolved rates new admissions freeze; the stored manual fields above stay nullable.
+    effective_cache_read_price_per_million: Decimal | None = None
+    effective_cache_write_price_per_million: Decimal | None = None
+    effective_cache_write_1h_price_per_million: Decimal | None = None
+    effective_cache_price_sources: dict[str, str | None] | None = None
     models_dev_model_id: str | None = None
     price_source: str | None = None
     capabilities: dict | None = None
@@ -645,6 +716,8 @@ class AvailableModelCandidate(BaseModel):
     generation_methods: list[str] = Field(default_factory=list)
     input_token_limit: int | None = None
     output_token_limit: int | None = None
+    # Classified from the exact installed catalog mode; ``None`` stays manually selectable.
+    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
 
     model_config = {"protected_namespaces": ()}
 
@@ -771,6 +844,8 @@ async def set_title_model(payload: TitleModelRequest):
         await repository.set_title_model(payload.model_id)
     except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except errors.ProviderValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 
@@ -782,6 +857,8 @@ async def set_memory_model(payload: MemoryModelRequest):
         await repository.set_memory_model(payload.model_id)
     except errors.ProviderNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except errors.ProviderValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 

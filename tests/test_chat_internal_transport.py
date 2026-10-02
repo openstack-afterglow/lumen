@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import ssl
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -13,10 +14,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from lumen.services.infrastructure import bootstrap
 from lumen.services.infrastructure.transport import InternalTransport, InternalTransportError, resource_identity
 
 
-def _certificate(key, issuer, signer, *, san=None, client=False):
+def _certificate(key, issuer, signer, *, san=None, client=False, subject_key_id=None):
     subject = issuer if signer is key else x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, "Lumen test guest")])
     builder = (x509.CertificateBuilder().subject_name(subject)
@@ -25,7 +27,20 @@ def _certificate(key, issuer, signer, *, san=None, client=False):
         .not_valid_after(datetime.now(UTC) + timedelta(minutes=10)))
     if signer is key:
         builder = builder.add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        builder = builder.add_extension(x509.SubjectKeyIdentifier(
+            subject_key_id if subject_key_id is not None else
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()).digest), critical=False)
+        builder = builder.add_extension(x509.KeyUsage(
+            digital_signature=True, content_commitment=False, key_encipherment=False,
+            data_encipherment=False, key_agreement=False, key_cert_sign=True,
+            crl_sign=True, encipher_only=False, decipher_only=False), critical=True)
     else:
+        builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        builder = builder.add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), critical=False)
+        builder = builder.add_extension(x509.KeyUsage(
+            digital_signature=True, content_commitment=False, key_encipherment=False,
+            data_encipherment=False, key_agreement=False, key_cert_sign=False,
+            crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
         builder = builder.add_extension(x509.SubjectAlternativeName([
             x509.UniformResourceIdentifier(san)]), critical=False)
         builder = builder.add_extension(x509.ExtendedKeyUsage([
@@ -116,3 +131,50 @@ async def test_internal_transport_never_sends_capability_before_pin_and_san(tmp_
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_controller_issued_sandbox_certificate_binds_the_signing_ca(monkeypatch):
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_cert = _certificate(ca_key, x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "Lumen test CA")]), ca_key,
+        subject_key_id=b"\x12" * 20)
+    now = datetime.now(UTC)
+    token = "test-token-" + "a" * 48
+    resource = SimpleNamespace(
+        id=str(uuid4()), generation=1, role="sandbox", run_id=str(uuid4()),
+        image_ref="test-image", policy_digest="test-policy",
+        bootstrap_token_hash=hashlib.sha256(token.encode("ascii")).hexdigest(),
+        bootstrap_expires_at=now + timedelta(minutes=5), deadline_at=now + timedelta(minutes=2),
+        desired_state="requested", observed_state="requested", certificate_fingerprint=None,
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        def begin(self):
+            return self
+
+        async def execute(self, _query):
+            return SimpleNamespace(scalar_one_or_none=lambda: resource)
+
+    monkeypatch.setattr(bootstrap, "_ca", lambda _config: (ca_cert, ca_key))
+    monkeypatch.setattr(bootstrap, "_factory", lambda: Session)
+    guest_key = ec.generate_private_key(ec.SECP256R1())
+    csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([])).sign(guest_key, hashes.SHA256())
+
+    issued = await bootstrap.exchange_bootstrap_token(
+        token, csr.public_bytes(serialization.Encoding.PEM).decode("ascii"),
+        object(), operator_key=b"operator-key-" + b"0" * 32,
+    )
+
+    certificate = x509.load_pem_x509_certificate(issued["certificate_pem"].encode("ascii"))
+    authority = certificate.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
+    subject = ca_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
+    assert authority.key_identifier == subject.digest
+    assert resource.certificate_fingerprint == certificate.fingerprint(hashes.SHA256()).hex()
+    assert resource.bootstrap_token_hash is None

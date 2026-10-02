@@ -22,6 +22,8 @@ def _public_provider(**over) -> dict:
         "id": 1,
         "name": "openai",
         "provider_type": "openai",
+        "api_provider": "openai",
+        "sort_order": 0,
         "api_base": None,
         "has_api_key": True,
         "api_key_source": "database",
@@ -359,9 +361,63 @@ class TestModelPricingContract:
         with pytest.raises(errors.ProviderValidationError):
             pricing._per_token_price(Decimal("0.00004"), "price")
 
-    async def test_update_rejects_mixed_null_price_pair(self, admin_client):
+    async def test_update_rejects_explicit_text_mixed_null_price_pair(self, admin_client):
         response = await admin_client.patch(
             f"{_MODELS_URL}/5",
-            json={"input_price_per_million": None, "output_price_per_million": "8"},
+            json={"model_kind": "text", "input_price_per_million": None, "output_price_per_million": "8"},
         )
         assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"name": None},
+        {"name": ""},
+        {"name": "   "},
+        {"api_provider": None},
+        {"api_provider": ""},
+        {"api_provider": "   "},
+        {"api_provider": "1nvidia"},
+        {"api_provider": "nvidia/v1"},
+        {"api_provider": "nvidia provider"},
+        {"api_provider": "a" * 41},
+        {"sort_order": None},
+        {"sort_order": -1},
+        {"sort_order": 0.5},
+        {"sort_order": 1.0},
+        {"sort_order": True},
+        {"sort_order": "2"},
+        {"sort_order": 2147483648},
+    ],
+)
+async def test_provider_identity_input_refused_before_repository(admin_client, monkeypatch, payload):
+    async def unexpected_write(*args, **kwargs):
+        raise AssertionError("invalid identity must not reach persistence")
+
+    monkeypatch.setattr(ps, "create_provider", unexpected_write)
+    monkeypatch.setattr(ps, "update_provider", unexpected_write)
+    created = await admin_client.post(_PROVIDERS_URL, json={"name": "NVIDIA", **payload})
+    updated = await admin_client.patch(f"{_PROVIDERS_URL}/1", json=payload)
+    assert created.status_code == 422, created.text
+    assert updated.status_code == 422, updated.text
+
+
+@pytest.mark.parametrize("value", [None, -1, 0.5, 1.0, True, "2", 2147483648])
+async def test_model_order_input_refused_before_repository(admin_client, monkeypatch, value):
+    async def unexpected_write(*args, **kwargs):
+        raise AssertionError("invalid order must not reach persistence")
+
+    monkeypatch.setattr(ps, "create_model", unexpected_write)
+    monkeypatch.setattr(ps, "update_model", unexpected_write)
+    created = await admin_client.post(
+        _MODELS_URL,
+        json={
+            "provider_id": 1,
+            "model_name": "opaque-id",
+            "sort_order": value,
+        },
+    )
+    updated = await admin_client.patch(f"{_MODELS_URL}/1", json={"sort_order": value})
+    assert created.status_code == 422, created.text
+    assert updated.status_code == 422, updated.text

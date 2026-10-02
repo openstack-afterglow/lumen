@@ -611,7 +611,7 @@ class ChatRunDescriptor(_StrictModel):
     run_id: str = Field(min_length=1, max_length=36)
     conversation_id: str | None = Field(default=None, max_length=36)
     temp_thread_id: str | None = Field(default=None, max_length=36)
-    run_kind: Literal["completion", "compaction"] = "completion"
+    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime"] = "completion"
     status: Literal[
         "queued",
         "running",
@@ -644,14 +644,15 @@ class ChatRunResponse(_StrictModel):
     ]
     conversation_id: str | None = Field(default=None, max_length=36)
     temp_thread_id: str | None = Field(default=None, max_length=36)
-    run_kind: Literal["completion", "compaction"] = "completion"
+    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime"] = "completion"
     effective_features: dict[str, Any] = Field(default_factory=dict)
     public_history: list[dict[str, Any]] | None = None
+    output_assets: list[dict[str, Any]] = Field(default_factory=list)
     last_seq: int = Field(ge=0)
     terminal: bool
 
 
-_DECIMAL_UNITS = {"token", "request", "context", "image", "second", "usd"}
+_DECIMAL_UNITS = {"token", "request", "context", "image", "second", "character", "usd"}
 _USAGE_KINDS = {
     "input_tokens",
     "output_tokens",
@@ -673,6 +674,14 @@ _USAGE_KINDS = {
     "advisor_cache_creation_5m_tokens",
     "advisor_cache_creation_1h_tokens",
     "image_units",
+    "image_input_tokens",
+    "image_cache_read_input_tokens",
+    "image_output_tokens",
+    "audio_input_tokens",
+    "audio_cache_read_input_tokens",
+    "audio_output_tokens",
+    "audio_input_characters",
+    "realtime_session_seconds",
     "audio_input_seconds",
     "audio_output_seconds",
     "video_seconds",
@@ -850,7 +859,7 @@ class RunStartedPayload(_StrictModel):
     temp_thread_id: str | None = None
     model_name: str = Field(min_length=1, max_length=190)
     effective_features: dict[str, Any]
-    run_kind: Literal["completion", "compaction"] = "completion"
+    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime"] = "completion"
 
 
 class ContextUpdatedPayload(_StrictModel):

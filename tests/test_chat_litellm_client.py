@@ -367,6 +367,51 @@ async def test_anthropic_subscription_pins_oauth_transport_parameters(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_anthropic_subscription_drops_unsupported_sampling_parameters(monkeypatch):
+    """Subscription calls must let LiteLLM drop unsupported sampling options, not the token cap."""
+    provider_auth = {"provider_id": 8, "generation": 4, "auth_mode": "anthropic_subscription"}
+    drop_params_at_call = []
+    wire_params = {}
+
+    async def resolve(ref):
+        return {"access_token": "sk-ant-oat01-request-local-token", "_fingerprint": "fingerprint"}
+
+    import litellm
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    monkeypatch.setitem(litellm.model_cost, "claude-opus-5-5", {"supports_sampling_params": False})
+
+    async def complete(**kwargs):
+        drop_params_at_call.append(litellm.drop_params)
+        wire_params.update(
+            AnthropicConfig().map_openai_params(
+                non_default_params={"temperature": kwargs["temperature"], "max_tokens": kwargs["max_tokens"]},
+                optional_params={},
+                model=kwargs["model"],
+                drop_params=False,
+            )
+        )
+        return SimpleNamespace(choices=[])
+
+    monkeypatch.setattr(subscriptions, "resolve_subscription_credential", resolve)
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    monkeypatch.setattr(litellm, "drop_params", False)
+
+    await litellm_client.acompletion(
+        "anthropic-subscription/claude-opus-5-5",
+        [{"role": "user", "content": "hello"}],
+        custom_llm_provider="anthropic",
+        provider_auth=provider_auth,
+        temperature=0,
+        max_tokens=512,
+    )
+
+    assert drop_params_at_call == [True]
+    assert "temperature" not in wire_params
+    assert wire_params["max_tokens"] == 512
+
+
+@pytest.mark.asyncio
 async def test_native_anthropic_forwards_claude_code_fields_and_protocol_headers(monkeypatch):
     captured = {}
 
@@ -578,6 +623,55 @@ async def test_perplexity_router_pins_chat_completions_and_preserves_canonical_m
     assert captured["stream_options"] == {"include_usage": True}
     assert "provider" not in captured
 
+
+@pytest.mark.parametrize("official_base", [None, "https://api.openai.com/v1"])
+@pytest.mark.asyncio
+async def test_direct_openai_uses_responses_without_redirecting_compatible_base(monkeypatch, official_base):
+    calls = []
+
+    class Sender:
+        async def post(self, *, url, headers, **kwargs):
+            calls.append((url, kwargs["json"]))
+            assert url == "https://api.openai.com/v1/responses"
+            payload = {
+                "id": "resp_test", "object": "response", "created_at": 1, "status": "completed",
+                "model": "gpt-4.1-mini", "output": [{
+                    "id": "msg_1", "type": "message", "status": "completed", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "official", "annotations": []}],
+                }], "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+                "error": None, "incomplete_details": None, "instructions": None, "metadata": {},
+            }
+            return httpx.Response(200, request=httpx.Request("POST", url), json=payload)
+
+    monkeypatch.setattr(
+        "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client", lambda **_kwargs: Sender(),
+    )
+    guarded_send = httpx.AsyncClient.send
+
+    async def compatible_send(client, request, *args, **kwargs):
+        if str(request.url) != "https://openai-compatible.example/v1/chat/completions":
+            return await guarded_send(client, request, *args, **kwargs)
+        calls.append((str(request.url), json.loads(request.content)))
+        return httpx.Response(200, request=request, json={
+            "id": "chatcmpl_test", "object": "chat.completion", "created": 1,
+            "model": "gpt-4.1-mini", "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "compatible"}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", compatible_send)
+    direct = await litellm_client.acompletion(
+        "gpt-4.1-mini", _MESSAGES, custom_llm_provider="openai", api_base=official_base, api_key="test-key",
+    )
+    compatible = await litellm_client.acompletion(
+        "gpt-4.1-mini", _MESSAGES, custom_llm_provider="openai",
+        api_base="https://openai-compatible.example/v1", api_key="test-key",
+    )
+    assert direct.choices[0].message.content == "official"
+    assert compatible.choices[0].message.content == "compatible"
+    assert [url for url, _ in calls] == [
+        "https://api.openai.com/v1/responses", "https://openai-compatible.example/v1/chat/completions",
+    ]
 
 @pytest.mark.asyncio
 async def test_perplexity_legacy_sonar_keeps_existing_chat_completion_route(monkeypatch):

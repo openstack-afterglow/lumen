@@ -6,6 +6,8 @@ DB 없이 conversation_store 를 monkeypatch 하여:
 - 저장소 장애 시 503
 """
 
+import pytest
+
 from lumen.services import conversation_store as cs
 from lumen.services.providers import errors, repository
 
@@ -162,7 +164,7 @@ class TestAvailableModels:
             ]
 
         async def fake_providers():
-            return [{"id": 1, "name": "openai", "has_api_key": False}]
+            return [{"id": 1, "name": "openai", "provider_type": "openai", "has_api_key": False}]
 
         monkeypatch.setattr(repository, "list_models", fake_models)
         monkeypatch.setattr(repository, "list_providers", fake_providers)
@@ -178,9 +180,52 @@ class TestAvailableModels:
         assert body[0]["capabilities"] == {"vision": True, "reasoning": False, "context_limit": 128000}
         assert body[0]["context_limit"] == 128000
         assert body[0]["provider_api_key_configured"] is False
+        assert body[0]["reasoning_none_supported"] is False
         assert "input_price" not in body[0]
         assert "api_key" not in body[0]
         assert body[0]["id"] == 1
+
+    async def test_reasoning_none_supported_follows_the_admission_rule(self, client, monkeypatch):
+        cases = [
+            ("openai", "gpt-5", [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}], False),
+            ("openai", "gpt-5.1", [{"type": "effort", "values": ["none", "low", "medium", "high"]}], True),
+            ("gemini", "gemini-2.5-pro", [{"type": "budget_tokens", "min": 128, "max": 32768}], False),
+            ("gemini", "gemini-2.5-flash", [{"type": "budget_tokens", "min": 0, "max": 24576}], True),
+            ("anthropic", "claude-sonnet-4-5", [{"type": "budget_tokens", "min": 1024}], True),
+            ("openai", "opaque-openai-reasoning", [{"type": "budget_tokens", "min": 1024}], False),
+        ]
+
+        async def fake_models(*, active_only=False):
+            return [
+                {
+                    "id": index,
+                    "provider_id": index,
+                    "model_name": model_name,
+                    "api_model_name": model_name,
+                    "api_provider": "anthropic"
+                    if model_name == "opaque-openai-reasoning"
+                    else f"renamed-{provider_type}",
+                    "provider_type": provider_type,
+                    "display_name": model_name,
+                    "effective_capabilities": {"reasoning": True, "reasoning_options": options},
+                }
+                for index, (provider_type, model_name, options, _) in enumerate(cases, start=1)
+            ]
+
+        async def fake_providers():
+            return [
+                {"id": index, "name": "provider", "provider_type": provider_type, "has_api_key": True}
+                for index, (provider_type, _, _, _) in enumerate(cases, start=1)
+            ]
+
+        monkeypatch.setattr(repository, "list_models", fake_models)
+        monkeypatch.setattr(repository, "list_providers", fake_providers)
+        resp = await client.get("/api/v1/chat/models")
+
+        assert resp.status_code == 200
+        assert {item["model_name"]: item["reasoning_none_supported"] for item in resp.json()} == {
+            model_name: expected for _, model_name, _, expected in cases
+        }
 
     async def test_graceful_empty_on_storage_unavailable(self, client, monkeypatch):
         async def fake_models(*, active_only=False):
@@ -242,6 +287,31 @@ class TestForkAndActiveLeaf:
         monkeypatch.setattr(cs, "fork_conversation", fake_fork)
         resp = await client.post(f"{_URL}/c1/fork", json={"message_id": 999})
         assert resp.status_code == 404
+
+    @pytest.mark.parametrize(
+        ("error", "status", "detail"),
+        [
+            (cs.ConversationRunActive, 409, "conversation_run_active"),
+            (cs.HistoryIndexUnavailable, 503, "history_index_unavailable"),
+        ],
+    )
+    async def test_fork_returns_retryable_graph_conflicts(self, client, monkeypatch, error, status, detail):
+        async def unavailable(*_args, **_kwargs):
+            raise error("fork unavailable")
+
+        monkeypatch.setattr(cs, "fork_conversation", unavailable)
+        response = await client.post(f"{_URL}/c1/fork", json={"message_id": 5})
+        assert response.status_code == status
+        assert response.json()["detail"] == detail
+
+    async def test_delete_rejects_active_run(self, client, monkeypatch):
+        async def active(*_args, **_kwargs):
+            raise cs.ConversationRunActive("conversation has an active run")
+
+        monkeypatch.setattr(cs, "delete_conversation", active)
+        response = await client.delete(f"{_URL}/c1")
+        assert response.status_code == 409
+        assert response.json()["detail"] == "conversation_run_active"
 
 
 async def test_messages_uses_anchor_and_returns_signed_page_cursors(client, monkeypatch):

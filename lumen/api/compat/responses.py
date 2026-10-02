@@ -59,10 +59,6 @@ def responses_error(status_code: int, message: str, *, code: str | None = None) 
     )
 
 
-def _selected_provider(model: str, body_provider: str | None, header_provider: str | None) -> str | None:
-    return core.select_api_provider(model, body_provider, header_provider)
-
-
 def _sse(event: dict) -> str:
     event_type = str(event.get("type") or "message")
     return f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
@@ -85,7 +81,7 @@ async def responses(
         return responses_error(400, "background responses are not supported", code="background_not_supported")
 
     try:
-        provider = _selected_provider(body.model, body.provider, x_lumen_provider)
+        provider = core.select_api_provider(body.provider, x_lumen_provider)
         resolved = await core.resolve_api(body.model, provider=provider)
         await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"))
         options = body.model_dump(

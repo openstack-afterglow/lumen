@@ -233,6 +233,40 @@ def test_usage_decimal_contract_allows_only_provider_adjustment_credit():
     assert UsageComponent(**{**base, "kind": "provider_adjustment", "cost_usd": "-0.1"}).cost_usd == "-0.1"
 
 
+@pytest.mark.parametrize("kind,unit", [
+    ("image_input_tokens", "token"),
+    ("image_cache_read_input_tokens", "token"),
+    ("image_output_tokens", "token"),
+    ("audio_input_tokens", "token"),
+    ("audio_cache_read_input_tokens", "token"),
+    ("audio_output_tokens", "token"),
+    ("audio_input_characters", "character"),
+    ("realtime_session_seconds", "second"),
+])
+def test_media_usage_event_keeps_auditable_kind_unit_and_decimal_charge(kind, unit):
+    component = {
+        "segment_id": "media:1", "kind": kind, "quantity": "10", "unit": unit,
+        "unit_price_usd": "0.000000000123456789", "cost_usd": "0.0000000012",
+        "source": "media", "model_name": "configured-model", "metadata": {},
+    }
+    payload = {
+        "event_id": "run-media:1", "run_id": "run-media", "seq": 1,
+        "type": "usage.updated", "created_at": "2026-10-01T00:00:00Z",
+        "payload": {"components": [component], "prompt_tokens": 10, "completion_tokens": 0,
+                    "raw_cost": "0.0000000012", "credited_cost": "0.00000012"},
+    }
+    event = validate_chat_run_event(payload)
+    billed = event.payload.components[0]
+    assert (billed.kind, billed.unit, billed.unit_price_usd) == (kind, unit, "0.000000000123456789")
+    assert billed.cost_usd == "0.0000000012"
+    with pytest.raises(ValidationError):
+        validate_chat_run_event({**payload, "payload": {**payload["payload"],
+            "components": [{**component, "unit": "hour"}]}})
+    with pytest.raises(ValidationError):
+        validate_chat_run_event({**payload, "payload": {**payload["payload"],
+            "components": [{**component, "cost_usd": "-0.0000000012"}]}})
+
+
 def test_run_event_requires_monotonic_opaque_cursor_and_typed_payload():
     event = validate_chat_run_event(
         {

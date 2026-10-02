@@ -153,6 +153,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
                 return stream()
 
             monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_litellm_stream)
+            monkeypatch.setattr(graph.litellm_client, "direct_openai_stream_completed", lambda _stream: True)
             assert await execution.execute_queued_run(run_id, owner=run_owner) is True
 
             events = await client.get(f"/v1/runs/{run_id}/events", headers={"X-Api-Key": key["key"]})
@@ -242,7 +243,7 @@ async def test_title_recovery_skips_empty_and_unavailable_conversations_without_
     from datetime import UTC, datetime, timedelta
 
     from lumen.crypto import encrypt_chat_content
-    from lumen.models.chat_db import ChatConversation, ChatMessage
+    from lumen.models.chat_db import ChatConversation, ChatConversationMessage, ChatMessage, ChatMessageGraph
     from lumen.models.chat_jobs import ChatJob
     from lumen.services import title_jobs
 
@@ -255,27 +256,42 @@ async def test_title_recovery_skips_empty_and_unavailable_conversations_without_
     now = datetime.now(UTC)
     try:
         async with factory() as session, session.begin():
+            for conv_id in empty_ids:
+                session.add(ChatMessageGraph(id=conv_id, **owner))
+            await session.flush()
             session.add_all(
                 [
-                    ChatConversation(id=conv_id, **owner, title_source="auto", created_at=now - timedelta(days=1))
+                    ChatConversation(
+                        id=conv_id, graph_id=conv_id, **owner,
+                        title_source="auto", created_at=now - timedelta(days=1),
+                    )
                     for conv_id in empty_ids
                 ]
             )
             for offset, conv_id in enumerate((unavailable_id, recoverable_id)):
+                session.add(ChatMessageGraph(id=conv_id, **owner))
+                await session.flush()
                 session.add(
                     ChatConversation(
-                        id=conv_id, **owner, title_source="auto", created_at=now - timedelta(minutes=20 - offset)
+                        id=conv_id, graph_id=conv_id, **owner,
+                        title_source="auto", created_at=now - timedelta(minutes=20 - offset),
                     )
                 )
                 await session.flush()
                 user = ChatMessage(
-                    conversation_id=conv_id, role="user", content=encrypt_chat_content("Plan OpenStack HA")
+                    conversation_id=conv_id, graph_id=conv_id, role="user",
+                    content=encrypt_chat_content("Plan OpenStack HA"),
                 )
                 assistant = ChatMessage(
-                    conversation_id=conv_id, role="assistant", content=encrypt_chat_content("Use three controllers")
+                    conversation_id=conv_id, graph_id=conv_id, role="assistant",
+                    content=encrypt_chat_content("Use three controllers"), parent_id=None,
                 )
                 session.add_all([user, assistant])
                 await session.flush()
+                session.add_all([
+                    ChatConversationMessage(conversation_id=conv_id, message_id=user.id),
+                    ChatConversationMessage(conversation_id=conv_id, message_id=assistant.id),
+                ])
                 session.add(
                     ChatRun(
                         id=str(uuid.uuid4()),

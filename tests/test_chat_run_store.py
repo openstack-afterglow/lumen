@@ -12,6 +12,7 @@ from lumen.services.run_store import (
     complete_segment_io,
     fail_unresolved_segment,
     load_segment_payload,
+    record_segment_usage,
     renew_run_lease,
     replay_events,
     transition_run,
@@ -122,6 +123,54 @@ def test_provider_segments_allow_canonical_output_limit_while_tools_remain_bound
     begin_segment_io(tool)
     with pytest.raises(RunStoreError, match="exceeds"):
         complete_segment_io(tool, result_payload=payload, usage_payload=None)
+
+
+def test_paid_usage_checkpoint_does_not_complete_or_reopen_provider_io():
+    segment = _segment()
+    begin_segment_io(segment)
+    started_at = segment.provider_started_at
+    record_segment_usage(segment, {"input_tokens": 120, "output_tokens": 80})
+    checkpoint = segment.usage_payload
+    assert checkpoint is not None and '"input_tokens"' not in checkpoint
+    assert segment.status == "provider_started"
+    assert segment.provider_started_at == started_at
+    assert segment.completed_at is None and segment.result_payload is None
+    with pytest.raises(RunStoreError):
+        begin_segment_io(segment)
+
+    fail_unresolved_segment(segment, error_code="provider_result_unknown")
+    assert segment.status == "failed"
+    assert segment.usage_payload == checkpoint
+    assert load_segment_payload(segment.usage_payload)["output_tokens"] == 80
+    with pytest.raises(RunStoreError):
+        record_segment_usage(segment, {"input_tokens": 0, "output_tokens": 0})
+    assert segment.usage_payload == checkpoint
+
+
+@pytest.mark.parametrize("status", ["prepared", "completed", "failed"])
+def test_usage_checkpoint_cannot_overwrite_an_unstarted_or_terminal_segment(status):
+    segment = _segment(status)
+    with pytest.raises(RunStoreError):
+        record_segment_usage(segment, {"input_tokens": 120, "output_tokens": 80})
+    assert segment.status == status
+    assert segment.usage_payload is None
+    assert segment.provider_started_at is None and segment.completed_at is None
+
+
+def test_oversize_utf8_usage_cannot_destroy_paid_checkpoint_or_complete_segment():
+    segment = _segment()
+    begin_segment_io(segment)
+    record_segment_usage(segment, {"input_tokens": 120, "output_tokens": 80})
+    checkpoint = segment.usage_payload
+    with pytest.raises(RunStoreError):
+        complete_segment_io(
+            segment,
+            result_payload={"text": "stored output"},
+            usage_payload={"evidence": "한" * (6 * 1024)},
+        )
+    assert segment.status == "provider_started"
+    assert segment.usage_payload == checkpoint
+    assert segment.result_payload is None and segment.completed_at is None
 
 
 @pytest.mark.asyncio

@@ -12,49 +12,36 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
 from typing import Any, Literal
 
+from litellm.exceptions import BadRequestError
+
 from lumen.config import get_settings
 from lumen.services import context_manager, credit, litellm_client, native_compaction
+from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
-from lumen.services.usage_breakdown import UsageBreakdown
+from lumen.services.providers.pricing import frozen_token_pricing
+from lumen.services.usage_breakdown import (
+    MODALITY_INPUT_REPORTING_PROVIDERS,
+    UsageBreakdown,
+    required_modalities_for_request,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_TOKENS = 4096
-_ROUTING_PROVIDER_PREFIXES = frozenset(
-    {
-        "anthropic",
-        "azure",
-        "bedrock",
-        "deepseek",
-        "gemini",
-        "ollama",
-        "openai",
-        "openrouter",
-        "perplexity",
-        "vertex_ai",
-    }
-)
 
 
-def select_api_provider(model: str, body_provider: str | None, header_provider: str | None) -> str | None:
+def select_api_provider(body_provider: str | None, header_provider: str | None) -> str | None:
     if body_provider and header_provider and body_provider != header_provider:
         raise CompletionError(400, "provider_header_conflict")
-    selected = body_provider or header_provider
-    prefix, separator, _bare = model.partition("/")
-    if (
-        body_provider is None
-        and header_provider
-        and separator
-        and prefix in _ROUTING_PROVIDER_PREFIXES
-        and prefix != header_provider
-    ):
-        raise CompletionError(400, "provider_header_conflict")
-    return selected
+    # A public model prefix describes its ID/transport encoding, not the
+    # administrator's independently editable API selector.
+    return body_provider or header_provider
 
 
 class CompletionError(Exception):
@@ -72,6 +59,8 @@ async def resolve(model: str) -> dict:
         raise CompletionError(400, "model 이 필요합니다")
     try:
         resolved = await ps.resolve_model(model)
+    except errors.AmbiguousModelRouteError as exc:
+        raise CompletionError(409, "model_route_ambiguous") from exc
     except errors.ChatStorageUnavailable as exc:
         raise CompletionError(503, "일시적으로 사용할 수 없습니다") from exc
     if resolved is None:
@@ -112,6 +101,39 @@ def clamp_max_tokens(requested: int | None) -> int:
     return value
 
 
+def _billing_route(
+    resolved: dict, messages: list[dict], *, protocol: str, options: dict | None = None
+) -> dict:
+    """Freeze this stateless request's route/prices and reject unmeterable priced media.
+
+    The chat allowlist is evidence about its transport, not a model-name guess.
+    Native protocol adapters do not establish equivalent modality metering.
+    No durable reservation/unknown hold exists on these compatibility APIs.
+    """
+
+    route = deepcopy(resolved)
+    try:
+        route["token_rates"] = frozen_token_pricing(route)["token_rates"]
+    except errors.ProviderValidationError as exc:
+        raise CompletionError(422, "model token pricing is invalid") from exc
+    output_modalities = list((options or {}).get("modalities") or [])
+    if any(tool.get("type") == "image_generation" for tool in (options or {}).get("tools") or []):
+        output_modalities.append("image")
+    required = required_modalities_for_request(
+        route["token_rates"], messages=messages, output_modalities=output_modalities
+    )
+    route["required_token_modalities"] = required
+    reporting = (
+        MODALITY_INPUT_REPORTING_PROVIDERS.get(str(route.get("provider_type") or ""), frozenset())
+        if protocol == "chat" and route.get("provider_auth") is None else frozenset()
+    )
+    for item in required:
+        modality, direction = item.rsplit("_", 1)
+        if direction != "input" or modality not in reporting:
+            raise CompletionError(422, f"{item} (modality_usage_unavailable)")
+    return route
+
+
 async def _bill(
     resolved: dict,
     messages: list[dict],
@@ -130,26 +152,61 @@ async def _bill(
     이 멱등성이 깨져 이중 과금·통계 이중집계가 발생한다.
     """
     model_name = resolved["model_name"]
-    breakdown = litellm_client.extract_usage_breakdown(model_name, messages, text, final_usage)
+    token_rates = resolved.get("token_rates")
+    if token_rates is None:
+        token_rates = frozen_token_pricing(resolved)["token_rates"]
+    required = resolved.get("required_token_modalities")
+    if required is None:
+        required = required_modalities_for_request(token_rates, messages=messages)
+    breakdown = UsageBreakdown.from_runtime(final_usage)
+    if (required or (token_rates and final_usage is not None)) and (
+        breakdown is None or breakdown.modality_usage_invalid
+    ):
+        raise CompletionError(502, "modality_usage_unavailable")
+    if required:
+        def field(value: Any, key: str) -> Any:
+            return value.get(key) if isinstance(value, dict) else getattr(value, key, None)
+
+        # A zero aggregate is not evidence that the provider explicitly
+        # reported a requested media split. Do not synthesize even zero media.
+        canonical = field(final_usage, "modality_tokens")
+        for item in required:
+            modality, direction = item.rsplit("_", 1)
+            if canonical is not None:
+                reported = field(field(canonical, modality), f"{direction}_tokens")
+            else:
+                details = "prompt_tokens_details" if direction == "input" else "completion_tokens_details"
+                reported = field(field(final_usage, details), f"{modality}_tokens")
+            if reported is None:
+                raise CompletionError(502, "modality_usage_unavailable")
+    if breakdown is None:
+        breakdown = litellm_client.extract_usage_breakdown(model_name, messages, text, final_usage)
     pt, ct = breakdown.input_tokens, breakdown.output_tokens
-    usage_cost = litellm_client.cost_from_usage(
-        model_name,
-        pt,
-        ct,
-        input_price_per_token=resolved.get("input_price_per_token"),
-        output_price_per_token=resolved.get("output_price_per_token"),
-        price_source=resolved.get("price_source"),
-        provider_type=resolved.get("provider_type"),
-        api_base=resolved.get("api_base"),
-        breakdown=breakdown,
-        cache_read_price_per_token=resolved.get("cache_read_price_per_token"),
-        cache_write_price_per_token=resolved.get("cache_write_price_per_token"),
-        cache_write_1h_price_per_token=resolved.get("cache_write_1h_price_per_token"),
-        cache_read_price_per_token_above_200k=resolved.get("cache_read_price_per_token_above_200k"),
-        cache_write_price_per_token_above_200k=resolved.get("cache_write_price_per_token_above_200k"),
-        cache_write_1h_price_per_token_above_200k=resolved.get("cache_write_1h_price_per_token_above_200k"),
-        cache_price_sources=resolved.get("cache_price_sources"),
-    )
+    try:
+        usage_cost = litellm_client.cost_from_usage(
+            model_name,
+            pt,
+            ct,
+            input_price_per_token=resolved.get("input_price_per_token"),
+            output_price_per_token=resolved.get("output_price_per_token"),
+            price_source=resolved.get("price_source"),
+            provider_type=resolved.get("provider_type"),
+            api_base=resolved.get("api_base"),
+            breakdown=breakdown,
+            cache_read_price_per_token=resolved.get("cache_read_price_per_token"),
+            cache_write_price_per_token=resolved.get("cache_write_price_per_token"),
+            cache_write_1h_price_per_token=resolved.get("cache_write_1h_price_per_token"),
+            cache_read_price_per_token_above_200k=resolved.get("cache_read_price_per_token_above_200k"),
+            cache_write_price_per_token_above_200k=resolved.get("cache_write_price_per_token_above_200k"),
+            cache_write_1h_price_per_token_above_200k=resolved.get("cache_write_1h_price_per_token_above_200k"),
+            cache_price_sources=resolved.get("cache_price_sources"),
+            token_rates=token_rates,
+            required_modalities=required,
+        )
+    except ValueError as exc:
+        if token_rates or required:
+            raise CompletionError(502, "modality_usage_unavailable") from exc
+        raise
     credited = await credit.apply_usage(
         event_id=event_id,
         user_id=user_id,
@@ -189,8 +246,24 @@ def _norm_tool_calls(raw: Any) -> list[dict] | None:
     return out
 
 
-def _reasoning_effort(explicit: str | None) -> str | None:
-    return explicit or get_settings().chat_reasoning_effort
+def _reasoning_effort(explicit: str | None, resolved: dict | None = None) -> str | None:
+    """Explicit effort, else the operator default.
+
+    An operator ``none`` carries no per-request intent, so it takes the omission path
+    (provider default) for models that cannot disable reasoning instead of sending a
+    value such as gpt-5/o3 reject.
+    """
+    if explicit:
+        return explicit
+    effort = get_settings().chat_reasoning_effort
+    if (
+        resolved is not None
+        and isinstance(effort, str)
+        and effort.strip().lower() == "none"
+        and not reasoning_can_be_disabled(resolved.get("capabilities"), resolved.get("provider_type"))
+    ):
+        return None
+    return effort
 
 
 async def complete_once(
@@ -206,6 +279,7 @@ async def complete_once(
     tool_choice: Any = None,
 ) -> dict:
     """비스트리밍 완료 — 전체 응답 반환 + 과금. tool_calls 는 릴레이(서버 미실행)."""
+    resolved = _billing_route(resolved, messages, protocol="chat", options={"tools": tools})
     extra_kwargs: dict[str, Any] = {}
     if tool_choice is not None:
         extra_kwargs["tool_choice"] = tool_choice
@@ -253,7 +327,28 @@ async def complete_once(
     }
 
 
-async def complete_stream(
+def complete_stream(
+    *,
+    resolved: dict,
+    messages: list[dict],
+    user_id: str,
+    project_id: str,
+    api_key_id: int | None,
+    max_tokens: int | None,
+    temperature: float | None,
+    tools: list[dict] | None = None,
+    tool_choice: Any = None,
+) -> AsyncIterator[dict]:
+    """Validate/freeze before HTTP streaming starts, then return the completion iterator."""
+    resolved = _billing_route(resolved, messages, protocol="chat", options={"tools": tools})
+    return _complete_stream(
+        resolved=resolved, messages=messages, user_id=user_id, project_id=project_id,
+        api_key_id=api_key_id, max_tokens=max_tokens, temperature=temperature,
+        tools=tools, tool_choice=tool_choice,
+    )
+
+
+async def _complete_stream(
     *,
     resolved: dict,
     messages: list[dict],
@@ -291,7 +386,7 @@ async def complete_stream(
             temperature=temperature,
             tools=tools,
             extra=extra_kwargs or None,
-            reasoning_effort=_reasoning_effort(None),
+            reasoning_effort=_reasoning_effort(None, resolved),
             provider_auth=resolved.get("provider_auth"),
         )
         async for chunk in gen:
@@ -352,7 +447,7 @@ async def complete_stream(
             ).cache_read_input_tokens,
         }
     finally:
-        if not charged and text:
+        if not charged and text and not resolved.get("token_rates"):
             try:
                 await _bill(
                     resolved,
@@ -413,7 +508,9 @@ def _with_passthrough_compaction(
     )
 
 
-def _native_usage(value: dict, *, protocol: Literal["anthropic", "responses"]) -> dict | None:
+def _native_usage(
+    value: dict, *, protocol: Literal["anthropic", "responses"], strict: bool = False
+) -> dict | None:
     """Map raw provider-native usage to the runtime dict ``_bill`` consumes.
 
     Anthropic ``input_tokens`` excludes cache, so cache read/creation are added
@@ -424,10 +521,42 @@ def _native_usage(value: dict, *, protocol: Literal["anthropic", "responses"]) -
     """
     usage = value.get("usage")
     if not isinstance(usage, dict):
+        if strict and usage is not None:
+            return UsageBreakdown(0, 0, modality_usage_invalid=True).as_usage_dict()
         return None
+    if strict:
+
+        def malformed(value: Any, key: str = "") -> bool:
+            if key.endswith("tokens"):
+                return isinstance(value, bool) or not isinstance(value, int) or value < 0
+            if key in {"input_tokens_details", "output_tokens_details", "cached_tokens_details", "cache_creation"} and not isinstance(value, dict):
+                return True
+            if isinstance(value, dict):
+                return any(malformed(item, name) for name, item in value.items())
+            if isinstance(value, list):
+                return any(malformed(item) for item in value)
+            return False
+
+        invalid = malformed(usage)
+        if protocol == "responses" and "input_tokens" in usage and "output_tokens" in usage:
+            checked = UsageBreakdown.from_openai_media(usage)
+            invalid = invalid or checked is None or checked.modality_usage_invalid
+        if protocol == "anthropic" and not invalid:
+            creation = usage.get("cache_creation_input_tokens")
+            split = usage.get("cache_creation") or {}
+            five = split.get("ephemeral_5m_input_tokens")
+            one = split.get("ephemeral_1h_input_tokens")
+            if creation is not None:
+                invalid = (five or 0) + (one or 0) > creation
+                if five is not None and one is not None:
+                    invalid = invalid or five + one != creation
+        if invalid:
+            return UsageBreakdown(0, 0, modality_usage_invalid=True).as_usage_dict()
     breakdown = (
         UsageBreakdown.from_anthropic(usage) if protocol == "anthropic" else UsageBreakdown.from_responses(usage)
     )
+    if strict and breakdown is None:
+        return UsageBreakdown(0, 0, modality_usage_invalid=True).as_usage_dict()
     return breakdown.as_usage_dict() if breakdown is not None else None
 
 
@@ -448,8 +577,18 @@ async def complete_responses(
     options: dict[str, Any],
 ) -> dict | AsyncIterator[dict]:
     """Execute the native Responses protocol and preserve every upstream item/event."""
+    messages = _responses_input_messages(input)
+    resolved = _billing_route(resolved, messages, protocol="responses", options=options)
     event_id = str(uuid.uuid4())
     options = _with_passthrough_compaction(options, resolved=resolved, protocol="responses")
+    if resolved.get("reasoning_unsupported") is True:
+        options.pop("reasoning", None)
+        if include := options.get("include"):
+            filtered = [item for item in include if not item.startswith("reasoning.")]
+            if filtered:
+                options["include"] = filtered
+            else:
+                options.pop("include")
     try:
         response = await litellm_client.aresponses(
             model=resolved["model_name"],
@@ -463,18 +602,20 @@ async def complete_responses(
         )
     except errors.ProviderSubscriptionError as exc:
         raise CompletionError(exc.status_code, exc.message) from None
+    except BadRequestError:
+        logger.info("Responses provider rejected request model=%s", resolved.get("model_name"))
+        raise CompletionError(400, "upstream model rejected request") from None
     except Exception as exc:
         logger.warning("Responses upstream request failed model=%s", resolved.get("model_name"), exc_info=True)
         raise CompletionError(502, "upstream model error") from exc
 
-    messages = _responses_input_messages(input)
     if not stream:
         payload = _native_dict(response)
         await _bill(
             resolved,
             messages,
             _native_text(payload.get("output", [])),
-            _native_usage(payload, protocol="responses"),
+            _native_usage(payload, protocol="responses", strict=bool(resolved.get("token_rates"))),
             event_id=event_id,
             user_id=user_id,
             project_id=project_id,
@@ -485,6 +626,7 @@ async def complete_responses(
     async def events() -> AsyncIterator[dict]:
         charged = False
         text_parts: list[str] = []
+        settlement_attempted = False
         try:
             async for raw_event in response:
                 event = _native_dict(raw_event)
@@ -493,11 +635,12 @@ async def complete_responses(
                     text_parts.append(event["delta"])
                 if event_type == "response.completed" and isinstance(event.get("response"), dict):
                     completed = event["response"]
+                    settlement_attempted = True
                     await _bill(
                         resolved,
                         messages,
                         "".join(text_parts) or _native_text(completed.get("output", [])),
-                        _native_usage(completed, protocol="responses"),
+                        _native_usage(completed, protocol="responses", strict=bool(resolved.get("token_rates"))),
                         event_id=event_id,
                         user_id=user_id,
                         project_id=project_id,
@@ -506,7 +649,10 @@ async def complete_responses(
                     charged = True
                 yield event
         finally:
-            if not charged and text_parts:
+            if (
+                not charged and text_parts and not resolved.get("required_token_modalities")
+                and not (resolved.get("token_rates") and settlement_attempted)
+            ):
                 try:
                     await _bill(
                         resolved,
@@ -536,6 +682,7 @@ async def complete_anthropic(
     options: dict[str, Any],
 ) -> dict | AsyncIterator[dict]:
     """Execute the native Anthropic protocol without lossy OpenAI conversion."""
+    resolved = _billing_route(resolved, messages, protocol="anthropic", options=options)
     event_id = str(uuid.uuid4())
     options = _with_passthrough_compaction(options, resolved=resolved, protocol="anthropic")
     try:
@@ -562,7 +709,7 @@ async def complete_anthropic(
             resolved,
             messages,
             _native_text(payload.get("content", [])),
-            _native_usage(payload, protocol="anthropic"),
+            _native_usage(payload, protocol="anthropic", strict=bool(resolved.get("token_rates"))),
             event_id=event_id,
             user_id=user_id,
             project_id=project_id,
@@ -575,6 +722,7 @@ async def complete_anthropic(
         delta_usages: list[dict] = []
         text_parts: list[str] = []
         charged = False
+        settlement_attempted = False
         try:
             async for raw_event in response:
                 event = _native_dict(raw_event)
@@ -595,12 +743,18 @@ async def complete_anthropic(
                     if isinstance(usage, dict):
                         delta_usages.append(usage)
                 elif event_type == "message_stop":
-                    breakdown = UsageBreakdown.from_anthropic_stream(start_usage, delta_usages)
+                    settlement_attempted = True
+                    merged_usage = {"input_tokens": 0, "output_tokens": 0}
+                    for usage in (start_usage, *delta_usages):
+                        merged_usage.update({key: value for key, value in usage.items() if value is not None})
+                    runtime_usage = _native_usage(
+                        {"usage": merged_usage}, protocol="anthropic", strict=bool(resolved.get("token_rates"))
+                    )
                     await _bill(
                         resolved,
                         messages,
                         "".join(text_parts),
-                        breakdown.as_usage_dict() if breakdown is not None else None,
+                        runtime_usage,
                         event_id=event_id,
                         user_id=user_id,
                         project_id=project_id,
@@ -609,7 +763,10 @@ async def complete_anthropic(
                     charged = True
                 yield event
         finally:
-            if not charged and text_parts:
+            if (
+                not charged and text_parts and not resolved.get("required_token_modalities")
+                and not (resolved.get("token_rates") and settlement_attempted)
+            ):
                 try:
                     completion_text = "".join(text_parts)
                     # A stream cut before message_stop still bills what
@@ -625,6 +782,14 @@ async def complete_anthropic(
                         if start_usage or delta_usages
                         else None
                     )
+                    if resolved.get("token_rates") and (start_usage or delta_usages):
+                        merged_usage = {"input_tokens": 0, "output_tokens": 0}
+                        for usage in (start_usage, *delta_usages):
+                            merged_usage.update({key: value for key, value in usage.items() if value is not None})
+                        runtime_usage = _native_usage({"usage": merged_usage}, protocol="anthropic", strict=True)
+                        reported = UsageBreakdown.from_runtime(runtime_usage)
+                        if reported is None or reported.modality_usage_invalid:
+                            raise CompletionError(502, "modality_usage_unavailable")
                     output_tokens = max(
                         reported.output_tokens if reported is not None else 0,
                         litellm_client.count_tokens(resolved["model_name"], text=completion_text),

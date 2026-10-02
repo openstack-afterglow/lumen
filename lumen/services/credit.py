@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any
@@ -27,7 +28,7 @@ from lumen.services import quota_policy
 from lumen.services.api_key_store import calculate_effective_limit
 from lumen.services.litellm_client import UsageCost
 from lumen.services.quota_periods import month_start, week_start
-from lumen.services.usage_breakdown import UsageBreakdown
+from lumen.services.usage_breakdown import UsageBreakdown, modality_token_charges
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ _CACHE_SNAPSHOT_PRICES = (
 
 def _snapshot_price(pricing_snapshot: dict, key: str, *, required: bool) -> Decimal | None:
     value = pricing_snapshot.get(key) if not required else pricing_snapshot[key]
-    if value is None and not required:
+    if value is None:
         return None
     price = Decimal(str(value))
     if not price.is_finite() or price < 0:
@@ -93,12 +94,21 @@ def usage_cost_from_pricing_snapshot(
     prompt_tokens: int,
     completion_tokens: int,
     breakdown: UsageBreakdown | None = None,
+    required_modalities: Iterable[str] | None = None,
 ) -> UsageCost:
-    """Calculate base-model usage exclusively from a durable run's frozen prices.
+    """Calculate token usage exclusively from a durable run's frozen prices.
 
     ``prompt_tokens`` is total input; the input rate applies to its uncached
     share. A cache category without a frozen rate — including every snapshot
     frozen before cache rates existed — bills 0 and marks the usage partial.
+    Frozen ``token_rates`` bill reported image/audio shares at their own rates
+    and the text rates apply only to the residual. The text input/output keys
+    must be frozen; a ``None`` text rate is allowed only while its residual is
+    zero (media models price only the applicable text directions).
+
+    ``required_modalities`` describes this actual provider call. An explicit
+    empty iterable permits a genuinely text-only segment after media was
+    compacted away; omitting it preserves legacy admission requirements.
     """
     try:
         input_price = _snapshot_price(pricing_snapshot, "input_price_per_token", required=True)
@@ -117,29 +127,49 @@ def usage_cost_from_pricing_snapshot(
         max(0, int(completion_tokens)),
     ):
         raise ValueError("usage breakdown totals do not match prompt/completion tokens")
-    uncached_tokens = breakdown.uncached_input_tokens
-    input_cost = (input_price * uncached_tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN)
-    output_cost = (output_price * breakdown.output_tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN)
+    frozen_required = pricing_snapshot.get("required_token_modalities") or ()
+    if not isinstance(frozen_required, (list, tuple)):
+        raise ValueError("durable pricing snapshot is invalid")
+    text, modality_charges = modality_token_charges(
+        breakdown,
+        pricing_snapshot.get("token_rates"),
+        frozen_required if required_modalities is None else required_modalities,
+    )
+    uncached_tokens = text.uncached_input_tokens
+    for price, tokens in ((input_price, uncached_tokens), (output_price, text.output_tokens)):
+        if price is None and tokens:
+            raise ValueError("text token pricing is unavailable for reported usage")
+    input_cost = ((input_price or Decimal("0")) * uncached_tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN)
+    output_cost = ((output_price or Decimal("0")) * text.output_tokens).quantize(
+        _USD_QUANTUM, rounding=ROUND_HALF_EVEN
+    )
     components: dict[str, dict[str, object]] = {
         "input": {
             "tokens": uncached_tokens,
-            "price_per_token": format(input_price, "f"),
+            "price_per_token": format(input_price, "f") if input_price is not None else None,
             "cost": format(input_cost, "f"),
         },
         "output": {
-            "tokens": breakdown.output_tokens,
-            "price_per_token": format(output_price, "f"),
+            "tokens": text.output_tokens,
+            "price_per_token": format(output_price, "f") if output_price is not None else None,
             "cost": format(output_cost, "f"),
         },
     }
     cache_costs: dict[str, Decimal] = {}
     unpriced_cache = False
+    sources = pricing_snapshot.get("cache_price_sources") or {}
     for name, token_field, _, _ in _CACHE_SNAPSHOT_PRICES:
-        tokens = getattr(breakdown, token_field)
+        tokens = getattr(text, token_field)
         rate, tier_rate = cache_prices[name]
-        source = (pricing_snapshot.get("cache_price_sources") or {}).get(name, "manual")
-        if breakdown.input_tokens > 200_000 and source == "litellm" and tier_rate is not None:
+        source = sources.get(name, "manual")
+        # Frozen tiers exist only for real catalog rates (own or inherited by a fallback write).
+        if breakdown.input_tokens > 200_000 and source != "manual" and tier_rate is not None:
             rate = tier_rate
+            # A fallback base and its real catalog tier carry separate provenance.
+            source = sources.get(f"{name}_above_200k") or source
+        if tokens and rate is None and pricing_snapshot.get("model_kind", "text") != "text":
+            # Legacy text snapshots bill an unpriced cache at 0 (partial); media never does.
+            raise ValueError(f"media {name} token pricing is unavailable for reported usage")
         cost = (rate * tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN) if rate is not None else Decimal("0")
         unpriced_cache = unpriced_cache or (tokens > 0 and rate is None)
         cache_costs[name] = cost
@@ -150,6 +180,20 @@ def usage_cost_from_pricing_snapshot(
             "source": source if rate is not None else None,
         }
     raw_cost = input_cost + output_cost + sum(cache_costs.values(), Decimal("0"))
+    for charge in modality_charges:
+        cost = (charge.price_per_token * charge.tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN)
+        raw_cost += cost
+        if charge.name.endswith("_cache_read"):
+            cache_costs["cache_read"] += cost
+        elif charge.name.endswith("_input"):
+            input_cost += cost
+        else:
+            output_cost += cost
+        components[charge.name] = {
+            "tokens": charge.tokens,
+            "price_per_token": format(charge.price_per_token, "f"),
+            "cost": format(cost, "f"),
+        }
     return UsageCost(
         raw_cost=raw_cost.quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN),
         input_cost=input_cost,
@@ -159,6 +203,108 @@ def usage_cost_from_pricing_snapshot(
         cache_read_cost=cache_costs["cache_read"],
         cache_creation_5m_cost=cache_costs["cache_creation_5m"],
         cache_creation_1h_cost=cache_costs["cache_creation_1h"],
+    )
+
+
+# (token_components key, ledger usage kind); cache and modality kinds appear only with tokens.
+TOKEN_USAGE_COMPONENT_KINDS = (
+    ("input", "input_tokens"),
+    ("output", "output_tokens"),
+    ("cache_read", "cache_read_input_tokens"),
+    ("cache_creation_5m", "cache_creation_5m_input_tokens"),
+    ("cache_creation_1h", "cache_creation_1h_input_tokens"),
+    *(
+        (f"{modality}_{category}", f"{modality}_{kind}")
+        for modality in ("image", "audio")
+        for category, kind in (
+            ("input", "input_tokens"),
+            ("cache_read", "cache_read_input_tokens"),
+            ("output", "output_tokens"),
+        )
+    ),
+)
+
+
+def token_usage_components(
+    usage_cost: UsageCost,
+    *,
+    segment_id: str,
+    source: str,
+    model_name: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Ledger token components of a ``usage_cost_from_pricing_snapshot`` result.
+
+    ``input_tokens`` is the uncached TEXT share; text input/output always
+    appear, other categories only with tokens.
+    """
+    token_components = usage_cost.pricing_snapshot.get("token_components")
+    if not isinstance(token_components, dict):
+        raise ValueError("usage cost has no token components")
+    components: list[dict[str, Any]] = []
+    for key, kind in TOKEN_USAGE_COMPONENT_KINDS:
+        item = token_components.get(key)
+        if not isinstance(item, dict):
+            continue
+        quantity = int(item["tokens"])
+        if key not in ("input", "output") and quantity == 0:
+            continue
+        cost = Decimal(str(item["cost"]))
+        components.append(
+            {
+                "segment_id": segment_id,
+                "kind": kind,
+                "quantity": str(quantity),
+                "unit": "token",
+                "unit_price_usd": format(cost / quantity if quantity else Decimal("0"), "f"),
+                "cost_usd": format(cost, "f"),
+                "source": source,
+                "model_name": model_name,
+                "metadata": dict(metadata),
+            }
+        )
+    return components
+
+
+_WORST_CASE_INPUT_KEYS = tuple(
+    key for _, _, rate_key, tier_key in _CACHE_SNAPSHOT_PRICES for key in (rate_key, tier_key)
+)
+
+
+def worst_case_token_rates(pricing_snapshot: dict) -> tuple[Decimal, Decimal, Decimal]:
+    """``(input_per_token, output_per_token, rounding_cushion_usd)`` bounding any settlement.
+
+    Maximizes over the frozen text input/cache rates and every image/audio
+    input/cache/output rate; the cushion covers one 1e-10 USD rounding per
+    billed token category. Absent rates contribute nothing, never a price.
+    """
+    inputs: list[Decimal] = []
+    outputs: list[Decimal] = []
+    categories = 5
+    try:
+        for key in ("input_price_per_token", *_WORST_CASE_INPUT_KEYS):
+            if pricing_snapshot.get(key) is not None:
+                inputs.append(Decimal(str(pricing_snapshot[key])))
+        if pricing_snapshot.get("output_price_per_token") is not None:
+            outputs.append(Decimal(str(pricing_snapshot["output_price_per_token"])))
+        token_rates = pricing_snapshot.get("token_rates") or {}
+        if not isinstance(token_rates, dict):
+            raise ValueError("durable pricing snapshot is invalid")
+        for fields in token_rates.values():
+            if not isinstance(fields, dict):
+                raise ValueError("durable pricing snapshot is invalid")
+            categories += 3
+            for key, value in fields.items():
+                rate = Decimal(str(value)) / Decimal("1000000")
+                (outputs if key == "output_per_million" else inputs).append(rate)
+    except (InvalidOperation, TypeError) as exc:
+        raise ValueError("durable pricing snapshot is invalid") from exc
+    if any(not rate.is_finite() or rate < 0 for rate in (*inputs, *outputs)):
+        raise ValueError("durable pricing snapshot is invalid")
+    return (
+        max(inputs, default=Decimal("0")),
+        max(outputs, default=Decimal("0")),
+        _USD_QUANTUM * categories,
     )
 
 
@@ -209,6 +355,62 @@ async def _ledger_credited_since(
     if api_only:
         stmt = stmt.where(ChatUsageLog.source == "api")
     return Decimal(str((await session.execute(stmt)).scalar_one()))
+
+
+async def reserve_media_credit_in_transaction(session, *, user_id: str, project_id: str,
+                                              api_key_id: int | None, bound: Decimal) -> None:
+    """Serialize media starts on the wallet and count unsettled holds before provider I/O.
+
+    Call only from a READ COMMITTED transaction set before its first statement:
+    earlier run reads otherwise pin a stale REPEATABLE READ snapshot. Held and
+    ledger aggregates must stay nonlocking: their unindexed FOR UPDATE scans
+    can block another user's text reservation insert. Failed or uncertain calls
+    retain their bound until reconciliation; settled calls enter the ledger.
+    No remote I/O runs under this row lock.
+    """
+    from lumen.models.chat_runs import ChatModelCallReservation, ChatRun
+
+    if not bound.is_finite() or bound <= 0:
+        raise QuotaExceeded("미디어 사용 한도가 올바르지 않습니다")
+    # A plain session.get() before this lock pins a REPEATABLE READ snapshot and
+    # can miss a competing reservation committed while waiting for the wallet.
+    wallet = (await session.execute(select(UserWallet).where(UserWallet.user_id == user_id)
+              .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    if wallet is None:
+        wallet = await _get_or_create_wallet(session, user_id, project_id)
+    _maybe_reset_month(wallet)
+    if not wallet.is_active:
+        raise QuotaExceeded("비활성 지갑입니다")
+    held = select(func.coalesce(func.sum(ChatModelCallReservation.bound_credits), Decimal("0"))).join(
+        ChatRun, ChatRun.id == ChatModelCallReservation.run_id).where(
+        ChatRun.user_id == user_id, ChatModelCallReservation.status.in_(("reserved", "unknown"))
+    )
+    pending = Decimal(str((await session.execute(held)).scalar_one()))
+    system = await quota_policy.get_system_quota(session, user_id)
+    if system.monthly > 0 and wallet.used_quota_this_month + pending + bound > system.monthly:
+        raise QuotaExceeded("월 사용 한도를 초과했습니다")
+    if system.weekly > 0:
+        usage = await _ledger_credited_since(session, since=week_start(), user_id=user_id)
+        if usage + pending + bound > system.weekly:
+            raise QuotaExceeded("주간 사용 한도를 초과했습니다")
+    if api_key_id is not None:
+        key = await session.get(ChatApiKey, api_key_id)
+        if (key is None or key.owner_user_id != user_id or key.owner_project_id != project_id
+                or not key.is_active or key.revoked_at is not None):
+            raise ChatStorageUnavailable("chat DB 오류")
+        held_key = held.where(ChatRun.api_key_id == api_key_id)
+        key_pending = Decimal(str((await session.execute(held_key)).scalar_one()))
+        monthly = calculate_effective_limit(key.owner_monthly_credit_limit,
+                                            key.admin_monthly_credit_limit, system.monthly)
+        if monthly is not None:
+            usage = await _ledger_credited_since(session, since=month_start(), api_key_id=api_key_id, api_only=True)
+            if usage + key_pending + bound > monthly:
+                raise QuotaExceeded("API 키 월 사용 한도를 초과했습니다")
+        weekly = calculate_effective_limit(key.owner_weekly_credit_limit, None, system.weekly)
+        if weekly is not None:
+            usage = await _ledger_credited_since(session, since=week_start(), api_key_id=api_key_id, api_only=True)
+            if usage + key_pending + bound > weekly:
+                raise QuotaExceeded("API 키 주간 사용 한도를 초과했습니다")
 
 
 async def precheck(user_id: str, project_id: str | None = None, api_key_id: int | None = None) -> None:

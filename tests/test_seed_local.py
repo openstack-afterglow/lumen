@@ -51,6 +51,9 @@ def test_required_scope_rotation_predicate() -> None:
     assert "native:conversations:read" in _LOCAL_KEY_SCOPES
     assert "native:conversations:write" in _LOCAL_KEY_SCOPES
     assert "models:read" in _LOCAL_KEY_SCOPES
+    assert {"compat:images:write", "compat:audio:write", "compat:realtime:write"} <= set(_LOCAL_KEY_SCOPES)
+    assert {"native:images:write", "native:audio:write", "native:realtime:write",
+            "native:assets:read", "native:assets:write"} <= set(_LOCAL_KEY_SCOPES)
 
     # Complete current scopes -> satisfied
     assert is_scope_satisfied(_LOCAL_KEY_SCOPES, _LOCAL_KEY_SCOPES) is True
@@ -232,126 +235,132 @@ def test_cli_rejects_extra_fields_and_insecure_permissions(
     assert "insecure file permissions" in capsys.readouterr().err
 
 
+def _setup_seed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, providers: dict, rows: list[dict]):
+    from lumen.scripts import seed_local
+
+    monkeypatch.setenv("DATABASE_URL", "mysql+aiomysql://lumen:lumen@localhost/lumen")
+    monkeypatch.setenv("LUMEN_LOCAL_SEED_PATH", str(tmp_path / "api-key"))
+    monkeypatch.setenv("LUMEN_LOCAL_CONNECTION_PATH", str(tmp_path / "connection.json"))
+    for name in ("OPENAI_API_KEY", "GEMINI_API_KEY", "LUMEN_LOCAL_PROVIDER_BASE_URL",
+                 "LUMEN_LOCAL_PROVIDER_NAME", "LUMEN_LOCAL_MODEL", "LUMEN_LOCAL_CONTEXT_LIMIT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LUMEN_LOCAL_PROVIDER_TYPE", "openai")
+    monkeypatch.setattr(seed_local, "init_db", lambda _url: None)
+    monkeypatch.setattr(seed_local, "close_db", AsyncMock())
+    bootstrap = AsyncMock(return_value=providers)
+    monkeypatch.setattr(seed_local, "seed_environment_providers", bootstrap)
+    monkeypatch.setattr(seed_local.repository, "list_providers", AsyncMock(return_value=list(providers.values())))
+    monkeypatch.setattr(seed_local.repository, "list_models", AsyncMock(return_value=rows))
+    create_provider = AsyncMock(return_value={"id": 90, "name": "local-openai", "has_api_key": False})
+    create_model = AsyncMock()
+    update_provider = AsyncMock()
+    monkeypatch.setattr(seed_local.repository, "create_provider", create_provider)
+    monkeypatch.setattr(seed_local.repository, "create_model", create_model)
+    monkeypatch.setattr(seed_local.repository, "update_provider", update_provider)
+    monkeypatch.setattr(seed_local.api_key_store, "verify_key", AsyncMock(return_value=None))
+    monkeypatch.setattr(seed_local.api_key_store, "create_key", AsyncMock(return_value={"key": "sk-afgl-new"}))
+    return seed_local, bootstrap, create_provider, create_model, update_provider
+
+
 @pytest.mark.asyncio
-async def test_seed_reconciles_provider_and_model_when_fields_differ(
+@pytest.mark.parametrize("keys,expected_model,expected_ids", [
+    ({"OPENAI_API_KEY": "openai-secret"}, "gpt-4.1-mini", [1]),
+    ({"GEMINI_API_KEY": "gemini-secret"}, "gemini/gemini-2.5-flash", [2]),
+    ({"OPENAI_API_KEY": "openai-secret", "GEMINI_API_KEY": "gemini-secret"},
+     "gpt-4.1-mini", [1, 2]),
+])
+async def test_seed_uses_direct_providers_and_creates_only_missing_text_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, keys: dict, expected_model: str, expected_ids: list[int]
+) -> None:
+    providers = {
+        "openai": {"id": 1, "name": "openai", "provider_type": "openai", "has_api_key": True},
+        "gemini": {"id": 2, "name": "gemini", "provider_type": "gemini", "has_api_key": True},
+    }
+    local, bootstrap, create_provider, create_model, update_provider = _setup_seed(
+        monkeypatch, tmp_path, providers, []
+    )
+    for key, value in keys.items():
+        monkeypatch.setenv(key, value)
+    await local.seed()
+    bootstrap.assert_awaited_once_with()
+    create_provider.assert_not_awaited()
+    update_provider.assert_not_awaited()
+    assert [call.kwargs["provider_id"] for call in create_model.await_args_list] == expected_ids
+    assert [call.kwargs["model_name"] for call in create_model.await_args_list] == (
+        [expected_model, "gemini/gemini-2.5-flash"] if len(expected_ids) == 2 else [expected_model]
+    )
+    for call in create_model.await_args_list:
+        if call.kwargs["provider_id"] == 2:
+            assert call.kwargs.get("input_price_per_million") is None
+            assert call.kwargs.get("output_price_per_million") is None
+    manifest = json.loads((tmp_path / "connection.json").read_text())
+    assert manifest["model"] == expected_model
+    assert manifest["provider_api_key_configured"] is True
+
+
+@pytest.mark.asyncio
+async def test_seed_preserves_admin_model_prices_and_provider_settings(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-
-    seed_file = tmp_path / "api-key"
-    conn_file = tmp_path / "connection.json"
-    monkeypatch.setenv("DATABASE_URL", "mysql+aiomysql://lumen:lumen@127.0.0.1:3306/lumen")
-    monkeypatch.setenv("LUMEN_LOCAL_SEED_PATH", str(seed_file))
-    monkeypatch.setenv("LUMEN_LOCAL_CONNECTION_PATH", str(conn_file))
-    monkeypatch.setenv("LUMEN_LOCAL_PROVIDER_TYPE", "openai")
-    monkeypatch.setenv("LUMEN_LOCAL_PROVIDER_BASE_URL", "http://new-provider-base:8000")
+    provider = {"id": 1, "name": "openai", "provider_type": "openai", "has_api_key": True,
+                "api_base": "https://admin.example/v1", "api_key_source": "database"}
+    model = {"provider_id": 1, "model_name": "gpt-4.1-mini", "input_price_per_million": "42",
+             "output_price_per_million": "99", "capabilities": {"context_limit": 8192}, "is_active": False}
+    local, _, _, create_model, update_provider = _setup_seed(monkeypatch, tmp_path, {"openai": provider}, [model])
+    monkeypatch.setenv("OPENAI_API_KEY", "configured")
     monkeypatch.setenv("LUMEN_LOCAL_INPUT_PRICE_PER_MILLION", "5")
-    monkeypatch.setenv("LUMEN_LOCAL_OUTPUT_PRICE_PER_MILLION", "15")
-    monkeypatch.setenv("LUMEN_LOCAL_CONTEXT_LIMIT", "4096")
-
-    fake_provider = {
-        "id": 1,
-        "name": "local-openai",
-        "provider_type": "openai",
-        "api_base": "http://old-provider-base:8000",
-        "api_key_env": "LUMEN_LOCAL_PROVIDER_API_KEY",
-    }
-    fake_model = {
-        "id": 10,
-        "provider_id": 1,
-        "model_name": "gpt-4.1-mini",
-        "input_price_per_million": "1.00000000",
-        "output_price_per_million": "3.00000000",
-        "capabilities": {"context_limit": 2048},
-    }
-
-    mock_list_providers = AsyncMock(return_value=[fake_provider])
-    mock_update_provider = AsyncMock(return_value={**fake_provider, "api_base": "http://new-provider-base:8000"})
-    mock_list_models = AsyncMock(return_value=[fake_model])
-    mock_update_model = AsyncMock(
-        return_value={
-            **fake_model,
-            "input_price_per_million": "5",
-            "output_price_per_million": "15",
-            "capabilities": {"context_limit": 4096},
-        }
-    )
-    mock_verify_key = AsyncMock(return_value=None)
-    mock_create_key = AsyncMock(return_value={"key": "sk-afgl-new-key-123"})
-    mock_close_db = AsyncMock()
-
-    monkeypatch.setattr("lumen.services.providers.repository.list_providers", mock_list_providers)
-    monkeypatch.setattr("lumen.services.providers.repository.update_provider", mock_update_provider)
-    monkeypatch.setattr("lumen.services.providers.repository.list_models", mock_list_models)
-    monkeypatch.setattr("lumen.services.providers.repository.update_model", mock_update_model)
-    monkeypatch.setattr("lumen.services.api_key_store.verify_key", mock_verify_key)
-    monkeypatch.setattr("lumen.services.api_key_store.create_key", mock_create_key)
-    monkeypatch.setattr("lumen.scripts.seed_local.init_db", lambda _url: None)
-    monkeypatch.setattr("lumen.scripts.seed_local.close_db", mock_close_db)
-
-    from lumen.scripts.seed_local import seed
-
-    await seed()
-
-    mock_update_provider.assert_called_once_with(1, {"api_base": "http://new-provider-base:8000"})
-    mock_update_model.assert_called_once_with(
-        10,
-        {
-            "input_price_per_million": "5",
-            "output_price_per_million": "15",
-            "capabilities": {"context_limit": 4096},
-        },
-    )
-    assert conn_file.exists()
-    manifest = json.loads(conn_file.read_text())
-    assert manifest["api_key"] == "sk-afgl-new-key-123"
+    await local.seed()
+    create_model.assert_not_awaited()
+    update_provider.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_seed_rotates_legacy_local_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    seed_file = tmp_path / "api-key"
-    seed_file.write_text("sk-afgl-legacy\n")
-    connection_file = tmp_path / "connection.json"
-    monkeypatch.setenv("DATABASE_URL", "mysql+aiomysql://lumen:lumen@127.0.0.1:3306/lumen")
-    monkeypatch.setenv("LUMEN_LOCAL_SEED_PATH", str(seed_file))
-    monkeypatch.setenv("LUMEN_LOCAL_CONNECTION_PATH", str(connection_file))
-    monkeypatch.setenv("LUMEN_LOCAL_PROVIDER_API_KEY", "provider-key")
-
-    provider = {
-        "id": 1,
-        "name": "local-openai",
-        "provider_type": "openai",
-        "api_base": None,
-        "api_key_env": "LUMEN_LOCAL_PROVIDER_API_KEY",
-        "has_api_key": True,
+async def test_seed_custom_fake_route_and_rotates_missing_media_scopes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider = {"id": 3, "name": "fake-openai", "provider_type": "openai", "has_api_key": True,
+                "api_base": "http://fake-provider:8080/v1", "api_key_env": "OPENAI_API_KEY"}
+    local, _, create_provider, create_model, _ = _setup_seed(monkeypatch, tmp_path, {"openai": {
+        "id": 1, "name": "openai", "provider_type": "openai", "has_api_key": True
+    }}, [])
+    local.repository.list_providers.return_value.append(provider)
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-provider-key")
+    monkeypatch.setenv("LUMEN_LOCAL_PROVIDER_NAME", "fake-openai")
+    monkeypatch.setenv("LUMEN_LOCAL_PROVIDER_BASE_URL", "http://fake-provider:8080/v1")
+    monkeypatch.setenv("LUMEN_LOCAL_MODEL", "fake-gpt-4")
+    old_key = tmp_path / "api-key"
+    old_key.write_text("sk-afgl-legacy\n")
+    local.api_key_store.verify_key.return_value = {
+        "user_id": "local-console-user", "project_id": "local-console-project", "api_key_id": 7,
+        "scopes": tuple(scope for scope in _LOCAL_KEY_SCOPES if scope != "native:assets:read"),
     }
-    model = {
-        "id": 10,
-        "provider_id": 1,
-        "model_name": "gpt-4.1-mini",
-        "input_price_per_million": "1",
-        "output_price_per_million": "3",
-    }
-    legacy_key = {
-        "user_id": "local-console-user",
-        "project_id": "local-console-project",
-        "api_key_id": 7,
-        "scopes": tuple(scope for scope in _LOCAL_KEY_SCOPES if scope != "compat:completions:write"),
-    }
-    revoke_key = AsyncMock()
-    create_key = AsyncMock(return_value={"key": "sk-afgl-current"})
-    monkeypatch.setattr("lumen.services.providers.repository.list_providers", AsyncMock(return_value=[provider]))
-    monkeypatch.setattr("lumen.services.providers.repository.list_models", AsyncMock(return_value=[model]))
-    monkeypatch.setattr("lumen.services.api_key_store.verify_key", AsyncMock(return_value=legacy_key))
-    monkeypatch.setattr("lumen.services.api_key_store.revoke_key", revoke_key)
-    monkeypatch.setattr("lumen.services.api_key_store.create_key", create_key)
-    monkeypatch.setattr("lumen.scripts.seed_local.init_db", lambda _url: None)
-    monkeypatch.setattr("lumen.scripts.seed_local.close_db", AsyncMock())
+    revoke = AsyncMock()
+    monkeypatch.setattr(local.api_key_store, "revoke_key", revoke)
+    await local.seed()
+    create_provider.assert_not_awaited()
+    assert create_model.await_args.kwargs["provider_id"] == 3
+    assert create_model.await_args.kwargs["model_name"] == "fake-gpt-4"
+    revoke.assert_awaited_once_with(7, "local-console-user", "local-console-project")
+    assert "native:assets:read" in local.api_key_store.create_key.await_args.args[3]
+    assert old_key.read_text() == "sk-afgl-new\n"
+    assert json.loads((tmp_path / "connection.json").read_text())["model"] == "fake-gpt-4"
 
-    from lumen.scripts.seed_local import seed
 
-    await seed()
-
-    revoke_key.assert_awaited_once_with(7, "local-console-user", "local-console-project")
-    assert "compat:completions:write" in create_key.await_args.args[3]
-    assert seed_file.read_text() == "sk-afgl-current\n"
-    assert json.loads(connection_file.read_text())["api_key"] == "sk-afgl-current"
+@pytest.mark.asyncio
+async def test_seed_migrates_only_unmodified_legacy_binding_without_duplicating_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    primary = {"id": 1, "name": "openai", "provider_type": "openai", "has_api_key": True}
+    legacy = {"id": 7, "name": "local-openai", "provider_type": "openai", "api_base": None,
+              "api_key_env": "LUMEN_LOCAL_PROVIDER_API_KEY", "has_api_key": False}
+    local, _, _, create_model, update_provider = _setup_seed(
+        monkeypatch, tmp_path, {"openai": primary}, [{"provider_id": 7, "model_name": "gpt-4.1-mini",
+                                             "input_price_per_million": "83"}]
+    )
+    local.repository.list_providers.return_value.append(legacy)
+    update_provider.return_value = {**legacy, "api_key_env": "OPENAI_API_KEY", "has_api_key": True}
+    monkeypatch.setenv("OPENAI_API_KEY", "configured")
+    await local.seed()
+    update_provider.assert_awaited_once_with(7, {"api_key_env": "OPENAI_API_KEY"})
+    create_model.assert_not_awaited()
+    assert json.loads((tmp_path / "connection.json").read_text())["provider_api_key_configured"] is True

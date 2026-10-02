@@ -1,3 +1,8 @@
+# System stack never forwards host provider credentials to containers.
+x-fake-provider-keys: &fake-provider-keys
+  OPENAI_API_KEY: fake-provider-key
+  GEMINI_API_KEY: ""
+
 services:
   mariadb:
     image: mariadb:11
@@ -96,8 +101,7 @@ services:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
     command: ["lumen-seed-local"]
     environment:
-      <<: *lumen-environment
-      LUMEN_LOCAL_PROVIDER_API_KEY: fake-provider-key
+      <<: [*lumen-environment, *fake-provider-keys]
       LUMEN_LOCAL_PROVIDER_NAME: fake-openai
       LUMEN_LOCAL_PROVIDER_TYPE: openai
       LUMEN_LOCAL_PROVIDER_BASE_URL: http://fake-provider:8080/v1
@@ -124,8 +128,7 @@ services:
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
     environment:
-      <<: *lumen-environment
-      LUMEN_LOCAL_PROVIDER_API_KEY: fake-provider-key
+      <<: [*lumen-environment, *fake-provider-keys]
     depends_on:
       seed-local:
         condition: service_completed_successfully
@@ -147,8 +150,7 @@ services:
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
     environment:
-      <<: *lumen-environment
-      LUMEN_LOCAL_PROVIDER_API_KEY: fake-provider-key
+      <<: [*lumen-environment, *fake-provider-keys]
     depends_on:
       seed-local:
         condition: service_completed_successfully

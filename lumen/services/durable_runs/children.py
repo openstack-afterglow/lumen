@@ -27,6 +27,7 @@ from lumen.models.chat_db import ChatAgent
 from lumen.models.chat_infrastructure import ChatDelegationCall, ChatDelegationGroup, ChatRuntimeResource
 from lumen.models.chat_runs import ChatRun
 from lumen.plugins.registry import get_registry
+from lumen.services.providers.errors import AmbiguousModelRouteError
 from lumen.services.run_protocol_v2 import transition_allowed
 from lumen.services.run_store import NONTERMINAL, TERMINAL, append_event
 from lumen.services.subagents import ChildRequest, DelegationDenied, validate_child_request
@@ -267,7 +268,10 @@ async def _prepare_child_inputs(
     features = ChatFeatureOptions.model_validate({**(parent_payload.get("features") or {}), "memory": False})
     route = None
     if agent.get("model_name"):
-        route = await ps.resolve_model(str(agent["model_name"]))
+        try:
+            route = await ps.resolve_model(str(agent["model_name"]))
+        except AmbiguousModelRouteError as exc:
+            raise ChildFailure("child_route_ambiguous", "child agent model route is ambiguous") from exc
         if route is None:
             raise ChildFailure("child_route_unavailable", "child agent model is not available")
     else:

@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import select
 
 from lumen.crypto import decrypt_chat_content
+from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_contracts import ChatRunDescriptor, ChatRunEvent, ChatRunResponse
 from lumen.models.chat_runs import ChatRun, ChatTempThread
 from lumen.services.run_store import NONTERMINAL, RunStoreError, load_owned_run, replay_events
@@ -21,6 +22,21 @@ async def owned_run_response(*, run_id: str, project_id: str, user_id: str) -> C
             run = await load_owned_run(session, run_id, user_id=user_id, project_id=project_id)
         except RunStoreError as exc:
             raise DurableRunNotFound(str(exc)) from exc
+        output_assets = []
+        if run.run_kind in {"image", "tts"} and run.usage_reconciled_at is not None:
+            rows = (await session.execute(
+                select(ChatAsset)
+                .join(ChatRunAsset, ChatRunAsset.asset_id == ChatAsset.id)
+                .where(ChatRunAsset.run_id == run.id, ChatRunAsset.purpose == "output",
+                       ChatAsset.user_id == user_id, ChatAsset.project_id == project_id,
+                       ChatAsset.status == "clean")
+                .order_by(ChatRunAsset.created_at, ChatAsset.id)
+            )).scalars().all()
+            output_assets = [
+                {"asset_id": asset.id, "mime_type": asset.mime_type,
+                 "size_bytes": asset.size_bytes, "download_url": f"/v1/assets/{asset.id}/download"}
+                for asset in rows
+            ]
         return ChatRunResponse(
             run_id=run.id,
             status=run.status,
@@ -28,6 +44,7 @@ async def owned_run_response(*, run_id: str, project_id: str, user_id: str) -> C
             temp_thread_id=run.temp_thread_id,
             run_kind=getattr(run, "run_kind", None) or "completion",
             effective_features=(run.capability_snapshot or {}).get("effective_features", {}),
+            output_assets=output_assets,
             last_seq=run.last_seq,
             terminal=run.status not in NONTERMINAL,
         )

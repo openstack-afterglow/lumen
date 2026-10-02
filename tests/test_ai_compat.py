@@ -6,14 +6,16 @@ completion_api 코어와 api_key_store.verify_key 를 monkeypatch 해 실제 lit
 import json
 from types import SimpleNamespace
 
+import litellm
 import pytest
+from litellm.exceptions import BadRequestError
 
 from lumen.api.compat import anthropic as an
 from lumen.api.compat import openai as oa
 from lumen.auth import get_principal
 from lumen.main import app
+from lumen.services import capabilities, litellm_client, openai_compat
 from lumen.services import completion_api as core
-from lumen.services import litellm_client, openai_compat
 
 _H = {"Authorization": "Bearer sk-afgl-test"}
 
@@ -206,6 +208,71 @@ class TestCompletionCoreContract:
             await core.resolve_api("model")
         assert unavailable_error.value.status_code == 503
 
+    async def test_responses_skips_unsupported_reasoning_but_preserves_supported_options(self, monkeypatch):
+        observed = []
+
+        async def provider(**kwargs):
+            observed.append(kwargs)
+            if kwargs["model"] == "gpt-4.1-mini" and (
+                "reasoning" in kwargs or "reasoning.encrypted_content" in kwargs.get("include", [])
+            ):
+                raise BadRequestError("Unsupported parameter: reasoning.effort", "gpt-4.1-mini", "openai")
+            return {"output": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        async def billed(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
+        monkeypatch.setattr(core, "_bill", billed)
+        options = {
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "include": ["reasoning.encrypted_content", "message.output_text.logprobs"],
+            "prompt_cache_key": "codex-session",
+        }
+        monkeypatch.setattr(litellm, "model_cost", {
+            "gpt-4.1-mini": {"supports_reasoning": False},
+            "gpt-5": {"supports_reasoning": True},
+        })
+        routes = (
+            ("gpt-4.1-mini", False, None, None),
+            ("gpt-5", True, None, None),
+            ("future-codex-model", False, None, None),
+            ("future-codex-override", False, "override", {"reasoning": False}),
+        )
+        for name, supported, source, overrides in routes:
+            await core.complete_responses(
+                resolved={
+                    "model_name": name, "provider_type": "openai", "capabilities": {"reasoning": supported},
+                    "reasoning_unsupported": capabilities.reasoning_explicitly_unsupported(name, source, overrides),
+                },
+                input="hello", stream=False, user_id="u1", project_id="p1", api_key_id=7,
+                options=options.copy(),
+            )
+
+        assert "reasoning" not in observed[0]
+        assert observed[0]["include"] == ["message.output_text.logprobs"]
+        assert observed[0]["prompt_cache_key"] == "codex-session"
+        assert observed[1]["reasoning"] == options["reasoning"]
+        assert observed[1]["include"] == options["include"]
+        assert observed[2]["reasoning"] == options["reasoning"]
+        assert observed[2]["include"] == options["include"]
+        assert "reasoning" not in observed[3]
+        assert observed[3]["include"] == ["message.output_text.logprobs"]
+
+    async def test_responses_reports_provider_bad_request_as_sanitized_client_error(self, monkeypatch):
+        async def provider(**_kwargs):
+            raise BadRequestError("private upstream detail", "gpt-5", "openai")
+
+        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
+        with pytest.raises(core.CompletionError) as failure:
+            await core.complete_responses(
+                resolved={"model_name": "gpt-5", "provider_type": "openai", "capabilities": {"reasoning": True}},
+                input="hello", stream=False, user_id="u1", project_id="p1", api_key_id=7,
+                options={},
+            )
+        assert failure.value.status_code == 400
+        assert "private upstream detail" not in failure.value.message
+
 
 # ── 엔드포인트 ────────────────────────────────────────────────────────────────
 @pytest.fixture
@@ -321,6 +388,35 @@ def _core(monkeypatch):
 
 
 class TestOpenAIEndpoint:
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_priced_media_without_metering_returns_http_422_before_provider_io(self, client, _auth, monkeypatch, stream):
+        async def resolve(model, **kwargs):
+            return {
+                "model_name": model, "api_model_name": model, "provider_type": "anthropic",
+                "media_pricing": {"token_rates": {"image": {"input_per_million": "10"}}},
+            }
+
+        async def precheck(*args, **kwargs):
+            return None
+
+        async def forbidden(*args, **kwargs):
+            pytest.fail("rejected media reached provider or ledger")
+
+        monkeypatch.setattr(core, "resolve_api", resolve)
+        monkeypatch.setattr(core, "precheck", precheck)
+        monkeypatch.setattr(core.litellm_client, "acompletion", forbidden)
+        monkeypatch.setattr(core.litellm_client, "acompletion_stream", forbidden)
+        monkeypatch.setattr(core.credit, "apply_usage", forbidden)
+        response = await client.post("/v1/chat/completions", headers=_H, json={
+            "model": "saved-model", "stream": stream,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://asset.example/image"}},
+            ]}],
+        })
+        assert response.status_code == 422
+        assert response.headers["content-type"].startswith("application/json")
+        assert "modality_usage_unavailable" in response.json()["error"]["message"]
+
     async def test_requires_api_key(self, client):
         resp = await client.post(
             "/v1/chat/completions", json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
@@ -1406,18 +1502,6 @@ class TestAnthropicEndpoint:
         assert conflict.status_code == 400
         assert conflict.json()["type"] == "error"
 
-    async def test_model_prefix_conflict_is_400(self, client, _auth):
-        response = await client.post(
-            "/v1/messages",
-            json={
-                "model": "openai/gpt-4o",
-                "max_tokens": 10,
-                "messages": [{"role": "user", "content": "hi"}],
-            },
-            headers={**_H, "X-Lumen-Provider": "anthropic"},
-        )
-        assert response.status_code == 400
-        assert response.json()["error"]["message"] == "provider_header_conflict"
 
     async def test_native_request_options_are_not_lossily_converted(self, client, _auth, monkeypatch):
         captured = {}
@@ -1641,3 +1725,35 @@ async def test_native_ping_does_not_cancel_pending_upstream_read():
         pass
     assert event == {"type": "response.completed"}
     assert cancelled is False
+
+
+class TestOperatorReasoningDefault:
+    _GPT5 = {
+        "provider_type": "openai",
+        "capabilities": {
+            "reasoning": True,
+            "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
+        },
+    }
+    _GPT51 = {
+        "provider_type": "openai",
+        "capabilities": {
+            "reasoning": True,
+            "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high"]}],
+        },
+    }
+
+    def _configure(self, monkeypatch, effort):
+        monkeypatch.setattr(core, "get_settings", lambda: SimpleNamespace(chat_reasoning_effort=effort))
+
+    def test_operator_none_is_omitted_for_models_that_cannot_disable_reasoning(self, monkeypatch):
+        self._configure(monkeypatch, "none")
+        assert core._reasoning_effort(None, self._GPT5) is None
+        assert core._reasoning_effort(None, self._GPT51) == "none"
+        assert core._reasoning_effort(None, {"provider_type": "anthropic", "capabilities": {"reasoning": True}}) == "none"
+
+    def test_explicit_and_non_none_defaults_are_unchanged(self, monkeypatch):
+        self._configure(monkeypatch, "auto")
+        assert core._reasoning_effort(None, self._GPT5) == "auto"
+        self._configure(monkeypatch, "none")
+        assert core._reasoning_effort("low", self._GPT5) == "low"
