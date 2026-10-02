@@ -4,7 +4,7 @@
 
 ## 인증과 scope
 
-Keystone token은 Native route에서 user 권한으로 통과하며, API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat 호환 route (`/v1/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API Key만 허용하며 Keystone Token 사용 시 401을 반환한다. 한 요청에 `X-API-Key`, `Authorization`, `X-Auth-Token` 중 둘 이상을 보내면 400이다. 단, 동일한 API key를 `X-API-Key`와 `Authorization: Bearer`로 중복 전달한 경우(Claude Code의 기본 동작)는 두 값이 일치할 때만 허용한다. API key의 `X-Project-Id`는 key owner project와 같아야 한다. `X-Lumen-Provider`는 선택적 provider selector이며 body `provider` 또는 인식 가능한 `model` provider prefix와 충돌하면 400이다.
+Keystone token은 Native route에서 user 권한으로 통과하며, API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat 호환 route (`/v1/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API Key만 허용하며 Keystone Token 사용 시 401을 반환한다. 한 요청에 `X-API-Key`, `Authorization`, `X-Auth-Token` 중 둘 이상을 보내면 400이다. 단, 동일한 API key를 `X-API-Key`와 `Authorization: Bearer`로 중복 전달한 경우(Claude Code의 기본 동작)는 두 값이 일치할 때만 허용한다. API key의 `X-Project-Id`는 key owner project와 같아야 한다. `X-Lumen-Provider`는 관리자 설정 `api_provider` 선택자이며 body `provider`와 충돌하면 400이다. 모델 ID의 transport prefix를 선택자의 alias나 추가 충돌 조건으로 해석하지 않는다.
 
 | Surface | API-key scope | Keystone only |
 | --- | --- | --- |
@@ -79,6 +79,14 @@ Native realtime `POST /v1/chat/realtime/sessions`는 `{model_id, provider_id?, v
 OpenAI compatible `WS /v1/realtime?model=<public-model>&voice=<allowed-voice>`는 `compat:realtime:write` scoped API key의 Bearer/`X-API-Key`/OpenAI insecure WS subprotocol 중 정확히 한 방식을 요구한다. `input_audio_buffer.append/commit/clear`, `response.create/cancel`, 제한된 `session.update`와 provider native 응답 이벤트를 지원한다. 모델·voice·PCM format/output modality 변경은 거부한다. Gemini Live `WS /v1beta/realtime`는 같은 scope의 API key로 첫 `setup.model` 및 선택한 voice/instruction을 확인한 뒤 `realtimeInput.audio`와 `serverContent`를 중계한다. 두 compat WS는 임의 provider URL이 아닌 Lumen에 등록된 공식 OpenAI/Gemini direct API-key route만 사용한다. OpenAI upstream은 Bearer header, Gemini 공식 Live upstream은 **서버 측 `?key=` query** 인증을 사용하므로 URL은 log/APM에서 반드시 제거한다. Client/브라우저에는 provider key가 전달되지 않는다. Vendor protocol 완전 구현이 아니라 위 subset이다.
 
 Media 비용은 route의 정확한 USD rate × 관측한 생성 단위/시간에 margin과 credit 환율을 적용한다. Provider I/O 전 `ChatModelCallReservation`과 account-scoped 월/주·API-key credit hold를 원자적으로 생성하고 완료 시 actual로 전환한다. Provider result가 불확실하면 hold는 `unknown`으로 남아 운영자가 확인해야 한다. Lumen DB에는 사용량·암호화된 요청/segment와 소유 asset만 저장하며 realtime PCM/audio transcript는 저장하지 않는다. 생성 이미지 및 유한 TTS/STT는 scanner/S3가 필요하지만 realtime에는 필요하지 않다.
+
+## Provider identity와 catalog 순서
+
+Provider `name`은 표시 이름, `api_provider`는 공개 API 요청의 `provider`/`X-Lumen-Provider` 선택자, `provider_type`은 실행 transport다. 관리자 provider POST/PATCH는 `name`, `api_provider`, `sort_order`를 지원하고 model POST/PATCH는 `sort_order`를 지원한다. 선택자는 소문자 영문자로 시작하는 1~40자의 소문자·숫자·`_`·`-` 식별자로 정규화되며 순서는 bool/float/string이 아닌 `0..2147483647` 정수다. 표시 이름은 공백만일 수 없다. Metadata-only PATCH는 API Base, auth mode, 암호화 credential, 가격, capability, 활성 상태 및 ID를 덮어쓰지 않는다. 기존 active-run mutation fence는 계속 적용된다.
+
+Migration `021-provider-identity-catalog-order`는 기존 provider 선택자를 `provider_type`으로, provider/model 순서를 0으로 backfill한다. `GET /v1/chat/models`는 `provider_id`, `provider_type`, `provider_sort_order`, `sort_order`를 포함하며 `(provider_sort_order, provider_id, sort_order, id)` 순으로 반환한다. `GET /v1/models`의 `providers`는 활성 `api_provider` 목록이며 transport 이름이 아니다. 같은 공개 ID가 여러 route에 일치하면 선택자가 필요하며 같은 ID/선택자 자체가 중복이면 409다. 작은 rank로 ambiguity를 해소하지 않는다.
+
+NVIDIA NIM provider를 `name="NVIDIA"`, `api_provider="nvidia"`로 바꿔도 `provider_type="openai"`는 그대로다. 외부 클라이언트는 새 selector를 사용해야 하며 이전 selector alias는 만들지 않는다. Credential·공개 model ID·reasoning·가격 계산은 transport를 따르고 native 선택은 provider/model ID를 보존한다. 선택자와 rank는 frozen execution fingerprint에 포함하지 않는다. 순서만 변경하는 model PATCH는 legacy manual/media 가격 version인 `updated_at`도 보존한다.
 
 ## Provider credential 상태
 

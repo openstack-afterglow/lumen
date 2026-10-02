@@ -42,6 +42,8 @@ def test_public_provider_projection_reports_missing_and_environment_credentials(
         id=1,
         name="openai",
         provider_type="openai",
+        api_provider="openai",
+        sort_order=0,
         api_base=None,
         encrypted_api_key=None,
         api_key_env="OPENAI_API_KEY",
@@ -185,6 +187,7 @@ def test_perplexity_public_projection_preserves_route_key_and_custom_label(monke
     base = {
         "id": 7,
         "provider_id": 3,
+        "sort_order": 0,
         "model_name": "perplexity/perplexity/sonar",
         "is_active": True,
         "is_title_model": False,
@@ -203,10 +206,12 @@ def test_perplexity_public_projection_preserves_route_key_and_custom_label(monke
     default_label = pricing._model_public(
         SimpleNamespace(display_name="perplexity/perplexity/sonar", **base),
         provider_type="perplexity",
+        api_provider="perplexity",
     )
     custom_label = pricing._model_public(
         SimpleNamespace(display_name="Sonar Research", **base),
         provider_type="perplexity",
+        api_provider="perplexity",
     )
 
     assert default_label["model_name"] == "perplexity/perplexity/sonar"
@@ -222,6 +227,8 @@ def test_subscription_public_projection_distinguishes_api_key_and_subscription_s
         "id": 1,
         "name": "provider",
         "provider_type": "openai",
+        "api_provider": "openai",
+        "sort_order": 0,
         "api_base": None,
         "encrypted_api_key": None,
         "api_key_env": "OPENAI_API_KEY",

@@ -197,10 +197,6 @@ def models_list(models: list[dict], include_lumen: bool = False) -> dict:
     }
 
 
-def _selected_provider(model: str, body_provider: str | None, header_provider: str | None) -> str | None:
-    return core.select_api_provider(model, body_provider, header_provider)
-
-
 # ── 엔드포인트 ──────────────────────────────────────────────────────────────
 def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
@@ -229,7 +225,7 @@ async def chat_completions(
     api_key_id = token_info.get("api_key_id")
     source = str(token_info.get("source") or "api")
     try:
-        selected_provider = _selected_provider(body.model, body.provider, x_lumen_provider)
+        selected_provider = core.select_api_provider(body.provider, x_lumen_provider)
     except core.CompletionError as exc:
         return openai_error_response(exc.status_code, exc.message)
 

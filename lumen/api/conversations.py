@@ -29,6 +29,10 @@ class AvailableModel(BaseModel):
     model_name: str
     api_model_name: str
     api_provider: str
+    provider_id: int
+    provider_type: str
+    provider_sort_order: int = 0
+    sort_order: int = 0
     model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
     display_name: str
     provider: str | None = None
@@ -60,6 +64,7 @@ async def list_available_models(
             continue
         caps = m.get("effective_capabilities") or {}
         provider = providers.get(m["provider_id"])
+        provider_type = m.get("provider_type") or (provider.get("provider_type", "") if provider else "")
         result.append(
             {
                 "id": m["id"],
@@ -67,13 +72,18 @@ async def list_available_models(
                 "api_model_name": m["api_model_name"],
                 "model_kind": m.get("model_kind", "text"),
                 "api_provider": m["api_provider"],
+                "provider_id": m["provider_id"],
+                "provider_type": provider_type,
+                "provider_sort_order": m.get("provider_sort_order", 0),
+                "sort_order": m.get("sort_order", 0),
                 "display_name": m["display_name"],
                 "provider": provider.get("name") if provider else None,
                 "provider_api_key_configured": bool(provider and provider.get("has_api_key")),
                 "capabilities": caps or None,
                 "context_limit": caps.get("context_limit") if isinstance(caps, dict) else None,
                 "reasoning_none_supported": capabilities.reasoning_can_be_disabled(
-                    caps if isinstance(caps, dict) else None, m["api_provider"]
+                    caps if isinstance(caps, dict) else None,
+                    provider_type,
                 ),
             }
         )

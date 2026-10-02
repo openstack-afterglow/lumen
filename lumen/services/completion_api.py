@@ -28,36 +28,14 @@ from lumen.services.usage_breakdown import UsageBreakdown
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_TOKENS = 4096
-_ROUTING_PROVIDER_PREFIXES = frozenset(
-    {
-        "anthropic",
-        "azure",
-        "bedrock",
-        "deepseek",
-        "gemini",
-        "ollama",
-        "openai",
-        "openrouter",
-        "perplexity",
-        "vertex_ai",
-    }
-)
 
 
-def select_api_provider(model: str, body_provider: str | None, header_provider: str | None) -> str | None:
+def select_api_provider(body_provider: str | None, header_provider: str | None) -> str | None:
     if body_provider and header_provider and body_provider != header_provider:
         raise CompletionError(400, "provider_header_conflict")
-    selected = body_provider or header_provider
-    prefix, separator, _bare = model.partition("/")
-    if (
-        body_provider is None
-        and header_provider
-        and separator
-        and prefix in _ROUTING_PROVIDER_PREFIXES
-        and prefix != header_provider
-    ):
-        raise CompletionError(400, "provider_header_conflict")
-    return selected
+    # A public model prefix describes its ID/transport encoding, not the
+    # administrator's independently editable API selector.
+    return body_provider or header_provider
 
 
 class CompletionError(Exception):
@@ -75,6 +53,8 @@ async def resolve(model: str) -> dict:
         raise CompletionError(400, "model 이 필요합니다")
     try:
         resolved = await ps.resolve_model(model)
+    except errors.AmbiguousModelRouteError as exc:
+        raise CompletionError(409, "model_route_ambiguous") from exc
     except errors.ChatStorageUnavailable as exc:
         raise CompletionError(503, "일시적으로 사용할 수 없습니다") from exc
     if resolved is None:

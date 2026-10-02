@@ -1473,18 +1473,6 @@ class TestAnthropicEndpoint:
         assert conflict.status_code == 400
         assert conflict.json()["type"] == "error"
 
-    async def test_model_prefix_conflict_is_400(self, client, _auth):
-        response = await client.post(
-            "/v1/messages",
-            json={
-                "model": "openai/gpt-4o",
-                "max_tokens": 10,
-                "messages": [{"role": "user", "content": "hi"}],
-            },
-            headers={**_H, "X-Lumen-Provider": "anthropic"},
-        )
-        assert response.status_code == 400
-        assert response.json()["error"]["message"] == "provider_header_conflict"
 
     async def test_native_request_options_are_not_lossily_converted(self, client, _auth, monkeypatch):
         captured = {}

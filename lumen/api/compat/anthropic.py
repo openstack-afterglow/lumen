@@ -104,10 +104,6 @@ def anthropic_error_response(status_code: int, message: str) -> JSONResponse:
     )
 
 
-def _selected_provider(model: str, body_provider: str | None, header_provider: str | None) -> str | None:
-    return core.select_api_provider(model, body_provider, header_provider)
-
-
 def anthropic_protocol_headers(request: Request) -> dict[str, str]:
     """Forward only Anthropic protocol headers, never caller credentials."""
     headers: dict[str, str] = {}
@@ -140,7 +136,7 @@ async def messages(
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
     try:
-        provider = _selected_provider(body.model, body.provider, x_lumen_provider)
+        provider = core.select_api_provider(body.provider, x_lumen_provider)
         resolved = await core.resolve_api(body.model, provider=provider)
         await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"))
         options = body.model_dump(
@@ -196,7 +192,7 @@ async def count_tokens(
 ):
     del token_info
     try:
-        provider = _selected_provider(body.model, body.provider, x_lumen_provider)
+        provider = core.select_api_provider(body.provider, x_lumen_provider)
         resolved = await core.resolve_api(body.model, provider=provider)
         payload = body.model_dump(exclude={"provider"}, exclude_none=True)
         return await core.count_anthropic_tokens(

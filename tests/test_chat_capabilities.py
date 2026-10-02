@@ -379,6 +379,7 @@ def test_resolved_model_uses_a_secret_keyed_config_version_hash(monkeypatch):
         id=3,
         name="test-provider",
         provider_type="openai",
+        api_provider="openai",
         api_base="https://api.example.test/v1",
         encrypted_api_key="ciphertext",
         is_active=True,
@@ -436,6 +437,7 @@ def test_resolved_model_gates_litellm_fallback_prices(monkeypatch):
         id=3,
         name="test-provider",
         provider_type="openai",
+        api_provider="openai",
         api_base=None,
         encrypted_api_key=None,
         margin_multiplier="1",
@@ -488,6 +490,7 @@ def test_public_model_marks_unpriced_text_route_unavailable():
         provider_id=3,
         model_name="unpriced-model",
         display_name=None,
+        sort_order=0,
         is_active=True,
         is_title_model=False,
         is_memory_model=False,
@@ -502,7 +505,7 @@ def test_public_model_marks_unpriced_text_route_unavailable():
         updated_at=None,
     )
 
-    public = _model_public(model, provider_type="openai")
+    public = _model_public(model, provider_type="openai", api_provider="openai")
 
     assert public["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is False
 
