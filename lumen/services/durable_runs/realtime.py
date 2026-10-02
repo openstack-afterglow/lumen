@@ -252,8 +252,9 @@ async def consume_ticket(run_id: str, token: str) -> tuple[str, str]:
 
 async def admit_realtime_session(
     request: dict, *, project_id: str, user_id: str, client_request_id: str,
-    source: str = "web", api_key_id: int | None = None,
+    source: str = "web", api_key_id: int | None = None, provider_type: str | None = None,
 ) -> dict:
+    """``provider_type`` is the transport a vendor wire fixes, never the editable public selector."""
     from .admission import _lock_run_configurations, existing_run_for_intent
 
     intent = _intent(request)
@@ -272,13 +273,13 @@ async def admit_realtime_session(
     api_provider = str(provider_id) if provider_id is not None and provider_number is None else None
     try:
         route = (await routing.resolve_model_by_id(int(model_id), model_kind="realtime") if model_id.isdecimal()
-                 else await routing.resolve_api_model(model_id, provider=api_provider,
-                                                       provider_id=provider_number, model_kind="realtime"))
+                 else await routing.resolve_api_model(model_id, provider=api_provider, provider_id=provider_number,
+                                                       provider_type=provider_type, model_kind="realtime"))
     except AmbiguousModelRouteError as exc:
         raise DurableRunInputError("realtime provider selection is ambiguous") from exc
     if route is None or (provider_number is not None and route["provider_id"] != provider_number) or (
         api_provider is not None and route["api_provider"] != api_provider
-    ):
+    ) or (provider_type is not None and route["provider_type"] != provider_type):
         raise DurableRunInputError("realtime provider or model is unavailable")
     voices = realtime_transport.available_realtime_options(route)
     voice = intent["voice"] or voices["default_voice"]

@@ -30,8 +30,7 @@ def test_realtime_websocket_requires_scoped_key_and_frozen_gemini_setup(monkeypa
             "Authorization": "Bearer scoped-key"}) as socket:
             assert socket.receive_json() == {"type": "connected", "wire": "openai"}
         verify.assert_awaited_with("scoped-key")
-        assert admission.call_args.args[0] == {"model_id": "gpt-realtime", "provider_id": "openai",
-                                               "voice": None, "instructions": None}
+        assert admission.call_args.args[0] == {"model_id": "gpt-realtime", "voice": None, "instructions": None}
         with browser.websocket_connect("/v1/realtime?model=gpt-realtime", subprotocols=[
             "realtime", "openai-insecure-api-key.scoped-key"]) as socket:
             assert socket.accepted_subprotocol == "realtime"
@@ -43,8 +42,8 @@ def test_realtime_websocket_requires_scoped_key_and_frozen_gemini_setup(monkeypa
                     "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}}},
                 "systemInstruction": {"parts": [{"text": "respond politely"}]}}})
             assert socket.receive_json() == {"type": "connected", "wire": "gemini"}
-        assert admission.call_args.args[0] == {"model_id": "gemini-2.5-flash-live", "provider_id": "gemini",
-                                               "voice": "Kore", "instructions": "respond politely"}
+        assert admission.call_args.args[0] == {"model_id": "gemini-2.5-flash-live", "voice": "Kore",
+                                               "instructions": "respond politely"}
         calls = admission.await_count
         with browser.websocket_connect("/v1beta/realtime?model=another-model", headers={"x-api-key": "scoped-key"}) as socket:
             socket.send_json({"setup": {"model": "models/gemini-2.5-flash-live"}})

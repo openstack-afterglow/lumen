@@ -718,14 +718,13 @@ class _DurableExecutionHooks:
                 ),
                 "price_source": summary_pricing.get("price_source"),
                 "price_version": summary_pricing.get("price_version"),
-                "cache_price_sources": summary_pricing.get("cache_price_sources") or route.get("cache_price_sources") or {},
-                # Snapshots frozen before cache rates existed carry no cache keys.
-                # The route fallback mirrors the input/output keys above: a live
-                # route only resolves under the admission config hash, which
-                # pins the same (then null) cache rates, and a replayed route
-                # snapshot carries no rates, so those categories bill 0 (partial).
+                "cache_price_sources": summary_pricing.get("cache_price_sources") or {},
+                # Snapshots frozen before cache rates existed carry no cache keys;
+                # those categories bill 0 (partial). Never read the live route:
+                # a hash-matching route may now carry inherited write rates that
+                # the admission never froze.
                 **{
-                    key: summary_pricing.get(key, route.get(key))
+                    key: summary_pricing.get(key)
                     for key in (
                         "cache_read_price_per_token",
                         "cache_write_price_per_token",

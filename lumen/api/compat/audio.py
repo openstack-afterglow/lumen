@@ -99,7 +99,7 @@ async def speech(
         payload = SpeechRequest(model_id=body.get("model"), input=body.get("input"), voice=body.get("voice"),
                                 response_format=body.get("response_format", "mp3"), provider_id=body.get("provider_id"))
         run_id = await admit(payload, kind="tts", principal=principal,
-                             idempotency_key=idempotency_key or uuid.uuid4(), provider_type=body.get("provider"))
+                             idempotency_key=idempotency_key or uuid.uuid4(), api_provider=body.get("provider"))
         result = await completed_audio(run_id, principal=principal, request=request)
         return await speech_stream(result, principal=principal)
     except ValidationError as exc:
@@ -158,7 +158,7 @@ async def transcriptions(
         payload.input_asset_id = uuid.UUID(source_id)
         try:
             run_id = await admit(payload, kind="stt", principal=principal,
-                                 idempotency_key=idempotency_key or uuid.uuid4(), provider_type=provider)
+                                 idempotency_key=idempotency_key or uuid.uuid4(), api_provider=provider)
             result = await completed_audio(run_id, principal=principal, request=request)
             if result.get("kind") != "stt":
                 raise HTTPException(status_code=503, detail="transcript is unavailable")

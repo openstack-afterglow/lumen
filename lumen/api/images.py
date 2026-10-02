@@ -60,11 +60,11 @@ async def admit(
     principal: Principal,
     idempotency_key: UUID,
     input_asset_id: UUID | None = None,
-    provider_type: str | None = None,
+    api_provider: str | None = None,
 ) -> ChatRunDescriptor:
     request = payload.model_dump(mode="json")
-    if provider_type is not None:
-        request["provider_id"] = provider_type
+    if api_provider is not None:
+        request["provider_id"] = api_provider
     if input_asset_id is not None:
         request.pop("input_asset_id", None)
         request["source_asset_id"] = str(input_asset_id)

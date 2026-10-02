@@ -10,7 +10,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider
@@ -324,4 +324,88 @@ async def test_session_deadline_closes_and_settles_connected_time_once(monkeypat
             assert run.status == "completed" and hold.status == "settled"
             assert hold.actual_credits == usage.credited_cost
     finally:
+        await close_db()
+
+
+async def test_compat_gateways_route_by_wire_transport_not_renamed_selector(monkeypatch):
+    """A renamed public selector must not hide the route whose transport a vendor wire fixes."""
+    from lumen.api.compat import realtime as compat
+
+    nonce = uuid.uuid4().hex
+    user_id, project_id = f"realtime-compat-user-{nonce}", f"realtime-compat-project-{nonce}"
+    init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
+    factory = get_session_factory()
+    assert factory is not None
+    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    monkeypatch.setattr(compat, "get_settings", lambda: SimpleNamespace(chat_api_hosts=""))
+
+    async def verify_key(_key):
+        return {"user_id": user_id, "project_id": project_id, "api_key_id": None,
+                "scopes": ["compat:realtime:write"]}
+
+    connected = []
+
+    async def relay(_websocket, *, run_id, token, wire):
+        connected.append((run_id, wire))
+
+    monkeypatch.setattr(compat.api_key_store, "verify_key", verify_key)
+    monkeypatch.setattr(compat, "run_realtime_session", relay)
+
+    class Socket:
+        headers = {"x-api-key": "fixture-lumen-key"}
+
+        def __init__(self, *, query=None, setup_model=None):
+            self.query_params = query or {}
+            self.setup_model = setup_model
+            self.code = None
+
+        async def accept(self, subprotocol=None):
+            return None
+
+        async def receive_json(self):
+            return {"setup": {"model": self.setup_model}}
+
+        async def close(self, code=1000):
+            self.code = code
+
+    prices = {"realtime_input_per_minute": "0.012", "realtime_output_per_minute": "0.024"}
+    created: list[int] = []
+    try:
+        async with factory() as session, session.begin():
+            google = LlmProvider(name=f"realtime-google-{nonce}", provider_type="gemini", api_provider="google",
+                                 is_active=True, margin_multiplier=Decimal("1"))
+            openai = LlmProvider(name=f"realtime-openai-{nonce}", provider_type="openai",
+                                 is_active=True, margin_multiplier=Decimal("1"))
+            session.add_all([google, openai])
+            await session.flush()
+            created = [google.id, openai.id]
+            openai_model = LlmModel(provider_id=openai.id, model_name="gpt-realtime", model_kind="realtime",
+                                    media_pricing=prices, is_active=True)
+            session.add_all([openai_model, LlmModel(provider_id=google.id, model_name="gemini-2.5-flash-live",
+                                                    model_kind="realtime", media_pricing=prices, is_active=True)])
+            await session.flush()
+            google_id, openai_model_id = google.id, openai_model.id
+
+        live = Socket(setup_model="models/gemini-2.5-flash-live")
+        await compat.gemini_live(live)
+        assert live.code == 1000 and [wire for _, wire in connected] == ["gemini"]
+        run_id = connected[0][0]
+        async with factory() as session:
+            run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id))).scalar_one()
+        assert (run.capability_snapshot["provider_id"], run.capability_snapshot["provider_type"]) == (google_id, "gemini")
+        assert (await request_cancelled(run_id=run_id, project_id=project_id, user_id=user_id)).status == "canceled"
+
+        # Each wire executes only its own transport, whether named publicly or by numeric model ID.
+        for socket, route in ((Socket(query={"model": "gemini-2.5-flash-live"}), compat.openai_realtime),
+                              (Socket(setup_model=f"models/{openai_model_id}"), compat.gemini_live)):
+            await route(socket)
+            assert socket.code == 1011
+        assert len(connected) == 1
+        async with factory() as session:
+            runs = (await session.execute(select(ChatRun.id).where(ChatRun.project_id == project_id))).scalars().all()
+        assert runs == [run_id]
+    finally:
+        if created:
+            async with factory() as session, session.begin():
+                await session.execute(update(LlmProvider).where(LlmProvider.id.in_(created)).values(is_active=False))
         await close_db()

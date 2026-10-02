@@ -417,13 +417,15 @@ def cost_from_usage(
     cache_price_sources: Mapping[str, str] | None = None,
     allow_catalog_cache: bool = True,
     allow_catalog_prices: bool = True,
+    allow_cache_write_fallback: bool = True,
     token_rates: Mapping[str, Any] | None = None,
     required_modalities: Iterable[str] = (),
 ) -> UsageCost:
     """Bill provider-reported token totals using manual or exact catalog prices.
 
-    A direct provider's known cache rates fill only unset categories. A custom
-    base requires configured prices; missing categories remain visibly partial.
+    Direct-provider catalog rates fill unset categories. A missing 5m write
+    inherits the effective input rate, then a missing 1h write inherits the
+    effective 5m rate; cache reads still require their own rate.
     Configured ``token_rates`` bill reported image/audio shares at their own
     per-million rates; text prices apply to the residual only.
     """
@@ -487,7 +489,13 @@ def cost_from_usage(
         tier = configured_tier if configured_tier is not None else catalog_tier if source == "litellm" else None
         if prompt_tokens > 200_000 and tier is not None:
             rate = tier
-            source = source or "litellm"
+            # A fallback base and its real catalog tier carry separate provenance.
+            source = cache_sources.get(f"{name}_above_200k") or source or "litellm"
+        if allow_cache_write_fallback and rate is None and name == "cache_creation_5m" and input_rate is not None:
+            rate, source = input_rate, f"fallback_input:{input_source or 'unknown'}"
+        elif allow_cache_write_fallback and rate is None and name == "cache_creation_1h":
+            rate = cache_components["cache_creation_5m"][1]
+            source = f"fallback_5m:{cache_sources['cache_creation_5m']}" if rate is not None else None
         cost = (rate * tokens).quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else Decimal("0")
         cache_components[name] = (tokens, rate, cost)
         cache_sources[name] = source

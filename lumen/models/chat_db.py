@@ -123,8 +123,8 @@ class LlmModel(Base):
     # 미지정 시 litellm 내장 단가 사용 (override용). 토큰당 USD 단가.
     input_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     output_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
-    # 프롬프트 캐시 토큰당 USD 단가(관리자 수동 설정 전용, catalog fallback 없음).
-    # 미설정 카테고리는 0원으로 과금하고 pricing_status=partial 로 남는다.
+    # 관리자가 저장한 프롬프트 캐시 토큰당 USD 단가(nullable). 적용 단가는 routing이
+    # 수동값→direct provider exact catalog→text write cascade 순으로 해석하며 저장값을 채우지 않는다.
     cache_read_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     cache_write_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # 5분 TTL cache write
     cache_write_1h_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))

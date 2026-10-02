@@ -377,30 +377,74 @@ CACHE_PRICE_FIELDS = (
     ("cache_write_price_per_million", "cache_write_price", "cache_write_price_per_token"),
     ("cache_write_1h_price_per_million", "cache_write_1h_price", "cache_write_1h_price_per_token"),
 )
+# Usage/snapshot cache categories, aligned with ``CACHE_PRICE_FIELDS``.
+_CACHE_CATEGORIES = ("cache_read", "cache_creation_5m", "cache_creation_1h")
 
 
-def _resolved_cache_prices(model: LlmModel, provider: LlmProvider) -> dict[str, Decimal | None]:
-    """Manual rates override exact direct-provider catalog rates per category."""
+def _resolved_cache_prices(
+    model: LlmModel, provider_type: str | None, api_base: str | None
+) -> tuple[dict[str, Decimal | None], dict[str, str | None]]:
+    """Stated rates: manual (zero included) overrides exact direct-provider catalog per category.
+
+    Only these rates belong to the route identity; inherited writes are derived
+    from the separately hashed input price and source.
+    """
+    prices: dict[str, Decimal | None] = {
+        key: None for _, _, resolved in CACHE_PRICE_FIELDS for key in (resolved, f"{resolved}_above_200k")
+    }
+    sources: dict[str, str | None] = dict.fromkeys(_CACHE_CATEGORIES)
     if _kind(model) != "text":
         # Media models carry only a manual cache-read rate; no catalog fallback.
-        prices = {key: None for _, _, resolved in CACHE_PRICE_FIELDS for key in (resolved, f"{resolved}_above_200k")}
         value = getattr(model, "cache_read_price", None)
         if value is not None:
             prices["cache_read_price_per_token"] = Decimal(value).quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP)
-        return prices
-    catalog = bundled_cache_rates(model.model_name, provider.provider_type, provider.api_base)
-    prices: dict[str, Decimal | None] = {}
-    for _, column, resolved_key in CACHE_PRICE_FIELDS:
-        value = getattr(model, column, None)
-        rate = Decimal(value) if value is not None else catalog.get(resolved_key)
-        prices[resolved_key] = (
-            rate.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else None
+            sources["cache_read"] = "manual"
+        return prices, sources
+    catalog = bundled_cache_rates(model.model_name, provider_type, api_base)
+    for category, (_, column, key) in zip(_CACHE_CATEGORIES, CACHE_PRICE_FIELDS, strict=True):
+        manual = getattr(model, column, None)
+        rate = Decimal(manual) if manual is not None else catalog.get(key)
+        # Long-context tiers are real catalog rates, possibly without a base rate.
+        tier = catalog.get(f"{key}_above_200k") if manual is None else None
+        prices[key] = rate.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else None
+        prices[f"{key}_above_200k"] = (
+            tier.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if tier is not None else None
         )
-        tier_rate = catalog.get(f"{resolved_key}_above_200k") if value is None else None
-        prices[f"{resolved_key}_above_200k"] = (
-            tier_rate.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if tier_rate is not None else None
-        )
-    return prices
+        sources[category] = "manual" if manual is not None else "litellm" if rate is not None or tier is not None else None
+    return prices, sources
+
+
+def _effective_cache_prices(
+    model: LlmModel,
+    stated: tuple[dict[str, Decimal | None], dict[str, str | None]],
+    input_rate: Decimal | None,
+    input_source: str | None = None,
+) -> tuple[dict[str, Decimal | None], dict[str, str | None]]:
+    """New-admission rates: a missing text 5m write inherits effective input, then 1h inherits 5m.
+
+    Cache reads are never inferred and media models never inherit text writes. A fallback
+    fills only the normal-context base: a real catalog >200k tier keeps its own provenance
+    under ``<category>_above_200k`` so settlement can name the rate it actually bills.
+    """
+    prices, sources = dict(stated[0]), dict(stated[1])
+    if _kind(model) != "text":
+        return prices, sources
+    if prices["cache_write_price_per_token"] is None and input_rate is not None:
+        if prices["cache_write_price_per_token_above_200k"] is not None:
+            sources["cache_creation_5m_above_200k"] = sources["cache_creation_5m"]
+        prices["cache_write_price_per_token"] = Decimal(input_rate).quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP)
+        sources["cache_creation_5m"] = f"fallback_input:{input_source or 'unknown'}"
+    if prices["cache_write_1h_price_per_token"] is None and prices["cache_write_price_per_token"] is not None:
+        if prices["cache_write_1h_price_per_token_above_200k"] is not None:
+            sources["cache_creation_1h_above_200k"] = sources["cache_creation_1h"]
+        elif prices["cache_write_price_per_token_above_200k"] is not None:
+            # Only a real catalog 5m tier exists here; manual 5m rates are flat.
+            prices["cache_write_1h_price_per_token_above_200k"] = prices["cache_write_price_per_token_above_200k"]
+            tier_source = sources.get("cache_creation_5m_above_200k", sources["cache_creation_5m"])
+            sources["cache_creation_1h_above_200k"] = f"fallback_5m:{tier_source}"
+        prices["cache_write_1h_price_per_token"] = prices["cache_write_price_per_token"]
+        sources["cache_creation_1h"] = f"fallback_5m:{sources['cache_creation_5m']}"
+    return prices, sources
 
 
 def _validate_cache_prices(values: dict) -> dict[str, Decimal | None]:
@@ -582,9 +626,11 @@ def _model_public(
         output_price=effective_output,
     )
     if _kind(row) != "text":
-        effective_price_source = (
-            "manual" if model_media_pricing_available(row) else "unpriced"
-        )
+        effective_price_source = "manual" if model_media_pricing_available(row) else "unpriced"
+    # Stored manual cache columns stay nullable; effective rates are projected separately.
+    effective_cache, effective_cache_sources = _effective_cache_prices(
+        row, _resolved_cache_prices(row, provider_type, api_base), effective_input, effective_price_source or row.price_source
+    )
     return {
         "id": row.id,
         "provider_id": row.provider_id,
@@ -606,6 +652,14 @@ def _model_public(
         "effective_output_price_per_million": effective_output_price_per_million,
         "effective_price_source": effective_price_source,
         **{field: _per_million_price(getattr(row, column, None)) for field, column, _ in CACHE_PRICE_FIELDS},
+        **{
+            f"effective_{field}": _per_million_price(effective_cache[resolved])
+            for field, _, resolved in CACHE_PRICE_FIELDS
+        },
+        # Normal-context provenance only; >200k tier sources apply per call at settlement.
+        "effective_cache_price_sources": {
+            category: effective_cache_sources[category] for category in _CACHE_CATEGORIES
+        },
         "models_dev_model_id": row.models_dev_model_id,
         "price_source": row.price_source,
         "capabilities": row.capabilities,

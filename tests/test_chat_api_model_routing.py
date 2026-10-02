@@ -503,6 +503,13 @@ async def test_media_token_prices_survive_admin_roundtrip_and_frozen_settlement(
     assert Decimal(listed["input_price_per_million"]) == 5
     assert listed["output_price_per_million"] is None
     assert Decimal(listed["cache_read_price_per_million"]) == Decimal("1.25")
+    # Media never inherits text cache writes from its text input basis.
+    assert Decimal(listed["effective_cache_read_price_per_million"]) == Decimal("1.25")
+    assert listed["effective_cache_write_price_per_million"] is None
+    assert listed["effective_cache_write_1h_price_per_million"] is None
+    assert listed["effective_cache_price_sources"] == {
+        "cache_read": "manual", "cache_creation_5m": None, "cache_creation_1h": None,
+    }
 
     usage = UsageBreakdown.from_openai_media({
         "input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500,
@@ -533,6 +540,30 @@ async def test_media_token_prices_survive_admin_roundtrip_and_frozen_settlement(
     assert settle(current).raw_cost == Decimal("0.025925")
     # The admission snapshot keeps settling at its frozen rates after the edit.
     assert settle(admitted).raw_cost == Decimal("0.021825")
+
+
+def test_admin_projection_exposes_effective_cache_without_overwriting_manual_fields(monkeypatch):
+    monkeypatch.setattr(pricing, "_effective_capabilities", lambda *_args, **_kwargs: ({}, "test"))
+    monkeypatch.setattr(pricing, "_pricing_aware_capabilities", lambda _row, caps, **_kw: caps)
+    monkeypatch.setattr(pricing, "bundled_cache_rates", lambda *_args: {
+        "cache_write_1h_price_per_token": Decimal("0.000003"),
+    })
+    model = LlmModel(
+        id=1, provider_id=2, model_name="claude", is_active=True,
+        input_price=Decimal("0.000002"), output_price=Decimal("0.000004"),
+        price_source="manual", cache_read_price=Decimal("0"),
+    )
+    projection = pricing._model_public(model, provider_type="anthropic", api_provider="anthropic")
+
+    assert projection["cache_read_price_per_million"] == 0
+    assert projection["cache_write_price_per_million"] is None
+    assert projection["cache_write_1h_price_per_million"] is None
+    assert projection["effective_cache_read_price_per_million"] == 0
+    assert projection["effective_cache_write_price_per_million"] == 2
+    assert projection["effective_cache_write_1h_price_per_million"] == 3
+    assert projection["effective_cache_price_sources"] == {
+        "cache_read": "manual", "cache_creation_5m": "fallback_input:manual", "cache_creation_1h": "litellm",
+    }
 
 
 async def test_compatible_transports_resolve_independent_selectors_and_not_catalog_rank(provider_db):

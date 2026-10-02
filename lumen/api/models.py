@@ -325,7 +325,8 @@ class ModelCreateRequest(BaseModel):
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
     # Optional prompt-cache rates, independent of each other and of the input/output pair.
-    # An unset rate bills that cache category at 0 USD (no catalog fallback).
+    # Unset rates use the exact direct-provider catalog; unset cache read then stays
+    # unpriced, while unset writes inherit input (5m) and then 5m (1h) for new runs.
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -381,7 +382,8 @@ class ModelUpdateRequest(BaseModel):
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
     # Optional prompt-cache rates, independent of each other and of the input/output pair.
-    # An unset rate bills that cache category at 0 USD (no catalog fallback).
+    # Unset rates use the exact direct-provider catalog; unset cache read then stays
+    # unpriced, while unset writes inherit input (5m) and then 5m (1h) for new runs.
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -451,6 +453,11 @@ class ModelResponse(BaseModel):
     cache_read_price_per_million: Decimal | None = None
     cache_write_price_per_million: Decimal | None = None
     cache_write_1h_price_per_million: Decimal | None = None
+    # Resolved rates new admissions freeze; the stored manual fields above stay nullable.
+    effective_cache_read_price_per_million: Decimal | None = None
+    effective_cache_write_price_per_million: Decimal | None = None
+    effective_cache_write_1h_price_per_million: Decimal | None = None
+    effective_cache_price_sources: dict[str, str | None] | None = None
     models_dev_model_id: str | None = None
     price_source: str | None = None
     capabilities: dict | None = None

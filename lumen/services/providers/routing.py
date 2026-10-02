@@ -26,6 +26,7 @@ from .errors import (
     ProviderNotFoundError,
 )
 from .pricing import (
+    _effective_cache_prices,
     _effective_capabilities,
     _kind,
     _pricing_aware_capabilities,
@@ -239,21 +240,16 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
     if model_kind != "text" or media_pricing is not None:
         config_fingerprint["model_kind"] = model_kind
         config_fingerprint["media_pricing"] = media_pricing
-    cache_prices = _resolved_cache_prices(model, provider)
-    cache_price_sources = {
-        category: "manual" if getattr(model, column, None) is not None else "litellm"
-        for category, column in (
-            ("cache_read", "cache_read_price"),
-            ("cache_creation_5m", "cache_write_price"),
-            ("cache_creation_1h", "cache_write_1h_price"),
-        )
-    }
-    # Catalog rates are frozen with the route fingerprint; old run snapshots
-    # retain their previously admitted prices after a LiteLLM upgrade.
-    if any(price is not None for price in cache_prices.values()):
+    stated_cache = _resolved_cache_prices(model, provider.provider_type, provider.api_base)
+    # Stated catalog/manual rates are frozen with the route fingerprint, so old run
+    # snapshots keep their admitted prices after a LiteLLM upgrade. Inherited writes
+    # derive from the hashed input price/source and stay out of the identity: 0.5.0
+    # route hashes remain valid, and legacy snapshots never read live cache rates.
+    if any(price is not None for price in stated_cache[0].values()):
         config_fingerprint["cache_prices_per_token"] = {
-            key: str(price) if price is not None else None for key, price in cache_prices.items()
+            key: str(price) if price is not None else None for key, price in stated_cache[0].items()
         }
+    cache_prices, cache_price_sources = _effective_cache_prices(model, stated_cache, input_price, price_source)
     if provider_auth is not None:
         config_fingerprint.update(
             {
@@ -364,8 +360,12 @@ async def resolve_model(model_name: str) -> dict | None:
 
 
 async def resolve_api_model(model_name: str, *, provider: str | None = None, model_kind: str = "text",
-                            provider_id: int | None = None) -> dict | None:
-    """Resolve one external API model/provider pair without exposing route encoding."""
+                            provider_id: int | None = None, provider_type: str | None = None) -> dict | None:
+    """Resolve one external API model/provider pair without exposing route encoding.
+
+    ``provider`` is the administrator-editable public selector. ``provider_type``
+    is the execution transport an endpoint's vendor wire protocol fixes.
+    """
     candidates = {
         model_name,
         f"perplexity/{model_name}",
@@ -404,6 +404,8 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None, mod
                 stmt = stmt.where(LlmProvider.api_provider == provider)
             if provider_id is not None:
                 stmt = stmt.where(LlmProvider.id == provider_id)
+            if provider_type is not None:
+                stmt = stmt.where(LlmProvider.provider_type == provider_type)
             rows = (await session.execute(stmt)).all()
 
             def _row_matches(model_row: LlmModel, provider_row: LlmProvider) -> bool:

@@ -148,7 +148,7 @@ async def generate_image(
             _request(body.model, body.prompt, body.n, body.size, body.quality, body.provider_id),
             principal=principal,
             idempotency_key=idempotency_key or uuid.uuid4(),
-            provider_type=body.provider,
+            api_provider=body.provider,
         )
     except HTTPException as exc:
         return _compat_error(exc)
@@ -214,7 +214,7 @@ async def edit_image(
             principal=principal,
             idempotency_key=idempotency_key or uuid.uuid4(),
             input_asset_id=uuid.UUID(source_id),
-            provider_type=provider,
+            api_provider=provider,
         )
     except HTTPException as exc:
         return _compat_error(exc)

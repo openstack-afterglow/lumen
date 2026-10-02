@@ -52,13 +52,15 @@ async def test_catalog_backfill_rename_rank_and_encrypted_transport_survive_relo
             await connection.exec_driver_sql(
                 "CREATE TABLE chat_run_providers (run_id CHAR(36), provider_id BIGINT, model_id BIGINT)"
             )
+            # A fixed past clock makes any timestamp bump by selector/rank edits change the route hash.
             await connection.exec_driver_sql(
                 """
                 INSERT INTO llm_providers
                     (id, name, provider_type, api_base, encrypted_api_key, is_active, margin_multiplier,
                      created_at, updated_at)
-                VALUES (1, 'OpenAI', 'openai', NULL, %s, TRUE, 1, NOW(), NOW()),
-                       (2, 'NVIDIA NIM', 'openai', 'https://provider.example/v1', %s, TRUE, 1, NOW(), NOW())
+                VALUES (1, 'OpenAI', 'openai', NULL, %s, TRUE, 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+                       (2, 'NVIDIA NIM', 'openai', 'https://provider.example/v1', %s, TRUE, 1,
+                        '2026-01-01 00:00:00', '2026-01-01 00:00:00')
             """,
                 (encrypted, encrypted),
             )
@@ -66,9 +68,12 @@ async def test_catalog_backfill_rename_rank_and_encrypted_transport_survive_relo
                 INSERT INTO llm_models
                     (id, provider_id, model_name, is_active, is_title_model, is_memory_model,
                      input_price, output_price, price_source, created_at, updated_at)
-                VALUES (11, 1, 'shared-id', TRUE, FALSE, FALSE, 0.000001, 0.000002, 'manual', NOW(), NOW()),
-                       (12, 2, 'shared-id', TRUE, FALSE, FALSE, 0.000001, 0.000002, 'manual', NOW(), NOW()),
-                       (13, 2, 'other-id', TRUE, FALSE, FALSE, 0.000001, 0.000002, 'manual', NOW(), NOW())
+                VALUES (11, 1, 'shared-id', TRUE, FALSE, FALSE, 0.000001, 0.000002, 'manual',
+                        '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+                       (12, 2, 'shared-id', TRUE, FALSE, FALSE, 0.000001, 0.000002, 'manual',
+                        '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+                       (13, 2, 'other-id', TRUE, FALSE, FALSE, 0.000001, 0.000002, 'manual',
+                        '2026-01-01 00:00:00', '2026-01-01 00:00:00')
             """)
             if model_kind == "image":
                 await connection.exec_driver_sql("UPDATE llm_providers SET api_base = NULL")

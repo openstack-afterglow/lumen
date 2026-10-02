@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from lumen.crypto import encrypt_llm_provider_billing_admin_key, encrypt_llm_provider_key
 from lumen.db import mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
-from lumen.services.litellm_client import direct_provider_route, effective_prices_per_million, official_price_source
+from lumen.services.litellm_client import direct_provider_route
 from lumen.services.models_dev import ModelsDevCatalog
 
 from .billing import billing_admin_key_supported, billing_capability_for
@@ -34,10 +34,10 @@ from .pricing import (
     _per_million_price,
     _per_token_price,
     _provider_public,
+    _resolved_base_prices,
     _to_decimal,
     _validate_cache_prices,
     _validate_price_pair,
-    model_media_pricing_available,
     validate_media_pricing,
 )
 from .routing import _lock_mutable_route, _require_db
@@ -422,8 +422,12 @@ async def create_model(
             )
             session.add(row)
             await session.flush()
+            effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
             return _model_public(
                 row,
+                effective_input_price_per_million=_per_million_price(effective_input),
+                effective_output_price_per_million=_per_million_price(effective_output),
+                effective_price_source=effective_source,
                 provider_type=provider.provider_type,
                 api_provider=provider.api_provider,
                 provider_sort_order=provider.sort_order,
@@ -452,49 +456,19 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
             rows = (await session.execute(stmt)).all()
             public_models: list[dict] = []
             for model, provider in rows:
-                if getattr(model, "model_kind", "text") != "text":
-                    effective_input = _per_million_price(model.input_price)
-                    effective_output = _per_million_price(model.output_price)
-                    effective_source = (
-                        "manual" if model_media_pricing_available(model) else "unpriced"
-                    )
-                else:
-                    stored_input = _per_million_price(model.input_price)
-                    stored_output = _per_million_price(model.output_price)
-                    fallback_input, fallback_output = (
-                        (None, None)
-                        if stored_input is not None and stored_output is not None
-                        else effective_prices_per_million(
-                            model.model_name, provider.provider_type, api_base=provider.api_base
-                        )
-                    )
-                    effective_input = stored_input if stored_input is not None else fallback_input
-                    effective_output = stored_output if stored_output is not None else fallback_output
-                    if stored_input is not None and stored_output is not None:
-                        effective_source = model.price_source
-                    elif effective_input is not None and effective_output is not None:
-                        effective_source = (
-                            official_price_source(model.model_name, provider.provider_type, api_base=provider.api_base)
-                            or "litellm"
-                            if stored_input is None and stored_output is None
-                            else "partial"
-                        )
-                    else:
-                        effective_source = "unpriced"
-                public_models.append(
-                    _model_public(
-                        model,
-                        effective_input_price_per_million=effective_input,
-                        effective_output_price_per_million=effective_output,
-                        effective_price_source=effective_source,
-                        provider_type=provider.provider_type,
-                        api_provider=provider.api_provider,
-                        provider_sort_order=provider.sort_order,
-                        auth_mode=getattr(provider, "auth_mode", "api_key"),
-                        api_key_configured=api_key_source(provider) is not None,
-                        api_base=provider.api_base,
-                    )
-                )
+                effective_input, effective_output, effective_source, _ = _resolved_base_prices(model, provider)
+                public_models.append(_model_public(
+                    model,
+                    effective_input_price_per_million=_per_million_price(effective_input),
+                    effective_output_price_per_million=_per_million_price(effective_output),
+                    effective_price_source=effective_source,
+                    provider_type=provider.provider_type,
+                    api_provider=provider.api_provider,
+                    provider_sort_order=provider.sort_order,
+                    auth_mode=getattr(provider, "auth_mode", "api_key"),
+                    api_key_configured=api_key_source(provider) is not None,
+                    api_base=provider.api_base,
+                ))
             return public_models
     except OperationalError as exc:
         mark_db_unhealthy()
@@ -608,8 +582,12 @@ async def update_model(model_id: int, patch: dict) -> dict:
             if patch.get("is_active") is not None:
                 row.is_active = bool(patch["is_active"])
             await session.flush()
+            effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
             return _model_public(
                 row,
+                effective_input_price_per_million=_per_million_price(effective_input),
+                effective_output_price_per_million=_per_million_price(effective_output),
+                effective_price_source=effective_source,
                 provider_type=provider.provider_type,
                 api_provider=provider.api_provider,
                 provider_sort_order=provider.sort_order,
@@ -712,18 +690,23 @@ async def import_models_dev_prices(
                     "unsupported_price_fields": external_model.unsupported_price_fields,
                 }
             await session.flush()
-            return [
-                _model_public(
-                    rows_by_id[local_model_id],
+            public_models: list[dict] = []
+            for local_model_id in selected_external:
+                row = rows_by_id[local_model_id]
+                effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
+                public_models.append(_model_public(
+                    row,
+                    effective_input_price_per_million=_per_million_price(effective_input),
+                    effective_output_price_per_million=_per_million_price(effective_output),
+                    effective_price_source=effective_source,
                     provider_type=provider.provider_type,
                     api_provider=provider.api_provider,
                     provider_sort_order=provider.sort_order,
                     auth_mode=getattr(provider, "auth_mode", "api_key"),
                     api_key_configured=api_key_source(provider) is not None,
                     api_base=provider.api_base,
-                )
-                for local_model_id in selected_external
-            ]
+                ))
+            return public_models
     except IntegrityError as exc:
         raise ModelsDevImportConflictError("models.dev 가격 import 저장 충돌") from exc
     except OperationalError as exc:

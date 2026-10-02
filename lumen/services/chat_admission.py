@@ -209,7 +209,7 @@ def _cache_price_snapshot(route: dict[str, Any]) -> dict[str, Any]:
     """Freeze resolved direct-provider or manual cache prices and provenance."""
     return {
         **{key: str(route[key]) if route.get(key) is not None else None for key in _CACHE_PRICE_KEYS},
-        "cache_price_sources": route.get("cache_price_sources") or {},
+        "cache_price_sources": dict(route.get("cache_price_sources") or {}),
     }
 
 
@@ -344,6 +344,7 @@ def _run_snapshots(
         "input_price_per_token": str(resolved["input_price_per_token"]),
         "output_price_per_token": str(resolved["output_price_per_token"]),
         "component_prices": component_prices,
+        "advisor_cache_price_sources": dict((advisor_route or {}).get("cache_price_sources") or {}),
         "price_source": resolved.get("price_source"),
         "price_version": resolved.get("price_version"),
         "provider_name": resolved["provider_name"],
