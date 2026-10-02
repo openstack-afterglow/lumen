@@ -506,6 +506,8 @@ async def _resolve_model(model_name: str) -> dict:
         raise HTTPException(status_code=400, detail="모델이 지정되지 않았습니다")
     try:
         resolved = await ps.resolve_model(model_name)
+    except errors.AmbiguousModelRouteError as exc:
+        raise HTTPException(status_code=409, detail="model_route_ambiguous") from exc
     except errors.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if resolved is None:

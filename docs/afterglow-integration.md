@@ -278,8 +278,8 @@ Codex의 알 수 없는 모델 metadata fallback은 실제 reasoning 지원 여�
 
 ## 5. 모델 디스커버리 및 Provider Credential 상태
 
-* `GET /v1/models` (OpenAI 호환 포맷): 표준 필드(`id`, `object`, `created`, `owned_by`)에 더해 같은 공개 ID를 제공하는 활성 provider type의 정렬된 `providers` 배열을 반환합니다. `id`는 SDK가 보내는 공개 `model` 값이며 내부 LiteLLM route key가 아닙니다.
-* `GET /v1/chat/models` (Native 상세 포맷): 각 모델의 공개 `api_model_name`, `api_provider`와 운영용 내부 `model_name`을 분리해 반환하고 `provider_api_key_configured` (`true`/`false`)와 `reasoning_none_supported`를 포함합니다. `reasoning_none_supported=false`인 모델에 `reasoning_effort="none"`을 보내면 422이므로 UI는 이 값이 true일 때만 "없음"을 노출합니다.
+* `GET /v1/models` (OpenAI 호환 포맷): 표준 필드(`id`, `object`, `created`, `owned_by`)에 더해 같은 공개 ID를 제공하는 활성 `api_provider` 선택자의 `providers` 배열을 반환합니다. `id`는 SDK가 보내는 공개 `model` 값이며 내부 LiteLLM route key가 아닙니다.
+* `GET /v1/chat/models` (Native 상세 포맷): 각 모델의 공개 `api_model_name`, `api_provider`, 표시 `provider`, 실제 연결 `provider_type`, stable `provider_id`와 운영용 내부 `model_name`을 분리합니다. Provider `provider_sort_order`·provider ID·model `sort_order`·model ID 순으로 반환하고 `provider_api_key_configured` 및 `reasoning_none_supported`를 포함합니다. `reasoning_none_supported=false`인 모델에 `reasoning_effort="none"`을 보내면 422이므로 UI는 이 값이 true일 때만 "없음"을 노출합니다.
   * `true`: 해당 모델의 provider API Key가 Lumen 서버에 정상 설정(DB 또는 환경 변수 `api_key_env`)되어 있음.
   * `false`: 명시적인 provider API Key가 등록되지 않음 (`false`인 모델 호출 시 completion 시점에 502/400 오류 발생 가능).
 * Keystone 전용 관리자 엔드포인트 `GET /v1/admin/providers`는 `has_api_key`, `api_key_source`(`database`/`environment`/`null`), `api_key_env`, `has_billing_admin_key` 정보를 제공하며 시크릿 값 자체는 반환하지 않습니다. `POST /v1/admin/providers`와 `PATCH /v1/admin/providers/{provider_id}`의 선택적 `billing_admin_key`는 direct OpenAI/Anthropic 조직 report용 별도 administrator credential입니다. Subscription auth, Gemini, Perplexity, custom base에는 설정할 수 없습니다.
@@ -299,7 +299,7 @@ Direct Gemini/Anthropic에서 exact LiteLLM catalog의 cache 단가에 `above_20
 
 ### 5.1 공개 모델 ID와 실행 route
 
-호환 API 클라이언트는 `api_model_name`만 `model`로 보내고 필요할 때 `api_provider`를 `provider`로 보냅니다. 다른 provider와 겹치지 않는 고유 모델(예: Perplexity 단독의 `sonar`, `kimi-k3`, `deepseek-v4-flash-0731`)은 `provider`를 생략해도 정상적으로 라우팅됩니다. 동일한 공개 ID가 여러 provider type에 존재하는 경우에만 `provider`를 생략한 completion이 **HTTP 409 Conflict**로 실패합니다. 요청 body의 `provider`는 소문자 provider type이며 OpenAI/Anthropic Python SDK에서는 `extra_body={"provider": "perplexity"}`로 전달할 수 있습니다. 같은 provider type 안에서도 route가 둘 이상이면 선택자가 충분하지 않으므로 409를 유지합니다. Perplexity Agent API는 명시적으로 요청한 native search만 tool로 전달하며, 일반 Agent route에 검색 도구를 자동 주입하지 않습니다.
+호환 API 클라이언트는 `api_model_name`만 `model`로 보내고 필요할 때 관리자 설정 `api_provider`를 `provider`로 보냅니다. 다른 provider와 겹치지 않는 고유 모델(예: Perplexity 단독의 `sonar`, `kimi-k3`, `deepseek-v4-flash-0731`)은 `provider`를 생략해도 정상적으로 라우팅됩니다. 동일한 공개 ID가 여러 route에 존재하면 `provider`를 생략한 completion이 **HTTP 409 Conflict**로 실패합니다. OpenAI/Anthropic Python SDK에서는 `extra_body={"provider": "nvidia"}`처럼 공개 선택자를 전달할 수 있습니다. 같은 model/selector 안에서도 route가 둘 이상이면 409를 유지하며 표시 순서는 실행 선택에 쓰지 않습니다. 선택자 변경 후 외부 클라이언트는 새 값을 사용해야 하며 이전 값의 alias는 없습니다. Perplexity Agent API는 명시적으로 요청한 native search만 tool로 전달하며 일반 Agent route에 검색 도구를 자동 주입하지 않습니다.
 
 Perplexity provider는 base URL로 transport를 명시합니다.
 
@@ -378,7 +378,7 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
 
 * **OpenAI Chat Completions (`POST /v1/chat/completions`)**:
   - `model`: `lumen` virtual model 또는 공개 provider model ID (필수)
-  - `provider`: 같은 공개 model ID의 route 충돌을 해소하는 선택적 provider type
+  - `provider`: 같은 공개 model ID의 route 충돌을 해소하는 선택적 관리자 설정 `api_provider`
   - `messages`: 메시지 목록 (필수)
   - `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`, `stream_options`
   - `model="lumen"`은 문자열 content의 `system`/`developer`/`user`/`assistant` transcript만 받고 마지막 `user` message를 요구합니다. Caller tools/tool messages/multimodal content는 400으로 거부하며 Lumen memory/extensions/MCP/tool 실행은 비활성화됩니다.
@@ -390,7 +390,7 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
   - `model`, `messages`, 필수 양수 `max_tokens`, 선택적 `provider`, `system`, `temperature`, `stream`, `metadata`, `stop_sequences`, `thinking`, `tools`, `tool_choice`, `top_k`, `top_p`, `container`를 받습니다.
   - `POST /v1/messages/count_tokens`는 동일한 Anthropic input block을 native token-count transport로 전달합니다.
   - Streaming은 Anthropic event 이름과 body를 유지하고 약 15초 idle마다 `event: ping`을 보냅니다. OpenAI `[DONE]` sentinel로 변환하지 않습니다.
-* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르거나 header가 인식 가능한 `model` provider prefix와 충돌하면 400 `provider_header_conflict`입니다. Request schema에 없는 필드는 422로 거부합니다.
+* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르면 400 `provider_header_conflict`입니다. `model`의 transport prefix는 editable selector의 alias나 충돌 조건이 아닙니다. Request schema에 없는 필드는 422로 거부합니다.
 
 ### 6.2 Output token budget
 

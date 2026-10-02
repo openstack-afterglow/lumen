@@ -239,6 +239,7 @@ Built-in remote MCP connector bundles (`mcp_bundles.py`) are declarative presets
 - **SDK transports**: `lumen_sdk.Client`와 OpenStack SDK `Proxy`는 opaque history cursor를 변환하지 않고 같은 native page contract를 전달한다. 이 둘은 Lumen API transport이며 provider credential transport가 아니다.
 - **Protocol invariant**: accepted durable run에는 admission snapshot, pricing/provenance, selected extension/config fingerprint가 있어야 하며 worker가 mutable configuration을 재검증한다. `model="lumen"` bridge는 tools/memory가 없는 text-only 입력만 accepted한다. Compat provider request는 Lumen conversation/active-path에 저장되지 않는다.
 - **Release snapshot compatibility**: Migration 020의 기존 text model `model_kind=text`·`media_pricing=NULL`은 v0.3.1의 route HMAC 직렬화에 추가하지 않는다. 정지 시 남은 queued text run은 설정이 실제로 바뀌지 않았다면 기존 frozen hash로 재개하며, 이미지·오디오·realtime route는 kind와 media 가격을 hash에 포함해 변경을 차단한다. 고정된 v0.3.1 HMAC/실제 ORM 조회 회귀가 이 경계를 검증한다.
+- **Provider catalog identity/order**: migration 021이 editable `api_provider`와 provider/model `sort_order`를 추가한다. 기존 selector는 transport에서 backfill하며 같은 model/selector의 중복을 rank로 해소하지 않는다. Public API는 selector, credential·reasoning·media·LiteLLM 실행은 `provider_type`, native/durable 선택은 stable provider/model ID를 사용한다. Catalog는 provider rank·provider ID·model rank·model ID 순이고 selector/rank는 frozen HMAC에 들어가지 않는다. Rank-only model PATCH는 legacy manual/media 가격 version으로 쓰는 `updated_at`을 유지해 queue snapshot을 무효화하지 않는다. 기존 route locks·active-run mutation fence·DB/credential 소유권은 유지한다.
 - **0.3.1 integration boundary**: `origin/dev`의 title/admission/operator/graph reasoning 수정과 기존 subscription sampling·operations 변경을 별도 worktree에서 통합했다. Legacy Perplexity Sonar의 정확한 bundled 가격 키를 synthetic Agent 중복 접두보다 우선해 서로 다른 tariff를 유지한다. Managed runtime guest 인증서의 Authority Key Identifier는 controller CA의 Subject Key Identifier가 있으면 그 값을 사용하고, 없으면 CA 공개키에서 유도한다. 기존 CA material·소유권은 변경하지 않는다. 서비스·schema·dependency·저장소 소유권 변경은 없으며 root/runtime/lock 및 packaged Kolla image default만 patch version으로 맞춘다. 기존 discovery는 변경하지 않았다. 0.3.1 candidate에서 contract 1,369건, SDK 125건, 실제 MariaDB/Redis integration 40건, local Compose fake-provider system 9건, Ruff와 wheel build, API/worker/controller/sandbox linux/amd64·linux/arm64 이미지 build 및 각 이미지의 offline import/platform smoke를 통과했다. `v0.3.1` package/image workflows와 네 tag image의 linux/amd64·linux/arm64 manifest/OCI revision은 게시 후 확인했다. live Anthropic/OpenAI provider·production rollout은 아직 검증하지 않았다.
 
 ### Provider model onboarding
@@ -366,9 +367,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "11dc3bb5658505679d0b09d04ff8f286a6454a9f866e497aefad157bb5a66492",
-  "reviewed_at": "2026-10-01T12:14:08Z",
-  "summary": "Lumen 0.5.0 release review: lifecycle logging (worker/main/controller, request logging), modality pricing (api/models, providers/pricing+repository, usage_breakdown, credit, chat_admission, completion_api, graph, durable_runs execution/images/audio/realtime, image/audio/realtime transports), official OpenAI Responses routing (litellm_client, graph), native whisper-1 segment timestamps (api/audio, conversations, audio transport/durable), 019-to-020 media migration identity adoption (scripts/migrate.py), version 0.5.0 in pyproject/lumen/uv.lock and Kolla lumen_image_tag. No new SQL migration. contract 1615+SDK 125, native integration 102, system 9 passed."
+  "source_sha256": "a5df1c67097fab9eb6ba05fceb4c205b4b990e16dc77f0a243cf49091da3e75e",
+  "reviewed_at": "2026-10-02T17:07:58Z",
+  "summary": "Reviewed provider selector/transport separation, migration 021 ranks and constraints, catalog routing ambiguity, media selector admission, native ambiguity consumers, and rank-only price-version preservation; merged with current 0.5.0 media pricing. Integrated release gates pending; no production deployment."
 }
 ```
 <!-- architecture-review:end -->

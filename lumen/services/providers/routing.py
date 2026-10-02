@@ -271,7 +271,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "model_kind": model_kind,
         "media_pricing": media_pricing,
         "api_model_name": api_model_name(model.model_name, provider.provider_type),
-        "api_provider": provider.provider_type,
+        "api_provider": provider.api_provider,
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
         "api_base": api_base,
@@ -341,7 +341,7 @@ async def resolve_model(model_name: str) -> dict | None:
     factory = _require_db()
     try:
         async with factory() as session:
-            row = (
+            rows = (
                 await session.execute(
                     select(LlmModel, LlmProvider)
                     .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
@@ -352,11 +352,12 @@ async def resolve_model(model_name: str) -> dict | None:
                         LlmProvider.is_active.is_(True),
                     )
                 )
-            ).first()
-            if row is None:
+            ).all()
+            if not rows:
                 return None
-            model, provider = row
-            return _resolved_model(model, provider)
+            if len(rows) != 1:
+                raise AmbiguousModelRouteError("model route is ambiguous")
+            return _resolved_model(*rows[0])
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
@@ -400,7 +401,7 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None, mod
                 .order_by(LlmModel.id)
             )
             if provider is not None:
-                stmt = stmt.where(LlmProvider.provider_type == provider)
+                stmt = stmt.where(LlmProvider.api_provider == provider)
             if provider_id is not None:
                 stmt = stmt.where(LlmProvider.id == provider_id)
             rows = (await session.execute(stmt)).all()
@@ -429,33 +430,20 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None, mod
             if not matches:
                 return None
 
-            if provider is None:
-                provider_types = {route_provider.provider_type for _, route_provider in matches}
-                if len(provider_types) > 1:
-                    raise AmbiguousModelRouteError("model route is ambiguous")
-                exact = [
-                    m
-                    for m in matches
-                    if api_model_name(m[0].model_name, m[1].provider_type) == model_name
-                    or short_model_name(m[0].model_name, m[1].provider_type) == model_name
-                    or m[0].model_name == model_name
-                ]
-                if exact:
-                    return _resolved_model(*exact[0])
-                return _resolved_model(*matches[0])
-            else:
-                if len(matches) > 1:
-                    exact = [
-                        m
-                        for m in matches
-                        if api_model_name(m[0].model_name, m[1].provider_type) == model_name
-                        or short_model_name(m[0].model_name, m[1].provider_type) == model_name
-                        or m[0].model_name == model_name
-                    ]
-                    if len(exact) == 1:
-                        return _resolved_model(*exact[0])
-                    raise AmbiguousModelRouteError("model route is ambiguous")
-                return _resolved_model(*matches[0])
+            # Presentation order must never pick an endpoint. Even equal selectors
+            # on different connections remain ambiguous until provider_id is given.
+            if len({route_provider.id for _, route_provider in matches}) > 1:
+                raise AmbiguousModelRouteError("model route is ambiguous")
+            exact = [
+                m for m in matches
+                if api_model_name(m[0].model_name, m[1].provider_type) == model_name
+                or short_model_name(m[0].model_name, m[1].provider_type) == model_name
+                or m[0].model_name == model_name
+            ]
+            selected = exact or matches
+            if len(selected) != 1:
+                raise AmbiguousModelRouteError("model route is ambiguous")
+            return _resolved_model(*selected[0])
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
@@ -475,14 +463,18 @@ async def list_api_models(*, model_kind: str = "text") -> list[dict]:
                         LlmModel.model_kind == model_kind,
                         LlmProvider.is_active.is_(True),
                     )
-                    .order_by(LlmModel.id)
+                    .order_by(LlmProvider.sort_order, LlmProvider.id, LlmModel.sort_order, LlmModel.id)
                 )
             ).all()
             return [
                 {
                     "model_name": model.model_name,
                     "api_model_name": api_model_name(model.model_name, provider.provider_type),
-                    "api_provider": provider.provider_type,
+                    "api_provider": provider.api_provider,
+                    "provider_id": provider.id,
+                    "provider_type": provider.provider_type,
+                    "provider_sort_order": provider.sort_order,
+                    "sort_order": model.sort_order,
                 }
                 for model, provider in rows
             ]

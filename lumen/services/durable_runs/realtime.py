@@ -269,15 +269,15 @@ async def admit_realtime_session(
     if not isinstance(model_id, str) or not model_id or (provider_id is not None and not isinstance(provider_id, (str, int))):
         raise DurableRunInputError("realtime model is required")
     provider_number = int(provider_id) if provider_id is not None and str(provider_id).isdecimal() else None
-    provider_type = str(provider_id) if provider_id is not None and provider_number is None else None
+    api_provider = str(provider_id) if provider_id is not None and provider_number is None else None
     try:
         route = (await routing.resolve_model_by_id(int(model_id), model_kind="realtime") if model_id.isdecimal()
-                 else await routing.resolve_api_model(model_id, provider=provider_type,
+                 else await routing.resolve_api_model(model_id, provider=api_provider,
                                                        provider_id=provider_number, model_kind="realtime"))
     except AmbiguousModelRouteError as exc:
         raise DurableRunInputError("realtime provider selection is ambiguous") from exc
     if route is None or (provider_number is not None and route["provider_id"] != provider_number) or (
-        provider_type is not None and route["provider_type"] != provider_type
+        api_provider is not None and route["api_provider"] != api_provider
     ):
         raise DurableRunInputError("realtime provider or model is unavailable")
     voices = realtime_transport.available_realtime_options(route)
