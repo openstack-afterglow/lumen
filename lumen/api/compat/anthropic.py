@@ -20,7 +20,7 @@ router = APIRouter()
 
 class AnthropicMessagesRequest(BaseModel):
     model: str = Field(..., max_length=190)
-    provider: str | None = Field(default=None, min_length=1, max_length=40, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    provider: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[^\x00-\x1f\x7f]+$")
     messages: list[dict[str, Any]] = Field(..., min_length=1)
     system: Any = None
     max_tokens: int = Field(..., gt=0)
@@ -42,7 +42,7 @@ class AnthropicMessagesRequest(BaseModel):
 
 class AnthropicCountTokensRequest(BaseModel):
     model: str = Field(..., max_length=190)
-    provider: str | None = Field(default=None, min_length=1, max_length=40, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    provider: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[^\x00-\x1f\x7f]+$")
     messages: list[dict[str, Any]] = Field(..., min_length=1)
     system: Any = None
     tools: list[dict[str, Any]] | None = None

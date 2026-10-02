@@ -20,7 +20,7 @@ router = APIRouter()
 
 class ResponsesRequest(BaseModel):
     model: str = Field(..., max_length=190)
-    provider: str | None = Field(default=None, min_length=1, max_length=40, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    provider: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[^\x00-\x1f\x7f]+$")
     input: str | list[dict[str, Any]]
     stream: bool = False
     store: bool | None = None

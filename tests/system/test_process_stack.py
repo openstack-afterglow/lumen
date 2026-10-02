@@ -898,7 +898,7 @@ async def _approve_gateway_code_and_seed_anthropic(user_code: str, fake_provider
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     try:
         provider = await repository.create_provider(
-            name=f"system-anthropic-{uuid.uuid4().hex}",
+            name="system-anthropic",
             provider_type="anthropic",
             api_base=fake_provider_url,
             api_key="fake-anthropic-key",
@@ -1247,14 +1247,14 @@ def test_process_stack_discovers_and_routes_new_claude_without_restart() -> None
         rows = asyncio.run(_register_discovered_system_model(fake_provider_url, model_name))
         registered = rows["registered"]
         assert registered["provider_id"] == rows["provider"]["id"]
-        assert registered["api_provider"] == "anthropic"
+        assert registered["api_provider"] == rows["provider"]["name"]
         assert registered["api_model_name"] == model_name
         assert registered["price_source"] == "manual"
 
         active = client.get("/v1/models", headers=headers)
         assert active.status_code == 200, active.text
         public = next(item for item in active.json()["data"] if item["id"] == model_name)
-        assert "anthropic" in public["providers"]
+        assert rows["provider"]["name"] in public["providers"]
 
         denied = client.post(
             "/v1/temp-completions",
@@ -1287,7 +1287,7 @@ def test_process_stack_discovers_and_routes_new_claude_without_restart() -> None
         compat = client.post(
             "/v1/chat/completions",
             headers=headers,
-            json={"model": model_name, "provider": "anthropic", "messages": [{"role": "user", "content": "compat"}]},
+            json={"model": model_name, "provider": rows["provider"]["name"], "messages": [{"role": "user", "content": "compat"}]},
         )
         assert compat.status_code == 200, compat.text
         assert compat.json()["choices"][0]["message"]["content"] == "Hello from fake provider!"

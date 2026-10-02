@@ -138,7 +138,7 @@ def usage_cost_from_pricing_snapshot(
         tokens = getattr(breakdown, token_field)
         rate, tier_rate = cache_prices[name]
         source = (pricing_snapshot.get("cache_price_sources") or {}).get(name, "manual")
-        if breakdown.input_tokens > 200_000 and source == "litellm" and tier_rate is not None:
+        if breakdown.input_tokens > 200_000 and source in {"litellm", "fallback_5m:litellm"} and tier_rate is not None:
             rate = tier_rate
         cost = (rate * tokens).quantize(_USD_QUANTUM, rounding=ROUND_HALF_EVEN) if rate is not None else Decimal("0")
         unpriced_cache = unpriced_cache or (tokens > 0 and rate is None)

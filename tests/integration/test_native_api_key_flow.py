@@ -19,7 +19,7 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun
 from lumen.services import api_key_store, graph
 from lumen.services.durable_runs import execution
-from lumen.services.providers import repository
+from lumen.services.providers import repository, routing
 from lumen.services.providers.errors import ProviderValidationError
 
 pytestmark = pytest.mark.integration
@@ -389,6 +389,69 @@ async def test_subscription_model_namespace_is_unique_under_concurrent_registrat
         await close_db()
 
 
+async def test_global_model_order_append_and_provider_name_use_real_mariadb():
+    nonce = uuid.uuid4().hex
+    init_db(os.environ["DATABASE_URL"], pool_size=2, max_overflow=0)
+    factory = get_session_factory()
+    assert factory is not None
+    provider_id = None
+
+    try:
+        async with factory() as session, session.begin():
+            provider = LlmProvider(
+                name=f"order-provider-{nonce}", provider_type="openai",
+                is_active=True, margin_multiplier=Decimal("1"),
+            )
+            session.add(provider)
+            await session.flush()
+            provider_id = provider.id
+
+        first = await repository.create_model(
+            provider_id=provider_id, model_name=f"first-{nonce}",
+            input_price_per_million="2", output_price_per_million="8", is_active=True,
+        )
+        second = await repository.create_model(
+            provider_id=provider_id, model_name=f"second-{nonce}",
+            input_price_per_million="2", output_price_per_million="8", is_active=True,
+        )
+        original = await repository.list_models()
+        original_ids = [model["id"] for model in original]
+        reordered = [second["id"], *[id for id in original_ids if id not in {first["id"], second["id"]}], first["id"]]
+        before = await routing.resolve_model_by_id(first["id"])
+        assert before is not None
+        async with factory() as session:
+            before_updated_at = await session.scalar(select(LlmModel.updated_at).where(LlmModel.id == first["id"]))
+
+        await repository.reorder_models(reordered)
+        assert [model["id"] for model in await repository.list_models()] == reordered
+        assert (await routing.resolve_model_by_id(first["id"]))["config_version_hash"] == before["config_version_hash"]
+        async with factory() as session:
+            assert await session.scalar(select(LlmModel.updated_at).where(LlmModel.id == first["id"])) == before_updated_at
+        with pytest.raises(ProviderValidationError):
+            await repository.reorder_models(reordered[:-1])
+        assert [model["id"] for model in await repository.list_models()] == reordered
+
+        appended = await repository.create_model(
+            provider_id=provider_id, model_name=f"appended-{nonce}",
+            input_price_per_million="2", output_price_per_million="8", is_active=True,
+        )
+        assert [model["id"] for model in await repository.list_models()] == [*reordered, appended["id"]]
+        assert [row["api_model_name"] for row in await routing.list_api_models()][-1] == f"appended-{nonce}"
+
+        public_name = f"nvidia nim {nonce}"
+        await repository.update_provider(provider_id, {"name": public_name})
+        assert await routing.resolve_api_model(f"first-{nonce}", provider=f"order-provider-{nonce}") is None
+        selected = await routing.resolve_api_model(f"first-{nonce}", provider=public_name)
+        assert selected is not None
+        assert selected["api_provider"] == public_name
+        assert selected["provider_type"] == "openai"
+    finally:
+        if provider_id is not None:
+            async with factory() as session, session.begin():
+                await session.execute(delete(LlmProvider).where(LlmProvider.id == provider_id))
+        await close_db()
+
+
 async def test_second_page_claude_requires_explicit_pricing_before_native_admission(monkeypatch):
     """Discovery is read-only; explicit registration becomes routable and billable without a flush."""
     import json
@@ -527,7 +590,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             assert registered.status_code == 201, registered.text
             model = registered.json()
             assert model["provider_id"] == provider_id
-            assert model["api_model_name"] == model_name and model["api_provider"] == "anthropic"
+            assert model["api_model_name"] == model_name and model["api_provider"] == f"onboarding-provider-{nonce}"
             assert model["price_source"] == "manual"
             assert model["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is True
 
@@ -540,7 +603,9 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             assert unpriced_projection["effective_output_price_per_million"] is None
             public = await client.get("/v1/models", headers=key_headers)
             assert public.status_code == 200, public.text
-            assert "anthropic" in next(item for item in public.json()["data"] if item["id"] == model_name)["providers"]
+            assert f"onboarding-provider-{nonce}" in next(
+                item for item in public.json()["data"] if item["id"] == model_name
+            )["providers"]
 
             def native_request(selected_model: str, text: str, *, search: bool = False) -> dict:
                 return {

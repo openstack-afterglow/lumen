@@ -204,10 +204,12 @@ Codex의 `prompt_cache_key`는 provider transport로 전달합니다. 로컬 ins
 
 ## 5. 모델 디스커버리 및 Provider Credential 상태
 
-* `GET /v1/models` (OpenAI 호환 포맷): 표준 필드(`id`, `object`, `created`, `owned_by`)에 더해 같은 공개 ID를 제공하는 활성 provider type의 정렬된 `providers` 배열을 반환합니다. `id`는 SDK가 보내는 공개 `model` 값이며 내부 LiteLLM route key가 아닙니다.
+* `GET /v1/models` (OpenAI 호환 포맷): 표준 필드(`id`, `object`, `created`, `owned_by`)에 더해 같은 공개 ID를 제공하는 활성 **등록 provider 이름**의 `providers` 배열을 반환합니다. 모델과 providers 배열은 저장된 전역 모델 순서를 따르며 동일 공개 ID는 첫 등장 위치에서 합칩니다. `id`는 SDK가 보내는 공개 `model` 값이며 내부 LiteLLM route key가 아닙니다.
 * `GET /v1/chat/models` (Native 상세 포맷): 각 모델의 공개 `api_model_name`, `api_provider`와 운영용 내부 `model_name`을 분리해 반환하고 `provider_api_key_configured` (`true`/`false`)와 `reasoning_none_supported`를 포함합니다. `reasoning_none_supported=false`인 모델에 `reasoning_effort="none"`을 보내면 422이므로 UI는 이 값이 true일 때만 "없음"을 노출합니다.
   * `true`: 해당 모델의 provider API Key가 Lumen 서버에 정상 설정(DB 또는 환경 변수 `api_key_env`)되어 있음.
   * `false`: 명시적인 provider API Key가 등록되지 않음 (`false`인 모델 호출 시 completion 시점에 502/400 오류 발생 가능).
+* 관리자 `PUT /v1/admin/models/order`에는 비활성 모델을 포함한 전체 ID의 순열 `{model_ids:[...]}`을 보냅니다. 필터된 일부 ID만 보내면 400입니다. `/v1/admin/models`와 `/v1/chat/models`는 이 전역 순서를 유지하므로 provider별 재정렬을 하지 않습니다. Migration 020을 matching API/worker보다 먼저 적용합니다.
+* 관리자 cache 편집에는 raw `cache_*_price_per_million`(null 유지)를, 목록 단가 표시에는 `effective_cache_*_price_per_million`을 사용합니다. Effective 필드가 없는 구 backend에서 fallback 단가가 확인됐다고 표시하지 않습니다. Source map `effective_cache_price_sources`는 manual/catalog와 write fallback을 구분합니다.
 * Keystone 전용 관리자 엔드포인트 `GET /v1/admin/providers`는 `has_api_key`, `api_key_source`(`database`/`environment`/`null`), `api_key_env`, `has_billing_admin_key` 정보를 제공하며 시크릿 값 자체는 반환하지 않습니다. `POST /v1/admin/providers`와 `PATCH /v1/admin/providers/{provider_id}`의 선택적 `billing_admin_key`는 direct OpenAI/Anthropic 조직 report용 별도 administrator credential입니다. Subscription auth, Gemini, Perplexity, custom base에는 설정할 수 없습니다.
 
 * Keystone 전용 `GET /v1/admin/providers/billing`은 모든 configured provider를 한 번에 반환합니다. 각 항목은 Lumen immutable usage ledger의 일·주·월·누적 request/token/raw USD cost를 포함합니다. OpenRouter/DeepSeek는 inference key로 live credit 한도·잔액을 조회합니다. Direct OpenAI/Anthropic은 별도 AES-GCM/HKDF domain에 저장한 administrator key로 공식 organization report를 조회해 현재 UTC 일·주·월 cost/usage를 반환합니다. Gemini는 console-only, Perplexity Enterprise Computer Analytics는 Sonar/API Platform billing과 제품 범위가 달라 해당 analytics API를 호출하지 않습니다. Subscription credential과 custom base에는 오인 가능한 vendor console URL을 반환하지 않습니다. Provider/report별 upstream 실패는 안전한 상태로 격리되어 다른 provider 항목이나 관리자 CRUD를 막지 않습니다.
@@ -220,11 +222,13 @@ UI는 provider·exact ID·표시명·가격을 검토한 뒤 기존 `POST /v1/ad
 
 호출별 token 수는 provider 응답의 `usage`를 우선하며 확정 USD 비용은 일반 inference API가 반환하지 않습니다. Lumen은 모델의 수동 단가를 우선 적용하고, direct provider의 exact LiteLLM bundled cache 단가가 있으면 미설정 cache 범주에만 적용합니다. 동일 model ID의 custom `api_base`에는 catalog 가격을 상속하지 않으므로 운영자가 입력·출력·cache 가격을 명시해야 합니다. `/v1/usage/records`의 `uncached_input_tokens`·`cache_read_input_tokens`·`cache_creation_5m_input_tokens`·`cache_creation_1h_input_tokens`와 `credited_cost`를 함께 표시할 수 있습니다. 관리자 `/v1/admin/stats/users/{user_id}`의 각 record는 `cache_costs_usd`와 `cache_price_sources`도 제공합니다. `/v1/chat/completions`의 `usage.prompt_tokens_details.cached_tokens`는 보고된 hit 수입니다. OpenAI/Gemini의 자동 캐싱 및 Anthropic direct chat의 stable-system breakpoint는 모두 **실제 cache counter가 있는 응답**에서만 hit로 판단하며, provider organization report와 Lumen per-request 원가는 범위·시차·tier가 다를 수 있습니다. 상세 운영 계약은 [API 참조](api-reference.md#모델-단가와-prompt-cache-단가)입니다.
 
+미설정 cache-write는 direct catalog 뒤에 5분→effective input, 1시간→effective 5분 순서로 상속합니다. 명시적 0과 direct Anthropic의 별도 1시간 단가는 보존합니다. Cache-read에는 input fallback이 없습니다. 이 cascade는 새 admission/일반 billing에만 적용하며 기존 frozen snapshot의 누락 가격을 소급하여 채우지 않습니다.
+
 Direct Gemini/Anthropic에서 exact LiteLLM catalog의 cache 단가에 `above_200k_tokens` tier가 있으면 호출별 provider-reported prompt 총량이 200,000을 초과할 때만 그 tier가 적용됩니다. Run·요약·advisor 가격은 admission에 고정되고, 관리자가 수동 설정한 cache 단가는 두 문맥 tier 모두에서 우선합니다. Advisor 사용량은 호출별로 판단합니다. `model="lumen"`의 OpenAI 호환 `cached_tokens`는 해당 executor 호출의 cache-read만 포함하고 별도 advisor 사용량은 포함하지 않습니다. Frozen title job은 누락 가격을 public catalog로 채우지 않습니다.
 
 ### 5.1 공개 모델 ID와 실행 route
 
-호환 API 클라이언트는 `api_model_name`만 `model`로 보내고 필요할 때 `api_provider`를 `provider`로 보냅니다. 다른 provider와 겹치지 않는 고유 모델(예: Perplexity 단독의 `sonar`, `kimi-k3`, `deepseek-v4-flash-0731`)은 `provider`를 생략해도 정상적으로 라우팅됩니다. 동일한 공개 ID가 여러 provider type에 존재하는 경우에만 `provider`를 생략한 completion이 **HTTP 409 Conflict**로 실패합니다. 요청 body의 `provider`는 소문자 provider type이며 OpenAI/Anthropic Python SDK에서는 `extra_body={"provider": "perplexity"}`로 전달할 수 있습니다. 같은 provider type 안에서도 route가 둘 이상이면 선택자가 충분하지 않으므로 409를 유지합니다. Perplexity Agent API는 명시적으로 요청한 native search만 tool로 전달하며, 일반 Agent route에 검색 도구를 자동 주입하지 않습니다.
+호환 API 클라이언트는 `api_model_name`을 `model`, **등록된 provider 이름**인 `api_provider`를 `provider`로 보냅니다. 예를 들어 `name="nvidia nim", provider_type="openai"`는 `extra_body={"provider":"nvidia nim"}`로 선택하며 내부 LiteLLM transport만 `openai`입니다. 같은 공개 ID를 여러 등록 provider가 제공하면 selector 생략 시 409이며 같은 transport type이라도 이름으로 정확히 선택할 수 있습니다. ASCII 이름은 `X-Lumen-Provider` header로도 보낼 수 있지만 Unicode 이름은 JSON body를 사용합니다. Body와 header가 서로 다르면 400입니다. Model transport prefix와 provider 이름은 별개입니다. Provider rename은 공개 selector를 즉시 바꾸므로 기존 이름을 저장한 클라이언트는 목록을 갱신해야 합니다. Perplexity Agent API는 명시적으로 요청한 native search만 tool로 전달하며, 일반 Agent route에 검색 도구를 자동 주입하지 않습니다.
 
 Perplexity provider는 base URL로 transport를 명시합니다.
 
@@ -303,7 +307,7 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
 
 * **OpenAI Chat Completions (`POST /v1/chat/completions`)**:
   - `model`: `lumen` virtual model 또는 공개 provider model ID (필수)
-  - `provider`: 같은 공개 model ID의 route 충돌을 해소하는 선택적 provider type
+  - `provider`: 같은 공개 model ID의 route 충돌을 해소하는 선택적 등록 provider 이름
   - `messages`: 메시지 목록 (필수)
   - `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`, `stream_options`
   - `model="lumen"`은 문자열 content의 `system`/`developer`/`user`/`assistant` transcript만 받고 마지막 `user` message를 요구합니다. Caller tools/tool messages/multimodal content는 400으로 거부하며 Lumen memory/extensions/MCP/tool 실행은 비활성화됩니다.
@@ -315,7 +319,7 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
   - `model`, `messages`, 필수 양수 `max_tokens`, 선택적 `provider`, `system`, `temperature`, `stream`, `metadata`, `stop_sequences`, `thinking`, `tools`, `tool_choice`, `top_k`, `top_p`, `container`를 받습니다.
   - `POST /v1/messages/count_tokens`는 동일한 Anthropic input block을 native token-count transport로 전달합니다.
   - Streaming은 Anthropic event 이름과 body를 유지하고 약 15초 idle마다 `event: ping`을 보냅니다. OpenAI `[DONE]` sentinel로 변환하지 않습니다.
-* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르거나 header가 인식 가능한 `model` provider prefix와 충돌하면 400 `provider_header_conflict`입니다. Request schema에 없는 필드는 422로 거부합니다.
+* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다른 등록 이름이면 400 `provider_header_conflict`입니다. Model prefix는 provider 이름과 비교하지 않습니다. Unicode 이름은 JSON body로 보내세요. Request schema에 없는 필드는 422로 거부합니다.
 
 ### 6.2 Output token budget
 

@@ -12,7 +12,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, StrictInt, field_validator, model_validator
 
 from lumen.auth import require_admin
 from lumen.services import model_discovery, models_dev
@@ -289,7 +289,7 @@ class ModelCreateRequest(BaseModel):
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
     # Optional prompt-cache rates, independent of each other and of the input/output pair.
-    # An unset rate bills that cache category at 0 USD (no catalog fallback).
+    # Unset cache read stays unpriced; unset writes inherit input then 5m at admission.
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -330,7 +330,7 @@ class ModelUpdateRequest(BaseModel):
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
     # Optional prompt-cache rates, independent of each other and of the input/output pair.
-    # An unset rate bills that cache category at 0 USD (no catalog fallback).
+    # Unset cache read stays unpriced; unset writes inherit input then 5m at admission.
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -376,6 +376,7 @@ class ModelResponse(BaseModel):
     api_model_name: str
     api_provider: str
     display_name: str | None
+    sort_order: int = 0
     is_active: bool
     is_title_model: bool = False
     is_memory_model: bool = False
@@ -387,6 +388,10 @@ class ModelResponse(BaseModel):
     cache_read_price_per_million: Decimal | None = None
     cache_write_price_per_million: Decimal | None = None
     cache_write_1h_price_per_million: Decimal | None = None
+    effective_cache_read_price_per_million: Decimal | None = None
+    effective_cache_write_price_per_million: Decimal | None = None
+    effective_cache_write_1h_price_per_million: Decimal | None = None
+    effective_cache_price_sources: dict[str, str | None] | None = None
     models_dev_model_id: str | None = None
     price_source: str | None = None
     capabilities: dict | None = None
@@ -397,6 +402,12 @@ class ModelResponse(BaseModel):
     updated_at: str | None
 
     model_config = {"protected_namespaces": ()}
+
+
+class ModelOrderRequest(BaseModel):
+    model_ids: list[StrictInt] = Field(..., min_length=1)
+
+    model_config = {"extra": "forbid"}
 
 
 class ModelsDevImportSelection(BaseModel):
@@ -689,6 +700,16 @@ async def available_models(provider_id: int, response: Response):
 async def list_models(active_only: bool = False):
     try:
         return await repository.list_models(active_only=active_only)
+    except errors.ChatStorageUnavailable as exc:
+        raise _map_storage(exc) from exc
+
+
+@router.put("/admin/models/order", status_code=204)
+async def reorder_models(payload: ModelOrderRequest):
+    try:
+        await repository.reorder_models(payload.model_ids)
+    except errors.ProviderValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
 

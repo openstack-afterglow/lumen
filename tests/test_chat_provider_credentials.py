@@ -203,15 +203,17 @@ def test_perplexity_public_projection_preserves_route_key_and_custom_label(monke
     default_label = pricing._model_public(
         SimpleNamespace(display_name="perplexity/perplexity/sonar", **base),
         provider_type="perplexity",
+        provider=SimpleNamespace(name="perplexity direct", provider_type="perplexity", api_base=None),
     )
     custom_label = pricing._model_public(
         SimpleNamespace(display_name="Sonar Research", **base),
         provider_type="perplexity",
+        provider=SimpleNamespace(name="perplexity direct", provider_type="perplexity", api_base=None),
     )
 
     assert default_label["model_name"] == "perplexity/perplexity/sonar"
     assert default_label["api_model_name"] == "perplexity/sonar"
-    assert default_label["api_provider"] == "perplexity"
+    assert default_label["api_provider"] == "perplexity direct"
     assert default_label["display_name"] == "perplexity/sonar"
     assert custom_label["display_name"] == "Sonar Research"
 

@@ -25,10 +25,10 @@ from .errors import (
     ProviderNotFoundError,
 )
 from .pricing import (
+    _effective_cache_prices,
     _effective_capabilities,
     _pricing_aware_capabilities,
     _resolved_base_prices,
-    _resolved_cache_prices,
 )
 
 
@@ -228,15 +228,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "capabilities": capabilities,
         "api_key": api_key,
     }
-    cache_prices = _resolved_cache_prices(model, provider)
-    cache_price_sources = {
-        category: "manual" if getattr(model, column, None) is not None else "litellm"
-        for category, column in (
-            ("cache_read", "cache_read_price"),
-            ("cache_creation_5m", "cache_write_price"),
-            ("cache_creation_1h", "cache_write_1h_price"),
-        )
-    }
+    cache_prices, cache_price_sources = _effective_cache_prices(model, provider, input_price, price_source)
     # Catalog rates are frozen with the route fingerprint; old run snapshots
     # retain their previously admitted prices after a LiteLLM upgrade.
     if any(price is not None for price in cache_prices.values()):
@@ -258,7 +250,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
     return {
         "model_name": model.model_name,
         "api_model_name": api_model_name(model.model_name, provider.provider_type),
-        "api_provider": provider.provider_type,
+        "api_provider": provider.name,
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
         "api_base": api_base,
@@ -378,10 +370,10 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None) -> 
                     LlmModel.is_active.is_(True),
                     LlmProvider.is_active.is_(True),
                 )
-                .order_by(LlmModel.id)
+                .order_by(LlmModel.sort_order, LlmModel.id)
             )
             if provider is not None:
-                stmt = stmt.where(LlmProvider.provider_type == provider)
+                stmt = stmt.where(LlmProvider.name == provider)
             rows = (await session.execute(stmt)).all()
 
             def _row_matches(model_row: LlmModel, provider_row: LlmProvider) -> bool:
@@ -409,8 +401,7 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None) -> 
                 return None
 
             if provider is None:
-                provider_types = {route_provider.provider_type for _, route_provider in matches}
-                if len(provider_types) > 1:
+                if len({route_provider.id for _, route_provider in matches}) > 1:
                     raise AmbiguousModelRouteError("model route is ambiguous")
                 exact = [
                     m
@@ -420,7 +411,11 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None) -> 
                     or m[0].model_name == model_name
                 ]
                 if exact:
+                    if len(exact) != 1:
+                        raise AmbiguousModelRouteError("model route is ambiguous")
                     return _resolved_model(*exact[0])
+                if len(matches) != 1:
+                    raise AmbiguousModelRouteError("model route is ambiguous")
                 return _resolved_model(*matches[0])
             else:
                 if len(matches) > 1:
@@ -453,14 +448,14 @@ async def list_api_models() -> list[dict]:
                         LlmModel.is_active.is_(True),
                         LlmProvider.is_active.is_(True),
                     )
-                    .order_by(LlmModel.id)
+                    .order_by(LlmModel.sort_order, LlmModel.id)
                 )
             ).all()
             return [
                 {
                     "model_name": model.model_name,
                     "api_model_name": api_model_name(model.model_name, provider.provider_type),
-                    "api_provider": provider.provider_type,
+                    "api_provider": provider.name,
                 }
                 for model, provider in rows
             ]

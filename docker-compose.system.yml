@@ -76,7 +76,7 @@ services:
       FRONTEND_BASE_URL: http://afterglow.example
       # Keep a recognized adaptive Claude ID so LiteLLM preserves current output_config fields.
       CLAUDE_GATEWAY_MODEL: ${LUMEN_GATEWAY_MODEL:-claude-sonnet-4-6}
-      CLAUDE_GATEWAY_PROVIDER: ${LUMEN_GATEWAY_PROVIDER:-anthropic}
+      CLAUDE_GATEWAY_PROVIDER: ${LUMEN_GATEWAY_PROVIDER:-system-anthropic}
       # Protocol/checkpointer are opt-in per scenario; v1 smoke leaves them at defaults.
       CHAT_EXECUTION_PROTOCOL_VERSION: ${CHAT_EXECUTION_PROTOCOL_VERSION:-1}
       CHAT_CHECKPOINTER_POSTGRES_URL: ${CHAT_CHECKPOINTER_POSTGRES_URL:-}

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.crypto import encrypt_llm_provider_billing_admin_key, encrypt_llm_provider_key
@@ -176,6 +176,8 @@ async def list_providers() -> list[dict]:
 
 
 async def update_provider(provider_id: int, patch: dict) -> dict:
+    if "name" in patch and (not isinstance(patch["name"], str) or not patch["name"].strip()):
+        raise ProviderValidationError("name 은 필수입니다")
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
@@ -203,8 +205,8 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 target_auth_mode,
                 patch.get("api_base", row.api_base),
             )
-            if patch.get("name"):
-                row.name = str(patch["name"]).strip()
+            if "name" in patch:
+                row.name = patch["name"].strip()
             if patch.get("provider_type"):
                 row.provider_type = target_provider_type
             if "auth_mode" in patch:
@@ -282,13 +284,13 @@ async def create_model(
     try:
         async with factory() as session, session.begin():
             subscription_providers = await _lock_subscription_namespaces(session)
-            provider = subscription_providers.get(provider_id) or await session.get(LlmProvider, provider_id)
+            # Creation and reorder use the same global parent-lock order.
+            (await session.execute(select(LlmProvider.id).order_by(LlmProvider.id).with_for_update())).all()
+            provider = (
+                await session.execute(select(LlmProvider).where(LlmProvider.id == provider_id).with_for_update())
+            ).scalar_one_or_none()
             if provider is None:
                 raise ProviderValidationError(f"프로바이더 {provider_id} 가 존재하지 않습니다")
-            if provider.provider_type == "perplexity" and getattr(provider, "auth_mode", "api_key") == "api_key":
-                provider = (
-                    await session.execute(select(LlmProvider).where(LlmProvider.id == provider_id).with_for_update())
-                ).scalar_one()
             auth_mode = getattr(provider, "auth_mode", "api_key")
             namespace_provider_ids = tuple(
                 candidate.id for candidate in subscription_providers.values() if candidate.auth_mode == auth_mode
@@ -306,10 +308,12 @@ async def create_model(
                 namespace_provider_ids=namespace_provider_ids,
                 model_name=canonical_name,
             )
+            next_position = await session.scalar(select(func.coalesce(func.max(LlmModel.sort_order), 0) + 1))
             row = LlmModel(
                 provider_id=provider_id,
                 model_name=canonical_name,
                 display_name=(display_name or None),
+                sort_order=next_position,
                 input_price=input_price,
                 output_price=output_price,
                 **cache_prices,
@@ -323,6 +327,7 @@ async def create_model(
             return _model_public(
                 row,
                 provider_type=provider.provider_type,
+                provider=provider,
                 auth_mode=auth_mode,
             )
     except IntegrityError as exc:
@@ -339,10 +344,10 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
             stmt = (
                 select(LlmModel, LlmProvider)
                 .join(LlmProvider, LlmProvider.id == LlmModel.provider_id)
-                .order_by(LlmModel.id)
+                .order_by(LlmModel.sort_order, LlmModel.id)
             )
             if active_only:
-                stmt = stmt.where(LlmModel.is_active.is_(True))
+                stmt = stmt.where(LlmModel.is_active.is_(True), LlmProvider.is_active.is_(True))
             rows = (await session.execute(stmt)).all()
             public_models: list[dict] = []
             for model, provider in rows:
@@ -375,10 +380,41 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
                         effective_output_price_per_million=effective_output,
                         effective_price_source=effective_source,
                         provider_type=provider.provider_type,
+                        provider=provider,
                         auth_mode=getattr(provider, "auth_mode", "api_key"),
                     )
                 )
             return public_models
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def reorder_models(model_ids: list[int]) -> None:
+    """Replace the global order in one transaction, rejecting stale or partial sets."""
+    if not model_ids or any(type(model_id) is not int or model_id <= 0 for model_id in model_ids):
+        raise ProviderValidationError("model_ids must contain positive model IDs")
+    if len(model_ids) != len(set(model_ids)):
+        raise ProviderValidationError("model_ids must not contain duplicates")
+    factory = _require_db()
+    try:
+        async with factory() as session, session.begin():
+            # Match model-CRUD lock ordering: subscription namespaces, then other parents.
+            await _lock_subscription_namespaces(session)
+            (await session.execute(select(LlmProvider.id).order_by(LlmProvider.id).with_for_update())).all()
+            models = (
+                (await session.execute(select(LlmModel).order_by(LlmModel.id).with_for_update()))
+                .scalars().all()
+            )
+            if set(model_ids) != {model.id for model in models}:
+                raise ProviderValidationError("model_ids must include every current model exactly once")
+            positions = {model_id: position for position, model_id in enumerate(model_ids, 1)}
+            # One UPDATE, with no price-version bump from the updated_at onupdate default.
+            await session.execute(
+                update(LlmModel).where(LlmModel.id.in_(model_ids))
+                .values(sort_order=case(positions, value=LlmModel.id), updated_at=LlmModel.updated_at)
+                .execution_options(synchronize_session=False)
+            )
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
@@ -455,6 +491,7 @@ async def update_model(model_id: int, patch: dict) -> dict:
             return _model_public(
                 row,
                 provider_type=provider.provider_type,
+                provider=provider,
                 auth_mode=auth_mode,
             )
     except IntegrityError as exc:
@@ -554,6 +591,7 @@ async def import_models_dev_prices(
                 _model_public(
                     rows_by_id[local_model_id],
                     provider_type=provider.provider_type,
+                    provider=provider,
                     auth_mode=getattr(provider, "auth_mode", "api_key"),
                 )
                 for local_model_id in selected_external

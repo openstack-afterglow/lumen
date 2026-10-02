@@ -132,8 +132,15 @@ class TestCrossEndpointLedger:
         round_usage = graph._usage_breakdown(usage)
         replayed = graph._replayed_usage(round_usage.as_usage_dict())
         aggregate = execution._usage_payload_breakdown((graph._replayed_usage({}) + replayed).as_usage_dict())
+        # New runs freeze resolved write fallbacks; legacy snapshots stay literal.
+        prices, sources = pricing._effective_cache_prices(
+            LlmModel(model_name=_MODEL, **{
+                column: cache_prices.get(key) for _, column, key in pricing.CACHE_PRICE_FIELDS
+            }),
+            LlmProvider(provider_type="anthropic", api_base=None), _INPUT, "manual",
+        )
         cost = credit.usage_cost_from_pricing_snapshot(
-            _frozen_snapshot(cache_prices),
+            {**_frozen_snapshot(prices), "cache_price_sources": sources},
             prompt_tokens=aggregate.input_tokens,
             completion_tokens=aggregate.output_tokens,
             breakdown=aggregate,
@@ -163,8 +170,8 @@ class TestCrossEndpointLedger:
         [
             # 210×3e-6 + 150×3e-7 + 20×3.75e-6 + 10×6e-6 + 45×1.5e-5
             (_CACHE_PRICES, Decimal("0.0014850000"), "priced"),
-            # Cache categories bill 0 until a rate is set on the model.
-            (_NO_CACHE_PRICES, Decimal("0.0013050000"), "partial"),
+            # Missing read remains unpriced; new write rates inherit input.
+            (_NO_CACHE_PRICES, Decimal("0.0013950000"), "partial"),
         ],
     )
     async def test_chat_and_passthrough_write_identical_ledgers(self, cache_prices, raw_cost, status):
@@ -339,11 +346,13 @@ class TestCacheRates:
             **cache_prices,
         )
 
-    def test_unset_rate_bills_zero_and_is_partial(self):
+    def test_unset_read_is_partial_and_writes_inherit_input(self):
         cost = self._cost()
         assert cost.input_cost == Decimal("0.0003000000")  # uncached 100 tokens only
-        assert cost.cache_read_cost == cost.cache_creation_5m_cost == cost.cache_creation_1h_cost == Decimal("0")
-        assert cost.raw_cost == Decimal("0.0018000000")
+        assert cost.cache_read_cost == Decimal("0")
+        assert cost.cache_creation_5m_cost == Decimal("0.0006000000")
+        assert cost.cache_creation_1h_cost == Decimal("0.0003000000")
+        assert cost.raw_cost == Decimal("0.0027000000")
         assert cost.pricing_status == "partial"
         assert cost.pricing_snapshot["input"]["tokens"] == 100
         assert cost.pricing_snapshot["cache_read"] == {
@@ -364,10 +373,29 @@ class TestCacheRates:
         assert cost.pricing_snapshot["cache_creation_1h"]["source"] == "manual"
         assert cost.pricing_snapshot["cache_creation_1h"]["effective_price_per_million"] == "6.000000"
 
-    def test_one_missing_rate_is_partial_and_only_that_category_is_free(self):
+    def test_missing_hour_rate_inherits_five_minute_rate(self):
         cost = self._cost(**{**_CACHE_PRICES, "cache_write_1h_price_per_token": None})
-        assert cost.cache_creation_1h_cost == Decimal("0")
-        assert cost.raw_cost == Decimal("0.0027300000")
+        assert cost.cache_creation_1h_cost == Decimal("0.0003750000")
+        assert cost.raw_cost == Decimal("0.0031050000")
+        assert cost.pricing_status == "priced"
+
+    @pytest.mark.parametrize(
+        ("rates", "five_minute", "one_hour"),
+        [
+            ({"cache_write_price_per_token": Decimal("0")}, Decimal("0"), Decimal("0")),
+            ({"cache_write_1h_price_per_token": Decimal("0")}, Decimal("0.0006"), Decimal("0")),
+        ],
+    )
+    def test_normal_write_cascade_preserves_explicit_zero(self, rates, five_minute, one_hour):
+        cost = self._cost(**rates)
+        assert cost.cache_creation_5m_cost == five_minute
+        assert cost.cache_creation_1h_cost == one_hour
+
+    def test_frozen_title_billing_does_not_apply_new_write_policy(self):
+        cost = self._cost(allow_cache_write_fallback=False, allow_catalog_cache=False, allow_catalog_prices=False)
+        assert cost.cache_creation_5m_cost == 0
+        assert cost.cache_creation_1h_cost == 0
+        assert cost.raw_cost == Decimal("0.0018")
         assert cost.pricing_status == "partial"
 
     def test_zero_cache_tokens_without_rate_stays_priced(self):
@@ -579,6 +607,64 @@ class TestConfigFingerprint:
         assert with_1h["config_version_hash"] != baseline
         assert with_read["cache_read_price_per_token"] == Decimal("0.0000003000")
 
+    @pytest.mark.parametrize(
+        ("manual_5m", "manual_1h", "five_minute", "one_hour"),
+        [
+            (None, None, Decimal("0.000003"), Decimal("0.000003")),
+            (Decimal("0"), None, Decimal("0"), Decimal("0")),
+            (None, Decimal("0"), Decimal("0.000003"), Decimal("0")),
+            (Decimal("0.000004"), Decimal("0.000006"), Decimal("0.000004"), Decimal("0.000006")),
+        ],
+    )
+    def test_new_admission_freezes_write_cascade_for_executor_and_advisor(
+        self, monkeypatch, manual_5m, manual_1h, five_minute, one_hour
+    ):
+        monkeypatch.setattr(pricing, "bundled_cache_rates", lambda *_args: {})
+        resolved = routing._resolved_model(*self._rows(
+            cache_write_price=manual_5m, cache_write_1h_price=manual_1h,
+        ))
+        _, frozen = _run_snapshots(resolved, {}, feature_routes={"advisor": resolved})
+        observed = UsageBreakdown.from_totals(
+            300, 0, cache_creation_5m_input_tokens=100, cache_creation_1h_input_tokens=100,
+        )
+        cost = credit.usage_cost_from_pricing_snapshot(
+            frozen, prompt_tokens=300, completion_tokens=0, breakdown=observed,
+        )
+        assert cost.cache_creation_5m_cost == 100 * five_minute
+        assert cost.cache_creation_1h_cost == 100 * one_hour
+        assert cost.raw_cost == 100 * (_INPUT + five_minute + one_hour)
+        assert cost.pricing_status == "priced"
+        records = [
+            {"kind": f"advisor_cache_creation_{ttl}_tokens", "price_key": key,
+             "source": "advisor", "unit": "token", "quantity": "100", "prompt_tokens": 300}
+            for ttl, key in (
+                ("5m", "advisor_cache_write_price_per_token"),
+                ("1h", "advisor_cache_write_1h_price_per_token"),
+            )
+        ]
+        total, _ = execution._managed_usage_components(records, pricing_snapshot=frozen, model_name=_MODEL)
+        assert total == 100 * (five_minute + one_hour)
+        # Previously admitted missing categories remain unpriced, not backfilled at settlement.
+        legacy_total, legacy_components = execution._managed_usage_components(
+            records, pricing_snapshot={"component_prices": {}}, model_name=_MODEL,
+        )
+        assert legacy_total == 0
+        assert all(item["metadata"].get("unpriced") for item in legacy_components)
+
+    @pytest.mark.parametrize(("manual_5m", "expected"), [(None, Decimal("0.8")), (Decimal("0"), Decimal("0"))])
+    def test_missing_hour_inherits_only_actual_catalog_five_minute_tier(self, monkeypatch, manual_5m, expected):
+        monkeypatch.setattr(pricing, "bundled_cache_rates", lambda *_args: {
+            "cache_write_price_per_token": Decimal("0.000004"),
+            "cache_write_price_per_token_above_200k": Decimal("0.000008"),
+        })
+        resolved = routing._resolved_model(*self._rows(cache_write_price=manual_5m))
+        _, frozen = _run_snapshots(resolved, {})
+        observed = UsageBreakdown.from_totals(200_001, 0, cache_creation_1h_input_tokens=100_000)
+        result = credit.usage_cost_from_pricing_snapshot(
+            frozen, prompt_tokens=200_001, completion_tokens=0, breakdown=observed,
+        )
+        assert result.cache_creation_1h_cost == expected
+
     def test_admission_snapshot_freezes_cache_rates(self, monkeypatch):
         resolved = routing._resolved_model(*self._rows(cache_write_price=Decimal("0.0000037500")))
         summary = {**resolved, "cache_write_1h_price_per_token": Decimal("0.0000060000")}
@@ -586,7 +672,7 @@ class TestConfigFingerprint:
 
         assert pricing_snapshot["cache_read_price_per_token"] is None
         assert Decimal(pricing_snapshot["cache_write_price_per_token"]) == Decimal("0.00000375")
-        assert pricing_snapshot["cache_write_1h_price_per_token"] is None
+        assert Decimal(pricing_snapshot["cache_write_1h_price_per_token"]) == Decimal("0.00000375")
         assert Decimal(pricing_snapshot["summary_route"]["cache_write_1h_price_per_token"]) == Decimal("0.000006")
 
 

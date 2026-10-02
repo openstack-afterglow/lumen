@@ -115,21 +115,23 @@ def test_runtime_enabled_kolla_config_loads_as_typed_settings(tmp_path):
         lumen_controller_listen_address="10.42.0.5", lumen_controller_listen_port=8013,
         lumen_worker_concurrency=4, lumen_worker_heartbeat_seconds=5,
         lumen_worker_drain_seconds=300, lumen_chat_compat_run_timeout_seconds=300,
+        lumen_claude_gateway_provider='nvidia "nim" 研究',
     )
     config_file = tmp_path / "lumen.conf"
     config_file.write_text(environment.from_string(source).render(**values), encoding="utf-8")
     parsed = tomllib.loads(config_file.read_text(encoding="utf-8"))
     assert isinstance(parsed["lumen"]["runtime_config"], str)
+    assert parsed["chat"]["claude_gateway_provider"] == 'nvidia "nim" 研究'
 
     result = subprocess.run(
         [sys.executable, "-c", "import json; from lumen.config import get_settings; "
-         "c = get_settings().runtime_config; "
-         "print(json.dumps([c.enabled, c.listen_host, c.pools[0].cloud_profile_id]))"],
+         "s = get_settings(); c = s.runtime_config; "
+         "print(json.dumps([c.enabled, c.listen_host, c.pools[0].cloud_profile_id, s.claude_gateway_provider]))"],
         env={"LUMEN_CONFIG_FILE": str(config_file), "PATH": os.environ.get("PATH", ""),
              "PYTHONPATH": str(REPO_ROOT)},
         capture_output=True, text=True, check=True, timeout=20,
     )
-    assert json.loads(result.stdout) == [True, "10.42.0.5", "trusted"]
+    assert json.loads(result.stdout) == [True, "10.42.0.5", "trusted", 'nvidia "nim" 研究']
 
 
 def test_runtime_worker_mount_excludes_controller_signing_keys():

@@ -198,10 +198,10 @@ class TestAvailableModels:
             return [
                 {
                     "id": index,
-                    "provider_id": 1,
+                    "provider_id": index,
                     "model_name": model_name,
                     "api_model_name": model_name,
-                    "api_provider": provider_type,
+                    "api_provider": f"registered provider {index}",
                     "display_name": model_name,
                     "effective_capabilities": {"reasoning": True, "reasoning_options": options},
                 }
@@ -209,7 +209,10 @@ class TestAvailableModels:
             ]
 
         async def fake_providers():
-            return [{"id": 1, "name": "provider", "has_api_key": True}]
+            return [
+                {"id": index, "name": f"registered provider {index}", "provider_type": provider_type, "has_api_key": True}
+                for index, (provider_type, _, _, _) in enumerate(cases, start=1)
+            ]
 
         monkeypatch.setattr(repository, "list_models", fake_models)
         monkeypatch.setattr(repository, "list_providers", fake_providers)

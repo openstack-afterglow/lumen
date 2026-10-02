@@ -102,6 +102,7 @@ class LlmModel(Base):
     provider_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_providers.id", ondelete="CASCADE"), nullable=False)
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     display_name: Mapped[str | None] = mapped_column(VARCHAR(150))
+    sort_order: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     # 대화 제목 자동 요약에 쓸 모델. 앱 레벨에서 최대 1개만 True 로 유지(set_title_model).
     is_title_model: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
@@ -110,8 +111,8 @@ class LlmModel(Base):
     # 미지정 시 litellm 내장 단가 사용 (override용). 토큰당 USD 단가.
     input_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     output_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
-    # 프롬프트 캐시 토큰당 USD 단가(관리자 수동 설정 전용, catalog fallback 없음).
-    # 미설정 카테고리는 0원으로 과금하고 pricing_status=partial 로 남는다.
+    # Stored manual cache rates; resolved projections apply direct catalog/write fallbacks.
+    # Missing cache read remains unpriced; stored null is never replaced by an effective rate.
     cache_read_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     cache_write_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # 5분 TTL cache write
     cache_write_1h_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
@@ -131,6 +132,7 @@ class LlmModel(Base):
 
     __table_args__ = (
         UniqueConstraint("provider_id", "model_name", name="uq_llm_models_provider_model"),
+        Index("idx_llm_models_sort_order", "sort_order", "id"),
         Index("idx_llm_models_active", "is_active"),
     )
 

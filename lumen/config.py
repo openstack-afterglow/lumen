@@ -230,9 +230,8 @@ class Settings(BaseSettings):
     def validate_claude_gateway_provider(cls, value: str) -> str:
         value = value.strip()
         if value and (
-            len(value) > 40
-            or not value[0].isalnum()
-            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in value)
+            len(value) > 100
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
         ):
             raise ValueError("claude_gateway_provider is invalid")
         return value

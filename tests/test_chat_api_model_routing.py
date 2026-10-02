@@ -103,13 +103,14 @@ def provider_db(monkeypatch):
         *,
         provider_id: int = 1,
         provider_type: str = "perplexity",
+        name: str | None = None,
         is_active: bool = True,
     ):
         with sync_factory.begin() as session:
             session.add(
                 LlmProvider(
                     id=provider_id,
-                    name=f"{provider_type}-{provider_id}",
+                    name=name or f"{provider_type}-{provider_id}",
                     provider_type=provider_type,
                     auth_mode="api_key",
                     is_active=is_active,
@@ -193,7 +194,7 @@ async def test_api_route_selects_explicit_provider_and_rejects_ambiguity(provide
     add_model(canonical, model_id=11, provider_id=1)
     add_model(f"perplexity/{canonical}", model_id=12, provider_id=2)
 
-    selected = await routing.resolve_api_model(canonical, provider="perplexity")
+    selected = await routing.resolve_api_model(canonical, provider="perplexity-2")
 
     assert selected["model_id"] == 12
     assert selected["provider_type"] == "perplexity"
@@ -212,7 +213,7 @@ async def test_api_route_ignores_inactive_models_and_providers(provider_db):
     add_model(f"perplexity/{canonical}", model_id=11, provider_id=1)
     add_model(f"perplexity/{canonical}", model_id=12, provider_id=2, is_active=False)
 
-    assert await routing.resolve_api_model(canonical, provider="perplexity") is None
+    assert await routing.resolve_api_model(canonical, provider="perplexity-2") is None
 
 
 async def test_api_route_rejects_multiple_connections_of_same_provider_type(provider_db):
@@ -224,7 +225,8 @@ async def test_api_route_rejects_multiple_connections_of_same_provider_type(prov
     add_model(f"perplexity/{canonical}", model_id=12, provider_id=2)
 
     with pytest.raises(routing.AmbiguousModelRouteError):
-        await routing.resolve_api_model(canonical, provider="perplexity")
+        await routing.resolve_api_model(canonical)
+    assert (await routing.resolve_api_model(canonical, provider="perplexity-2"))["model_id"] == 12
 
 
 async def test_api_model_listing_keeps_internal_keys_private_and_does_not_decrypt(provider_db, monkeypatch):
@@ -243,7 +245,7 @@ async def test_api_model_listing_keeps_internal_keys_private_and_does_not_decryp
         {
             "model_name": "perplexity/perplexity/sonar",
             "api_model_name": "perplexity/sonar",
-            "api_provider": "perplexity",
+            "api_provider": "perplexity-1",
         }
     ]
 
@@ -301,10 +303,121 @@ async def test_api_route_resolves_gemini_model_with_or_without_provider(provider
     assert res2["model_id"] == 301
 
     # Resolve with explicit provider
-    res3 = await routing.resolve_api_model("gemini-3.8-flash", provider="gemini")
+    res3 = await routing.resolve_api_model("gemini-3.8-flash", provider="gemini-30")
     assert res3 is not None
     assert res3["model_id"] == 302
     assert res3["api_model_name"] == "gemini-3.8-flash"
+
+
+@pytest.mark.parametrize("provider_name", ["nvidia nim", "엔비디아 nim"])
+async def test_named_provider_routes_with_internal_openai_transport(provider_db, provider_name):
+    from lumen.api.compat.openai import OpenAIChatRequest, models_list
+    from lumen.services.completion_api import select_api_provider
+
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_id=3, provider_type="openai", name=provider_name)
+    add_provider(provider_id=4, provider_type="openai", name="openai official")
+    add_model("nemotron-chat", provider_id=3, model_id=31)
+    add_model("nemotron-chat", provider_id=4, model_id=41)
+
+    listed = await routing.list_api_models()
+    assert [item["api_provider"] for item in listed] == [provider_name, "openai official"]
+    assert models_list(listed)["data"][0]["providers"] == [provider_name, "openai official"]
+    body = OpenAIChatRequest(model="nemotron-chat", provider=provider_name, messages=[{"role":"user", "content":"hi"}])
+    chosen = await routing.resolve_api_model(
+        body.model, provider=select_api_provider(body.model, body.provider, None)
+    )
+    assert chosen["api_provider"] == provider_name
+    assert chosen["provider_type"] == "openai"
+    assert chosen["model_id"] == 31
+    with pytest.raises(routing.AmbiguousModelRouteError):
+        await routing.resolve_api_model("nemotron-chat")
+
+
+async def test_global_order_rejects_partial_duplicate_and_unknown_without_mutating(provider_db, monkeypatch):
+    from lumen.api.compat.openai import models_list
+    from lumen.api.conversations import list_available_models
+    from lumen.services.providers import pricing
+
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr(pricing, "_effective_capabilities", lambda *_args: ({}, "test"))
+    monkeypatch.setattr(pricing, "_pricing_aware_capabilities", lambda _row, caps, **_kw: caps)
+    monkeypatch.setattr(routing, "_resolved_base_prices", pricing._resolved_base_prices)
+
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_id=1, provider_type="openai", name="nvidia nim")
+    add_provider(provider_id=2, provider_type="anthropic", name="anthropic direct")
+    add_model("first", model_id=11, provider_id=1)
+    add_model("second", model_id=12, provider_id=2)
+    add_model("third", model_id=13, provider_id=1, is_active=False)
+    before = await routing.resolve_model_by_id(11)
+
+    await repository.reorder_models([12, 13, 11])
+    assert [row["id"] for row in await repository.list_models()] == [12, 13, 11]
+    public = await routing.list_api_models()
+    assert [row["api_model_name"] for row in public] == ["second", "first"]
+    assert [row["id"] for row in models_list(public)["data"]] == ["second", "first"]
+    native = await list_available_models(token_info={})
+    assert [(row["id"], row["api_provider"]) for row in native] == [(12, "anthropic direct"), (11, "nvidia nim")]
+    assert (await routing.resolve_model_by_id(11))["config_version_hash"] == before["config_version_hash"]
+    for invalid in ([12, 11], [12, 12, 11], [12, 13, 404]):
+        with pytest.raises(ProviderValidationError):
+            await repository.reorder_models(invalid)
+        assert [row["id"] for row in await repository.list_models()] == [12, 13, 11]
+
+    created = await repository.create_model(
+        provider_id=1, model_name="new-model", input_price_per_million="0", output_price_per_million="0",
+    )
+    assert created["sort_order"] == 4
+    assert [row["id"] for row in await repository.list_models()] == [12, 13, 11, created["id"]]
+    assert [row["api_model_name"] for row in await routing.list_api_models()] == ["second", "first", "new-model"]
+
+
+async def test_provider_rename_rejects_blank_and_changes_external_selector(provider_db, monkeypatch):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_id=1, provider_type="openai", name="old endpoint")
+    add_model("nemotron-chat", model_id=11)
+    for bad_name in (None, "", "  "):
+        with pytest.raises(ProviderValidationError, match="name"):
+            await repository.update_provider(1, {"name": bad_name})
+
+    async def lock_provider(session, *, provider_id, model_ids=None):
+        return await session.get(LlmProvider, provider_id), []
+
+    monkeypatch.setattr(repository, "_lock_mutable_route", lock_provider)
+    await repository.update_provider(1, {"name": "  nvidia nim  "})
+    assert await routing.resolve_api_model("nemotron-chat", provider="old endpoint") is None
+    selected = await routing.resolve_api_model("nemotron-chat", provider="nvidia nim")
+    assert selected["provider_type"] == "openai"
+    assert selected["api_provider"] == "nvidia nim"
+
+
+def test_admin_projection_exposes_effective_cache_without_overwriting_manual_fields(monkeypatch):
+    from lumen.services.providers import pricing
+
+    monkeypatch.setattr(pricing, "_effective_capabilities", lambda *_args: ({}, "test"))
+    monkeypatch.setattr(pricing, "_pricing_aware_capabilities", lambda _row, caps, **_kw: caps)
+    monkeypatch.setattr(pricing, "bundled_cache_rates", lambda *_args: {
+        "cache_write_1h_price_per_token": Decimal("0.000003"),
+    })
+    model = LlmModel(
+        id=1, provider_id=2, model_name="claude", is_active=True,
+        input_price=Decimal("0.000002"), output_price=Decimal("0.000004"),
+        price_source="manual", cache_read_price=Decimal("0"),
+    )
+    provider = LlmProvider(id=2, name="nvidia nim", provider_type="openai")
+    projection = pricing._model_public(model, provider=provider, provider_type="openai")
+
+    assert projection["api_provider"] == "nvidia nim"
+    assert projection["cache_read_price_per_million"] == 0
+    assert projection["cache_write_price_per_million"] is None
+    assert projection["cache_write_1h_price_per_million"] is None
+    assert projection["effective_cache_read_price_per_million"] == 0
+    assert projection["effective_cache_write_price_per_million"] == 2
+    assert projection["effective_cache_write_1h_price_per_million"] == 3
+    assert projection["effective_cache_price_sources"] == {
+        "cache_read": "manual", "cache_creation_5m": "fallback_input:manual", "cache_creation_1h": "litellm",
+    }
 
 
 def test_capabilities_detect_exact_native_search_support():

@@ -47,6 +47,10 @@ class TestAdminGate:
         resp = await non_admin_client.post(_MODELS_URL, json={"provider_id": 1, "model_name": "gpt-4o"})
         assert resp.status_code == 403
 
+    async def test_reorder_forbidden_for_non_admin(self, non_admin_client):
+        response = await non_admin_client.put(f"{_MODELS_URL}/order", json={"model_ids": [1]})
+        assert response.status_code == 403
+
 
 class TestProviderCrud:
     async def test_create_masks_api_key(self, admin_client, monkeypatch):
@@ -192,6 +196,11 @@ class TestProviderCrud:
 
 
 class TestModelCrud:
+    @pytest.mark.parametrize("model_ids", [[], [True], [1.5], ["1"]])
+    async def test_reorder_requires_nonempty_strict_integer_ids(self, admin_client, model_ids):
+        response = await admin_client.put(f"{_MODELS_URL}/order", json={"model_ids": model_ids})
+        assert response.status_code == 422
+
     async def test_create_model_ok(self, admin_client, monkeypatch):
         async def fake_create(**kwargs):
             return {

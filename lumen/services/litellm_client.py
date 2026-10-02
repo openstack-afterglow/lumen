@@ -416,11 +416,12 @@ def cost_from_usage(
     cache_price_sources: Mapping[str, str] | None = None,
     allow_catalog_cache: bool = True,
     allow_catalog_prices: bool = True,
+    allow_cache_write_fallback: bool = True,
 ) -> UsageCost:
     """Bill provider-reported token totals using manual or exact catalog prices.
 
-    A direct provider's known cache rates fill only unset categories. A custom
-    base requires configured prices; missing categories remain visibly partial.
+    Direct catalog prices fill unset categories. Missing writes inherit input
+    (5m), then effective 5m (1h). Cache reads still require their own rate.
     """
     if breakdown is None:
         breakdown = UsageBreakdown.from_totals(prompt_tokens, completion_tokens)
@@ -482,6 +483,12 @@ def cost_from_usage(
         if prompt_tokens > 200_000 and tier is not None:
             rate = tier
             source = source or "litellm"
+        if allow_cache_write_fallback and rate is None and name == "cache_creation_5m":
+            rate = input_rate
+            source = f"fallback_input:{input_source or 'unknown'}" if rate is not None else None
+        elif allow_cache_write_fallback and rate is None and name == "cache_creation_1h":
+            rate = cache_components["cache_creation_5m"][1]
+            source = f"fallback_5m:{cache_sources['cache_creation_5m']}" if rate is not None else None
         cost = (rate * tokens).quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else Decimal("0")
         cache_components[name] = (tokens, rate, cost)
         cache_sources[name] = source

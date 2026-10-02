@@ -55,3 +55,9 @@ Maintainers MUST label test definitions and local fake-provider/container result
 #### Scenario: Local system gate passes
 - **WHEN** Compose tests complete using fake provider HTTP
 - **THEN** evidence records local API/worker/process behavior only, not live provider, Keystone, cloud guest or production rollout acceptance
+
+## Historical architecture review evidence
+
+Before this documentation migration, the architecture marker recorded source SHA-256 `9fcd3787be0cad2a4957d69a00525a07b31e29e74e5ce4a1b6c9024c90530d7a` at `2026-09-27T14:41:45Z`, with summary: "Migration 019 shared-message membership, provider-compliant title prompts, and haiku compaction exclusion verified with real MariaDB and live Anthropic API."
+
+This is preserved prior-review evidence for that source snapshot, not a new execution or a claim that the documentation migration reran MariaDB or Anthropic checks. A later documentation-only guard stamp does not replace this historical verification scope.

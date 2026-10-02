@@ -66,21 +66,35 @@ CACHE_PRICE_FIELDS = (
 )
 
 
-def _resolved_cache_prices(model: LlmModel, provider: LlmProvider) -> dict[str, Decimal | None]:
-    """Manual rates override exact direct-provider catalog rates per category."""
+def _effective_cache_prices(
+    model: LlmModel, provider: LlmProvider, input_rate: Decimal | None, input_source: str | None = None
+) -> tuple[dict[str, Decimal | None], dict[str, str | None]]:
+    """Freeze manual/catalog rates, then inherit missing writes from input and 5m."""
     catalog = bundled_cache_rates(model.model_name, provider.provider_type, provider.api_base)
     prices: dict[str, Decimal | None] = {}
-    for _, column, resolved_key in CACHE_PRICE_FIELDS:
-        value = getattr(model, column, None)
-        rate = Decimal(value) if value is not None else catalog.get(resolved_key)
-        prices[resolved_key] = (
-            rate.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else None
+    sources: dict[str, str | None] = {}
+    for category, (_, column, key) in zip(
+        ("cache_read", "cache_creation_5m", "cache_creation_1h"), CACHE_PRICE_FIELDS, strict=True
+    ):
+        manual = getattr(model, column, None)
+        rate = Decimal(manual) if manual is not None else catalog.get(key)
+        source = "manual" if manual is not None else "litellm" if rate is not None else None
+        if rate is None and category == "cache_creation_5m" and input_rate is not None:
+            rate, source = input_rate, f"fallback_input:{input_source or 'unknown'}"
+        elif rate is None and category == "cache_creation_1h":
+            rate = prices["cache_write_price_per_token"]
+            source = f"fallback_5m:{sources['cache_creation_5m']}" if rate is not None else None
+        prices[key] = rate.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if rate is not None else None
+        tier = catalog.get(f"{key}_above_200k") if source == "litellm" else None
+        if tier is None and category == "cache_creation_1h" and source == "fallback_5m:litellm":
+            tier = prices["cache_write_price_per_token_above_200k"]
+        prices[f"{key}_above_200k"] = (
+            tier.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if tier is not None else None
         )
-        tier_rate = catalog.get(f"{resolved_key}_above_200k") if value is None else None
-        prices[f"{resolved_key}_above_200k"] = (
-            tier_rate.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if tier_rate is not None else None
-        )
-    return prices
+        sources[category] = source
+    return prices, sources
+
+
 
 
 def _validate_cache_prices(values: dict) -> dict[str, Decimal | None]:
@@ -167,8 +181,18 @@ def _model_public(
     effective_output_price_per_million: Decimal | None = None,
     effective_price_source: str | None = None,
     provider_type: str | None = None,
+    provider: LlmProvider,
     auth_mode: str = "api_key",
 ) -> dict:
+    if effective_input_price_per_million is None and row.input_price is None:
+        input_rate, output_rate, resolved_source, _ = _resolved_base_prices(row, provider)
+        effective_input_price_per_million = _per_million_price(input_rate)
+        effective_output_price_per_million = _per_million_price(output_rate)
+        effective_price_source = resolved_source
+    elif effective_input_price_per_million is None:
+        effective_input_price_per_million = _per_million_price(row.input_price)
+        effective_output_price_per_million = _per_million_price(row.output_price)
+        effective_price_source = row.price_source
     eff_caps, eff_caps_source = _effective_capabilities(row, provider_type, auth_mode)
     public_model_name = api_model_name(row.model_name, provider_type or "")
     display_name = row.display_name
@@ -196,12 +220,16 @@ def _model_public(
         input_price=effective_input,
         output_price=effective_output,
     )
+    effective_cache, effective_cache_sources = _effective_cache_prices(
+        row, provider, effective_input, effective_price_source
+    )
     return {
         "id": row.id,
+        "sort_order": getattr(row, "sort_order", row.id),
         "provider_id": row.provider_id,
         "model_name": row.model_name,
         "api_model_name": public_model_name,
-        "api_provider": provider_type,
+        "api_provider": provider.name,
         "display_name": display_name,
         "is_active": row.is_active,
         "is_title_model": row.is_title_model,
@@ -212,6 +240,10 @@ def _model_public(
         "effective_output_price_per_million": effective_output_price_per_million,
         "effective_price_source": effective_price_source,
         **{field: _per_million_price(getattr(row, column, None)) for field, column, _ in CACHE_PRICE_FIELDS},
+        "effective_cache_read_price_per_million": _per_million_price(effective_cache.get("cache_read_price_per_token")),
+        "effective_cache_write_price_per_million": _per_million_price(effective_cache.get("cache_write_price_per_token")),
+        "effective_cache_write_1h_price_per_million": _per_million_price(effective_cache.get("cache_write_1h_price_per_token")),
+        "effective_cache_price_sources": effective_cache_sources,
         "models_dev_model_id": row.models_dev_model_id,
         "price_source": row.price_source,
         "capabilities": row.capabilities,

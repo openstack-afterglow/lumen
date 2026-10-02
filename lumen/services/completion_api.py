@@ -26,36 +26,13 @@ from lumen.services.usage_breakdown import UsageBreakdown
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_TOKENS = 4096
-_ROUTING_PROVIDER_PREFIXES = frozenset(
-    {
-        "anthropic",
-        "azure",
-        "bedrock",
-        "deepseek",
-        "gemini",
-        "ollama",
-        "openai",
-        "openrouter",
-        "perplexity",
-        "vertex_ai",
-    }
-)
-
 
 def select_api_provider(model: str, body_provider: str | None, header_provider: str | None) -> str | None:
     if body_provider and header_provider and body_provider != header_provider:
         raise CompletionError(400, "provider_header_conflict")
-    selected = body_provider or header_provider
-    prefix, separator, _bare = model.partition("/")
-    if (
-        body_provider is None
-        and header_provider
-        and separator
-        and prefix in _ROUTING_PROVIDER_PREFIXES
-        and prefix != header_provider
-    ):
-        raise CompletionError(400, "provider_header_conflict")
-    return selected
+    # Model transport prefixes are not registered provider names.
+    del model
+    return body_provider or header_provider
 
 
 class CompletionError(Exception):

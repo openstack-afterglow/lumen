@@ -473,6 +473,7 @@ async def _apply_result(job: dict[str, Any]) -> bool:
                 cache_price_sources=pricing.get("cache_price_sources"),
                 allow_catalog_cache=False,
                 allow_catalog_prices=False,
+                allow_cache_write_fallback=False,
             )
             await credit.apply_usage_in_transaction(
                 session,

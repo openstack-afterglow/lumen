@@ -29,8 +29,8 @@ class OpenAIChatRequest(BaseModel):
     provider: str | None = Field(
         default=None,
         min_length=1,
-        max_length=40,
-        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+        max_length=100,
+        pattern=r"^[^\x00-\x1f\x7f]+$",
     )
     messages: list[dict] = Field(..., min_length=1)
     stream: bool = False
@@ -189,8 +189,6 @@ def models_list(models: list[dict], include_lumen: bool = False) -> dict:
         provider = model["api_provider"]
         if provider not in item["providers"]:
             item["providers"].append(provider)
-    for item in data:
-        item["providers"].sort()
     return {
         "object": "list",
         "data": data,
@@ -218,8 +216,8 @@ async def chat_completions(
         default=None,
         alias="X-Lumen-Provider",
         min_length=1,
-        max_length=40,
-        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+        max_length=100,
+        pattern=r"^[^\x00-\x1f\x7f]+$",
     ),
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
@@ -365,8 +363,8 @@ async def list_models(
         default=None,
         alias="X-Lumen-Provider",
         min_length=1,
-        max_length=40,
-        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+        max_length=100,
+        pattern=r"^[^\x00-\x1f\x7f]+$",
     ),
     token_info: dict = Depends(require_api_key_scopes("models:read")),
 ):

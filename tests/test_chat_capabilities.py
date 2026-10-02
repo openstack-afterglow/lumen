@@ -502,7 +502,10 @@ def test_public_model_marks_unpriced_text_route_unavailable():
         updated_at=None,
     )
 
-    public = _model_public(model, provider_type="openai")
+    public = _model_public(
+        model, provider_type="openai",
+        provider=SimpleNamespace(name="openai", provider_type="openai", api_base=None),
+    )
 
     assert public["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is False
 

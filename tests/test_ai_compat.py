@@ -87,7 +87,7 @@ class TestOpenAITranslate:
                     "object": "model",
                     "created": 0,
                     "owned_by": "lumen",
-                    "providers": ["anthropic", "perplexity"],
+                    "providers": ["perplexity", "anthropic"],
                 }
             ],
         }
@@ -403,7 +403,7 @@ class TestOpenAIEndpoint:
             "/v1/chat/completions",
             json={
                 "model": "gpt-4o",
-                "provider": "Perplexity!",
+                "provider": "nvidia\nnim",
                 "messages": [{"role": "user", "content": "hi"}],
             },
             headers=_H,
@@ -1406,18 +1406,24 @@ class TestAnthropicEndpoint:
         assert conflict.status_code == 400
         assert conflict.json()["type"] == "error"
 
-    async def test_model_prefix_conflict_is_400(self, client, _auth):
+    async def test_model_transport_prefix_does_not_conflict_with_registered_name(self, client, _auth, _core, monkeypatch):
+        captured = []
+
+        async def resolve(model, *, provider=None):
+            captured.append((model, provider))
+            return {"model_name": model, "api_model_name": model, "api_provider": provider, "provider_name": provider}
+
+        monkeypatch.setattr(core, "resolve_api", resolve)
         response = await client.post(
             "/v1/messages",
             json={
-                "model": "openai/gpt-4o",
-                "max_tokens": 10,
+                "model": "openai/gpt-4o", "max_tokens": 10,
                 "messages": [{"role": "user", "content": "hi"}],
             },
-            headers={**_H, "X-Lumen-Provider": "anthropic"},
+            headers={**_H, "X-Lumen-Provider": "nvidia nim"},
         )
-        assert response.status_code == 400
-        assert response.json()["error"]["message"] == "provider_header_conflict"
+        assert response.status_code == 200
+        assert captured == [("openai/gpt-4o", "nvidia nim")]
 
     async def test_native_request_options_are_not_lossily_converted(self, client, _auth, monkeypatch):
         captured = {}

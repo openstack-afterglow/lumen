@@ -172,6 +172,15 @@ def test_claude_gateway_base_url_rejects_wrong_path_and_insecure_public_origin()
     )
 
 
+def test_claude_gateway_provider_accepts_registered_display_names():
+    assert Settings(claude_gateway_provider=" nvidia nim ").claude_gateway_provider == "nvidia nim"
+    assert Settings(claude_gateway_provider="연구 " + "A" * 97).claude_gateway_provider == "연구 " + "A" * 97
+    with pytest.raises(ValueError, match="claude_gateway_provider"):
+        Settings(claude_gateway_provider="A" * 101)
+    with pytest.raises(ValueError, match="claude_gateway_provider"):
+        Settings(claude_gateway_provider="nvidia\nnim")
+
+
 def test_lumen_maps_afterglow_openstack_section(monkeypatch):
     monkeypatch.setattr(
         "lumen.config.load_raw_toml",

@@ -66,7 +66,7 @@ async def list_available_models(token_info: dict = Depends(require_scopes("model
                 "capabilities": caps or None,
                 "context_limit": caps.get("context_limit") if isinstance(caps, dict) else None,
                 "reasoning_none_supported": capabilities.reasoning_can_be_disabled(
-                    caps if isinstance(caps, dict) else None, m["api_provider"]
+                    caps if isinstance(caps, dict) else None, provider.get("provider_type") if provider else None
                 ),
             }
         )
