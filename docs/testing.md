@@ -55,6 +55,12 @@ Actual durable hook smoke는 image/audio 입력·캐시 입력·출력 각각 1 
 
 0.5.0 release tree에서 `uv run lumen-test contract -q`(service 1,615·SDK 125·Ruff), native arm64 `integration`(MariaDB/Redis 102), `system`(Docker process stack 9)이 통과했고 staged architecture guard를 갱신했다. Gate green과 scoped consumer/runtime proof를 구분한다. 세부 증거는 `openspec/changes/archive/2026-10-01-modality-model-pricing/tasks.md`에 기록한다.
 
+### 0.6.0 provider identity·cache-write 통합 검증 (2026-10-03)
+
+0.6.0 release tree에서 `uv run lumen-test contract -q`(service 1,675·SDK 125·Ruff), native arm64 `integration`(MariaDB/Redis 105), `system`(Docker process stack 9)이 통과했다. `tests/integration/test_durable_realtime_flow.py::test_compat_gateways_route_by_wire_transport_not_renamed_selector`는 수정 전 tree(`498da9d`)에서 renamed selector의 Gemini Live 연결이 1011로 닫혀 실패했고 수정 후 통과한다. `test_provider_identity_catalog.py`는 고정된 과거 `updated_at`으로 selector/rank 편집이 가격 version을 건드리면 hash 비교가 실패하게 한다.
+
+별도 일회용 MariaDB/Redis와 실제 uvicorn TCP API에 synthetic upstream만 붙인 smoke에서 compat `/v1/messages`(`X-Lumen-Provider`로 고른 renamed selector, 수동 input/output·cache 미설정 custom base)가 5분/1시간 write 각 100 tokens를 input 단가로 상속해 `0.00105` USD `priced` ledger를 남겼다. `/v1beta/realtime`은 renamed `google` selector의 Gemini route로 setupComplete/serverContent를 중계하고 close 1000, run `completed`, `0.00006` USD를 기록했으며 OpenAI wire에 Gemini model을 지정하면 1011로 닫혔다. Throwaway script와 stack은 제거했다. 실제 vendor 호출·invoice·운영 배포는 포함하지 않는다.
+
 
 ### 실제 Codex CLI 확인
 
