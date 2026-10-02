@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import re
+
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.crypto import encrypt_llm_provider_billing_admin_key, encrypt_llm_provider_key
 from lumen.db import mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
-from lumen.services.litellm_client import direct_provider_route, effective_prices_per_million, official_price_source
+from lumen.services.litellm_client import direct_provider_route
 from lumen.services.models_dev import ModelsDevCatalog
 
 from .billing import billing_admin_key_supported, billing_capability_for
@@ -32,16 +34,38 @@ from .pricing import (
     _per_million_price,
     _per_token_price,
     _provider_public,
+    _resolved_base_prices,
     _to_decimal,
     _validate_cache_prices,
     _validate_price_pair,
-    model_media_pricing_available,
     validate_media_pricing,
 )
 from .routing import _lock_mutable_route, _require_db
 
 _AUTH_MODES = frozenset({"api_key", "chatgpt_device", "anthropic_subscription"})
 _MEDIA_PROVIDERS = frozenset({"openai", "gemini"})
+_DEFAULT_API_PROVIDER = object()
+
+
+def validate_api_provider(value: str) -> str:
+    if not isinstance(value, str):
+        raise ProviderValidationError("api_provider 은 유효한 식별자여야 합니다")
+    normalized = value.strip().lower()
+    if len(normalized) > 40 or not re.fullmatch(r"[a-z][a-z0-9_-]*", normalized):
+        raise ProviderValidationError("api_provider 은 40자 이하 영문 식별자여야 합니다")
+    return normalized
+
+
+def validate_sort_order(value: int) -> int:
+    if type(value) is not int or not 0 <= value <= 2147483647:
+        raise ProviderValidationError("sort_order 은 0..2147483647 범위의 정수여야 합니다")
+    return value
+
+
+def validate_provider_name(value: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 100:
+        raise ProviderValidationError("name 은 100자 이하의 비어 있지 않은 문자열이어야 합니다")
+    return value.strip()
 
 
 def _validate_model_kind(provider: LlmProvider, kind: str) -> None:
@@ -141,6 +165,8 @@ async def create_provider(
     *,
     name: str,
     provider_type: str = "openai",
+    api_provider: str = _DEFAULT_API_PROVIDER,
+    sort_order: int = 0,
     api_base: str | None = None,
     api_key: str | None = None,
     api_key_env: str | None = None,
@@ -151,9 +177,12 @@ async def create_provider(
     is_active: bool = True,
 ) -> dict:
     factory = _require_db()
-    if not name or not name.strip():
-        raise ProviderValidationError("name 은 필수입니다")
+    name = validate_provider_name(name)
+    sort_order = validate_sort_order(sort_order)
     normalized_provider_type = (provider_type or "openai").strip()
+    api_provider = validate_api_provider(
+        normalized_provider_type if api_provider is _DEFAULT_API_PROVIDER else api_provider
+    )
     normalized_auth_mode = (auth_mode or "api_key").strip()
     validate_provider_auth_configuration(
         provider_type=normalized_provider_type,
@@ -166,6 +195,8 @@ async def create_provider(
     row = LlmProvider(
         name=name.strip(),
         provider_type=normalized_provider_type,
+        api_provider=api_provider,
+        sort_order=sort_order,
         api_base=(api_base or None) if normalized_auth_mode == "api_key" else None,
         encrypted_api_key=(
             encrypt_llm_provider_key(api_key) if api_key and normalized_auth_mode == "api_key" else None
@@ -198,7 +229,9 @@ async def list_providers() -> list[dict]:
     factory = _require_db()
     try:
         async with factory() as session:
-            rows = (await session.execute(select(LlmProvider).order_by(LlmProvider.id))).scalars().all()
+            rows = (await session.execute(
+                select(LlmProvider).order_by(LlmProvider.sort_order, LlmProvider.id)
+            )).scalars().all()
             return [_provider_public(row) for row in rows]
     except OperationalError as exc:
         mark_db_unhealthy()
@@ -207,6 +240,13 @@ async def list_providers() -> list[dict]:
 
 async def update_provider(provider_id: int, patch: dict) -> dict:
     factory = _require_db()
+    patch = dict(patch)
+    if "name" in patch:
+        patch["name"] = validate_provider_name(patch["name"])
+    if "api_provider" in patch:
+        patch["api_provider"] = validate_api_provider(patch["api_provider"])
+    if "sort_order" in patch:
+        patch["sort_order"] = validate_sort_order(patch["sort_order"])
     try:
         async with factory() as session, session.begin():
             row, _ = await _lock_mutable_route(session, provider_id=provider_id)
@@ -240,8 +280,12 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 target_auth_mode,
                 patch.get("api_base", row.api_base),
             )
-            if patch.get("name"):
-                row.name = str(patch["name"]).strip()
+            if "name" in patch:
+                row.name = patch["name"]
+            if "api_provider" in patch:
+                row.api_provider = patch["api_provider"]
+            if "sort_order" in patch:
+                row.sort_order = patch["sort_order"]
             if patch.get("provider_type"):
                 row.provider_type = target_provider_type
             if "auth_mode" in patch:
@@ -296,6 +340,7 @@ async def create_model(
     provider_id: int,
     model_name: str,
     display_name: str | None = None,
+    sort_order: int = 0,
     model_kind: str = "text",
     media_pricing: dict | None = None,
     input_price_per_million=None,
@@ -309,6 +354,7 @@ async def create_model(
     factory = _require_db()
     if not model_name or not model_name.strip():
         raise ProviderValidationError("model_name 은 필수입니다")
+    sort_order = validate_sort_order(sort_order)
     media_pricing = _validate_kind_prices(model_kind, media_pricing, (
         input_price_per_million, output_price_per_million, cache_read_price_per_million,
         cache_write_price_per_million, cache_write_1h_price_per_million,
@@ -359,6 +405,7 @@ async def create_model(
                 provider_id=provider_id,
                 model_name=canonical_name,
                 display_name=(display_name or None),
+                sort_order=sort_order,
                 model_kind=model_kind,
                 media_pricing=media_pricing,
                 input_price=input_price,
@@ -375,9 +422,15 @@ async def create_model(
             )
             session.add(row)
             await session.flush()
+            effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
             return _model_public(
                 row,
+                effective_input_price_per_million=_per_million_price(effective_input),
+                effective_output_price_per_million=_per_million_price(effective_output),
+                effective_price_source=effective_source,
                 provider_type=provider.provider_type,
+                api_provider=provider.api_provider,
+                provider_sort_order=provider.sort_order,
                 auth_mode=auth_mode,
                 api_key_configured=api_key_source(provider) is not None,
                 api_base=provider.api_base,
@@ -396,54 +449,26 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
             stmt = (
                 select(LlmModel, LlmProvider)
                 .join(LlmProvider, LlmProvider.id == LlmModel.provider_id)
-                .order_by(LlmModel.id)
+                .order_by(LlmProvider.sort_order, LlmProvider.id, LlmModel.sort_order, LlmModel.id)
             )
             if active_only:
                 stmt = stmt.where(LlmModel.is_active.is_(True))
             rows = (await session.execute(stmt)).all()
             public_models: list[dict] = []
             for model, provider in rows:
-                if getattr(model, "model_kind", "text") != "text":
-                    effective_input = _per_million_price(model.input_price)
-                    effective_output = _per_million_price(model.output_price)
-                    effective_source = (
-                        "manual" if model_media_pricing_available(model) else "unpriced"
-                    )
-                else:
-                    stored_input = _per_million_price(model.input_price)
-                    stored_output = _per_million_price(model.output_price)
-                    fallback_input, fallback_output = (
-                        (None, None)
-                        if stored_input is not None and stored_output is not None
-                        else effective_prices_per_million(
-                            model.model_name, provider.provider_type, api_base=provider.api_base
-                        )
-                    )
-                    effective_input = stored_input if stored_input is not None else fallback_input
-                    effective_output = stored_output if stored_output is not None else fallback_output
-                    if stored_input is not None and stored_output is not None:
-                        effective_source = model.price_source
-                    elif effective_input is not None and effective_output is not None:
-                        effective_source = (
-                            official_price_source(model.model_name, provider.provider_type, api_base=provider.api_base)
-                            or "litellm"
-                            if stored_input is None and stored_output is None
-                            else "partial"
-                        )
-                    else:
-                        effective_source = "unpriced"
-                public_models.append(
-                    _model_public(
-                        model,
-                        effective_input_price_per_million=effective_input,
-                        effective_output_price_per_million=effective_output,
-                        effective_price_source=effective_source,
-                        provider_type=provider.provider_type,
-                        auth_mode=getattr(provider, "auth_mode", "api_key"),
-                        api_key_configured=api_key_source(provider) is not None,
-                        api_base=provider.api_base,
-                    )
-                )
+                effective_input, effective_output, effective_source, _ = _resolved_base_prices(model, provider)
+                public_models.append(_model_public(
+                    model,
+                    effective_input_price_per_million=_per_million_price(effective_input),
+                    effective_output_price_per_million=_per_million_price(effective_output),
+                    effective_price_source=effective_source,
+                    provider_type=provider.provider_type,
+                    api_provider=provider.api_provider,
+                    provider_sort_order=provider.sort_order,
+                    auth_mode=getattr(provider, "auth_mode", "api_key"),
+                    api_key_configured=api_key_source(provider) is not None,
+                    api_base=provider.api_base,
+                ))
             return public_models
     except OperationalError as exc:
         mark_db_unhealthy()
@@ -452,6 +477,8 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
 
 async def update_model(model_id: int, patch: dict) -> dict:
     factory = _require_db()
+    if "sort_order" in patch:
+        validate_sort_order(patch["sort_order"])
     has_input_price = "input_price_per_million" in patch
     has_output_price = "output_price_per_million" in patch
     # Present key → set (null clears); absent key → unchanged.
@@ -528,6 +555,16 @@ async def update_model(model_id: int, patch: dict) -> dict:
                     row.model_name = canonical_name
             if "display_name" in patch:
                 row.display_name = patch["display_name"] or None
+            if "sort_order" in patch:
+                if len(patch) == 1:
+                    # Legacy manual/media price versions use updated_at; rank is not a price change.
+                    await session.execute(
+                        update(LlmModel)
+                        .where(LlmModel.id == model_id)
+                        .values(sort_order=patch["sort_order"], updated_at=row.updated_at)
+                    )
+                else:
+                    row.sort_order = patch["sort_order"]
             if has_input_price or has_output_price:
                 input_price, output_price = _validate_text_prices(target_kind, token_prices[0], token_prices[1])
                 if has_input_price:
@@ -545,9 +582,15 @@ async def update_model(model_id: int, patch: dict) -> dict:
             if patch.get("is_active") is not None:
                 row.is_active = bool(patch["is_active"])
             await session.flush()
+            effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
             return _model_public(
                 row,
+                effective_input_price_per_million=_per_million_price(effective_input),
+                effective_output_price_per_million=_per_million_price(effective_output),
+                effective_price_source=effective_source,
                 provider_type=provider.provider_type,
+                api_provider=provider.api_provider,
+                provider_sort_order=provider.sort_order,
                 auth_mode=auth_mode,
                 api_key_configured=api_key_source(provider) is not None,
                 api_base=provider.api_base,
@@ -647,16 +690,23 @@ async def import_models_dev_prices(
                     "unsupported_price_fields": external_model.unsupported_price_fields,
                 }
             await session.flush()
-            return [
-                _model_public(
-                    rows_by_id[local_model_id],
+            public_models: list[dict] = []
+            for local_model_id in selected_external:
+                row = rows_by_id[local_model_id]
+                effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
+                public_models.append(_model_public(
+                    row,
+                    effective_input_price_per_million=_per_million_price(effective_input),
+                    effective_output_price_per_million=_per_million_price(effective_output),
+                    effective_price_source=effective_source,
                     provider_type=provider.provider_type,
+                    api_provider=provider.api_provider,
+                    provider_sort_order=provider.sort_order,
                     auth_mode=getattr(provider, "auth_mode", "api_key"),
                     api_key_configured=api_key_source(provider) is not None,
                     api_base=provider.api_base,
-                )
-                for local_model_id in selected_external
-            ]
+                ))
+            return public_models
     except IntegrityError as exc:
         raise ModelsDevImportConflictError("models.dev 가격 import 저장 충돌") from exc
     except OperationalError as exc:

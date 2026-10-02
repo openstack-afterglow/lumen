@@ -70,15 +70,15 @@ async def admit_image_run(request: dict, *, project_id: str, user_id: str, clien
     if provider_id is not None and not isinstance(provider_id, (str, int)):
         raise DurableRunInputError("invalid image provider")
     provider_number = int(provider_id) if provider_id is not None and str(provider_id).isdecimal() else None
-    provider_type = str(provider_id) if provider_id is not None and provider_number is None else None
+    api_provider = str(provider_id) if provider_id is not None and provider_number is None else None
     try:
         route = (await routing.resolve_model_by_id(int(model_id), model_kind="image") if model_id.isdecimal()
-                 else await routing.resolve_api_model(model_id, provider=provider_type,
+                 else await routing.resolve_api_model(model_id, provider=api_provider,
                                                        provider_id=provider_number, model_kind="image"))
     except AmbiguousModelRouteError as exc:
         raise DurableRunInputError("image provider selection is ambiguous") from exc
     if (route is None or (provider_number is not None and provider_number != route["provider_id"])
-            or (provider_type is not None and provider_type != route["provider_type"])):
+            or (api_provider is not None and api_provider != route["api_provider"])):
         raise DurableRunInputError("image provider or model is unavailable")
     source_asset_id = request.get("source_asset_id")
     if source_asset_id is not None:

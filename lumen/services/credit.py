@@ -157,12 +157,16 @@ def usage_cost_from_pricing_snapshot(
     }
     cache_costs: dict[str, Decimal] = {}
     unpriced_cache = False
+    sources = pricing_snapshot.get("cache_price_sources") or {}
     for name, token_field, _, _ in _CACHE_SNAPSHOT_PRICES:
         tokens = getattr(text, token_field)
         rate, tier_rate = cache_prices[name]
-        source = (pricing_snapshot.get("cache_price_sources") or {}).get(name, "manual")
-        if breakdown.input_tokens > 200_000 and source == "litellm" and tier_rate is not None:
+        source = sources.get(name, "manual")
+        # Frozen tiers exist only for real catalog rates (own or inherited by a fallback write).
+        if breakdown.input_tokens > 200_000 and source != "manual" and tier_rate is not None:
             rate = tier_rate
+            # A fallback base and its real catalog tier carry separate provenance.
+            source = sources.get(f"{name}_above_200k") or source
         if tokens and rate is None and pricing_snapshot.get("model_kind", "text") != "text":
             # Legacy text snapshots bill an unpriced cache at 0 (partial); media never does.
             raise ValueError(f"media {name} token pricing is unavailable for reported usage")

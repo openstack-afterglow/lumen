@@ -164,7 +164,7 @@ class TestAvailableModels:
             ]
 
         async def fake_providers():
-            return [{"id": 1, "name": "openai", "has_api_key": False}]
+            return [{"id": 1, "name": "openai", "provider_type": "openai", "has_api_key": False}]
 
         monkeypatch.setattr(repository, "list_models", fake_models)
         monkeypatch.setattr(repository, "list_providers", fake_providers)
@@ -192,16 +192,20 @@ class TestAvailableModels:
             ("gemini", "gemini-2.5-pro", [{"type": "budget_tokens", "min": 128, "max": 32768}], False),
             ("gemini", "gemini-2.5-flash", [{"type": "budget_tokens", "min": 0, "max": 24576}], True),
             ("anthropic", "claude-sonnet-4-5", [{"type": "budget_tokens", "min": 1024}], True),
+            ("openai", "opaque-openai-reasoning", [{"type": "budget_tokens", "min": 1024}], False),
         ]
 
         async def fake_models(*, active_only=False):
             return [
                 {
                     "id": index,
-                    "provider_id": 1,
+                    "provider_id": index,
                     "model_name": model_name,
                     "api_model_name": model_name,
-                    "api_provider": provider_type,
+                    "api_provider": "anthropic"
+                    if model_name == "opaque-openai-reasoning"
+                    else f"renamed-{provider_type}",
+                    "provider_type": provider_type,
                     "display_name": model_name,
                     "effective_capabilities": {"reasoning": True, "reasoning_options": options},
                 }
@@ -209,7 +213,10 @@ class TestAvailableModels:
             ]
 
         async def fake_providers():
-            return [{"id": 1, "name": "provider", "has_api_key": True}]
+            return [
+                {"id": index, "name": "provider", "provider_type": provider_type, "has_api_key": True}
+                for index, (provider_type, _, _, _) in enumerate(cases, start=1)
+            ]
 
         monkeypatch.setattr(repository, "list_models", fake_models)
         monkeypatch.setattr(repository, "list_providers", fake_providers)

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0
+
+Changes since `v0.5.0`:
+
+- **Provider identity and catalog order:** Migration 021 separates administrator-editable public `api_provider` selectors from display names and execution `provider_type`, and persists provider/model display ranks. Native catalogs sort by provider rank/ID then model rank/ID; API ambiguity remains 409 regardless of rank. Selector/rank edits preserve routing credentials and frozen route identity, including the legacy manual/media price-version clock for rank-only model updates. Verified with isolated MariaDB and actual Lumen/Afterglow BFF HTTP using synthetic compatible-provider endpoints, not live NVIDIA inference or production rollout.
+- **Effective text cache-write pricing:** Manual values, including zero, and exact direct-provider catalog rates take precedence. Missing 5-minute writes inherit effective input, and missing 1-hour writes inherit effective 5-minute writes with provenance and applicable catalog tiers; a call billed at a real catalog >200k tier records that tier's provenance rather than the fallback base. Admin effective cache fields remain separate from nullable stored values; cache-read is never inferred, media writes are excluded, and existing frozen executor/advisor/title/summary prices remain literal without live-route backfill. Route hashes cover only stated rates, so unchanged legacy routes keep their published hash.
+- **Selector consumers and deployment configuration:** Native and compatible text/media paths use the stored public selector while capabilities, credentials and billing continue to use the execution transport. OpenAI Realtime and Gemini Live compatibility WebSockets constrain only the transport their wire fixes, so renaming a selector no longer closes them with 1011. Ambiguous native/child/maintenance routes fail explicitly; Kolla renders the Gateway selector as an escaped TOML string.
+- **Prior work reconciliation:** Preserve both previous worktree commits in history, but ship the later independent-selector/provider-and-model-rank design once. The conflicting global-order migration 020 and name-derived selector prototype are superseded; already released shared-message graph/media/Responses changes are retained.
+
+**Release boundary:** Root package, lock and Kolla image defaults target `0.6.0`; apply additive migration 021 before starting matching API/worker/controller. Published SQL through 020 is unchanged. SDK/plugins/sandbox retain independent package versions. GitHub Release and multi-architecture image publication are separate from production deployment; vendor invoices and live NVIDIA/Afterglow acceptance are not claimed.
+
 ## 0.5.0
 
 Changes since `v0.4.0`:

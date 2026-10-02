@@ -78,11 +78,11 @@ def audio_error(exc: Exception) -> HTTPException:
 
 
 async def admit(payload: SpeechRequest | TranscriptionRequest, *, kind: str, principal: Principal,
-                idempotency_key: UUID, provider_type: str | None = None) -> str:
+                idempotency_key: UUID, api_provider: str | None = None) -> str:
     body = payload.model_dump(mode="json")
     body["kind"] = kind
-    if provider_type is not None:
-        body["provider_id"] = provider_type
+    if api_provider is not None:
+        body["provider_id"] = api_provider
     try:
         descriptor = await admit_audio_run(
             body, project_id=principal["project_id"], user_id=principal["user_id"],

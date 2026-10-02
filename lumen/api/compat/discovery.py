@@ -241,7 +241,7 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
             "codex": {
                 "base_url": f"{origin}/v1",
                 "responses": f"{origin}/v1/responses",
-                "provider_header": "X-Lumen-Provider (optional, must not conflict with model prefix)",
+                "provider_header": "X-Lumen-Provider (optional administrator-configured api_provider selector)",
             },
             "claude_code": {
                 "base_url": origin,

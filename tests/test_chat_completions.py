@@ -1294,7 +1294,6 @@ class TestCanonicalTempCompletion:
         catalog_models = models_resp.json()
         assert len(catalog_models) == 1
         model_entry = catalog_models[0]
-        assert "provider_id" not in model_entry
         assert model_entry["capabilities"]["web_search"] is True
 
         monkeypatch.setattr(

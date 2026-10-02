@@ -37,7 +37,7 @@ async def _principal(websocket: WebSocket) -> dict | None:
     return info
 
 
-async def _compat_socket(websocket: WebSocket, *, wire: str, provider: str):
+async def _compat_socket(websocket: WebSocket, *, wire: str):
     principal = await _principal(websocket)
     if principal is None:
         await websocket.close(code=4401)
@@ -89,10 +89,10 @@ async def _compat_socket(websocket: WebSocket, *, wire: str, provider: str):
         await websocket.close(code=4400)
         return
     try:
-        result = await admit_realtime_session({"model_id": model, "provider_id": provider,
-                                               "voice": voice, "instructions": instructions},
+        # The vendor wire fixes the execution transport; editable public selectors never stand in for it.
+        result = await admit_realtime_session({"model_id": model, "voice": voice, "instructions": instructions},
             project_id=principal["project_id"], user_id=principal["user_id"],
-            client_request_id=str(uuid4()), source="api", api_key_id=principal["api_key_id"])
+            client_request_id=str(uuid4()), source="api", api_key_id=principal["api_key_id"], provider_type=wire)
         await run_realtime_session(websocket, run_id=result["session_id"], token=result["connect_token"], wire=wire)
     except WebSocketDisconnect:
         pass
@@ -104,9 +104,9 @@ async def _compat_socket(websocket: WebSocket, *, wire: str, provider: str):
 
 @router.websocket("/v1/realtime")
 async def openai_realtime(websocket: WebSocket):
-    await _compat_socket(websocket, wire="openai", provider="openai")
+    await _compat_socket(websocket, wire="openai")
 
 
 @router.websocket("/v1beta/realtime")
 async def gemini_live(websocket: WebSocket):
-    await _compat_socket(websocket, wire="gemini", provider="gemini")
+    await _compat_socket(websocket, wire="gemini")

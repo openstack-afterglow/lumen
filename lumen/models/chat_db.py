@@ -33,6 +33,10 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _default_api_provider(context) -> str:
+    return context.get_current_parameters().get("provider_type") or "openai"
+
+
 class LlmProvider(Base):
     __tablename__ = "llm_providers"
 
@@ -40,6 +44,9 @@ class LlmProvider(Base):
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
     # litellm custom_llm_provider (openai|anthropic|gemini|vertex_ai|azure|bedrock|ollama|...)
     provider_type: Mapped[str] = mapped_column(VARCHAR(40), nullable=False, default="openai")
+    # Public API selector is independent of the execution transport.
+    api_provider: Mapped[str] = mapped_column(VARCHAR(40), nullable=False, default=_default_api_provider)
+    sort_order: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
     api_base: Mapped[str | None] = mapped_column(VARCHAR(255))
     # AES-256-GCM(lumen_encryption_key, 도메인 llm_provider_key) 암호화 상태로 저장
     encrypted_api_key: Mapped[str | None] = mapped_column(TEXT)
@@ -69,7 +76,10 @@ class LlmProvider(Base):
         uselist=False,
     )
 
-    __table_args__ = (UniqueConstraint("name", name="uq_llm_providers_name"),)
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_llm_providers_name"),
+        CheckConstraint("sort_order >= 0", name="chk_llm_providers_sort_order"),
+    )
 
 
 class LlmProviderAuthAttempt(Base):
@@ -102,6 +112,7 @@ class LlmModel(Base):
     provider_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_providers.id", ondelete="CASCADE"), nullable=False)
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     display_name: Mapped[str | None] = mapped_column(VARCHAR(150))
+    sort_order: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
     model_kind: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="text", server_default="text")
     media_pricing: Mapped[dict | None] = mapped_column(JSON)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
@@ -112,8 +123,8 @@ class LlmModel(Base):
     # 미지정 시 litellm 내장 단가 사용 (override용). 토큰당 USD 단가.
     input_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     output_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
-    # 프롬프트 캐시 토큰당 USD 단가(관리자 수동 설정 전용, catalog fallback 없음).
-    # 미설정 카테고리는 0원으로 과금하고 pricing_status=partial 로 남는다.
+    # 관리자가 저장한 프롬프트 캐시 토큰당 USD 단가(nullable). 적용 단가는 routing이
+    # 수동값→direct provider exact catalog→text write cascade 순으로 해석하며 저장값을 채우지 않는다.
     cache_read_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     cache_write_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # 5분 TTL cache write
     cache_write_1h_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
@@ -134,6 +145,7 @@ class LlmModel(Base):
     __table_args__ = (
         UniqueConstraint("provider_id", "model_name", name="uq_llm_models_provider_model"),
         Index("idx_llm_models_active", "is_active"),
+        CheckConstraint("sort_order >= 0", name="chk_llm_models_sort_order"),
     )
 
 

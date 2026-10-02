@@ -6,6 +6,7 @@ import litellm
 
 from lumen.config import get_settings
 from lumen.services.providers import routing as provider_store
+from lumen.services.providers.errors import AmbiguousModelRouteError
 
 
 class EmbeddingUnavailable(RuntimeError):
@@ -41,7 +42,10 @@ async def embed_maintenance(text: str) -> list[float]:
     settings = get_settings()
     if not settings.chat_memory_embedding_model:
         raise EmbeddingUnavailable("semantic memory embedding route is unavailable")
-    route = await provider_store.resolve_model(settings.chat_memory_embedding_model)
+    try:
+        route = await provider_store.resolve_model(settings.chat_memory_embedding_model)
+    except AmbiguousModelRouteError as exc:
+        raise EmbeddingUnavailable("semantic memory embedding route is ambiguous") from exc
     if route is None:
         raise EmbeddingUnavailable("semantic memory embedding route is unavailable")
     return await embed_with_route(

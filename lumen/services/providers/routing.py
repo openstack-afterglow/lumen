@@ -26,6 +26,7 @@ from .errors import (
     ProviderNotFoundError,
 )
 from .pricing import (
+    _effective_cache_prices,
     _effective_capabilities,
     _kind,
     _pricing_aware_capabilities,
@@ -239,21 +240,16 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
     if model_kind != "text" or media_pricing is not None:
         config_fingerprint["model_kind"] = model_kind
         config_fingerprint["media_pricing"] = media_pricing
-    cache_prices = _resolved_cache_prices(model, provider)
-    cache_price_sources = {
-        category: "manual" if getattr(model, column, None) is not None else "litellm"
-        for category, column in (
-            ("cache_read", "cache_read_price"),
-            ("cache_creation_5m", "cache_write_price"),
-            ("cache_creation_1h", "cache_write_1h_price"),
-        )
-    }
-    # Catalog rates are frozen with the route fingerprint; old run snapshots
-    # retain their previously admitted prices after a LiteLLM upgrade.
-    if any(price is not None for price in cache_prices.values()):
+    stated_cache = _resolved_cache_prices(model, provider.provider_type, provider.api_base)
+    # Stated catalog/manual rates are frozen with the route fingerprint, so old run
+    # snapshots keep their admitted prices after a LiteLLM upgrade. Inherited writes
+    # derive from the hashed input price/source and stay out of the identity: 0.5.0
+    # route hashes remain valid, and legacy snapshots never read live cache rates.
+    if any(price is not None for price in stated_cache[0].values()):
         config_fingerprint["cache_prices_per_token"] = {
-            key: str(price) if price is not None else None for key, price in cache_prices.items()
+            key: str(price) if price is not None else None for key, price in stated_cache[0].items()
         }
+    cache_prices, cache_price_sources = _effective_cache_prices(model, stated_cache, input_price, price_source)
     if provider_auth is not None:
         config_fingerprint.update(
             {
@@ -271,7 +267,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider) -> dict:
         "model_kind": model_kind,
         "media_pricing": media_pricing,
         "api_model_name": api_model_name(model.model_name, provider.provider_type),
-        "api_provider": provider.provider_type,
+        "api_provider": provider.api_provider,
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
         "api_base": api_base,
@@ -341,7 +337,7 @@ async def resolve_model(model_name: str) -> dict | None:
     factory = _require_db()
     try:
         async with factory() as session:
-            row = (
+            rows = (
                 await session.execute(
                     select(LlmModel, LlmProvider)
                     .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
@@ -352,19 +348,24 @@ async def resolve_model(model_name: str) -> dict | None:
                         LlmProvider.is_active.is_(True),
                     )
                 )
-            ).first()
-            if row is None:
+            ).all()
+            if not rows:
                 return None
-            model, provider = row
-            return _resolved_model(model, provider)
+            if len(rows) != 1:
+                raise AmbiguousModelRouteError("model route is ambiguous")
+            return _resolved_model(*rows[0])
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
 async def resolve_api_model(model_name: str, *, provider: str | None = None, model_kind: str = "text",
-                            provider_id: int | None = None) -> dict | None:
-    """Resolve one external API model/provider pair without exposing route encoding."""
+                            provider_id: int | None = None, provider_type: str | None = None) -> dict | None:
+    """Resolve one external API model/provider pair without exposing route encoding.
+
+    ``provider`` is the administrator-editable public selector. ``provider_type``
+    is the execution transport an endpoint's vendor wire protocol fixes.
+    """
     candidates = {
         model_name,
         f"perplexity/{model_name}",
@@ -400,9 +401,11 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None, mod
                 .order_by(LlmModel.id)
             )
             if provider is not None:
-                stmt = stmt.where(LlmProvider.provider_type == provider)
+                stmt = stmt.where(LlmProvider.api_provider == provider)
             if provider_id is not None:
                 stmt = stmt.where(LlmProvider.id == provider_id)
+            if provider_type is not None:
+                stmt = stmt.where(LlmProvider.provider_type == provider_type)
             rows = (await session.execute(stmt)).all()
 
             def _row_matches(model_row: LlmModel, provider_row: LlmProvider) -> bool:
@@ -429,33 +432,20 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None, mod
             if not matches:
                 return None
 
-            if provider is None:
-                provider_types = {route_provider.provider_type for _, route_provider in matches}
-                if len(provider_types) > 1:
-                    raise AmbiguousModelRouteError("model route is ambiguous")
-                exact = [
-                    m
-                    for m in matches
-                    if api_model_name(m[0].model_name, m[1].provider_type) == model_name
-                    or short_model_name(m[0].model_name, m[1].provider_type) == model_name
-                    or m[0].model_name == model_name
-                ]
-                if exact:
-                    return _resolved_model(*exact[0])
-                return _resolved_model(*matches[0])
-            else:
-                if len(matches) > 1:
-                    exact = [
-                        m
-                        for m in matches
-                        if api_model_name(m[0].model_name, m[1].provider_type) == model_name
-                        or short_model_name(m[0].model_name, m[1].provider_type) == model_name
-                        or m[0].model_name == model_name
-                    ]
-                    if len(exact) == 1:
-                        return _resolved_model(*exact[0])
-                    raise AmbiguousModelRouteError("model route is ambiguous")
-                return _resolved_model(*matches[0])
+            # Presentation order must never pick an endpoint. Even equal selectors
+            # on different connections remain ambiguous until provider_id is given.
+            if len({route_provider.id for _, route_provider in matches}) > 1:
+                raise AmbiguousModelRouteError("model route is ambiguous")
+            exact = [
+                m for m in matches
+                if api_model_name(m[0].model_name, m[1].provider_type) == model_name
+                or short_model_name(m[0].model_name, m[1].provider_type) == model_name
+                or m[0].model_name == model_name
+            ]
+            selected = exact or matches
+            if len(selected) != 1:
+                raise AmbiguousModelRouteError("model route is ambiguous")
+            return _resolved_model(*selected[0])
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
@@ -475,14 +465,18 @@ async def list_api_models(*, model_kind: str = "text") -> list[dict]:
                         LlmModel.model_kind == model_kind,
                         LlmProvider.is_active.is_(True),
                     )
-                    .order_by(LlmModel.id)
+                    .order_by(LlmProvider.sort_order, LlmProvider.id, LlmModel.sort_order, LlmModel.id)
                 )
             ).all()
             return [
                 {
                     "model_name": model.model_name,
                     "api_model_name": api_model_name(model.model_name, provider.provider_type),
-                    "api_provider": provider.provider_type,
+                    "api_provider": provider.api_provider,
+                    "provider_id": provider.id,
+                    "provider_type": provider.provider_type,
+                    "provider_sort_order": provider.sort_order,
+                    "sort_order": model.sort_order,
                 }
                 for model, provider in rows
             ]
