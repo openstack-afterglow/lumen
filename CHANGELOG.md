@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Redis shutdown compatibility:** Cache teardown awaits the async `close()` method provided by the pinned Redis 5.0.0 client, instead of its nonexistent `aclose()`. The real-client regression and contract gate pass; built arm64 and emulated amd64 API images close actual Redis TCP connections, clear cached state, and safely repeat teardown. This removes the observed shutdown `AttributeError`; it does not change database readiness or resolve the separate C2 closed-transport failure. The correction is not in the published 0.6.0 artifacts.
+
 ## 0.6.0
 
 Changes since `v0.5.0`:

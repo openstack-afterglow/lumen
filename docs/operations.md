@@ -11,6 +11,8 @@ source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra ser
 
 `docker/Dockerfile`은 migration을 자동 실행하지 않는다. migration 누락 상태로 새 API/worker를 기동하지 않는다.
 
+Cache 종료는 pinned Redis 5.0.0의 async `close()`로 client 소유 connection pool을 해제한 뒤 process-local client를 비운다. `aclose()` AttributeError가 있는 이전 이미지에서는 API shutdown이 DB teardown 전에 중단될 수 있다. 수정된 source/image의 정상 종료와 DB readiness는 별도 acceptance이며, 이 수정으로 aiomysql/uvloop closed-transport 오류의 해결을 주장하지 않는다.
+
 ### Plugin workspace 이미지 누락 방지
 
 `lumen-plugin-api` 및 내장 database/memory/tools/skills/MCP plugin은 `service` extra의 workspace dependency다. Builder에 설치된 editable distribution은 최종 이미지에서도 동일한 `/app/packages/lumen-plugin-api`와 `/app/plugins/` source 경로가 필요하다. Docker build는 workspace manifests와 lock을 `uv sync --locked`로 검증하고, source 설치·복사 뒤 non-root runtime에서 `python -m lumen.scripts.migrate --help`를 실행한다. 이 CLI smoke는 DB 연결 전에 import를 검사한다.

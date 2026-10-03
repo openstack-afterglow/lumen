@@ -266,6 +266,8 @@ Kolla role은 API/worker를 별도 host-network container로 실행하고 MariaD
 
 `GET /v1/health`와 Kolla healthcheck는 process HTTP response만 확인한다. Migration checksum/projection integrity, DB/Redis, worker, Gateway device login, provider inference readiness는 별도 검증한다. 운영 장애 시 journal, lease, provider snapshot, migration ledger/checksum, unready history count와 Gateway OAuth safe code를 함께 확인한다. Backup은 active-path/device/API-key metadata를 포함한 MariaDB, configured PostgreSQL, S3와 encryption key recovery를 일관되게 계획한다.
 
+Cache teardown은 pinned Redis 5.0.0의 async `close()`를 사용해 소유 pool을 닫고 client 참조를 비운다. `tests/test_cache.py`의 실제 client API 회귀와 contract gate(service1,676·SDK125·Ruff)가 통과했다. 별도 Redis7에 연결한 canonical API image의 native arm64·emulated amd64 실행에서 서버 `CLIENT LIST`로 원래·재생성 TCP connection의 제거, 참조 초기화와 반복 종료를 확인하고 owned container/network를 정리했다. 이 unpublished 수정은 API shutdown의 `aclose()` AttributeError에만 해당하며 DB readiness/driver closed-transport 복구나 published0.6.0 image 변경의 증거가 아니다.
+
 ## Security boundaries
 
 - **Principal**: Keystone token, scoped ordinary API key와 expiring legacy-device API key를 `Principal`로 정규화한다. 한 요청에 여러 credential을 보내면 400이다. 동일한 API key를 `X-API-Key`와 `Authorization: Bearer`로 중복 전달한 경우만 값이 일치할 때 허용하며(Claude Code 기본 동작), API key는 project에 고정된다. Custom gateway route는 `credential_kind="claude_gateway"`와 fixed scope를 추가 검사하며 ordinary key를 거부한다. Keystone만 management/approval route를 사용한다.
@@ -369,9 +371,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "2d249e49e307ab09b55e85393d27f373b6eab5bdbaec319d90e76c49e9afc851",
-  "reviewed_at": "2026-10-02T17:53:49Z",
-  "summary": "Reviewed provider selector/transport separation including compat realtime wire-transport constraint and media selector kwargs, migration 021 ranks and catalog ambiguity, text cache-write cascade with billed-tier provenance, frozen executor/advisor/title/summary literalness and legacy route-hash stability. Contract/integration/system gates and real-socket synthetic-upstream smoke passed 2026-10-03; no production deployment."
+  "source_sha256": "beba59fbffcd8234192b744ddd5b5fa2a9f3ea0881e32db999422513b051be07",
+  "reviewed_at": "2026-10-03T15:01:19Z",
+  "summary": "Reviewed Redis 5.0.0 async close and real-client regression in the exact submitted source; no ownership/API/schema/deployment changes. Contract1676, SDK125, real MariaDB/Redis integration105 and process-system9 pass; arm64 and emulated amd64 API images release real Redis TCP connections and clear cache state. C2 DB readiness and stable publication remain separate."
 }
 ```
 <!-- architecture-review:end -->
