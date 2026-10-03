@@ -61,6 +61,10 @@ Actual durable hook smoke는 image/audio 입력·캐시 입력·출력 각각 1 
 
 별도 일회용 MariaDB/Redis와 실제 uvicorn TCP API에 synthetic upstream만 붙인 smoke에서 compat `/v1/messages`(`X-Lumen-Provider`로 고른 renamed selector, 수동 input/output·cache 미설정 custom base)가 5분/1시간 write 각 100 tokens를 input 단가로 상속해 `0.00105` USD `priced` ledger를 남겼다. `/v1beta/realtime`은 renamed `google` selector의 Gemini route로 setupComplete/serverContent를 중계하고 close 1000, run `completed`, `0.00006` USD를 기록했으며 OpenAI wire에 Gemini model을 지정하면 1011로 닫혔다. Throwaway script와 stack은 제거했다. 실제 vendor 호출·invoice·운영 배포는 포함하지 않는다.
 
+### Pool closed-transport readiness 회귀 (2026-10-04)
+
+`tests/integration/test_database_pool_recovery.py`는 실제 MariaDB 11/aiomysql/SQLAlchemy pool을 운영 API와 같은 uvloop event loop에서 실행한다. 단일 pooled connection을 사용한 뒤 pool에 쉬는 동안 transport를 닫으면 수정 전 database plugin 0.1.0은 C2 로그와 같은 `TCPTransport closed=True … handler is closed`로 `check_db()` false를 반환했다. 같은 상황의 기본 asyncio loop는 true였다. Plugin 0.1.1은 새 connection으로 true를 반환하고, 다른 ping `RuntimeError`는 계속 readiness false로 드러낸다. 수정 후 `uv run lumen-test contract -q`(service 1,676·SDK 125·Ruff), database plugin wheel/conformance 16, native arm64 `integration`(MariaDB/Redis 107), `system`(Docker process stack 9)이 통과했다. 기존 Redis-fix API image(`b3fc2bde`)는 arm64·emulated amd64 모두 uvloop에서 false를 재현했고, 수정 API image는 두 architecture에서 true와 connection 갱신을 보였다. Worker/controller image도 두 architecture에서 plugin 0.1.1·기본 승인 0.1.1·non-root import를 확인했다. 일회용 MariaDB와 network는 제거했다. 실제 C2 socket 종료 원인과 운영 rollout은 이 증거에 포함하지 않는다.
+
 
 ### 실제 Codex CLI 확인
 

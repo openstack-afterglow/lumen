@@ -19,6 +19,27 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 _CONNECTION_ERROR_CODES = frozenset({2003, 2006, 2013, 2014, 2055})
 
 
+def _recover_closed_transport_ping(engine: AsyncEngine) -> None:
+    """Report uvloop's closed-transport error to SQLAlchemy's pool pre-ping as a disconnect.
+
+    aiomysql lets the ``RuntimeError`` for a socket closed while idle in the pool escape
+    its DBAPI adapter, so SQLAlchemy would raise it instead of renewing the connection.
+    Only that exact signature is reported; every other error still propagates.
+    """
+    ping = engine.sync_engine.dialect.do_ping
+
+    def do_ping(connection) -> bool:
+        try:
+            return ping(connection)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "TCPTransport closed=True" not in message or "handler is closed" not in message:
+                raise
+            return False
+
+    engine.sync_engine.dialect.do_ping = do_ping
+
+
 @dataclass(frozen=True, kw_only=True)
 class MariaDbHandle:
     engine: AsyncEngine
@@ -55,7 +76,7 @@ class MariaDbDatabase:
     manifest = PluginManifest(
         id="mariadb",
         kind="database",
-        version="0.1.0",
+        version="0.1.1",
         required_capabilities=(),
     )
 
@@ -75,6 +96,8 @@ class MariaDbDatabase:
             pool_pre_ping=True,
             connect_args={"connect_timeout": config.connect_timeout},
         )
+        if engine.sync_engine.dialect.driver == "aiomysql":
+            _recover_closed_transport_ping(engine)
         session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
         return MariaDbHandle(engine=engine, session_factory=session_factory)
 

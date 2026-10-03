@@ -11,7 +11,9 @@ source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra ser
 
 `docker/Dockerfile`은 migration을 자동 실행하지 않는다. migration 누락 상태로 새 API/worker를 기동하지 않는다.
 
-Cache 종료는 pinned Redis 5.0.0의 async `close()`로 client 소유 connection pool을 해제한 뒤 process-local client를 비운다. `aclose()` AttributeError가 있는 이전 이미지에서는 API shutdown이 DB teardown 전에 중단될 수 있다. 수정된 source/image의 정상 종료와 DB readiness는 별도 acceptance이며, 이 수정으로 aiomysql/uvloop closed-transport 오류의 해결을 주장하지 않는다.
+Cache 종료는 pinned Redis 5.0.0의 async `close()`로 client 소유 connection pool을 해제한 뒤 process-local client를 비운다. `aclose()` AttributeError가 있는 이전 이미지에서는 API shutdown이 DB teardown 전에 중단될 수 있다.
+
+`lumen-database-mariadb` 0.1.1은 pool에서 쉬는 동안 닫힌 aiomysql socket의 uvloop `RuntimeError: unable to perform operation on <TCPTransport closed=True …>; the handler is closed`를 pre-ping disconnect로 처리해 새 connection으로 갱신한다. 이전 plugin에서는 이 signature 직후 `/v1/ready`가 503이 되고 다음 확인에서 회복될 수 있었다. 수정 후에도 dead socket을 폐기할 때 SQLAlchemy의 `Exception terminating connection` traceback이 한 번 남을 수 있으며, 같은 요청의 readiness 결과와 다음 요청으로 판정한다. 상위 ProxySQL/MariaDB socket 종료 원인은 별도로 조사한다.
 
 ### Plugin workspace 이미지 누락 방지
 
@@ -63,7 +65,7 @@ Ceph RGW clients use SigV4 path-style requests and calculate request/response ch
 
 ### 설치된 Python plugin 승인
 
-`[lumen.plugin_config]` 또는 `PLUGIN_CONFIG` JSON은 설치된 distribution **이름·버전**, entry-point kind/name 승인 목록과 실제 선택을 정의한다. `lumen.conf.example`의 `allowlist`는 기본 database/memory/tools/skills/MCP wheel의 정확한 예시다. 외부 plugin은 `lumen-plugin-api` 공개 계약에만 의존해 wheel을 만들고(`uv build --wheel <package-dir>`), 별도 conformance kit(`lumen-plugin-api[testing]`)로 검증한 뒤 승인된 배포 환경의 API와 worker 이미지 **모두**에 설치한다. Wheel 변경은 이미지와 allowlist/config 동시 변경 및 프로세스 재시작이 필요하며, `/v1/plugin-bindings` POST는 Python 패키지 설치가 아니다. 임의 사용자 업로드/온라인 installer는 없다.
+`[lumen.plugin_config]` 또는 `PLUGIN_CONFIG` JSON은 설치된 distribution **이름·버전**, entry-point kind/name 승인 목록과 실제 선택을 정의한다. `lumen.conf.example`의 `allowlist`는 기본 database(0.1.1)/memory/tools/skills/MCP wheel의 정확한 예시다. 명시적 allowlist를 쓰는 운영자는 database plugin 0.1.1 이미지와 승인 버전을 함께 갱신해야 하며, 불일치하면 API/worker가 시작을 중단한다. 외부 plugin은 `lumen-plugin-api` 공개 계약에만 의존해 wheel을 만들고(`uv build --wheel <package-dir>`), 별도 conformance kit(`lumen-plugin-api[testing]`)로 검증한 뒤 승인된 배포 환경의 API와 worker 이미지 **모두**에 설치한다. Wheel 변경은 이미지와 allowlist/config 동시 변경 및 프로세스 재시작이 필요하며, `/v1/plugin-bindings` POST는 Python 패키지 설치가 아니다. 임의 사용자 업로드/온라인 installer는 없다.
 
 선택한 plugin의 설치·버전·manifest/API version·설정 schema·host capability 검증에 실패하면 시작을 중단한다. 등록되지 않은 plugin code를 fallback import하지 않는다. API/worker는 시작 시 registry를 load/start하고 종료 시 close한다. 현재 controller entry point는 plugin registry를 시작하지 않고 DB 및 cloud provider preflight만 수행한다. Admin `GET /v1/admin/plugins`는 manifest/readiness를, `GET /v1/admin/plugin-bindings`는 승인된 tool/skill export 인스턴스를 보여 준다. Binding의 변경은 active run 재인가에 영향을 주므로 rollout 전에 동시 실행 중인 run을 확인한다.
 

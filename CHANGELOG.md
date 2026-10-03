@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **Redis shutdown compatibility:** Cache teardown awaits the async `close()` method provided by the pinned Redis 5.0.0 client, instead of its nonexistent `aclose()`. The real-client regression and contract gate pass; built arm64 and emulated amd64 API images close actual Redis TCP connections, clear cached state, and safely repeat teardown. This removes the observed shutdown `AttributeError`; it does not change database readiness or resolve the separate C2 closed-transport failure. The correction is not in the published 0.6.0 artifacts.
+- **Pooled MariaDB readiness recovery:** Database plugin `lumen-database-mariadb` 0.1.1 reports uvloop's exact closed-transport `RuntimeError` from aiomysql pool pre-ping as a disconnect, so SQLAlchemy renews a pooled connection whose socket closed while idle instead of failing `/v1/ready` or the request. This reproduces the C2 `TCPTransport closed=True … handler is closed` signature: under uvloop the unfixed readiness check returned false and now renews the connection, while unrelated ping errors still fail. SQLAlchemy may still log one `Exception terminating connection` traceback while discarding the dead socket. The default and example plugin approvals move to 0.1.1; operators with an explicit `[lumen.plugin_config]` allowlist must approve 0.1.1 together with the new image. The cause of the upstream socket closure and production rollout remain separate evidence.
 
 ## 0.6.0
 
