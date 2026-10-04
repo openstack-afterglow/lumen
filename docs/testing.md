@@ -55,6 +55,12 @@ Actual durable hook smoke는 image/audio 입력·캐시 입력·출력 각각 1 
 
 0.5.0 release tree에서 `uv run lumen-test contract -q`(service 1,615·SDK 125·Ruff), native arm64 `integration`(MariaDB/Redis 102), `system`(Docker process stack 9)이 통과했고 staged architecture guard를 갱신했다. Gate green과 scoped consumer/runtime proof를 구분한다. 세부 증거는 `openspec/changes/archive/2026-10-01-modality-model-pricing/tasks.md`에 기록한다.
 
+### 0.6.1 patch candidate 검증 (2026-10-04)
+
+Root manifest·runtime version·lock과 packaged Kolla image default를 `0.6.1`로 맞췄다. `uv lock --offline`은 root `lumen`0.6.0→0.6.1만 갱신했고 service dependency와 SDK/다른 plugin/sandbox 버전은 유지했다. Fresh `uv run --frozen lumen-test contract -q`는 service1,676·SDK125·Ruff, `integration -q`는 real MariaDB/Redis107, `system -q`는 canonical Docker process stack9를 통과했다.
+
+Canonical `docker/Dockerfile`의 API·worker·controller를 `linux/arm64`와 `linux/amd64`로 실제 build/load하고 각 image에서 runtime0.6.1·database plugin0.1.1·aarch64/x86_64·UID1000 import를 확인했다. 두 API image의 `python -m lumen.scripts.migrate --help`도 exit0이다. Root0.6.1·database plugin0.1.1 wheel을 빌드했고 격리 base-only wheel 환경에서 root import0.6.1·설치된 역할의 image default0.6.1과 기존 source-build pin 보존을 확인했다. System fixture의 upstream은 synthetic이다. 이 증거는 새 tag/wheel/GHCR 게시, 실제 KVM/cloud, 운영 migration·provider·authenticated Afterglow acceptance를 대체하지 않는다.
+
 ### 0.6.0 provider identity·cache-write 통합 검증 (2026-10-03)
 
 0.6.0 release tree에서 `uv run lumen-test contract -q`(service 1,675·SDK 125·Ruff), native arm64 `integration`(MariaDB/Redis 105), `system`(Docker process stack 9)이 통과했다. `tests/integration/test_durable_realtime_flow.py::test_compat_gateways_route_by_wire_transport_not_renamed_selector`는 수정 전 tree(`498da9d`)에서 renamed selector의 Gemini Live 연결이 1011로 닫혀 실패했고 수정 후 통과한다. `test_provider_identity_catalog.py`는 고정된 과거 `updated_at`으로 selector/rank 편집이 가격 version을 건드리면 hash 비교가 실패하게 한다.
