@@ -110,5 +110,5 @@ async def invalidate(pattern: str) -> None:
 async def close_cache() -> None:
     global _client
     if _client is not None:
-        await _client.aclose()
+        await _client.close()
     _client = None

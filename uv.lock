@@ -1490,7 +1490,7 @@ wheels = [
 
 [[package]]
 name = "lumen"
-version = "0.6.0"
+version = "0.6.1"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1590,7 +1590,7 @@ provides-extras = ["service", "dev"]
 
 [[package]]
 name = "lumen-database-mariadb"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "plugins/database-mariadb" }
 dependencies = [
     { name = "aiomysql" },

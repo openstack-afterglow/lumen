@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lumen-database-mariadb"
-version = "0.1.0"
+version = "0.1.1"
 description = "MariaDB async SQLAlchemy database plugin for Lumen"
 requires-python = ">=3.11"
 dependencies = ["lumen-plugin-api[database]==0.1.0", "sqlalchemy[asyncio]>=2.0.0", "aiomysql>=0.2.0"]

@@ -11,6 +11,10 @@ source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra ser
 
 `docker/Dockerfile`은 migration을 자동 실행하지 않는다. migration 누락 상태로 새 API/worker를 기동하지 않는다.
 
+Cache 종료는 pinned Redis 5.0.0의 async `close()`로 client 소유 connection pool을 해제한 뒤 process-local client를 비운다. `aclose()` AttributeError가 있는 이전 이미지에서는 API shutdown이 DB teardown 전에 중단될 수 있다.
+
+`lumen-database-mariadb` 0.1.1은 pool에서 쉬는 동안 닫힌 aiomysql socket의 uvloop `RuntimeError: unable to perform operation on <TCPTransport closed=True …>; the handler is closed`를 pre-ping disconnect로 처리해 새 connection으로 갱신한다. 이전 plugin에서는 이 signature 직후 `/v1/ready`가 503이 되고 다음 확인에서 회복될 수 있었다. 수정 후에도 dead socket을 폐기할 때 SQLAlchemy의 `Exception terminating connection` traceback이 한 번 남을 수 있으며, 같은 요청의 readiness 결과와 다음 요청으로 판정한다. 상위 ProxySQL/MariaDB socket 종료 원인은 별도로 조사한다.
+
 ### Plugin workspace 이미지 누락 방지
 
 `lumen-plugin-api` 및 내장 database/memory/tools/skills/MCP plugin은 `service` extra의 workspace dependency다. Builder에 설치된 editable distribution은 최종 이미지에서도 동일한 `/app/packages/lumen-plugin-api`와 `/app/plugins/` source 경로가 필요하다. Docker build는 workspace manifests와 lock을 `uv sync --locked`로 검증하고, source 설치·복사 뒤 non-root runtime에서 `python -m lumen.scripts.migrate --help`를 실행한다. 이 CLI smoke는 DB 연결 전에 import를 검사한다.
@@ -61,7 +65,7 @@ Ceph RGW clients use SigV4 path-style requests and calculate request/response ch
 
 ### 설치된 Python plugin 승인
 
-`[lumen.plugin_config]` 또는 `PLUGIN_CONFIG` JSON은 설치된 distribution **이름·버전**, entry-point kind/name 승인 목록과 실제 선택을 정의한다. `lumen.conf.example`의 `allowlist`는 기본 database/memory/tools/skills/MCP wheel의 정확한 예시다. 외부 plugin은 `lumen-plugin-api` 공개 계약에만 의존해 wheel을 만들고(`uv build --wheel <package-dir>`), 별도 conformance kit(`lumen-plugin-api[testing]`)로 검증한 뒤 승인된 배포 환경의 API와 worker 이미지 **모두**에 설치한다. Wheel 변경은 이미지와 allowlist/config 동시 변경 및 프로세스 재시작이 필요하며, `/v1/plugin-bindings` POST는 Python 패키지 설치가 아니다. 임의 사용자 업로드/온라인 installer는 없다.
+`[lumen.plugin_config]` 또는 `PLUGIN_CONFIG` JSON은 설치된 distribution **이름·버전**, entry-point kind/name 승인 목록과 실제 선택을 정의한다. `lumen.conf.example`의 `allowlist`는 기본 database(0.1.1)/memory/tools/skills/MCP wheel의 정확한 예시다. 명시적 allowlist를 쓰는 운영자는 database plugin 0.1.1 이미지와 승인 버전을 함께 갱신해야 하며, 불일치하면 API/worker가 시작을 중단한다. 외부 plugin은 `lumen-plugin-api` 공개 계약에만 의존해 wheel을 만들고(`uv build --wheel <package-dir>`), 별도 conformance kit(`lumen-plugin-api[testing]`)로 검증한 뒤 승인된 배포 환경의 API와 worker 이미지 **모두**에 설치한다. Wheel 변경은 이미지와 allowlist/config 동시 변경 및 프로세스 재시작이 필요하며, `/v1/plugin-bindings` POST는 Python 패키지 설치가 아니다. 임의 사용자 업로드/온라인 installer는 없다.
 
 선택한 plugin의 설치·버전·manifest/API version·설정 schema·host capability 검증에 실패하면 시작을 중단한다. 등록되지 않은 plugin code를 fallback import하지 않는다. API/worker는 시작 시 registry를 load/start하고 종료 시 close한다. 현재 controller entry point는 plugin registry를 시작하지 않고 DB 및 cloud provider preflight만 수행한다. Admin `GET /v1/admin/plugins`는 manifest/readiness를, `GET /v1/admin/plugin-bindings`는 승인된 tool/skill export 인스턴스를 보여 준다. Binding의 변경은 active run 재인가에 영향을 주므로 rollout 전에 동시 실행 중인 run을 확인한다.
 
@@ -208,13 +212,13 @@ Lumen의 root `lumen` wheel은 Kolla 역할을 shared data로 포함한다. Koll
 - **PostgreSQL 모드 선택**: 기본값 `lumen_postgres_mode="external"`은 `lumen_external_postgres_url`이 반드시 필요하다. 역할이 PostgreSQL을 관리하게 하려면 `/etc/kolla/config/afterglow/globals.yml`에서 `lumen_postgres_mode: "bundled"`를 선택하고 `secrets.yml`에 강한 `lumen_postgres_password`를 제공한다. 둘 중 하나를 명시하지 않은 stock defaults는 precheck에서 fail-closed 한다.
 
 ### 2. 독립 wheel/image release
-#### 0.6.0 현재 목표
+#### 0.6.1 현재 목표
 
-- **root package release**: `v0.6.0` tag push 시 `.github/workflows/release.yml`은 `lumen.__version__ == 0.6.0`과 root `uv.lock` 버전 일치를 확인하고 root·plugin·sandbox wheel을 GitHub Release에 첨부한다. `workflow_dispatch`는 release 첨부를 수행하지 않는다.
-- **runtime image tag**: Kolla 역할의 API/worker/controller `lumen_image_tag` 기본값은 `0.6.0`이다. `.github/workflows/docker-build.yml`의 별도 `v0.6.0` 실행이 `linux/amd64,linux/arm64` 이미지를 GHCR에 게시하기 전에는 이 ref로 배포하지 않는다. Wheel Release 성공만으로 이미지 게시나 Kolla 배포가 보장되지 않는다. `lumen_source_version`은 별도 source-build commit pin이며 기본값 `c561a155...`는 이번 릴리스가 아니므로 운영자는 정확한 검증 commit으로 override해야 한다.
+- **root package release**: `v0.6.1` tag push 시 `.github/workflows/release.yml`은 `lumen.__version__ == 0.6.1`을 확인하고 root·plugin·sandbox wheel을 GitHub Release에 첨부한다. Root manifest·`uv.lock` 일치는 아래 게시 계약과 locked image build에서 확인한다. `workflow_dispatch`는 release 첨부를 수행하지 않는다. 이미 게시된 `v0.6.0`을 이동하거나 덮어쓰지 않는다.
+- **runtime image tag**: Kolla 역할의 API/worker/controller `lumen_image_tag` 기본값은 `0.6.1`이다. `.github/workflows/docker-build.yml`의 별도 `v0.6.1` 실행이 `linux/amd64,linux/arm64` 이미지를 GHCR에 게시하기 전에는 이 ref로 배포하지 않는다. Wheel Release 성공만으로 이미지 게시나 Kolla 배포가 보장되지 않는다. `lumen_source_version`은 별도 source-build commit pin이며 기본값 `c561a155...`는 이번 릴리스가 아니므로 운영자는 정확한 검증 commit으로 override해야 한다.
 - **기본 이미지 네임스페이스**: Kolla 역할은 `ghcr.io/openstack-afterglow/lumen-api:<image-tag>`, `ghcr.io/openstack-afterglow/lumen-worker:<image-tag>`, runtime-enabled일 때 `ghcr.io/openstack-afterglow/lumen-controller:<image-tag>`를 사용한다. `ghcr.io/openstack-afterglow/lumen-sandbox`는 별도 게시 이미지이며 Kolla 서비스 컨테이너가 아니라 운영자가 sandbox cloud pool `image`에 정확한 ref로 지정한다. Operator는 역할의 exact digest ref override를 그대로 유지할 수 있다.
 
-0.6.0 게시 계약: release commit에서 root manifest·`lumen.__version__`·`uv.lock`의 `0.6.0` 일치를 확인하고 `uv sync --extra service --extra dev --frozen`, `uv run lumen-test contract`, `uv run lumen-test integration`, `uv run lumen-test system`, `uv build --wheel`을 수행한다. `v0.6.0` tag workflow가 CI 이후 두 플랫폼의 API/worker/controller/sandbox 이미지를 GHCR `0.6.0`·`sha-<short-sha>`에 게시하는지 확인한다. 기존 API/worker/controller를 중지하고 DB 백업·migration 021 적용·재실행 no-op을 확인한 뒤 새 이미지를 함께 기동한다. CI·이미지 게시·wheel release는 운영 Kolla 배포를 대체하지 않는다.
+0.6.1 게시 계약: release commit에서 root manifest·`lumen.__version__`·`uv.lock`의 `0.6.1` 일치를 확인하고 `uv sync --extra service --extra dev --frozen`, `uv run lumen-test contract`, `uv run lumen-test integration`, `uv run lumen-test system`, `uv build --wheel`을 수행한다. `v0.6.1` tag workflow가 CI 이후 두 플랫폼의 API/worker/controller/sandbox 이미지를 GHCR `0.6.1`·`sha-<short-sha>`에 게시하는지 확인한다. 기존 API/worker/controller를 중지하고 DB 백업·migration 021 적용·재실행 no-op을 확인한 뒤 새 이미지를 함께 기동한다. 이 patch는 새 migration을 추가하지 않는다. Explicit plugin allowlist는 `lumen-database-mariadb`0.1.1을 matching image와 함께 승인해야 한다. CI·이미지 게시·wheel release는 운영 Kolla 배포를 대체하지 않는다.
 
 #### v0.3.1 당시 운영 가이드 (현재 기본값이 아님)
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lumen"
-version = "0.6.0"
+version = "0.6.1"
 description = "Afterglow Lumen durable chat, LLM, and agent service"
 requires-python = ">=3.11"
 dependencies = []
@@ -12,7 +12,7 @@ dependencies = []
 [project.optional-dependencies]
 service = [
     "lumen-plugin-api==0.1.0",
-    "lumen-database-mariadb==0.1.0",
+    "lumen-database-mariadb==0.1.1",
     "lumen-memory-default==0.1.0",
     "lumen-tools-default==0.1.0",
     "lumen-skills-default==0.1.0",
