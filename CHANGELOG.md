@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.6.1
+## 0.6.2
+
+Changes since the published `v0.6.0`: the Redis 5 shutdown compatibility and pooled MariaDB readiness recovery fixes described under 0.6.1 below. `0.6.1` was prepared and merged to `main` but never tagged, wheel-released or published as an image, so 0.6.2 is the first published release carrying those fixes. Source behavior is unchanged from the 0.6.1 candidate; only release values move.
+
+**Release boundary:** Root package, lock and packaged Kolla image defaults target `0.6.2`; the published `v0.6.0` remains immutable and no `v0.6.1` artifacts exist. Database plugin `0.1.1` stays with its matching allowlist; SDK, other plugins and sandbox versions stay independent. No new migration or change to storage, authentication, provider routing or the source-build commit pin. Tag, wheel and multi-architecture image publication and production rollout remain separate gates.
+
+**Candidate verification (2026-10-05):** Frozen contract service1,676/SDK125/Ruff, plugin conformance 88 (1 pgvector skip), Linux sandbox 14 (7 privileged-host skips), Kolla assets 15, real MariaDB/Redis integration 107 and canonical process-system 9 passed. The isolated system stack served real API HTTP traffic and the worker completed durable runs; arm64 API/worker images report root 0.6.2/plugin 0.1.1/UID1000, and an isolated root-wheel install shows version 0.6.2 and packaged role image default 0.6.2. These are local candidate checks, not tag publication, amd64 image or production acceptance.
+
+## 0.6.1 (unpublished; superseded by 0.6.2)
 
 - **Redis shutdown compatibility:** Cache teardown awaits the async `close()` method provided by the pinned Redis 5.0.0 client, instead of its nonexistent `aclose()`. The real-client regression and contract gate pass; built arm64 and emulated amd64 API images close actual Redis TCP connections, clear cached state, and safely repeat teardown. This removes the observed shutdown `AttributeError`; it does not change database readiness or resolve the separate C2 closed-transport failure. The correction is not in the published 0.6.0 artifacts.
 - **Pooled MariaDB readiness recovery:** Database plugin `lumen-database-mariadb` 0.1.1 reports uvloop's exact closed-transport `RuntimeError` from aiomysql pool pre-ping as a disconnect, so SQLAlchemy renews a pooled connection whose socket closed while idle instead of failing `/v1/ready` or the request. This reproduces the C2 `TCPTransport closed=True … handler is closed` signature: under uvloop the unfixed readiness check returned false and now renews the connection, while unrelated ping errors still fail. SQLAlchemy may still log one `Exception terminating connection` traceback while discarding the dead socket. The default and example plugin approvals move to 0.1.1; operators with an explicit `[lumen.plugin_config]` allowlist must approve 0.1.1 together with the new image. The cause of the upstream socket closure and production rollout remain separate evidence.
