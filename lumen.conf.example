@@ -73,7 +73,7 @@ tools = ["default-tools"]
 skills = ["default-skills"]
 mcp = ["remote-mcp", "afterglow-mcp"]
 allowlist = [
-  { kind = "database", name = "mariadb", distribution = "lumen-database-mariadb", version = "0.1.0" },
+  { kind = "database", name = "mariadb", distribution = "lumen-database-mariadb", version = "0.1.1" },
   { kind = "memory", name = "default-memory", distribution = "lumen-memory-default", version = "0.1.0" },
   { kind = "tools", name = "default-tools", distribution = "lumen-tools-default", version = "0.1.0" },
   { kind = "skills", name = "default-skills", distribution = "lumen-skills-default", version = "0.1.0" },
