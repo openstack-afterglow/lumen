@@ -34,6 +34,10 @@ API_KEY_SCOPES = frozenset(
         "compat:images:write",
         "compat:audio:write",
         "compat:realtime:write",
+        "compat:batches:read",
+        "compat:batches:write",
+        "compat:files:read",
+        "compat:files:write",
         "native:conversations:read",
         "native:conversations:write",
         "native:runs:read",
@@ -42,6 +46,8 @@ API_KEY_SCOPES = frozenset(
         "native:audio:write",
         "native:realtime:write",
         "native:assets:read",
+        "native:batches:read",
+        "native:batches:write",
         "native:assets:write",
         "native:extensions:read",
         "native:extensions:write",
@@ -552,6 +558,42 @@ async def revoke_key(key_id: int, user_id: str, project_id: str) -> None:
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ApiKeyStorageUnavailable("chat DB 오류") from exc
+
+
+async def authorize_api_key_in_transaction(
+    session,
+    *,
+    api_key_id: int | None,
+    user_id: str,
+    project_id: str,
+    required_scopes: Iterable[str],
+) -> None:
+    """Re-authorize a persisted run's key in the caller's transaction before new provider I/O.
+
+    Keystone/web runs carry no key and keep their admission authority. A key that
+    was revoked, expired, deactivated, moved, or lost a required scope after
+    admission raises ``ApiKeyForbidden``. The row is refreshed, never locked:
+    revocation must not wait for a worker and only bounds the next I/O start.
+    """
+    if api_key_id is None:
+        return
+    row = (
+        await session.execute(
+            select(ChatApiKey).where(ChatApiKey.id == api_key_id).execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        row is None
+        or row.owner_user_id != user_id
+        or row.owner_project_id != project_id
+        or not row.is_active
+        or row.revoked_at is not None
+        or _is_expired(row.expires_at)
+    ):
+        raise ApiKeyForbidden("API 키가 더 이상 유효하지 않습니다")
+    scopes = _valid_scopes(row.scopes)
+    if scopes is None or any(scope not in scopes for scope in required_scopes):
+        raise ApiKeyForbidden("API 키에 필요한 scope가 없습니다")
 
 
 async def verify_key(raw: str) -> dict | None:

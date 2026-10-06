@@ -13,6 +13,10 @@ class ModelsDevImportConflictError(RuntimeError):
     """models.dev provider mapping would orphan imported local prices."""
 
 
+class ModelOrderConflictError(RuntimeError):
+    """Provider model membership or display order changed before a reorder."""
+
+
 class ProviderValidationError(ValueError):
     """입력 검증 실패/제약 위반 — 400."""
 

@@ -4,50 +4,19 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from typing import Any, Literal
+from contextlib import aclosing
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
 
 from lumen.auth import require_api_key_scopes
+from lumen.models.api_requests import ResponsesRequest
 from lumen.services import completion_api as core
+from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 
 from .streaming import events_with_ping
 
 router = APIRouter()
-
-
-class ResponsesRequest(BaseModel):
-    model: str = Field(..., max_length=190)
-    provider: str | None = Field(default=None, min_length=1, max_length=40, pattern=r"^[a-z0-9][a-z0-9_-]*$")
-    input: str | list[dict[str, Any]]
-    stream: bool = False
-    store: bool | None = None
-    previous_response_id: str | None = None
-    background: bool | None = None
-    include: list[str] | None = None
-    prompt_cache_key: str | None = None
-    client_metadata: dict[str, Any] | None = None
-    instructions: str | None = None
-    max_output_tokens: int | None = Field(default=None, gt=0)
-    metadata: dict[str, Any] | None = None
-    parallel_tool_calls: bool | None = None
-    reasoning: dict[str, Any] | None = None
-    temperature: float | None = None
-    text: dict[str, Any] | None = None
-    tool_choice: Any = None
-    tools: list[dict[str, Any]] | None = None
-    top_p: float | None = None
-    truncation: Literal["auto", "disabled"] | None = None
-    user: str | None = None
-    service_tier: str | None = None
-    safety_identifier: str | None = None
-    # Accepting this lets a caller keep its own context strategy. Lumen only
-    # supplies a default when the field is absent; it never overrides one.
-    context_management: list[dict[str, Any]] | None = None
-
-    model_config = {"extra": "forbid"}
 
 
 def responses_error(status_code: int, message: str, *, code: str | None = None) -> JSONResponse:
@@ -68,7 +37,9 @@ def _sse(event: dict) -> str:
     "/responses",
     openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
 )
+@admit_sse
 async def responses(
+    request: Request,
     body: ResponsesRequest,
     x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider"),
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
@@ -111,21 +82,24 @@ async def responses(
 
     if not body.stream:
         return JSONResponse(content=result)
+    # The provider stream is already open; the SSE owner closes it even if the body never starts.
+    register_sse_resource(request, result)
 
     async def generate() -> AsyncIterator[str]:
-        try:
-            async for event in events_with_ping(result):
-                if event is None:
-                    yield ": ping\n\n"
-                else:
-                    yield _sse(event)
-        except Exception:
-            yield _sse(
-                {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": "upstream model error", "code": None},
-                }
-            )
+        async with aclosing(events_with_ping(result)) as events:
+            try:
+                async for event in events:
+                    if event is None:
+                        yield ": ping\n\n"
+                    else:
+                        yield _sse(event)
+            except Exception:
+                yield _sse(
+                    {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": "upstream model error", "code": None},
+                    }
+                )
 
     return StreamingResponse(
         generate(),

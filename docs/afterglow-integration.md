@@ -118,9 +118,14 @@ API Key 요청 시 필요한 최소 Scope 정의:
 | `native:extensions:read`, `native:extensions:write` | 스킬, MCP 서버, 커스텀 도구 사용 |
 | `native:agents:use` | API-key native `chat` run의 소유/승인된 `agent_id` 사용 (agent 정의 관리 권한은 아님) |
 | `usage:read` | 사용량 기록 및 API key 사용 현황 조회 (`GET /v1/usage/*`) |
+| `native:batches:read`, `native:batches:write` | Native mixed Batch 조회 / 생성·취소 (`/v1/chat/batches*`). 생성 시 각 항목 operation scope도 필요 |
+| `compat:files:read`, `compat:files:write` | OpenAI 호환 Files 조회·다운로드 / 업로드·삭제 (`/v1/files*`, purpose `batch`) |
+| `compat:batches:read`, `compat:batches:write` | OpenAI 호환 Batch 조회 / 생성·취소 (`/v1/batches*`). 생성 시 endpoint scope(`compat:completions:write` 또는 `compat:images:write`)도 필요 |
 
 > **Native Default Features 주의사항**:
 > Native Completion 요청(`CompletionRequest`, `TempCompletionRequest`)의 기본 옵션(`features`)은 `memory=true`, `tool_policy.mode="agent_default"`를 포함합니다. `native:memory:*` 및 `native:tools:execute` scope가 없는 최소 권한 API Key를 사용하는 경우, 요청 body에 `features: {"memory": false, "tool_policy": {"mode": "none"}}`를 명시적으로 전달해야 HTTP 403 거절을 방지할 수 있습니다.
+
+> **Batch 주의사항**: Batch/Files는 서버 `batch_enabled`가 켜진 배포에서만 열리며 꺼져 있으면 503 `batch_unavailable`입니다. 위 6개 scope는 기본 발급 scope가 아니므로 명시적으로 부여해야 합니다. 지원 범위·한도·오류 형식은 `GET /v1/compat`의 `batches` 필드와 [API 참조](api-reference.md#batch-api)를 따릅니다.
 
 ### 4.3 API Key 프로비저닝 (Credential Provisioning)
 
@@ -387,11 +392,13 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
 * **OpenAI Responses (`POST /v1/responses`)**:
   - `model`, text 또는 item-list `input`, 선택적 `instructions`, `provider`, `stream`, `max_output_tokens`, `temperature`, `tools`, `tool_choice`와 documented stateless options를 받습니다.
   - `store=true`, `previous_response_id`, `background=true`는 지원하지 않으며 안전한 400 code를 반환합니다. Lumen conversation/history에 Responses 요청이나 결과를 저장하지 않습니다.
-  - Streaming은 Responses-native named SSE event를 유지하고 idle ping은 comment frame입니다. Downstream disconnect는 pending upstream read를 취소하지 않고 background drain합니다.
+  - Streaming은 Responses-native named SSE event를 유지하고 idle ping은 comment frame입니다. Downstream disconnect는 pending upstream read를 취소하지 않으며, 해당 ASGI 요청이 read drain·iterator close·과금 settlement 완료까지 기다립니다. Background task로 수명을 넘기지 않습니다.
 * **Anthropic native (`POST /v1/messages`)**:
   - `model`, `messages`, 필수 양수 `max_tokens`, 선택적 `provider`, `system`, `temperature`, `stream`, `metadata`, `stop_sequences`, `thinking`, `tools`, `tool_choice`, `top_k`, `top_p`, `container`를 받습니다.
   - `POST /v1/messages/count_tokens`는 동일한 Anthropic input block을 native token-count transport로 전달합니다.
   - Streaming은 Anthropic event 이름과 body를 유지하고 약 15초 idle마다 `event: ping`을 보냅니다. OpenAI `[DONE]` sentinel로 변환하지 않습니다.
+  - Legacy Claude gateway의 `/v1/claude-gateway/v1/messages`도 같은 SSE admission·요청 소유 cleanup을 사용합니다. `api_max_sse_connections` 포화 시 auth/schema validation 뒤, route resolution·provider 호출 전에 429와 `Retry-After: 1`을 반환하며 non-stream 요청은 SSE slot을 쓰지 않습니다. HTTP/SSE/WS reservation과 측정 load는 마지막 byte나 disconnect가 아니라 ASGI cleanup 완료 때 해제되므로, drain 중 settlement를 새 작업으로 오인하거나 guest를 조기 삭제하지 않습니다.
+  - Gateway Messages의 실제 text delta도 first-text latency 표본에 포함되며 ping·tool event는 표본이 아닙니다. SSE 시작 전 reservation과 시작 후 measured SSE load는 별개입니다.
 * **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르면 400 `provider_header_conflict`입니다. `model`의 transport prefix는 editable selector의 alias나 충돌 조건이 아닙니다. Request schema에 없는 필드는 422로 거부합니다.
 
 ### 6.2 Output token budget
@@ -521,12 +528,10 @@ FastAPI 프레임워크 특성에 따라 HTTP 예외 발생 시 반환되는 JSO
 * **Anthropic 호환 에러 응답 (`POST /v1/messages`)**:
   ```json
   {
-    "detail": {
-      "type": "error",
-      "error": {
-        "type": "invalid_request_error",
-        "message": "API 키 월 사용 한도를 초과했습니다"
-      }
+    "type": "error",
+    "error": {
+      "type": "rate_limit_error",
+      "message": "API 키 월 사용 한도를 초과했습니다"
     }
   }
   ```
@@ -580,9 +585,14 @@ import { randomUUID } from "node:crypto";
 
 const LUMEN_API_KEY = process.env.LUMEN_API_KEY;
 const LUMEN_PROVIDER_MODEL = process.env.LUMEN_PROVIDER_MODEL;
+const LUMEN_ORIGIN = process.env.LUMEN_ORIGIN ?? "http://localhost:8012";
+const LUMEN_MODEL = process.env.LUMEN_MODEL;
 
 if (!LUMEN_API_KEY) {
   throw new Error("LUMEN_API_KEY environment variable is required");
+}
+if (!LUMEN_PROVIDER_MODEL || !LUMEN_MODEL) {
+  throw new Error("LUMEN_PROVIDER_MODEL and LUMEN_MODEL environment variables are required");
 }
 
 // 1. OpenAI 호환 Lumen Durable Completion (OpenAI base_url은 /v1 필수)

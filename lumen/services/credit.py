@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -308,6 +308,26 @@ def worst_case_token_rates(pricing_snapshot: dict) -> tuple[Decimal, Decimal, De
     )
 
 
+def call_credit_bound(pricing_snapshot: dict, *, input_tokens: int, output_tokens: int) -> Decimal:
+    """Worst-case credits for one provider call under frozen prices, rounded upward.
+
+    ``pricing_snapshot`` carries the frozen token rates plus ``margin_multiplier``
+    and ``chat_credit_per_usd``; it is never a live catalog price. A free route
+    (every frozen rate zero) bounds to exactly zero. Raises ``ValueError``.
+    """
+    try:
+        input_rate, output_rate, cushion = worst_case_token_rates(pricing_snapshot)
+        multiplier = Decimal(str(pricing_snapshot["margin_multiplier"])) * Decimal(
+            str(pricing_snapshot["chat_credit_per_usd"])
+        )
+    except (KeyError, InvalidOperation, TypeError) as exc:
+        raise ValueError("durable pricing snapshot is invalid") from exc
+    if not multiplier.is_finite() or multiplier < 0:
+        raise ValueError("invalid credit conversion")
+    cost = input_rate * input_tokens + output_rate * output_tokens
+    return ((cost + (cushion if cost else 0)) * multiplier).quantize(_CREDIT_QUANTUM, rounding=ROUND_CEILING)
+
+
 def _first_of_month(d: date) -> date:
     return d.replace(day=1)
 
@@ -357,21 +377,23 @@ async def _ledger_credited_since(
     return Decimal(str((await session.execute(stmt)).scalar_one()))
 
 
-async def reserve_media_credit_in_transaction(session, *, user_id: str, project_id: str,
-                                              api_key_id: int | None, bound: Decimal) -> None:
-    """Serialize media starts on the wallet and count unsettled holds before provider I/O.
+async def reserve_call_credit_in_transaction(session, *, user_id: str, project_id: str,
+                                             api_key_id: int | None, bound: Decimal) -> None:
+    """Serialize provider-call starts on the wallet and count unsettled holds before I/O.
 
-    Call only from a READ COMMITTED transaction set before its first statement:
-    earlier run reads otherwise pin a stale REPEATABLE READ snapshot. Held and
-    ledger aggregates must stay nonlocking: their unindexed FOR UPDATE scans
-    can block another user's text reservation insert. Failed or uncertain calls
-    retain their bound until reconciliation; settled calls enter the ledger.
-    No remote I/O runs under this row lock.
+    Shared by durable text, media and realtime calls. Call only from a READ
+    COMMITTED transaction set before its first statement: earlier run reads
+    otherwise pin a stale REPEATABLE READ snapshot. Held and ledger aggregates
+    must stay nonlocking: their unindexed FOR UPDATE scans can block another
+    user's reservation insert. Failed or uncertain calls retain their bound until
+    reconciliation; settled calls enter the ledger. A zero bound is only valid
+    for a route whose frozen prices are explicitly free; it still passes every
+    wallet/key gate. No remote I/O runs under this row lock.
     """
     from lumen.models.chat_runs import ChatModelCallReservation, ChatRun
 
-    if not bound.is_finite() or bound <= 0:
-        raise QuotaExceeded("미디어 사용 한도가 올바르지 않습니다")
+    if not bound.is_finite() or bound < 0:
+        raise QuotaExceeded("호출 사용 한도가 올바르지 않습니다")
     # A plain session.get() before this lock pins a REPEATABLE READ snapshot and
     # can miss a competing reservation committed while waiting for the wallet.
     wallet = (await session.execute(select(UserWallet).where(UserWallet.user_id == user_id)

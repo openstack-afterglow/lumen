@@ -10,6 +10,8 @@ from lumen.services import memory_jobs as jobs
 from lumen.services import title_jobs
 
 pytestmark = pytest.mark.asyncio
+# These tests replace the committed claim and exercise only post-claim behavior.
+# Actual registration gates and finish-inflight behavior are integration-tested.
 
 
 class _Result:
@@ -101,7 +103,7 @@ async def test_process_one_applies_small_model_deltas_and_completes_atomically(m
     monkeypatch.setattr(jobs, "generate_memory_if_applicable", fake_extract)
     monkeypatch.setattr(jobs, "_apply_and_complete", fake_apply_and_complete)
 
-    assert await jobs.process_one(owner="worker-1") is True
+    assert await jobs.process_one.__wrapped__(owner="worker-1") is True
     assert completed == {
         "job_id": "job-1",
         "owner": "worker-1",
@@ -131,7 +133,7 @@ async def test_process_one_does_not_retry_when_another_worker_owns_the_lease(mon
     monkeypatch.setattr(jobs, "_apply_and_complete", fake_apply_and_complete)
     monkeypatch.setattr(jobs, "_retry", fake_retry)
 
-    assert await jobs.process_one(owner="worker-1") is True
+    assert await jobs.process_one.__wrapped__(owner="worker-1") is True
     assert retried == []
 
 
@@ -151,7 +153,7 @@ async def test_process_one_retries_transient_extraction_failure(monkeypatch):
     monkeypatch.setattr(jobs, "generate_memory_if_applicable", fake_extract)
     monkeypatch.setattr(jobs, "_retry", fake_retry)
 
-    assert await jobs.process_one(owner="worker-1") is True
+    assert await jobs.process_one.__wrapped__(owner="worker-1") is True
     assert retried == {"job_id": "job-1", "owner": "worker-1"}
 
 
@@ -175,7 +177,7 @@ async def test_process_one_retries_post_apply_failure(monkeypatch):
     monkeypatch.setattr(jobs, "_apply_and_complete", failing_apply_and_complete)
     monkeypatch.setattr(jobs, "_retry", fake_retry)
 
-    assert await jobs.process_one(owner="worker-1") is True
+    assert await jobs.process_one.__wrapped__(owner="worker-1") is True
     assert retried == {"job_id": "job-1", "owner": "worker-1"}
 
 
@@ -258,7 +260,7 @@ async def test_title_provider_started_expiry_never_replays_provider(monkeypatch)
     monkeypatch.setattr(title_jobs, "_claim_one", fake_claim)
     monkeypatch.setattr(title_jobs.title_summary, "generate_title", forbidden_generate)
 
-    assert await title_jobs.process_one(owner="worker-1") is True
+    assert await title_jobs.process_one.__wrapped__(owner="worker-1") is True
     assert calls == []
 
 
@@ -293,7 +295,7 @@ async def test_title_completed_result_replays_without_provider(monkeypatch):
     monkeypatch.setattr(title_jobs, "_apply_result", fake_apply)
     monkeypatch.setattr(title_jobs.title_summary, "generate_title", forbidden_generate)
 
-    assert await title_jobs.process_one(owner="worker-1") is True
+    assert await title_jobs.process_one.__wrapped__(owner="worker-1") is True
     assert applied == ["job-1"]
 
 
@@ -418,6 +420,6 @@ async def test_title_apply_failure_requeues_stored_result_without_provider_retry
     monkeypatch.setattr(title_jobs, "_apply_result", failing_apply)
     monkeypatch.setattr(title_jobs, "_requeue_stored_result", fake_requeue)
 
-    assert await title_jobs.process_one(owner="worker-1") is True
+    assert await title_jobs.process_one.__wrapped__(owner="worker-1") is True
     assert provider_calls == [True]
     assert requeued == [("job-1", "worker-1")]

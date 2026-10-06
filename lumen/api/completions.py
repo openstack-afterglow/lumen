@@ -15,7 +15,7 @@ import logging
 from time import monotonic
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
@@ -46,6 +46,7 @@ from lumen.services.chat_admission import (
 )
 from lumen.services.durable_runs import admission, common, interactions, lifecycle, queries
 from lumen.services.durable_runs import errors as durable_errors
+from lumen.services.infrastructure.api_load import admit_sse
 from lumen.services.run_store import NONTERMINAL
 
 logger = logging.getLogger(__name__)
@@ -1141,8 +1142,10 @@ def _cursor(last_event_id: str | None, after_seq: int | None, run_id: str) -> in
 
 
 @router.get("/runs/{run_id}/events")
+@admit_sse
 async def run_events(
     run_id: str,
+    request: Request,
     after_seq: int | None = Query(default=None, ge=0),
     last_event_id: str | None = Header(default=None),
     token_info: Principal = Depends(require_scopes("native:runs:read")),

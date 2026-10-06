@@ -1,19 +1,10 @@
 ---
-- name: Bootstrap | Pull Lumen API image for migration
-  become: true
-  community.docker.docker_image:
-    name: "{{ lumen_api_image_ref }}"
-    source: pull
-    force_source: "{{ lumen_image_tag == 'latest' }}"
-  run_once: true
-  delegate_to: "{{ groups['lumen'] | first }}"
-  when: not (lumen_source_mode | default(false) | bool)
-
 - name: Bootstrap | Apply Lumen database migrations
   become: true
   community.docker.docker_container:
     name: lumen_bootstrap
     image: "{{ lumen_api_image_ref }}"
+    pull: never
     command: ["python", "-m", "lumen.scripts.migrate", "--apply"]
     state: started
     detach: false
@@ -47,6 +38,7 @@
   community.docker.docker_container:
     name: lumen_provider_bootstrap
     image: "{{ lumen_api_image_ref }}"
+    pull: never
     command: ["python", "-m", "lumen.scripts.seed_providers"]
     state: started
     detach: false

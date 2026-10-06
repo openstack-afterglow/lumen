@@ -25,6 +25,18 @@ from lumen.services.providers.errors import ProviderValidationError
 pytestmark = pytest.mark.integration
 
 
+async def _fixed_text_worker(run_id: str, identity: str) -> str:
+    """A real fixed online_text registration compatible with the admitted run."""
+    from lumen.services.infrastructure import store
+
+    async with get_session_factory()() as session:
+        run = await session.get(ChatRun, run_id)
+    return await store.register_worker(
+        worker_identity=identity, boot_id=str(uuid.uuid4()), capacity=1, protocol_versions=[1, 2],
+        plugin_digest=run.required_plugin_digest or "0" * 64, schema_version=1, workload_classes=["online_text"],
+    )
+
+
 async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypatch):
     """Exercise HTTP admission, the durable journal, worker execution, and usage attribution."""
     database_url = os.environ["DATABASE_URL"]
@@ -154,7 +166,8 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
 
             monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_litellm_stream)
             monkeypatch.setattr(graph.litellm_client, "direct_openai_stream_completed", lambda _stream: True)
-            assert await execution.execute_queued_run(run_id, owner=run_owner) is True
+            registration_id = await _fixed_text_worker(run_id, run_owner)
+            assert await execution.execute_queued_run(run_id, owner=run_owner, registration_id=registration_id) is True
 
             events = await client.get(f"/v1/runs/{run_id}/events", headers={"X-Api-Key": key["key"]})
             assert events.status_code == 200, events.text
@@ -244,8 +257,10 @@ async def test_title_recovery_skips_empty_and_unavailable_conversations_without_
 
     from lumen.crypto import encrypt_chat_content
     from lumen.models.chat_db import ChatConversation, ChatConversationMessage, ChatMessage, ChatMessageGraph
+    from lumen.models.chat_infrastructure import ChatWorkerRegistration
     from lumen.models.chat_jobs import ChatJob
     from lumen.services import title_jobs
+    from lumen.services.infrastructure import store
 
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
@@ -254,6 +269,11 @@ async def test_title_recovery_skips_empty_and_unavailable_conversations_without_
     empty_ids = [str(uuid.uuid4()) for _ in range(21)]
     unavailable_id, recoverable_id = str(uuid.uuid4()), str(uuid.uuid4())
     now = datetime.now(UTC)
+    registration_id = await store.register_worker(
+        worker_identity="recovery-" + nonce, boot_id=str(uuid.uuid4()), capacity=1,
+        protocol_versions=[2], plugin_digest="a" * 64, schema_version=1,
+        workload_classes=["online_text"],
+    )
     try:
         async with factory() as session, session.begin():
             for conv_id in empty_ids:
@@ -312,9 +332,9 @@ async def test_title_recovery_skips_empty_and_unavailable_conversations_without_
                     )
                 )
 
-        assert await title_jobs._recover_one() is True
-        assert await title_jobs._recover_one() is True
-        await title_jobs._recover_one()
+        assert await title_jobs._recover_one(owner=registration_id) is True
+        assert await title_jobs._recover_one(owner=registration_id) is True
+        await title_jobs._recover_one(owner=registration_id)
         async with factory() as session:
             unavailable = await session.get(ChatConversation, unavailable_id)
             recovered = await session.get(ChatConversation, recoverable_id)
@@ -335,6 +355,8 @@ async def test_title_recovery_skips_empty_and_unavailable_conversations_without_
             )
             assert set(empty_statuses) == {"idle"}
     finally:
+        async with factory() as session, session.begin():
+            await session.delete(await session.get(ChatWorkerRegistration, registration_id))
         await close_db()
 
 
@@ -610,7 +632,11 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                 return chunks()
 
             monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_stream)
-            assert await execution.execute_queued_run(run_id, owner=f"onboarding-worker-{nonce}") is True
+            worker_identity = f"onboarding-worker-{nonce}"
+            registration_id = await _fixed_text_worker(run_id, worker_identity)
+            assert await execution.execute_queued_run(
+                run_id, owner=worker_identity, registration_id=registration_id
+            ) is True
             async with factory() as session:
                 stored = await session.get(ChatRun, run_id)
                 ledger = (await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))).scalar_one()

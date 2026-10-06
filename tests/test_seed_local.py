@@ -54,6 +54,8 @@ def test_required_scope_rotation_predicate() -> None:
     assert {"compat:images:write", "compat:audio:write", "compat:realtime:write"} <= set(_LOCAL_KEY_SCOPES)
     assert {"native:images:write", "native:audio:write", "native:realtime:write",
             "native:assets:read", "native:assets:write"} <= set(_LOCAL_KEY_SCOPES)
+    assert {"native:batches:read", "native:batches:write", "compat:batches:read", "compat:batches:write",
+            "compat:files:read", "compat:files:write"} <= set(_LOCAL_KEY_SCOPES)
 
     # Complete current scopes -> satisfied
     assert is_scope_satisfied(_LOCAL_KEY_SCOPES, _LOCAL_KEY_SCOPES) is True

@@ -16,6 +16,7 @@ from sqlalchemy import select
 from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_db import ChatConversation, ChatMessage, ChatUsageLog
+from lumen.models.chat_infrastructure import ChatWorkerRegistration
 from lumen.models.chat_runs import ChatRun, ChatRunSegment, ChatRunTurn, ChatTempThread
 from lumen.plugins import bindings as plugin_bindings
 from lumen.plugins import skills_host
@@ -29,6 +30,7 @@ from lumen.services import (
     extensions_store,
     litellm_client,
     native_compaction,
+    worker_routing,
 )
 from lumen.services import conversation_store as cs
 from lumen.services.capabilities import reasoning_can_be_disabled
@@ -324,7 +326,7 @@ async def _finish_transaction(
         _require_owned_running_lease(run, owner)
         if run.status not in NONTERMINAL:
             return False, None
-        if run.run_kind in {"image", "tts", "stt", "realtime"}:
+        if run.run_kind in {"image", "tts", "stt", "realtime", "api_completion"}:
             from lumen.models.chat_runs import ChatModelCallReservation
 
             reservation = (await session.execute(select(ChatModelCallReservation).where(
@@ -338,10 +340,19 @@ async def _finish_transaction(
                 segment = (await session.execute(select(ChatRunSegment).where(
                     ChatRunSegment.run_id == run.id, ChatRunSegment.segment_id == f"{run.run_kind}:1"
                 ).with_for_update())).scalar_one()
-                if segment.status == "provider_started":
-                    fail_unresolved_segment(segment, error_code="provider_result_unknown")
-                reservation.status = "unknown"
-                reservation.settled_at = _now()
+                if (run.batch_id is not None and run.run_kind in {"image", "tts", "stt"}
+                        and error_code == "provider_rejected" and segment.status == "provider_started"):
+                    # Confirmed refusal, hold release and terminal state commit together.
+                    fail_unresolved_segment(segment, error_code="provider_rejected")
+                    reservation.actual_credits = Decimal("0")
+                    reservation.status = "settled"
+                    reservation.settled_at = _now()
+                    run.usage_reconciled_at = reservation.settled_at
+                else:
+                    if segment.status == "provider_started":
+                        fail_unresolved_segment(segment, error_code="provider_result_unknown")
+                    reservation.status = "unknown"
+                    reservation.settled_at = _now()
         await append_event(session, run, _event(run, "run.stage.changed", {"stage": "finalizing"}))
         run.status = "finalizing"
         if usage_record is not None:
@@ -537,15 +548,8 @@ async def _finish_transaction(
 def _bounded_credits(pricing: dict[str, Any], input_tokens: int, output_tokens: int) -> Decimal:
     """Round a worst-case frozen price upward, never a live catalog price."""
     try:
-        input_rate, output_rate, cushion = credit.worst_case_token_rates(pricing)
-        multiplier = Decimal(str(pricing["margin_multiplier"])) * Decimal(str(pricing["chat_credit_per_usd"]))
-        if not multiplier.is_finite() or multiplier < 0:
-            raise ValueError("invalid credit conversion")
-        cost = input_rate * input_tokens + output_rate * output_tokens
-        return ((cost + (cushion if cost else 0)) * multiplier).quantize(
-            Decimal("0.00000001"), rounding=ROUND_CEILING
-        )
-    except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
+        return credit.call_credit_bound(pricing, input_tokens=input_tokens, output_tokens=output_tokens)
+    except ValueError as exc:
         raise DurableRunError("bounded credit pricing is unavailable") from exc
 
 
@@ -1906,10 +1910,11 @@ def _native_compaction_options(capability_snapshot: dict[str, Any], resolved: di
     )
 
 
-async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | None = None) -> bool:
-    """Claim one queued run and stream its normalized engine output into the journal."""
+async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -> bool:
+    """Claim one queued run for a registered worker and stream its output into the journal."""
     factory = _factory()
     async with factory() as session, session.begin():
+        await worker_routing.use_read_committed(session)
         run = await claim_queued_run(session, run_id, owner=owner, registration_id=registration_id)
         if run is None:
             return False
@@ -1940,6 +1945,14 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
         return await execute_audio_run(run_id, owner=owner,
                                        payload={**payload, "user_id": user_id, "project_id": project_id},
                                        capability_snapshot=capability_snapshot, pricing_snapshot=pricing_snapshot)
+
+    if run_kind == "api_completion":
+        from .api_completion import execute_api_completion_run
+
+        return await execute_api_completion_run(run_id, owner=owner,
+                                                payload={**payload, "user_id": user_id, "project_id": project_id},
+                                                capability_snapshot=capability_snapshot,
+                                                pricing_snapshot=pricing_snapshot)
 
     if run_kind == "compaction":
         input_messages = [dict(m) for m in (payload.get("input_messages") or [])]
@@ -2830,14 +2843,20 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str | 
     return True
 
 
-async def queued_run_ids(*, limit: int = 4) -> list[str]:
+async def queued_run_ids(*, registration_id: str, limit: int = 4) -> list[str]:
+    """Oldest queued runs this registration may claim; the claim re-checks every gate."""
     factory = _factory()
     async with factory() as session:
+        registration = await session.get(ChatWorkerRegistration, registration_id)
+        if registration is None or registration.draining or not registration.accepting:
+            return []
         return list(
             (
                 await session.execute(
-                    select(ChatRun.id).where(ChatRun.status == "queued", ChatRun.run_kind != "realtime")
-                    .order_by(ChatRun.created_at).limit(limit)
+                    select(ChatRun.id)
+                    .where(*worker_routing.registration_run_filter(registration),
+                           *worker_routing.queued_filter(now=_now()))
+                    .order_by(ChatRun.created_at, ChatRun.id).limit(limit)
                 )
             ).scalars()
         )

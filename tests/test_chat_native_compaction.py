@@ -889,7 +889,7 @@ class TestPassthroughInjection:
 
     def test_responses_request_model_accepts_the_field(self):
         """`extra="forbid"` would otherwise 400 a caller that sends its own."""
-        from lumen.api.compat.responses import ResponsesRequest
+        from lumen.models.api_requests import ResponsesRequest
 
         body = ResponsesRequest(
             model="gpt-5.6-sol",

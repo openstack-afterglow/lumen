@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -30,7 +31,7 @@ def cloud_connection(cloud: CloudProfile) -> Connection:
     secret = os.environ[secret_ref.env] if secret_ref.env else Path(secret_ref.file).read_text(encoding="utf-8").strip()
     if not secret:
         raise ValueError("empty application credential secret")
-    return Connection(
+    connection = Connection(
         auth_type="v3applicationcredential",
         auth_url=cloud.auth_url,
         application_credential_id=cloud.application_credential_id,
@@ -38,7 +39,18 @@ def cloud_connection(cloud: CloudProfile) -> Connection:
         region_name=cloud.region_name,
         interface=cloud.interface,
         verify=cloud.ca_file or True,
+        api_timeout=(5, 15),
+        connect_retries=0,
+        status_code_retries=0,
     )
+    # Proxy.request defaults connect_retries=1 even when its adapter is configured
+    # with zero. Enforce the durable one-shot contract at the HTTP session boundary.
+    request = connection.session.request
+    def bounded_request(*args, **kwargs):
+        kwargs.update(timeout=(5, 15), connect_retries=0, status_code_retries=0)
+        return request(*args, **kwargs)
+    connection.session.request = bounded_request
+    return connection
 
 def validate_controller_material(controller_url: str, controller_ca_pem: str) -> None:
     url = urlsplit(controller_url)
@@ -128,6 +140,19 @@ class NovaProvider:
             f"{'SANDBOX' if intent.role == 'sandbox' else 'LUMEN'}_CONTROLLER_CA=/var/lib/lumen/bootstrap/ca.pem\n"
             f"{'SANDBOX' if intent.role == 'sandbox' else 'LUMEN'}_BOOTSTRAP_FILE=/var/lib/lumen/bootstrap/token\n"
         )
+        if intent.role in {"api", "worker"}:
+            if (not intent.guest_profile_id
+                    or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", intent.guest_profile_id)
+                    or not intent.guest_profile_digest
+                    or not re.fullmatch(r"[0-9a-f]{64}", intent.guest_profile_digest)
+                    or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}", intent.image_ref)):
+                raise ValueError("trusted Nova guest requires immutable profile/image pins")
+            guest_environment += (
+                f"LUMEN_GUEST_ROLE={intent.role}\n"
+                f"LUMEN_GUEST_PROFILE_ID={intent.guest_profile_id}\n"
+                f"LUMEN_GUEST_PROFILE_DIGEST={intent.guest_profile_digest}\n"
+                f"LUMEN_GUEST_IMAGE={intent.image_ref}\n"
+            )
         files = {"token": intent.bootstrap_token, "ca.pem": self.controller_ca_pem,
                  "environment": guest_environment}
         if intent.role == "worker":

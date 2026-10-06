@@ -443,6 +443,9 @@ async def prepare_delegations(
                     id=child_id,
                     run_scope="child",
                     run_kind="completion",
+                    # Agent children execute on the parent's online_text route; no separate pool lookup.
+                    workload_class=parent.workload_class,
+                    worker_pool_id=parent.worker_pool_id,
                     project_id=parent.project_id,
                     user_id=parent.user_id,
                     model_name=prepared["route"]["model_name"],

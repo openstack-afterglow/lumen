@@ -10,65 +10,21 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from contextlib import aclosing
 
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from lumen.auth import require_api_key_scopes
+from lumen.models.api_requests import OpenAIChatRequest, OpenAIChatResponse
 from lumen.services import completion_api as core
 from lumen.services import openai_compat
+from lumen.services.completion_format import nonstream_response
+from lumen.services.infrastructure.api_load import admit_sse
 from lumen.services.providers import errors, routing
 
 router = APIRouter()
-
-
-class OpenAIChatRequest(BaseModel):
-    model: str = Field(..., max_length=190)
-    provider: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=40,
-        pattern=r"^[a-z0-9][a-z0-9_-]*$",
-    )
-    messages: list[dict] = Field(..., min_length=1)
-    stream: bool = False
-    temperature: float | None = None
-    max_tokens: int | None = None
-    tools: list[dict] | None = None
-    tool_choice: Any = None
-    stream_options: dict | None = None
-
-    model_config = {"extra": "allow"}  # 미지원 OpenAI 파라미터는 무시(호환성)
-
-
-class OpenAIChatChoiceMessage(BaseModel):
-    role: str = "assistant"
-    content: str | None = None
-    tool_calls: list[dict] | None = None
-
-
-class OpenAIChatChoice(BaseModel):
-    index: int = 0
-    message: OpenAIChatChoiceMessage
-    finish_reason: str = "stop"
-
-
-class OpenAIUsage(BaseModel):
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-    prompt_tokens_details: dict[str, int] = Field(default_factory=lambda: {"cached_tokens": 0})
-
-
-class OpenAIChatResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: list[OpenAIChatChoice]
-    usage: OpenAIUsage
 
 
 class OpenAIModelItem(BaseModel):
@@ -99,32 +55,6 @@ def openai_error_response(
 
 def _completion_id() -> str:
     return "chatcmpl-" + uuid.uuid4().hex
-
-
-def nonstream_response(result: dict, *, cmpl_id: str, created: int) -> dict:
-    msg: dict = {"role": "assistant", "content": result["content"] or None}
-    if result.get("tool_calls"):
-        msg["tool_calls"] = [
-            {
-                "id": tc.get("id") or f"call_{i}",
-                "type": "function",
-                "function": {"name": tc["function"].get("name"), "arguments": tc["function"].get("arguments") or "{}"},
-            }
-            for i, tc in enumerate(result["tool_calls"])
-        ]
-    return {
-        "id": cmpl_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": result["model"],
-        "choices": [{"index": 0, "message": msg, "finish_reason": result["finish_reason"]}],
-        "usage": {
-            "prompt_tokens": result["prompt_tokens"],
-            "completion_tokens": result["completion_tokens"],
-            "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
-            "prompt_tokens_details": {"cached_tokens": result.get("cache_read_input_tokens", 0)},
-        },
-    }
 
 
 def chunk_dict(delta: dict, *, cmpl_id: str, created: int, model: str) -> dict:
@@ -207,6 +137,7 @@ def _sse(obj: dict) -> str:
     response_model=OpenAIChatResponse,
     openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
 )
+@admit_sse
 async def chat_completions(
     request: Request,
     body: OpenAIChatRequest,
@@ -276,7 +207,7 @@ async def chat_completions(
         include_usage = bool((body.stream_options or {}).get("include_usage"))
 
         async def gen() -> AsyncIterator[str]:
-            async for ev in openai_compat.execute_lumen_stream(
+            async with aclosing(openai_compat.execute_lumen_stream(
                 run_id=run_id,
                 user_id=user_id,
                 project_id=project_id,
@@ -284,13 +215,14 @@ async def chat_completions(
                 created=created,
                 include_usage=include_usage,
                 is_disconnected=request.is_disconnected,
-            ):
-                if ev["kind"] in {"chunk", "error"}:
-                    yield _sse(ev["data"])
-                elif ev["kind"] == "keepalive":
-                    yield ": keepalive\n\n"
-                elif ev["kind"] == "done":
-                    yield "data: [DONE]\n\n"
+            )) as events:
+                async for ev in events:
+                    if ev["kind"] in {"chunk", "error"}:
+                        yield _sse(ev["data"])
+                    elif ev["kind"] == "keepalive":
+                        yield ": keepalive\n\n"
+                    elif ev["kind"] == "done":
+                        yield "data: [DONE]\n\n"
 
         return StreamingResponse(
             gen(),
@@ -344,15 +276,16 @@ async def chat_completions(
         return openai_error_response(502, "업스트림 모델 오류")
 
     async def gen() -> AsyncIterator[str]:
-        async for ev in stream:
-            if ev["type"] == "delta":
-                yield _sse(chunk_dict(ev, cmpl_id=cmpl_id, created=created, model=resolved["api_model_name"]))
-            elif ev["type"] == "done":
-                if include_usage:
-                    yield _sse(usage_chunk(ev, cmpl_id=cmpl_id, created=created, model=resolved["api_model_name"]))
-            elif ev["type"] == "error":
-                yield _sse(openai_error_dict(ev.get("message", "오류"), type_="api_error"))
-                return
+        async with aclosing(stream):
+            async for ev in stream:
+                if ev["type"] == "delta":
+                    yield _sse(chunk_dict(ev, cmpl_id=cmpl_id, created=created, model=resolved["api_model_name"]))
+                elif ev["type"] == "done":
+                    if include_usage:
+                        yield _sse(usage_chunk(ev, cmpl_id=cmpl_id, created=created, model=resolved["api_model_name"]))
+                elif ev["type"] == "error":
+                    yield _sse(openai_error_dict(ev.get("message", "오류"), type_="api_error"))
+                    return
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")

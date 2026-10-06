@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+# Record after DIB's bootloader and package customizations have completed.
+dpkg-query --show --showformat='${binary:Package}\t${Version}\t${Architecture}\n' > /usr/share/lumen-guest/packages.tsv
+chmod 0644 /usr/share/lumen-guest/packages.tsv

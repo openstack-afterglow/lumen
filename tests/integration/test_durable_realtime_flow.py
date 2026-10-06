@@ -21,6 +21,7 @@ from lumen.services.durable_runs.common import _now
 from lumen.services.durable_runs.errors import DurableRunProviderResultUnknown
 from lumen.services.durable_runs.execution import _finish
 from lumen.services.durable_runs.lifecycle import recover_stale_runs, request_cancelled
+from lumen.services.infrastructure.store import register_worker
 from lumen.services.providers import routing
 from lumen.services.providers.realtime_protocol import AudioMeter
 from lumen.services.run_store import load_segment_payload
@@ -122,7 +123,11 @@ async def test_realtime_durable_exact_pcm_usage_and_crash_unknown(monkeypatch, l
                  .with_for_update())).scalar_one()
             assert run.lease_owner == owner
             run.lease_expires_at = _now() - timedelta(seconds=1)
-        await recover_stale_runs(owner="voice-recovery")
+        # Recovery reconciles any stale run; a real recovering worker identity is required.
+        recovery_registration = await register_worker(
+            worker_identity="voice-recovery", boot_id=str(uuid.uuid4()), capacity=1, protocol_versions=[1, 2],
+            plugin_digest="0" * 64, schema_version=1, workload_classes=["online_text"])
+        await recover_stale_runs(owner="voice-recovery", registration_id=recovery_registration)
         async with factory() as session:
             run = (await session.execute(select(ChatRun).where(ChatRun.id == unknown["session_id"]))).scalar_one()
             hold = (await session.execute(select(ChatModelCallReservation).where(
@@ -355,6 +360,7 @@ async def test_compat_gateways_route_by_wire_transport_not_renamed_selector(monk
         headers = {"x-api-key": "fixture-lumen-key"}
 
         def __init__(self, *, query=None, setup_model=None):
+            self.scope = {"type": "websocket"}
             self.query_params = query or {}
             self.setup_model = setup_model
             self.code = None

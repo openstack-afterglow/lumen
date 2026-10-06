@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from lumen.plugins.config import PluginRuntimeConfig
-from lumen.services.infrastructure.config import RuntimeConfig
+from lumen.services.infrastructure.config import RuntimeConfig, WorkloadClass
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -40,18 +40,23 @@ def is_development_loopback_http_url(value: str) -> bool:
 
 def _config_candidates() -> list[Path]:
     configured = os.environ.get("LUMEN_CONFIG_FILE", "").strip()
-    candidates = [Path(configured)] if configured else []
-    candidates.extend(
-        [
-            Path("/etc/lumen/lumen.conf"),
-            Path("lumen.conf"),
-        ]
-    )
+    if configured:
+        return [Path(configured)]
+    candidates = [Path("/etc/lumen/lumen.conf"), Path("lumen.conf")]
     return candidates
 
 
 @lru_cache
 def load_raw_toml() -> dict:
+    configured = os.environ.get("LUMEN_CONFIG_FILE", "").strip()
+    if configured:
+        # An explicit mount/path must never silently select another deployment's
+        # credentials or defaults when it is missing, empty, or unreadable.
+        with Path(configured).open("rb") as handle:
+            data = tomllib.load(handle)
+        if not data:
+            raise ValueError("LUMEN_CONFIG_FILE must contain a nonempty TOML configuration")
+        return data
     for path in _config_candidates():
         if path.is_file() and path.stat().st_size > 0:
             with path.open("rb") as handle:
@@ -94,11 +99,31 @@ class Settings(BaseSettings):
 
     plugin_config: PluginRuntimeConfig = Field(default_factory=PluginRuntimeConfig)
     runtime_config: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    worker_workload_classes: list[WorkloadClass] = Field(
+        default_factory=lambda: ["online_text", "online_media"], min_length=1, max_length=3,
+    )
     worker_concurrency: int = Field(default=4, ge=1, le=64)
     worker_heartbeat_seconds: int = Field(default=5, ge=1, le=30)
     worker_drain_seconds: int = Field(default=300, ge=0, le=3600)
-    api_max_active_requests: int = Field(default=256, ge=1)
-    api_max_sse_connections: int = Field(default=256, ge=1)
+    api_max_active_requests: int = Field(default=256, ge=1, le=100000)
+    api_max_sse_connections: int = Field(default=256, ge=1, le=100000)
+    api_max_websocket_connections: int = Field(default=64, ge=1, le=100000)
+    api_max_body_bytes: int = Field(default=210 * 1024 * 1024, ge=1, le=1024 * 1024 * 1024)
+
+    batch_enabled: bool = False
+    batch_dispatch_window: int = Field(default=8, ge=1, le=1000)
+    batch_project_dispatch_window: int = Field(default=32, ge=1, le=10000)
+    batch_native_max_items: int = Field(default=1000, ge=1, le=1000)
+    batch_native_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1, le=10 * 1024 * 1024)
+    batch_jsonl_max_rows: int = Field(default=50000, ge=1, le=50000)
+    batch_jsonl_max_bytes: int = Field(default=200000000, ge=1, le=200000000)
+    batch_jsonl_max_line_bytes: int = Field(default=4 * 1024 * 1024, ge=1, le=4 * 1024 * 1024)
+    batch_validation_chunk_rows: int = Field(default=100, ge=1, le=100)
+    batch_validation_chunk_bytes: int = Field(default=1024 * 1024, ge=1, le=1024 * 1024)
+    batch_upload_slots: int = Field(default=4, ge=1, le=64)
+    batch_result_ttl_days: int = Field(default=7, ge=1, le=30)
+    batch_input_ttl_days: int = Field(default=30, ge=1, le=365)
+    batch_cancel_grace_seconds: int = Field(default=600, ge=1, le=600)
 
     # Infrastructure & Auth
     keystone_auth_url: str = "http://localhost:5000/v3"
@@ -183,6 +208,26 @@ class Settings(BaseSettings):
 
     os_cacert: str = ""
     insecure: bool = False
+
+    @model_validator(mode="after")
+    def coherent_execution_policy(self) -> Settings:
+        classes = self.worker_workload_classes
+        if len(set(classes)) != len(classes):
+            raise ValueError("worker_workload_classes must be unique")
+        if "batch" in classes and len(classes) != 1:
+            raise ValueError("batch workers cannot share online workload classes")
+        if self.batch_dispatch_window > self.batch_project_dispatch_window:
+            raise ValueError("batch dispatch window cannot exceed project dispatch window")
+        if self.batch_jsonl_max_line_bytes > self.batch_jsonl_max_bytes:
+            raise ValueError("batch line limit cannot exceed input file limit")
+        if self.batch_enabled:
+            if self.api_max_body_bytes < max(self.batch_native_max_bytes, self.batch_jsonl_max_bytes):
+                raise ValueError("public body limit cannot be smaller than enabled batch input limits")
+            if self.runtime_config.enabled and not {"online_text", "batch"}.issubset(
+                self.runtime_config.workload_pools
+            ):
+                raise ValueError("managed batch requires online_text coordinator and batch pools")
+        return self
 
     @field_validator("chat_execution_protocol_version")
     @classmethod

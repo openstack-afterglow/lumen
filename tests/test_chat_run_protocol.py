@@ -451,6 +451,9 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
         def begin(self):
             return self
 
+        async def connection(self, **_kwargs):
+            return None
+
     flushed = asyncio.Event()
     closed = asyncio.Event()
     journal: list[tuple[str, dict]] = []
@@ -502,7 +505,7 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
     monkeypatch.setattr(execution.credit, "precheck", lambda *_args, **_kwargs: _return(None))
     monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
 
-    assert await execution.execute_queued_run("run-1", owner="worker-1") is True
+    assert await execution.execute_queued_run("run-1", owner="worker-1", registration_id="registration-1") is True
     assert [payload["delta"] for event_type, payload in journal if event_type == "part.delta"] == ["small"]
     assert finished[-1]["status"] == "completed"
     assert closed.is_set()
@@ -553,6 +556,9 @@ async def test_worker_passes_frozen_reasoning_disable_capability_to_engine(monke
         def begin(self):
             return self
 
+        async def connection(self, **_kwargs):
+            return None
+
     async def engine_stream(**kwargs):
         captured.update(kwargs)
         yield {"type": "token", "text": "ok"}
@@ -590,7 +596,7 @@ async def test_worker_passes_frozen_reasoning_disable_capability_to_engine(monke
     monkeypatch.setattr(execution.credit, "usage_cost_from_pricing_snapshot", usage_cost)
     monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
 
-    assert await execution.execute_queued_run("run-1", owner="worker-1") is True
+    assert await execution.execute_queued_run("run-1", owner="worker-1", registration_id="registration-1") is True
     assert captured["reasoning_effort"] == "auto"
     assert captured["reasoning_can_be_disabled"] is expected
 
@@ -1034,6 +1040,9 @@ async def test_compaction_worker_uses_persisted_large_tool_schema_snapshot(monke
         def begin(self):
             return self
 
+        async def connection(self, **_kwargs):
+            return None
+
     captured: dict = {}
 
     class _Hooks:
@@ -1067,7 +1076,7 @@ async def test_compaction_worker_uses_persisted_large_tool_schema_snapshot(monke
     monkeypatch.setattr(execution, "_cancel_requested", no_cancel)
     monkeypatch.setattr(execution, "_finish", finish)
 
-    assert await execution.execute_queued_run("run-compact", owner="worker-1") is True
+    assert await execution.execute_queued_run("run-compact", owner="worker-1", registration_id="registration-1") is True
     assert captured["tool_schemas"] == [large_schema]
     assert captured["finished"]["status"] == "completed"
 

@@ -18,11 +18,29 @@ from lumen.models.chat_infrastructure import (
     ChatProjectAgentQuota,
 )
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunEventRow
+from lumen.services import worker_routing
 from lumen.services.durable_runs import budgets, children, lifecycle
 from lumen.services.durable_runs.errors import DurableRunError
+from lumen.services.infrastructure import store
 from lumen.services.run_store import claim_queued_run, replay_events
 
 pytestmark = pytest.mark.integration
+
+
+async def _fixed_text_worker(identity: str) -> str:
+    return await store.register_worker(
+        worker_identity=identity, boot_id=str(uuid.uuid4()), capacity=1, protocol_versions=[1, 2],
+        plugin_digest="0" * 64, schema_version=1, workload_classes=["online_text"],
+    )
+
+
+async def _claim_as_fixed_worker(factory, run_id: str, identity: str) -> str | None:
+    """Claim through a real fixed online_text registration; returns the fenced lease owner."""
+    registration_id = await _fixed_text_worker(identity)
+    async with factory() as session, session.begin():
+        await worker_routing.use_read_committed(session)
+        claimed = await claim_queued_run(session, run_id, owner=identity, registration_id=registration_id)
+        return claimed.lease_owner if claimed is not None else None
 
 
 @pytest.fixture
@@ -145,10 +163,8 @@ async def test_children_settle_and_join_in_call_order_once(family, finish_before
     assert len(state["reservation_statuses"]) == 8
     assert [item[1]["call_id"] for item in state["events"] if item[0] == "child.completed"] == ["call-1", "call-0"]
 
-    async with factory() as session, session.begin():
-        claimed = await claim_queued_run(session, root_id, owner="replacement-worker")
-        assert claimed is not None
-        replacement_owner = claimed.lease_owner
+    replacement_owner = await _claim_as_fixed_worker(factory, root_id, f"replacement-worker-{uuid.uuid4().hex}")
+    assert replacement_owner is not None
     assert await children.pending_wait_group(root_id) == group_id
     first = await children.delegation_results(parent_run_id=root_id, owner=replacement_owner, wait_group_id=group_id)
     second = await children.delegation_results(parent_run_id=root_id, owner=replacement_owner, wait_group_id=group_id)
@@ -335,7 +351,10 @@ async def test_expired_parent_lease_requeues_prepared_children_without_an_unresu
     async with factory() as session, session.begin():
         root = await session.get(ChatRun, root_id)
         root.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
-    recovered = await lifecycle.recover_stale_runs(owner="recovery-worker")
+    recovery_identity = f"recovery-worker-{uuid.uuid4().hex}"
+    recovered = await lifecycle.recover_stale_runs(
+        owner=recovery_identity, registration_id=await _fixed_text_worker(f"{recovery_identity}-scan"),
+    )
     assert root_id in recovered
     state = await _snapshot(factory, project, root_id, group_id, child_ids)
     assert state["parent_status"] == "queued"
@@ -343,10 +362,8 @@ async def test_expired_parent_lease_requeues_prepared_children_without_an_unresu
     assert state["checkpoint"] is None
     assert state["child_statuses"] == ["waiting_resource", "waiting_resource"]
     assert await children.pending_wait_group(root_id) is None
-    async with factory() as session, session.begin():
-        claimed = await claim_queued_run(session, root_id, owner="recovery-worker")
-        assert claimed is not None
-        replacement_owner = claimed.lease_owner
+    replacement_owner = await _claim_as_fixed_worker(factory, root_id, recovery_identity)
+    assert replacement_owner is not None
     assert await children.mark_waiting_children(
         parent_run_id=root_id, owner=replacement_owner, wait_group_id=group_id, checkpoint_id="recovered-checkpoint"
     ) == "waiting_children"
@@ -781,7 +798,7 @@ async def test_terminal_paths_decide_on_the_locked_row_not_an_earlier_read(monke
                     row.lease_fence = 2
                     row.lease_owner = rival_owner
                 else:
-                    assert await claim_queued_run(rival, run_id, owner=f"worker-b-{nonce}") is not None
+                    assert await _claim_as_fixed_worker(factory, run_id, f"worker-b-{nonce}") is not None
             interleaved.append(locked_id)
         return await lock_run(session, locked_id, **kwargs)
 

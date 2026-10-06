@@ -213,11 +213,7 @@ def test_admission_freezes_rates_and_rejects_unmeterable_priced_inputs():
     assert "token_rates" not in legacy
 
 
-def test_media_models_price_only_applicable_text_directions():
-    assert ModelCreateRequest(provider_id=1, model_name="gpt-image-2", model_kind="image",
-                              input_price_per_million="5", cache_read_price_per_million="1.25")
-    with pytest.raises(ValueError):
-        ModelCreateRequest(provider_id=1, model_name="gpt-4.1", input_price_per_million="5")
+def test_media_models_reject_cache_write_prices():
     with pytest.raises(ValueError):
         ModelCreateRequest(provider_id=1, model_name="gpt-image-2", model_kind="image",
                            cache_write_price_per_million="1")

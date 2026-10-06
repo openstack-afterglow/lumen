@@ -13,6 +13,7 @@ from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
 from lumen.models.chat_contracts import ChatRunDescriptor, validate_user_input_parts
 from lumen.models.chat_db import ChatConversation, ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatRunProvider, ChatTempThread
+from lumen.services import worker_routing
 from lumen.services.message_graph import append_active_message, reachable_message_clause, register_message
 from lumen.services.message_parts import serialize_parts
 from lumen.services.message_timestamps import message_timestamps
@@ -419,6 +420,7 @@ async def create_persistent_run(
             session.add(ChatRunAsset(run_id=run_id, asset_id=part["asset_id"], purpose="input"))
             session.add(ChatMessageAsset(message_id=user_message.id, asset_id=part["asset_id"], part_index=index))
 
+        route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
         run = ChatRun(
             id=run_id,
             run_scope="persistent",
@@ -442,6 +444,8 @@ async def create_persistent_run(
             fingerprint_version=1,
             last_seq=0,
             run_kind=run_kind,
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             current_ordinal=0,
             status="queued",
             execution_mode=execution_mode,
@@ -606,6 +610,7 @@ async def create_run(
                 raise DurableRunConflict("conversation_run_active")
 
         await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
+        route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="persistent" if conversation_id else "temp",
@@ -631,6 +636,8 @@ async def create_run(
             last_seq=0,
             current_ordinal=0,
             run_kind=run_kind,
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             status="queued",
             execution_mode=execution_mode,
         )
@@ -749,6 +756,7 @@ async def create_temp_run(
         ).scalar_one_or_none()
         if active is not None:
             raise DurableRunConflict("conversation_run_active")
+        route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="temp",
@@ -771,6 +779,8 @@ async def create_temp_run(
             last_seq=0,
             current_ordinal=0,
             run_kind=run_kind,
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             status="queued",
         )
         session.add(run)
@@ -937,6 +947,7 @@ async def create_compaction_run(
 
         await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
 
+        route = await worker_routing.resolve_worker_route(session, run_kind="compaction")
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="persistent" if conversation_id else "temp",
@@ -962,6 +973,8 @@ async def create_compaction_run(
             last_seq=0,
             current_ordinal=0,
             run_kind="compaction",
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             status="queued",
         )
         session.add(run)

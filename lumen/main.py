@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import hmac
 import logging
+import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, get_args
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -23,7 +26,12 @@ from lumen.logging_config import configure_logging
 from lumen.plugins.host import build_host
 from lumen.plugins.registry import get_registry
 from lumen.request_logging import RequestLoggingMiddleware
-from lumen.services.infrastructure.api_load import ApiLoadMeter, ApiLoadMiddleware
+from lumen.services.infrastructure.api_load import (
+    ApiAdmissionMiddleware,
+    ApiLoadMeter,
+    ApiLoadMiddleware,
+    api_admission,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,14 +117,37 @@ async def lifespan(app: FastAPI):
     logger.info("api stopped")
 
 
+def _initialize_guest_drain_state(state: Any) -> None:
+    """Close admission before serving when the supervisor restores a drain fence."""
+    token = os.environ.get("LUMEN_INTERNAL_DRAIN_TOKEN", "")
+    raw_fence = os.environ.get("LUMEN_INTERNAL_DRAIN_FENCE")
+    fence = None
+    if raw_fence is not None:
+        if not token or not raw_fence.isascii() or not raw_fence.isdecimal():
+            raise RuntimeError("invalid guest boot drain advisory")
+        fence = int(raw_fence)  # ASCII decimal digits only: no sign, whitespace or Unicode digits.
+    # The secret is fixed for this child boot, not reloaded on later requests.
+    state.internal_drain_token = token
+    state.draining = fence is not None
+    state.drain_fence = fence
+
+
 app = FastAPI(
     title="Lumen",
     description="Lumen durable agent, LLM, and chat service API",
     version="1.0.0",
     lifespan=lifespan,
 )
+# Restore persisted supervisor intent before constructing any admission middleware.
+_initialize_guest_drain_state(app.state)
 api_load_meter = ApiLoadMeter()
 app.add_middleware(ApiLoadMiddleware, meter=api_load_meter)
+
+
+# Reservations share the guest drain flag. Keep admission outside measured load
+# so rejected HTTP requests cannot be mistaken for serving capacity.
+api_admission.state = app.state
+app.state.api_admission = api_admission
 
 settings = get_settings()
 origins = settings.cors_origin_list
@@ -129,6 +160,7 @@ if origins:
         allow_headers=["*"],
     )
 app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(ApiAdmissionMiddleware, admission=api_admission)
 
 
 @app.exception_handler(RequestValidationError)
@@ -190,6 +222,31 @@ class ReadyResponse(BaseModel):
     checkpointer: bool | None = None
 
 
+@app.post("/v1/internal/drain", include_in_schema=False)
+async def internal_drain(request: Request):
+    """Apply the supervisor's persisted fence to this boot's in-memory gate."""
+    if request.client is None or request.client.host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=403, detail="local drain only")
+    token = request.headers.get("X-Lumen-Drain-Token", "")
+    expected = request.app.state.internal_drain_token
+    if not expected or not token or not hmac.compare_digest(token.encode(), expected.encode()):
+        raise HTTPException(status_code=403, detail="invalid drain token")
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="nonnegative integer fence required") from None
+    fence = body.get("fence") if isinstance(body, dict) else None
+    if type(fence) is not int or fence < 0:
+        raise HTTPException(status_code=422, detail="nonnegative integer fence required")
+    state = request.app.state
+    if state.drain_fence is not None and fence < state.drain_fence:
+        raise HTTPException(status_code=409, detail="stale drain fence")
+    # No await between fence comparison and admission closure.
+    state.drain_fence = fence
+    state.draining = True
+    return {"draining": True, "drain_fence": fence, "drain_acknowledged": True}
+
+
 @app.get("/v1/ready", tags=["Health"], response_model=ReadyResponse)
 async def ready(request: Request, include_load: bool = False):
     """Dependency readiness; guest-only load details require a loopback connection."""
@@ -198,18 +255,35 @@ async def ready(request: Request, include_load: bool = False):
     from lumen.db import check_db
     from lumen.services.checkpointer import chat_checkpointer
 
-    database = await check_db()
+    if include_load:
+        # The supervisor gives the child 3 s; a stalled dependency must not hide live counters.
+        try:
+            database = await asyncio.wait_for(check_db(), timeout=1)
+        except TimeoutError:
+            database = False
+    else:
+        database = await check_db()
+    draining = request.app.state.draining
     plugins = get_registry().ready
     checkpointer = chat_checkpointer.available if get_settings().chat_checkpointer_postgres_url else None
-    ok = database and plugins and checkpointer is not False
+    ok = database and plugins and checkpointer is not False and not draining
     body = ReadyResponse(status="ok" if ok else "unavailable", database=database, plugins=plugins, checkpointer=checkpointer)
     content = body.model_dump(mode="json")
     if include_load:
         content.update(api_load_meter.snapshot())
-    return JSONResponse(status_code=200 if ok else 503, content=content)
+        content.update(api_admission.snapshot())
+        content.update(
+            ready=ok,
+            draining=draining,
+            drain_fence=request.app.state.drain_fence,
+            drain_acknowledged=draining,
+        )
+    # Local supervision needs fresh counters even when dependency readiness fails.
+    return JSONResponse(status_code=200 if include_load or ok else 503, content=content)
 
 
 from lumen.api import agent_runtime as agent_runtime_routes
+from lumen.api import batches as batch_routes
 from lumen.api import (
     chat_admin_router,
     chat_agents_router,
@@ -234,7 +308,9 @@ from lumen.api import (
 from lumen.api import plugins as plugin_routes
 from lumen.api.compat import anthropic as compat_anthropic
 from lumen.api.compat import audio as compat_audio
+from lumen.api.compat import batches as compat_batches
 from lumen.api.compat import discovery as compat_discovery
+from lumen.api.compat import files as compat_files
 from lumen.api.compat import images as compat_images
 from lumen.api.compat import openai as compat_openai
 from lumen.api.compat import realtime as compat_realtime
@@ -258,6 +334,7 @@ for router, tag in (
     (chat_images_router, "Images"),
     (chat_audio_router, "Audio"),
     (chat_realtime_router, "Realtime Voice"),
+    (batch_routes.router, "Batches"),
     (chat_api_keys_router, "Chat API Keys"),
     (chat_mcp_oauth_router, "Chat MCP OAuth"),
     (chat_extensions_admin_router, "Chat Extensions Admin"),
@@ -278,6 +355,8 @@ for router, tag in (
     (compat_openai.router, "OpenAI Compat"),
     (compat_anthropic.router, "Anthropic Compat"),
     (compat_responses.router, "OpenAI Responses Compat"),
+    (compat_files.router, "OpenAI Files Compat"),
+    (compat_batches.router, "OpenAI Batch Compat"),
 ):
     app.include_router(router, prefix="/v1", tags=[tag], dependencies=[Depends(require_chat_api_host)])
 app.include_router(compat_realtime.router, tags=["Realtime Voice Compat"])
@@ -302,6 +381,13 @@ def custom_openapi() -> dict:
     """Document API-key compatibility schemes without changing native route semantics."""
     if app.openapi_schema:
         return app.openapi_schema
+    from lumen.models.batch_contracts import (
+        BATCH_ENDPOINTS,
+        BatchOperation,
+        NativeBatchCreateRequest,
+        OpenAIBatchCreateRequest,
+        batch_item_scopes,
+    )
     from lumen.models.chat_contracts import _CHAT_RUN_EVENT
 
     schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
@@ -316,6 +402,8 @@ def custom_openapi() -> dict:
         "gemini_live": "Google Gemini Live-compatible WebSocket (/v1beta/realtime)",
         "lumen_native": "Lumen native durable runs (/v1/conversations/{conversation_id}/completions, /v1/temp-completions, /v1/runs/...)",
         "claude_gateway": "Claude Code device-authenticated Anthropic gateway (/v1/claude-gateway)",
+        "openai_batch": "OpenAI-compatible Files/Batch (/v1/files, /v1/batches) executed by Lumen batch workers",
+        "lumen_batch": "Lumen native mixed multimodal batches (/v1/chat/batches)",
     }
 
     security_schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
@@ -351,6 +439,15 @@ def custom_openapi() -> dict:
         ("/v1/claude-gateway/v1/messages/count_tokens", "post"),
         ("/v1/claude-gateway/v1/models", "get"),
         ("/v1/claude-gateway/v1/managed-settings", "get"),
+        ("/v1/files", "post"),
+        ("/v1/files", "get"),
+        ("/v1/files/{file_id}", "get"),
+        ("/v1/files/{file_id}", "delete"),
+        ("/v1/files/{file_id}/content", "get"),
+        ("/v1/batches", "post"),
+        ("/v1/batches", "get"),
+        ("/v1/batches/{batch_id}", "get"),
+        ("/v1/batches/{batch_id}/cancel", "post"),
     ):
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             schema["paths"][path][method]["security"] = api_key_security
@@ -414,6 +511,20 @@ def custom_openapi() -> dict:
         ("/v1/usage/timeseries", "get"): ["usage:read"],
         ("/v1/usage/keys", "get"): ["usage:read"],
         ("/v1/usage/records", "get"): ["usage:read"],
+        ("/v1/chat/batches", "post"): ["native:batches:write"],
+        ("/v1/chat/batches", "get"): ["native:batches:read"],
+        ("/v1/chat/batches/{batch_id}", "get"): ["native:batches:read"],
+        ("/v1/chat/batches/{batch_id}/items", "get"): ["native:batches:read"],
+        ("/v1/chat/batches/{batch_id}/cancel", "post"): ["native:batches:write"],
+        ("/v1/files", "post"): ["compat:files:write"],
+        ("/v1/files", "get"): ["compat:files:read"],
+        ("/v1/files/{file_id}", "get"): ["compat:files:read"],
+        ("/v1/files/{file_id}", "delete"): ["compat:files:write"],
+        ("/v1/files/{file_id}/content", "get"): ["compat:files:read"],
+        ("/v1/batches", "post"): ["compat:batches:write"],
+        ("/v1/batches", "get"): ["compat:batches:read"],
+        ("/v1/batches/{batch_id}", "get"): ["compat:batches:read"],
+        ("/v1/batches/{batch_id}/cancel", "post"): ["compat:batches:write"],
     }
     admission_posts = {
         ("/v1/conversations/{conversation_id}/completions", "post"),
@@ -434,6 +545,19 @@ def custom_openapi() -> dict:
             op["x-required-api-key-scopes"] = scopes
             if (path, method) in admission_posts:
                 op["x-conditional-api-key-scopes"] = conditional_scopes
+    batch_conditional_scopes = {
+        ("/v1/chat/batches", "post"): {
+            f"operation {operation}": list(batch_item_scopes(operation, contract="native"))
+            for operation in get_args(BatchOperation)
+        },
+        ("/v1/batches", "post"): {
+            f"endpoint {endpoint}": list(batch_item_scopes(operation, contract="openai"))
+            for endpoint, operation in BATCH_ENDPOINTS.items()
+        },
+    }
+    for (path, method), scopes in batch_conditional_scopes.items():
+        if path in schema.get("paths", {}) and method in schema["paths"][path]:
+            schema["paths"][path][method]["x-conditional-api-key-scopes"] = scopes
     sse_routes = [
         ("/v1/chat/completions", "post", "OpenAI SSE stream (data: JSON \\n\\n data: [DONE])"),
         ("/v1/responses", "post", "OpenAI Responses semantic SSE events"),
@@ -467,6 +591,13 @@ def custom_openapi() -> dict:
     for def_name, def_schema in defs.items():
         components_schemas[def_name] = def_schema
     components_schemas["ChatRunEvent"] = event_schema
+    # Batch create routes bound and parse their bodies before validation, so the
+    # request schemas are published explicitly instead of through a body parameter.
+    for model in (NativeBatchCreateRequest, OpenAIBatchCreateRequest):
+        model_schema = model.model_json_schema(ref_template="#/components/schemas/{model}")
+        for def_name, def_schema in model_schema.pop("$defs", {}).items():
+            components_schemas.setdefault(def_name, def_schema)
+        components_schemas[model.__name__] = model_schema
 
     def _fix_refs(obj: Any) -> None:
         if isinstance(obj, dict):

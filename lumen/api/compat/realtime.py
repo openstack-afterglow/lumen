@@ -10,6 +10,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from lumen.config import get_settings
 from lumen.services import api_key_store
 from lumen.services.durable_runs.realtime import admit_realtime_session, run_realtime_session
+from lumen.services.infrastructure.api_load import admit_websocket
 
 from ..realtime import origin_allowed
 
@@ -37,6 +38,7 @@ async def _principal(websocket: WebSocket) -> dict | None:
     return info
 
 
+@admit_websocket
 async def _compat_socket(websocket: WebSocket, *, wire: str):
     principal = await _principal(websocket)
     if principal is None:

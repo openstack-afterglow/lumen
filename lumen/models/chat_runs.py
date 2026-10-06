@@ -23,6 +23,13 @@ class ChatRun(Base):
     id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
     run_scope: Mapped[str] = mapped_column(VARCHAR(20), nullable=False)
     run_kind: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="completion")
+    workload_class: Mapped[str] = mapped_column(
+        VARCHAR(20), nullable=False, default="online_text", server_default="online_text"
+    )
+    # Worker routing is separate from runtime_pool_id's sandbox allocation; no routing FKs.
+    worker_pool_id: Mapped[str | None] = mapped_column(CHAR(36))
+    worker_registration_id: Mapped[str | None] = mapped_column(CHAR(36))
+    batch_id: Mapped[str | None] = mapped_column(CHAR(36))
     conversation_id: Mapped[str | None] = mapped_column(
         CHAR(36), ForeignKey("chat_conversations.id", ondelete="SET NULL")
     )
@@ -92,6 +99,12 @@ class ChatRun(Base):
         Index("idx_chat_runs_status_pool", "status", "runtime_pool_id"),
         Index("idx_chat_runs_status_plugin_digest", "status", "required_plugin_digest"),
         Index("idx_chat_runs_assigned_resource", "assigned_resource_id"),
+        Index("idx_chat_runs_worker_pool_workload_status", "worker_pool_id", "workload_class", "status", "created_at", "id"),
+        Index("idx_chat_runs_worker_registration_lease", "worker_registration_id", "status", "lease_expires_at"),
+        Index("idx_chat_runs_batch_status", "batch_id", "status"),
+        CheckConstraint(
+            "workload_class IN ('online_text','online_media','batch','realtime')", name="ck_chat_runs_workload_class"
+        ),
     )
 
 

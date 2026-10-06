@@ -150,6 +150,58 @@ class TestOpenAPIContract:
 
         _check_refs(schema)
 
+    def test_openapi_documents_batch_and_file_routes_with_scopes_and_bodies(self):
+        schema = app.openapi()
+        paths = schema["paths"]
+        schemas = schema["components"]["schemas"]
+        api_key_only = [{"APIKeyBearer": []}, {"XApiKey": []}]
+        expected = {
+            ("/v1/chat/batches", "post"): "native:batches:write",
+            ("/v1/chat/batches", "get"): "native:batches:read",
+            ("/v1/chat/batches/{batch_id}", "get"): "native:batches:read",
+            ("/v1/chat/batches/{batch_id}/items", "get"): "native:batches:read",
+            ("/v1/chat/batches/{batch_id}/cancel", "post"): "native:batches:write",
+            ("/v1/files", "post"): "compat:files:write",
+            ("/v1/files", "get"): "compat:files:read",
+            ("/v1/files/{file_id}", "get"): "compat:files:read",
+            ("/v1/files/{file_id}", "delete"): "compat:files:write",
+            ("/v1/files/{file_id}/content", "get"): "compat:files:read",
+            ("/v1/batches", "post"): "compat:batches:write",
+            ("/v1/batches", "get"): "compat:batches:read",
+            ("/v1/batches/{batch_id}", "get"): "compat:batches:read",
+            ("/v1/batches/{batch_id}/cancel", "post"): "compat:batches:write",
+        }
+        for (path, method), scope in expected.items():
+            operation = paths[path][method]
+            assert operation["x-required-api-key-scopes"] == [scope], (path, method)
+            if path.startswith(("/v1/files", "/v1/batches")):
+                assert operation["security"] == api_key_only, (path, method)
+            else:
+                assert {"KeystoneToken": []} in operation["security"], (path, method)
+
+        native_create = paths["/v1/chat/batches"]["post"]
+        assert native_create["requestBody"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/NativeBatchCreateRequest"
+        }
+        assert any(param["name"] == "Idempotency-Key" and param["required"] for param in native_create["parameters"])
+        assert native_create["x-conditional-api-key-scopes"]["operation images.edits"] == [
+            "native:images:write", "native:assets:read",
+        ]
+        assert "202" in native_create["responses"]
+        compat_create = paths["/v1/batches"]["post"]
+        assert compat_create["requestBody"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/OpenAIBatchCreateRequest"
+        }
+        assert compat_create["x-conditional-api-key-scopes"]["endpoint /v1/images/generations"] == ["compat:images:write"]
+        assert "multipart/form-data" in paths["/v1/files"]["post"]["requestBody"]["content"]
+        for name in ("NativeBatchCreateRequest", "NativeBatchItemRequest", "OpenAIBatchCreateRequest",
+                     "OutputExpiresAfter", "NativeBatchDescriptor", "NativeBatchPage", "NativeBatchItemPage",
+                     "OpenAIBatchObject", "OpenAIBatchList", "OpenAIFileObject", "OpenAIFileList", "OpenAIFileDeleted"):
+            assert name in schemas, name
+        batch_object = schemas["OpenAIBatchObject"]["properties"]
+        assert batch_object["created_at"]["type"] == "integer"
+        assert {"lumen_batch", "openai_batch"} <= set(schema["x-profiles"])
+
 
 class FakeAccessInfo:
     def __init__(

@@ -1,0 +1,20 @@
+[Unit]
+Description=Lumen trusted Nova guest supervisor
+Requires=docker.service
+After=cloud-final.service docker.service network-online.target
+Wants=cloud-final.service network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/libexec/lumen-guest-run
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=infinity
+KillMode=process
+ExecStop=-/usr/bin/docker stop --time -1 lumen-guest
+
+[Install]
+WantedBy=cloud-init.target

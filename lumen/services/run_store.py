@@ -12,8 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_contracts import ChatRunEvent, validate_chat_run_event
-from lumen.models.chat_infrastructure import ChatRuntimeResource, ChatWorkerRegistration
 from lumen.models.chat_runs import ChatRun, ChatRunEventRow, ChatRunSegment
+from lumen.services import worker_routing
 
 
 class RunStoreError(RuntimeError):
@@ -143,36 +143,16 @@ def fenced_owner(owner: str, fence: int) -> str:
     return f"{owner}#{fence}"
 
 
-async def claim_queued_run(
-    session: AsyncSession, run_id: str, *, owner: str, lease_seconds: int = 45,
-    registration_id: str | None = None,
-) -> ChatRun | None:
-    run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one_or_none()
+async def _lock_queued_run(session: AsyncSession, run_id: str) -> ChatRun | None:
+    run = (await session.execute(
+        select(ChatRun).where(ChatRun.id == run_id).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
     if run is None or run.status != "queued" or run.cancel_requested_at is not None:
         return None
-    if registration_id is not None:
-        registration = (await session.execute(select(ChatWorkerRegistration).where(
-            ChatWorkerRegistration.id == registration_id,
-            ChatWorkerRegistration.worker_identity == owner,
-        ).with_for_update())).scalar_one_or_none()
-        now = datetime.now(UTC)
-        if (registration is None or registration.draining or not registration.accepting
-                or _as_utc(registration.heartbeat_at) < now - timedelta(seconds=20)
-                or run.execution_protocol_version not in registration.protocol_versions
-                or (run.required_plugin_digest is not None
-                    and run.required_plugin_digest != registration.plugin_digest)):
-            return None
-        if registration.resource_id is not None:
-            resource = (await session.execute(select(ChatRuntimeResource).where(
-                ChatRuntimeResource.id == registration.resource_id))).scalar_one_or_none()
-            if (resource is None or resource.role != "worker" or resource.observed_state != "ready"
-                    or resource.desired_state == "deleting" or resource.pool_id != registration.pool_id
-                    or resource.generation != registration.resource_generation
-                    or resource.certificate_fingerprint != registration.certificate_fingerprint
-                    or resource.bootstrap_token_hash is not None):
-                return None
-        elif registration.resource_generation is not None or registration.certificate_fingerprint is not None:
-            return None
+    return run
+
+
+def _take_lease(run: ChatRun, *, owner: str, lease_seconds: int) -> ChatRun:
     now = datetime.now(UTC)
     run.status = "running"
     # Monotonic per claim: the owner token carries the fence, so a worker whose lease
@@ -183,11 +163,69 @@ async def claim_queued_run(
     return run
 
 
+async def claim_queued_run(
+    session: AsyncSession, run_id: str, *, owner: str, registration_id: str, lease_seconds: int = 45,
+) -> ChatRun | None:
+    """Atomically claim one queued run for a registered worker.
+
+    Lock order is batch (if any) -> trusted resource -> registration -> run. The worker
+    must be fresh and accepting, serve the run's exact workload class and pool, and have
+    a free slot measured by share-locked live DB leases rather than heartbeat counts.
+    Callers should run READ COMMITTED (``worker_routing.use_read_committed``); under
+    REPEATABLE READ snapshot isolation a concurrent change surfaces as a retryable 1020.
+    """
+    identity = (await session.execute(
+        select(ChatRun.batch_id, ChatRun.workload_class).where(ChatRun.id == run_id)
+    )).one_or_none()
+    if identity is None or identity.workload_class not in worker_routing.WORKER_WORKLOAD_CLASSES:
+        return None
+    batch_id = identity.batch_id
+    # A closed batch admits only checkpoint replay, which never starts provider I/O.
+    if (batch_id is not None and not await worker_routing.lock_open_batch(session, batch_id)
+            and not await worker_routing.has_provider_checkpoint(session, run_id)):
+        return None
+    locked = await worker_routing.lock_registration(session, registration_id, owner=owner, require_accepting=True)
+    if locked is None:
+        return None
+    registration, _resource = locked
+    run = await _lock_queued_run(session, run_id)
+    if run is None or run.batch_id != batch_id or not worker_routing.run_matches_registration(run, registration):
+        return None
+    if await worker_routing.live_run_leases(session, registration.id, lock=True) >= registration.capacity:
+        return None
+    run.worker_registration_id = registration.id
+    return _take_lease(run, owner=owner, lease_seconds=lease_seconds)
+
+
+async def claim_realtime_run(session: AsyncSession, run_id: str, *, owner: str, lease_seconds: int = 45) -> ChatRun | None:
+    """Claim an API-owned realtime run; never usable for any worker workload class."""
+    run = await _lock_queued_run(session, run_id)
+    if (run is None or run.run_kind != "realtime" or run.workload_class != "realtime"
+            or run.worker_pool_id is not None or run.batch_id is not None):
+        return None
+    run.worker_registration_id = None
+    return _take_lease(run, owner=owner, lease_seconds=lease_seconds)
+
+
 async def renew_run_lease(session: AsyncSession, run_id: str, *, owner: str, lease_seconds: int = 45) -> ChatRun | None:
-    """Extend only the currently-owned running lease; a stale worker loses authority."""
-    run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one_or_none()
+    """Extend only the currently-owned running lease; a stale worker loses authority.
+
+    Worker-owned runs also re-prove the registration's trusted identity (resource ->
+    registration -> run). Draining workers keep renewing, they only stop claiming.
+    Callers must use READ COMMITTED: the run row changes with every journal append.
+    """
+    registration_id = (await session.execute(
+        select(ChatRun.worker_registration_id).where(ChatRun.id == run_id)
+    )).scalar_one_or_none()
+    if registration_id is not None and await worker_routing.lock_registration(
+        session, registration_id, require_accepting=False
+    ) is None:
+        return None
+    run = (await session.execute(
+        select(ChatRun).where(ChatRun.id == run_id).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
     now = datetime.now(UTC)
-    if run is None:
+    if run is None or run.worker_registration_id != registration_id:
         return None
     expires_at = run.lease_expires_at
     if run.status != "running" or run.lease_owner != owner or expires_at is None or _as_utc(expires_at) <= now:
@@ -266,7 +304,7 @@ def complete_segment_io(
         raise RunStoreError(f"segment cannot complete from {segment.status}")
     # Provider text checkpoints (chat output, bounded transcripts with optional
     # segment timing) exceed the small tool/media-reference payload limit.
-    result_limit = (_MAX_PROVIDER_RESULT_BYTES if segment.endpoint in {"chat_completions", "audio_stt"}
+    result_limit = (_MAX_PROVIDER_RESULT_BYTES if segment.endpoint in {"chat_completions", "responses", "audio_stt"}
                     else _MAX_SEGMENT_RESULT_BYTES)
     result = _encode_segment_payload(result_payload, max_bytes=result_limit)
     record_segment_usage(segment, usage_payload)

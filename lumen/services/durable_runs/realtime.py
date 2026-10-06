@@ -29,7 +29,7 @@ from lumen.services.providers.errors import AmbiguousModelRouteError, ProviderVa
 from lumen.services.run_store import (
     append_event,
     begin_segment_io,
-    claim_queued_run,
+    claim_realtime_run,
     complete_segment_io,
     load_segment_payload,
     prepare_segment,
@@ -310,7 +310,7 @@ async def admit_realtime_session(
                 run = existing
             else:
                 await _lock_run_configurations(session, capability, model_name=route["model_name"])
-                run = ChatRun(id=str(uuid.uuid4()), run_scope="realtime", run_kind="realtime",
+                run = ChatRun(id=str(uuid.uuid4()), run_scope="realtime", run_kind="realtime", workload_class="realtime",
                     project_id=project_id, user_id=user_id, model_name=route["model_name"], source=source,
                     api_key_id=api_key_id, client_request_id=client_request_id, request_fingerprint=_fingerprint(intent),
                     fingerprint_version=1, execution_protocol_version=1, capability_snapshot=capability,
@@ -345,7 +345,7 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
     async def transaction():
         async with _factory()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-            run = await claim_queued_run(session, run_id, owner=owner, lease_seconds=45)
+            run = await claim_realtime_run(session, run_id, owner=owner, lease_seconds=45)
             if run is None or run.user_id != user_id or run.project_id != project_id:
                 raise DurableRunNotFound("realtime session is unavailable")
             owner_fenced = run.lease_owner
@@ -353,7 +353,7 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
             await session.flush()
             if segment.status != "prepared":
                 raise DurableRunProviderResultUnknown("realtime session cannot be resumed")
-            await credit.reserve_media_credit_in_transaction(session, user_id=run.user_id,
+            await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id,
                 project_id=run.project_id, api_key_id=run.api_key_id,
                 bound=Decimal(run.pricing_snapshot["bound_credits"]))
             session.add(ChatModelCallReservation(run_id=run.id, segment_id=_SEGMENT,

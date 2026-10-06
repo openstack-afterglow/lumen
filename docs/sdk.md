@@ -48,6 +48,28 @@ with Client("https://lumen.example", "sk-afgl-...") as client:
 
 위 예제 key는 `native:runs:write`, `native:runs:read`와 `models:read`가 필요하다. memory를 켜면 `native:memory:read`와 `native:memory:write`, tools를 켜면 `native:tools:execute`, skill/custom/MCP selection이면 `native:extensions:read`를 추가한다. `usage_records()`에는 `usage:read`가 필요하다.
 
+`AsyncClient(base_url, api_key, *, timeout=30.0, verify=True, transport=None)`는 같은 mixin method set을 awaitable로 제공한다. `speech()`와 `download_asset()`은 bytes를 반환하고 `run_events()`는 async iterator다. `async with` 또는 `aclose()`로 연결을 닫는다.
+
+### Batch
+
+Sync `Client`, `AsyncClient`, Keystone proxy는 `create_batch(*, idempotency_key, **attrs)`, `list_batches(**query)`, `get_batch(batch_id)`, `list_batch_items(batch_id, **query)`, `cancel_batch(batch_id)`를 제공한다. 서버의 `batch_enabled`가 꺼져 있으면 503 `batch_unavailable`이다. 조회에는 `native:batches:read`, 생성/취소에는 `native:batches:write`와 각 항목 operation scope가 필요하다. 결과는 batch가 terminal 상태가 된 뒤 item page로 읽는다. 순서는 `ordinal`과 `custom_id`로 확인한다.
+
+```python
+from uuid import uuid4
+from lumen_sdk import AsyncClient
+
+async with AsyncClient("https://lumen.example", "sk-afgl-...") as client:
+    batch = await client.create_batch(
+        idempotency_key=str(uuid4()),
+        items=[{"custom_id": "q1", "operation": "chat.completions",
+                "body": {"model": "provider-model", "messages": [{"role": "user", "content": "hello"}]}}],
+        metadata={"job": "nightly"},
+    )
+    page = await client.list_batch_items(batch["id"], limit=100)
+```
+
+OpenAI Python SDK로 Files/Batch를 사용할 때는 `compat:files:write|read`, `compat:batches:write|read`와 endpoint scope가 필요하다. `client.files.create(file=..., purpose="batch")` 후 `client.batches.create(input_file_id=..., endpoint="/v1/chat/completions", completion_window="24h")`를 호출한다. 지원 endpoint는 chat completions, Responses와 image generation 세 개다. Upstream OpenAI Batch 할인이나 provider batch quota는 적용되지 않는다.
+
 ## Plugin binding과 native agent/child
 
 `Client`/Keystone proxy 모두 같은 transport-neutral method set을 제공한다: `plugin_bindings()`, `create_plugin_binding(**attrs)`, `update_plugin_binding(id, **attrs)`, `delete_plugin_binding(id)`, `run_children(run_id, limit=..., cursor=...)`, `get_run()`, `run_events()`, `cancel_run()`. Administrator는 Keystone client로 `admin_plugins()`, `admin_plugin_bindings()`, `admin_agent_project_quota(project_id)`, `admin_set_agent_project_quota(project_id, **attrs)`, `admin_runtime_pools()`, `admin_runtime_resources(**query)`를 사용한다. User binding API는 이미 설치·승인된 wheel의 `user_configurable` export만 설정하며 wheel 설치가 아니다. `plugin_tool_ids`/`plugin_skill_ids`에는 binding UUID를 넣고 DB custom tool/skill ID와 섞지 않는다.

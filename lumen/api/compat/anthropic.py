@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Request
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
+from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 
 from .streaming import events_with_ping
 
@@ -129,6 +131,7 @@ def _event(payload: dict) -> str:
     response_model=AnthropicMessagesResponse,
     openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
 )
+@admit_sse
 async def messages(
     body: AnthropicMessagesRequest,
     request: Request,
@@ -161,16 +164,19 @@ async def messages(
 
     if not body.stream:
         return JSONResponse(content=result)
+    # The provider stream is already open; the SSE owner closes it even if the body never starts.
+    register_sse_resource(request, result)
 
     async def generate() -> AsyncIterator[str]:
-        try:
-            async for payload in events_with_ping(result):
-                if payload is None:
-                    yield 'event: ping\ndata: {"type":"ping"}\n\n'
-                else:
-                    yield _event(payload)
-        except Exception:
-            yield _event(anthropic_error(502, "upstream model error"))
+        async with aclosing(events_with_ping(result)) as events:
+            try:
+                async for payload in events:
+                    if payload is None:
+                        yield 'event: ping\ndata: {"type":"ping"}\n\n'
+                    else:
+                        yield _event(payload)
+            except Exception:
+                yield _event(anthropic_error(502, "upstream model error"))
 
     return StreamingResponse(
         generate(),

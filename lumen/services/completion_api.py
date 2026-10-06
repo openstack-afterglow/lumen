@@ -5,6 +5,11 @@
 스트리밍/비스트리밍(요청 `tools` pass-through) → `credit.apply_usage(source="api", api_key_id=…)`.
 대화 트리에 저장하지 않는다(stateless). 도구는 서버가 실행하지 않고 `tool_calls` 를 릴레이한다
 (표준 OpenAI/Anthropic function-calling — 호출자가 실행 후 재요청).
+
+Provider invocation/normalization (`invoke_chat_once`, `invoke_responses_once`) is separate
+from billing: online wrappers bill with a request-scoped UUID event, while durable Batch
+runs (`durable_runs.api_completion`) settle the same normalized result against their
+frozen run ledger with event ``run:<run_id>``.
 """
 
 from __future__ import annotations
@@ -13,10 +18,11 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
+import anyio
 from litellm.exceptions import BadRequestError
 
 from lumen.config import get_settings
@@ -101,14 +107,15 @@ def clamp_max_tokens(requested: int | None) -> int:
     return value
 
 
-def _billing_route(
+def billing_route(
     resolved: dict, messages: list[dict], *, protocol: str, options: dict | None = None
 ) -> dict:
     """Freeze this stateless request's route/prices and reject unmeterable priced media.
 
     The chat allowlist is evidence about its transport, not a model-name guess.
     Native protocol adapters do not establish equivalent modality metering.
-    No durable reservation/unknown hold exists on these compatibility APIs.
+    Online compatibility APIs hold no durable reservation; durable Batch
+    preparation reuses this freeze and adds its own frozen bound and hold.
     """
 
     route = deepcopy(resolved)
@@ -132,6 +139,47 @@ def _billing_route(
         if direction != "input" or modality not in reporting:
             raise CompletionError(422, f"{item} (modality_usage_unavailable)")
     return route
+
+
+def usage_breakdown_for_billing(
+    model_name: str,
+    *,
+    token_rates: dict | None,
+    required: list[str] | tuple[str, ...],
+    messages: list[dict],
+    text: str,
+    final_usage: Any | None,
+) -> UsageBreakdown:
+    """Validate provider usage against the frozen modality requirements of one call.
+
+    A priced media split must be explicitly reported; malformed usage fails
+    instead of being guessed. Only when nothing requires an exact split may an
+    absent report fall back to the local token estimate.
+    """
+    breakdown = UsageBreakdown.from_runtime(final_usage)
+    if (required or (token_rates and final_usage is not None)) and (
+        breakdown is None or breakdown.modality_usage_invalid
+    ):
+        raise CompletionError(502, "modality_usage_unavailable")
+    if required:
+        def field(value: Any, key: str) -> Any:
+            return value.get(key) if isinstance(value, dict) else getattr(value, key, None)
+
+        # A zero aggregate is not evidence that the provider explicitly
+        # reported a requested media split. Do not synthesize even zero media.
+        canonical = field(final_usage, "modality_tokens")
+        for item in required:
+            modality, direction = item.rsplit("_", 1)
+            if canonical is not None:
+                reported = field(field(canonical, modality), f"{direction}_tokens")
+            else:
+                details = "prompt_tokens_details" if direction == "input" else "completion_tokens_details"
+                reported = field(field(final_usage, details), f"{modality}_tokens")
+            if reported is None:
+                raise CompletionError(502, "modality_usage_unavailable")
+    if breakdown is None:
+        breakdown = litellm_client.extract_usage_breakdown(model_name, messages, text, final_usage)
+    return breakdown
 
 
 async def _bill(
@@ -158,29 +206,10 @@ async def _bill(
     required = resolved.get("required_token_modalities")
     if required is None:
         required = required_modalities_for_request(token_rates, messages=messages)
-    breakdown = UsageBreakdown.from_runtime(final_usage)
-    if (required or (token_rates and final_usage is not None)) and (
-        breakdown is None or breakdown.modality_usage_invalid
-    ):
-        raise CompletionError(502, "modality_usage_unavailable")
-    if required:
-        def field(value: Any, key: str) -> Any:
-            return value.get(key) if isinstance(value, dict) else getattr(value, key, None)
-
-        # A zero aggregate is not evidence that the provider explicitly
-        # reported a requested media split. Do not synthesize even zero media.
-        canonical = field(final_usage, "modality_tokens")
-        for item in required:
-            modality, direction = item.rsplit("_", 1)
-            if canonical is not None:
-                reported = field(field(canonical, modality), f"{direction}_tokens")
-            else:
-                details = "prompt_tokens_details" if direction == "input" else "completion_tokens_details"
-                reported = field(field(final_usage, details), f"{modality}_tokens")
-            if reported is None:
-                raise CompletionError(502, "modality_usage_unavailable")
-    if breakdown is None:
-        breakdown = litellm_client.extract_usage_breakdown(model_name, messages, text, final_usage)
+    breakdown = usage_breakdown_for_billing(
+        model_name, token_rates=token_rates, required=required, messages=messages, text=text,
+        final_usage=final_usage,
+    )
     pt, ct = breakdown.input_tokens, breakdown.output_tokens
     try:
         usage_cost = litellm_client.cost_from_usage(
@@ -266,6 +295,59 @@ def _reasoning_effort(explicit: str | None, resolved: dict | None = None) -> str
     return effort
 
 
+@dataclass(frozen=True)
+class ChatInvocation:
+    """Normalized nonstreaming provider chat result; carries raw usage, never a charge."""
+
+    model: str
+    content: str
+    tool_calls: list[dict] | None
+    finish_reason: str
+    usage: Any
+
+
+async def invoke_chat_once(
+    *,
+    resolved: dict,
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float | None,
+    tools: list[dict] | None = None,
+    tool_choice: Any = None,
+    provider_once: bool = False,
+) -> ChatInvocation:
+    """Send one nonstreaming chat request on an already frozen route; no billing.
+
+    Provider exceptions propagate unchanged so each caller keeps its own error
+    contract. ``provider_once`` disables every transport retry/re-send layer.
+    """
+    extra_kwargs: dict[str, Any] = {}
+    if tool_choice is not None:
+        extra_kwargs["tool_choice"] = tool_choice
+    resp = await litellm_client.acompletion(
+        resolved["model_name"],
+        messages,
+        api_base=resolved.get("api_base"),
+        api_key=resolved.get("api_key"),
+        custom_llm_provider=resolved.get("provider_type"),
+        max_tokens=max_tokens,
+        temperature=temperature,
+        tools=tools,
+        extra=extra_kwargs or None,
+        provider_auth=resolved.get("provider_auth"),
+        **({"provider_once": True} if provider_once else {}),
+    )
+    choice = resp.choices[0]
+    msg = choice.message
+    return ChatInvocation(
+        model=resolved["api_model_name"],
+        content=getattr(msg, "content", None) or "",
+        tool_calls=_norm_tool_calls(getattr(msg, "tool_calls", None)),
+        finish_reason=getattr(choice, "finish_reason", None) or "stop",
+        usage=getattr(resp, "usage", None),
+    )
+
+
 async def complete_once(
     *,
     resolved: dict,
@@ -279,49 +361,37 @@ async def complete_once(
     tool_choice: Any = None,
 ) -> dict:
     """비스트리밍 완료 — 전체 응답 반환 + 과금. tool_calls 는 릴레이(서버 미실행)."""
-    resolved = _billing_route(resolved, messages, protocol="chat", options={"tools": tools})
-    extra_kwargs: dict[str, Any] = {}
-    if tool_choice is not None:
-        extra_kwargs["tool_choice"] = tool_choice
+    resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
     try:
-        resp = await litellm_client.acompletion(
-            resolved["model_name"],
-            messages,
-            api_base=resolved.get("api_base"),
-            api_key=resolved.get("api_key"),
-            custom_llm_provider=resolved.get("provider_type"),
+        invocation = await invoke_chat_once(
+            resolved=resolved,
+            messages=messages,
             max_tokens=clamp_max_tokens(max_tokens),
             temperature=temperature,
             tools=tools,
-            extra=extra_kwargs or None,
-            provider_auth=resolved.get("provider_auth"),
+            tool_choice=tool_choice,
         )
     except errors.ProviderSubscriptionError as exc:
         raise CompletionError(exc.status_code, exc.message) from None
-    choice = resp.choices[0]
-    msg = choice.message
-    content = getattr(msg, "content", None) or ""
-    tool_calls = _norm_tool_calls(getattr(msg, "tool_calls", None))
-    finish_reason = getattr(choice, "finish_reason", None) or "stop"
     pt, ct, credited = await _bill(
         resolved,
         messages,
-        content,
-        getattr(resp, "usage", None),
+        invocation.content,
+        invocation.usage,
         event_id=str(uuid.uuid4()),
         user_id=user_id,
         project_id=project_id,
         api_key_id=api_key_id,
     )
     return {
-        "model": resolved["api_model_name"],
-        "content": content,
-        "tool_calls": tool_calls,
-        "finish_reason": finish_reason,
+        "model": invocation.model,
+        "content": invocation.content,
+        "tool_calls": invocation.tool_calls,
+        "finish_reason": invocation.finish_reason,
         "prompt_tokens": pt,
         "completion_tokens": ct,
         "cache_read_input_tokens": (
-            UsageBreakdown.from_runtime(getattr(resp, "usage", None)) or UsageBreakdown(0, 0)
+            UsageBreakdown.from_runtime(invocation.usage) or UsageBreakdown(0, 0)
         ).cache_read_input_tokens,
         "credited_cost": float(credited),
     }
@@ -340,7 +410,7 @@ def complete_stream(
     tool_choice: Any = None,
 ) -> AsyncIterator[dict]:
     """Validate/freeze before HTTP streaming starts, then return the completion iterator."""
-    resolved = _billing_route(resolved, messages, protocol="chat", options={"tools": tools})
+    resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
     return _complete_stream(
         resolved=resolved, messages=messages, user_id=user_id, project_id=project_id,
         api_key_id=api_key_id, max_tokens=max_tokens, temperature=temperature,
@@ -371,64 +441,66 @@ async def _complete_stream(
     final_usage = None
     finish_reason = "stop"
     charged = False
+    gen = None
     event_id = str(uuid.uuid4())  # 요청당 1개 — 정상/finally 재과금 모두 재사용(멱등, 이중과금 방지)
     extra_kwargs: dict[str, Any] = {}
     if tool_choice is not None:
         extra_kwargs["tool_choice"] = tool_choice
+    # One finally owns the provider stream and partial billing: a consumer close
+    # (GeneratorExit) at any delta yield must still close upstream and bill.
     try:
-        gen = await litellm_client.acompletion_stream(
-            resolved["model_name"],
-            messages,
-            api_base=resolved.get("api_base"),
-            api_key=resolved.get("api_key"),
-            custom_llm_provider=resolved.get("provider_type"),
-            max_tokens=clamp_max_tokens(max_tokens),
-            temperature=temperature,
-            tools=tools,
-            extra=extra_kwargs or None,
-            reasoning_effort=_reasoning_effort(None, resolved),
-            provider_auth=resolved.get("provider_auth"),
-        )
-        async for chunk in gen:
-            u = getattr(chunk, "usage", None)
-            if u is not None:
-                final_usage = u
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            ch = choices[0]
-            delta = getattr(ch, "delta", None)
-            fr = getattr(ch, "finish_reason", None)
-            if fr:
-                finish_reason = fr
-            content = (getattr(delta, "content", None) if delta else None) or ""
-            reasoning = (getattr(delta, "reasoning_content", None) if delta else None) or ""
-            tcs = _norm_tool_calls(getattr(delta, "tool_calls", None) if delta else None)
-            if content:
-                text_parts.append(content)
-            if content or reasoning or tcs or fr:
-                yield {
-                    "type": "delta",
-                    "content": content,
-                    "reasoning": reasoning,
-                    "tool_calls": tcs,
-                    "finish_reason": fr,
-                }
-    except errors.ProviderSubscriptionError as exc:
-        logger.warning("API 구독 스트리밍 실패 model=%s code=%s", resolved.get("model_name"), exc.code)
-        yield {"type": "error", "code": exc.code, "message": exc.message}
-        return
-    except Exception:
-        logger.warning("API 스트리밍 실패 model=%s", resolved.get("model_name"), exc_info=True)
-        yield {"type": "error", "message": "생성 중 오류가 발생했습니다"}
-        return
+        try:
+            gen = await litellm_client.acompletion_stream(
+                resolved["model_name"],
+                messages,
+                api_base=resolved.get("api_base"),
+                api_key=resolved.get("api_key"),
+                custom_llm_provider=resolved.get("provider_type"),
+                max_tokens=clamp_max_tokens(max_tokens),
+                temperature=temperature,
+                tools=tools,
+                extra=extra_kwargs or None,
+                reasoning_effort=_reasoning_effort(None, resolved),
+                provider_auth=resolved.get("provider_auth"),
+            )
+            async for chunk in gen:
+                u = getattr(chunk, "usage", None)
+                if u is not None:
+                    final_usage = u
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                ch = choices[0]
+                delta = getattr(ch, "delta", None)
+                fr = getattr(ch, "finish_reason", None)
+                if fr:
+                    finish_reason = fr
+                content = (getattr(delta, "content", None) if delta else None) or ""
+                reasoning = (getattr(delta, "reasoning_content", None) if delta else None) or ""
+                tcs = _norm_tool_calls(getattr(delta, "tool_calls", None) if delta else None)
+                if content:
+                    text_parts.append(content)
+                if content or reasoning or tcs or fr:
+                    yield {
+                        "type": "delta",
+                        "content": content,
+                        "reasoning": reasoning,
+                        "tool_calls": tcs,
+                        "finish_reason": fr,
+                    }
+        except errors.ProviderSubscriptionError as exc:
+            logger.warning("API 구독 스트리밍 실패 model=%s code=%s", resolved.get("model_name"), exc.code)
+            yield {"type": "error", "code": exc.code, "message": exc.message}
+            return
+        except Exception:
+            logger.warning("API 스트리밍 실패 model=%s", resolved.get("model_name"), exc_info=True)
+            yield {"type": "error", "message": "생성 중 오류가 발생했습니다"}
+            return
 
-    text = "".join(text_parts)
-    try:
         pt, ct, credited = await _bill(
             resolved,
             messages,
-            text,
+            "".join(text_parts),
             final_usage,
             event_id=event_id,
             user_id=user_id,
@@ -447,20 +519,69 @@ async def _complete_stream(
             ).cache_read_input_tokens,
         }
     finally:
-        if not charged and text and not resolved.get("token_rates"):
+        # An ASGI disconnect is a level-triggered AnyIO cancel that can land at the
+        # upstream read; unshielded cleanup awaits would be re-cancelled and skip billing.
+        with anyio.CancelScope(shield=True):
             try:
-                await _bill(
-                    resolved,
-                    messages,
-                    text,
-                    final_usage,
-                    event_id=event_id,
-                    user_id=user_id,
-                    project_id=project_id,
-                    api_key_id=api_key_id,
-                )
-            except Exception:
-                logger.warning("API 스트림 종료 후 과금 실패", exc_info=True)
+                await _close_provider_stream(gen)
+            finally:
+                if not charged and text_parts and not resolved.get("token_rates"):
+                    try:
+                        await _bill(
+                            resolved,
+                            messages,
+                            "".join(text_parts),
+                            final_usage,
+                            event_id=event_id,
+                            user_id=user_id,
+                            project_id=project_id,
+                            api_key_id=api_key_id,
+                        )
+                    except Exception:
+                        logger.warning("API 스트림 종료 후 과금 실패", exc_info=True)
+
+
+async def _close_provider_stream(stream: Any) -> None:
+    """Release an opened provider stream; LiteLLM Responses iterators expose only their httpx response."""
+    if stream is None:
+        return
+    close = getattr(stream, "aclose", None)
+    if not callable(close):
+        close = getattr(getattr(stream, "response", None), "aclose", None)
+    if not callable(close):
+        return
+    try:
+        await close()
+    except Exception:
+        logger.warning("provider stream close failed", exc_info=True)
+
+
+class _ProviderEvents:
+    """Native events that release their eagerly opened provider stream even if never iterated.
+
+    Routes register this with the ASGI SSE owner, whose cleanup runs even when the
+    response body generator never starts. ``aclose`` is idempotent.
+    """
+
+    def __init__(self, events: AsyncIterator[dict], provider_stream: Any):
+        self._events = events
+        self._provider_stream = provider_stream
+        self._closed = False
+
+    def __aiter__(self) -> _ProviderEvents:
+        return self
+
+    async def __anext__(self) -> dict:
+        return await self._events.__anext__()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._events.aclose()  # a started stream settles billing here
+        finally:
+            await _close_provider_stream(self._provider_stream)
 
 
 def _native_dict(value: Any) -> dict:
@@ -560,10 +681,64 @@ def _native_usage(
     return breakdown.as_usage_dict() if breakdown is not None else None
 
 
-def _responses_input_messages(input_value: str | list[dict]) -> list[dict]:
+def responses_input_messages(input_value: str | list[dict]) -> list[dict]:
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
     return [item for item in input_value if isinstance(item, dict)]
+
+
+def responses_provider_options(options: dict[str, Any], *, resolved: dict) -> dict[str, Any]:
+    """Drop reasoning only for a model an operator/catalog explicitly marked unsupported."""
+    options = dict(options)
+    if resolved.get("reasoning_unsupported") is True:
+        options.pop("reasoning", None)
+        if include := options.get("include"):
+            filtered = [item for item in include if not item.startswith("reasoning.")]
+            if filtered:
+                options["include"] = filtered
+            else:
+                options.pop("include")
+    return options
+
+
+def responses_usage(payload: dict, *, strict: bool) -> tuple[str, dict | None]:
+    """``(output_text, runtime_usage)`` of one nonstreaming Responses payload for billing."""
+    return _native_text(payload.get("output", [])), _native_usage(payload, protocol="responses", strict=strict)
+
+
+async def invoke_responses_once(
+    *, resolved: dict, input: str | list[dict], options: dict[str, Any], provider_once: bool = False
+) -> dict:
+    """Send one nonstreaming native Responses request; returns the provider payload, no billing.
+
+    ``options`` must already be the exact provider options. Provider exceptions
+    propagate unchanged; ``provider_once`` disables every retry/re-send layer.
+    """
+    response = await litellm_client.aresponses(
+        model=resolved["model_name"],
+        input=input,
+        stream=False,
+        api_base=resolved.get("api_base"),
+        api_key=resolved.get("api_key"),
+        custom_llm_provider=resolved.get("provider_type"),
+        provider_auth=resolved.get("provider_auth"),
+        **({"provider_once": True} if provider_once else {}),
+        **options,
+    )
+    return _native_dict(response)
+
+
+def _raise_responses_error(exc: Exception, resolved: dict) -> NoReturn:
+    """Map one Responses provider failure to the online compatibility error contract."""
+    if isinstance(exc, CompletionError):
+        raise exc
+    if isinstance(exc, errors.ProviderSubscriptionError):
+        raise CompletionError(exc.status_code, exc.message) from None
+    if isinstance(exc, BadRequestError):
+        logger.info("Responses provider rejected request model=%s", resolved.get("model_name"))
+        raise CompletionError(400, "upstream model rejected request") from None
+    logger.warning("Responses upstream request failed model=%s", resolved.get("model_name"), exc_info=exc)
+    raise CompletionError(502, "upstream model error") from exc
 
 
 async def complete_responses(
@@ -577,18 +752,29 @@ async def complete_responses(
     options: dict[str, Any],
 ) -> dict | AsyncIterator[dict]:
     """Execute the native Responses protocol and preserve every upstream item/event."""
-    messages = _responses_input_messages(input)
-    resolved = _billing_route(resolved, messages, protocol="responses", options=options)
+    messages = responses_input_messages(input)
+    resolved = billing_route(resolved, messages, protocol="responses", options=options)
     event_id = str(uuid.uuid4())
-    options = _with_passthrough_compaction(options, resolved=resolved, protocol="responses")
-    if resolved.get("reasoning_unsupported") is True:
-        options.pop("reasoning", None)
-        if include := options.get("include"):
-            filtered = [item for item in include if not item.startswith("reasoning.")]
-            if filtered:
-                options["include"] = filtered
-            else:
-                options.pop("include")
+    options = responses_provider_options(
+        _with_passthrough_compaction(options, resolved=resolved, protocol="responses"), resolved=resolved
+    )
+    if not stream:
+        try:
+            payload = await invoke_responses_once(resolved=resolved, input=input, options=options)
+        except Exception as exc:
+            _raise_responses_error(exc, resolved)
+        text, usage = responses_usage(payload, strict=bool(resolved.get("token_rates")))
+        await _bill(
+            resolved,
+            messages,
+            text,
+            usage,
+            event_id=event_id,
+            user_id=user_id,
+            project_id=project_id,
+            api_key_id=api_key_id,
+        )
+        return payload
     try:
         response = await litellm_client.aresponses(
             model=resolved["model_name"],
@@ -600,28 +786,8 @@ async def complete_responses(
             provider_auth=resolved.get("provider_auth"),
             **options,
         )
-    except errors.ProviderSubscriptionError as exc:
-        raise CompletionError(exc.status_code, exc.message) from None
-    except BadRequestError:
-        logger.info("Responses provider rejected request model=%s", resolved.get("model_name"))
-        raise CompletionError(400, "upstream model rejected request") from None
     except Exception as exc:
-        logger.warning("Responses upstream request failed model=%s", resolved.get("model_name"), exc_info=True)
-        raise CompletionError(502, "upstream model error") from exc
-
-    if not stream:
-        payload = _native_dict(response)
-        await _bill(
-            resolved,
-            messages,
-            _native_text(payload.get("output", [])),
-            _native_usage(payload, protocol="responses", strict=bool(resolved.get("token_rates"))),
-            event_id=event_id,
-            user_id=user_id,
-            project_id=project_id,
-            api_key_id=api_key_id,
-        )
-        return payload
+        _raise_responses_error(exc, resolved)
 
     async def events() -> AsyncIterator[dict]:
         charged = False
@@ -649,6 +815,8 @@ async def complete_responses(
                     charged = True
                 yield event
         finally:
+            # Stop upstream generation first; close failures are logged, never skip billing.
+            await _close_provider_stream(response)
             if (
                 not charged and text_parts and not resolved.get("required_token_modalities")
                 and not (resolved.get("token_rates") and settlement_attempted)
@@ -667,7 +835,7 @@ async def complete_responses(
                 except Exception:
                     logger.warning("Responses partial-stream accounting failed", exc_info=True)
 
-    return events()
+    return _ProviderEvents(events(), response)
 
 
 async def complete_anthropic(
@@ -682,7 +850,7 @@ async def complete_anthropic(
     options: dict[str, Any],
 ) -> dict | AsyncIterator[dict]:
     """Execute the native Anthropic protocol without lossy OpenAI conversion."""
-    resolved = _billing_route(resolved, messages, protocol="anthropic", options=options)
+    resolved = billing_route(resolved, messages, protocol="anthropic", options=options)
     event_id = str(uuid.uuid4())
     options = _with_passthrough_compaction(options, resolved=resolved, protocol="anthropic")
     try:
@@ -717,6 +885,30 @@ async def complete_anthropic(
         )
         return payload
 
+    # Start the provider chain before HTTP 200: LiteLLM's Anthropic byte stream
+    # releases its pooled connection on close only after it was iterated.
+    upstream = aiter(response)
+    try:
+        first_event = await anext(upstream)
+    except StopAsyncIteration:
+        first_event = None
+    except BaseException as exc:
+        # The ASGI resource owner is registered only after this function returns.
+        with anyio.CancelScope(shield=True):
+            await _close_provider_stream(upstream)
+        if isinstance(exc, errors.ProviderSubscriptionError):
+            raise CompletionError(exc.status_code, exc.message) from None
+        if not isinstance(exc, Exception):
+            raise
+        logger.warning("Anthropic upstream stream failed model=%s", resolved.get("model_name"), exc_info=True)
+        raise CompletionError(502, "upstream model error") from exc
+
+    async def raw_events() -> AsyncIterator[Any]:
+        if first_event is not None:
+            yield first_event
+        async for item in upstream:
+            yield item
+
     async def events() -> AsyncIterator[dict]:
         start_usage: dict = {}
         delta_usages: list[dict] = []
@@ -724,7 +916,7 @@ async def complete_anthropic(
         charged = False
         settlement_attempted = False
         try:
-            async for raw_event in response:
+            async for raw_event in raw_events():
                 event = _native_dict(raw_event)
                 event_type = event.get("type")
                 if event_type == "message_start":
@@ -763,6 +955,8 @@ async def complete_anthropic(
                     charged = True
                 yield event
         finally:
+            # Stop upstream generation first; close failures are logged, never skip billing.
+            await _close_provider_stream(response)
             if (
                 not charged and text_parts and not resolved.get("required_token_modalities")
                 and not (resolved.get("token_rates") and settlement_attempted)
@@ -814,7 +1008,7 @@ async def complete_anthropic(
                 except Exception:
                     logger.warning("Anthropic partial-stream accounting failed", exc_info=True)
 
-    return events()
+    return _ProviderEvents(events(), upstream)
 
 
 async def count_anthropic_tokens(

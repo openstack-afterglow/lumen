@@ -9,16 +9,17 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from lumen.api.assets import _map_error as asset_error
 from lumen.api.assets import _spool_upload
 from lumen.api.compat.openai import openai_error_response
-from lumen.api.images import ImageGenerationRequest, admit, image_error
+from lumen.api.images import admit, image_error
 from lumen.auth import Principal, require_api_key_scopes
 from lumen.db import get_session_factory
+from lumen.models.api_requests import ImageGenerationRequest, OpenAIImageGenerationRequest
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_runs import ChatRun
 from lumen.services import assets, openai_compat
@@ -30,19 +31,6 @@ from lumen.services.durable_runs.images import image_result
 router = APIRouter()
 _POLL_INTERVAL_SECONDS = 0.25
 _EDIT_FIELDS = frozenset({"image", "prompt", "model", "n", "size", "quality", "response_format", "provider", "provider_id"})
-
-
-class OpenAIImageGenerationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    model: str = Field(min_length=1, max_length=190)
-    provider: str | None = None
-    provider_id: int | None = None
-    prompt: str = Field(min_length=1)
-    n: int = Field(default=1, ge=1)
-    size: str = "auto"
-    quality: str = "auto"
-    response_format: str = "b64_json"
 
 
 def _compat_error(exc: HTTPException) -> JSONResponse:
@@ -149,6 +137,7 @@ async def generate_image(
             principal=principal,
             idempotency_key=idempotency_key or uuid.uuid4(),
             api_provider=body.provider,
+            required_scopes=("compat:images:write",),
         )
     except HTTPException as exc:
         return _compat_error(exc)
@@ -215,6 +204,7 @@ async def edit_image(
             idempotency_key=idempotency_key or uuid.uuid4(),
             input_asset_id=uuid.UUID(source_id),
             api_provider=provider,
+            required_scopes=("compat:images:write",),
         )
     except HTTPException as exc:
         return _compat_error(exc)

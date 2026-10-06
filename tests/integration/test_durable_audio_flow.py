@@ -17,17 +17,29 @@ from sqlalchemy import select
 from lumen.crypto import decrypt_chat_content
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
+from lumen.models.chat_batches import ChatBatch, ChatBatchItem
 from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment
 from lumen.services import assets, credit
 from lumen.services.durable_runs import audio, queries
 from lumen.services.durable_runs.common import _fingerprint
-from lumen.services.durable_runs.errors import DurableRunConflict
+from lumen.services.durable_runs.errors import DurableRunConflict, DurableRunInputError
+from lumen.services.infrastructure.store import register_worker
 from lumen.services.providers import routing
 from lumen.services.providers.errors import ProviderValidationError
 from lumen.services.run_store import claim_queued_run, load_segment_payload
+from lumen.services.worker_routing import use_read_committed
 
 pytestmark = pytest.mark.integration
+
+
+async def _claim(session, run_id: str, owner: str):
+    """Claim through a fresh fixed online_media registration, as a real worker must."""
+    registration_id = await register_worker(worker_identity=owner, boot_id=str(uuid.uuid4()), capacity=4,
+                                            protocol_versions=[1, 2], plugin_digest="0" * 64, schema_version=1,
+                                            workload_classes=["online_media"])
+    await use_read_committed(session)
+    return await claim_queued_run(session, run_id, owner=owner, registration_id=registration_id)
 
 
 def _wave() -> bytes:
@@ -103,6 +115,46 @@ async def test_audio_durable_scanned_assets_idempotency_and_unknown(monkeypatch)
         monkeypatch.setattr(audio.audio_transport, "transcribe_audio", transcription)
 
         tts_request = {"kind": "tts", "model_id": str(ids[0]), "input": "hello", "voice": "alloy", "response_format": "wav"}
+        prepared = await audio.prepare_audio_run(
+            {"model_id": str(ids[1]), "input_asset_id": source_id, "language": "en"},
+            operation="audio.transcriptions", project_id=project_id, user_id=user_id)
+        assert prepared.source_asset_id == source_id
+        assert prepared.required_scopes == ("native:audio:write", "native:assets:read")
+        rolled_back_id = None
+        with pytest.raises(RuntimeError, match="caller rollback"):
+            async with factory() as session, session.begin():
+                batch = ChatBatch(id=str(uuid.uuid4()), user_id=user_id, project_id=project_id,
+                    contract="native", status="in_progress", request_fingerprint="0" * 64,
+                    idempotency_key_hash="1" * 64)
+                session.add(batch)
+                await session.flush()
+                session.add(ChatBatchItem(batch_id=batch.id, ordinal=1, custom_id="stt", custom_id_hash="2" * 64,
+                    operation="audio.transcriptions", request_ciphertext="sealed", input_asset_id=source_id,
+                    state="pending"))
+                # Deleted after acceptance: new reuse is refused, the accepted Batch pin survives.
+                pinned_source = await session.get(ChatAsset, source_id)
+                pinned_source.status = "deleting"
+                await session.flush()
+                async with session.begin_nested():
+                    with pytest.raises(DurableRunInputError, match="source media is unavailable"):
+                        await audio.persist_audio_run_in_transaction(
+                            session, prepared, project_id=project_id, user_id=user_id,
+                            client_request_id=str(uuid.uuid4()))
+                staged = await audio.persist_audio_run_in_transaction(
+                    session, prepared, project_id=project_id, user_id=user_id,
+                    client_request_id=str(uuid.uuid4()), workload_class="batch", batch_id=batch.id)
+                rolled_back_id = staged.id
+                assert staged.workload_class == "batch" and staged.worker_pool_id is None
+                await session.flush()
+                binding = (await session.execute(select(ChatRunAsset).where(
+                    ChatRunAsset.run_id == staged.id))).scalar_one()
+                assert binding.asset_id == source_id and binding.purpose == "input"
+                assert (await session.execute(select(ChatModelCallReservation).where(
+                    ChatModelCallReservation.run_id == staged.id))).scalar_one_or_none() is None
+                raise RuntimeError("caller rollback")
+        async with factory() as session:
+            assert await session.get(ChatRun, rolled_back_id) is None
+        assert calls == []
         key = str(uuid.uuid4())
         first = await audio.admit_audio_run(tts_request, user_id=user_id, project_id=project_id, client_request_id=key)
         repeated = await audio.admit_audio_run(tts_request, user_id=user_id, project_id=project_id, client_request_id=key)
@@ -111,7 +163,7 @@ async def test_audio_durable_scanned_assets_idempotency_and_unknown(monkeypatch)
             await audio.admit_audio_run({**tts_request, "input": "different"}, user_id=user_id,
                                         project_id=project_id, client_request_id=key)
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, first.run_id, owner="audio-worker")
+            claimed = await _claim(session, first.run_id, "audio-worker")
             assert claimed is not None
             owner = claimed.lease_owner
             capability, frozen = dict(claimed.capability_snapshot), dict(claimed.pricing_snapshot)
@@ -135,7 +187,7 @@ async def test_audio_durable_scanned_assets_idempotency_and_unknown(monkeypatch)
         second = await audio.admit_audio_run(stt_request, user_id=user_id, project_id=project_id,
                                              client_request_id=str(uuid.uuid4()))
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, second.run_id, owner="audio-worker")
+            claimed = await _claim(session, second.run_id, "audio-worker")
             assert claimed is not None
             owner = claimed.lease_owner
             capability, frozen = dict(claimed.capability_snapshot), dict(claimed.pricing_snapshot)
@@ -152,7 +204,7 @@ async def test_audio_durable_scanned_assets_idempotency_and_unknown(monkeypatch)
         third = await audio.admit_audio_run({**tts_request, "input": "unknown"}, user_id=user_id,
                                             project_id=project_id, client_request_id=str(uuid.uuid4()))
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, third.run_id, owner="audio-worker")
+            claimed = await _claim(session, third.run_id, "audio-worker")
             assert claimed is not None
             owner = claimed.lease_owner
             capability, frozen = dict(claimed.capability_snapshot), dict(claimed.pricing_snapshot)
@@ -241,7 +293,7 @@ async def test_audio_explicit_billing_checkpoint_ledger_and_unknown_hold(monkeyp
             if kind == "tts" else {"kind": "stt", "model_id": str(model_id), "input_asset_id": source_id})
         admitted = await audio.admit_audio_run(request, user_id=user_id, project_id=project_id, client_request_id=str(uuid.uuid4()))
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, admitted.run_id, owner="audio-bill-worker")
+            claimed = await _claim(session, admitted.run_id, "audio-bill-worker")
             owner = claimed.lease_owner
             capability, frozen = dict(claimed.capability_snapshot), dict(claimed.pricing_snapshot)
         async def handle(http_request):
@@ -272,7 +324,7 @@ async def test_audio_explicit_billing_checkpoint_ledger_and_unknown_hold(monkeyp
                 "input_token_details": {"audio_tokens": 800 if case != "invalid" else 1100, "text_tokens": 200}}
             return httpx.Response(200, json={"text": "heard", **({} if case == "missing" else {"usage": usage})})
         client = httpx.AsyncClient
-        monkeypatch.setattr(audio.audio_transport.httpx, "AsyncClient", lambda **kwargs: client(transport=httpx.MockTransport(handle), **kwargs))
+        monkeypatch.setattr(audio.audio_transport.httpx, "AsyncClient", lambda **kwargs: client(**{**kwargs, "transport": httpx.MockTransport(handle)}))
         # Keep the real route/config resolver fence, but simulate changed current
         # effective prices. Admission's rates must remain the only charge source.
         resolve = routing.resolve_model_snapshot
@@ -354,7 +406,7 @@ async def test_timed_transcription_intent_checkpoint_projection_and_invalid_timi
             ]})
     client = httpx.AsyncClient
     monkeypatch.setattr(audio.audio_transport.httpx, "AsyncClient",
-                        lambda **kwargs: client(transport=httpx.MockTransport(handle), **kwargs))
+                        lambda **kwargs: client(**{**kwargs, "transport": httpx.MockTransport(handle)}))
 
     async def run_row(run_id):
         async with factory() as session:
@@ -362,7 +414,7 @@ async def test_timed_transcription_intent_checkpoint_projection_and_invalid_timi
 
     async def execute(run_id):
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, run_id, owner="audio-timed-worker")
+            claimed = await _claim(session, run_id, "audio-timed-worker")
             assert claimed is not None
             owner = claimed.lease_owner
             capability, frozen = dict(claimed.capability_snapshot), dict(claimed.pricing_snapshot)

@@ -170,6 +170,24 @@ class _LumenApiMixin:
         return self._json_request("POST", "/v1/chat/realtime/sessions", body=attrs,
                                   headers={"Idempotency-Key": idempotency_key})
 
+    # -- Native Batches -------------------------------------------------
+
+    def create_batch(self, *, idempotency_key: str, **attrs):
+        return self._json_request("POST", "/v1/chat/batches", body=attrs,
+                                  headers={"Idempotency-Key": idempotency_key})
+
+    def list_batches(self, **query):
+        return self._json_request("GET", "/v1/chat/batches", params=_query(**query))
+
+    def get_batch(self, batch_id):
+        return self._json_request("GET", f"/v1/chat/batches/{_segment(batch_id)}")
+
+    def list_batch_items(self, batch_id, **query):
+        return self._json_request("GET", f"/v1/chat/batches/{_segment(batch_id)}/items", params=_query(**query))
+
+    def cancel_batch(self, batch_id):
+        return self._json_request("POST", f"/v1/chat/batches/{_segment(batch_id)}/cancel")
+
     # -- Models & Capabilities ------------------------------------------
 
     def discovery(self):

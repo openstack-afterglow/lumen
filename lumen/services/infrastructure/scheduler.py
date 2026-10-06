@@ -20,6 +20,18 @@ def _clamp(minimum: int, maximum: int, value: int) -> int:
     return min(maximum, max(minimum, value))
 
 
+def capacity_limit(*, maximum: int, db_budget: int | None, db_per_process: int,
+                   pg_budget: int | None, pg_per_process: int, surge: int = 0) -> int:
+    """Only this pool's reservations are spendable; reserve surge for replacement."""
+    if min(maximum, db_per_process, pg_per_process, surge) < 0:
+        raise ValueError("invalid capacity reservation")
+    limits = [maximum]
+    for budget, per_process in ((db_budget, db_per_process), (pg_budget, pg_per_process)):
+        if budget is not None and per_process:
+            limits.append(max(0, budget // per_process - surge))
+    return min(limits)
+
+
 def worker_desired(
     min_replicas: int,
     max_replicas: int,
@@ -66,18 +78,25 @@ def gate_scale(
     pool_size: int,
     overflow: int,
     db_connection_budget: int | None,
+    pg_connection_budget: int | None = None,
+    pg_connections_per_process: int = 0,
+    replacement_reserve: int = 0,
 ) -> ScaleDecision:
     """Two consecutive high samples; 300s sustained low load and safe drain for scale-in."""
     if target > current:
         samples = high_samples + 1
         if samples < 2:
-            return ScaleDecision(current, samples, None, "awaiting_second_demand_sample")
-        if db_connection_budget is not None and target * (pool_size + overflow) > db_connection_budget:
-            return ScaleDecision(current, samples, None, "db_connection_budget_exceeded")
-        return ScaleDecision(target, samples, None)
+            return ScaleDecision(current, samples, None, "demand_high")
+        limit = capacity_limit(maximum=target, db_budget=db_connection_budget,
+                               db_per_process=pool_size + overflow,
+                               pg_budget=pg_connection_budget,
+                               pg_per_process=pg_connections_per_process,
+                               surge=replacement_reserve)
+        return ScaleDecision(max(current, limit), samples, None,
+                             "db_budget" if limit < target else "demand_high")
     if target < current and low_utilization:
         since = now if low_since is None else low_since
         if now - since >= 300 and safe_to_drain:
-            return ScaleDecision(target, 0, since)
-        return ScaleDecision(current, 0, since, "scale_down_waiting_for_idle_drain")
+            return ScaleDecision(target, 0, since, "idle_window")
+        return ScaleDecision(current, 0, since, "idle_window")
     return ScaleDecision(current, 0, None)

@@ -6,6 +6,10 @@ the authority when Redis is unavailable or a publish is missed.
 Scheduling model (plan Step 3): a bounded set of active run tasks is refilled as soon as
 any slot frees, independent bounded maintenance never blocks polling or lease renewal,
 and drain stops new claims while renewing the leases of work already in flight.
+
+Each worker registers explicit workload classes; it only sees, claims and relaunches
+runs of those classes in its own pool. Title/memory/workspace maintenance runs only on
+``online_text`` workers and is owned by the registration UUID.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ import os
 import signal
 import socket
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 
 from lumen.cache import _get_redis
 from lumen.config import get_settings
@@ -24,6 +28,7 @@ from lumen.db import init_db
 from lumen.logging_config import configure_logging
 from lumen.plugins.host import build_host
 from lumen.plugins.registry import get_registry
+from lumen.services import auxiliary, worker_routing
 from lumen.services.agent_workspace_runtime import configured_workspace_policy
 from lumen.services.code_workspace_service import delete_pending_workspaces, provision_pending_workspaces
 from lumen.services.durable_runs.execution import execute_queued_run, queued_run_ids
@@ -32,8 +37,8 @@ from lumen.services.durable_runs.lifecycle import purge_expired_temp_threads, re
 from lumen.services.execution_protocol import SUPPORTED_EXECUTION_PROTOCOL_VERSIONS
 
 logger = logging.getLogger(__name__)
-_QUEUE = "afterglow:chat:runs"
 _REGISTRATION_SCHEMA_VERSION = 1
+
 
 def _log_run_id(run_id: str) -> str:
     """Only a canonical UUID may cross the untrusted wakeup-to-log boundary."""
@@ -43,19 +48,23 @@ def _log_run_id(run_id: str) -> str:
         return "invalid"
 
 
-async def _next_run_ids(limit: int) -> list[str]:
+async def _next_run_ids(limit: int, *, registration_id: str, hint_keys: Sequence[str]) -> list[str]:
+    """Class/pool Redis hints first, then the authoritative filtered DB poll every time."""
     if limit < 1:
         await asyncio.sleep(0.5)
         return []
-    try:
-        redis = await _get_redis()
-        item = await redis.brpop(_QUEUE, timeout=1)
-        if item is not None:
-            _, value = item
-            return [value.decode("utf-8") if isinstance(value, bytes) else str(value)]
-    except Exception:
-        logger.debug("chat worker Redis wakeup unavailable")
-    return await queued_run_ids(limit=limit)
+    hinted: list[str] = []
+    if hint_keys:
+        try:
+            redis = await _get_redis()
+            item = await redis.brpop(list(hint_keys), timeout=1)
+            if item is not None:
+                _, value = item
+                hinted.append(value.decode("utf-8") if isinstance(value, bytes) else str(value))
+        except Exception:
+            logger.debug("chat worker Redis wakeup unavailable")
+    polled = await queued_run_ids(registration_id=registration_id, limit=limit)
+    return list(dict.fromkeys([*hinted, *polled]))
 
 
 async def _title_processor_loop(processor, *, owner: str) -> None:
@@ -105,16 +114,27 @@ class _Maintenance:
 class WorkerLoop:
     """Bounded active tasks, immediate slot refill, registration heartbeat and drain."""
 
-    def __init__(self, *, owner: str, capacity: int, heartbeat_seconds: int, drain_seconds: int) -> None:
+    def __init__(self, *, owner: str, capacity: int, heartbeat_seconds: int, drain_seconds: int,
+                 workload_classes: Sequence[str]) -> None:
         self.owner = owner
         self.capacity = capacity
         self.heartbeat_seconds = heartbeat_seconds
         self.drain_seconds = drain_seconds
+        self.workload_classes = tuple(workload_classes)
         self.active: dict[str, asyncio.Task[None]] = {}
         self.draining = asyncio.Event()
         self.drain_started_at: float | None = None
         self.registration_id: str | None = None
+        self.pool_id: str | None = None
         self.boot_id = str(uuid.uuid4())
+
+    @property
+    def hint_keys(self) -> list[str]:
+        return [worker_routing.run_hint_key(value, self.pool_id) for value in self.workload_classes]
+
+    @property
+    def serves_online_text(self) -> bool:
+        return "online_text" in self.workload_classes
 
     @property
     def free_slots(self) -> int:
@@ -177,40 +197,56 @@ class WorkerLoop:
             protocol_versions=sorted(SUPPORTED_EXECUTION_PROTOCOL_VERSIONS),
             plugin_digest=get_registry().digest,
             schema_version=_REGISTRATION_SCHEMA_VERSION,
+            workload_classes=list(self.workload_classes),
             resource_id=resource_id,
             **({"resource_generation": generation,
                 "certificate_fingerprint": identity["certificate_fingerprint"]} if guest_dir else {}),
         )
+        self.pool_id = await store.registration_pool_id(self.registration_id)
+
     async def heartbeat(self) -> None:
         from lumen.services.infrastructure import store
 
         if self.registration_id is None:
             return
         guest_dir = os.environ.get("LUMEN_GUEST_IDENTITY_DIR")
-        if guest_dir and not self.draining.is_set():
+        identity_kwargs = {}
+        if guest_dir:
             from pathlib import Path
 
             from lumen.services.infrastructure.guest_bootstrap import load_identity
             try:
-                load_identity(Path(guest_dir), role="worker", resource_id=os.environ["LUMEN_RESOURCE_ID"],
-                              generation=int(os.environ["LUMEN_RESOURCE_GENERATION"]))
+                identity = load_identity(Path(guest_dir), role="worker", resource_id=os.environ["LUMEN_RESOURCE_ID"],
+                                         generation=int(os.environ["LUMEN_RESOURCE_GENERATION"]))
+                identity_kwargs = {"resource_generation": identity["generation"],
+                                   "certificate_fingerprint": identity["certificate_fingerprint"]}
             except Exception:
                 logger.error("worker certificate expired or identity changed; entering drain")
                 self.start_drain()
-        alive = await store.heartbeat_worker(
-            self.registration_id, active_count=len(self.active), accepting=not self.draining.is_set()
-        )
-        if not alive:
+                return
+        state = await store.heartbeat_worker(self.registration_id, accepting=not self.draining.is_set(),
+                                             **identity_kwargs)
+        if state is None:
             # A lost registration means the controller may already count this worker as gone;
             # stop claiming so no run is dispatched to a worker nobody tracks.
             logger.warning("worker registration lost; entering drain")
             self.start_drain()
+        elif state == "draining":
+            # Controller scale-in/replacement commits the same fence as SIGTERM.
+            # Observe it locally so admitted work finishes, then ack and exit.
+            self.start_drain()
 
-    async def mark_draining(self) -> None:
+    async def mark_draining(self) -> bool:
+        """Commit the DB drain fence; False only when no registration row exists."""
         from lumen.services.infrastructure import store
 
-        if self.registration_id is not None:
-            await store.start_drain(self.registration_id)
+        return self.registration_id is not None and await store.start_drain(self.registration_id)
+
+    async def acknowledge_drain(self) -> bool:
+        """DB proof that no live run/auxiliary lease or step remains for this registration."""
+        from lumen.services.infrastructure import store
+
+        return self.registration_id is not None and await store.acknowledge_drain(self.registration_id)
 
 
 async def serve() -> None:
@@ -251,21 +287,33 @@ async def serve() -> None:
         capacity=settings.worker_concurrency,
         heartbeat_seconds=settings.worker_heartbeat_seconds,
         drain_seconds=settings.worker_drain_seconds,
+        workload_classes=settings.worker_workload_classes,
     )
     await loop.register()
+    registration_id = loop.registration_id
+    if registration_id is None:
+        raise RuntimeError("worker registration unavailable")
     logger.info("worker ready capacity=%d", loop.capacity)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("worker ready state maintenance_heartbeat_seconds=%d memory_outbox_enabled=%s",
                      loop.heartbeat_seconds, memory_outbox_enabled)
 
     async def extract_memory() -> None:
-        await process_memory_extraction(owner=owner)
+        await process_memory_extraction(owner=registration_id)
 
     async def reconcile_workspaces() -> None:
         workspace_policy = configured_workspace_policy(settings)
-        if workspace_policy is not None:
-            await provision_pending_workspaces(workspace_policy)
-            await delete_pending_workspaces(workspace_policy)
+        if workspace_policy is None:
+            return
+
+        async def reconcile() -> None:
+            # Registration-gated and counted busy; a drain/shutdown waits instead of cancelling.
+            async with auxiliary.step(owner=registration_id) as admitted:
+                if admitted:
+                    await provision_pending_workspaces(workspace_policy)
+                    await delete_pending_workspaces(workspace_policy)
+
+        await auxiliary.finish_inflight(reconcile())
 
     async def purge_temp() -> None:
         purged = await purge_expired_temp_threads()
@@ -279,18 +327,51 @@ async def serve() -> None:
 
     async def outbox() -> None:
         # The outbox itself commits its lease before all provider/pgvector I/O.
-        await process_memory_outbox(owner=owner)
+        await process_memory_outbox(owner=registration_id)
 
-    maintenance = [
-        _Maintenance("temp_purge", purge_temp, interval=3_600),
-        _Maintenance("workspace_reconcile", reconcile_workspaces, interval=1.0),
-        _Maintenance("input_expiry", expire_inputs, interval=1.0),
-        _Maintenance("memory_extraction", extract_memory, interval=0.5),
-        _Maintenance("heartbeat", loop.heartbeat, interval=float(loop.heartbeat_seconds)),
-    ]
-    if memory_outbox_enabled:
-        maintenance.append(_Maintenance("memory_outbox", outbox, interval=0.5))
-    title_job_task = asyncio.create_task(_title_processor_loop(process_title_generation, owner=owner))
+    batch_gc_at = 0.0
+
+    async def coordinate_batches() -> None:
+        from lumen.services import batch_files, batches
+
+        async def coordinate() -> None:
+            nonlocal batch_gc_at
+            await batches.coordinate_once(owner=registration_id)
+            now = asyncio.get_running_loop().time()
+            if now >= batch_gc_at:
+                async with auxiliary.step(owner=registration_id) as admitted:
+                    if admitted:
+                        await batch_files.gc_batch_files()
+                        batch_gc_at = now + 3_600
+
+        await auxiliary.finish_inflight(coordinate())
+
+    heartbeat = _Maintenance("heartbeat", loop.heartbeat, interval=float(loop.heartbeat_seconds))
+    # Auxiliary maintenance belongs to the always-on online_text pool only.
+    auxiliary_jobs: list[_Maintenance] = []
+    title_job_task: asyncio.Task[None] | None = None
+    if loop.serves_online_text:
+        auxiliary_jobs = [
+            _Maintenance("temp_purge", purge_temp, interval=3_600),
+            _Maintenance("workspace_reconcile", reconcile_workspaces, interval=1.0),
+            _Maintenance("input_expiry", expire_inputs, interval=1.0),
+            _Maintenance("memory_extraction", extract_memory, interval=0.5),
+        ]
+        if memory_outbox_enabled:
+            auxiliary_jobs.append(_Maintenance("memory_outbox", outbox, interval=0.5))
+        if settings.batch_enabled:
+            auxiliary_jobs.append(_Maintenance("batch_coordinator", coordinate_batches, interval=1.0))
+        title_job_task = asyncio.create_task(_title_processor_loop(process_title_generation, owner=registration_id))
+
+    async def stop_auxiliary() -> None:
+        # Cancellation reaches only the scheduling loops; admitted steps finish in flight.
+        nonlocal title_job_task
+        for job in auxiliary_jobs:
+            await job.stop()
+        if title_job_task is not None:
+            title_job_task.cancel()
+            await asyncio.gather(title_job_task, return_exceptions=True)
+            title_job_task = None
 
     running_loop = asyncio.get_running_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -300,36 +381,58 @@ async def serve() -> None:
             pass
 
     drain_recorded = False
+    registration_missing = False
     drain_overdue_logged = False
+    ack_pending_logged = False
     try:
         while True:
             now = running_loop.time()
-            for job in maintenance:
-                job.tick(now)
+            heartbeat.tick(now)
             if loop.draining.is_set():
                 if not drain_recorded:
-                    drain_recorded = True
                     try:
-                        await loop.mark_draining()
+                        drain_recorded = True
+                        registration_missing = not await loop.mark_draining()
                     except Exception:
+                        drain_recorded = False
                         logger.error("worker drain registration failed")
                 if not loop.active:
-                    break
+                    await stop_auxiliary()
+                    if not drain_recorded:
+                        await asyncio.sleep(1.0)
+                        continue
+                    if registration_missing:
+                        break
+                    try:
+                        if await loop.acknowledge_drain():
+                            logger.info("worker drain acknowledged")
+                            break
+                    except Exception:
+                        logger.error("worker drain acknowledgement failed")
+                    if not ack_pending_logged:
+                        ack_pending_logged = True
+                        logger.warning("worker drain waiting for live leases to clear")
+                    await asyncio.sleep(1.0)
+                    continue
                 if loop.drain_overdue() and not drain_overdue_logged:
                     # Overdue drain retains leases; indeterminate calls are never force-reassigned.
                     drain_overdue_logged = True
                     logger.warning("worker drain overdue active=%d", len(loop.active))
                 await asyncio.wait(set(loop.active.values()), timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
                 continue
+            for job in auxiliary_jobs:
+                job.tick(now)
             if loop.free_slots < 1:
                 await asyncio.wait(set(loop.active.values()), timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
                 continue
             try:
-                recovered_run_ids = await recover_stale_runs(owner=owner)
+                recovered_run_ids = await recover_stale_runs(owner=owner, registration_id=registration_id)
             except Exception:
                 logger.warning("stale durable chat run recovery failed")
                 recovered_run_ids = []
-            run_ids = list(dict.fromkeys([*recovered_run_ids, *(await _next_run_ids(loop.free_slots))]))
+            candidates = await _next_run_ids(loop.free_slots, registration_id=registration_id,
+                                             hint_keys=loop.hint_keys)
+            run_ids = list(dict.fromkeys([*recovered_run_ids, *candidates]))
             if run_ids:
                 logger.info("worker run candidates discovered count=%d", len(run_ids))
             if not run_ids:
@@ -339,10 +442,8 @@ async def serve() -> None:
                 loop.launch(run_id)
     finally:
         logger.info("worker shutdown started active=%d draining=%s", len(loop.active), loop.draining.is_set())
-        for job in maintenance:
-            await job.stop()
-        title_job_task.cancel()
-        await asyncio.gather(title_job_task, return_exceptions=True)
+        await stop_auxiliary()
+        await heartbeat.stop()
         if loop.active:
             await asyncio.gather(*loop.active.values(), return_exceptions=True)
         from lumen.db import close_db

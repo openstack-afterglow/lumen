@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
 
-from lumen_sdk import Client
+from lumen_sdk import AsyncClient, Client
 
 
 def test_client_uses_api_key_and_shared_json_routes():
@@ -88,3 +89,93 @@ def test_client_forwards_context_preview_and_compaction_routes():
         "model_id": 3,
         "expected_context_revision": "revision-1",
     }
+
+
+def _batch_handler(requests: list[httpx.Request]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        status = 202 if request.method == "POST" else 200
+        return httpx.Response(status, json={
+            "raw_path": request.url.raw_path.decode().split("?")[0],
+            "query": dict(request.url.params),
+        })
+
+    return handler
+
+
+def _assert_batch_requests(requests: list[httpx.Request]) -> None:
+    assert [(request.method, request.url.raw_path.decode().split("?")[0]) for request in requests] == [
+        ("POST", "/v1/chat/batches"),
+        ("GET", "/v1/chat/batches"),
+        ("GET", "/v1/chat/batches/b%2F1"),
+        ("GET", "/v1/chat/batches/b%2F1/items"),
+        ("POST", "/v1/chat/batches/b%2F1/cancel"),
+    ]
+    create = requests[0]
+    assert create.headers["idempotency-key"] == "batch-key-1"
+    assert json.loads(create.content) == {
+        "items": [{"custom_id": "a", "operation": "chat.completions", "body": {"model": "m", "messages": []}}],
+        "completion_window": "24h",
+    }
+    assert dict(requests[1].url.params) == {"limit": "5", "after": "cursor"}
+    assert dict(requests[3].url.params) == {"after": "100", "limit": "10"}
+    assert "idempotency-key" not in requests[4].headers
+    assert all(request.headers["authorization"] == "Bearer sk-afgl-test" for request in requests)
+
+
+_ITEMS = [{"custom_id": "a", "operation": "chat.completions", "body": {"model": "m", "messages": []}}]
+
+
+def test_client_native_batch_routes():
+    requests: list[httpx.Request] = []
+    with Client("https://lumen.example", "sk-afgl-test", transport=httpx.MockTransport(_batch_handler(requests))) as client:
+        assert client.create_batch(idempotency_key="batch-key-1", items=_ITEMS, completion_window="24h")["raw_path"] == "/v1/chat/batches"
+        assert client.list_batches(limit=5, after="cursor", ignored=None)["query"] == {"limit": "5", "after": "cursor"}
+        client.get_batch("b/1")
+        assert client.list_batch_items("b/1", after=100, limit=10)["raw_path"] == "/v1/chat/batches/b%2F1/items"
+        client.cancel_batch("b/1")
+    _assert_batch_requests(requests)
+
+
+def test_async_client_shares_routes_and_returns_awaitables():
+    requests: list[httpx.Request] = []
+
+    async def scenario() -> None:
+        transport = httpx.MockTransport(_batch_handler(requests))
+        async with AsyncClient("https://lumen.example/", "sk-afgl-test", transport=transport) as client:
+            created = await client.create_batch(idempotency_key="batch-key-1", items=_ITEMS, completion_window="24h")
+            assert created["raw_path"] == "/v1/chat/batches"
+            await client.list_batches(limit=5, after="cursor")
+            await client.get_batch("b/1")
+            await client.list_batch_items("b/1", after=100, limit=10)
+            await client.cancel_batch("b/1")
+
+    asyncio.run(scenario())
+    _assert_batch_requests(requests)
+
+
+def test_async_client_returns_bytes_and_streams_lines():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/audio/speech":
+            assert request.headers["idempotency-key"] == "speech-key"
+            return httpx.Response(200, content=b"RIFFaudio")
+        if request.url.raw_path == b"/v1/assets/a%2F1/download":
+            return httpx.Response(200, content=b"\x89PNG")
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, content=b"data: first\n\ndata: [DONE]\n")
+        return httpx.Response(404, json={"detail": "not found"})
+
+    async def scenario() -> None:
+        async with AsyncClient("https://lumen.example", "sk-afgl-test", transport=httpx.MockTransport(handler)) as client:
+            assert await client.speech(idempotency_key="speech-key", model_id=1, input="hi", voice="alloy") == b"RIFFaudio"
+            assert await client.download_asset("a/1") == b"\x89PNG"
+            lines = [line async for line in client.openai_chat_completions(model="gpt-4", stream=True)]
+            assert lines == ["data: first", "", "data: [DONE]"]
+            try:
+                await client.get_batch("missing")
+            except httpx.HTTPStatusError as exc:
+                assert exc.response.status_code == 404
+            else:
+                raise AssertionError("HTTP errors must raise")
+
+    asyncio.run(scenario())

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from dataclasses import dataclass
 from decimal import Decimal
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumen.config import get_settings
 from lumen.crypto import encrypt_chat_content
@@ -46,6 +48,16 @@ from .errors import (
     DurableRunProviderResultUnknown,
 )
 from .lifecycle import _cancel_requested, _require_owned_running_lease
+from .media import (
+    IO_BLOCKED,
+    MediaAuthorizationRevoked,
+    authorize_media_in_transaction,
+    confirmed_media_rejection,
+    lock_media_run_for_io,
+    lock_media_source_in_transaction,
+    media_io_allowed,
+    validate_batch_media_io_in_transaction,
+)
 
 _MAX_AUDIO_BYTES = 25 * 1024 * 1024
 _MAX_DURATION_MS = 30 * 60 * 1000
@@ -166,15 +178,27 @@ def _bill(pricing: dict, *, kind: str, usage: dict, model_name: str) -> tuple[Us
     return cost, None, [component]
 
 
-async def admit_audio_run(request: dict, *, project_id: str, user_id: str, client_request_id: str,
-                          source: str = "web", api_key_id: int | None = None):
-    from .admission import _lock_run_configurations, existing_run_for_intent
+@dataclass(frozen=True)
+class PreparedAudioRun:
+    payload: dict
+    capability_snapshot: dict
+    pricing_snapshot: dict
+    required_scopes: tuple[str, ...]
+    source_asset_id: str | None
+    project_id: str
+    user_id: str
 
+
+async def prepare_audio_run(request: dict, *, project_id: str, user_id: str,
+                            source: str = "web", api_key_id: int | None = None,
+                            operation: str | None = None,
+                            required_scopes: tuple[str, ...] | None = None) -> PreparedAudioRun:
+    """Freeze speech/transcription without inference or downloading source bytes."""
+    if operation is not None:
+        if operation not in {"audio.speech", "audio.transcriptions"}:
+            raise DurableRunInputError("unsupported audio operation")
+        request = {**request, "kind": "tts" if operation == "audio.speech" else "stt"}
     intent = _intent(request)
-    previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
-        client_request_id=client_request_id, intent=intent, conversation_id=None)
-    if previous is not None:
-        return previous
     kind = intent["kind"]
     model_id, provider_id = intent["model_id"], intent["provider_id"]
     if not isinstance(model_id, str) or not model_id or (provider_id is not None and not isinstance(provider_id, (str, int))):
@@ -218,48 +242,92 @@ async def admit_audio_run(request: dict, *, project_id: str, user_id: str, clien
         duration_ms = _duration(asset)
         source_limit = (audio_transport._MAX_GEMINI_INLINE_BYTES if route["provider_type"] == "gemini"
                         else audio_transport._MAX_INPUT_BYTES)
-        if asset["size_bytes"] > source_limit or asset["mime_type"] not in audio_transport._INPUT_FORMATS:
+        if asset["status"] != "clean" or asset["size_bytes"] > source_limit or asset["mime_type"] not in audio_transport._INPUT_FORMATS:
             raise DurableRunInputError("source audio exceeds provider input limits")
     await credit.precheck(user_id, project_id, api_key_id)
     per_usd = Decimal(str(get_settings().chat_credit_per_usd))
     margin = Decimal(str(route["margin_multiplier"]))
     pricing = _freeze_pricing(route, kind=kind, duration_ms=duration_ms, input_text=intent.get("input"), margin=margin, per_usd=per_usd)
+    if kind == "stt":
+        pricing["max_source_bytes"] = source_limit
     bound = credit.credits_for_cost(_reservation_usd(pricing), margin, per_usd)
     if bound <= 0 or bound >= Decimal("10000000000"):
         raise DurableRunInputError("audio credit reservation is invalid")
+    pricing["bound_credits"] = format(bound, "f")
     capability = {key: route[key] for key in ("provider_id", "model_id", "provider_name", "model_name", "model_kind", "config_version_hash")}
     capability["effective_features"] = {}
-    factory = _factory()
+    scopes = required_scopes or ("native:audio:write", *(("native:assets:read",) if kind == "stt" else ()))
+    return PreparedAudioRun(intent, capability, json.loads(json.dumps(pricing)), scopes,
+                            intent.get("input_asset_id"), project_id, user_id)
+
+
+async def persist_audio_run_in_transaction(
+    session: AsyncSession, prepared: PreparedAudioRun, *, project_id: str, user_id: str,
+    client_request_id: str, source: str = "web", api_key_id: int | None = None,
+    workload_class: str | None = None, batch_id: str | None = None,
+) -> ChatRun:
+    """Atomically bind a finite request in the caller's session; never commit, hold credit or wake.
+
+    Default class is ``online_media``; a Batch caller passes ``workload_class="batch"``
+    with its locked ``batch_id``. The pool is resolved from persisted configuration.
+    """
+    from lumen.services.worker_routing import resolve_worker_route
+
+    from .admission import _lock_run_configurations
+
+    if (prepared.project_id, prepared.user_id) != (project_id, user_id):
+        raise DurableRunInputError("prepared audio owner changed")
+    intent, capability, pricing = prepared.payload, prepared.capability_snapshot, prepared.pricing_snapshot
+    kind = intent["kind"]
+    existing = (await session.execute(select(ChatRun).where(ChatRun.project_id == project_id,
+        ChatRun.user_id == user_id, ChatRun.client_request_id == client_request_id)
+        .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    if existing is not None:
+        if existing.request_fingerprint != _fingerprint(intent):
+            raise DurableRunConflict("idempotency_key_reused_with_different_intent")
+        return existing
+    route = await resolve_worker_route(session, run_kind=kind, workload_class=workload_class, batch_id=batch_id)
+    await _lock_run_configurations(session, capability, model_name=capability["model_name"])
+    await authorize_media_in_transaction(session, user_id=user_id, project_id=project_id,
+        api_key_id=api_key_id, required_scopes=prepared.required_scopes)
+    run = ChatRun(id=str(uuid.uuid4()), run_scope="audio", run_kind=kind, project_id=project_id,
+        user_id=user_id, model_name=capability["model_name"], source=source, api_key_id=api_key_id,
+        workload_class=route.workload_class, worker_pool_id=route.worker_pool_id, batch_id=batch_id,
+        client_request_id=client_request_id, request_fingerprint=_fingerprint(intent), fingerprint_version=1,
+        execution_protocol_version=1, capability_snapshot=capability, pricing_snapshot=pricing,
+        request_payload=encrypt_chat_content(json.dumps({**intent, "execution_protocol_version": 1,
+                                                       "required_scopes": list(prepared.required_scopes)})),
+        status="queued", last_seq=0, current_ordinal=0)
+    session.add(run)
+    if prepared.source_asset_id is not None:
+        asset = await lock_media_source_in_transaction(session, asset_id=prepared.source_asset_id, user_id=user_id,
+            project_id=project_id, run_kind=kind, pricing=pricing, batch_id=batch_id)
+        session.add(ChatRunAsset(run_id=run.id, asset_id=asset.id, purpose="input"))
+    session.add(ChatRunProvider(run_id=run.id, purpose="executor", provider_id=capability["provider_id"],
+        model_id=capability["model_id"], provider_label=capability["provider_name"],
+        model_label=capability["model_name"], config_version_hash=capability["config_version_hash"]))
+    await append_event(session, run, _event(run, "run.started", {"conversation_id": None,
+        "temp_thread_id": None, "model_name": run.model_name, "effective_features": {}, "run_kind": kind}))
+    await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+    return run
+
+
+async def admit_audio_run(request: dict, *, project_id: str, user_id: str, client_request_id: str,
+                          source: str = "web", api_key_id: int | None = None,
+                          required_scopes: tuple[str, ...] | None = None):
+    from .admission import existing_run_for_intent
+
+    intent = _intent(request)
+    previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
+        client_request_id=client_request_id, intent=intent, conversation_id=None)
+    if previous is not None:
+        return previous
+    prepared = await prepare_audio_run(request, project_id=project_id, user_id=user_id, source=source,
+                                       api_key_id=api_key_id, required_scopes=required_scopes)
     try:
-        async with factory() as session, session.begin():
-            existing = (await session.execute(select(ChatRun).where(ChatRun.project_id == project_id,
-                ChatRun.user_id == user_id, ChatRun.client_request_id == client_request_id).with_for_update())).scalar_one_or_none()
-            if existing is not None:
-                if existing.request_fingerprint != _fingerprint(intent):
-                    raise DurableRunConflict("idempotency_key_reused_with_different_intent")
-                return descriptor(existing)
-            await _lock_run_configurations(session, capability, model_name=route["model_name"])
-            run = ChatRun(id=str(uuid.uuid4()), run_scope="audio", run_kind=kind, project_id=project_id,
-                user_id=user_id, model_name=route["model_name"], source=source, api_key_id=api_key_id,
-                client_request_id=client_request_id, request_fingerprint=_fingerprint(intent), fingerprint_version=1,
-                execution_protocol_version=1, capability_snapshot=capability, pricing_snapshot=pricing,
-                request_payload=encrypt_chat_content(json.dumps({**intent, "execution_protocol_version": 1})),
-                status="queued", last_seq=0, current_ordinal=0)
-            session.add(run)
-            if kind == "stt":
-                asset = (await session.execute(select(ChatAsset).where(ChatAsset.id == intent["input_asset_id"],
-                    ChatAsset.user_id == user_id, ChatAsset.project_id == project_id,
-                    ChatAsset.status == "clean").with_for_update())).scalar_one_or_none()
-                if asset is None or _duration({"mime_type": asset.mime_type, "size_bytes": asset.size_bytes,
-                                               "media_metadata": asset.media_metadata}) != duration_ms:
-                    raise DurableRunInputError("source audio changed before admission")
-                session.add(ChatRunAsset(run_id=run.id, asset_id=asset.id, purpose="input"))
-            session.add(ChatRunProvider(run_id=run.id, purpose="executor", provider_id=route["provider_id"],
-                model_id=route["model_id"], provider_label=route["provider_name"],
-                model_label=route["model_name"], config_version_hash=route["config_version_hash"]))
-            await append_event(session, run, _event(run, "run.started", {"conversation_id": None,
-                "temp_thread_id": None, "model_name": run.model_name, "effective_features": {}, "run_kind": kind}))
-            await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+        async with _factory()() as session, session.begin():
+            run = await persist_audio_run_in_transaction(session, prepared, project_id=project_id, user_id=user_id,
+                client_request_id=client_request_id, source=source, api_key_id=api_key_id)
             created = descriptor(run)
     except IntegrityError:
         previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
@@ -281,17 +349,21 @@ def _duration(asset: dict) -> int:
     return ms
 
 
-async def _read_source(asset_id: str, *, user_id: str, project_id: str, expected_ms: int) -> tuple[bytes, str]:
+async def _read_source(asset_id: str, *, user_id: str, project_id: str, expected_ms: int,
+                       max_bytes: int = _MAX_AUDIO_BYTES, run_id: str | None = None) -> tuple[bytes, str]:
     row = await assets.get_asset(asset_id=asset_id, user_id=user_id, project_id=project_id)
-    if row["status"] != "clean" or _duration(row) != expected_ms:
+    # Only a Batch run's accepted input pin survives a later delete; online runs need clean.
+    if row["status"] not in ({"clean", "deleting"} if run_id is not None else {"clean"}) or (
+            _duration(row) != expected_ms or row["size_bytes"] > max_bytes):
         raise DurableRunInputError("source audio changed")
-    opened = await assets.open_download(asset_id=asset_id, user_id=user_id, project_id=project_id)
+    opened = (await assets.open_run_input_download(asset_id=asset_id, run_id=run_id, user_id=user_id, project_id=project_id)
+              if run_id is not None else await assets.open_download(asset_id=asset_id, user_id=user_id, project_id=project_id))
     if opened.size_bytes != row["size_bytes"] or opened.mime_type != row["mime_type"]:
         await asyncio.to_thread(opened.body.close)
         raise DurableRunInputError("source audio changed")
     data = bytearray()
     async for chunk in opened.chunks():
-        if len(data) + len(chunk) > _MAX_AUDIO_BYTES:
+        if len(data) + len(chunk) > max_bytes:
             raise DurableRunInputError("source audio exceeds size limit")
         data.extend(chunk)
     if len(data) != opened.size_bytes:
@@ -303,18 +375,19 @@ async def _start(run_id: str, *, owner: str, bound: Decimal, kind: str) -> str:
     async def transaction():
         async with _factory()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-            run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
-                .with_for_update().execution_options(populate_existing=True))).scalar_one()
-            _require_owned_running_lease(run, owner)
+            run, blocked = await lock_media_run_for_io(session, run_id, owner=owner)
             segment = await prepare_segment(session, run, segment_id=f"{kind}:1", ordinal=1, endpoint=f"audio_{kind}")
             await session.flush()
             if segment.status == "completed":
                 return "completed"
             if segment.status != "prepared":
                 return "unknown"
-            if run.cancel_requested_at is not None:
-                return "canceled"
-            await credit.reserve_media_credit_in_transaction(session, user_id=run.user_id,
+            if blocked is not None:
+                return blocked
+            await validate_batch_media_io_in_transaction(session, run)
+            if "bound_credits" in run.pricing_snapshot and bound != Decimal(run.pricing_snapshot["bound_credits"]):
+                raise DurableRunInputError("audio credit reservation changed")
+            await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id,
                 project_id=run.project_id, api_key_id=run.api_key_id, bound=bound)
             session.add(ChatModelCallReservation(run_id=run.id, segment_id=f"{kind}:1", bound_credits=bound, status="reserved"))
             run.reserved_credits = bound
@@ -430,9 +503,10 @@ async def _execute(run_id: str, *, owner: str, payload: dict, capability_snapsho
         return True
     try:
         if persisted != "completed":
-            if await _cancel_requested(run_id):
+            blocked, is_batch = await media_io_allowed(run_id, owner=owner)
+            if blocked is not None:
                 await _finish(run_id, status="canceled", message_id=None, owner=owner,
-                    error_code="canceled", safe_message="audio run canceled")
+                    error_code=blocked, safe_message="audio run canceled")
                 return True
             route = await routing.resolve_model_snapshot(capability_snapshot)
             if route is None:
@@ -449,20 +523,38 @@ async def _execute(run_id: str, *, owner: str, payload: dict, capability_snapsho
             source = None
             if kind == "stt":
                 source = await _read_source(payload["input_asset_id"], user_id=payload["user_id"],
-                    project_id=payload["project_id"], expected_ms=pricing_snapshot["max_duration_ms"])
+                    project_id=payload["project_id"], expected_ms=pricing_snapshot["max_duration_ms"],
+                    max_bytes=(audio_transport._MAX_GEMINI_INLINE_BYTES if route["provider_type"] == "gemini"
+                               else audio_transport._MAX_INPUT_BYTES), run_id=run_id if is_batch else None)
             bound = credit.credits_for_cost(_reservation_usd(pricing_snapshot),
                 Decimal(pricing_snapshot["margin_multiplier"]), Decimal(pricing_snapshot["credit_per_usd"]))
             state = await _start(run_id, owner=owner, bound=bound, kind=kind)
-            if state == "canceled":
+            if state in IO_BLOCKED:
                 await _finish(run_id, status="canceled", message_id=None, owner=owner,
-                    error_code="canceled", safe_message="audio run canceled")
+                    error_code=state, safe_message="audio run canceled")
                 return True
             if state == "unknown":
                 raise DurableRunProviderResultUnknown("audio provider result cannot be replayed")
             if state == "started":
+                try:
+                    if kind == "tts":
+                        speech = await audio_transport.generate_speech(route, text=payload["input"],
+                            voice=payload["voice"], format=payload["response_format"])
+                    else:
+                        data, mime = source
+                        granularities = payload.get("timestamp_granularities")
+                        # Untimed runs keep the legacy transport call exactly.
+                        timing = {"timestamp_granularities": granularities} if granularities else {}
+                        transcription = await audio_transport.transcribe_audio(route, data=data, mime_type=mime,
+                            language=payload.get("language"), prompt=payload.get("prompt"), **timing)
+                except audio_transport.AudioTransportError as exc:
+                    # Batch only: a confirmed refusal settles at zero; anything else stays unknown.
+                    if not is_batch or confirmed_media_rejection(exc) is None:
+                        raise
+                    await _finish(run_id, status="failed", message_id=None, owner=owner,
+                        error_code="provider_rejected", safe_message="upstream provider rejected the request")
+                    return True
                 if kind == "tts":
-                    speech = await audio_transport.generate_speech(route, text=payload["input"],
-                        voice=payload["voice"], format=payload["response_format"])
                     data, mime, tokens = speech.data, speech.mime_type, speech.usage
                     usage = {"tokens": tokens.as_usage_dict() if tokens is not None else None}
                     if pricing_snapshot.get("billing_basis") == "characters":
@@ -474,12 +566,6 @@ async def _execute(run_id: str, *, owner: str, payload: dict, capability_snapsho
                     duration_ms = _duration({**stored, "media_metadata": stored.get("media_metadata")})
                     result = {"asset_id": stored["id"]}
                 else:
-                    data, mime = source
-                    granularities = payload.get("timestamp_granularities")
-                    # Untimed runs keep the legacy transport call exactly.
-                    timing = {"timestamp_granularities": granularities} if granularities else {}
-                    transcription = await audio_transport.transcribe_audio(route, data=data, mime_type=mime,
-                        language=payload.get("language"), prompt=payload.get("prompt"), **timing)
                     text, tokens = transcription.text, transcription.usage
                     usage = {"duration_ms": pricing_snapshot["max_duration_ms"],
                              "tokens": tokens.as_usage_dict() if tokens is not None else None}
@@ -502,6 +588,13 @@ async def _execute(run_id: str, *, owner: str, payload: dict, capability_snapsho
         canceled = await _cancel_requested(run_id)
         await _finish(run_id, status="canceled" if canceled else "completed", message_id=None, owner=owner,
             error_code="canceled" if canceled else None, safe_message="audio run canceled" if canceled else None)
+    except MediaAuthorizationRevoked:
+        # Raised before any reservation or provider I/O committed: definite, not unknown.
+        try:
+            await _finish(run_id, status="failed", message_id=None, owner=owner,
+                error_code="api_key_unauthorized", safe_message="audio request is no longer authorized")
+        except Exception:
+            logger.exception("audio run finalization deferred run_id=%s", run_id)
     except Exception:
         logger.exception("durable audio execution failed run_id=%s", run_id)
         try:

@@ -30,6 +30,11 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _default_workload_classes() -> list[str]:
+    """Legacy fixed workers serve text and media; managed callers supply their pool's singleton."""
+    return ["online_text", "online_media"]
+
+
 class ChatRuntimePool(Base):
     """Operator-declared capacity pool; configuration is synced, never user-editable."""
 
@@ -39,6 +44,7 @@ class ChatRuntimePool(Base):
     deployment_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     name: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     role: Mapped[str] = mapped_column(VARCHAR(10), nullable=False)
+    workload_class: Mapped[str | None] = mapped_column(VARCHAR(20))
     backend: Mapped[str] = mapped_column(VARCHAR(10), nullable=False)
     enabled: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
     cloud_profile_id: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
@@ -46,8 +52,19 @@ class ChatRuntimePool(Base):
     region_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     image_ref: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
     profile_digest: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    guest_profile_id: Mapped[str | None] = mapped_column(VARCHAR(190))
+    guest_profile_digest: Mapped[str | None] = mapped_column(CHAR(64))
     min_replicas: Mapped[int] = mapped_column(INT, nullable=False, default=0)
     max_replicas: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    max_surge: Mapped[int] = mapped_column(INT, nullable=False, default=1, server_default="1")
+    desired_replicas: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    ready_replicas: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    provisioning_replicas: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    draining_replicas: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    queued_count: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    oldest_queued_seconds: Mapped[int | None] = mapped_column(INT)
+    last_scale_reason: Mapped[str | None] = mapped_column(VARCHAR(40))
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     slots_per_worker: Mapped[int] = mapped_column(INT, nullable=False, default=1)
     target_wait_seconds: Mapped[int] = mapped_column(INT, nullable=False, default=10)
     boot_timeout_seconds: Mapped[int] = mapped_column(INT, nullable=False, default=600)
@@ -64,6 +81,8 @@ class ChatRuntimePool(Base):
     low_demand_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     high_demand_samples: Mapped[int] = mapped_column(INT, nullable=False, default=0)
     service_time_estimate_ms: Mapped[int] = mapped_column(INT, nullable=False, default=30_000)
+    service_time_cursor_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    service_time_cursor_id: Mapped[str | None] = mapped_column(CHAR(36))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
@@ -72,6 +91,9 @@ class ChatRuntimePool(Base):
         CheckConstraint("role IN ('api','worker','sandbox')", name="ck_runtime_pool_role"),
         CheckConstraint("backend IN ('nova','zun')", name="ck_runtime_pool_backend"),
         CheckConstraint("min_replicas >= 0 AND max_replicas >= min_replicas", name="ck_runtime_pool_replicas"),
+        CheckConstraint(
+            "workload_class IN ('online_text','online_media','batch')", name="ck_runtime_pool_workload_class"
+        ),
     )
 
 
@@ -98,13 +120,31 @@ class ChatRuntimeResource(Base):
     port: Mapped[int | None] = mapped_column(INT)
     image_ref: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
     policy_digest: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    guest_profile_id: Mapped[str | None] = mapped_column(VARCHAR(190))
+    guest_profile_digest: Mapped[str | None] = mapped_column(CHAR(64))
     bootstrap_token_hash: Mapped[str | None] = mapped_column(CHAR(64))
     bootstrap_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     certificate_fingerprint: Mapped[str | None] = mapped_column(CHAR(64))
+    certificate_not_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pending_certificate_fingerprint: Mapped[str | None] = mapped_column(CHAR(64))
+    pending_certificate_pem: Mapped[str | None] = mapped_column(MEDIUMTEXT)
+    pending_certificate_not_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pending_certificate_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    previous_certificate_fingerprint: Mapped[str | None] = mapped_column(CHAR(64))
+    previous_certificate_valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    renewal_request_id: Mapped[str | None] = mapped_column(CHAR(36))
+    renewal_csr_hash: Mapped[str | None] = mapped_column(CHAR(64))
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active_slots: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    idle_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accepting: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True, server_default="1")
+    drain_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    drain_ack_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    drain_reason: Mapped[str | None] = mapped_column(VARCHAR(100))
+    api_counter_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    api_counter_snapshot_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ingress_member_id: Mapped[str | None] = mapped_column(VARCHAR(190))
     failure_code: Mapped[str | None] = mapped_column(VARCHAR(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
@@ -157,19 +197,31 @@ class ChatWorkerRegistration(Base):
     certificate_fingerprint: Mapped[str | None] = mapped_column(CHAR(64))
     pool_id: Mapped[str | None] = mapped_column(CHAR(36), ForeignKey("chat_runtime_pools.id", ondelete="SET NULL"))
     protocol_versions: Mapped[list] = mapped_column(JSON, nullable=False)
+    workload_classes: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=_default_workload_classes, server_default='["online_text", "online_media"]'
+    )
     plugin_digest: Mapped[str] = mapped_column(CHAR(64), nullable=False)
     schema_version: Mapped[int] = mapped_column(INT, nullable=False)
     capacity: Mapped[int] = mapped_column(INT, nullable=False)
     active_count: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    auxiliary_active: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
     accepting: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     draining: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
     drain_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    drain_ack_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
 
     __table_args__ = (
         Index("uq_worker_registration_boot", "worker_identity", "boot_id", unique=True),
         Index("idx_worker_registration_heartbeat", "accepting", "heartbeat_at"),
+        CheckConstraint("auxiliary_active >= 0", name="ck_worker_registration_auxiliary_active"),
+        CheckConstraint(
+            "JSON_TYPE(workload_classes) = 'ARRAY' AND JSON_LENGTH(workload_classes) > 0 "
+            "AND JSON_DEPTH(workload_classes) = 2 "
+            "AND JSON_CONTAINS('[\"online_text\",\"online_media\",\"batch\"]', workload_classes) = 1",
+            name="ck_worker_registration_workload_classes",
+        ),
     )
 
 

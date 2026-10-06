@@ -1,0 +1,11 @@
+#!/bin/bash
+set -euo pipefail
+: "${DIB_LUMEN_STAGING:?Verified staging directory is required}"
+: "${DIB_LUMEN_SOURCE:?Artifact source directory is required}"
+: "${TMP_HOOKS_PATH:?DIB hook directory is required}"
+destination="$TMP_HOOKS_PATH/lumen-guest"
+mkdir -p "$destination"
+cp -a "$DIB_LUMEN_STAGING/packages" "$destination/packages"
+cp "$DIB_LUMEN_STAGING/image.tar" "$DIB_LUMEN_STAGING/image.json" "$destination/"
+cp "$DIB_LUMEN_SOURCE/guest-run.sh" "$DIB_LUMEN_SOURCE/guest-settings.py" \
+    "$DIB_LUMEN_SOURCE/lumen-guest.service" "$destination/"

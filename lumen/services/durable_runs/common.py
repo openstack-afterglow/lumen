@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from lumen_plugin_api.tools import AgentExecutionPolicy
+from sqlalchemy import select
 
 from lumen.crypto import decrypt_chat_content
 from lumen.db import get_session_factory, is_db_available
@@ -333,12 +334,23 @@ def _temporary_history_messages(history_ciphertext: str) -> list[dict[str, str]]
 
 
 async def wake_run(run_id: str) -> None:
-    """Best-effort post-commit wakeup; MySQL scanning remains authoritative."""
+    """Best-effort post-commit wakeup on the run's class/pool hint queue.
+
+    MySQL scanning remains authoritative; a hint never reaches a worker of another
+    class or pool, and API-owned realtime runs are never hinted to workers.
+    """
     try:
         from lumen.cache import _get_redis
+        from lumen.services import worker_routing
 
+        async with _factory()() as session:
+            route = (await session.execute(
+                select(ChatRun.workload_class, ChatRun.worker_pool_id).where(ChatRun.id == run_id)
+            )).one_or_none()
+        if route is None or route.workload_class not in worker_routing.WORKER_WORKLOAD_CLASSES:
+            return
         redis = await _get_redis()
-        await redis.lpush("afterglow:chat:runs", run_id)
+        await redis.lpush(worker_routing.run_hint_key(route.workload_class, route.worker_pool_id), run_id)
     except Exception:
         # A missed wakeup only adds up to the worker's bounded DB-poll delay.
         return

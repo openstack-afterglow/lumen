@@ -13,8 +13,10 @@ litellm 의 로컬 계산(token_counter/cost_per_token)만 쓰는 함수는 네�
 from __future__ import annotations
 
 import codecs
+import functools
 import json
 import logging
+import sys
 import uuid
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextvars import ContextVar
@@ -72,6 +74,70 @@ def direct_provider_route(provider_type: str | None, api_base: str | None) -> bo
     if provider_type not in _DIRECT_API_BASES:
         return False
     return api_base is None or api_base.rstrip("/") in _DIRECT_API_BASES[provider_type]
+
+
+# Provider types whose every Lumen transport layer can be pinned to exactly one
+# provider request: OpenAI-SDK retries are disabled with max_retries=0, the
+# LiteLLM wrapper with num_retries=0, and every LiteLLM httpx handler path gets a
+# client that never re-sends a POST. Other adapters are not proven single-attempt.
+_PROVIDER_ONCE_TYPES = frozenset({"openai", "anthropic", "gemini", "chatgpt"})
+
+
+def provider_once_supported(provider_type: str | None) -> bool:
+    """True when a durable call on this provider type can be held to one attempt."""
+    return provider_type in _PROVIDER_ONCE_TYPES
+
+
+@functools.cache
+def _single_attempt_handler_class(base: type) -> type:
+    class SingleAttemptHandler(base):
+        """``AsyncHTTPHandler`` that surfaces a connection error instead of re-sending.
+
+        The base ``post`` re-sends the same POST on a fresh connection after
+        ``RemoteProtocolError``/``ConnectError`` through this method, which can
+        duplicate an inference the provider already received.
+        """
+
+        async def single_connection_post_request(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            error = sys.exc_info()[1]
+            if error is None:
+                raise RuntimeError("single-attempt transport refused to re-send a provider request")
+            raise error
+
+    SingleAttemptHandler.__name__ = f"SingleAttempt{base.__name__}"
+    SingleAttemptHandler.__qualname__ = SingleAttemptHandler.__name__
+    return SingleAttemptHandler
+
+
+def single_attempt_http_handler(base: type | None = None, **kwargs: Any) -> Any:
+    """Return a fresh caller-owned single-attempt LiteLLM HTTP handler; close it after use."""
+    if base is None:
+        from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+        base = AsyncHTTPHandler
+    return _single_attempt_handler_class(base)(**kwargs)
+
+
+def _provider_once_params(
+    custom_llm_provider: str | None, api_base: str | None, *, protocol: Literal["chat", "responses"]
+) -> tuple[dict[str, Any], Any | None]:
+    """Retry-free LiteLLM kwargs plus an owned httpx handler when the path accepts one."""
+    if custom_llm_provider not in _PROVIDER_ONCE_TYPES - {"chatgpt"}:
+        raise ValueError("provider_once_unsupported")
+    params: dict[str, Any] = {"num_retries": 0, "max_retries": 0}
+    # Custom-base OpenAI chat uses the OpenAI SDK (max_retries=0) and rejects an
+    # httpx handler client; every other supported path runs on LiteLLM httpx.
+    if custom_llm_provider != "openai" or protocol == "responses" or direct_provider_route("openai", api_base):
+        handler = single_attempt_http_handler()
+        params["client"] = handler
+        return params, handler
+    return params, None
+
+
+async def _close_handler(handler: Any | None) -> None:
+    if handler is not None:
+        await handler.close()
 
 
 def bundled_cache_rates(model: str, provider_type: str | None, api_base: str | None) -> dict[str, Decimal | None]:
@@ -834,6 +900,7 @@ async def _subscription_completion(
     custom_llm_provider: str | None,
     tools: list[dict] | None,
     extra: dict | None,
+    provider_once: bool = False,
 ) -> Any:
     import litellm
 
@@ -864,6 +931,7 @@ async def _subscription_completion(
                 credential=credential,
                 stream=stream,
                 optional_params=optional_params,
+                **({"single_attempt": True} if provider_once else {}),
             )
             if stream:
                 return _guard_subscription_stream(result, provider_auth, fingerprint)
@@ -919,7 +987,14 @@ async def _subscription_completion(
         )
         if stream:
             params["stream_options"] = {"include_usage": True}
-        result = await litellm.acompletion(**params)
+        handler = None
+        if provider_once:
+            once_params, handler = _provider_once_params("anthropic", "https://api.anthropic.com", protocol="chat")
+            params.update(once_params)
+        try:
+            result = await litellm.acompletion(**params)
+        finally:
+            await _close_handler(handler)
         if stream:
             return _guard_subscription_stream(result, provider_auth, fingerprint)
         return result
@@ -1280,8 +1355,16 @@ async def acompletion(
     native_web_search: dict[str, Any] | None = None,
     extra: dict | None = None,
     provider_auth: ProviderAuthRef | None = None,
+    provider_once: bool = False,
 ) -> Any:
-    """비스트리밍 litellm 호출."""
+    """비스트리밍 litellm 호출.
+
+    ``provider_once`` (durable Batch) sends exactly one provider request: every
+    transport retry/re-send layer is disabled and unsupported adapters fail
+    before any network I/O.
+    """
+    if provider_once and not provider_once_supported(custom_llm_provider):
+        raise ValueError("provider_once_unsupported")
     merged_extra = _native_web_search_extra(extra, native_web_search, custom_llm_provider)
     if provider_auth is not None:
         if native_web_search is not None:
@@ -1296,6 +1379,7 @@ async def acompletion(
             custom_llm_provider=custom_llm_provider,
             tools=tools,
             extra=merged_extra,
+            provider_once=provider_once,
         )
     if _requires_subscription_auth(model, custom_llm_provider):
         raise ProviderSubscriptionError("subscription_auth_required", 502)
@@ -1328,7 +1412,14 @@ async def acompletion(
         tools=tools,
         extra=merged_extra,
     )
-    return await litellm.acompletion(**params)
+    handler = None
+    if provider_once:
+        once_params, handler = _provider_once_params(custom_llm_provider, api_base, protocol="chat")
+        params.update(once_params)
+    try:
+        return await litellm.acompletion(**params)
+    finally:
+        await _close_handler(handler)
 
 
 async def acompletion_stream(
@@ -1451,10 +1542,16 @@ async def aresponses(
     service_tier: str | None = None,
     safety_identifier: str | None = None,
     context_management: list[dict] | None = None,
+    provider_once: bool = False,
 ) -> Any:
-    """Call LiteLLM's native Responses transport without forwarding arbitrary request keys."""
+    """Call LiteLLM's native Responses transport without forwarding arbitrary request keys.
+
+    ``provider_once`` is nonstreaming only and sends exactly one provider request.
+    """
     if provider_auth is not None or _requires_subscription_auth(model, custom_llm_provider):
         raise ProviderSubscriptionError("subscription_protocol_unsupported", 400)
+    if provider_once and (stream or custom_llm_provider == "chatgpt" or not provider_once_supported(custom_llm_provider)):
+        raise ValueError("provider_once_unsupported")
     import litellm
 
     params: dict[str, Any] = {
@@ -1487,7 +1584,14 @@ async def aresponses(
         "context_management": context_management,
     }
     params.update({key: value for key, value in optional.items() if value is not None})
-    return await litellm.aresponses(**params)
+    handler = None
+    if provider_once:
+        once_params, handler = _provider_once_params(custom_llm_provider, api_base, protocol="responses")
+        params.update(once_params)
+    try:
+        return await litellm.aresponses(**params)
+    finally:
+        await _close_handler(handler)
 
 
 async def aanthropic_messages(
