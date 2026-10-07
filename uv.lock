@@ -1490,7 +1490,7 @@ wheels = [
 
 [[package]]
 name = "lumen"
-version = "0.6.3"
+version = "0.6.5"
 source = { editable = "." }
 
 [package.optional-dependencies]

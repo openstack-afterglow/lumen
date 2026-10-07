@@ -171,6 +171,8 @@ claude
 
 Claude Code 2.1.278의 direct stream과 local `Bash` tool→native `tool_result` continuation을 격리된 실제 CLI process에서 확인했습니다. Lumen은 현재 client의 명시적 `context_management`와 `output_config`, native tool/thinking block, bounded `anthropic-*` protocol-header namespace를 보존합니다. Caller `Authorization`과 `x-api-key`는 provider credential로 전달하지 않습니다.
 
+Auto mode의 Claude Code는 server-side classifier review용 top-level `safeguards`와 `dangerous-tool-use-*` beta를 보냅니다. Lumen의 LiteLLM transport는 이를 upstream까지 전달할 수 없으므로 `400 invalid_request_error`(`safeguards: Extra inputs are not permitted`)로 거부하고, Claude Code는 같은 세션에서 두 값을 빼고 재시도한 뒤 자체 classifier를 일반 `/v1/messages` 호출로 실행합니다. 2026-10-07 실제 Claude Code 2.1.287과 2.1.292의 auto mode에서 400→재시도→classifier→`Bash`→최종 응답을 synthetic upstream으로 확인했습니다. Classifier 호출 model은 2.1.287이 session model, 2.1.292가 `claude-sonnet-5`였으므로 해당 model도 Lumen에서 활성이어야 합니다.
+
 Configured `/v1/claude-gateway` device routes는 Lumen custom protocol입니다. Current Claude Apps Gateway login은 administrator-managed `forceLoginGatewayUrl`, official `/protocol`, OIDC device authorization, refresh session을 요구하므로 이 custom route를 Claude Code `/login` 대체로 광고하지 않습니다. 기존 grant는 10분, custom credential은 24시간이고 one-time consume·fixed scopes·Redis/MariaDB fail-closed 보안 계약은 그대로 유지됩니다.
 
 ### 4.5 Codex CLI direct Responses provider
@@ -399,7 +401,7 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
   - Streaming은 Anthropic event 이름과 body를 유지하고 약 15초 idle마다 `event: ping`을 보냅니다. OpenAI `[DONE]` sentinel로 변환하지 않습니다.
   - Legacy Claude gateway의 `/v1/claude-gateway/v1/messages`도 같은 SSE admission·요청 소유 cleanup을 사용합니다. `api_max_sse_connections` 포화 시 auth/schema validation 뒤, route resolution·provider 호출 전에 429와 `Retry-After: 1`을 반환하며 non-stream 요청은 SSE slot을 쓰지 않습니다. HTTP/SSE/WS reservation과 측정 load는 마지막 byte나 disconnect가 아니라 ASGI cleanup 완료 때 해제되므로, drain 중 settlement를 새 작업으로 오인하거나 guest를 조기 삭제하지 않습니다.
   - Gateway Messages의 실제 text delta도 first-text latency 표본에 포함되며 ping·tool event는 표본이 아닙니다. SSE 시작 전 reservation과 시작 후 measured SSE load는 별개입니다.
-* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르면 400 `provider_header_conflict`입니다. `model`의 transport prefix는 editable selector의 alias나 충돌 조건이 아닙니다. Request schema에 없는 필드는 422로 거부합니다.
+* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르면 400 `provider_header_conflict`입니다. `model`의 transport prefix는 editable selector의 alias나 충돌 조건이 아닙니다. Request schema에 없는 필드는 OpenAI 계열에서 422로 거부합니다. Anthropic Messages 계열은 Anthropic API와 같은 400 `invalid_request_error`로 각 필드를 `<field>: <reason>` 형식으로 명시하고 입력값을 되돌려 보내지 않습니다.
 
 ### 6.2 Output token budget
 
@@ -551,14 +553,14 @@ FastAPI 프레임워크 특성에 따라 HTTP 예외 발생 시 반환되는 JSO
 
 | Status Code | 원인 및 설명 |
 | --- | --- |
-| **400 Bad Request** | 둘 이상의 인증 헤더 동시 사용(동일 API key를 `X-API-Key`+`Authorization: Bearer`로 중복 전달한 경우는 제외), SSE 커서 불일치/손상 |
+| **400 Bad Request** | 둘 이상의 인증 헤더 동시 사용(동일 API key를 `X-API-Key`+`Authorization: Bearer`로 중복 전달한 경우는 제외), SSE 커서 불일치/손상, Anthropic Messages 계열(`/v1/messages`, `count_tokens`, legacy gateway) request schema 위반(`invalid_request_error`) |
 | **401 Unauthorized** | 인증 헤더 누락, 유효하지 않거나 만료된 API Key 또는 Keystone Token |
 | **402 Payment Required** | Native Completion 호출 시 당월 Credit Quota 초과 |
 | **403 Forbidden** | 요청에 필요한 Scope 부족, API Key의 Project ID와 `X-Project-Id` 불일치 |
 | **404 Not Found** | CHAT_API_HOSTS 미일치로 인한 은닉 404, 존재하지 않는 Conversation/Run ID |
 | **409 Conflict** | 동일 `Idempotency-Key`에 다른 Intent 전달, Key limit 수치 상충 |
 | **410 Gone** | SSE Event Cursor 만료 |
-| **422 Unprocessable Entity** | `Idempotency-Key`가 구문상 올바른 UUID 형식이 아님, Request body 검증 실패 |
+| **422 Unprocessable Entity** | `Idempotency-Key`가 구문상 올바른 UUID 형식이 아님, Request body 검증 실패(Anthropic Messages 계열 제외) |
 | **429 Too Many Requests** | Compat Completion 호출 시 당월 Credit Quota 초과 |
 | **502 Bad Gateway** | 업스트림 LLM Provider 네트워크/응답 오류 |
 | **503 Service Unavailable** | 요청 처리 시점에 DB 연결/스토어 장애가 발생한 경우. Worker 부재만으로는 503을 반환하지 않으며 수락된 작업은 Queued 상태로 유지됨 |
