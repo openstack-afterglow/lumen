@@ -52,6 +52,11 @@ def cache_mode(
     return CacheMode(enabled=not no_cache, refresh=refresh_cache)
 
 
+# Directory reads gate provider I/O; a stalled Keystone must surface as an
+# authority outage (503), never as an indefinitely parked worker or request.
+_KEYSTONE_ADMIN_TIMEOUT_SECONDS = 15
+
+
 def _get_admin_ks_client():
     from keystoneauth1 import session as ks_session
     from keystoneauth1.identity import v3
@@ -66,7 +71,7 @@ def _get_admin_ks_client():
         user_domain_name=settings.keystone_domain,
         project_domain_name=settings.keystone_domain,
     )
-    session = ks_session.Session(auth=auth, verify=settings.verify)
+    session = ks_session.Session(auth=auth, verify=settings.verify, timeout=_KEYSTONE_ADMIN_TIMEOUT_SECONDS)
     return ks_client.Client(session=session)
 
 

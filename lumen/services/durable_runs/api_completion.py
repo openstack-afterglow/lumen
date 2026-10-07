@@ -263,6 +263,7 @@ async def persist_api_completion_run_in_transaction(
     api_key_id: int | None = None,
     workload_class: str | None = "batch",
     batch_id: str | None = None,
+    allowed_scopes: frozenset[str] | None = None,
 ) -> ChatRun:
     """Bind a prepared request in the caller's transaction; never commit, hold credit or wake.
 
@@ -292,8 +293,11 @@ async def persist_api_completion_run_in_transaction(
     )
     await _lock_run_configurations(session, capability, model_name=capability["model_name"])
     try:
-        await authorize_api_key_in_transaction(session, api_key_id=api_key_id, user_id=user_id,
-                                               project_id=project_id, required_scopes=prepared.required_scopes)
+        if allowed_scopes is None:
+            await authorize_api_key_in_transaction(session, api_key_id=api_key_id, user_id=user_id,
+                                                   project_id=project_id, required_scopes=prepared.required_scopes)
+        elif not allowed_scopes.issuperset(prepared.required_scopes):
+            raise ApiKeyForbidden("required scope is not currently authorized")
     except ApiKeyForbidden as exc:
         raise DurableRunInputError("api_key_unauthorized") from exc
     except ApiKeyAuthorityUnavailable as exc:
