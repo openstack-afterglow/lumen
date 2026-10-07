@@ -163,13 +163,31 @@ app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(ApiAdmissionMiddleware, admission=api_admission)
 
 
+# Anthropic Messages clients act only on Anthropic-shaped request errors. Claude Code auto mode
+# adds a top-level `safeguards` field whose server-side review the LiteLLM transport cannot carry;
+# a 400 naming the field makes the client retry without it and classify locally. FastAPI's 422
+# envelope is not recognized and would echo the rejected input (local paths, permission rules).
+_ANTHROPIC_MESSAGE_PATHS = frozenset(
+    {
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/claude-gateway/v1/messages",
+        "/v1/claude-gateway/v1/messages/count_tokens",
+    }
+)
+
+
 @app.exception_handler(RequestValidationError)
-async def provider_request_validation_handler(request: Request, exc: RequestValidationError):
+async def request_validation_handler(request: Request, exc: RequestValidationError):
     if request.url.path == "/v1/admin/providers" or request.url.path.startswith("/v1/admin/providers/"):
         return JSONResponse(
             status_code=422,
             content={"detail": "프로바이더 요청 형식이 올바르지 않습니다"},
             headers={"Cache-Control": "no-store"},
+        )
+    if request.url.path in _ANTHROPIC_MESSAGE_PATHS:
+        return compat_anthropic.anthropic_error_response(
+            400, compat_anthropic.anthropic_validation_message(exc.errors())
         )
     return await request_validation_exception_handler(request, exc)
 

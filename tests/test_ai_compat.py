@@ -1914,8 +1914,64 @@ class TestAnthropicEndpoint:
             json={"model": "claude", "max_tokens": 0, "messages": [{"role": "user", "content": "hi"}]},
             headers=_H,
         )
-        assert missing.status_code == 422
-        assert negative.status_code == 422
+        assert missing.status_code == 400
+        assert missing.json() == {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "max_tokens: Field required"},
+        }
+        assert negative.status_code == 400
+        assert negative.json()["error"]["message"].startswith("max_tokens: ")
+
+    @pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+    async def test_claude_code_safeguards_get_named_400_without_echo(self, client, _auth, monkeypatch, path):
+        # Claude Code auto mode retries without `safeguards` (and classifies locally) only after an
+        # HTTP 400 whose message names the field; the former 422 ended every auto-mode session.
+        async def forbidden(**_kwargs):
+            raise AssertionError("provider must not be called")
+
+        monkeypatch.setattr(core, "complete_anthropic", forbidden)
+        monkeypatch.setattr(core, "count_anthropic_tokens", forbidden)
+        body = {
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "safeguards": [{"type": "dangerous_tool_use", "classifier_context": {"home_dir": "/Users/private-home"}}],
+        }
+        if path == "/v1/messages":
+            body["max_tokens"] = 16
+        response = await client.post(
+            path,
+            json=body,
+            headers={**_H, "anthropic-beta": "dangerous-tool-use-2026-09-03"},
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "safeguards: Extra inputs are not permitted"},
+        }
+        assert response.headers["cache-control"] == "no-store"
+        assert "/Users/private-home" not in response.text
+
+    async def test_many_unknown_fields_preserve_safeguards_rejection_without_inputs(self, client, _auth):
+        unknown = {f"unknown_{index}": "private-value" for index in range(2048)}
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "claude",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+                **unknown,
+                "safeguards": [{"classifier_context": {"home_dir": "/private/classifier-context"}}],
+            },
+            headers=_H,
+        )
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        fields = [part.split(":", 1)[0] for part in error["message"].split("; ")]
+        assert fields == [*unknown, "safeguards"]
+        assert "private-value" not in response.text
+        assert "/private/classifier-context" not in response.text
 
 
 class TestResponsesEndpoint:

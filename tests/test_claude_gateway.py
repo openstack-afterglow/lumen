@@ -294,6 +294,30 @@ async def test_gateway_count_tokens_does_not_require_generation_budget(client, g
     assert response.json() == {"input_tokens": 17}
 
 
+async def test_gateway_names_rejected_safeguards_in_anthropic_400(client, gateway_auth, monkeypatch):
+    async def forbidden(**_kwargs):
+        raise AssertionError("provider must not be called")
+
+    monkeypatch.setattr("lumen.api.claude_gateway.core.complete_anthropic", forbidden)
+    response = await client.post(
+        f"{_GATEWAY}/v1/messages",
+        headers={**_HEADERS, "anthropic-beta": "dangerous-tool-use-2026-09-03"},
+        json={
+            "model": "client-alias",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "safeguards": [{"type": "dangerous_tool_use", "classifier_context": {"home_dir": "/Users/private-home"}}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "safeguards: Extra inputs are not permitted"},
+    }
+    assert "/Users/private-home" not in response.text
+
+
 async def test_consumed_device_grant_requires_repair_after_lost_token_response(monkeypatch):
     now = datetime.now(UTC)
     row = ChatGatewayDeviceGrant(

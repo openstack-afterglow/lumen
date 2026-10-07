@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import aclosing
 from typing import Any
 
@@ -39,6 +39,8 @@ class AnthropicMessagesRequest(BaseModel):
     container: dict[str, Any] | None = None
     output_config: dict[str, Any] | None = None
 
+    # Closed on purpose: an unknown field such as Claude Code auto mode's `safeguards` is answered
+    # with an Anthropic 400 that names it (see lumen.main), so the client retries without it.
     model_config = {"extra": "forbid"}
 
 
@@ -104,6 +106,26 @@ def anthropic_error_response(status_code: int, message: str) -> JSONResponse:
         content=anthropic_error(status_code, message),
         headers={"Cache-Control": "no-store"},
     )
+
+
+def anthropic_validation_message(errors: Iterable[Mapping[str, Any]]) -> str:
+    """Name each rejected request field as the Anthropic API does, never echoing the input.
+
+    Claude Code recovers from a rejected capability only when a 400 names the field, e.g.
+    ``safeguards: Extra inputs are not permitted`` moves auto mode to its local classifier.
+    """
+    parts: list[str] = []
+    seen: set[str] = set()
+    for error in errors:
+        loc = [str(part) for part in error.get("loc", ())]
+        if len(loc) > 1 and loc[0] == "body":
+            loc = loc[1:]
+        message = str(error.get("msg") or "Invalid value")
+        text = f"{'.'.join(loc)}: {message}" if loc else message
+        if text not in seen:
+            seen.add(text)
+            parts.append(text)
+    return "; ".join(parts) or "Invalid request"
 
 
 def anthropic_protocol_headers(request: Request) -> dict[str, str]:

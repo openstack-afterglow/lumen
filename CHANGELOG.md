@@ -1,6 +1,20 @@
 # Changelog
 
-## 0.6.3 (unpublished candidate) — 2026-10-07
+## 0.6.4 (unpublished candidate; rollout pending) — 2026-10-07
+
+Changes since published stable `v0.6.3` at source commit `cadb6ac`. This patch adds the Claude Code safeguards compatibility fix; the existing 0.6.3 release scope is retained.
+
+**Release boundary:** Root manifest/runtime/lock and packaged Kolla API/worker/controller image defaults target `0.6.4`. Dependencies, SDK `0.2.1`, database plugin `0.1.1`, other plugins, sandbox and source-build/guest artifact pins remain unchanged. No new migration beyond 0.6.3 is introduced; previously published SQL and checksums remain immutable.
+
+**Operator/client contract:** After the 0.6.4 server rollout, no manual installer environment-variable additions are necessary for this fix. Existing endpoint/API key configuration is unchanged.
+
+**Candidate status:** New tag, wheel and multi-architecture image publication and production rollout remain pending. Fresh Python 3.12 contract gate passed (service 2,649, SDK 128, both Ruff checks); isolated MariaDB/Redis integration passed 272 and canonical Compose process-system passed 14. Real generated-settings Claude Code 2.1.292 completed named safeguards 400 → local classifier → harmless Bash tool continuation, and Codex 0.160 completed Responses over local verified TLS. Auth/provider fixtures were synthetic; no paid production or deployment acceptance is claimed by these local results. The 0.6.3 qualification counts below remain historical.
+
+- **Claude Code auto mode on compat Messages:** Request-schema rejections on `/v1/messages`, `/v1/messages/count_tokens` and the legacy gateway's same routes now return the Anthropic `400 invalid_request_error` envelope naming each field (for example `safeguards: Extra inputs are not permitted`) instead of FastAPI's `422 {detail}`, which Claude Code cannot recover from and which echoed the client's auto-mode classifier context (local paths, permission rules). Claude Code auto mode sends a top-level `safeguards` field with a `dangerous-tool-use-*` beta for server-side classifier review; the pinned LiteLLM 1.93 Anthropic transport can forward neither, so the schema stays closed and the named 400 makes the client drop both for the session and run its own classifier through ordinary Messages calls. No provider, billing, LiteLLM or migration change. Compat and gateway regressions failed before and pass after; installed Claude Code 2.1.287 reproduced the 422 against the unpatched route, and 2.1.287/2.1.292 auto mode completed 400→retry→local classifier→`Bash`→final answer against the fix with a synthetic upstream. This entry postdates the local qualification counts below.
+
+## 0.6.3 (published source) — 2026-10-07
+
+**Source status:** Published stable `v0.6.3` is source commit `cadb6acd70504c6b31f19e02c0e3bedc2f103166` (`cadb6ac`). The original preparation notes, release boundary and local qualification entries below are retained as historical 0.6.3 evidence, including their then-current candidate wording; they are not 0.6.4 qualification or production rollout receipts. No additional wheel/image publication or rollout receipts are asserted here.
 
 Changes since published stable `v0.6.2`. The ecosystem's explicit release-first deployment contract defaults to the next patch unless the user explicitly requests a minor/major version-up; this candidate is therefore `0.6.3` while preserving the complete additive Batch/Files, workload-routing, trusted-runtime and migrations 022–025 scope. Earlier focused counts below are historical implementation evidence, not fresh gates for this integrated candidate.
 
