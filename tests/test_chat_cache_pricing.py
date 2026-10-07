@@ -31,6 +31,8 @@ from lumen.services.tool_runtime import managed
 from lumen.services.tools import ToolContext
 from lumen.services.usage_breakdown import UsageBreakdown
 
+pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
+
 _MODEL = "anthropic/claude-sonnet-5"
 
 # One raw Anthropic Messages usage: a compaction iteration plus the message
@@ -927,7 +929,7 @@ class TestConfigFingerprint:
         monkeypatch.setattr(completion_api.credit, "apply_usage", apply_usage)
         result = await completion_api.complete_once(
             resolved=resolved, messages=[{"role": "user", "content": "hello"}],
-            user_id="u1", project_id="p1", api_key_id=1,
+            user_id="u1", project_id="p1", api_key_id=7,
             max_tokens=16, temperature=None,
         )
         wire = OpenAIChatResponse.model_validate(
@@ -946,7 +948,7 @@ class TestConfigFingerprint:
         monkeypatch.setattr(completion_api.litellm_client, "acompletion_stream", complete_stream)
         events = [event async for event in completion_api.complete_stream(
             resolved=resolved, messages=[{"role": "user", "content": "hello"}],
-            user_id="u1", project_id="p1", api_key_id=1,
+            user_id="u1", project_id="p1", api_key_id=7,
             max_tokens=16, temperature=None,
         )]
         wire_chunk = openai_api.usage_chunk(events[-1], cmpl_id="chatcmpl-test", created=1, model=model.model_name)

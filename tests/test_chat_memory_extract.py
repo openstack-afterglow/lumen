@@ -8,6 +8,8 @@ import pytest
 
 from lumen.services import memory_extract as me
 
+pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
+
 
 class _Msg:
     def __init__(self, content):

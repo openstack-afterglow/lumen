@@ -33,6 +33,7 @@ import httpx
 import openai
 import pytest
 from PIL import Image
+from system.fake_keystone import OWNER_TOKEN, PROJECT_ID
 
 if TYPE_CHECKING:
     # The SDK is installed only in the system test image; host contract runs only collect.
@@ -935,10 +936,24 @@ def test_openai_sdk_files_and_batches_chat_responses_images() -> None:
                   "images.generations": Counter({200: 1})},
     )
 
-    # Deleting an input of a terminal batch removes it from the public surface.
+    # Editor/write scopes cannot delete; use an explicitly attenuated destructive key.
     chat_input = submitted["chat"][0]
-    deleted = client.files.delete(chat_input.id)
-    assert deleted.id == chat_input.id and deleted.deleted is True
+    with pytest.raises(openai.PermissionDeniedError):
+        client.files.delete(chat_input.id)
+    assert client.files.retrieve(chat_input.id).id == chat_input.id
+    owner_headers = {"X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID}
+    with httpx.Client(base_url=conn["api_base_url"], timeout=30.0, trust_env=False) as owner:
+        issue = owner.post("/v1/api-keys", headers=owner_headers,
+                           json={"name": "system file delete", "scopes": ["compat:files:delete"]})
+        assert issue.status_code == 201, issue.text
+        issued = issue.json()
+        try:
+            with _openai_client({**conn, "api_key": issued["key"]}) as destructive:
+                deleted = destructive.files.delete(chat_input.id)
+                assert deleted.id == chat_input.id and deleted.deleted is True
+        finally:
+            revoked = owner.delete(f"/v1/api-keys/{issued['id']}", headers=owner_headers)
+            assert revoked.status_code in {200, 204}, revoked.text
     with pytest.raises(openai.NotFoundError):
         client.files.retrieve(chat_input.id)
 

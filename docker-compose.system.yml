@@ -186,6 +186,25 @@ services:
       start_period: 5s
       retries: 50
 
+  # Explicit synthetic directory boundary; no production auth fallback or host credentials.
+  fake-keystone:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: lumen-test
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    command: ["python", "tests/system/fake_keystone.py"]
+    environment:
+      PORT: "5000"
+    networks: [isolated]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/health"]
+      interval: 2s
+      timeout: 5s
+      start_period: 5s
+      retries: 50
+
   fake-provider:
     build:
       context: .
@@ -228,6 +247,11 @@ services:
     networks: [isolated]
     environment: &lumen-environment
       DATABASE_URL: mysql+aiomysql://lumen:lumen@mariadb:3306/lumen
+      KEYSTONE_AUTH_URL: http://fake-keystone:5000/v3
+      KEYSTONE_ADMIN_USERNAME: synthetic-directory
+      KEYSTONE_ADMIN_PASSWORD: synthetic-directory-password
+      KEYSTONE_ADMIN_PROJECT: synthetic-directory-project
+      KEYSTONE_DOMAIN: Default
       <<: *test-trust
       BATCH_ENABLED: "true"
       CHAT_ASSET_S3_ENDPOINT: https://minio:9000
@@ -283,6 +307,8 @@ services:
       LUMEN_LOCAL_INPUT_PRICE_PER_MILLION: "1"
       LUMEN_LOCAL_MODEL: ${LUMEN_LOCAL_MODEL:-fake-gpt-4}
       LUMEN_LOCAL_CONTEXT_LIMIT: "16384"
+      LUMEN_LOCAL_OWNER_USER_ID: system-owner
+      LUMEN_LOCAL_OWNER_PROJECT_ID: system-project
       LUMEN_LOCAL_SEED_PATH: /seed/api-key
       LUMEN_LOCAL_CONNECTION_PATH: /seed/connection.json
       LUMEN_LOCAL_PUBLIC_BASE_URL: http://127.0.0.1:8012/v1
@@ -293,6 +319,8 @@ services:
       test-ca:
         condition: service_completed_successfully
       fake-provider:
+        condition: service_healthy
+      fake-keystone:
         condition: service_healthy
     volumes:
       - system-seed:/seed
@@ -428,6 +456,7 @@ services:
       LUMEN_API_BASE_URL: http://lumen-api:8012
       <<: *test-trust
       LUMEN_FAKE_PROVIDER_URL: http://fake-provider:8080
+      LUMEN_FAKE_KEYSTONE_URL: http://fake-keystone:5000
       LUMEN_SEED_KEY_FILE: /seed/api-key
       LUMEN_CONNECTION_FILE: /seed/connection.json
       LUMEN_MODEL_NAME: fake-gpt-4

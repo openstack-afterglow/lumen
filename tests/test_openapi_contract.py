@@ -230,8 +230,15 @@ class FakeTokenPlugin:
         return self._access_info
 
 
+@pytest.fixture
+def current_authority(monkeypatch):
+    async def resolve(user_id, project_id):
+        return {"roles": ["member"], "is_system_admin": user_id == "sys-admin-1"}
+    monkeypatch.setattr(deps, "resolve_project_authority", resolve)
+
+
 @pytest.mark.parametrize("dependency", [deps.get_principal, deps.require_token])
-async def test_slow_keystone_validation_does_not_block_public_requests(dependency, monkeypatch):
+async def test_slow_keystone_validation_does_not_block_public_requests(dependency, monkeypatch, current_authority):
     started, release = Event(), Event()
 
     def validate(*_args, **_kwargs):
@@ -292,7 +299,9 @@ class TestKeystoneProjectScoping:
         assert info["roles"] == ["member", "admin"]
         assert info["auth_token"] == "rescoped-token-789"
 
-    async def test_scoped_keystone_token_propagation_in_get_principal_and_require_token(self, monkeypatch):
+    async def test_scoped_keystone_token_propagation_in_get_principal_and_require_token(
+        self, monkeypatch, current_project_authority
+    ):
         access_info = FakeAccessInfo(
             auth_token="rescoped-token-999",
             project_id="proj-777",
@@ -304,6 +313,7 @@ class TestKeystoneProjectScoping:
 
         monkeypatch.setattr("keystoneauth1.identity.v3.Token", lambda **kwargs: fake_token)
         monkeypatch.setattr("keystoneauth1.session.Session", lambda **kwargs: None)
+        monkeypatch.setattr(deps, "_is_system_admin", lambda user_id: False)
 
         from starlette.requests import Request
 
@@ -387,7 +397,7 @@ class TestKeystoneProjectScoping:
         assert principal["api_key_id"] == 42
         assert principal["scopes"] == ("read", "write")
 
-    async def test_keystone_bearer_token_support(self, monkeypatch):
+    async def test_keystone_bearer_token_support(self, monkeypatch, current_authority):
         monkeypatch.setattr(
             deps,
             "validate_token",
@@ -401,7 +411,7 @@ class TestKeystoneProjectScoping:
         assert info["token"] == "tok123"
         assert info["project_id"] == "p1"
 
-    async def test_system_admin_foreign_target_project_success(self, monkeypatch):
+    async def test_system_admin_foreign_target_project_success(self, monkeypatch, current_authority):
         access_info = FakeAccessInfo(
             auth_token="admin-rescoped-tok",
             project_id="home-proj",
@@ -484,7 +494,7 @@ class TestKeystoneProjectScoping:
             )
         assert ei.value.status_code == 403
 
-    async def test_system_admin_same_target_project_success(self, monkeypatch):
+    async def test_system_admin_same_target_project_success(self, monkeypatch, current_authority):
         access_info = FakeAccessInfo(
             auth_token="admin-tok-same",
             project_id="home-proj",

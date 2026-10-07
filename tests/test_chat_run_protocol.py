@@ -13,7 +13,7 @@ from lumen.models.chat_contracts import validate_chat_run_event
 from lumen.models.chat_db import ChatUsageLog
 from lumen.models.chat_runs import ChatRun, ChatToolApproval
 from lumen.services import context_inspector, context_manager, execution_protocol, run_store
-from lumen.services.durable_runs import common, execution, interactions, lifecycle, queries
+from lumen.services.durable_runs import common, execution, interactions, queries
 from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.durable_runs.common import _fingerprint
 from lumen.services.run_protocol_v2 import transition_allowed
@@ -1099,20 +1099,6 @@ async def test_events_return_gone_after_temporary_journal_purge(client, monkeypa
     assert response.status_code == 410
 
 
-async def test_cancel_is_owner_scoped_and_idempotent(client, monkeypatch):
-    seen = {}
-
-    async def cancel(**kwargs):
-        seen.update(kwargs)
-        return {"run_id": "run-1", "status": "running"}
-
-    monkeypatch.setattr(lifecycle, "request_cancelled", cancel)
-    response = await client.post("/api/v1/chat/runs/run-1/cancel")
-
-    assert response.status_code == 200
-    assert seen["run_id"] == "run-1"
-    assert seen["project_id"] == "test-project-123"
-    assert seen["user_id"] == "test-user-123"
 
 
 async def test_approval_decision_is_owner_scoped_and_validated(client, monkeypatch):

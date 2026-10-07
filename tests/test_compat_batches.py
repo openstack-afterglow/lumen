@@ -19,6 +19,7 @@ from lumen.models.batch_contracts import (
     openai_public_id,
     unix_seconds,
 )
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import batches as batch_service
 
 _BATCH_ID = "0b7e3c1a-5a4f-4c39-9c51-2b1b7f7a9e10"
@@ -53,7 +54,7 @@ def _create_body(endpoint: str = "/v1/chat/completions") -> dict:
 def _api_key(*scopes: str):
     async def principal():
         return {"auth_type": "api_key", "user_id": "u1", "project_id": "p1", "api_key_id": 7,
-                "scopes": tuple(scopes), "source": "api", "roles": [], "is_system_admin": False}
+                "scopes": tuple(scopes), "source": "api", "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False}
 
     return principal
 
@@ -91,6 +92,9 @@ def service(monkeypatch):
     record("list_batches", ([_view()], False))
     record("get_batch", _view())
     record("cancel_batch", _view(status="cancelling", cancelling_at=_CREATED + timedelta(seconds=9)))
+    async def cancel_scopes(**kwargs):
+        return ("compat:batches:write", "compat:completions:write")
+    monkeypatch.setattr(batch_service, "owned_cancel_scopes", cancel_scopes)
     return SimpleNamespace(calls=calls, set=record)
 
 

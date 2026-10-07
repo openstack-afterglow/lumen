@@ -15,7 +15,7 @@ from pydantic import ValidationError
 
 from lumen.api.batches import read_bounded_body
 from lumen.api.compat.openai import openai_error_response
-from lumen.auth import Principal, require_api_key_scopes
+from lumen.auth import Principal, ensure_scopes, require_api_key_scopes
 from lumen.config import get_settings
 from lumen.models.batch_contracts import (
     BATCH_ENDPOINTS,
@@ -204,6 +204,10 @@ async def cancel_batch(
     if (internal_id := openai_internal_id(OPENAI_BATCH_ID_PREFIX, batch_id)) is None:
         return _not_found()
     try:
+        scopes = await batch_service.owned_cancel_scopes(
+            project_id=principal["project_id"], user_id=principal["user_id"], batch_id=internal_id, contract="openai",
+        )
+        ensure_scopes(principal, *scopes)
         view = await batch_service.cancel_batch(
             project_id=principal["project_id"], user_id=principal["user_id"], batch_id=internal_id, contract="openai",
         )

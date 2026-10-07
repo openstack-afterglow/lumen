@@ -390,9 +390,9 @@ class TestStorePureLogic:
 
 class TestApiKeyAuthDependency:
     async def test_missing_key_401(self):
-        req = SimpleNamespace(state=SimpleNamespace())
+        req = _request()
         with pytest.raises(HTTPException) as ei:
-            await deps.get_api_key_info(req, bearer=None, x_api_key=None)
+            await deps.get_principal(req)
         assert ei.value.status_code == 401
 
     async def test_invalid_key_401(self, monkeypatch):
@@ -400,13 +400,9 @@ class TestApiKeyAuthDependency:
             return None
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
-        req = SimpleNamespace(state=SimpleNamespace())
+        req = _request(authorization="Bearer sk-afgl-bad")
         with pytest.raises(HTTPException) as ei:
-            await deps.get_api_key_info(
-                req,
-                bearer=deps.HTTPAuthorizationCredentials(scheme="Bearer", credentials="sk-afgl-bad"),
-                x_api_key=None,
-            )
+            await deps.get_principal(req)
         assert ei.value.status_code == 401
 
     async def test_valid_bearer_sets_token_info(self, monkeypatch):
@@ -417,15 +413,12 @@ class TestApiKeyAuthDependency:
                 "project_id": "p1",
                 "api_key_id": 7,
                 "scopes": ("models:read",),
+                "roles": ["reader", "lumen-inventory_reader", "lumen-history_reader"],
             }
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
-        req = SimpleNamespace(state=SimpleNamespace())
-        await deps.get_api_key_info(
-            req,
-            bearer=deps.HTTPAuthorizationCredentials(scheme="Bearer", credentials=" sk-afgl-good "),
-            x_api_key=None,
-        )
+        req = _request(authorization="Bearer sk-afgl-good")
+        await deps.get_principal(req)
         assert req.state.token_info["source"] == "api"
 
     async def test_valid_x_api_key_header(self, monkeypatch):
@@ -436,11 +429,12 @@ class TestApiKeyAuthDependency:
                 "project_id": "p1",
                 "api_key_id": 9,
                 "scopes": ("models:read",),
+                "roles": ["reader", "lumen-inventory_reader", "lumen-history_reader"],
             }
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
-        req = SimpleNamespace(state=SimpleNamespace())
-        info = await deps.get_api_key_info(req, bearer=None, x_api_key="sk-afgl-viakey")
+        req = _request(x_api_key="sk-afgl-viakey")
+        info = await deps.get_principal(req)
         assert info["api_key_id"] == 9
 
 
@@ -453,13 +447,14 @@ class TestPrincipalDependency:
                 "project_id": "p1",
                 "api_key_id": 7,
                 "scopes": ("models:read",),
+                "roles": ["reader", "lumen-inventory_reader", "lumen-history_reader"],
             }
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
         principal = await deps.get_principal(_request(authorization="Bearer sk-afgl-key"))
         assert principal["auth_type"] == "api_key"
         assert principal["project_id"] == "p1"
-        assert principal["roles"] == []
+        assert principal["roles"] == ["reader", "lumen-inventory_reader", "lumen-history_reader"]
         with pytest.raises(HTTPException, match="API 키 프로젝트와 X-Project-Id가 일치하지 않습니다") as exc_info:
             await deps.get_principal(_request(x_api_key="sk-afgl-key", x_project_id="other"))
         assert exc_info.value.status_code == 403
@@ -486,9 +481,9 @@ class TestPrincipalDependency:
             )
         assert exc_info.value.status_code == 403
 
-    def test_native_defaults_require_memory_and_tool_scopes(self):
+    def test_native_defaults_require_memory_read_and_tool_scopes(self):
         with pytest.raises(
-            HTTPException, match="native:memory:read, native:memory:write, native:tools:execute"
+            HTTPException, match="native:memory:read, native:tools:execute"
         ) as exc_info:
             chat_admission._require_native_admission_scopes(
                 {
@@ -537,42 +532,30 @@ class TestPrincipalDependency:
         assert exc_info.value.status_code == 403
 
 
-    def test_plugin_tool_selection_requires_execute_scope(self):
-        """A frozen plugin tool needs both extension read and tool execute; a plugin skill only read."""
+    @pytest.mark.parametrize("kind", ["tool", "skill"])
+    def test_plugin_selection_requires_independent_execute_scope(self, kind):
+        """A frozen tool or skill is execution, not mere extension inventory."""
         principal = {
             "auth_type": "api_key",
             "user_id": "u1",
             "project_id": "p1",
             "api_key_id": 7,
-            "scopes": ("native:memory:read", "native:memory:write", "native:extensions:read"),
+            "scopes": ("native:memory:read", "native:extensions:read"),
             "source": "api",
-            "roles": [],
+            "roles": ["member", "lumen-history_reader", "lumen-inventory_reader", "lumen-tools_user"],
             "is_system_admin": False,
         }
-        features = ChatFeatureOptions(tool_policy={"mode": "none"})
-        chat_admission._require_native_admission_scopes(
-            principal,
-            features,
-            parts=[TextPart(type="text", text="hello")],
-            execution_mode="chat",
-            skill_ids=[],
-            agent=None,
-            extension_selection={"tools": [], "mcp": []},
-            plugin_tool_snapshots=[],
-            plugin_skill_snapshots=[{"binding": {"id": "b"}}],
+        kwargs = dict(
+            parts=[TextPart(type="text", text="hello")], execution_mode="chat",
+            skill_ids=[], agent=None, extension_selection={"tools": [], "mcp": []},
+            plugin_tool_snapshots=[{"binding": {"id": "b"}}] if kind == "tool" else [],
+            plugin_skill_snapshots=[{"binding": {"id": "b"}}] if kind == "skill" else [],
         )
+        features = ChatFeatureOptions(tool_policy={"mode": "none"})
         with pytest.raises(HTTPException, match="native:tools:execute"):
-            chat_admission._require_native_admission_scopes(
-                principal,
-                features,
-                parts=[TextPart(type="text", text="hello")],
-                execution_mode="chat",
-                skill_ids=[],
-                agent=None,
-                extension_selection={"tools": [], "mcp": []},
-                plugin_tool_snapshots=[{"binding": {"id": "b"}}],
-                plugin_skill_snapshots=[],
-            )
+            chat_admission._require_native_admission_scopes(principal, features, **kwargs)
+        principal["scopes"] += ("native:tools:execute",)
+        chat_admission._require_native_admission_scopes(principal, features, **kwargs)
 
 class TestRouter:
     async def test_create_returns_plaintext_once(self, client, monkeypatch):

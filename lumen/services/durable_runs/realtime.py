@@ -22,6 +22,7 @@ from lumen.config import get_settings
 from lumen.crypto import encrypt_chat_content
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import credit
+from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
 from lumen.services.litellm_client import UsageCost
 from lumen.services.providers import pricing as provider_pricing
 from lumen.services.providers import realtime_transport, routing
@@ -285,7 +286,8 @@ async def admit_realtime_session(
     voice = intent["voice"] or voices["default_voice"]
     plan = realtime_transport.validate_realtime_request(route, voice=voice,
         instructions=intent["instructions"], max_duration_seconds=intent["max_duration_seconds"])
-    payload = {**intent, "voice": voice}
+    required_scopes = ("compat:realtime:write",) if source == "api" else ("native:realtime:write",)
+    payload = {**intent, "voice": voice, "required_scopes": list(required_scopes)}
     await credit.precheck(user_id, project_id, api_key_id)
     per_usd = Decimal(str(get_settings().chat_credit_per_usd))
     margin = Decimal(str(route["margin_multiplier"]))
@@ -310,6 +312,13 @@ async def admit_realtime_session(
                 run = existing
             else:
                 await _lock_run_configurations(session, capability, model_name=route["model_name"])
+                try:
+                    await authorize_api_key_in_transaction(session, user_id=user_id, project_id=project_id,
+                        api_key_id=api_key_id, required_scopes=required_scopes)
+                except ApiKeyForbidden as exc:
+                    raise DurableRunInputError("inference_authority_revoked") from exc
+                except ApiKeyAuthorityUnavailable as exc:
+                    raise DurableRunError("inference_authority_unavailable") from exc
                 run = ChatRun(id=str(uuid.uuid4()), run_scope="realtime", run_kind="realtime", workload_class="realtime",
                     project_id=project_id, user_id=user_id, model_name=route["model_name"], source=source,
                     api_key_id=api_key_id, client_request_id=client_request_id, request_fingerprint=_fingerprint(intent),
@@ -353,6 +362,15 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
             await session.flush()
             if segment.status != "prepared":
                 raise DurableRunProviderResultUnknown("realtime session cannot be resumed")
+            scopes = _payload(run).get("required_scopes") or [
+                "compat:realtime:write" if run.source == "api" else "native:realtime:write"]
+            try:
+                await authorize_api_key_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
+                    api_key_id=run.api_key_id, required_scopes=tuple(scopes))
+            except ApiKeyForbidden as exc:
+                raise DurableRunInputError("inference_authority_revoked") from exc
+            except ApiKeyAuthorityUnavailable as exc:
+                raise DurableRunError("inference_authority_unavailable") from exc
             await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id,
                 project_id=run.project_id, api_key_id=run.api_key_id,
                 bound=Decimal(run.pricing_snapshot["bound_credits"]))

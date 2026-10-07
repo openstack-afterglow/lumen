@@ -18,6 +18,7 @@ from lumen.services.durable_runs import api_completion, execution
 from lumen.services.durable_runs.errors import DurableRunInputError
 from lumen.services.providers.errors import ProviderSubscriptionError
 
+pytestmark = pytest.mark.usefixtures("current_project_authority")
 _URL = "https://provider.test/v1/responses"
 
 
@@ -176,7 +177,7 @@ async def test_responses_admission_sends_the_frozen_output_budget(route_catalog)
     )
     assert prepared.payload["options"]["max_output_tokens"] == 4096
     assert prepared.pricing_snapshot["max_output_tokens"] == 4096
-    assert prepared.required_scopes == ("compat:batches:write",)
+    assert prepared.required_scopes == ("compat:batches:write", "native:tools:execute")
 
 
 @pytest.mark.parametrize(
@@ -240,7 +241,11 @@ class _KeySession:
         _key(scopes=["models:read"]),
     ],
 )
-async def test_run_key_reauthorization_fails_closed(row):
+async def test_run_key_reauthorization_fails_closed(row, monkeypatch):
+    async def current_authority(user_id, project_id):
+        return {"roles": ["member", "lumen-chat_user"], "is_system_admin": False}
+
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
     with pytest.raises(api_key_store.ApiKeyForbidden):
         await api_key_store.authorize_api_key_in_transaction(
             _KeySession(row), api_key_id=7, user_id="u", project_id="p",
@@ -248,7 +253,11 @@ async def test_run_key_reauthorization_fails_closed(row):
         )
 
 
-async def test_run_key_reauthorization_accepts_live_scoped_key_and_keystone_runs():
+async def test_run_key_reauthorization_accepts_live_scoped_key_and_keystone_runs(monkeypatch):
+    async def current_authority(user_id, project_id):
+        return {"roles": ["member", "lumen-chat_user"], "is_system_admin": False}
+
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
     session = _KeySession(_key())
     await api_key_store.authorize_api_key_in_transaction(
         session, api_key_id=7, user_id="u", project_id="p", required_scopes=("compat:completions:write",),

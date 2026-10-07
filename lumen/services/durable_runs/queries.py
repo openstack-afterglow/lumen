@@ -15,6 +15,18 @@ from .common import _factory, _now, descriptor
 from .errors import DurableRunCursorExpired, DurableRunError, DurableRunNotFound
 
 
+async def owned_run_cancel_scopes(*, run_id: str, project_id: str, user_id: str) -> tuple[str, ...]:
+    from lumen.services.inference_authority import cancel_run_scopes
+
+    async with _factory()() as session:
+        try:
+            run = await load_owned_run(session, run_id, user_id=user_id, project_id=project_id)
+        except RunStoreError as exc:
+            raise DurableRunNotFound(str(exc)) from exc
+        payload = json.loads(decrypt_chat_content(run.request_payload)) if run.request_payload else {}
+        return cancel_run_scopes(run, payload)
+
+
 async def owned_run_response(*, run_id: str, project_id: str, user_id: str) -> ChatRunResponse:
     factory = _factory()
     async with factory() as session:

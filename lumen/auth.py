@@ -12,6 +12,7 @@ from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBea
 from starlette.concurrency import run_in_threadpool
 
 from lumen.config import get_settings
+from lumen.service_authority import SERVICE_CAPABILITIES, allowed_scopes
 
 keystone_token_scheme = APIKeyHeader(name="X-Auth-Token", auto_error=False, scheme_name="KeystoneToken")
 keystone_bearer_scheme = HTTPBearer(auto_error=False, scheme_name="KeystoneBearer")
@@ -20,7 +21,6 @@ api_key_bearer_scheme = HTTPBearer(auto_error=False, scheme_name="APIKeyBearer")
 x_api_key_scheme = APIKeyHeader(name="x-api-key", auto_error=False, scheme_name="XApiKey")
 
 _logger = logging.getLogger(__name__)
-_admin_role_id_cache: str | None = None
 
 
 class Principal(TypedDict):
@@ -33,6 +33,7 @@ class Principal(TypedDict):
     source: Literal["web", "api"]
     roles: list[str]
     is_system_admin: bool
+    service_system_admin: NotRequired[bool]
     credential_kind: NotRequired[str]
     expires_at: NotRequired[object]
     token: NotRequired[str]
@@ -69,38 +70,143 @@ def _get_admin_ks_client():
     return ks_client.Client(session=session)
 
 
-def _resolve_admin_role_id() -> str | None:
-    global _admin_role_id_cache
-    if _admin_role_id_cache is not None:
-        return _admin_role_id_cache
-    try:
-        ks = _get_admin_ks_client()
-        roles = ks.roles.list(name="admin")
-        if roles:
-            _admin_role_id_cache = roles[0].id
-            return _admin_role_id_cache
-    except Exception:
-        _logger.warning("Failed to resolve admin role ID from Keystone", exc_info=True)
-    return None
+def _load_role_graph(ks) -> tuple[dict[str, set[str]], dict[str, str], dict[str, str]]:
+    """Bind exact unique global IDs and validate the current provider DAG."""
+    catalog = {}
+    global_ids = {}
+    restricted_ids = {}
+    builtin_names = SERVICE_CAPABILITIES | {
+        "admin", "manager", "member", "reader",
+        "lumen_reader", "lumen_user", "lumen_editor", "lumen_admin",
+    }
+    seen_builtin_names = set()
+    for role in ks.roles.list():
+        rid, name, domain = role.id, role.name, getattr(role, "domain_id", None)
+        if (not isinstance(rid, str) or not rid or rid in catalog
+                or not isinstance(name, str) or not name
+                or (domain is not None and not isinstance(domain, str))):
+            raise ValueError("Malformed Keystone role catalog")
+        catalog[rid] = role
+        if name in builtin_names:
+            if name in seen_builtin_names:
+                raise ValueError("Builtin Keystone role name has a domain/global collision")
+            seen_builtin_names.add(name)
+        if name in {"admin", "manager"}:
+            restricted_ids[rid] = name
+        if domain is None:
+            if name in global_ids:
+                raise ValueError("Ambiguous global Keystone role name")
+            global_ids[name] = rid
+    graph = {rid: set() for rid in catalog}
+    rules = ks.inference_rules.list_inference_roles()
+    if not isinstance(rules, list):
+        raise ValueError("Keystone role inference graph unavailable")
+    for rule in rules:
+        prior = rule.prior_role["id"]
+        children = rule.implies
+        if prior not in catalog or not isinstance(children, list):
+            raise ValueError("Malformed Keystone role inference graph")
+        for child in children:
+            implied = child["id"]
+            if implied not in catalog:
+                raise ValueError("Unknown implied Keystone role ID")
+            graph[prior].add(implied)
+    incoming = dict.fromkeys(graph, 0)
+    for children in graph.values():
+        for child in children:
+            incoming[child] += 1
+    pending = [rid for rid, count in incoming.items() if not count]
+    visited = 0
+    while pending:
+        rid = pending.pop()
+        visited += 1
+        for child in graph[rid]:
+            incoming[child] -= 1
+            if not incoming[child]:
+                pending.append(child)
+    if visited != len(graph):
+        raise ValueError("Cyclic Keystone role inference graph")
+    return graph, global_ids, restricted_ids
+
+
+def _expand_role_ids(role_ids: set[str], graph: dict[str, set[str]]) -> set[str]:
+    reached = set()
+    pending = list(role_ids)
+    while pending:
+        rid = pending.pop()
+        if rid not in graph:
+            raise ValueError("Assigned Keystone role ID absent from current catalog")
+        if rid not in reached:
+            reached.add(rid)
+            pending.extend(graph[rid])
+    return reached
+
+
+def _system_admin_from_graph(ks, user_id: str, graph: dict[str, set[str]], global_ids: dict[str, str]) -> bool:
+    admin_id = global_ids.get("admin")
+    if not user_id or admin_id is None:
+        return False
+    assignments = ks.role_assignments.list(user=user_id, system="all", effective=True)
+    role_ids = {a.role["id"] for a in assignments
+                if (getattr(a, "scope", {}) or {}).get("system", {}).get("all") is True}
+    return admin_id in _expand_role_ids(role_ids, graph)
 
 
 def _is_system_admin(user_id: str) -> bool:
     try:
         ks = _get_admin_ks_client()
-        admin_role_id = _resolve_admin_role_id()
-        if not admin_role_id:
-            return False
-        assignments = ks.role_assignments.list(user=user_id, role=admin_role_id)
-        for a in assignments:
-            scope = getattr(a, "scope", {}) or {}
-            if "system" in scope and scope["system"].get("all") is True:
-                return True
-            if "domain" in scope:
-                return True
-        return False
+        graph, global_ids, _restricted_ids = _load_role_graph(ks)
+        return _system_admin_from_graph(ks, user_id, graph, global_ids)
     except Exception:
         _logger.warning("Keystone system admin check failed for user_id=%s", user_id, exc_info=True)
         return False
+
+
+def _resolve_project_authority(user_id: str, project_id: str) -> dict:
+    """Read current effective grants, including group and inherited assignments.
+
+    Only a project-scoped effective row establishes membership. Domain and
+    project admin labels never stand in for verified system authority.
+    """
+    if not user_id or not project_id:
+        raise HTTPException(status_code=403, detail="Current project membership required")
+    try:
+        from keystoneclient.exceptions import NotFound
+
+        ks = _get_admin_ks_client()
+        try:
+            user_enabled = getattr(ks.users.get(user_id), "enabled", None)
+            project_enabled = getattr(ks.projects.get(project_id), "enabled", None)
+        except NotFound as exc:
+            raise HTTPException(status_code=403, detail="Current Keystone owner or project no longer exists") from exc
+        if not isinstance(user_enabled, bool) or not isinstance(project_enabled, bool):
+            raise ValueError("Current Keystone owner status unavailable")
+        if not user_enabled or not project_enabled:
+            raise HTTPException(status_code=403, detail="Current Keystone owner or project is disabled")
+        graph, global_ids, restricted_ids = _load_role_graph(ks)
+        assignments = ks.role_assignments.list(user=user_id, project=project_id, effective=True)
+        role_ids = {
+            a.role["id"] for a in assignments
+            if (getattr(a, "scope", {}) or {}).get("project", {}).get("id") == project_id
+        }
+        is_system_admin = _system_admin_from_graph(ks, user_id, graph, global_ids)
+        if not role_ids and not is_system_admin:
+            raise HTTPException(status_code=403, detail="Current project membership required")
+        reached = _expand_role_ids(role_ids, graph)
+        # Domain aliases never grant builtin authority, but raw native privileged
+        # labels still trigger the nonverified-admin fail-closed policy.
+        roles = sorted({name for name, rid in global_ids.items() if rid in reached}
+                       | {name for rid, name in restricted_ids.items() if rid in reached})
+        return {"roles": roles, "is_system_admin": is_system_admin}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _logger.warning("Current Keystone authority lookup failed", exc_info=True)
+        raise HTTPException(status_code=503, detail="Current Keystone authority unavailable") from exc
+
+
+async def resolve_project_authority(user_id: str, project_id: str) -> dict:
+    return await run_in_threadpool(_resolve_project_authority, user_id, project_id)
 
 
 def validate_token(token: str, project_id: str = "", target_project_id: str = "") -> dict:
@@ -127,7 +233,7 @@ def validate_token(token: str, project_id: str = "", target_project_id: str = ""
 
     u_id = auth_ref.user_id or ""
     roles = list(auth_ref.role_names or [])
-    is_sys_admin = "admin" in roles and _is_system_admin(u_id)
+    is_sys_admin = _is_system_admin(u_id)
     effective_token = auth_ref.auth_token or token
     if not isinstance(target_project_id, str):
         target_project_id = ""
@@ -231,10 +337,11 @@ async def get_principal(
             "api_key_id": info["api_key_id"],
             "scopes": scopes,
             "source": "api",
-            "roles": [],
+            "roles": list(info.get("roles", ())),
             "credential_kind": info.get("credential_kind", "api_key"),
             "expires_at": info.get("expires_at"),
             "is_system_admin": False,
+            "service_system_admin": bool(info.get("service_system_admin", False)),
         }
     else:
         assert keystone_token is not None
@@ -248,6 +355,7 @@ async def get_principal(
                 await run_in_threadpool(validate_token, keystone_token, **val_kwargs),
                 keystone_token,
             )
+            principal.update(await resolve_project_authority(principal["user_id"], principal["project_id"]))
         except HTTPException:
             raise
         except Exception as exc:
@@ -258,12 +366,14 @@ async def get_principal(
 
 
 def ensure_scopes(principal: Principal, *required: str) -> Principal:
-    """Enforce every required scope for API keys; Keystone sessions retain existing authority."""
-    if principal["auth_type"] == "keystone":
-        return principal
-    missing = tuple(scope for scope in sorted(set(required)) if scope not in principal["scopes"])
+    """Require current service authority AND, for a key, its attenuating scopes."""
+    service_admin = principal.get("is_system_admin", False) or principal.get("service_system_admin", False)
+    permitted = allowed_scopes(principal.get("roles", ()), service_admin)
+    missing = sorted(set(required) - permitted)
+    if principal.get("auth_type") == "api_key":
+        missing = sorted(set(missing) | (set(required) - set(principal.get("scopes", ()))))
     if missing:
-        raise HTTPException(status_code=403, detail=f"API 키에 필요한 scope가 없습니다: {', '.join(missing)}")
+        raise HTTPException(status_code=403, detail=f"Required service action denied: {', '.join(missing)}")
     return principal
 
 
@@ -307,6 +417,7 @@ async def require_token(
         info = await run_in_threadpool(validate_token, token, **val_kwargs)
         info["token"] = info.get("auth_token") or token
         info.setdefault("connection_project_id", info.get("project_id", ""))
+        info.update(await resolve_project_authority(info["user_id"], info["project_id"]))
     except HTTPException:
         raise
     except Exception:
@@ -337,41 +448,6 @@ def require_chat_api_host(request: Request) -> None:
         raise HTTPException(status_code=404, detail="Not Found")
 
 
-async def get_api_key_info(
-    request: Request,
-    bearer: HTTPAuthorizationCredentials | None = Security(api_key_bearer_scheme),
-    x_api_key: str | None = Security(x_api_key_scheme),
-) -> Principal:
-    """Legacy API-key-only dependency retained for compat route callers."""
-    from lumen.services import api_key_store as aks
-
-    raw = None
-    if bearer and bearer.credentials:
-        raw = bearer.credentials.strip()
-    elif x_api_key:
-        raw = x_api_key.strip()
-    if not raw:
-        raise HTTPException(status_code=401, detail="API 키가 필요합니다 (Authorization: Bearer 또는 x-api-key)")
-
-    info = await aks.verify_key(raw)
-    scopes = info.get("scopes") if info else None
-    if not isinstance(scopes, tuple) or not scopes:
-        raise HTTPException(status_code=401, detail="유효하지 않은 API 키입니다")
-    principal: Principal = {
-        "auth_type": "api_key",
-        "user_id": info["user_id"],
-        "project_id": info["project_id"],
-        "connection_project_id": info["project_id"],
-        "api_key_id": info["api_key_id"],
-        "scopes": scopes,
-        "source": "api",
-        "roles": [],
-        "credential_kind": info.get("credential_kind", "api_key"),
-        "expires_at": info.get("expires_at"),
-        "is_system_admin": False,
-    }
-    request.state.token_info = principal
-    return principal
 
 
 def get_admin_connection_for_project(project_id: str):

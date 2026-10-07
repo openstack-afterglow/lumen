@@ -10,6 +10,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import delete, select
 
+from lumen.crypto import encrypt_chat_content
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_infrastructure import (
     ChatAgentReservation,
@@ -24,7 +25,7 @@ from lumen.services.durable_runs.errors import DurableRunError
 from lumen.services.infrastructure import store
 from lumen.services.run_store import claim_queued_run, replay_events
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
 
 async def _fixed_text_worker(identity: str) -> str:
@@ -63,6 +64,7 @@ async def family():
             session.add(ChatRun(
                 id=root_id, run_scope="persistent", project_id=project_id, user_id=user_id,
                 model_name="scripted-parent", capability_snapshot={}, pricing_snapshot={},
+                request_payload=encrypt_chat_content('{"required_scopes":["native:runs:write"]}'),
                 client_request_id=str(uuid.uuid4()), request_fingerprint=nonce, fingerprint_version=1,
                 execution_protocol_version=2, status="running", lease_owner=owner,
                 lease_expires_at=now + timedelta(minutes=5), credit_ceiling=Decimal("2"),
@@ -75,6 +77,7 @@ async def family():
                 session.add(ChatRun(
                     id=child_id, run_scope="child", project_id=project_id, user_id=user_id,
                     model_name="scripted-child", capability_snapshot={}, pricing_snapshot={},
+                    request_payload=encrypt_chat_content('{"required_scopes":["native:runs:write","native:agents:use","native:tools:execute"]}'),
                     client_request_id=str(uuid.uuid4()), request_fingerprint=f"{nonce}-{ordinal}",
                     fingerprint_version=1, execution_protocol_version=2, status="waiting_resource",
                     parent_run_id=root_id, root_run_id=root_id, delegation_call_id=call_id, depth=1,

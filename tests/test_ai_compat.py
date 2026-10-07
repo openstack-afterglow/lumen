@@ -16,11 +16,14 @@ from lumen.api.compat import anthropic as an
 from lumen.api.compat import openai as oa
 from lumen.auth import get_principal
 from lumen.main import app
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import capabilities, litellm_client, openai_compat
 from lumen.services import completion_api as core
 from lumen.services.completion_format import nonstream_response
 
 _H = {"Authorization": "Bearer sk-afgl-test"}
+
+pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
 
 
 @pytest.fixture(autouse=True)
@@ -569,9 +572,9 @@ def _auth(monkeypatch):
             "user_id": "u1",
             "project_id": "p1",
             "api_key_id": 7,
-            "scopes": ("models:read", "compat:completions:write"),
+            "scopes": ("models:read", "compat:completions:write", "native:tools:execute"),
             "source": "api",
-            "roles": [],
+            "roles": ["member", *SERVICE_CAPABILITIES],
             "is_system_admin": False,
         }
 

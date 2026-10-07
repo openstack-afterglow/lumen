@@ -21,6 +21,8 @@ from lumen.models.chat_db import ChatConversation, ChatMessage, ChatUsageLog
 from lumen.models.chat_jobs import ChatJob
 from lumen.models.chat_runs import ChatRun
 from lumen.services import auxiliary, credit, litellm_client, message_graph, title_summary
+from lumen.services.api_key_store import ApiKeyForbidden
+from lumen.services.inference_authority import authorize_run_generation
 from lumen.services.providers import routing as ps
 from lumen.services.usage_breakdown import CACHE_USAGE_KEYS, UsageBreakdown
 from lumen.services.worker_routing import use_read_committed
@@ -333,7 +335,7 @@ async def _claim_one(*, owner: str) -> dict[str, Any] | None:
 
 
 @auxiliary.retry_db
-async def _mark_provider_started(job_id: str, *, owner: str, expected_revision: int) -> None:
+async def _mark_provider_started(job_id: str, *, owner: str, expected_revision: int, resolved: dict | None = None) -> None:
     from lumen.db import get_session_factory
 
     factory = get_session_factory()
@@ -343,6 +345,10 @@ async def _mark_provider_started(job_id: str, *, owner: str, expected_revision: 
         job = await _get_for_update(session, ChatJob, job_id)
         if job is None or job.status != "running" or job.lease_owner != owner:
             raise RuntimeError("title job lease lost")
+        run = await session.get(ChatRun, job.run_id)
+        if run is None or run.conversation_id != job.conversation_id:
+            raise ApiKeyForbidden("title source run is unavailable")
+        await authorize_run_generation(session, run, resolved=resolved)
         job.progress = {"state": "provider_started", "expected_revision": expected_revision}
         job.lease_expires_at = _now() + timedelta(seconds=_LEASE_SECONDS)
 
@@ -586,9 +592,12 @@ async def _process_claimed(claimed: dict[str, Any], *, owner: str) -> bool:
         # Quota/storage checks happen before the write-ahead provider fence;
         # failures here are safe to retry without risking a duplicate call.
         await credit.precheck(str(payload["user_id"]), str(payload["project_id"]), None)
-        await _mark_provider_started(job_id, owner=owner, expected_revision=expected)
+        await _mark_provider_started(job_id, owner=owner, expected_revision=expected, resolved=resolved)
     except credit.QuotaExceeded:
         await _mark_failed(job_id, owner=owner, error_code="quota_exceeded")
+        return True
+    except ApiKeyForbidden:
+        await _mark_failed(job_id, owner=owner, error_code="inference_authority_revoked")
         return True
     except Exception:
         logger.warning("title job preflight failed job=%s", job_id, exc_info=True)

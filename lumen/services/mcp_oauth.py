@@ -15,11 +15,13 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
+from fastapi import HTTPException
 from lumen_plugin_api.contracts import Namespace
 from lumen_plugin_api.mcp import McpConnection, McpConnectionStore, McpOAuthError, McpOAuthProvider
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from lumen.auth import ensure_scopes, resolve_project_authority
 from lumen.config import get_settings, is_development_loopback_http_url
 from lumen.crypto import decrypt_llm_provider_key, encrypt_llm_provider_key
 from lumen.db import get_session_factory, mark_db_unhealthy
@@ -221,6 +223,19 @@ class SqlMcpConnectionStore(McpConnectionStore):
                     request.completed_at = _now()
                 expired_or_used = True
             else:
+                # Callback credentials are the persisted browser-bound state, not
+                # request headers. Revalidate that owner's current management
+                # authority before the plugin can exchange any authorization code.
+                try:
+                    authority = await resolve_project_authority(request.owner_user_id, request.owner_project_id)
+                    ensure_scopes({
+                        "auth_type": "keystone",
+                        "user_id": request.owner_user_id,
+                        "project_id": request.owner_project_id,
+                        **authority,
+                    }, "native:mcp:write")
+                except HTTPException as exc:
+                    raise McpOAuthError("MCP OAuth management authority is no longer available") from exc
                 payload = _decrypt(request.encrypted_payload)
                 request.status = "processing"
         if expired_or_used or payload is None:

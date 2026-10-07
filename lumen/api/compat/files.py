@@ -259,7 +259,7 @@ async def get_file(file_id: str, principal: Principal = Depends(require_api_key_
 
 
 @router.delete("/files/{file_id}", response_model=OpenAIFileDeleted)
-async def delete_file(file_id: str, principal: Principal = Depends(require_api_key_scopes("compat:files:write"))):
+async def delete_file(file_id: str, principal: Principal = Depends(require_api_key_scopes("compat:files:delete"))):
     try:
         _available()
         await batch_files.delete_batch_file(project_id=principal["project_id"], user_id=principal["user_id"],

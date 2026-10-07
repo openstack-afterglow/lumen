@@ -14,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from lumen.api.compat import files as api
 from lumen.api.compat.openai import openai_error_response
 from lumen.auth import get_principal
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import assets, batch_files
 
 
@@ -26,7 +27,8 @@ def env(monkeypatch):
     app = FastAPI()
     app.include_router(api.router, prefix="/v1")
     principal = {"auth_type": "api_key", "user_id": "u", "project_id": "p", "api_key_id": 7,
-                 "scopes": ("compat:files:read", "compat:files:write")}
+                 "roles": ["member", *sorted(SERVICE_CAPABILITIES)], "is_system_admin": False,
+                 "scopes": ("compat:files:read", "compat:files:write", "compat:files:delete")}
     app.dependency_overrides[get_principal] = lambda: principal
 
     @app.exception_handler(HTTPException)
@@ -212,7 +214,9 @@ async def test_disabled_feature_returns_explicit_openai_error(env, method, path)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method,path,scope", [("get", "/v1/files", "compat:files:read"), ("post", "/v1/files", "compat:files:write")])
+@pytest.mark.parametrize("method,path,scope", [("get", "/v1/files", "compat:files:read"),
+    ("post", "/v1/files", "compat:files:write"),
+    ("delete", "/v1/files/file-" + "0" * 32, "compat:files:delete")])
 async def test_api_key_scope_is_checked_before_file_work(env, method, path, scope):
     app, principal, _ = env
     principal["scopes"] = ()

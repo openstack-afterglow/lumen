@@ -9,9 +9,10 @@ from contextlib import aclosing
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from lumen.auth import require_api_key_scopes
+from lumen.auth import ensure_scopes, require_api_key_scopes
 from lumen.models.api_requests import ResponsesRequest
 from lumen.services import completion_api as core
+from lumen.services.inference_authority import completion_scopes
 from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 
 from .streaming import events_with_ping
@@ -44,6 +45,7 @@ async def responses(
     x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider"),
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
+    ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
     if body.store is True:
         return responses_error(400, "store=true is not supported", code="stateful_responses_not_supported")
     if body.previous_response_id is not None:

@@ -31,8 +31,9 @@ from lumen.crypto import encrypt_chat_content
 from lumen.models.api_requests import OpenAIChatRequest, ResponsesRequest
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import completion_api, credit, litellm_client, worker_routing
-from lumen.services.api_key_store import ApiKeyForbidden, authorize_api_key_in_transaction
+from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
 from lumen.services.completion_format import nonstream_response
+from lumen.services.inference_authority import completion_scopes
 from lumen.services.providers import routing
 from lumen.services.providers.errors import ProviderSubscriptionError
 from lumen.services.providers.pricing import frozen_token_pricing
@@ -245,7 +246,7 @@ async def prepare_api_completion_run(
         payload=payload,
         capability_snapshot=capability,
         pricing_snapshot=pricing,
-        required_scopes=tuple(required_scopes or _DEFAULT_SCOPES),
+        required_scopes=completion_scopes(request, base=tuple(required_scopes or _DEFAULT_SCOPES), resolved=route),
         project_id=project_id,
         user_id=user_id,
     )
@@ -295,6 +296,8 @@ async def persist_api_completion_run_in_transaction(
                                                project_id=project_id, required_scopes=prepared.required_scopes)
     except ApiKeyForbidden as exc:
         raise DurableRunInputError("api_key_unauthorized") from exc
+    except ApiKeyAuthorityUnavailable as exc:
+        raise DurableRunError("inference_authority_unavailable") from exc
     request_payload = {**prepared.payload, "execution_protocol_version": 1,
                        "required_scopes": list(prepared.required_scopes)}
     run = ChatRun(
@@ -628,6 +631,8 @@ async def _execute(run_id: str, *, owner: str, payload: dict, capability_snapsho
                                      bound=bound)
     except ApiKeyForbidden:
         pre_io_error = ("api_key_unauthorized", "API key is no longer authorized for this request")
+    except ApiKeyAuthorityUnavailable:
+        pre_io_error = ("inference_authority_unavailable", "Current inference authority is unavailable")
     except credit.QuotaExceeded:
         pre_io_error = ("quota_exceeded", "credit quota is exhausted")
     except DurableRunConflict:

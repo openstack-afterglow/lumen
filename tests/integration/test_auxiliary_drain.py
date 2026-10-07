@@ -23,7 +23,7 @@ from lumen.services import auxiliary, memory_jobs, memory_outbox, title_jobs
 from lumen.services.infrastructure import store
 from lumen.services.worker_routing import use_read_committed
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
 
 @pytest.fixture(params=["ON", "OFF"])

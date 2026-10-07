@@ -157,7 +157,7 @@ async def edit_image(
     quality: str = Form("auto"),
     response_format: str = Form("b64_json"),
     idempotency_key: uuid.UUID | None = Header(default=None, alias="Idempotency-Key"),
-    principal: Principal = Depends(require_api_key_scopes("compat:images:write", "native:assets:write")),
+    principal: Principal = Depends(require_api_key_scopes("compat:images:write")),
 ):
     unknown = set((await request.form()).keys()) - _EDIT_FIELDS
     if unknown:
