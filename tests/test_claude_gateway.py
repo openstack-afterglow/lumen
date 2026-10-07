@@ -35,7 +35,7 @@ def gateway_auth():
             "credential_kind": "claude_gateway",
             "expires_at": datetime.now(UTC) + timedelta(hours=1),
             "source": "api",
-            "roles": [],
+            "roles": ["member", "lumen-inventory_reader", "lumen-chat_user"],
             "is_system_admin": False,
         }
 
@@ -165,6 +165,7 @@ async def test_identical_dual_headers_work_but_mismatch_is_rejected(client, gate
             "api_key_id": 19,
             "scopes": gateway.GATEWAY_SCOPES,
             "credential_kind": "claude_gateway",
+            "roles": ["member", "lumen-inventory_reader", "lumen-chat_user"],
         }
 
     monkeypatch.setattr(api_key_store, "verify_key", verify)
@@ -215,6 +216,21 @@ async def test_managed_settings_support_conditional_etag(client, gateway_auth, m
     assert second.headers["etag"] == etag
 
 
+async def test_gateway_fixed_scope_denies_client_tools_before_resolution(client, gateway_auth, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    resolve = AsyncMock()
+    monkeypatch.setattr("lumen.api.claude_gateway.core.resolve_api", resolve)
+    response = await client.post(
+        f"{_GATEWAY}/v1/messages", headers=_HEADERS,
+        json={"model": "client-alias", "messages": [{"role": "user", "content": "hello"}],
+              "max_tokens": 100, "tools": [{"name": "read", "description": "read",
+                                           "input_schema": {"type": "object"}}]},
+    )
+    assert response.status_code == 403
+    resolve.assert_not_awaited()
+
+
 async def test_gateway_messages_use_configured_route_and_preserve_native_blocks(client, gateway_auth, monkeypatch):
     monkeypatch.setattr(gateway, "configured_route", lambda: ("configured-claude", "anthropic"))
     captured = {}
@@ -254,7 +270,6 @@ async def test_gateway_messages_use_configured_route_and_preserve_native_blocks(
             "thinking": {"type": "enabled", "budget_tokens": 12000},
             "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
             "output_config": {"effort": "high"},
-            "tools": [{"name": "read", "description": "read", "input_schema": {"type": "object"}}],
         },
     )
     assert response.status_code == 200
@@ -262,7 +277,6 @@ async def test_gateway_messages_use_configured_route_and_preserve_native_blocks(
     assert captured["resolved"]["model_name"] == "configured-claude"
     assert captured["max_tokens"] == 20000
     assert captured["options"]["thinking"]["budget_tokens"] == 12000
-    assert captured["options"]["tools"][0]["name"] == "read"
     assert captured["options"]["context_management"]["edits"][0]["keep"] == "all"
     assert captured["options"]["output_config"] == {"effort": "high"}
     assert captured["options"]["anthropic_headers"] == {
@@ -319,6 +333,12 @@ async def test_gateway_names_rejected_safeguards_in_anthropic_400(client, gatewa
 
 
 async def test_consumed_device_grant_requires_repair_after_lost_token_response(monkeypatch):
+    async def current_authority(user_id, project_id):
+        assert (user_id, project_id) == ("user-1", "project-1")
+        return {"roles": ["member", "lumen-inventory_reader", "lumen-chat_user", "lumen-keys_editor"],
+                "is_system_admin": False}
+
+    monkeypatch.setattr(auth, "resolve_project_authority", current_authority)
     now = datetime.now(UTC)
     row = ChatGatewayDeviceGrant(
         id="grant-1",

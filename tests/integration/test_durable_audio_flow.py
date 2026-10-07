@@ -30,7 +30,7 @@ from lumen.services.providers.errors import ProviderValidationError
 from lumen.services.run_store import claim_queued_run, load_segment_payload
 from lumen.services.worker_routing import use_read_committed
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
 
 async def _claim(session, run_id: str, owner: str):

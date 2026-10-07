@@ -18,6 +18,7 @@ from lumen.models.batch_contracts import (
     batch_item_scopes,
 )
 from lumen.models.chat_contracts import ChatRunDescriptor, ChatRunResponse, validate_chat_run_event
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import batches as batch_service
 
 _CHAT = {"model": "registered-model", "messages": [{"role": "user", "content": "hello"}]}
@@ -125,7 +126,7 @@ def _create_body(*operations: str) -> dict:
 def _api_key(*scopes: str):
     async def principal():
         return {"auth_type": "api_key", "user_id": "test-user-123", "project_id": "test-project-123",
-                "api_key_id": 41, "scopes": tuple(scopes), "source": "api", "roles": [], "is_system_admin": False}
+                "api_key_id": 41, "scopes": tuple(scopes), "source": "api", "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False}
 
     return principal
 
@@ -153,6 +154,9 @@ def service(monkeypatch):
     record("get_batch", _view())
     record("list_batch_items", ([], None))
     record("cancel_batch", _view(status="cancelling", cancelling_at=_CREATED))
+    async def cancel_scopes(**kwargs):
+        return ("native:batches:write", "compat:completions:write")
+    monkeypatch.setattr(batch_service, "owned_cancel_scopes", cancel_scopes)
     return SimpleNamespace(calls=calls, set=record)
 
 

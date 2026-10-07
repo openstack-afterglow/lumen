@@ -117,14 +117,13 @@ def _load_policy(row: ChatMcpServer | ChatCustomTool) -> str:
 
 def _public_mcp(row: ChatMcpServer) -> dict:
     # Header values remain write-only and are exposed only as administrator configuration state.
-    headers = _decrypt_headers(row)
     return {
         "id": row.id,
         "scope": row.scope,
         "name": row.name,
         "transport": row.transport,
         "url": row.url,
-        "has_headers": bool(row.encrypted_headers) or bool(headers),
+        "has_headers": bool(row.encrypted_headers) or bool(row.headers),
         "auth_mode": _mcp_auth_mode(row),
         "oauth_scopes": _clean_oauth_scopes(getattr(row, "oauth_scopes", None)),
         "has_oauth_client": bool(getattr(row, "oauth_client_id", None)),
@@ -187,13 +186,13 @@ def _public_tool(row: ChatCustomTool) -> dict:
     }
 
 
-def _public_skill(row: ChatSkill) -> dict:
+def _public_skill(row: ChatSkill, *, include_private: bool = True) -> dict:
     return {
         "id": row.id,
         "scope": row.scope,
         "name": row.name,
         "description": row.description,
-        "instructions": decrypt_chat_content(row.instructions) if row.instructions else "",
+        **({"instructions": decrypt_chat_content(row.instructions) if row.instructions else ""} if include_private else {}),
         "is_active": row.is_active,
         "created_at": _iso(row.created_at),
     }
@@ -502,6 +501,7 @@ async def list_for_user(
     project_id: str,
     active_only: bool = False,
     reveal_secrets: bool = False,
+    include_private: bool = True,
 ) -> list[dict]:
     """사용자용 — 활성 global + 본인 user 스코프.
 
@@ -520,7 +520,10 @@ async def list_for_user(
             if active_only:
                 stmt = stmt.where(model.is_active.is_(True))
             rows = (await session.execute(stmt.order_by(model.id))).scalars().all()
-            return [serialize(r) for r in rows]
+            return [
+                _public_skill(r, include_private=include_private) if kind == "skill" else serialize(r)
+                for r in rows
+            ]
     except OperationalError as exc:
         # 선택적 확장 목록 — 전역 circuit breaker 를 열지 않는다(스키마 미적용/일시 실패가
         # 핵심 채팅(conversations 등)까지 503 으로 블랙아웃시키는 연쇄 방지). 진짜 DB 다운은 핵심 쿼리가 감지.

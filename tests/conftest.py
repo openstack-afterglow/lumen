@@ -1,7 +1,7 @@
 """Isolated Lumen service test fixtures."""
 
 import os
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlsplit
 
 os.environ.setdefault("LUMEN_ENCRYPTION_KEY", "0123456789abcdef" * 4)
@@ -11,6 +11,7 @@ import fakeredis.aioredis
 import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
+from inference_fixtures import synthetic_inference_store  # noqa: F401 — pytest fixture registration
 from starlette.testclient import _TestClientTransport
 
 from lumen.auth import get_os_conn, get_principal, require_token
@@ -18,6 +19,7 @@ from lumen.config import get_settings
 from lumen.main import app
 from lumen.plugins.host import build_host
 from lumen.plugins.registry import get_registry
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services.ssrf import SafeAsyncTransport
 
 
@@ -60,7 +62,7 @@ def _block_live_provider_requests(monkeypatch):
         if (
             os.environ.get("LUMEN_API_BASE_URL") == "http://lumen-api:8012"
             and request.url.scheme == "http"
-            and (host, request.url.port) in {("lumen-api", 8012), ("fake-provider", 8080)}
+            and (host, request.url.port) in {("lumen-api", 8012), ("fake-provider", 8080), ("fake-keystone", 5000)}
         ):
             return
         if host not in {"127.0.0.1", "::1", "localhost"}:
@@ -121,7 +123,7 @@ def _token_info(*, is_system_admin: bool) -> dict[str, object]:
         "username": "testuser",
         "project_id": "test-project-123",
         "project_name": "test-project",
-        "roles": ["admin", "member"] if is_system_admin else ["member"],
+        "roles": ["admin", "member"] if is_system_admin else ["member", *sorted(SERVICE_CAPABILITIES)],
         "is_system_admin": is_system_admin,
     }
 
@@ -157,18 +159,31 @@ async def _client_for(mock_conn, *, is_system_admin: bool):
 
 
 @pytest.fixture
-async def client(mock_conn):
+def current_project_authority(monkeypatch):
+    """Synthetic directory boundary for ordinary route/worker regression tests.
+
+    Opt-in only: authority contract tests exercise the real resolver separately.
+    Credential scopes and production action checks are never bypassed.
+    """
+    lookup = AsyncMock(return_value={"roles": ["member", *sorted(SERVICE_CAPABILITIES)], "is_system_admin": False})
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", lookup)
+    monkeypatch.setattr("lumen.services.mcp_oauth.resolve_project_authority", lookup)
+    return lookup
+
+
+@pytest.fixture
+async def client(mock_conn, current_project_authority):
     async for result in _client_for(mock_conn, is_system_admin=False):
         yield result
 
 
 @pytest.fixture
-async def admin_client(mock_conn):
+async def admin_client(mock_conn, current_project_authority):
     async for result in _client_for(mock_conn, is_system_admin=True):
         yield result
 
 
 @pytest.fixture
-async def non_admin_client(mock_conn):
+async def non_admin_client(mock_conn, current_project_authority):
     async for result in _client_for(mock_conn, is_system_admin=False):
         yield result

@@ -13,8 +13,10 @@ from lumen.config import get_settings
 from lumen.models.batch_contracts import NativeBatchCreateRequest
 from lumen.models.chat_batches import ChatBatchItem
 from lumen.services import batches
-from lumen.services.api_key_store import ApiKeyForbidden
+from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
 from lumen.services.durable_runs import api_completion
+
+pytestmark = pytest.mark.usefixtures("current_project_authority")
 
 
 @pytest.mark.parametrize("key", ["", "a" * 129, "bad\nkey", "é", "\x7f"])
@@ -31,7 +33,7 @@ def test_idempotency_key_hash_is_exact_and_optional_only_for_compat():
 
 
 @pytest.mark.parametrize(("operation", "contract", "body", "required"), [
-    ("chat.completions", "native", {}, ("native:batches:write", "compat:completions:write")),
+    ("chat.completions", "native", {}, ("compat:completions:write", "native:batches:write")),
     ("responses", "openai", {}, ("compat:batches:write", "compat:completions:write")),
     ("images.generations", "openai", {}, ("compat:batches:write", "compat:images:write")),
     ("images.edits", "native", {"source_asset_id": "asset"},
@@ -50,8 +52,13 @@ def test_operation_scope_mapping(operation, contract, body, required):
 
 
 @pytest.mark.parametrize("contract", ["native", "openai"])
-async def test_removing_batch_write_after_admission_blocks_frozen_authority(contract):
+async def test_removing_batch_write_after_admission_blocks_frozen_authority(contract, monkeypatch):
     from lumen.services import api_key_store
+
+    async def current_authority(user_id, project_id):
+        return {"roles": ["member", "lumen-chat_user"], "is_system_admin": False}
+
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
 
     required = batches._scopes("chat.completions", contract, {})
     write = "native:batches:write" if contract == "native" else "compat:batches:write"
@@ -157,12 +164,17 @@ async def test_current_key_authorization_never_falls_back_to_keystone(monkeypatc
 
     monkeypatch.setattr(batches, "_factory", lambda: Session)
     check = AsyncMock(side_effect=ApiKeyForbidden("revoked"))
-    monkeypatch.setattr(batches, "authorize_api_key_in_transaction", check)
-    batch = SimpleNamespace(project_id="p", user_id="u", api_key_id=7)
-    with pytest.raises(batches.BatchInputError) as error:
-        await batches._authorize(batch, ("compat:completions:write",))
-    assert error.value.code == "api_key_unauthorized"
+    monkeypatch.setattr(batches, "current_api_key_scopes", check)
+    batch = SimpleNamespace(project_id="p", user_id="u", api_key_id=7, contract="openai")
+    allowed = await batches._authority(batch)
     assert check.await_args.kwargs["api_key_id"] == 7
+    with pytest.raises(batches.BatchInputError) as error:
+        await batches._prepare(batch, "chat.completions",
+                               {"model": "m", "messages": [{"role": "user", "content": "hi"}]}, allowed)
+    assert error.value.code == "api_key_unauthorized"
+    check.side_effect = ApiKeyAuthorityUnavailable("directory down")
+    with pytest.raises(batches.BatchUnavailable):
+        await batches._authority(batch)
 
 
 async def test_result_jsonl_routes_success_http_failure_and_unknown(monkeypatch):

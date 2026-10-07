@@ -33,7 +33,9 @@ from lumen.services import (
     worker_routing,
 )
 from lumen.services import conversation_store as cs
+from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
 from lumen.services.capabilities import reasoning_can_be_disabled
+from lumen.services.inference_authority import authorize_run_generation, model_required_scopes, native_run_scopes
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
 from lumen.services.message_graph import reachable_message_clause, register_message
 from lumen.services.providers import routing as ps
@@ -1431,6 +1433,32 @@ class _DurableExecutionHooks:
                 return {"_boundary_abort": "provider_result_unknown"}
             if segment.status == "failed":
                 return {"_boundary_abort": "provider_result_unknown"}
+            # Replay/settlement above preserves committed I/O. Only new intent is authorized.
+            scopes = set(native_run_scopes(_payload(run), agent_id=run.agent_id))
+            scopes.update((run.capability_snapshot or {}).get("required_scopes") or ())
+            scopes.update(model_required_scopes(run.capability_snapshot))
+            if endpoint.startswith("tool") or call_id is not None:
+                scopes.add("native:tools:execute")
+            try:
+                if endpoint == "context_compaction":
+                    snapshot = run.capability_snapshot or {}
+                    summary = snapshot.get("summary_route") or snapshot
+                    # Older admitted summary snapshots omitted intrinsic capability metadata.
+                    # Resolve it only for a new intent; committed replay above remains unchanged.
+                    if ("web_search_required" not in (summary.get("capabilities") or {})
+                            and isinstance(summary.get("provider_id"), int)
+                            and isinstance(summary.get("model_id"), int)):
+                        summary = await ps.resolve_model_snapshot(summary)
+                        if summary is None:
+                            raise DurableRunError("context compaction route is unavailable")
+                    await authorize_run_generation(session, run, resolved=summary)
+                else:
+                    await authorize_api_key_in_transaction(session, api_key_id=run.api_key_id,
+                        user_id=run.user_id, project_id=run.project_id, required_scopes=tuple(sorted(scopes)))
+            except ApiKeyForbidden as exc:
+                raise DurableRunInputError("inference_authority_revoked") from exc
+            except ApiKeyAuthorityUnavailable as exc:
+                raise DurableRunError("inference_authority_unavailable") from exc
             if self.requires_credit_reservation:
                 if credit_bound is None:
                     raise DurableRunError("v2 call is missing its bounded credit estimate")

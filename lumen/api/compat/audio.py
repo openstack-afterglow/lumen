@@ -122,7 +122,7 @@ async def transcriptions(
     response_format: str = Form("json"),
     temperature: float = Form(0),
     idempotency_key: uuid.UUID | None = Header(default=None, alias="Idempotency-Key"),
-    principal: Principal = Depends(require_api_key_scopes("compat:audio:write", "native:assets:write")),
+    principal: Principal = Depends(require_api_key_scopes("compat:audio:write")),
 ):
     try:
         unknown = set((await request.form()).keys()) - _TRANSCRIPTION_FIELDS

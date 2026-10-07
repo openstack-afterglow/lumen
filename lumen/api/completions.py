@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
-from lumen.auth import Principal, require_scopes
+from lumen.auth import Principal, ensure_scopes, get_principal, require_scopes
 from lumen.config import get_settings
 from lumen.models.chat_contracts import (
     AgentBudget,
@@ -1284,8 +1284,12 @@ async def resolve_run_interaction(
 
 
 @router.post("/runs/{run_id}/cancel")
-async def cancel_run(run_id: str, token_info: Principal = Depends(require_scopes("native:runs:write"))):
+async def cancel_run(run_id: str, token_info: Principal = Depends(get_principal)):
     try:
+        scopes = await queries.owned_run_cancel_scopes(
+            run_id=run_id, project_id=token_info["project_id"], user_id=token_info["user_id"]
+        )
+        ensure_scopes(token_info, *scopes)
         return await lifecycle.request_cancelled(
             run_id=run_id, project_id=token_info["project_id"], user_id=token_info["user_id"]
         )

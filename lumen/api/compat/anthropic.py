@@ -11,8 +11,9 @@ from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from lumen.auth import require_api_key_scopes
+from lumen.auth import ensure_scopes, require_api_key_scopes
 from lumen.services import completion_api as core
+from lumen.services.inference_authority import completion_scopes
 from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 
 from .streaming import events_with_ping
@@ -160,6 +161,7 @@ async def messages(
     x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider"),
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
+    ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
     try:
         provider = core.select_api_provider(body.provider, x_lumen_provider)
         resolved = await core.resolve_api(body.model, provider=provider)

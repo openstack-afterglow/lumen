@@ -27,7 +27,7 @@ from lumen.services.providers.realtime_protocol import AudioMeter
 from lumen.services.run_store import load_segment_payload
 from lumen.services.usage_breakdown import UsageBreakdown
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
 
 @pytest.mark.parametrize("legacy_snapshot", [False, True])
@@ -346,7 +346,8 @@ async def test_compat_gateways_route_by_wire_transport_not_renamed_selector(monk
 
     async def verify_key(_key):
         return {"user_id": user_id, "project_id": project_id, "api_key_id": None,
-                "scopes": ["compat:realtime:write"]}
+                "scopes": ["compat:realtime:write"], "roles": ["member", "lumen-audio_user"],
+                "is_system_admin": False}
 
     connected = []
 

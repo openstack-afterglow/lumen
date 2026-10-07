@@ -24,6 +24,7 @@ from lumen.api import completions
 from lumen.api import realtime as native
 from lumen.api.compat import realtime as compat
 from lumen.auth import get_principal
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services.durable_runs import realtime as durable_realtime
 from lumen.services.durable_runs.errors import DurableRunNotFound
 from lumen.services.infrastructure.api_load import ApiAdmission, ApiAdmissionMiddleware
@@ -57,11 +58,11 @@ def gateway(monkeypatch):
 
     async def principal():
         return {"user_id": "owner", "project_id": "project", "auth_type": "keystone",
-                "api_key_id": None, "source": "web", "scopes": ()}
+                "api_key_id": None, "source": "web", "scopes": (), "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False}
 
     app.dependency_overrides[get_principal] = principal
     verify = AsyncMock(return_value={"user_id": "owner", "project_id": "project", "api_key_id": 37,
-                                     "scopes": ["compat:realtime:write"]})
+                                     "scopes": ["compat:realtime:write"], "roles": ["member", *SERVICE_CAPABILITIES], "service_system_admin": False})
     create = AsyncMock(return_value={"session_id": _SESSION_ID, "connect_token": "compat-ticket"})
     consume = AsyncMock(side_effect=AssertionError("denial must not consume a ticket"))
     upstream = AsyncMock(side_effect=AssertionError("denial must not connect upstream"))

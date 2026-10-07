@@ -27,7 +27,9 @@ from litellm.exceptions import BadRequestError
 
 from lumen.config import get_settings
 from lumen.services import context_manager, credit, litellm_client, native_compaction
+from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
 from lumen.services.capabilities import reasoning_can_be_disabled
+from lumen.services.inference_authority import authorize_new_io, completion_scopes
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
 from lumen.services.providers.pricing import frozen_token_pricing
@@ -57,6 +59,16 @@ class CompletionError(Exception):
         self.status_code = status_code
         self.message = message
         super().__init__(message)
+
+
+async def _authorize_completion(user_id: str, project_id: str, api_key_id: int | None, request: dict, resolved: dict) -> None:
+    try:
+        await authorize_new_io(user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+                               required_scopes=completion_scopes(request, resolved=resolved))
+    except ApiKeyForbidden as exc:
+        raise CompletionError(403, "inference_authority_revoked") from exc
+    except ApiKeyAuthorityUnavailable as exc:
+        raise CompletionError(503, "inference_authority_unavailable") from exc
 
 
 async def resolve(model: str) -> dict:
@@ -362,6 +374,7 @@ async def complete_once(
 ) -> dict:
     """비스트리밍 완료 — 전체 응답 반환 + 과금. tool_calls 는 릴레이(서버 미실행)."""
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
+    await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
     try:
         invocation = await invoke_chat_once(
             resolved=resolved,
@@ -438,6 +451,7 @@ async def _complete_stream(
       {"type":"error", "message":str}
     """
     text_parts: list[str] = []
+    await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
     final_usage = None
     finish_reason = "stop"
     charged = False
@@ -758,6 +772,7 @@ async def complete_responses(
     options = responses_provider_options(
         _with_passthrough_compaction(options, resolved=resolved, protocol="responses"), resolved=resolved
     )
+    await _authorize_completion(user_id, project_id, api_key_id, options, resolved)
     if not stream:
         try:
             payload = await invoke_responses_once(resolved=resolved, input=input, options=options)
@@ -853,6 +868,7 @@ async def complete_anthropic(
     resolved = billing_route(resolved, messages, protocol="anthropic", options=options)
     event_id = str(uuid.uuid4())
     options = _with_passthrough_compaction(options, resolved=resolved, protocol="anthropic")
+    await _authorize_completion(user_id, project_id, api_key_id, options, resolved)
     try:
         response = await litellm_client.aanthropic_messages(
             model=resolved["model_name"],

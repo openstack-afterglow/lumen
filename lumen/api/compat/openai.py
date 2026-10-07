@@ -16,11 +16,12 @@ from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from lumen.auth import require_api_key_scopes
+from lumen.auth import ensure_scopes, require_api_key_scopes
 from lumen.models.api_requests import OpenAIChatRequest, OpenAIChatResponse
 from lumen.services import completion_api as core
 from lumen.services import openai_compat
 from lumen.services.completion_format import nonstream_response
+from lumen.services.inference_authority import completion_scopes
 from lumen.services.infrastructure.api_load import admit_sse
 from lumen.services.providers import errors, routing
 
@@ -150,6 +151,7 @@ async def chat_completions(
     ),
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
+    ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
     if body.max_tokens is not None and body.max_tokens <= 0:
         return openai_error_response(400, "max_tokens must be positive", code="invalid_max_tokens")
     user_id, project_id = token_info["user_id"], token_info["project_id"]

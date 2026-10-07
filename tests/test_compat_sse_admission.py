@@ -12,6 +12,7 @@ from fastapi import FastAPI
 
 from lumen.api import claude_gateway
 from lumen.api.compat import anthropic, openai, responses
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import api_key_store, openai_compat
 from lumen.services import completion_api as core
 from lumen.services.durable_runs import admission as run_admission
@@ -61,6 +62,7 @@ def harness(monkeypatch):
         if key == "sk-afgl-invalid":
             return None
         return {"user_id": "user", "project_id": "project", "api_key_id": 7,
+                "roles": ["member", *SERVICE_CAPABILITIES], "service_system_admin": False,
                 "credential_kind": "claude_gateway" if key == "sk-afgl-gateway" else "api_key",
                 "scopes": ("models:read",) if key == "sk-afgl-no-scope" else ("compat:completions:write",)}
 

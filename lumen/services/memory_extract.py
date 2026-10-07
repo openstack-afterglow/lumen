@@ -20,6 +20,8 @@ from collections.abc import Mapping
 from lumen.services import conversation_store as cs
 from lumen.services import credit, litellm_client
 from lumen.services import memory_store as ms
+from lumen.services.api_key_store import ApiKeyForbidden
+from lumen.services.inference_authority import authorize_run_generation_by_id
 from lumen.services.providers import routing as ps
 
 logger = logging.getLogger(__name__)
@@ -150,7 +152,7 @@ async def generate_memory_if_applicable(
     run_id: str,
     user_id: str,
 ) -> list[dict] | None:
-    """Return validated deltas; only no-model/malformed output is a terminal no-op."""
+    """Return validated deltas; unconfigured models, denied authority and malformed output skip extraction."""
     try:
         resolved = await ps.resolve_memory_model()
     except Exception as exc:
@@ -197,6 +199,11 @@ async def generate_memory_if_applicable(
     ]
     model = resolved["model_name"]
 
+    try:
+        await authorize_run_generation_by_id(run_id=run_id, user_id=user_id, project_id=project_id, resolved=resolved)
+    except ApiKeyForbidden:
+        # Optional post-response work must not retry forbidden inference or alter the completed chat.
+        return None
     try:
         response = await litellm_client.acompletion(
             model,

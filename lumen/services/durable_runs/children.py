@@ -198,6 +198,7 @@ def _child_payload(parent_payload: dict[str, Any], agent: dict[str, Any], call: 
         "v2_max_model_turns": prepared["policy"].max_model_turns,
         "v2_max_tool_calls": prepared["policy"].max_tool_calls,
         "lumen_snapshot": None,
+        "required_scopes": ["native:runs:write", "native:agents:use", "native:tools:execute"],
         "delegation": {"call_id": call.call_id, "access": call.access, "fingerprint": call.fingerprint()},
     }
 

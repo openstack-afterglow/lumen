@@ -57,10 +57,11 @@ class TestCreateAndList:
             return [_public()]
 
         monkeypatch.setattr(ags, "list_agents", fake_list)
-        resp = await client.get(_URL)
+        resp = await client.get(f"{_URL}?include_private=true")
         assert resp.status_code == 200
         assert captured["user_id"] == "test-user-123"
         assert captured["project_id"] == "test-project-123"
+        assert captured["include_private"] is True
 
     async def test_list_graceful_empty_on_storage_unavailable(self, client, monkeypatch):
         """저장소 미가용/데이터 없음은 503 이 아니라 빈 목록(200)으로 degrade."""

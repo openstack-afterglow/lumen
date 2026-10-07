@@ -4,7 +4,7 @@
 
 ## 인증과 scope
 
-Keystone token은 Native route에서 user 권한으로 통과하며, API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat 호환 route (`/v1/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API Key만 허용하며 Keystone Token 사용 시 401을 반환한다. 한 요청에 `X-API-Key`, `Authorization`, `X-Auth-Token` 중 둘 이상을 보내면 400이다. 단, 동일한 API key를 `X-API-Key`와 `Authorization: Bearer`로 중복 전달한 경우(Claude Code의 기본 동작)는 두 값이 일치할 때만 허용한다. API key의 `X-Project-Id`는 key owner project와 같아야 한다. `X-Lumen-Provider`는 관리자 설정 `api_provider` 선택자이며 body `provider`와 충돌하면 400이다. 모델 ID의 transport prefix를 선택자의 alias나 추가 충돌 조건으로 해석하지 않는다.
+Keystone token과 API key는 모두 현재 enabled owner/project 및 effective Keystone role-ID graph의 service action을 요구한다. Parent 이름이나 token role snapshot은 권한의 대체재가 아니고 graph edge 제거는 다음 요청 및 새 provider I/O에 적용된다. API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat text route (`/v1/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API key만 허용하며 Keystone token 사용 시 401이다. 한 요청에 credential 둘 이상을 보내면 400이나 동일한 key의 `X-API-Key` + Bearer 중복은 허용한다. API key의 `X-Project-Id`는 key owner project와 같아야 한다. `X-Lumen-Provider`는 관리자 설정 `api_provider` 선택자이며 body `provider`와 충돌하면 400이다. Transport prefix를 선택자 alias로 해석하지 않는다.
 
 | Surface | API-key scope | Keystone only |
 | --- | --- | --- |
@@ -13,16 +13,23 @@ Keystone token은 Native route에서 user 권한으로 통과하며, API Key는 
 | conversations read/write | `native:conversations:read` / `native:conversations:write` | 아니오 |
 | native run read/write | `native:runs:read` / `native:runs:write` | 아니오 |
 | `GET /v1/runs/{id}/children` | `native:runs:read` (same user/project parent) | 아니오 |
-| custom tools, MCP, skills read/write | `native:extensions:read` / `native:extensions:write` | OAuth start 제외 |
-| memory read/write | `native:memory:read` / `native:memory:write` | 아니오 |
+| custom tools/skills read/config/delete; MCP config | `native:extensions:read` / `native:extensions:write` / `native:extensions:delete`; MCP `native:mcp:write` | OAuth start만 Keystone-only |
+| memory read/write/delete | `native:memory:read` / `native:memory:write` / `native:memory:delete` | 아니오 |
 | usage endpoints | `usage:read` | 아니오 |
 | Native image/audio/realtime admission | `native:images:write` / `native:audio:write` / `native:realtime:write`; edit/transcribe also `native:assets:read` | 아니오 |
-| Compat images/audio/realtime | `compat:images:write` / `compat:audio:write` / `compat:realtime:write`; multipart edit/transcribe also `native:assets:write` | API key만 허용 |
+| Compat images/audio/realtime | `compat:images:write` / `compat:audio:write` / `compat:realtime:write`; inline edit/transcribe upload는 별도 asset-editor 불필요 | API key만 허용 |
 | Native Batch | read `native:batches:read`; create/cancel `native:batches:write` plus each item operation scope (chat/Responses `compat:completions:write`, images `native:images:write`, audio `native:audio:write`, source asset `native:assets:read`) | 아니오 |
-| Compat Files/Batches | files `compat:files:read` / `compat:files:write`; batches `compat:batches:read` / `compat:batches:write` plus endpoint scope (`compat:completions:write` or `compat:images:write`) | API key만 허용 |
-| `/v1/api-keys`, `/v1/admin/*`, agents/workspaces/code/Git CRUD | 없음 | 예 |
+| Compat Files/Batches | files `compat:files:read` / `compat:files:write` / `compat:files:delete`; batches `compat:batches:read` / `compat:batches:write` plus endpoint scope (`compat:completions:write` or `compat:images:write`) | API key만 허용 |
+| agents and code/Git management | `native:agents:read` / `native:agents:write` / `native:agents:delete` (private detail/clone/config uses write) | 아니오 |
+| workspaces | `native:conversations:read` / `native:conversations:write` / `native:conversations:delete` | 아니오 |
+| `/v1/api-keys` / owner limits / revoke | internal route actions `native:keys:read|write|delete` (not issuable key scopes) | 예 |
+| `/v1/admin/*` | verified effective system `admin`, not tenant/domain admin | 예 |
 
-API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만 위 별도 media route는 해당 media scope로 실행한다. `memory=true`는 memory read+write, tool/managed tool/custom/MCP 선택은 `native:tools:execute`, skill/custom/MCP selection은 extensions read, `agent_id`는 `native:agents:use`를 추가로 요구한다. 누락 scope는 403이다.
+Scope는 current owner leaf와 교집합으로만 사용할 수 있다. 발급은 `lumen-keys_editor`와 requested scope 전체의 subset을 요구하며 default `models:read, compat:completions:write`도 자동 확대되지 않는다. Reader는 inventory/history, chat-user는 text generation, images-user는 image generation, audio-user는 finite/realtime audio, tools-user는 tool/skill/agent/provider search execution을 각각 허용한다. Config는 assets/agents/MCP/keys editor leaf, history/memory write/delete는 history-editor, resource/file/asset/extension/agent/key destruction은 resources-admin으로 분리된다. 실제 mapping은 `lumen/service_authority.py`의 단일 `SCOPE_CAPABILITIES`를 따른다. Nonreader action은 effective native `member`도 필요하며 `reader` baseline은 read-only다.
+
+API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만 별도 media route는 해당 media action으로 실행한다. `memory=true`는 memory read만 요구하며 automatic extraction에 history-editor를 재요구하지 않는다. Client function schemas(`tool_choice="none"` 포함), managed/stored/plugin/skill/MCP/agent 및 intrinsic model search는 independent `native:tools:execute`를 요구한다. Agent selection은 `native:agents:use`를, generated output modalities는 matching image/audio scope를 추가한다. Missing action은 403, revoked/no-effective-scope key는 401, current directory unavailable은 503이다. 이미 시작한 provider I/O의 회수/checkpoint replay/정산은 보존한다.
+
+`POST /v1/runs/{id}/cancel`은 ownership을 먼저 검사(다른 owner 404)한 뒤 frozen primary operation의 native/compat image/audio/realtime 또는 text generation scope를 요구한다. Image-only owner는 chat/editor/tool 권한 없이 자신의 image run을 반복 취소할 수 있지만 text run은 취소할 수 없다. Repeated terminal cancel은 동일 persisted descriptor다. Batch cancel은 각 owned item primary operation도 함께 요구한다. 2026-10-07 isolated real API/worker/MariaDB HTTP smoke 16건으로 subset/downgrade/native+compat bounds/revocation 및 persistent cancel을 실행했다. Identity와 provider는 synthetic이며 production/paid-provider 증거는 아니다.
 
 ## 주요 route matrix
 
@@ -37,15 +44,15 @@ API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만
 | Media | Native `POST /v1/chat/images/generations`, `/edits`, `/v1/chat/audio/speech`, `/transcriptions`, `/v1/chat/realtime/sessions`; native realtime `WS /v1/chat/realtime/sessions/{session_id}/ws`; compat `POST /v1/images/generations`, `/edits`, `/v1/audio/speech`, `/transcriptions`; API-key-only `WS /v1/realtime`, `/v1beta/realtime` |
 | Batch | Native `POST/GET /v1/chat/batches`, `GET /v1/chat/batches/{id}`, `GET /v1/chat/batches/{id}/items`, `POST /v1/chat/batches/{id}/cancel`; compat `POST/GET /v1/files`, `GET/DELETE /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, `POST/GET /v1/batches`, `GET /v1/batches/{batch_id}`, `POST /v1/batches/{batch_id}/cancel` |
 | Extensions | `GET/POST/PATCH/DELETE /v1/custom-tools`, `/v1/mcp-servers`, `/v1/skills`; OAuth status/disconnect; OAuth start is Keystone-only |
-| Installed plugins | `GET /v1/admin/plugins`; `GET/POST/PATCH/DELETE /v1/admin/plugin-bindings` (Keystone admin); `GET/POST/PATCH/DELETE /v1/plugin-bindings` (`native:extensions:read|write`, selected user-configurable exports only). Binding routes configure approved wheel exports; no HTTP wheel installer. |
+| Installed plugins | `GET /v1/admin/plugins`; `GET/POST/PATCH/DELETE /v1/admin/plugin-bindings` (verified system admin); `GET/POST/PATCH/DELETE /v1/plugin-bindings` (`native:extensions:read|write|delete`, selected user-configurable exports only). Inventory omits private config unless editor-authorized `include_private=true`; no HTTP wheel installer. |
 | Agent runtime | `GET/PUT /v1/admin/agent-project-quotas/{project_id}`, `GET /v1/admin/runtime-pools`, `GET /v1/admin/runtime-resources` (Keystone admin); `GET /v1/runs/{run_id}/children` (owner and `native:runs:read`). Controller bootstrap/dispatch is a **separate internal HTTPS listener**, not a public `/v1` route. |
 | MCP connector bundles | `GET /v1/admin/mcp-bundles`, `POST /v1/admin/mcp-bundles/{slug}/install` (`require_admin`). Slugs are `notion` and `github`. Install materializes a `scope="global"` MCP source and is idempotent by destination: a second call returns the existing row with `created=false` and never rewrites it, because rewriting bumps `config_version` and revokes every user's OAuth connection. Bundles carry no credential; each user then authorizes through the existing `/v1/mcp-servers/{id}/oauth` flow. An installed connector a user has not connected is silently absent from that user's runs rather than warning on each one. |
 | Memory/usage | `GET/POST /v1/memories`, `GET /v1/memories/document`, search, patch/delete; `GET /v1/usage`, `/keys`, `/timeseries`, `/records` |
-| Keystone-only management / scoped assets | `/v1/api-keys`, `/v1/api-keys/{key_id}/limits`, `/v1/admin/api-keys`, `/v1/admin/api-keys/{key_id}/limits`, `/v1/agents`, `/v1/workspaces`, `/v1/code-workspaces`, `/v1/git-credentials`, `/v1/admin/*`는 Keystone 관리 route. `/v1/assets`는 owner-scoped `native:assets:read|write` API key로도 허용 |
+| Keystone-only key/admin management / scoped resources | `/v1/api-keys`, owner limits와 `/v1/admin/*`는 Keystone-only. Agent/workspace/code/Git 및 `/v1/assets`는 해당 service action과 owner scope를 요구하며 API key도 stored scope와 current leaf가 모두 있어야 함 |
 
 ## Batch API
 
-`batch_enabled=false`가 기본값이며 이때 모든 Batch/Files route는 503 `batch_unavailable`이다. 새 scope 6개는 발급 가능하지만 `DEFAULT_API_KEY_SCOPES`에는 추가되지 않는다. 두 계약은 같은 `chat_batches` 원장과 기존 durable run/hold/usage ledger를 사용한다. 항목 실행은 batch-only worker의 일반 claim을 거치고, provider 호출은 한 번만 한다. 불명확한 결과는 `unknown`으로 남으며 자동 재호출하지 않는다. Upstream provider의 Batch API나 할인은 사용하지 않고 frozen Lumen 가격으로 정산한다.
+`batch_enabled=false`가 기본값이며 이때 모든 Batch/Files route는 503 `batch_unavailable`이다. Batch/Files scope는 발급 가능하지만 `DEFAULT_API_KEY_SCOPES`에는 추가되지 않는다. 두 계약은 같은 `chat_batches` 원장과 기존 durable run/hold/usage ledger를 사용한다. 항목 실행은 batch-only worker의 일반 claim을 거치고, provider 호출은 한 번만 한다. 불명확한 결과는 `unknown`으로 남으며 자동 재호출하지 않는다. Upstream provider의 Batch API나 할인은 사용하지 않고 frozen Lumen 가격으로 정산한다.
 
 **Native mixed Batch.** `POST /v1/chat/batches`는 `{items:[{custom_id, operation, body}], completion_window:"24h", metadata}`를 받는다. `operation`은 `chat.completions|responses|images.generations|images.edits|audio.speech|audio.transcriptions`이고 한 batch에서 섞을 수 있다. `Idempotency-Key`는 1–128 printable ASCII로 필수다(위반 422). 같은 key와 같은 요청은 원래 descriptor를 202로 반환하고 다른 요청은 409다. Body는 JSON parse 전에 `batch_native_max_bytes`(기본 10 MiB, 초과 413 `request_too_large`), 항목 수는 item 검증 전에 `batch_native_max_items`(기본 1,000, 초과 422 `too_many_items`)로 막는다. 응답 descriptor는 `id,status,created_at,expires_at,request_counts,metadata,links(self,items,cancel),errors`다. `GET /v1/chat/batches?after=<id>&limit=`(기본 20, 최대 100)는 최신순 `{batches,next_cursor}`를 반환한다. `GET .../items?after=<ordinal>&limit=`(기본 100, 최대 1,000)는 `custom_id,ordinal,operation,run_id,status,response,error,settlement_status`를 반환한다. Text 결과는 provider response body, image는 `{"data":[{"asset_id","mime_type","size_bytes"}]}`, speech는 asset reference, transcription은 `{"text","segments"?}`다. 항목 상태는 `pending|queued|running|completed|failed|cancelled|expired|unknown`이다. Cancel은 202 descriptor를 반환한다. Realtime, virtual `model=lumen`, streaming, provider built-in/server tool과 사용자 승인 대기는 허용하지 않는다. Function tool call 결과는 그대로 반환한다.
 
@@ -185,7 +192,7 @@ Managed advisor cache 단가도 같은 manual→direct catalog→text write casc
 
 ## API 키와 월·주간 사용 한도
 
-API 키 발급 및 한도 관리는 Keystone token 인증 전용(Keystone-only)이다. API 키 헤더(Bearer/X-API-Key)로 관리 route 호출 시 401 Unauthorized를 반환한다.
+API 키 발급·목록·이름·owner 한도 관리는 Keystone-only이며 current `lumen-keys_editor`가 필요하다. Requested scope는 current owner action의 subset이어야 하며 기본값도 예외가 아니다. `DELETE /v1/api-keys/{key_id}`는 current `lumen-resources_admin`과 ownership을 요구하고 row/ledger를 삭제하지 않고 revoke한다. API-key credential로 key management를 호출하면 401이다. `/v1/admin/api-keys*`는 verified effective system admin만 허용한다. Local seed는 실제 owner ID/directory credential을 필요로 하고 owned stale key rotation에도 delete action을 검사한다.
 
 ### API 키 관리 route
 

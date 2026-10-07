@@ -153,6 +153,8 @@ async def create_batch(
     )
     item_scopes = {scope for item in payload.items for scope in batch_item_scopes(item.operation, contract="native")}
     ensure_scopes(principal, *item_scopes)
+    ensure_scopes(principal, *(scope for item in payload.items
+        for scope in batch_service._scopes(item.operation, "native", item.body)))
     try:
         view, _created = await batch_service.create_native_batch(
             project_id=principal["project_id"],
@@ -236,6 +238,11 @@ async def cancel_batch(batch_id: str, principal: Principal = Depends(require_sco
     """Record durable cancel intent; running items get the bounded result-recovery grace."""
     batch_enabled_or_503()
     try:
+        scopes = await batch_service.owned_cancel_scopes(
+            project_id=principal["project_id"], user_id=principal["user_id"],
+            batch_id=_batch_uuid(batch_id), contract="native",
+        )
+        ensure_scopes(principal, *scopes)
         view = await batch_service.cancel_batch(
             project_id=principal["project_id"],
             user_id=principal["user_id"],

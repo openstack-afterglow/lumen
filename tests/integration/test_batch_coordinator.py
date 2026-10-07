@@ -34,7 +34,7 @@ from lumen.services.providers import routing
 from lumen.services.run_store import claim_queued_run, complete_segment_io
 from lumen.services.worker_routing import use_read_committed
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
 
 def dump_segment_payload(payload: dict) -> str:
@@ -205,6 +205,25 @@ async def test_openai_invalid_jsonl_fails_without_materializing(batch_db, monkey
         assert await session.scalar(select(func.count()).select_from(ChatRun).where(ChatRun.batch_id == view.id)) == 0
 
 
+@pytest.mark.parametrize("rows", [2, 3])
+async def test_openai_row_cap_boundary(batch_db, monkeypatch, rows):
+    db = batch_db
+    monkeypatch.setattr(get_settings(), "batch_jsonl_max_rows", 2)
+    view = await db.openai(await db.input_file())
+    lines = [batch_files.InputLine(start_byte=index, raw=json.dumps({
+        "custom_id": f"row-{index}", "method": "POST", "url": "/v1/chat/completions",
+        "body": {"model": "absent-" + uuid4().hex, "messages": [{"role": "user", "content": "hi"}]}}).encode())
+        for index in range(rows)]
+
+    async def read_chunk(**_kwargs):
+        return batch_files.InputChunk(lines=lines, next_byte=rows, eof=True)
+
+    monkeypatch.setattr(batch_files, "read_input_chunk", read_chunk)
+    await db.tick()
+    capped = [error for error in (await db.get(view.id, "openai")).errors if error["code"] == "too_many_items"]
+    assert capped == ([] if rows == 2 else [{"code": "too_many_items", "message": "Invalid batch input", "line": 3}])
+
+
 async def test_batch_project_windows_and_deterministic_materialization(batch_db):
     db = batch_db
     first, _ = await db.create(5)
@@ -251,6 +270,46 @@ async def test_cancel_commit_fences_a_waiting_claim(batch_db):
     await db.tick(4)
     assert (await db.get(view.id)).status == "cancelled"
     assert all(item.state == "cancelled" for item in await db.items(view.id))
+
+
+async def test_cancel_of_large_unstarted_batch_finishes_in_bounded_steps(batch_db, monkeypatch):
+    # A 50,000-row cancel must fit the cancel window; one projection step per item page did not.
+    db = batch_db
+    monkeypatch.setattr(get_settings(), "batch_validation_chunk_rows", 100)
+    view, _ = await db.create(250)
+    await db.tick(3)
+    assert (await db.get(view.id)).status == "in_progress"
+    await batches.cancel_batch(project_id=db.project_id, user_id=db.user_id, batch_id=view.id, contract="native")
+    await db.tick(2)
+    final = await db.get(view.id)
+    assert final.status == "cancelled" and final.counts["cancelled"] == 250
+    page, _ = await batches.list_batch_items(project_id=db.project_id, user_id=db.user_id, batch_id=view.id,
+                                             after=None, limit=1000)
+    assert len(page) == 250
+    assert all(item.run_id is None and item.status == "cancelled" and item.response is None
+               and item.error == {"code": "batch_cancelled", "message": "batch cancelled"}
+               and item.settlement_status == "none" for item in page)
+
+
+@pytest.mark.parametrize("authorized", [True, False])
+async def test_validation_resolves_owner_authority_once_per_chunk(batch_db, current_project_authority,
+                                                                   monkeypatch, authorized):
+    # Per-row resolution turned one 50,000-row file into ~50,000 directory lookups.
+    db = batch_db
+    monkeypatch.setattr(get_settings(), "batch_validation_chunk_rows", 100)
+    if not authorized:
+        current_project_authority.return_value = {"roles": ["member"], "is_system_admin": False}
+    view, _ = await db.create(5)
+    before = current_project_authority.await_count
+    await db.tick()
+    assert current_project_authority.await_count - before == 1
+    final = await db.get(view.id)
+    if authorized:
+        assert final.status == "in_progress" and final.counts["total"] == 5
+    else:
+        assert final.status == "failed"
+        assert [error["code"] for error in final.errors] == ["api_key_unauthorized"] * 5
+        assert all(item.run_id is None for item in await db.items(view.id))
 
 
 async def test_expiry_of_never_started_items(batch_db):

@@ -66,6 +66,9 @@ async def execute_tool(name: str, args: dict, ctx: ToolContext) -> str:
 
     if name not in {"list_my_conversations", "get_conversation_detail"}:
         return f"알 수 없는 툴입니다: {name}"
+    from lumen.services.inference_authority import authorize_tool_dispatch
+
+    await authorize_tool_dispatch(ctx)
     try:
         binding = await bind_default_tool(name, execution_context(ctx))
         allowed = binding.definition.input_schema.get("properties", {})

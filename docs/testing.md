@@ -112,6 +112,33 @@ Admission 회귀는 auth/schema 전후 거절 순서, HTTP/SSE/WS capacity, actu
 
 50k smoke에서 관찰된 shutdown AttributeError는 `redis==5.0.0`에 없는 `Redis.aclose` 호출이었다. Dependency를 바꾸거나 예외를 숨기지 않고 pinned async `close()`로 교체했다. 실제 QA Redis의 `CLIENT LIST`로 두 번의 PING→cache shutdown에서 own named connection이 각각 1→0으로 사라지고 새 client를 다시 열 수 있음을 관찰했다. Canonical system run은 이 단일 cache fix보다 앞선 source였으며 cache shutdown 증거는 별도 실제 Redis smoke다.
 
+#### Local acceptance 4–7 (2026-10-07)
+
+**50,000-row load.** Real Uvicorn API, online text, online media, batch-only workers, MariaDB/Redis, HTTPS MinIO와 ClamAV를 사용했다. 111,938,890-byte JSONL(SHA-256 `0110da90…4519`)은 1.78초에 업로드·생성됐고, 100행 단위 validation으로 617초 뒤 `in_progress`가 됐다. 같은 입력의 두 번째 validation은 635초였다. Coordinator worker RSS 증가는 validation 중 +14.9 MB, cancel/finalize 중 +37.7 MB로 128 MiB 이하였다. Batch window 8, project window 32, batch registration live lease 4(capacity 4), project DB connection 최대 16을 넘지 않았다. 부하 중 online `model=lumen` chat은 0.31초, TTS는 0.62초에 완료됐다. TTS 결과는 24 kHz mono PCM WAV 24,000 frame이며 각 run은 자기 online text/media registration이 claim했다. macOS는 `RLIMIT_AS`를 낮출 수 없어 media inspector가 fail-closed한다. 그래서 online media worker만 직전 canonical system run이 build한 Linux arm64 worker image(`sha256:3a2ba573…777d`, 아래 cancel 수정 이전 source)를 host network로 실행했다. 이 smoke에서 media RSS 값은 Docker CLI의 값이다.
+
+**Cancel window defect.** 첫 50k cancel은 cancelling→cancelled까지 650초가 걸려 600초 grace를 넘었다. 원인은 materialize되지 않은 항목도 coordinator step당 100개씩 개별 freeze한 것이다. `test_cancel_of_large_unstarted_batch_finishes_in_bounded_steps`는 MariaDB snapshot isolation ON/OFF 모두 `cancelling`으로 실패했다. Run/hold가 없는 항목을 lock된 batch lease 안에서 5,000개씩 set-based freeze하도록 고친 뒤 coordinator/file-GC integration 42 passed였다. 수정 뒤 새 50k batch는 실행 중 항목 포함 68.4초에 cancelled됐다. Output 4행(200), error 49,996행(`batch_cancelled` 49,992, queued run `canceled_by_user` 4)과 completed run 4개의 settled hold 4개·distinct ledger event 4개가 일치했다.
+
+**Crash and authority boundaries.** 실제 API, online coordinator와 batch worker, fake Keystone/OpenAI process를 사용했다. Worker는 `api_completion` segment start, checkpoint, settle 경계에서 SIGKILL하고 수정하지 않은 worker가 lease 만료 뒤 복구했다. Before-I/O는 POST 1회와 ledger 1행으로 완료했다. Intent 뒤(0 POST)나 응답 뒤 checkpoint 전(1 POST)은 재추론 없이 `unknown`/`provider_result_unknown`과 hold를 유지했다. Checkpoint 뒤는 추가 POST 없이 `run:<id>` ledger 1행과 settled hold, ledger 뒤는 terminal publish만 수행했다. 그 뒤 worker를 다시 시작해도 count가 변하지 않았다. 3초 grace cancel은 item을 unknown으로 동결했고 늦은 checkpoint는 한 번 정산됐지만 발행된 item snapshot은 바뀌지 않았다. HTTP owner read 200, 타 project token 404, batch scope 없는 key 403을 확인했다. Materialize 뒤 key revoke는 401과 `api_key_unauthorized`, POST/hold/ledger 0이었다. Run 0개인 online worker는 coordinator auxiliary step 동안 SIGTERM 후에도 drain ack 없이 살아 있었고 step 해제 뒤 ack·exit 0했다.
+
+**Packaging/render.** `lumen-0.6.3-py3-none-any.whl`(SHA-256 `fcfca5c6…b3a1`)를 clean 설치하자 shared Kolla role 23개 파일이 wheel bytes와 일치했다. 설치된 role과 고정 upstream `stable/2025.1` HAProxy hook으로 Ansible render 12 case를 실행했다. 대상은 VIP 없음·IPv4·IPv6, dedicated/shared frontend, plaintext/TLS였다. VIP가 있으면 internal/public backend가 모두 dynamic member로 바뀌고 없으면 inventory를 유지했다. `/v1/ready`와 connect/client/server/tunnel timeout도 확인했다. 실제 HAProxy 3.0.29 linux/arm64 `-c`는 12/12 통과했다. 설치된 precheck CLI 14 case도 통과했다. Upstream hook은 고정 fixture이며 operator Kolla나 live rollout 증거가 아니다.
+
+**Guest release.** `tests/test_nova_guest_release.py`는 floating/noncanonical 입력, unpinned build input, fork/PR ref·reviewer 정책·draft/tag mismatch·builder 누락·PR-only/failed CI와 artifact tampering 거부를 검사한다. Guest artifact test와 함께 65 passed였다. 실제 `qemu-img`로 만든 빈 qcow2 네 개에 `release.py verify-bundle`을 실행해 통과를 확인했다. 같은 묶음의 checksum을 non-portable path로 바꾸면 exit 1로 거부했다. `actionlint`는 workflow를 통과했다. Guest image build, Glance, Nova boot와 GitHub publication은 실행하지 않았다.
+
+**Final gates.** 모든 수정 뒤 `uv run --locked --extra service --extra dev lumen-test contract -q`에서 service 3,033 passed/304 deselected, SDK 128 passed, root/SDK Ruff 통과였다. 일회용 `lumen-test integration`은 274 passed, canonical `lumen-test system`은 30 passed(57.94초)였다. `nova-guest.yml`은 workflow_dispatch 전용이며 push/PR `docker-build.yml`→`ci.yml` 경로와 cache는 바꾸지 않아 CI timing 기준선은 재측정하지 않았다.
+
+
+### Scoped authority integration (2026-10-07)
+
+The permanent `tests/system/test_service_role_authority.py` scenarios use real API/online and batch-only worker processes, MariaDB/Redis, TLS MinIO and ClamAV. Only Keystone directory HTTP and upstream inference HTTP are synthetic. Scope-subset issuance, current inference-edge loss and revocation are asserted against HTTP status plus upstream request counts; native text/image completion, decoded finite audio and owned/idempotent media cancellation have persisted consumer assertions. The queued worker-denial cases copy an already HTTP-admitted frozen image request into offline-pool SQL fixtures, then release them after downgrade/revoke: this proves worker authority before provider I/O, not a second public admission.
+
+Run the canonical layers with a disposable project, never the operator's development project:
+
+```sh
+LUMEN_TEST_COMPOSE_PROJECT=lumen-rolegrades-20261006 uv run --frozen --extra service --extra dev lumen-test integration -q --tb=short
+LUMEN_TEST_COMPOSE_PROJECT=lumen-rolegrades-20261006 uv run --frozen --extra service --extra dev lumen-test system -q --tb=short
+```
+
+Both runners tear down their selected project's volumes. These local proofs do not establish production Keystone authorization, real provider output/billing, cloud workers or deployment. Docker multiarchitecture build/import checks are separate: importing `lumen.worker` is not worker execution evidence.
 
 
 ### 실제 Codex CLI 확인

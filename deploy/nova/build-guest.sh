@@ -82,6 +82,6 @@ export DIB_APT_LOCAL_CACHE=0
 disk-image-create --offline --no-tmpfs -a "$arch" -t qcow2 -o "${output%.qcow2}" \
     ubuntu vm block-device-efi lumen-guest
 [[ -s $output ]] || fail "DIB did not emit a qcow2 image"
-sha256sum "$output" > "$output.sha256"
+(cd "$(dirname "$output")" && sha256sum "$(basename "$output")" > "$(basename "$output").sha256")
 python3 "$root/artifact.py" build-manifest --staging "$staging" --output "$output"
 printf 'Guest artifact: %s\n' "$output"

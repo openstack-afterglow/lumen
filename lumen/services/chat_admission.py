@@ -226,6 +226,7 @@ def _feature_route_snapshot(route: dict[str, Any], *, purpose: str) -> dict[str,
         )
     if purpose == "summary":
         capabilities = route.get("capabilities")
+        snapshot["capabilities"] = {"web_search_required": (capabilities or {}).get("web_search_required") is True}
         context_limit = route.get("context_limit")
         if context_limit is None and isinstance(capabilities, dict):
             context_limit = capabilities.get("context_limit")
@@ -701,19 +702,20 @@ def _require_native_admission_scopes(
     plugin_skill_snapshots: list[dict],
     agent: dict | None,
     extension_selection: dict[str, list[dict[str, object]]],
+    resolved: dict | None = None,
 ) -> None:
     """Fail closed against materialized native-run defaults; never downgrade a key's request."""
-    if token_info["auth_type"] != "api_key":
-        return
-    if execution_mode != "chat" or any(part.type != "text" for part in parts):
+    if token_info["auth_type"] == "api_key" and (execution_mode != "chat" or any(part.type != "text" for part in parts)):
         raise HTTPException(status_code=403, detail="API 키 native run은 text chat만 지원합니다")
 
-    required: set[str] = set()
+    from lumen.services.inference_authority import model_required_scopes
+
+    required: set[str] = set(model_required_scopes(resolved))
     if features.memory:
-        required.update(("native:memory:read", "native:memory:write"))
+        required.add("native:memory:read")
     agent_skill_ids = agent.get("skill_ids") if agent else None
     if skill_ids or agent_skill_ids or plugin_skill_snapshots:
-        required.add("native:extensions:read")
+        required.update(("native:extensions:read", "native:tools:execute"))
     if plugin_tool_snapshots:
         required.update(("native:extensions:read", "native:tools:execute"))
     selected_extensions = extension_selection["tools"] or extension_selection["mcp"]
@@ -721,13 +723,17 @@ def _require_native_admission_scopes(
         required.update(("native:extensions:read", "native:tools:execute"))
     if (
         features.tool_policy.mode != "none"
-        or (features.web_search.enabled and features.web_search.mode == "managed")
+        or features.web_search.enabled
         or features.web_fetch.enabled
         or features.advisor.enabled
     ):
         required.add("native:tools:execute")
-    if agent is not None:
-        required.add("native:agents:use")
+    if agent is not None or execution_mode != "chat":
+        required.update(("native:agents:use", "native:tools:execute"))
+    if set(features.output_modalities) & {"image", "video"}:
+        required.add("native:images:write")
+    if set(features.output_modalities) & {"audio", "video"}:
+        required.add("native:audio:write")
     ensure_scopes(token_info, *required)
 
 
@@ -740,8 +746,7 @@ def _require_context_read_scopes(
     plugin_skill_snapshots: list[dict],
 ) -> None:
     """Check read-only context admission scopes without requiring execution or write grants."""
-    if token_info["auth_type"] != "api_key":
-        return
+    # Context selections remain role-gated for both session and API-key callers.
     required: set[str] = set()
     if features.tool_policy.mode != "none":
         required.add("native:extensions:read")
@@ -1107,6 +1112,11 @@ async def prepare_context_input(
             if temp_thread_id is not None:
                 raise HTTPException(status_code=503, detail="temporary chat history is unavailable") from exc
             raise HTTPException(status_code=422, detail="context source is invalid") from exc
+    history_scopes = []
+    if source.get("messages") or source.get("message_ids"):
+        history_scopes = ["native:conversations:read" if conversation_id is not None else "native:runs:read"]
+        if token_info is not None:
+            ensure_scopes(token_info, *history_scopes)
 
     agent = await _resolve_agent(agent_id, user_id, project_id)
     frozen_budget = (
@@ -1148,6 +1158,7 @@ async def prepare_context_input(
                 extension_selection=extension_selection,
                 plugin_tool_snapshots=plugin_tool_snapshots,
                 plugin_skill_snapshots=plugin_skill_snapshots,
+                resolved=resolved,
             )
 
     feature_routes = await _resolve_feature_routes(features)
@@ -1199,6 +1210,18 @@ async def prepare_context_input(
         parts=parts,
     )
     capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
+    from lumen.services.inference_authority import model_required_scopes, native_run_scopes
+
+    capability_snapshot["required_scopes"] = list(native_run_scopes({
+        "features": features.model_dump(mode="json", by_alias=True),
+        "input_parts": [part.model_dump(mode="json", by_alias=True) for part in parts],
+        "extension_snapshot": extension_selection,
+        "plugin_tool_snapshots": plugin_tool_snapshots,
+        "skill_snapshot": skill_snapshot,
+        "execution_mode": execution_mode,
+        "context_source": source,
+        "required_scopes": [*history_scopes, *model_required_scopes(resolved)],
+    }, agent_id=(agent or {}).get("id")))
     if plugin_tool_snapshots or plugin_skill_snapshots:
         capability_snapshot["required_plugin_digest"] = get_registry().digest
 

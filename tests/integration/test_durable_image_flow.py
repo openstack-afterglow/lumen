@@ -26,7 +26,7 @@ from lumen.services.run_store import claim_queued_run
 from lumen.services.usage_breakdown import ModalityTokens, UsageBreakdown
 from lumen.services.worker_routing import use_read_committed
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
 # Tiny valid PNG. The scanner/object-store boundary is replaced, not the owned asset ledger.
 _PNG = base64.b64decode(

@@ -14,6 +14,7 @@ from lumen.models.chat_contracts import ChatRunDescriptor, validate_user_input_p
 from lumen.models.chat_db import ChatConversation, ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatRunProvider, ChatTempThread
 from lumen.services import worker_routing
+from lumen.services.inference_authority import native_run_scopes
 from lumen.services.message_graph import append_active_message, reachable_message_clause, register_message
 from lumen.services.message_parts import serialize_parts
 from lumen.services.message_timestamps import message_timestamps
@@ -319,6 +320,10 @@ async def create_persistent_run(
         "client_timezone": client_timezone,
         "execution_protocol_version": execution_protocol_version,
     }
+    request_payload["required_scopes"] = list(native_run_scopes({
+        **request_payload, "execution_mode": execution_mode,
+        "required_scopes": capability_snapshot.get("required_scopes", ()),
+    }, agent_id=agent_id))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
     request_payload = await _freeze_v2_lumen_snapshot(
         request_payload,
@@ -510,6 +515,10 @@ async def create_run(
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
+    request_payload["required_scopes"] = list(native_run_scopes({
+        **request_payload, "execution_mode": execution_mode,
+        "required_scopes": capability_snapshot.get("required_scopes", ()),
+    }, agent_id=agent_id))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
     request_payload = await _freeze_v2_lumen_snapshot(
         request_payload,
@@ -696,6 +705,9 @@ async def create_temp_run(
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
+    request_payload["required_scopes"] = list(native_run_scopes({
+        **request_payload, "required_scopes": capability_snapshot.get("required_scopes", ()),
+    }))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
     request_payload = await _freeze_v2_lumen_snapshot(
         request_payload,
@@ -862,6 +874,8 @@ async def create_compaction_run(
 
     _require_supported_execution_protocol_version(execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
+    request_payload["required_scopes"] = ["native:runs:write",
+        "native:conversations:read" if conversation_id is not None else "native:runs:read"]
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():

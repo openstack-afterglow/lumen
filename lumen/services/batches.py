@@ -17,7 +17,7 @@ from functools import wraps
 from typing import Literal
 from uuid import UUID, uuid4, uuid5
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeout
@@ -36,13 +36,14 @@ from lumen.models.chat_assets import ChatAsset
 from lumen.models.chat_batches import ChatBatch, ChatBatchFile, ChatBatchItem, ChatBatchProjectQueue
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunEventRow, ChatRunSegment
 from lumen.services import auxiliary
-from lumen.services.api_key_store import ApiKeyForbidden, authorize_api_key_in_transaction
+from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, current_api_key_scopes
 from lumen.services.credit import QuotaExceeded
 from lumen.services.durable_runs import api_completion, audio, images, lifecycle
 from lumen.services.durable_runs.budgets import retry_deadlocks
 from lumen.services.durable_runs.common import wake_run
 from lumen.services.durable_runs.errors import DurableRunConflict, DurableRunInputError
 from lumen.services.durable_runs.media import MediaAuthorizationRevoked
+from lumen.services.inference_authority import completion_scopes
 from lumen.services.run_store import load_segment_payload
 from lumen.services.worker_routing import use_read_committed
 
@@ -117,6 +118,7 @@ class BatchItemView:
 _STATES = ("pending", "queued", "running", "completed", "failed", "cancelled", "expired", "unknown")
 _TERMINAL = frozenset(_STATES[3:])
 _ACTIVE_BATCHES = ("validating", "in_progress", "cancelling", "finalizing")
+_STOP_FREEZE_PAGE = 5000
 _TIMES = ("created_at", "expires_at", "in_progress_at", "finalizing_at", "completed_at", "failed_at",
           "cancelling_at", "cancelled_at", "expired_at")
 _step_lock = asyncio.Lock()
@@ -187,7 +189,7 @@ def _scopes(operation: str, contract: str, body: dict) -> tuple[str, ...]:
     # worker re-checks it before any new provider I/O.
     batch = "native:batches:write" if contract == "native" else "compat:batches:write"
     if operation in {"chat.completions", "responses"}:
-        return (batch, "compat:completions:write")
+        return completion_scopes(body, base=(batch, "compat:completions:write"))
     if contract == "openai":
         return (batch, "compat:images:write")
     scope = "native:images:write" if operation.startswith("images.") else "native:audio:write"
@@ -342,6 +344,25 @@ async def list_batch_items(*, project_id, user_id, batch_id: str, after: int | N
 
 
 @_public_service
+async def owned_cancel_scopes(*, project_id, user_id, batch_id: str, contract) -> tuple[str, ...]:
+    """Every owned item needs its matching primary generation action, including prevalidation."""
+    async with _factory()() as session:
+        row = await _owned(session, project_id=project_id, user_id=user_id, batch_id=batch_id, contract=contract)
+        if contract == "openai":
+            operation = BATCH_ENDPOINTS.get(row.endpoint)
+            if operation is None:
+                raise BatchInputError("unsupported_operation")
+            operations = {operation}
+        else:
+            operations = set((await session.execute(
+                select(ChatBatchItem.operation).where(ChatBatchItem.batch_id == row.id).distinct()
+            )).scalars().all())
+        if not operations or not operations.issubset(set(BATCH_ENDPOINTS.values()) | {"images.edits", "audio.speech", "audio.transcriptions"}):
+            raise BatchInputError("unsupported_operation")
+        return tuple(sorted({scope for operation in operations for scope in _scopes(operation, contract, {})}))
+
+
+@_public_service
 async def cancel_batch(*, project_id, user_id, batch_id: str, contract) -> BatchView:
     async def transaction():
         async with _factory()() as session, session.begin():
@@ -459,19 +480,24 @@ async def _keep_lease(lease):
             await retry_deadlocks(release)
 
 
-async def _authorize(batch, required):
+async def _authority(batch) -> frozenset[str]:
+    # One directory lookup per validation chunk, never per row: a 50,000-row file
+    # must not become 50,000 Keystone authority resolutions. Execution revalidates.
     try:
         async with _factory()() as session:
-            await authorize_api_key_in_transaction(session, api_key_id=batch.api_key_id,
-                user_id=batch.user_id, project_id=batch.project_id, required_scopes=required)
-    except ApiKeyForbidden as exc:
-        raise BatchInputError("api_key_unauthorized") from exc
+            return await current_api_key_scopes(session, api_key_id=batch.api_key_id,
+                                                user_id=batch.user_id, project_id=batch.project_id)
+    except ApiKeyForbidden:
+        return frozenset()
+    except ApiKeyAuthorityUnavailable as exc:
+        raise BatchUnavailable("inference_authority_unavailable") from exc
 
 
-async def _prepare(batch, operation, body):
+async def _prepare(batch, operation, body, allowed: frozenset[str]):
     body = validate_batch_body(operation, body, contract=batch.contract)
     required = _scopes(operation, batch.contract, body)
-    await _authorize(batch, required)
+    if not allowed.issuperset(required):
+        raise BatchInputError("api_key_unauthorized")
     kwargs = dict(project_id=batch.project_id, user_id=batch.user_id,
                   source="api" if batch.api_key_id is not None else "web",
                   api_key_id=batch.api_key_id, required_scopes=required)
@@ -544,9 +570,10 @@ async def _validate(lease):
         except BatchInputError as exc:
             errors.append({"code": exc.code, "message": "Invalid batch input", "line": ordinal + 1})
     prepared = []
+    allowed = await _authority(batch) if records else frozenset()
     for number, custom_id, operation, body in records:
         try:
-            value = await _prepare(batch, operation, body)
+            value = await _prepare(batch, operation, body, allowed)
             prepared.append((number, custom_id, operation, value))
         except (ValueError, DurableRunInputError, BatchInputError, QuotaExceeded) as exc:
             errors.append({"code": _input_fault(exc), "message": "Invalid batch input",
@@ -660,6 +687,24 @@ async def _project(lease):
             stopping = batch.status == "cancelling"
             grace_over = stopping and (_utc(batch.cancelling_at) + timedelta(
                 seconds=get_settings().batch_cancel_grace_seconds) <= now)
+            if stopping:
+                # Never-materialized items carry no run, hold or result: freeze them in bounded set-based
+                # pages so a 50,000-row cancel/expiry finishes inside the grace window.
+                last = (await session.execute(select(ChatBatchItem.ordinal).where(
+                    ChatBatchItem.batch_id == batch.id, ChatBatchItem.run_id.is_(None),
+                    ChatBatchItem.state.in_(("pending", "queued", "running")))
+                    .order_by(ChatBatchItem.ordinal).offset(_STOP_FREEZE_PAGE - 1).limit(1))).scalar_one_or_none()
+                target = batch.final_target_status
+                code = "batch_expired" if target == "expired" else "batch_cancelled"
+                frozen = await session.execute(update(ChatBatchItem).where(
+                    ChatBatchItem.batch_id == batch.id, ChatBatchItem.run_id.is_(None),
+                    ChatBatchItem.state.in_(("pending", "queued", "running")),
+                    *(() if last is None else (ChatBatchItem.ordinal <= last,)),
+                ).values(state=target, error_code=code, error_message=code.replace("_", " "),
+                         result_ciphertext=_seal({"response": None, "envelope": None,
+                                                  "error": {"code": code, "message": code.replace("_", " ")}}))
+                    .execution_options(synchronize_session=False))
+                changed |= frozen.rowcount > 0
             query = select(ChatBatchItem).where(ChatBatchItem.batch_id == batch.id,
                 ChatBatchItem.state.in_(("pending", "queued", "running")))
             eligible_runs = select(ChatRun.id).where(ChatRun.batch_id == batch.id, or_(

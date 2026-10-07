@@ -47,6 +47,12 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
     model_name = f"integration-model-{nonce}"
     run_owner = f"integration-worker-{nonce}"
 
+    async def current_authority(owner_user_id, owner_project_id):
+        assert (owner_user_id, owner_project_id) == (user_id, project_id)
+        return {"roles": ["member", "lumen-inventory_reader", "lumen-history_reader", "lumen-chat_user",
+                          "lumen-tools_user", "lumen-keys_editor"], "is_system_admin": False}
+
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
     init_db(database_url, pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
@@ -193,7 +199,8 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
                     "user_id": user_id,
                     "username": "integration-user",
                     "project_id": project_id or owner_project_id,
-                    "roles": ["member"],
+                    "roles": ["member", "lumen-inventory_reader", "lumen-history_reader", "lumen-chat_user",
+                              "lumen-tools_user", "lumen-keys_editor"],
                     "is_system_admin": False,
                 }
 
@@ -427,6 +434,12 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
     unpriced_name = f"claude-unpriced-{nonce}"
     project_id = f"onboarding-project-{nonce}"
     user_id = f"onboarding-user-{nonce}"
+    async def current_authority(owner_user_id, owner_project_id):
+        assert (owner_user_id, owner_project_id) == (user_id, project_id)
+        # Explicitly verified current system authority, not a raw admin label.
+        return {"roles": ["admin"], "is_system_admin": True}
+
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None

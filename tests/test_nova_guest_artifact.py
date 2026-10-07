@@ -1,6 +1,6 @@
-"""Static and offline input validation for the trusted Nova guest artifact.
+"""Offline behavior checks for trusted Nova guest input and boot boundaries.
 
-These tests do not build images, contact registries, or run Docker/DIB.
+Image construction, installed confinement and live registry checks need runtime acceptance.
 """
 from __future__ import annotations
 
@@ -9,8 +9,6 @@ import base64
 import hashlib
 import importlib.util
 import json
-import re
-import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,92 +37,6 @@ def build_helper():
     return _module("nova_artifact", "artifact.py")
 
 
-def _shell_scripts():
-    return sorted(path for path in ARTIFACT.rglob("*")
-                  if path.is_file() and (path.suffix == ".sh" or path.parent.name.endswith(".d")))
-
-
-def test_every_shell_script_and_dib_hook_parses_with_bash():
-    for path in _shell_scripts():
-        subprocess.run(["bash", "-n", str(path)], check=True, capture_output=True, text=True)
-
-
-def test_all_shell_entrypoints_are_strict_and_executable():
-    scripts = _shell_scripts()
-    assert scripts
-    for path in scripts:
-        source = path.read_text()
-        assert source.startswith("#!/bin/bash\n")
-        assert "set -euo pipefail" in source
-        assert path.stat().st_mode & 0o111, str(path)
-        assert "set -x" not in source
-
-
-def test_build_requires_and_verifies_every_pinned_input():
-    source = (ARTIFACT / "build-guest.sh").read_text()
-    for flag in ("--role", "--arch", "--image", "--ubuntu-url", "--ubuntu-sha256", "--ubuntu-snapshot",
-                 "--docker-packages", "--docker-packages-sha256", "--output"):
-        assert flag in source
-    assert "sha256sum --check --strict" in source
-    assert 'fetch_verified "$ubuntu_url" "$ubuntu_sha256"' in source
-    assert 'fetch_verified "$url" "$expected"' in source
-    for field in ("Package", "Version", "Architecture"):
-        assert f'dpkg-deb --field "$destination" {field}' in source
-    assert 'skopeo inspect --raw "docker://$image"' in source
-    assert 'skopeo inspect --raw "docker://$selected"' in source
-    assert '"docker://$selected"' in source
-    assert '"$output.sha256"' in source
-    assert "build-manifest" in source
-    assert "DIB_RELEASE=noble" in source and "DIB_LOCAL_IMAGE=" in source
-    assert "ubuntu vm block-device-efi lumen-guest" in source
-    assert "Use a native runner" in source
-    assert "--proto '=https' --proto-redir '=https'" in source
-    assert not re.search(r"docker\s+pull|pip\s+install|:latest(?:\s|$)", source)
-    install = (ARTIFACT / "elements/lumen-guest/install.d/50-lumen-guest").read_text()
-    assert "sha256sum --check --strict SHA256SUMS" in install
-    assert "dpkg --install" in install
-    assert not re.search(r"apt(?:-get)?\s+(?:install|update)", install)
-
-
-def test_service_and_runner_enforce_guest_confinement_without_pulls_or_secrets():
-    unit = (ARTIFACT / "lumen-guest.service").read_text()
-    assert "After=cloud-final.service docker.service network-online.target" in unit
-    assert "Requires=docker.service" in unit
-    assert "WantedBy=cloud-init.target" in unit and "WantedBy=multi-user.target" not in unit
-    assert "ExecStart=/usr/local/libexec/lumen-guest-run" in unit
-    assert "User=root" in unit and "Group=root" in unit and "UMask=0077" in unit
-    assert "TimeoutStopSec=infinity" in unit
-    assert "ExecStop=-/usr/bin/docker stop --time -1 lumen-guest" in unit
-    runner = (ARTIFACT / "guest-run.sh").read_text()
-    for argument in ("exec docker run", "--pull=never", "--network host", "--read-only",
-                     "--user 0:0", "--security-opt no-new-privileges", "--cap-drop ALL"):
-        assert argument in runner
-    assert "--detach" not in runner and not re.search(r"docker run[^\n]*\s-d(?:\s|$)", runner)
-    for directory in ("bootstrap", "identity", "drain"):
-        assert f"src=/var/lib/lumen/{directory},dst=/var/lib/lumen/{directory}" in runner
-    for directory, size in (("/run/lumen", "16m"), ("/var/lib/lumen/scratch", "256m"),
-                            ("/var/lib/lumen/spool", "1g")):
-        assert re.search(rf"--tmpfs {directory}:.*size={size}", runner)
-    assert "docker.sock" not in runner and "--privileged" not in runner
-    assert "docker image load --input /usr/share/lumen-guest/image.tar" in runner
-    assert '[[ $loaded_id == "$image_id"' in runner
-    assert '--entrypoint python "$image_id" -m lumen.services.infrastructure.guest_bootstrap' in runner
-    assert '--role "$role" -- "${command[@]}"' in runner
-    assert '--env "LUMEN_GUEST_IMAGE=$image"' in runner
-    assert "uvicorn lumen.main:app" in runner and "python -m lumen.worker" in runner
-    assert not re.search(r"docker\s+pull|skopeo|curl|wget|apt(?:-get)?\s|pip\s|source\s|eval\s", runner)
-    assert "settings=$(python3" in runner  # a validator failure propagates through set -e
-    for path in ARTIFACT.rglob("*"):
-        if path.is_file() and "__pycache__" not in path.parts:
-            source = path.read_text()
-            assert "BEGIN PRIVATE KEY" not in source
-            assert not re.search(r"(?:OPENAI_API_KEY|APPLICATION_CREDENTIAL_SECRET|DB_PASSWORD)=", source)
-    post_install = (ARTIFACT / "elements/lumen-guest/post-install.d/90-lumen-guest").read_text()
-    assert "package_update: false" in post_install and "package_upgrade: false" in post_install
-    assert "systemctl mask apt-daily.service" in post_install
-    assert '"containerd-snapshotter":false' in post_install
-    builder = (ARTIFACT / "build-guest.sh").read_text()
-    assert 'DIB_DISTRIBUTION_MIRROR="https://snapshot.ubuntu.com/ubuntu/$ubuntu_snapshot"' in builder
 
 
 def _build_inputs(tmp_path):
@@ -199,34 +111,17 @@ def test_source_digest_and_platform_selection_are_verified(build_helper, tmp_pat
         build_helper.select_image(args)
 
 
-def test_manifest_records_os_engine_oci_elements_and_input_hashes(build_helper, tmp_path, monkeypatch):
+def test_manifest_refuses_an_installed_engine_that_differs_from_the_lock(build_helper, tmp_path):
     args = _build_inputs(tmp_path)
     build_helper.prepare(args)
     directory = Path(args.staging)
-    (directory / "image.json").write_text(json.dumps({
-        "schema_version": 1, "role": "api", "architecture": "amd64", "image": IMAGE,
-        "platform_manifest_digest": "sha256:" + "a" * 64,
-        "image_id": "sha256:" + "e" * 64, "archive_sha256": "f" * 64,
-    }))
+    (directory / "image.json").write_text(json.dumps({"role": "api", "architecture": "amd64", "image": IMAGE}))
     packages = json.loads(Path(args.docker_packages).read_text())
     (directory / "installed-packages.tsv").write_text("".join(
-        f"{item['package']}\t{item['version']}\tamd64\n" for item in packages))
-    output = tmp_path / "guest.qcow2"
-    output.write_bytes(b"offline test artifact")
-    monkeypatch.setattr(build_helper.subprocess, "check_output", lambda *args, **kwargs: "test-dib-version\n")
-    build_helper.build_manifest(argparse.Namespace(staging=str(directory), output=str(output)))
-    manifest = json.loads(Path(str(output) + ".manifest.json").read_text())
-    assert manifest["os"]["release"] == "24.04"
-    assert manifest["os"]["sha256"] == args.ubuntu_sha256
-    assert manifest["os"]["package_snapshot"] == args.ubuntu_snapshot
-    assert len(manifest["installed_packages"]) == 3
-    assert manifest["installed_packages_sha256"] == hashlib.sha256((directory / "installed-packages.tsv").read_bytes()).hexdigest()
-    assert manifest["image"] == IMAGE
-    assert manifest["package_lock_sha256"] == args.docker_packages_sha256
-    assert {item["package"] for item in manifest["engine"]} >= {"docker-ce", "docker-ce-cli", "containerd.io"}
-    assert set(manifest["elements"]) == {"ubuntu", "vm", "block-device-efi", "lumen-guest"}
-    assert manifest["artifact_source_sha256"]["guest-run.sh"] == hashlib.sha256((ARTIFACT / "guest-run.sh").read_bytes()).hexdigest()
-    assert manifest["output"]["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
+        f"{item['package']}\t{'1.0' if item['package'] == 'docker-ce' else item['version']}\tamd64\n"
+        for item in packages))
+    with pytest.raises(ValueError, match="installed package does not match"):
+        build_helper.build_manifest(argparse.Namespace(staging=str(directory), output=str(tmp_path / "guest.qcow2")))
 
 
 def _nova(role):

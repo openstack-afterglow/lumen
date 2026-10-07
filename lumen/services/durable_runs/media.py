@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_batches import ChatBatch, ChatBatchItem
 from lumen.models.chat_runs import ChatRun
-from lumen.services.api_key_store import ApiKeyForbidden, authorize_api_key_in_transaction
+from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
 from lumen.services.providers import audio_transport, image_transport
 from lumen.services.worker_routing import lock_open_batch
 
@@ -46,6 +46,8 @@ async def authorize_media_in_transaction(
             api_key_id=api_key_id, required_scopes=required_scopes)
     except ApiKeyForbidden as exc:
         raise MediaAuthorizationRevoked("media credential is no longer authorized") from exc
+    except ApiKeyAuthorityUnavailable as exc:
+        raise DurableRunInputError("inference_authority_unavailable") from exc
 
 
 def _source_matches(asset: ChatAsset, *, run_kind: str, pricing: dict) -> bool:
@@ -123,9 +125,7 @@ async def lock_media_run_for_io(session: AsyncSession, run_id: str, *, owner: st
 
 
 async def validate_batch_media_io_in_transaction(session: AsyncSession, run: ChatRun) -> None:
-    """Batch-only: re-authorize frozen scopes, route configuration and pinned source."""
-    if run.batch_id is None:
-        return
+    """Re-authorize every finite media call before new I/O, including non-batch runs."""
     from .admission import _lock_run_configurations
 
     await _lock_run_configurations(session, run.capability_snapshot, model_name=run.model_name)
