@@ -792,7 +792,29 @@ async def _project(lease):
     return changed
 
 
+async def _dispatch_slots(session, batch) -> int:
+    settings = get_settings()
+    project_active = (await session.execute(select(func.count()).select_from(ChatBatchItem)
+        .join(ChatBatch, ChatBatch.id == ChatBatchItem.batch_id).where(ChatBatch.project_id == batch.project_id,
+            ChatBatchItem.state.in_(("queued", "running"))))).scalar_one()
+    batch_active = (await session.execute(select(func.count()).select_from(ChatBatchItem).where(
+        ChatBatchItem.batch_id == batch.id, ChatBatchItem.state.in_(("queued", "running"))))).scalar_one()
+    return min(settings.batch_dispatch_window - batch_active,
+               settings.batch_project_dispatch_window - project_active, 100)
+
+
 async def _materialize(lease):
+    # Directory I/O never runs under the project/batch/item locks of the retried
+    # transaction: resolve current authority first, only when there is work to do.
+    if lease.batch.status != "in_progress":
+        return False
+    async with _factory()() as session:
+        pending = await session.scalar(select(ChatBatchItem.ordinal).where(
+            ChatBatchItem.batch_id == lease.batch.id, ChatBatchItem.state == "pending").limit(1))
+        if pending is None or await _dispatch_slots(session, lease.batch) <= 0:
+            return False
+    allowed = await _authority(lease.batch)
+
     async def transaction():
         wake_ids = []
         async with _factory()() as session, session.begin():
@@ -800,14 +822,7 @@ async def _materialize(lease):
             _, batch = await _locked(session, lease)
             if batch.status != "in_progress" or _utc(batch.expires_at) <= _now():
                 return wake_ids, False
-            settings = get_settings()
-            project_active = (await session.execute(select(func.count()).select_from(ChatBatchItem)
-                .join(ChatBatch, ChatBatch.id == ChatBatchItem.batch_id).where(ChatBatch.project_id == batch.project_id,
-                    ChatBatchItem.state.in_(("queued", "running"))))).scalar_one()
-            batch_active = (await session.execute(select(func.count()).select_from(ChatBatchItem).where(
-                ChatBatchItem.batch_id == batch.id, ChatBatchItem.state.in_(("queued", "running"))))).scalar_one()
-            available = min(settings.batch_dispatch_window - batch_active,
-                            settings.batch_project_dispatch_window - project_active, 100)
+            available = await _dispatch_slots(session, batch)
             if available <= 0:
                 return wake_ids, False
             items = (await session.execute(select(ChatBatchItem).where(ChatBatchItem.batch_id == batch.id,
@@ -820,7 +835,7 @@ async def _materialize(lease):
                         run = await persist(session, prepared, project_id=batch.project_id, user_id=batch.user_id,
                             client_request_id=str(uuid5(UUID(batch.id), item.custom_id)),
                             source="api" if batch.api_key_id is not None else "web", api_key_id=batch.api_key_id,
-                            workload_class="batch", batch_id=batch.id)
+                            workload_class="batch", batch_id=batch.id, allowed_scopes=allowed)
                         # No ORM relationship orders this foreign key for us.
                         await session.flush()
                         item.run_id, item.state = run.id, "queued"

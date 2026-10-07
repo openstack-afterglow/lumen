@@ -445,9 +445,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "d37a5ca18aa90d3b6157764af5b6bbc36e859986202a1bda80c1caaa959d715d",
-  "reviewed_at": "2026-10-07T05:54:49Z",
-  "summary": "Release 0.6.5: merged dev 0.6.4 Claude safeguards fix with scoped service authority, Batch bulk cancel freeze and per-chunk validation authority, nova-guest workflow/CI shape; merged-tree service3038/SDK128/Ruff, integration282, system30; Nova/Octavia/qcow2 boot/paid provider/production unverified."
+  "source_sha256": "580bd3b14727ecc1a335a784bb75c2ebbe339e3a8402254f5172c22a82202596",
+  "reviewed_at": "2026-10-07T06:23:38Z",
+  "summary": "0.6.5 pre-tag fix: Batch materialization resolves owner/key authority before locked retried transaction (persist allowed_scopes), Keystone admin session 15s timeout, domain-admin->system-admin operator note; NOWAIT lock regression failed-before/passed-after ON/OFF; service3038/SDK128 (py3.12), integration284, system30."
 }
 ```
 <!-- architecture-review:end -->

@@ -17,6 +17,7 @@ from uuid import UUID, uuid4, uuid5
 
 import pytest
 from sqlalchemy import delete, event, func, select, text
+from sqlalchemy.exc import OperationalError
 
 from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content
@@ -310,6 +311,29 @@ async def test_validation_resolves_owner_authority_once_per_chunk(batch_db, curr
         assert final.status == "failed"
         assert [error["code"] for error in final.errors] == ["api_key_unauthorized"] * 5
         assert all(item.run_id is None for item in await db.items(view.id))
+
+
+async def test_materialization_resolves_authority_without_holding_batch_locks(batch_db, current_project_authority):
+    # Directory latency must not extend the locked, deadlock-retried materialization transaction.
+    db = batch_db
+    view, _ = await db.create(2)
+    granted = current_project_authority.return_value
+    lock_probes = []
+
+    async def probe_then_grant(*_args):
+        async with db.factory() as session, session.begin():
+            try:
+                await session.execute(text("SELECT id FROM chat_batches WHERE id = :id FOR UPDATE NOWAIT"),
+                                      {"id": view.id})
+                lock_probes.append("free")
+            except OperationalError:
+                lock_probes.append("locked")
+        return granted
+
+    current_project_authority.side_effect = probe_then_grant
+    await db.tick(3)
+    assert lock_probes and set(lock_probes) == {"free"}
+    assert sum(item.run_id is not None for item in await db.items(view.id)) == 2
 
 
 async def test_expiry_of_never_started_items(batch_db):

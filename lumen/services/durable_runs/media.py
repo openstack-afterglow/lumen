@@ -39,8 +39,17 @@ class MediaAuthorizationRevoked(DurableRunInputError):
 async def authorize_media_in_transaction(
     session: AsyncSession, *, user_id: str, project_id: str,
     api_key_id: int | None, required_scopes: tuple[str, ...],
+    allowed_scopes: frozenset[str] | None = None,
 ) -> None:
-    """Map the shared credential fence into finite media's safe input error contract."""
+    """Map the shared credential fence into finite media's safe input error contract.
+
+    ``allowed_scopes`` is authority the caller resolved before taking row locks, so a
+    locked transaction does not wait on the identity directory.
+    """
+    if allowed_scopes is not None:
+        if not allowed_scopes.issuperset(required_scopes):
+            raise MediaAuthorizationRevoked("media credential is no longer authorized")
+        return
     try:
         await authorize_api_key_in_transaction(session, user_id=user_id, project_id=project_id,
             api_key_id=api_key_id, required_scopes=required_scopes)

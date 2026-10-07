@@ -265,6 +265,7 @@ async def persist_audio_run_in_transaction(
     session: AsyncSession, prepared: PreparedAudioRun, *, project_id: str, user_id: str,
     client_request_id: str, source: str = "web", api_key_id: int | None = None,
     workload_class: str | None = None, batch_id: str | None = None,
+    allowed_scopes: frozenset[str] | None = None,
 ) -> ChatRun:
     """Atomically bind a finite request in the caller's session; never commit, hold credit or wake.
 
@@ -289,7 +290,7 @@ async def persist_audio_run_in_transaction(
     route = await resolve_worker_route(session, run_kind=kind, workload_class=workload_class, batch_id=batch_id)
     await _lock_run_configurations(session, capability, model_name=capability["model_name"])
     await authorize_media_in_transaction(session, user_id=user_id, project_id=project_id,
-        api_key_id=api_key_id, required_scopes=prepared.required_scopes)
+        api_key_id=api_key_id, required_scopes=prepared.required_scopes, allowed_scopes=allowed_scopes)
     run = ChatRun(id=str(uuid.uuid4()), run_scope="audio", run_kind=kind, project_id=project_id,
         user_id=user_id, model_name=capability["model_name"], source=source, api_key_id=api_key_id,
         workload_class=route.workload_class, worker_pool_id=route.worker_pool_id, batch_id=batch_id,
