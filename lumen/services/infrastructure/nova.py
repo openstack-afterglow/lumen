@@ -39,7 +39,8 @@ def cloud_connection(cloud: CloudProfile) -> Connection:
         region_name=cloud.region_name,
         interface=cloud.interface,
         verify=cloud.ca_file or True,
-        api_timeout=(5, 15),
+        # Keystone Session accepts a scalar; requests below retain connect/read bounds.
+        api_timeout=15,
         connect_retries=0,
         status_code_retries=0,
     )

@@ -140,6 +140,27 @@ LUMEN_TEST_COMPOSE_PROJECT=lumen-rolegrades-20261006 uv run --frozen --extra ser
 
 Both runners tear down their selected project's volumes. These local proofs do not establish production Keystone authorization, real provider output/billing, cloud workers or deployment. Docker multiarchitecture build/import checks are separate: importing `lumen.worker` is not worker execution evidence.
 
+### Execution credential isolation handoff (test-defined)
+
+Local change: `openspec/changes/isolate-service-execution-credentials`. No builds/tests/lint/formatters/runtime smoke or architecture stamping were run during implementation. Existing receipts above are historical and do not qualify this cutover. Keep operator credentials and paid-provider secrets out of the test environment.
+
+After all implementation slices land, run from the Lumen root in the service+dev environment (`uv sync --extra service --extra dev --frozen` if prerequisites are not installed):
+
+```sh
+uv run --frozen --extra service --extra dev pytest -q tests/test_native_keystone_authority.py tests/test_runtime_scaling.py tests/test_openapi_contract.py tests/test_api_key_authority.py tests/test_service_authority.py tests/test_service_inference_authority.py tests/test_media_cancellation_authority.py tests/test_api_completion_batch.py tests/test_batch_admission_contract.py
+uv run --frozen --extra service --extra dev lumen-test contract -q
+LUMEN_TEST_COMPOSE_PROJECT=lumen-credential-isolation-20261007-integration uv run --frozen --extra service --extra dev lumen-test integration -q --tb=short
+LUMEN_TEST_COMPOSE_PROJECT=lumen-credential-isolation-20261007-system uv run --frozen --extra service --extra dev lumen-test system -q --tb=short
+```
+
+Docker Engine/Compose and disposable image/network/volume permissions are required for the last two commands. The runner tears down **the selected project and volumes**; never reuse an operator development/production project. It clears inherited runtime profiles, uses ephemeral loopback datastore ports, and never calls paid providers or provisions Nova resources.
+
+`tests/system/test_service_role_authority.py::test_system_admin_target_key_cannot_substitute_tenant_scope` adds real HTTP regressions: system-admin logical-target reads/issuance are admitted, a non-admin's foreign target is rejected, and a target-tenant `models:read` key cannot override its tenant with either project header even when its human owner is system-admin. Both `X-API-Key` and Bearer transports are exercised. This was test-defined during implementation; authorized follow-up verification receipts are reported separately to the parent, not inferred from the smoke plan.
+
+Real HTTP smoke plan: use the canonical system runner (or narrow its pytest selection with `-k service_role_authority`). It builds current API/online worker/batch-only worker images, migrates isolated MariaDB, checks readiness and executes real TCP HTTP against synthetic Keystone and provider HTTP with Redis, TLS MinIO and ClamAV. Exercise scope-subset key issuance, independent native/compat text/image/audio/tools authority, foreign project/target rejection, current role-edge removal and key revoke; assert denied HTTP plus unchanged upstream counters. For queued worker denial, the existing harness copies a real HTTP-completed image's frozen request into an offline-pool SQL fixture, revokes owner/key, then releases it: assert failed journal, NULL provider-start, zero holds and unchanged upstream count. This is worker execution evidence, **not a second HTTP admission**. Preserve completed-checkpoint settlement coverage in integration, and verify original system-admin caller connection scope through the installed-SDK HTTP contract tests. These layers do not prove production RBAC, paid inference or Nova/Octavia provisioning.
+
+Architecture guard: parent must review this cutover's exact changed source/test paths and docs, then stamp/check only that scope using its temporary index if unrelated dirty work is present. The repo commands are `python3 scripts/check_architecture.py --stamp --staged --summary "auth.py tenant-password factory removal; configured infrastructure credential isolation and behavioral regressions; original owner/new-I/O and settlement unchanged"` and `python3 scripts/check_architecture.py --staged`. Do not stamp the whole dirty working tree or manually edit the existing marker.
+
 
 ### 실제 Codex CLI 확인
 

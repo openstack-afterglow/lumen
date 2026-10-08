@@ -327,6 +327,7 @@ from lumen.api import plugins as plugin_routes
 from lumen.api.compat import anthropic as compat_anthropic
 from lumen.api.compat import audio as compat_audio
 from lumen.api.compat import batches as compat_batches
+from lumen.api.compat import cli as compat_cli
 from lumen.api.compat import discovery as compat_discovery
 from lumen.api.compat import files as compat_files
 from lumen.api.compat import images as compat_images
@@ -371,6 +372,7 @@ for router, tag in (
     (compat_images.router, "OpenAI Images Compat"),
     (compat_audio.router, "OpenAI Audio Compat"),
     (compat_openai.router, "OpenAI Compat"),
+    (compat_cli.router, "Coding CLI Model Catalog"),
     (compat_anthropic.router, "Anthropic Compat"),
     (compat_responses.router, "OpenAI Responses Compat"),
     (compat_files.router, "OpenAI Files Compat"),
@@ -453,6 +455,7 @@ def custom_openapi() -> dict:
         ("/v1/messages", "post"),
         ("/v1/messages/count_tokens", "post"),
         ("/v1/models", "get"),
+        ("/v1/cli/models", "get"),
         ("/v1/claude-gateway/v1/messages", "post"),
         ("/v1/claude-gateway/v1/messages/count_tokens", "post"),
         ("/v1/claude-gateway/v1/models", "get"),
@@ -484,6 +487,7 @@ def custom_openapi() -> dict:
         ("/v1/claude-gateway/v1/models", "get"): ["models:read"],
         ("/v1/claude-gateway/v1/managed-settings", "get"): ["models:read"],
         ("/v1/models", "get"): ["models:read"],
+        ("/v1/cli/models", "get"): ["models:read"],
         ("/v1/chat/models", "get"): ["models:read"],
         ("/v1/capabilities", "get"): ["models:read"],
         ("/v1/conversations", "post"): ["native:conversations:write"],

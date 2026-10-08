@@ -4,11 +4,11 @@
 
 ## 인증과 scope
 
-Keystone token과 API key는 모두 현재 enabled owner/project 및 effective Keystone role-ID graph의 service action을 요구한다. Parent 이름이나 token role snapshot은 권한의 대체재가 아니고 graph edge 제거는 다음 요청 및 새 provider I/O에 적용된다. API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat text route (`/v1/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API key만 허용하며 Keystone token 사용 시 401이다. 한 요청에 credential 둘 이상을 보내면 400이나 동일한 key의 `X-API-Key` + Bearer 중복은 허용한다. API key의 `X-Project-Id`는 key owner project와 같아야 한다. `X-Lumen-Provider`는 관리자 설정 `api_provider` 선택자이며 body `provider`와 충돌하면 400이다. Transport prefix를 선택자 alias로 해석하지 않는다.
+Keystone token과 API key는 모두 현재 enabled owner/project 및 effective Keystone role-ID graph의 service action을 요구한다. Parent 이름이나 token role snapshot은 권한의 대체재가 아니고 graph edge 제거는 다음 요청 및 새 provider I/O에 적용된다. API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat text route (`/v1/models`, `/v1/cli/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API key만 허용하며 Keystone token 사용 시 401이다. 한 요청에 credential 둘 이상을 보내면 400이나 동일한 key의 `X-API-Key` + Bearer 중복은 허용한다. API key의 `X-Project-Id`는 key owner project와 같아야 한다. `X-Lumen-Provider`는 관리자 설정 `api_provider` 선택자이며 body `provider`와 충돌하면 400이다. Transport prefix를 선택자 alias로 해석하지 않는다.
 
 | Surface | API-key scope | Keystone only |
 | --- | --- | --- |
-| `GET /v1/models`, `/v1/chat/models`, `/v1/capabilities` | `models:read` | 아니오 |
+| `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities` | `models:read` | 아니오 |
 | `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` | `compat:completions:write` | 아니오 |
 | conversations read/write | `native:conversations:read` / `native:conversations:write` | 아니오 |
 | native run read/write | `native:runs:read` / `native:runs:write` | 아니오 |
@@ -36,7 +36,7 @@ API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만
 | 그룹 | Route |
 | --- | --- |
 | Discovery/health | `GET /`, `/v1/` (both advertise `rel=models` for `/v1/models`), `/v1/health`, `/v1/ready`, compat `GET /v1/compat` |
-| Compat | `GET /v1/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` |
+| Compat | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` |
 | Legacy Lumen device gateway | `/.well-known/oauth-authorization-server`, `/oauth/device/code`, `/oauth/token`, `/v1/managed-settings`, `/v1/models`, `/v1/messages`, `/v1/messages/count_tokens` under the configured `/v1/claude-gateway` base; not the current Claude Apps Gateway protocol |
 | Conversations | `POST/GET /v1/conversations`, `GET/DELETE /v1/conversations/{id}`, projected message pages/search/fork/workspace/active-leaf, completion/regenerate/retry/runs subroutes |
 | Native runs/children | `POST /v1/temp-completions`; `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/events`, `/v1/runs/{id}/children`, `/v1/temp-threads/{id}`; approval/interaction/cancel POST routes |
@@ -135,6 +135,18 @@ NVIDIA NIM provider를 `name="NVIDIA"`, `api_provider="nvidia"`로 바꿔도 `pr
 `provider_id`와 목록 원소는 bool/float/string이 아닌 `1..9223372036854775807` strict 정수다. 두 목록은 각각 1~500개 unique ID이며 모든 필드가 필수이고 추가 필드는 422로 거부한다. `expected_model_ids`는 `GET /v1/admin/models`를 provider로 필터한 현재 `(sort_order,id)` 순서 전체(비활성·모든 종류 포함), `model_ids`는 같은 membership의 원하는 permutation이다. UI의 검색·종류·활성 필터 결과 일부만 보내면 안 된다.
 
 Provider→model ID 순서 잠금과 기존 provider 전체 active-run fence 아래 현재 목록을 대조한 뒤 한 transaction에서 바뀐 rank만 `0..N-1`로 정규화한다. 성공은 body 없는 `204`, `Cache-Control: no-store`다. 오래된 expected 순서·누락/추가/다른 provider ID 등 membership 충돌과 nonterminal run 사용은 `409`, provider 부재는 `404`, 입력 schema 위반은 `422`, 저장소 장애는 `503`이다. 충돌 시 부분 저장하지 않으며 클라이언트는 전체 관리자 목록을 다시 조회해야 한다. 가격·metadata·credential·활성/title/memory flag·timestamp 및 frozen route hash는 보존하고 기존 scalar sort_order PATCH는 유지한다.
+
+### Coding CLI catalog와 exact route ID
+
+`GET /v1/cli/models`는 coding CLI installer용 catalog다. API key만 허용하고(`models:read`, Keystone token 401, scope 누락 403) 다른 compat route처럼 `chat_api_hosts` 밖에서는 404다. 성공과 저장소 장애 응답 모두 `Cache-Control: no-store`다. 활성 provider의 활성 `model_kind="text"` 모델만 `(provider_sort_order, provider_id, sort_order, id)` 순으로 `{"models":[...]}`에 담는다. 저장소 장애는 빈 200이 아니라 503 OpenAI 오류다. 기존 `GET /v1/models` 응답은 바뀌지 않는다.
+
+각 행은 `id`(`lumen/<provider_id>/<model_id>` route token), `api_model_name`(공개 model ID), `display_name`, `provider`(`api_provider` 선택자), `provider_name`(표시 이름), `provider_type`(transport), `protocols`(`messages`/`responses`의 부분집합), `usable`, `disabled_reason`, `capabilities`, `input_price_per_million`·`output_price_per_million`(USD/1M token의 정확한 Decimal 문자열 또는 `null`)이다. `capabilities`는 effective capability에서 `context_limit`, `max_output_tokens`, `input_modalities`, `output_modalities`, `function_calling`, `tool_call`, `parallel_function_calling`, `reasoning`, `reasoning_options`, `vision`, `streaming` 중 서버가 가진 key만 그대로 복사하고 없는 값을 만들지 않는다. 카탈로그에 없는 모델의 `function_calling=false`는 LiteLLM probe 결과일 수 있으므로 선택 가능 여부는 `usable`과 `protocols`로 판단한다. API base, credential, 내부 route key는 응답에 없고 credential은 복호화하지 않는다.
+
+API-key route는 LiteLLM adapter로 `messages`/`responses`를 지원하되 custom OpenAI-compatible `api_base`는 native Responses endpoint가 확인되지 않으므로 catalog에서 `['messages']`만 광고한다. OpenAI 공식 direct base(없음 또는 `https://api.openai.com[/v1]`, trailing slash 허용)는 `['messages','responses']`다. 이 보수적 catalog 제한은 기존 `/v1/responses`나 Batch Responses transport를 변경하지 않으며 custom base의 native Responses 호출을 Chat Completions로 강제 변환하거나 retry/probe하지 않는다. Claude 구독(`anthropic_subscription`)은 `['messages']`만 광고하고 ChatGPT device 구독은 두 endpoint 모두 지원하지 않는다. 사용할 수 없는 행은 `usable=false`, `protocols=[]`이고 첫 번째 해당 사유를 `disabled_reason`에 넣는다: `subscription_protocol_unsupported`, `provider_credentials_missing`(API-key route에 key도 운영자 지정 API base도 없음, 구독은 저장 credential이 없거나 Claude 구독 만료 시각이 지남), `pricing_unavailable`(effective input/output 가격 중 하나 없음), `text_unavailable`(effective text gate가 비활성, `streaming=false`, 또는 비어 있지 않은 `input_modalities`/`output_modalities` 목록에 `text`가 없음), `tools_disabled`(저장된 override/models.dev `tool_call`/`function_calling=false`만 해당). Modality 목록이 없거나 `null`/빈 목록이면 unknown 그대로이며 이름으로 종류를 추론하거나 사용 불가로 바꾸지 않는다. Route token은 서버의 role preference가 아니며 migration도 추가하지 않는다.
+
+호환 resolver(`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, Batch 항목)는 canonical token(앞자리 0 없는 `1..9223372036854775807` 정수 두 개)을 받으면 해당 provider/model 한 쌍만 조회한다. Provider·model이 모두 활성이고 model이 그 provider에 속하며 요청 kind와 같아야 한다. 함께 보낸 `provider`/`X-Lumen-Provider`, provider id, transport 제한도 그대로 적용한다. 하나라도 맞지 않으면 404이며, 이름·rank나 같은 이름의 다른 route로 대체하지 않는다. 실행·과금·frozen fingerprint는 해석된 실제 `model_name`과 provider credential을 쓰고 credential은 서버에 남는다. Canonical 형식이 아닌 `lumen/...` 문자열은 일반 공개 ID로 해석하며 일반 공개 ID의 ambiguity 409 계약은 그대로다. 관리자가 canonical token 형식의 이름으로 등록한 모델은 공개 ID로 호출할 수 없다. Legacy gateway도 같은 resolver를 쓰지만 model은 서버의 `configured_route()` 설정이며 client가 임의 token을 선택하는 surface는 아니다.
+
+구독 transport가 지원하지 않는 protocol 요청(Claude 구독의 Responses, ChatGPT device의 Messages)은 provider 호출 전에 400 `invalid_request_error`로 거부한다. 이전에는 이 안전 오류 code(`subscription_protocol_unsupported`)가 등록되지 않아 502로 바뀌었다. `count_tokens`는 route token에서도 direct Anthropic API-key route만 Anthropic의 authoritative count endpoint를 호출한다. 다른 provider와 구독 route는 추정값 대신 501 `token_count_unavailable`이다.
 
 ## Provider credential 상태
 

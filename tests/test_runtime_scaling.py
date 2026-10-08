@@ -272,8 +272,107 @@ def test_cloud_http_boundary_overrides_sdk_write_retry_defaults(monkeypatch):
                             region_name="RegionOne", interface="internal", ca_file=None)
     conn = nova.cloud_connection(cloud)
     assert conn.session.request("/servers", "POST", connect_retries=1, status_code_retries=3) == "response"
-    assert kwargs[0]["api_timeout"] == (5, 15)
+    assert kwargs[0]["api_timeout"] == 15
     assert calls[0][1] == {"timeout": (5, 15), "connect_retries": 0, "status_code_retries": 0}
+
+
+@pytest.mark.parametrize("selected_cloud", [None, "ambient", "envvars"])
+def test_cloud_connection_real_sdk_ignores_ambient_auth_and_scope(monkeypatch, tmp_path, selected_cloud):
+    import os
+
+    from keystoneauth1.identity.v3 import ApplicationCredential
+    from openstack.config import loader
+    from requests.sessions import Session
+
+    from lumen.services.infrastructure.config import CloudProfile, SecretRef
+
+    # Redirect every SDK search path and clear inherited OS_* values so the
+    # regression never depends on developer credentials or host clouds.yaml.
+    for name in tuple(os.environ):
+        if name.startswith("OS_"):
+            monkeypatch.delenv(name)
+    clouds_file = tmp_path / "clouds.yaml"
+    clouds_file.write_text(json.dumps({"clouds": {"ambient": {
+        "auth_type": "v3applicationcredential",
+        "auth": {
+            "auth_url": "https://file-keystone.invalid/v3",
+            "application_credential_id": "file-credential",
+            "application_credential_secret": "file-secret",
+            "application_credential_name": "file-credential-name",
+            "user_id": "file-user",
+            "project_id": "file-project",
+        },
+        "region_name": "FileRegion",
+        "interface": "admin",
+        "insecure": True,
+    }}}), encoding="utf-8")
+    monkeypatch.setattr(loader, "CONFIG_FILES", [str(clouds_file)])
+    monkeypatch.setattr(loader, "SECURE_FILES", [])
+    monkeypatch.setattr(loader, "VENDOR_FILES", [])
+    ambient = {
+        "OS_CLIENT_CONFIG_FILE": str(clouds_file),
+        "OS_AUTH_TYPE": "v3applicationcredential",
+        "OS_AUTH_URL": "https://env-keystone.invalid/v3",
+        "OS_APPLICATION_CREDENTIAL_ID": "env-credential",
+        "OS_APPLICATION_CREDENTIAL_SECRET": "env-secret",
+        "OS_APPLICATION_CREDENTIAL_NAME": "env-credential-name",
+        "OS_USER_ID": "caller-user",
+        "OS_PROJECT_ID": "caller-project",
+        "OS_PROJECT_NAME": "caller-project-name",
+        "OS_PROJECT_DOMAIN_ID": "caller-domain",
+        "OS_REGION_NAME": "EnvRegion",
+        "OS_INTERFACE": "public",
+        "OS_INSECURE": "true",
+    }
+    if selected_cloud is not None:
+        ambient["OS_CLOUD"] = selected_cloud
+    for name, value in ambient.items():
+        monkeypatch.setenv(name, value)
+
+    # Prove these fixtures reach the installed SDK when ambient loading is on.
+    ambient_config = loader.OpenStackConfig().get_one()
+    source = "file" if selected_cloud == "ambient" else "env"
+    assert ambient_config.get_auth_args()["application_credential_id"] == f"{source}-credential"
+    assert ambient_config.get_auth().project_id == ("file-project" if source == "file" else "caller-project")
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("cloud connection construction must not perform HTTP")
+
+    monkeypatch.setattr(Session, "request", no_network)
+    monkeypatch.setenv("SCALING_TEST_SECRET", "operator-secret")
+    cloud = CloudProfile(
+        id="operator", auth_url="https://operator-keystone.invalid/v3",
+        project_id="operator-project", region_name="OperatorRegion", interface="internal",
+        application_credential_id="operator-credential",
+        application_credential_secret=SecretRef(env="SCALING_TEST_SECRET"), purpose="trusted",
+    )
+    conn = nova.cloud_connection(cloud)
+    try:
+        assert conn.config.get_auth_args() == {
+            "auth_url": cloud.auth_url,
+            "application_credential_id": cloud.application_credential_id,
+            "application_credential_secret": "operator-secret",
+        }
+        auth = conn.session.auth
+        assert isinstance(auth, ApplicationCredential)
+        assert auth is conn.config.get_auth()
+        assert auth.auth_url == cloud.auth_url
+        # Application credentials supply their own project binding; neither
+        # the profile's bookkeeping project nor caller scope is sent to auth.
+        assert not auth.has_scope_parameters
+        assert not auth.unscoped
+        assert len(auth.auth_methods) == 1
+        assert auth.auth_methods[0].get_auth_data(conn.session, auth, {}, {}) == (
+            "application_credential", {"id": "operator-credential", "secret": "operator-secret"},
+        )
+        assert conn.config.region_name == cloud.region_name
+        assert conn.config.config["interface"] == cloud.interface
+        assert conn.session.verify is True
+        assert conn.session.timeout == 15
+        assert conn.config.get_connect_retries("compute") == 0
+        assert conn.config.get_status_code_retries("compute") == 0
+    finally:
+        conn.close()
 
 
 def test_admin_pool_view_exposes_projection_without_secret_material():

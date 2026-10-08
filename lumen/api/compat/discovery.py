@@ -91,6 +91,7 @@ class CompatDiscoveryHostGate(BaseModel):
             "/v1/responses",
             "/v1/messages",
             "/v1/models",
+            "/v1/cli/models",
             "/v1/files",
             "/v1/batches",
             "/v1/claude-gateway/*",

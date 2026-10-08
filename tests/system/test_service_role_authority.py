@@ -11,10 +11,54 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from system.fake_keystone import CONTROL_TOKEN, OWNER_TOKEN, PROJECT_ID
+from system.fake_keystone import CONTROL_TOKEN, DIRECTORY_PROJECT_ID, DIRECTORY_TOKEN, OWNER_TOKEN, PROJECT_ID
 from system.test_process_stack import _poll_run_until_terminal
 
 pytestmark = pytest.mark.system
+
+
+def test_system_admin_target_key_cannot_substitute_tenant_scope():
+    api_url = os.environ.get("LUMEN_API_BASE_URL", "http://localhost:8012")
+    directory_url = os.environ.get("LUMEN_FAKE_KEYSTONE_URL", "http://fake-keystone:5000")
+    owner_headers = {
+        "X-Auth-Token": DIRECTORY_TOKEN,
+        "X-Project-Id": DIRECTORY_PROJECT_ID,
+        "X-Target-Project-Id": PROJECT_ID,
+    }
+    control_headers = {"X-Test-Control-Token": CONTROL_TOKEN}
+    created_id = None
+    with httpx.Client(base_url=api_url, timeout=30, trust_env=False) as api, \
+            httpx.Client(base_url=directory_url, timeout=10, trust_env=False) as directory:
+        assert directory.post("/_control/reset", headers=control_headers, json={}).status_code == 200
+        try:
+            target_read = api.get("/v1/api-keys", headers=owner_headers)
+            assert target_read.status_code == 200, target_read.text
+            own_read = api.get("/v1/api-keys", headers={
+                "X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID,
+            })
+            assert own_read.status_code == 200, own_read.text
+            forbidden_target = api.get("/v1/api-keys", headers={
+                "X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID,
+                "X-Target-Project-Id": DIRECTORY_PROJECT_ID,
+            })
+            assert forbidden_target.status_code == 403, forbidden_target.text
+            issued = api.post("/v1/api-keys", headers=owner_headers,
+                              json={"name": "system target isolation", "scopes": ["models:read"]})
+            assert issued.status_code == 201, issued.text
+            key = issued.json()
+            created_id = key["id"]
+            for key_headers in ({"X-API-Key": key["key"]}, {"Authorization": "Bearer " + key["key"]}):
+                assert api.get("/v1/models", headers=key_headers).status_code == 200
+                for header in ("X-Project-Id", "X-Target-Project-Id"):
+                    own = api.get("/v1/models", headers={**key_headers, header: PROJECT_ID})
+                    assert own.status_code == 200, own.text
+                    foreign = api.get("/v1/models", headers={**key_headers, header: DIRECTORY_PROJECT_ID})
+                    assert foreign.status_code == 403, foreign.text
+        finally:
+            assert directory.post("/_control/reset", headers=control_headers, json={}).status_code == 200
+            if created_id is not None:
+                cleanup = api.delete(f"/v1/api-keys/{created_id}", headers=owner_headers)
+                assert cleanup.status_code in {200, 204}, cleanup.text
 
 
 def test_current_graph_downgrade_at_native_and_compat_http_boundaries():

@@ -1,4 +1,4 @@
-"""Keystone token validation and service-scoped OpenStack connections for Lumen."""
+"""Current caller authority, directory reads and caller-token OpenStack connections."""
 
 from __future__ import annotations
 
@@ -451,28 +451,6 @@ def require_chat_api_host(request: Request) -> None:
     host = (request.headers.get("host") or "").split(":")[0].strip().lower()
     if host not in allowed:
         raise HTTPException(status_code=404, detail="Not Found")
-
-
-
-
-def get_admin_connection_for_project(project_id: str):
-    import openstack
-
-    settings = get_settings()
-    conn = openstack.connect(
-        auth_url=settings.keystone_auth_url,
-        username=settings.keystone_admin_username,
-        password=settings.keystone_admin_password,
-        project_name=settings.keystone_admin_project,
-        user_domain_name=settings.keystone_domain,
-        project_domain_name=settings.keystone_domain,
-        region_name=settings.keystone_region_name,
-        interface=settings.keystone_interface,
-        verify=settings.verify,
-    )
-    if project_id and conn.current_project_id != project_id:
-        conn = conn.connect_to_project(project_id)
-    return conn
 
 
 async def get_os_conn(token_info: dict = Depends(require_token)):
