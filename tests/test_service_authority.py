@@ -138,7 +138,7 @@ async def test_current_assignment_provider_outage_is_not_stale_token_fallback(mo
 @pytest.mark.parametrize("scope,expected", [({"project": {"id": "admin"}}, False),
                                            ({"domain": {"id": "default"}}, False),
                                            ({"system": {"all": True}}, True)])
-def test_only_verified_effective_system_assignment_is_global_admin(monkeypatch, scope, expected):
+def test_only_verified_direct_system_assignment_is_global_admin(monkeypatch, scope, expected):
     query = []
     def assignments(**kwargs):
         query.append(kwargs)
@@ -148,7 +148,7 @@ def test_only_verified_effective_system_assignment_is_global_admin(monkeypatch, 
         roles=SimpleNamespace(list=lambda: [SimpleNamespace(id="global-admin-id", name="admin", domain_id=None)]),
         inference_rules=SimpleNamespace(list_inference_roles=lambda: [])))
     assert auth._is_system_admin("user") is expected
-    assert query == [{"user": "user", "system": "all", "effective": True}]
+    assert query == [{"user": "user", "system": "all"}]
 
 
 def test_domain_named_admin_role_cannot_be_global_admin_role(monkeypatch):

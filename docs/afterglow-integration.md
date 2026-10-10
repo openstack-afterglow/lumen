@@ -101,6 +101,10 @@ Native와 Keystone-only 인증 dependency는 동기 Keystone 네트워크 검증
 처리할 수 있지만, token rescope·target project·admin 검증과 인증 실패 응답은 그대로입니다.
 인증 결과 cache나 Keystone 장애 시 허용 경로를 추가하지 않습니다.
 
+Afterglow가 보내는 token role snapshot이나 caller role header는 Lumen service authority가 아닙니다. Lumen은 현재 enabled owner/project와 role-ID inference DAG를 다시 확인합니다. Project membership은 `role_assignments.list(user=user_id, project=project_id, effective=True)`의 해당 project row로 확인하여 group/inherited grant를 유지합니다(verified system admin 예외는 유지). System admin은 별도로 `role_assignments.list(user=user_id, system="all")`에서 **`effective=True` 없이 direct system assignment**를 읽고, `scope.system.all is True`인 row의 role ID를 현재 검증된 DAG로 확장하여 정확한 unique global `admin` ID 도달 여부로 판정합니다. Keystone effective expansion은 direct system grant를 누락하므로 이 system 조회에 사용하지 않습니다.
+
+Project/domain `admin|manager`는 system admin으로 승격되지 않습니다. Verified system admin의 `X-Target-Project-Id`는 logical target만 선택하며 원래 caller의 `connection_project_id`를 바꾸지 않습니다. API key는 system-admin owner라도 `is_system_admin=false`인 project-bound credential이며 stored scope와 current owner action의 교집합만 허용합니다. Foreign `X-Project-Id`/`X-Target-Project-Id`는 403입니다. Current service leaf 제거는 다음 요청과 새 provider I/O를 차단하며, current authority lookup 장애는 503으로 닫힙니다. 이 계약의 source qualification과 pending production rollout은 [테스트 문서](testing.md#067-direct-system-authority-source-qualification)에 구분하여 기록합니다.
+
 ### 4.2 Scope Matrix
 
 API Key 요청 시 필요한 최소 Scope 정의:

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from system.fake_keystone import (
     CONTROL_TOKEN,
     DIRECTORY_ID,
@@ -144,3 +144,23 @@ async def test_native_sdk_non_admin_cannot_select_foreign_target(native_director
             x_project_id=PROJECT_ID, x_target_project_id=DIRECTORY_PROJECT_ID,
         )
     assert exc.value.status_code == 403
+
+
+@pytest.mark.parametrize("admin", [False, True], ids=["native-read", "global-admin"])
+async def test_direct_system_grant_authorizes_http_without_promoting_project_admin(native_directory, admin):
+    app = FastAPI()
+    dependency = auth.require_admin if admin else auth.require_scopes("native:conversations:read")
+
+    @app.get("/authority")
+    async def authority(principal=Depends(dependency)):
+        return {"system_admin": principal["is_system_admin"], "project_id": principal["project_id"]}
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+        allowed = await client.get("/authority", headers={"X-Auth-Token": DIRECTORY_TOKEN,
+            "X-Project-Id": DIRECTORY_PROJECT_ID})
+        assert allowed.status_code == 200, allowed.text
+        assert allowed.json() == {"system_admin": True, "project_id": DIRECTORY_PROJECT_ID}
+        native_directory.configure({"owner_roles": ["admin", "member"]})
+        denied = await client.get("/authority", headers={"X-Auth-Token": OWNER_TOKEN,
+            "X-Project-Id": PROJECT_ID})
+        assert denied.status_code == 403

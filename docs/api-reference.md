@@ -4,7 +4,9 @@
 
 ## 인증과 scope
 
-Keystone token과 API key는 모두 현재 enabled owner/project 및 effective Keystone role-ID graph의 service action을 요구한다. Parent 이름이나 token role snapshot은 권한의 대체재가 아니고 graph edge 제거는 다음 요청 및 새 provider I/O에 적용된다. API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat text route (`/v1/models`, `/v1/cli/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API key만 허용하며 Keystone token 사용 시 401이다. 한 요청에 credential 둘 이상을 보내면 400이나 동일한 key의 `X-API-Key` + Bearer 중복은 허용한다. API key의 `X-Project-Id`는 key owner project와 같아야 한다. `X-Lumen-Provider`는 관리자 설정 `api_provider` 선택자이며 body `provider`와 충돌하면 400이다. Transport prefix를 선택자 alias로 해석하지 않는다.
+Keystone token과 API key는 모두 현재 enabled owner/project 및 현재 검증된 Keystone role-ID graph의 service action을 요구한다. Parent 이름이나 token role snapshot은 권한의 대체재가 아니고 graph edge 제거는 다음 요청 및 새 provider I/O에 적용된다. API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat text route (`/v1/models`, `/v1/cli/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API key만 허용하며 Keystone token 사용 시 401이다. 한 요청에 credential 둘 이상을 보내면 400이나 동일한 key의 `X-API-Key` + Bearer 중복은 허용한다. API key의 `X-Project-Id`는 key owner project와 같아야 한다. `X-Lumen-Provider`는 관리자 설정 `api_provider` 선택자이며 body `provider`와 충돌하면 400이다. Transport prefix를 선택자 alias로 해석하지 않는다.
+
+System admin은 `role_assignments.list(user=user_id, system="all")`로 **`effective=True` 없이 direct system assignment**를 읽고 `scope.system.all is True`인 row의 role ID를 현재 검증된 inference DAG로 확장하여 정확한 unique global `admin` ID 도달 여부로 판정한다. Keystone의 effective expansion은 direct system grant를 누락하므로 system 조회에 사용하지 않는다. Project membership 조회는 `role_assignments.list(user=user_id, project=project_id, effective=True)`를 유지하여 group/inherited grant를 포함하고 해당 project row만 인정한다. Verified system admin 예외를 제외하면 current project membership이 필요하다. Project/domain `admin|manager`, token role snapshot, caller role header는 global admin으로 승격되지 않는다. API key는 system-admin owner라도 `is_system_admin=false`이며 stored scope와 current owner action의 교집합만 사용하고 foreign project/target header는 403이다. Graph/ID 검증 실패는 fail-closed이며 current authority lookup 장애는 503이다.
 
 | Surface | API-key scope | Keystone only |
 | --- | --- | --- |
@@ -23,7 +25,7 @@ Keystone token과 API key는 모두 현재 enabled owner/project 및 effective K
 | agents and code/Git management | `native:agents:read` / `native:agents:write` / `native:agents:delete` (private detail/clone/config uses write) | 아니오 |
 | workspaces | `native:conversations:read` / `native:conversations:write` / `native:conversations:delete` | 아니오 |
 | `/v1/api-keys` / owner limits / revoke | internal route actions `native:keys:read|write|delete` (not issuable key scopes) | 예 |
-| `/v1/admin/*` | verified effective system `admin`, not tenant/domain admin | 예 |
+| `/v1/admin/*` | verified system `admin` (direct system assignments + current validated role-ID DAG), not tenant/domain admin | 예 |
 
 Scope는 current owner leaf와 교집합으로만 사용할 수 있다. 발급은 `lumen-keys_editor`와 requested scope 전체의 subset을 요구하며 default `models:read, compat:completions:write`도 자동 확대되지 않는다. Reader는 inventory/history, chat-user는 text generation, images-user는 image generation, audio-user는 finite/realtime audio, tools-user는 tool/skill/agent/provider search execution을 각각 허용한다. Config는 assets/agents/MCP/keys editor leaf, history/memory write/delete는 history-editor, resource/file/asset/extension/agent/key destruction은 resources-admin으로 분리된다. 실제 mapping은 `lumen/service_authority.py`의 단일 `SCOPE_CAPABILITIES`를 따른다. Nonreader action은 effective native `member`도 필요하며 `reader` baseline은 read-only다.
 
@@ -204,7 +206,7 @@ Managed advisor cache 단가도 같은 manual→direct catalog→text write casc
 
 ## API 키와 월·주간 사용 한도
 
-API 키 발급·목록·이름·owner 한도 관리는 Keystone-only이며 current `lumen-keys_editor`가 필요하다. Requested scope는 current owner action의 subset이어야 하며 기본값도 예외가 아니다. `DELETE /v1/api-keys/{key_id}`는 current `lumen-resources_admin`과 ownership을 요구하고 row/ledger를 삭제하지 않고 revoke한다. API-key credential로 key management를 호출하면 401이다. `/v1/admin/api-keys*`는 verified effective system admin만 허용한다. Local seed는 실제 owner ID/directory credential을 필요로 하고 owned stale key rotation에도 delete action을 검사한다.
+API 키 발급·목록·이름·owner 한도 관리는 Keystone-only이며 current `lumen-keys_editor`가 필요하다. Requested scope는 current owner action의 subset이어야 하며 기본값도 예외가 아니다. `DELETE /v1/api-keys/{key_id}`는 current `lumen-resources_admin`과 ownership을 요구하고 row/ledger를 삭제하지 않고 revoke한다. API-key credential로 key management를 호출하면 401이다. `/v1/admin/api-keys*`는 direct system assignment와 현재 검증된 role-ID DAG로 확인한 system admin만 허용한다. Local seed는 실제 owner ID/directory credential을 필요로 하고 owned stale key rotation에도 delete action을 검사한다.
 
 ### API 키 관리 route
 

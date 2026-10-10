@@ -110,6 +110,8 @@ class DirectoryState:
         project = query.get("scope.project.id", [None])[0]
         system = query.get("scope.system", [None])[0]
         selected_role = query.get("role.id", [None])[0]
+        # Keystone effective expansion emits project/domain rows, not direct system grants.
+        effective = query.get("effective", ["false"])[0].lower() == "true"
         rows = [
             *({"user": {"id": OWNER_ID}, "role": {"id": rid}, "scope": {"project": {"id": PROJECT_ID}}}
               for rid in sorted(self.owner_roles)),
@@ -121,6 +123,7 @@ class DirectoryState:
                 if (user is None or row["user"]["id"] == user)
                 and (project is None or row["scope"].get("project", {}).get("id") == project)
                 and (system is None or (system == "all" and row["scope"].get("system", {}).get("all") is True))
+                and not (effective and "system" in row["scope"])
                 and (selected_role is None or row["role"]["id"] == selected_role)]
 
     def token_document(self, subject: str, base_url: str, *, system: bool = False) -> dict:

@@ -140,6 +140,41 @@ LUMEN_TEST_COMPOSE_PROJECT=lumen-rolegrades-20261006 uv run --frozen --extra ser
 
 Both runners tear down their selected project's volumes. These local proofs do not establish production Keystone authorization, real provider output/billing, cloud workers or deployment. Docker multiarchitecture build/import checks are separate: importing `lumen.worker` is not worker execution evidence.
 
+### 0.6.7 direct-system authority source qualification
+
+The 0.6.7 source repair reads `role_assignments.list(user=user_id, system="all")` **without `effective=True`**, keeps only `scope.system.all is True` rows, and expands their role IDs through the current validated inference DAG to the exact unique global `admin` ID. Project membership still uses `role_assignments.list(user=user_id, project=project_id, effective=True)` for current group/inherited grants, with the existing verified-system-admin exception. Enabled owner/project checks, project/domain `admin|manager` denials, API-key stored-scope attenuation and foreign project/target rejection remain in force.
+
+`tests/system/fake_keystone.py::DirectoryState.assignments` models Keystone's omission of direct system grants when `effective=true`; it is an isolated directory HTTP fixture, not a production authentication fallback. `tests/test_native_keystone_authority.py::test_direct_system_grant_authorizes_http_without_promoting_project_admin` uses the installed Keystone SDK against that fixture and real auth dependencies through ASGI HTTP. Its `native-read` and `global-admin` cases admit the direct-system principal and reject a project-only `admin`/`member` principal with 403. This is not real deployed Keystone/API HTTP acceptance evidence.
+
+Final-tree qualification on isolated local `dev`: frozen `lumen-test contract -q` passed **3,069 service tests** (315 deselected), root Ruff, **128 SDK tests** and SDK Ruff. The disposable MariaDB/Redis integration gate passed **284**, and canonical Compose process-system gate passed **31** with actual API, online worker, batch worker, PostgreSQL, HTTPS MinIO, ClamAV and synthetic Keystone/provider HTTP. Strict X.509 guest-runtime smoke passed **1**; only ephemeral test certificates gained SAN/SKI/AKI/key-usage metadata, with production TLS policy unchanged. Existing dependency deprecation warnings remain disclosed rather than suppressed.
+
+Root `lumen-0.6.7-py3-none-any.whl` and all seven independent package wheels built. Independent plugin conformance passed **88**, with **1** optional-pgvector skip; Kolla asset tests passed **41**. Sandbox tests on macOS were **21 skipped** as Linux-only; a nonprivileged Linux arm64 process passed **12** and skipped **9**, not full namespace/cgroup workload qualification. These isolated fixtures and packaging results are not production RBAC, paid-provider, cloud sandbox/Nova/Octavia or rollout evidence. Local current-source Afterglow1.30.10/Lumen0.6.7, using the unchanged real Keystone owner session, returned200 for conversations and global provider administration; no role assignment or provider mutation was made.
+
+Production remains **Lumen0.6.6 revision `2757a5df`, defective**, until the owner-authorized immutable publication, canonical `/etc/kolla/multinode` rollout and authenticated production acceptance are recorded. The source migration tree/manifest are byte-identical to0.6.6; no new migration is introduced.
+
+Canonical reproducible commands (the exercised gates/builds above qualify this integrated source, not earlier user-reported20-test evidence):
+
+```sh
+uv sync --extra service --extra dev --frozen
+uv run --frozen lumen-test contract -q
+export LUMEN_TEST_COMPOSE_PROJECT=lumen-direct-system-067-qualification
+uv run --frozen lumen-test integration -q
+uv run --frozen lumen-test system -q
+uv run --frozen pytest tests/test_kolla_assets.py -q
+uv build --wheel
+uv build --wheel --out-dir dist packages/lumen-plugin-api
+uv build --wheel --out-dir dist plugins/database-mariadb
+uv build --wheel --out-dir dist plugins/memory-default
+uv build --wheel --out-dir dist plugins/tools-default
+uv build --wheel --out-dir dist plugins/skills-default
+uv build --wheel --out-dir dist plugins/mcp-default
+uv build --wheel --out-dir dist packages/lumen-sandbox
+```
+
+`contract` runs root pytest excluding integration/system, root Ruff, SDK pytest and SDK Ruff. The Compose project above is a disposable qualification project, not an operator development/production project: integration/system require Docker Engine/Compose and remove the selected project's volumes. They exercise isolated services with synthetic directory/provider HTTP, not paid providers or production Keystone. The root wheel command above is local packaging; `.github/workflows/release.yml` builds it with `python -m build --wheel --outdir dist`. Independent package wheels and the Kolla-assets test are separate from service contract evidence.
+
+Publication must separately qualify all four Dockerfile targets (`lumen-api`, `lumen-worker`, `lumen-controller`, `lumen-sandbox`) on **`linux/amd64` and `linux/arm64`**, verify immutable revision/digest and aliases, and execute the declared platforms. Final exact-scope architecture stamping and staged guard follow source/docs integration. Successful local gates, published tag/image digests, deployed version/revision and authenticated production acceptance remain separate evidence requirements.
+
 ### Execution credential isolation handoff (test-defined)
 
 Local change: `openspec/changes/isolate-service-execution-credentials`. No builds/tests/lint/formatters/runtime smoke or architecture stamping were run during implementation. Existing receipts above are historical and do not qualify this cutover. Keep operator credentials and paid-provider secrets out of the test environment.

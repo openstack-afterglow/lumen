@@ -151,7 +151,9 @@ def _system_admin_from_graph(ks, user_id: str, graph: dict[str, set[str]], globa
     admin_id = global_ids.get("admin")
     if not user_id or admin_id is None:
         return False
-    assignments = ks.role_assignments.list(user=user_id, system="all", effective=True)
+    # Keystone effective expansion omits direct system grants. Expand the
+    # validated current role-ID graph locally after reading actual system rows.
+    assignments = ks.role_assignments.list(user=user_id, system="all")
     role_ids = {a.role["id"] for a in assignments
                 if (getattr(a, "scope", {}) or {}).get("system", {}).get("all") is True}
     return admin_id in _expand_role_ids(role_ids, graph)
