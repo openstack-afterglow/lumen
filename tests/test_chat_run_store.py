@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from lumen.models.chat_infrastructure import ChatWorkerRegistration
 from lumen.models.chat_runs import ChatRun, ChatRunSegment
 from lumen.services.run_store import (
     RunStoreError,
@@ -198,13 +199,33 @@ class _ScalarResult:
     def scalar_one_or_none(self):
         return self.run
 
+    def one_or_none(self):
+        return self.run
+
 
 class _LeaseSession:
-    def __init__(self, run):
-        self.run = run
+    """Answers entity selects with the stored row and column selects with its attributes."""
 
-    async def execute(self, _statement):
-        return _ScalarResult(self.run)
+    def __init__(self, run, registration=None):
+        self.run = run
+        self.registration = registration
+
+    async def execute(self, statement):
+        descriptions = statement.column_descriptions
+        entity = descriptions[0]["entity"]
+        source = self.registration if entity is ChatWorkerRegistration else self.run
+        if len(descriptions) == 1 and descriptions[0]["expr"] is entity:
+            return _ScalarResult(source)
+        if source is None:
+            return _ScalarResult(None)
+        values = {description["name"]: getattr(source, description["name"]) for description in descriptions}
+        if len(descriptions) == 1:
+            return _ScalarResult(next(iter(values.values())))
+        return _ScalarResult(SimpleNamespace(**values))
+
+    async def scalar(self, _statement):
+        # No other live run leases hold this registration's capacity.
+        return 0
 
 
 @pytest.mark.asyncio
@@ -237,19 +258,36 @@ async def test_claim_fence_invalidates_stale_owner_after_reclaim():
 
     run = _run("queued")
     run.lease_fence = 0
-    first = await claim_queued_run(_LeaseSession(run), run.id, owner="worker-a")
+    run.workload_class = "online_text"
+    run.execution_protocol_version = 1
+    registration = ChatWorkerRegistration(
+        id="registration-1", worker_identity="worker-a", boot_id="boot-1", resource_id=None, pool_id=None,
+        protocol_versions=[1], workload_classes=["online_text"], plugin_digest="d" * 64, schema_version=1,
+        capacity=1, accepting=True, draining=False, heartbeat_at=datetime.now(UTC),
+    )
+    session = _LeaseSession(run, registration)
+    first = await claim_queued_run(session, run.id, owner="worker-a", registration_id=registration.id)
     stale_token = first.lease_owner
     assert run.lease_fence == 1 and stale_token.endswith("#1")
+    assert run.worker_registration_id == registration.id
 
     # Lease lapses and recovery requeues the run; a fresh worker claims it again.
     run.status = "queued"
     run.lease_owner = None
     run.lease_expires_at = None
-    second = await claim_queued_run(_LeaseSession(run), run.id, owner="worker-a")
+    run.worker_registration_id = None
+    second = await claim_queued_run(session, run.id, owner="worker-a", registration_id=registration.id)
     assert run.lease_fence == 2 and second.lease_owner != stale_token
 
-    assert await renew_run_lease(_LeaseSession(run), run.id, owner=stale_token) is None
-    assert await renew_run_lease(_LeaseSession(run), run.id, owner=second.lease_owner) is run
+    assert await renew_run_lease(session, run.id, owner=stale_token) is None
+    assert await renew_run_lease(session, run.id, owner=second.lease_owner) is run
+
+    # A different workload class never claims the run, whatever its free capacity.
+    run.status = "queued"
+    run.lease_owner = None
+    registration.workload_classes = ["batch"]
+    assert await claim_queued_run(session, run.id, owner="worker-a", registration_id=registration.id) is None
+    assert run.lease_fence == 2
 
 @pytest.mark.asyncio
 async def test_finalizer_claim_accepts_persisted_naive_expiry():

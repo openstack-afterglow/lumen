@@ -71,6 +71,11 @@ _OUTPUT_FORMATS = {"mp3": "audio/mpeg", "wav": "audio/wav"}
 class AudioTransportError(RuntimeError):
     """The direct provider failed or produced an invalid bounded result."""
 
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        # Only the integer upstream status survives; provider bodies are never retained.
+        self.status_code = status_code
+
 
 @dataclass(frozen=True)
 class SpeechResult:
@@ -323,11 +328,13 @@ async def _post(url: str, *, headers: dict, max_bytes: int, json_body: dict | No
     # Never interpolate credentials, URLs from a response, or provider bodies into errors.
     try:
         async with (
-            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False) as client,
+            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False,
+                              transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False)) as client,
             client.stream("POST", url, headers=headers, json=json_body, data=form, files=files) as response,
         ):
             if response.status_code != 200:
-                raise AudioTransportError(f"audio provider returned HTTP {response.status_code}")
+                raise AudioTransportError(f"audio provider returned HTTP {response.status_code}",
+                                          status_code=response.status_code)
             size = response.headers.get("content-length", "")
             if size.isdecimal() and int(size) > max_bytes:
                 raise AudioTransportError("audio provider response exceeds size limit")

@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+install -d -o root -g root -m 0700 /var/lib/lumen/bootstrap /var/lib/lumen/identity /var/lib/lumen/drain
+# The running guest never updates packages or installs application dependencies.
+install -d -m 0755 /etc/cloud/cloud.cfg.d
+cat > /etc/cloud/cloud.cfg.d/99-lumen-no-packages.cfg <<'EOF'
+package_update: false
+package_upgrade: false
+packages: []
+EOF
+install -d -m 0755 /etc/docker
+# Keep .Id tied to the verified OCI config digest, including on Docker 29+.
+cat > /etc/docker/daemon.json <<'EOF'
+{"features":{"containerd-snapshotter":false}}
+EOF
+systemctl mask apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer unattended-upgrades.service
+systemctl enable docker.service lumen-guest.service

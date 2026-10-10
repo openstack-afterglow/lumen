@@ -98,9 +98,11 @@ claude_gateway_provider = "anthropic"
     assert settings.claude_gateway_provider == "anthropic"
 
 
-def test_lumen_environment_variable_overrides(monkeypatch):
+def test_lumen_environment_variable_overrides(monkeypatch, tmp_path):
     """Test environment variable overrides hitting exact Settings fields."""
-    monkeypatch.setenv("LUMEN_CONFIG_FILE", "/nonexistent/path/lumen.conf")
+    config_file = tmp_path / "lumen.conf"
+    config_file.write_text('[lumen]\nservice_chat_enabled = true\n')
+    monkeypatch.setenv("LUMEN_CONFIG_FILE", str(config_file))
     monkeypatch.setenv("KEYSTONE_AUTH_URL", "http://env-keystone:5000/v3")
     monkeypatch.setenv("KEYSTONE_ADMIN_USERNAME", "env-user")
     monkeypatch.setenv("KEYSTONE_ADMIN_PASSWORD", "env-pass")
@@ -204,7 +206,21 @@ def test_lumen_config_candidates_only_lumen_paths(monkeypatch):
 
     monkeypatch.setenv("LUMEN_CONFIG_FILE", "/custom/lumen.conf")
     candidates_custom = _config_candidates()
-    assert candidates_custom == [Path("/custom/lumen.conf"), Path("/etc/lumen/lumen.conf"), Path("lumen.conf")]
+    assert candidates_custom == [Path("/custom/lumen.conf")]
+
+
+@pytest.mark.parametrize("content", [None, "", "# empty deployment\n", "[lumen\n"])
+def test_explicit_config_never_falls_back(monkeypatch, tmp_path, content):
+    config = tmp_path / "explicit.conf"
+    if content is not None:
+        config.write_text(content)
+    monkeypatch.setenv("LUMEN_CONFIG_FILE", str(config))
+    load_raw_toml.cache_clear()
+    try:
+        with pytest.raises((OSError, ValueError)):
+            load_raw_toml()
+    finally:
+        load_raw_toml.cache_clear()
 
 
 def test_get_lumen_encryption_key_strict_validation():
@@ -238,3 +254,85 @@ def test_chat_compat_run_timeout_seconds_bounds_validation():
 
     with pytest.raises(ValueError, match="must be between 1 and 3600"):
         Settings(chat_compat_run_timeout_seconds=3601)
+
+
+def test_fixed_worker_classes_preserve_online_default_and_isolate_batch():
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings()
+        assert settings.runtime_config.enabled is False
+        assert settings.worker_workload_classes == ["online_text", "online_media"]
+        assert Settings(worker_workload_classes=["batch"]).worker_workload_classes == ["batch"]
+        assert Settings(worker_workload_classes=["online_media"]).worker_workload_classes == ["online_media"]
+        for classes in ([], ["realtime"], ["online_text", "online_text"], ["batch", "online_text"]):
+            with pytest.raises(ValueError):
+                Settings(worker_workload_classes=classes)
+
+
+def test_batch_policy_defaults_match_bounded_validation_and_dispatch_contract():
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings()
+        assert settings.batch_enabled is False
+        assert (settings.batch_dispatch_window, settings.batch_project_dispatch_window) == (8, 32)
+        assert (settings.batch_native_max_items, settings.batch_native_max_bytes) == (1000, 10 * 1024 * 1024)
+        assert (settings.batch_jsonl_max_rows, settings.batch_jsonl_max_bytes, settings.batch_jsonl_max_line_bytes) == (
+            50000, 200000000, 4 * 1024 * 1024,
+        )
+        assert (settings.batch_validation_chunk_rows, settings.batch_validation_chunk_bytes) == (100, 1024 * 1024)
+        assert settings.batch_upload_slots == 4
+        assert (settings.batch_result_ttl_days, settings.batch_input_ttl_days) == (7, 30)
+        assert settings.batch_cancel_grace_seconds == 600
+        assert settings.api_max_websocket_connections == 64
+        assert settings.api_max_body_bytes > settings.batch_jsonl_max_bytes
+        assert Settings(batch_enabled=True, worker_workload_classes=["batch"]).batch_enabled is True
+
+
+@pytest.mark.parametrize("policy", [
+    {"api_max_active_requests": 0}, {"api_max_sse_connections": 0},
+    {"api_max_websocket_connections": 0}, {"api_max_body_bytes": 0},
+    {"api_max_websocket_connections": float("inf")},
+    {"batch_native_max_items": 1001}, {"batch_native_max_bytes": 10 * 1024 * 1024 + 1},
+    {"batch_jsonl_max_rows": 50001}, {"batch_jsonl_max_bytes": 200000001},
+    {"batch_jsonl_max_line_bytes": 4 * 1024 * 1024 + 1},
+    {"batch_validation_chunk_rows": 101}, {"batch_validation_chunk_bytes": 1024 * 1024 + 1},
+    {"batch_dispatch_window": 0}, {"batch_project_dispatch_window": 0},
+    {"batch_dispatch_window": 33}, {"batch_upload_slots": 0},
+    {"batch_result_ttl_days": 31}, {"batch_input_ttl_days": 0},
+    {"batch_cancel_grace_seconds": 601},
+    {"batch_jsonl_max_bytes": 1},
+    {"batch_enabled": True, "api_max_body_bytes": 199999999},
+])
+def test_online_and_batch_settings_reject_invalid_finite_bounds(policy):
+    with patch.dict(os.environ, {}, clear=True), pytest.raises(ValueError):
+        Settings(**policy)
+
+
+def test_runtime_and_batch_environment_fields_use_public_settings_names():
+    with patch.dict(os.environ, {
+        "WORKER_WORKLOAD_CLASSES": '["batch"]', "BATCH_ENABLED": "true",
+        "BATCH_DISPATCH_WINDOW": "4", "BATCH_PROJECT_DISPATCH_WINDOW": "16",
+        "API_MAX_WEBSOCKET_CONNECTIONS": "32", "RUNTIME_CONFIG": '{"enabled":false}',
+    }, clear=True):
+        settings = Settings()
+        assert settings.worker_workload_classes == ["batch"]
+        assert settings.batch_enabled is True
+        assert settings.runtime_config.enabled is False
+        assert (settings.batch_dispatch_window, settings.batch_project_dispatch_window) == (4, 16)
+        assert settings.api_max_websocket_connections == 32
+
+
+def test_shipped_toml_example_preserves_disabled_runtime_and_settings_sections(monkeypatch):
+    import tomllib
+
+    example = Path(__file__).resolve().parents[1] / "lumen.conf.example"
+    with example.open("rb") as handle:
+        parsed = tomllib.load(handle)
+    monkeypatch.setattr("lumen.config.load_raw_toml", lambda: parsed)
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(**_load_toml())
+    assert settings.worker_workload_classes == ["online_text", "online_media"]
+    assert settings.batch_jsonl_max_line_bytes == 4 * 1024 * 1024
+    assert settings.runtime_config.enabled is False
+    assert settings.runtime_config.pools == ()
+    assert settings.runtime_config.guest_profiles == ()
+    assert settings.runtime_config.renewal.renew_interval_seconds == 1200
+    assert settings.runtime_config.renewal.overlap_seconds == 120

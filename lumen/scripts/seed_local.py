@@ -10,19 +10,24 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
 
+from fastapi import HTTPException
+
+from lumen.auth import ensure_scopes, resolve_project_authority
 from lumen.db import close_db, init_db
 from lumen.scripts.seed_providers import seed_environment_providers
 from lumen.services import api_key_store
 from lumen.services.providers import repository
 
-_LOCAL_USER_ID = "local-console-user"
-_LOCAL_PROJECT_ID = "local-console-project"
 _LOCAL_KEY_SCOPES = [
     "models:read",
     "compat:completions:write",
     "compat:images:write",
     "compat:audio:write",
     "compat:realtime:write",
+    "compat:batches:read",
+    "compat:batches:write",
+    "compat:files:read",
+    "compat:files:write",
     "native:conversations:read",
     "native:conversations:write",
     "native:runs:read",
@@ -32,6 +37,8 @@ _LOCAL_KEY_SCOPES = [
     "native:realtime:write",
     "native:assets:read",
     "native:assets:write",
+    "native:batches:read",
+    "native:batches:write",
     "native:extensions:read",
     "native:tools:execute",
     "native:memory:read",
@@ -72,11 +79,11 @@ def is_scope_satisfied(verified_scopes: Collection[str], required_scopes: Collec
     return set(required_scopes).issubset(verified_scopes)
 
 
-def is_seed_key_current(verified: dict | None) -> bool:
+def is_seed_key_current(verified: dict | None, user_id: str, project_id: str) -> bool:
     return bool(
         verified
-        and verified.get("user_id") == _LOCAL_USER_ID
-        and verified.get("project_id") == _LOCAL_PROJECT_ID
+        and verified.get("user_id") == user_id
+        and verified.get("project_id") == project_id
         and is_scope_satisfied(verified.get("scopes", ()), _LOCAL_KEY_SCOPES)
     )
 
@@ -120,6 +127,16 @@ def _required(name: str) -> str:
 
 async def seed() -> None:
     database_url = _required("DATABASE_URL")
+    user_id = _required("LUMEN_LOCAL_OWNER_USER_ID")
+    project_id = _required("LUMEN_LOCAL_OWNER_PROJECT_ID")
+    try:
+        authority = await resolve_project_authority(user_id, project_id)
+        ensure_scopes(authority, "native:keys:write", *_LOCAL_KEY_SCOPES)
+    except HTTPException as exc:
+        raise RuntimeError(
+            f"Local API key owner {user_id!r} in project {project_id!r} must have current Keystone "
+            f"membership, keys-editor and all requested service capabilities: {exc.detail}"
+        ) from exc
     provider_name = os.environ.get("LUMEN_LOCAL_PROVIDER_NAME", "local-openai").strip()
     provider_type = os.environ.get("LUMEN_LOCAL_PROVIDER_TYPE", "openai").strip()
     requested_model = os.environ.get("LUMEN_LOCAL_MODEL", "").strip()
@@ -233,18 +250,19 @@ async def seed() -> None:
         raw_key = seed_path.read_text().strip() if seed_path.exists() else ""
         verified = await api_key_store.verify_key(raw_key) if raw_key else None
 
-        if verified is not None and not is_seed_key_current(verified):
-            if verified.get("user_id") == _LOCAL_USER_ID and verified.get("project_id") == _LOCAL_PROJECT_ID:
+        if verified is not None and not is_seed_key_current(verified, user_id, project_id):
+            if verified.get("user_id") == user_id and verified.get("project_id") == project_id:
+                ensure_scopes(authority, "native:keys:delete")
                 await api_key_store.revoke_key(
                     verified["api_key_id"],
-                    _LOCAL_USER_ID,
-                    _LOCAL_PROJECT_ID,
+                    user_id,
+                    project_id,
                 )
             verified = None
         if verified is None:
             issued = await api_key_store.create_key(
-                _LOCAL_USER_ID,
-                _LOCAL_PROJECT_ID,
+                user_id,
+                project_id,
                 "local-console",
                 _LOCAL_KEY_SCOPES,
                 None,

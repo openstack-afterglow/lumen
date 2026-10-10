@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 
+from lumen.config import Settings
 from lumen.services.infrastructure import controller as controller_module
-from lumen.services.infrastructure.config import PoolConfig
+from lumen.services.infrastructure.config import GuestProfile, PoolConfig, RenewalPolicy, RuntimeConfig
 from lumen.services.infrastructure.guest_api import dependency_ready
 from lumen.services.infrastructure.providers import DeleteResult, Observation
 from lumen.services.infrastructure.scheduler import api_desired, gate_scale, worker_desired
@@ -41,7 +43,12 @@ class FakeProvider:
 
 def _controller():
     config = SimpleNamespace(max_parallel_cloud_operations=4, pools=(), tls=None)
-    return controller_module.ResourceController(config, {}, owner="one")
+    reconciler = controller_module.ResourceController(config, {}, owner="one")
+    # Provider lifecycle tests isolate DB authorization; real-DB tests cover fences.
+    async def fenced(resource, fence, function, *args, **kwargs):
+        return await reconciler._cloud(function, *args)
+    reconciler._fenced_cloud = fenced
+    return reconciler
 
 
 def _pool(name="workers", deployment_id="deployment"):
@@ -57,8 +64,13 @@ def _resource(state="requested", provider_id=None, *, desired="requested"):
         id="resource-1", generation=1, observed_state=state, desired_state=desired,
         provider_id=provider_id, request_fingerprint="fp-1", policy_digest="policy-1",
         role="worker", run_id=None, address=None, certificate_fingerprint=None,
+        certificate_not_after=datetime.now(UTC) + timedelta(hours=1),
         image_ref="worker-image", deadline_at=None, logical_project_id=None,
         logical_user_id=None, ingress_member_id=None,
+        pool_id="pool-1", active_slots=0, accepting=True, idle_since=None,
+        drain_requested_at=None, drain_ack_at=None, drain_reason=None, ready_at=None,
+        bootstrap_token_hash=None, heartbeat_at=None, failure_code=None,
+        created_at=datetime.now(UTC),
     )
 
 
@@ -205,7 +217,7 @@ def test_scaling_gate_hysteresis_and_connection_budget():
     blocked = gate_scale(target=5, current=1, high_samples=first.high_samples, low_since=None,
                          now=2, low_utilization=False, safe_to_drain=False, pool_size=4,
                          overflow=1, db_connection_budget=20)
-    assert blocked.desired == 1 and blocked.reason == "db_connection_budget_exceeded"
+    assert blocked.desired == 4 and blocked.reason == "db_budget"
     allowed = gate_scale(target=3, current=1, high_samples=first.high_samples, low_since=None,
                          now=2, low_utilization=False, safe_to_drain=False, pool_size=4,
                          overflow=1, db_connection_budget=20)
@@ -241,26 +253,204 @@ def _configured_pool(role: str, backend: str = "nova", **overrides) -> dict:
     return data
 
 
-def test_pool_roles_and_certificate_budget_are_validated_before_provisioning():
+def test_pool_roles_and_renewable_lifetime_policy_are_validated_before_provisioning():
     for role in ("api", "worker", "sandbox"):
         assert PoolConfig.model_validate(_configured_pool(role)).role == role
     for role in ("api", "worker", "sandbox"):
         with pytest.raises(ValueError, match="Zun"):
             PoolConfig.model_validate(_configured_pool(role, "zun"))
-    with pytest.raises(ValueError, match="safety margin"):
-        PoolConfig.model_validate(_configured_pool("api", max_lifetime_seconds=3000))
+    api = PoolConfig.model_validate(_configured_pool("api"))
+    assert (api.idle_seconds, api.max_lifetime_seconds, api.boot_timeout_seconds, api.drain_seconds) == (
+        300, 86400, 600, 300,
+    )
+    assert PoolConfig.model_validate(_configured_pool("api", max_lifetime_seconds=7200)).max_lifetime_seconds == 7200
+    assert PoolConfig.model_validate(_configured_pool("sandbox")).max_lifetime_seconds == 1800
+    with pytest.raises(ValueError, match="boot and replacement drain"):
+        PoolConfig.model_validate(_configured_pool("api", max_lifetime_seconds=900))
     with pytest.raises(ValueError, match="api_readiness_port"):
         PoolConfig.model_validate(_configured_pool("api", ingress={
             **_configured_pool("api")["ingress"], "api_readiness_port": 8012,
         }))
 
 
+@pytest.mark.parametrize("workload,estimate", [
+    ("online_text", 30000), ("online_media", 120000), ("batch", 60000),
+])
+def test_worker_class_selects_cold_estimate(workload, estimate):
+    pool = PoolConfig.model_validate(_configured_pool("worker", workload_class=workload))
+    assert pool.workload_class == workload
+    assert pool.cold_service_time_ms == estimate
+    assert PoolConfig.model_validate(pool.model_dump()).workload_class == workload
+    assert PoolConfig.model_validate(_configured_pool("api")).workload_class is None
+
+
+@pytest.mark.parametrize("role", ["api", "sandbox"])
+@pytest.mark.parametrize("policy", [{"workload_class": "batch"}, {"cold_service_time_ms": 60000}])
+def test_worker_policy_cannot_leak_into_other_roles(role, policy):
+    with pytest.raises(ValueError, match="only worker"):
+        PoolConfig.model_validate(_configured_pool(role, **policy))
+
+
+@pytest.mark.parametrize("policy", [
+    {"workload_class": "realtime"}, {"idle_seconds": 0}, {"drain_seconds": 0},
+    {"boot_timeout_seconds": 3601}, {"max_lifetime_seconds": 2592001},
+    {"max_surge": -1}, {"cold_service_time_ms": 0}, {"max_replicas": float("inf")},
+    {"workload_class": None}, {"cold_service_time_ms": None},
+])
+def test_pool_policy_has_finite_typed_bounds(policy):
+    with pytest.raises(ValueError):
+        PoolConfig.model_validate(_configured_pool("worker", **policy))
+
+
+def _guest_profile(role="worker"):
+    names = ["DATABASE_URL", "REDIS_URL", "LUMEN_ENCRYPTION_KEY"]
+    return {
+        "id": "service", "role": role, "config_file": "/etc/lumen/runtime/service.conf",
+        "config_sha256": "b" * 64, "config_keys": ["service_chat_enabled"],
+        "secret_env_names": names, "secrets": {name: {"env": name} for name in names},
+        "image": "registry.example/lumen@sha256:" + "a" * 64,
+        "plugin_digest": "c" * 64, "schema_version": 22, "protocol_version": 2,
+    }
+
+
+def _enabled_runtime():
+    guest = _guest_profile()
+    pool = _configured_pool(
+        "worker", enabled=True, guest_profile_id=guest["id"], image=guest["image"],
+        db_connection_budget=100, pg_connection_budget=20, pg_connections_per_process=5,
+    )
+    return {
+        "enabled": True, "controller_url": "https://controller.example:8013",
+        "tls": {"ca_file": "/ca", "ca_key_file": "/ca-key", "cert_file": "/cert",
+                "key_file": "/key", "operator_client_cert_file": "/probe-cert",
+                "operator_client_key_file": "/probe-key"},
+        "dispatch_key": {"file": "/dispatch-key"}, "managed_networks": ["10.0.0.0/24"],
+        "cloud_profiles": [{"id": "trusted", "purpose": "trusted", "project_id": "trusted-project",
+                            "auth_url": "https://keystone.example/v3", "region_name": "RegionOne",
+                            "application_credential_id": "credential",
+                            "application_credential_secret": {"file": "/cloud-secret"}}],
+        "pools": [pool], "guest_profiles": [guest], "workload_pools": {"online_text": "managed"},
+        "db_connection_budget": 200, "pg_connection_budget": 100,
+        "fixed_db_connection_reserve": 30, "controller_db_connection_reserve": 30,
+        "fixed_pg_connection_reserve": 10, "controller_pg_connection_reserve": 5,
+    }
+
+
+def test_enabled_runtime_requires_renewal_and_partitioned_connection_budgets():
+    runtime = RuntimeConfig.model_validate(_enabled_runtime())
+    assert runtime.renewal.leaf_ttl_seconds == 3600
+    assert runtime.renewal.renew_interval_seconds == 1200
+    assert runtime.renewal.overlap_seconds == 120
+    assert runtime.pool("managed").max_lifetime_seconds == 86400
+    assert runtime.pool("managed").max_surge == 1
+    assert runtime.public_view()["pools"][0]["workload_class"] == "online_text"
+    assert "guest_profiles" not in runtime.public_view()
+    assert RuntimeConfig().enabled is False
+
+
+@pytest.mark.parametrize("policy,reason", [
+    ({"renewal": {"enabled": False}}, "identity renewal"),
+    ({"db_connection_budget": None}, "deployment DB and PG budgets"),
+    ({"pg_connection_budget": None}, "deployment DB and PG budgets"),
+    ({"db_connection_budget": 159}, "reservations exceed deployment"),
+    ({"pg_connection_budget": 34}, "reservations exceed deployment"),
+    ({"controller_db_connection_reserve": 0}, "controller DB reserve"),
+    ({"workload_pools": {}}, "explicit workload_pools"),
+    ({"workload_pools": {"batch": "managed"}}, "matching worker pool"),
+    ({"managed_networks": []}, "managed_networks"),
+    ({"controller_url": "http://controller.example"}, "https controller_url"),
+])
+def test_enabled_runtime_rejects_missing_or_conflicting_prerequisites(policy, reason):
+    with pytest.raises(ValueError, match=reason):
+        RuntimeConfig.model_validate({**_enabled_runtime(), **policy})
+
+
+def test_pool_minima_and_replacement_reservations_preserve_online_capacity():
+    values = _enabled_runtime()["pools"][0]
+    assert PoolConfig.model_validate({**values, "workload_class": "batch", "min_replicas": 0}).min_replicas == 0
+    for workload in ("online_text", "online_media"):
+        with pytest.raises(ValueError, match="online worker pools"):
+            PoolConfig.model_validate({**values, "workload_class": workload, "min_replicas": 0})
+    with pytest.raises(ValueError, match="minimum replicas and replacement surge"):
+        PoolConfig.model_validate({**values, "db_connection_budget": 59})
+    with pytest.raises(ValueError, match="minimum replicas and replacement surge"):
+        PoolConfig.model_validate({**values, "pg_connection_budget": 9})
+    with pytest.raises(ValueError, match="guest_profile_id"):
+        PoolConfig.model_validate({**values, "guest_profile_id": None})
+    api = _configured_pool("api", enabled=True, guest_profile_id="service", min_replicas=0)
+    with pytest.raises(ValueError, match="api pools require min_replicas"):
+        PoolConfig.model_validate(api)
+
+
+@pytest.mark.parametrize("policy", [
+    {"overlap_seconds": 0}, {"overlap_seconds": 120, "renew_interval_seconds": 120},
+    {"leaf_ttl_seconds": 7200}, {"renew_interval_seconds": 3001},
+    {"overlap_seconds": 600, "renew_interval_seconds": 3000},
+])
+def test_renewal_windows_are_finite_and_leave_unexpired_activation_time(policy):
+    with pytest.raises(ValueError):
+        RenewalPolicy.model_validate(policy)
+
+
+def test_guest_profiles_require_reference_only_scoped_delivery():
+    guest = GuestProfile.model_validate(_guest_profile())
+    assert guest.secrets["DATABASE_URL"].env == "DATABASE_URL"
+    assert len(guest.digest()) == 64
+    with pytest.raises(ValueError, match="exactly match"):
+        GuestProfile.model_validate({**_guest_profile(), "secret_env_names": []})
+    with pytest.raises(ValueError, match="secret references"):
+        GuestProfile.model_validate({**_guest_profile(), "secret_env_names": [], "secrets": {}})
+    with pytest.raises(ValueError, match="runtime_config"):
+        GuestProfile.model_validate({**_guest_profile(), "config_keys": ["runtime_config"]})
+    values = _guest_profile()
+    values["secret_env_names"].append("OS_APPLICATION_CREDENTIAL_SECRET")
+    values["secrets"]["OS_APPLICATION_CREDENTIAL_SECRET"] = {"file": "/cloud-secret"}
+    with pytest.raises(ValueError, match="controller credentials"):
+        GuestProfile.model_validate(values)
+    with pytest.raises(ValueError):
+        GuestProfile.model_validate({**_guest_profile(), "secrets": {"DATABASE_URL": "plaintext"}})
+    with pytest.raises(ValueError, match="matching role/image guest profile"):
+        RuntimeConfig.model_validate({**_enabled_runtime(), "guest_profiles": [_guest_profile("api")]})
+
+
+def test_enabled_runtime_rejects_duplicate_class_pool_and_unknown_guest_profile():
+    values = _enabled_runtime()
+    values["pools"].append({**values["pools"][0], "name": "duplicate"})
+    with pytest.raises(ValueError, match="exactly one enabled pool"):
+        RuntimeConfig.model_validate(values)
+    values = _enabled_runtime()
+    values["pools"][0]["guest_profile_id"] = "missing"
+    with pytest.raises(ValueError, match="matching role/image guest profile"):
+        RuntimeConfig.model_validate(values)
+
+
+def test_managed_batch_requires_online_coordinator_but_not_in_every_worker_process():
+    values = _enabled_runtime()
+    with pytest.raises(ValueError, match="online_text coordinator and batch pools"):
+        Settings(runtime_config=values, batch_enabled=True, worker_workload_classes=["batch"])
+    values["pools"].append({
+        **values["pools"][0], "name": "batch", "workload_class": "batch", "min_replicas": 0,
+    })
+    values["workload_pools"]["batch"] = "batch"
+    values["db_connection_budget"] = 300
+    settings = Settings(runtime_config=values, batch_enabled=True, worker_workload_classes=["batch"])
+    assert settings.runtime_config.pool("batch").min_replicas == 0
+    assert settings.worker_workload_classes == ["batch"]
+    values["pools"] = [values["pools"][1]]
+    values["workload_pools"] = {"batch": "batch"}
+    with pytest.raises(ValueError, match="online_text coordinator"):
+        Settings(runtime_config=values, batch_enabled=True, worker_workload_classes=["batch"])
+
+
+
 @pytest.mark.asyncio
 async def test_api_requires_real_dependency_readiness_before_admission(monkeypatch):
     reconciler = _controller()
     responses = [b'{"status":"unavailable","database":false,"plugins":true}',
-                 b'{"status":"ok","database":true,"plugins":true,"checkpointer":null,'
-                 b'"active_requests":2,"active_sse":1,"p95_ttft_ms":320,"ttft_samples":1}']
+                 json.dumps({"ready": True, "draining": False, "load": {
+                     "active_requests": 2, "active_sse": 1, "active_ws": 0,
+                     "observed_at": datetime.now(UTC).isoformat(), "p95_ttft_ms": 320,
+                     "ttft_samples": 1}}).encode()]
     calls = []
 
     class Probe:
@@ -291,7 +481,8 @@ async def test_api_requires_real_dependency_readiness_before_admission(monkeypat
         assert "admitted" not in calls
         reconciler._retry.clear()
         await reconciler._advance_readiness(resource, _pool("api"), 1, definition)
-        assert "admitted" in calls and ("measured", 2) in calls
+        assert "admitted" not in calls and ("measured", 2) in calls
+        assert resource.observed_state == "booting"  # ACTIVE ingress is still required.
         assert reconciler._api_load[resource.id][1:] == (2, 320)
         assert all(call["port"] == 8013 for call in calls if isinstance(call, dict))
     finally:
@@ -322,7 +513,7 @@ async def test_unhealthy_api_replica_withdraws_ingress_before_reprovision(monkey
         return True
 
     reconciler.transport = Probe()
-    reconciler.ingresses["api"] = SimpleNamespace(drain=lambda member: withdrawn.append(member))
+    reconciler.ingresses["api"] = SimpleNamespace(drain=lambda member, *identity: withdrawn.append(member))
     reconciler._cloud = cloud
     monkeypatch.setattr(controller_module.store, "mark_api_unavailable", unavailable)
     try:
@@ -342,54 +533,33 @@ def test_api_health_body_rejects_false_and_malformed_status():
 
 
 @pytest.mark.asyncio
-async def test_retirement_preserves_active_http_requests_after_grace(monkeypatch):
+async def test_retirement_waits_for_ready_replacement_before_drain(monkeypatch):
     reconciler = _controller()
-    drains = []
-    deletions = []
-    active = [1]
-
-    class Ingress:
-        def drain(self, member):
-            drains.append(member)
-
-        def register(self, *args):
-            raise AssertionError("expired resource must not rejoin ingress")
-
-    class Probe:
-        async def request(self, **_kwargs):
-            return ('{"status":"ok","database":true,"plugins":true,"checkpointer":null,'
-                    f'"active_requests":{active[0]},"active_sse":0,"p95_ttft_ms":null,"ttft_samples":0}}').encode()
-
-    async def record(*args, active_count):
-        resource.active_slots = active_count
-        return True
-
-    async def delete(resource_id, owner, fence):
-        deletions.append((resource_id, owner, fence))
-
-    monkeypatch.setattr(controller_module.store, "record_api_load", record)
-    monkeypatch.setattr(controller_module.store, "request_delete", delete)
-    reconciler.transport = Probe()
-    reconciler.config.listen_port = 8013
-    reconciler.config.reconcile_interval_seconds = 5
-    reconciler.ingresses["api"] = Ingress()
     resource = _resource("ready", "cloud-1")
-    resource.role = "api"
-    resource.address = "10.0.0.2"
-    resource.port = 8013
-    resource.certificate_fingerprint = "a" * 64
-    resource.ingress_member_id = "member-1"
-    resource.active_slots = 1
-    definition = SimpleNamespace(name="api", max_lifetime_seconds=600, drain_seconds=120)
+    resource.created_at = datetime.now(UTC) - timedelta(seconds=800)
+    replacement = _resource("booting", "cloud-2")
+    replacement.id = "resource-2"
+    replacement.drain_reason = "replacement:" + resource.id
+    drains = []
+    async def begin(*args, **kwargs):
+        drains.append(args[0])
+        return resource
+    monkeypatch.setattr(controller_module.store, "begin_drain", begin)
+    healthy_ids = {resource.id}
+    async def healthy(*args):
+        return healthy_ids
+    monkeypatch.setattr(controller_module.store, "healthy_worker_resources", healthy)
+    definition = SimpleNamespace(name="workers", role="worker", max_lifetime_seconds=600,
+                                 boot_timeout_seconds=60, drain_seconds=120, max_surge=1)
     try:
-        resource.created_at = datetime.now(UTC) - timedelta(seconds=800)
-        await reconciler._advance_readiness(resource, _pool("api"), 7, definition)
-        await reconciler._retire_expired([resource], 7, definition)
-        assert drains == ["member-1"] and deletions == []
-        active[0] = 0
-        await reconciler._advance_readiness(resource, _pool("api"), 7, definition)
-        await reconciler._retire_expired([resource], 7, definition)
-        assert deletions == [("resource-1", "one", 7)]
+        await reconciler._retire_expired([resource, replacement], 7, definition)
+        assert drains == []
+        replacement.observed_state = "ready"
+        await reconciler._retire_expired([resource, replacement], 7, definition)
+        assert drains == []  # An observed-ready guest with a stale registration cannot replace capacity.
+        healthy_ids.add(replacement.id)
+        await reconciler._retire_expired([resource, replacement], 7, definition)
+        assert drains == [resource.id]
     finally:
         reconciler.executor.shutdown(wait=True)
 

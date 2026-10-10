@@ -487,6 +487,12 @@ async def test_concurrent_fork_and_delete_source_resolves_cleanly() -> None:
 
 
 async def test_gateway_device_exchange_mints_one_expiring_hashed_key(monkeypatch) -> None:
+    async def current_authority(user_id, project_id):
+        assert (user_id, project_id) == ("gateway-user", "gateway-project")
+        return {"roles": ["member", "lumen-inventory_reader", "lumen-chat_user", "lumen-keys_editor"],
+                "is_system_admin": False}
+
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     monkeypatch.setattr(
         gateway,

@@ -12,6 +12,7 @@ from lumen.models.chat_agent_platform import (
     ChatRunInteraction,
 )
 from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
+from lumen.models.chat_batches import ChatBatch, ChatBatchFile, ChatBatchItem, ChatBatchProjectQueue
 from lumen.models.chat_contracts import *  # noqa: F403
 from lumen.models.chat_db import (
     ChatAgent,
@@ -96,6 +97,10 @@ __all__ = [
     "ChatAsset",
     "ChatMessageAsset",
     "ChatRunAsset",
+    "ChatBatch",
+    "ChatBatchFile",
+    "ChatBatchItem",
+    "ChatBatchProjectQueue",
     "ChatRunInteraction",
     "ChatContextCheckpoint",
     "ChatGitCredential",

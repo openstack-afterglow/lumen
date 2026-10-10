@@ -16,18 +16,22 @@ from litellm.llms.anthropic.chat.transformation import AnthropicConfig
 
 from lumen.api.compat import openai as openai_api
 from lumen.api.models import ModelCreateRequest, ModelResponse, ModelUpdateRequest
+from lumen.models.api_requests import OpenAIChatResponse
 from lumen.models.chat_contracts import UsageComponent, UsageUpdatedPayload
 from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider
 from lumen.scripts.migrate import MIGRATIONS, _sha256, _statements, load_manifest
 from lumen.services import advisor, completion_api, credit, graph, litellm_client
 from lumen.services import stats as stats_service
 from lumen.services.chat_admission import _run_snapshots
+from lumen.services.completion_format import nonstream_response
 from lumen.services.durable_runs import execution
 from lumen.services.providers import billing, pricing, repository, routing
 from lumen.services.providers.errors import ActiveRunConfigurationConflict, ProviderValidationError
 from lumen.services.tool_runtime import managed
 from lumen.services.tools import ToolContext
 from lumen.services.usage_breakdown import UsageBreakdown
+
+pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
 
 _MODEL = "anthropic/claude-sonnet-5"
 
@@ -925,11 +929,11 @@ class TestConfigFingerprint:
         monkeypatch.setattr(completion_api.credit, "apply_usage", apply_usage)
         result = await completion_api.complete_once(
             resolved=resolved, messages=[{"role": "user", "content": "hello"}],
-            user_id="u1", project_id="p1", api_key_id=1,
+            user_id="u1", project_id="p1", api_key_id=7,
             max_tokens=16, temperature=None,
         )
-        wire = openai_api.OpenAIChatResponse.model_validate(
-            openai_api.nonstream_response(result, cmpl_id="chatcmpl-test", created=1)
+        wire = OpenAIChatResponse.model_validate(
+            nonstream_response(result, cmpl_id="chatcmpl-test", created=1)
         )
         assert wire.usage.prompt_tokens_details["cached_tokens"] == 2038
         assert wire.usage.prompt_tokens == 2806
@@ -944,7 +948,7 @@ class TestConfigFingerprint:
         monkeypatch.setattr(completion_api.litellm_client, "acompletion_stream", complete_stream)
         events = [event async for event in completion_api.complete_stream(
             resolved=resolved, messages=[{"role": "user", "content": "hello"}],
-            user_id="u1", project_id="p1", api_key_id=1,
+            user_id="u1", project_id="p1", api_key_id=7,
             max_tokens=16, temperature=None,
         )]
         wire_chunk = openai_api.usage_chunk(events[-1], cmpl_id="chatcmpl-test", created=1, model=model.model_name)
@@ -1267,6 +1271,9 @@ async def _execute_with_usage_event(monkeypatch, usage_event: dict, *, component
         def begin(self):
             return self
 
+        async def connection(self, **_kwargs):
+            return None
+
     finished: list[dict] = []
 
     async def engine_stream(**_kwargs):
@@ -1302,7 +1309,9 @@ async def _execute_with_usage_event(monkeypatch, usage_event: dict, *, component
     monkeypatch.setattr(execution.credit, "precheck", lambda *_args, **_kwargs: _return(None))
     monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
 
-    assert await asyncio.wait_for(execution.execute_queued_run("run-1", owner="worker-1"), timeout=5) is True
+    assert await asyncio.wait_for(
+        execution.execute_queued_run("run-1", owner="worker-1", registration_id="registration-1"), timeout=5
+    ) is True
     return finished[-1]["usage_record"]
 
 

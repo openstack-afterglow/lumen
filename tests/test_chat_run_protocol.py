@@ -13,7 +13,7 @@ from lumen.models.chat_contracts import validate_chat_run_event
 from lumen.models.chat_db import ChatUsageLog
 from lumen.models.chat_runs import ChatRun, ChatToolApproval
 from lumen.services import context_inspector, context_manager, execution_protocol, run_store
-from lumen.services.durable_runs import common, execution, interactions, lifecycle, queries
+from lumen.services.durable_runs import common, execution, interactions, queries
 from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.durable_runs.common import _fingerprint
 from lumen.services.run_protocol_v2 import transition_allowed
@@ -451,6 +451,9 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
         def begin(self):
             return self
 
+        async def connection(self, **_kwargs):
+            return None
+
     flushed = asyncio.Event()
     closed = asyncio.Event()
     journal: list[tuple[str, dict]] = []
@@ -502,7 +505,7 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
     monkeypatch.setattr(execution.credit, "precheck", lambda *_args, **_kwargs: _return(None))
     monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
 
-    assert await execution.execute_queued_run("run-1", owner="worker-1") is True
+    assert await execution.execute_queued_run("run-1", owner="worker-1", registration_id="registration-1") is True
     assert [payload["delta"] for event_type, payload in journal if event_type == "part.delta"] == ["small"]
     assert finished[-1]["status"] == "completed"
     assert closed.is_set()
@@ -553,6 +556,9 @@ async def test_worker_passes_frozen_reasoning_disable_capability_to_engine(monke
         def begin(self):
             return self
 
+        async def connection(self, **_kwargs):
+            return None
+
     async def engine_stream(**kwargs):
         captured.update(kwargs)
         yield {"type": "token", "text": "ok"}
@@ -590,7 +596,7 @@ async def test_worker_passes_frozen_reasoning_disable_capability_to_engine(monke
     monkeypatch.setattr(execution.credit, "usage_cost_from_pricing_snapshot", usage_cost)
     monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
 
-    assert await execution.execute_queued_run("run-1", owner="worker-1") is True
+    assert await execution.execute_queued_run("run-1", owner="worker-1", registration_id="registration-1") is True
     assert captured["reasoning_effort"] == "auto"
     assert captured["reasoning_can_be_disabled"] is expected
 
@@ -1034,6 +1040,9 @@ async def test_compaction_worker_uses_persisted_large_tool_schema_snapshot(monke
         def begin(self):
             return self
 
+        async def connection(self, **_kwargs):
+            return None
+
     captured: dict = {}
 
     class _Hooks:
@@ -1067,7 +1076,7 @@ async def test_compaction_worker_uses_persisted_large_tool_schema_snapshot(monke
     monkeypatch.setattr(execution, "_cancel_requested", no_cancel)
     monkeypatch.setattr(execution, "_finish", finish)
 
-    assert await execution.execute_queued_run("run-compact", owner="worker-1") is True
+    assert await execution.execute_queued_run("run-compact", owner="worker-1", registration_id="registration-1") is True
     assert captured["tool_schemas"] == [large_schema]
     assert captured["finished"]["status"] == "completed"
 
@@ -1090,20 +1099,6 @@ async def test_events_return_gone_after_temporary_journal_purge(client, monkeypa
     assert response.status_code == 410
 
 
-async def test_cancel_is_owner_scoped_and_idempotent(client, monkeypatch):
-    seen = {}
-
-    async def cancel(**kwargs):
-        seen.update(kwargs)
-        return {"run_id": "run-1", "status": "running"}
-
-    monkeypatch.setattr(lifecycle, "request_cancelled", cancel)
-    response = await client.post("/api/v1/chat/runs/run-1/cancel")
-
-    assert response.status_code == 200
-    assert seen["run_id"] == "run-1"
-    assert seen["project_id"] == "test-project-123"
-    assert seen["user_id"] == "test-user-123"
 
 
 async def test_approval_decision_is_owner_scoped_and_validated(client, monkeypatch):

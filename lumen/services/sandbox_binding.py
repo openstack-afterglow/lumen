@@ -147,7 +147,7 @@ async def _authorized_request(
         role="sandbox",
         resource_id=target.resource_id,
         generation=target.generation,
-        certificate_fingerprint=grant.certificate_fingerprint,
+        certificate_fingerprints=frozenset({grant.certificate_fingerprint}),
         method=method,
         path=path,
         deadline=deadline,

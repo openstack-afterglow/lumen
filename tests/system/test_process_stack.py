@@ -912,8 +912,8 @@ async def _approve_gateway_code_and_seed_anthropic(user_code: str, fake_provider
         decision = await claude_gateway.authorize_user_code(
             user_code=user_code,
             approve=True,
-            owner_user_id="system-gateway-user",
-            owner_project_id="system-gateway-project",
+            owner_user_id="system-owner",
+            owner_project_id="system-project",
         )
         assert decision == {"status": "approved"}
     finally:
@@ -1084,11 +1084,23 @@ def test_process_stack_native_protocols_and_gateway_device_login() -> None:
             },
         }
         claude_messages = [{"role": "user", "content": "run a local command"}]
+        before_denied = _get_fake_provider_stats(fake_provider_url)
+        assert before_denied is not None
+        denied_gateway_tools = client.post(
+            "/v1/claude-gateway/v1/messages", headers=gateway_headers,
+            json={"model": "client-alias-is-ignored", "max_tokens": 128,
+                  "messages": claude_messages, "tools": [bash_tool]},
+        )
+        assert denied_gateway_tools.status_code == 403, denied_gateway_tools.text
+        after_denied = _get_fake_provider_stats(fake_provider_url)
+        assert after_denied is not None and after_denied["history"] == before_denied["history"]
+        tool_headers = {**headers, "anthropic-version": "2023-06-01",
+                        "anthropic-beta": "context-management-2025-06-27"}
         claude_tool_response = client.post(
-            "/v1/claude-gateway/v1/messages",
-            headers={**gateway_headers, "anthropic-beta": "context-management-2025-06-27"},
+            "/v1/messages",
+            headers=tool_headers,
             json={
-                "model": "client-alias-is-ignored",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": 128,
                 "stream": True,
                 "messages": claude_messages,
@@ -1109,10 +1121,10 @@ def test_process_stack_native_protocols_and_gateway_device_login() -> None:
         assert "anthropic-version" in first_claude_call["protocol_headers"]
 
         claude_continuation = client.post(
-            "/v1/claude-gateway/v1/messages",
-            headers={**gateway_headers, "anthropic-beta": "context-management-2025-06-27"},
+            "/v1/messages",
+            headers=tool_headers,
             json={
-                "model": "client-alias-is-ignored",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": 128,
                 "stream": True,
                 "tools": [bash_tool],

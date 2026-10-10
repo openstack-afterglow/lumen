@@ -70,7 +70,7 @@ docker compose run --rm --no-deps -T lumen-connection
 
 ### 3.2 Host Gate (CHAT_API_HOSTS)
 
-Lumen 서버 설정에 `CHAT_API_HOSTS`가 설정된 경우(예: `CHAT_API_HOSTS=api.lumen.example`), 허용되지 않은 `Host` 헤더로 들어오는 호환 API 요청(`GET /v1/compat`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, Claude Gateway 등)은 보안 목적으로 **HTTP 404 (Not Found)**를 반환하여 경로 존재 자체를 은닉합니다.
+Lumen 서버 설정에 `CHAT_API_HOSTS`가 설정된 경우(예: `CHAT_API_HOSTS=api.lumen.example`), 허용되지 않은 `Host` 헤더로 들어오는 호환 API 요청(`GET /v1/compat`, `GET /v1/models`, `GET /v1/cli/models`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, Claude Gateway 등)은 보안 목적으로 **HTTP 404 (Not Found)**를 반환하여 경로 존재 자체를 은닉합니다.
 
 ---
 
@@ -85,7 +85,7 @@ Lumen 요청 시 다음 3가지 인증 헤더 중 **정확히 1개**만 전달�
 3. `X-Auth-Token: <KEYSTONE_TOKEN>` (Keystone 전용)
 
 **엔드포인트별 허용 자격 증명 제약**:
-* **Compat 호환 엔드포인트 (`/v1/models`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, `POST /v1/messages/count_tokens`)**:
+* **Compat 호환 엔드포인트 (`/v1/models`, `/v1/cli/models`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, `POST /v1/messages/count_tokens`)**:
   - **API Key만 허용**됩니다 (`Authorization: Bearer sk-afgl-...` 또는 `X-API-Key`). Claude Gateway base는 device flow가 발급한 `credential_kind="claude_gateway"` key만 허용합니다.
   - Keystone Token (`X-Auth-Token` 또는 Keystone Bearer) 전달 시 **HTTP 401 Unauthorized**를 반환합니다.
 * **Native 엔드포인트 (`/v1/conversations`, `/v1/temp-completions`, `/v1/runs` 등)**:
@@ -101,13 +101,17 @@ Native와 Keystone-only 인증 dependency는 동기 Keystone 네트워크 검증
 처리할 수 있지만, token rescope·target project·admin 검증과 인증 실패 응답은 그대로입니다.
 인증 결과 cache나 Keystone 장애 시 허용 경로를 추가하지 않습니다.
 
+Afterglow가 보내는 token role snapshot이나 caller role header는 Lumen service authority가 아닙니다. Lumen은 현재 enabled owner/project와 role-ID inference DAG를 다시 확인합니다. Project membership은 `role_assignments.list(user=user_id, project=project_id, effective=True)`의 해당 project row로 확인하여 group/inherited grant를 유지합니다(verified system admin 예외는 유지). System admin은 별도로 `role_assignments.list(user=user_id, system="all")`에서 **`effective=True` 없이 direct system assignment**를 읽고, `scope.system.all is True`인 row의 role ID를 현재 검증된 DAG로 확장하여 정확한 unique global `admin` ID 도달 여부로 판정합니다. Keystone effective expansion은 direct system grant를 누락하므로 이 system 조회에 사용하지 않습니다.
+
+Project/domain `admin|manager`는 system admin으로 승격되지 않습니다. Verified system admin의 `X-Target-Project-Id`는 logical target만 선택하며 원래 caller의 `connection_project_id`를 바꾸지 않습니다. API key는 system-admin owner라도 `is_system_admin=false`인 project-bound credential이며 stored scope와 current owner action의 교집합만 허용합니다. Foreign `X-Project-Id`/`X-Target-Project-Id`는 403입니다. Current service leaf 제거는 다음 요청과 새 provider I/O를 차단하며, current authority lookup 장애는 503으로 닫힙니다. 이 계약의 source qualification과 pending production rollout은 [테스트 문서](testing.md#067-direct-system-authority-source-qualification)에 구분하여 기록합니다.
+
 ### 4.2 Scope Matrix
 
 API Key 요청 시 필요한 최소 Scope 정의:
 
 | Scope | 사용 목적 |
 | --- | --- |
-| `models:read` | 모델 목록 조회 (`GET /v1/models`, `GET /v1/chat/models`, `GET /v1/capabilities`) |
+| `models:read` | 모델 목록 조회 (`GET /v1/models`, `GET /v1/cli/models`, `GET /v1/chat/models`, `GET /v1/capabilities`) |
 | `compat:completions:write` | Stateless 호환 completion (`POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`) |
 | `native:conversations:read` | Native 대화 목록/상세/경로 조회 |
 | `native:conversations:write` | Native 대화 생성/수정/삭제 |
@@ -118,9 +122,14 @@ API Key 요청 시 필요한 최소 Scope 정의:
 | `native:extensions:read`, `native:extensions:write` | 스킬, MCP 서버, 커스텀 도구 사용 |
 | `native:agents:use` | API-key native `chat` run의 소유/승인된 `agent_id` 사용 (agent 정의 관리 권한은 아님) |
 | `usage:read` | 사용량 기록 및 API key 사용 현황 조회 (`GET /v1/usage/*`) |
+| `native:batches:read`, `native:batches:write` | Native mixed Batch 조회 / 생성·취소 (`/v1/chat/batches*`). 생성 시 각 항목 operation scope도 필요 |
+| `compat:files:read`, `compat:files:write` | OpenAI 호환 Files 조회·다운로드 / 업로드·삭제 (`/v1/files*`, purpose `batch`) |
+| `compat:batches:read`, `compat:batches:write` | OpenAI 호환 Batch 조회 / 생성·취소 (`/v1/batches*`). 생성 시 endpoint scope(`compat:completions:write` 또는 `compat:images:write`)도 필요 |
 
 > **Native Default Features 주의사항**:
 > Native Completion 요청(`CompletionRequest`, `TempCompletionRequest`)의 기본 옵션(`features`)은 `memory=true`, `tool_policy.mode="agent_default"`를 포함합니다. `native:memory:*` 및 `native:tools:execute` scope가 없는 최소 권한 API Key를 사용하는 경우, 요청 body에 `features: {"memory": false, "tool_policy": {"mode": "none"}}`를 명시적으로 전달해야 HTTP 403 거절을 방지할 수 있습니다.
+
+> **Batch 주의사항**: Batch/Files는 서버 `batch_enabled`가 켜진 배포에서만 열리며 꺼져 있으면 503 `batch_unavailable`입니다. 위 6개 scope는 기본 발급 scope가 아니므로 명시적으로 부여해야 합니다. 지원 범위·한도·오류 형식은 `GET /v1/compat`의 `batches` 필드와 [API 참조](api-reference.md#batch-api)를 따릅니다.
 
 ### 4.3 API Key 프로비저닝 (Credential Provisioning)
 
@@ -164,7 +173,11 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="$LUMEN_MODEL"
 claude
 ```
 
+Header 대신 `GET /v1/cli/models`에서 `protocols`에 `messages`가 있는 행의 `lumen/<provider_id>/<model_id>` token을 각 `ANTHROPIC_DEFAULT_*_MODEL` 값으로 쓰면 같은 공개 ID라도 role마다 다른 provider/model로 정확히 실행됩니다. 이 token에도 `X-Lumen-Provider`를 보내면 선택자가 일치해야 하며, 다르면 다른 route로 대체하지 않고 404입니다.
+
 Claude Code 2.1.278의 direct stream과 local `Bash` tool→native `tool_result` continuation을 격리된 실제 CLI process에서 확인했습니다. Lumen은 현재 client의 명시적 `context_management`와 `output_config`, native tool/thinking block, bounded `anthropic-*` protocol-header namespace를 보존합니다. Caller `Authorization`과 `x-api-key`는 provider credential로 전달하지 않습니다.
+
+Auto mode의 Claude Code는 server-side classifier review용 top-level `safeguards`와 `dangerous-tool-use-*` beta를 보냅니다. Lumen의 LiteLLM transport는 이를 upstream까지 전달할 수 없으므로 `400 invalid_request_error`(`safeguards: Extra inputs are not permitted`)로 거부하고, Claude Code는 같은 세션에서 두 값을 빼고 재시도한 뒤 자체 classifier를 일반 `/v1/messages` 호출로 실행합니다. 2026-10-07 실제 Claude Code 2.1.287과 2.1.292의 auto mode에서 400→재시도→classifier→`Bash`→최종 응답을 synthetic upstream으로 확인했습니다. Classifier 호출 model은 2.1.287이 session model, 2.1.292가 `claude-sonnet-5`였으므로 해당 model도 Lumen에서 활성이어야 합니다.
 
 Configured `/v1/claude-gateway` device routes는 Lumen custom protocol입니다. Current Claude Apps Gateway login은 administrator-managed `forceLoginGatewayUrl`, official `/protocol`, OIDC device authorization, refresh session을 요구하므로 이 custom route를 Claude Code `/login` 대체로 광고하지 않습니다. 기존 grant는 10분, custom credential은 24시간이고 one-time consume·fixed scopes·Redis/MariaDB fail-closed 보안 계약은 그대로 유지됩니다.
 
@@ -182,7 +195,9 @@ requires_openai_auth = false
 supports_websockets = false
 ```
 
-`replace-with-active-Responses-model-ID`에는 활성 모델의 공개 `GET /v1/models` ID를 사용합니다. 같은 ID가 여러 provider에 있어 409가 날 수 있으면 provider를 추정하지 말고 해당 provider block에 비밀이 아닌 고정 selector를 추가합니다.
+`replace-with-active-Responses-model-ID`에는 활성 모델의 공개 `GET /v1/models` ID를 사용합니다. 같은 ID가 여러 provider에 있어 409가 날 수 있으면 provider를 추정하지 말고 해당 provider block에 비밀이 아닌 고정 selector를 추가합니다. 또는 `GET /v1/cli/models`가 `protocols`에 `responses`를 포함해 반환한 `lumen/<provider_id>/<model_id>` route token을 model로 쓰면 header 없이 그 provider/model 하나로만 실행됩니다.
+
+Custom OpenAI-compatible base는 native Responses endpoint 존재를 보장하지 않아 CLI catalog가 `messages`만 광고합니다. 따라서 자동 Codex role 후보에는 나오지 않지만 Claude role에는 사용할 수 있습니다. 이미 native Responses가 가능한 custom base로 보내던 명시 `/v1/responses` 호출은 기존 transport 그대로 유지하며 catalog 수정 때문에 Chat Completions로 바꾸거나 재시도하지 않습니다. Catalog는 upstream readiness probe가 아니며 real role session smoke는 별도로 필요합니다.
 
 ```toml
 http_headers = { "X-Lumen-Provider" = "replace-with-provider-id" }
@@ -279,6 +294,7 @@ Codex의 알 수 없는 모델 metadata fallback은 실제 reasoning 지원 여�
 ## 5. 모델 디스커버리 및 Provider Credential 상태
 
 * `GET /v1/models` (OpenAI 호환 포맷): 표준 필드(`id`, `object`, `created`, `owned_by`)에 더해 같은 공개 ID를 제공하는 활성 `api_provider` 선택자의 `providers` 배열을 반환합니다. `id`는 SDK가 보내는 공개 `model` 값이며 내부 LiteLLM route key가 아닙니다.
+* `GET /v1/cli/models` (coding CLI catalog, `Cache-Control: no-store`): 활성 provider의 활성 text 모델을 provider/model 순서대로 `{"models":[...]}`로 반환합니다. 각 행의 `id`는 `lumen/<provider_id>/<model_id>` exact route token이고 `api_model_name`, `display_name`, `provider`, `provider_name`, `provider_type`, `protocols`, `usable`, `disabled_reason`, effective `capabilities` 일부, nullable `input_price_per_million`/`output_price_per_million` 문자열을 포함합니다. 같은 공개 ID도 provider마다 다른 token이며, compat endpoint는 token을 그 provider/model로만 해석하고 비활성·선택자 충돌이면 404입니다. 저장소 장애는 빈 목록이 아닌 503입니다. 필드·사유 정의는 [API 참조](api-reference.md#coding-cli-catalog와-exact-route-id)를 따릅니다.
 * `GET /v1/chat/models` (Native 상세 포맷): 각 모델의 공개 `api_model_name`, `api_provider`, 표시 `provider`, 실제 연결 `provider_type`, stable `provider_id`와 운영용 내부 `model_name`을 분리합니다. Provider `provider_sort_order`·provider ID·model `sort_order`·model ID 순으로 반환하고 `provider_api_key_configured` 및 `reasoning_none_supported`를 포함합니다. `reasoning_none_supported=false`인 모델에 `reasoning_effort="none"`을 보내면 422이므로 UI는 이 값이 true일 때만 "없음"을 노출합니다.
   * `true`: 해당 모델의 provider API Key가 Lumen 서버에 정상 설정(DB 또는 환경 변수 `api_key_env`)되어 있음.
   * `false`: 명시적인 provider API Key가 등록되지 않음 (`false`인 모델 호출 시 completion 시점에 502/400 오류 발생 가능).
@@ -387,12 +403,14 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
 * **OpenAI Responses (`POST /v1/responses`)**:
   - `model`, text 또는 item-list `input`, 선택적 `instructions`, `provider`, `stream`, `max_output_tokens`, `temperature`, `tools`, `tool_choice`와 documented stateless options를 받습니다.
   - `store=true`, `previous_response_id`, `background=true`는 지원하지 않으며 안전한 400 code를 반환합니다. Lumen conversation/history에 Responses 요청이나 결과를 저장하지 않습니다.
-  - Streaming은 Responses-native named SSE event를 유지하고 idle ping은 comment frame입니다. Downstream disconnect는 pending upstream read를 취소하지 않고 background drain합니다.
+  - Streaming은 Responses-native named SSE event를 유지하고 idle ping은 comment frame입니다. Downstream disconnect는 pending upstream read를 취소하지 않으며, 해당 ASGI 요청이 read drain·iterator close·과금 settlement 완료까지 기다립니다. Background task로 수명을 넘기지 않습니다.
 * **Anthropic native (`POST /v1/messages`)**:
   - `model`, `messages`, 필수 양수 `max_tokens`, 선택적 `provider`, `system`, `temperature`, `stream`, `metadata`, `stop_sequences`, `thinking`, `tools`, `tool_choice`, `top_k`, `top_p`, `container`를 받습니다.
-  - `POST /v1/messages/count_tokens`는 동일한 Anthropic input block을 native token-count transport로 전달합니다.
+  - `POST /v1/messages/count_tokens`는 direct Anthropic API-key route에서만 동일한 Anthropic input block을 Anthropic의 authoritative token-count endpoint로 전달합니다. 다른 provider(LiteLLM이 Messages로 변환하는 route 포함)와 Claude 구독은 추정값을 만들지 않고 501 `token_count_unavailable`을 반환합니다. Client는 이를 provider count 불가로 처리해야 합니다.
   - Streaming은 Anthropic event 이름과 body를 유지하고 약 15초 idle마다 `event: ping`을 보냅니다. OpenAI `[DONE]` sentinel로 변환하지 않습니다.
-* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르면 400 `provider_header_conflict`입니다. `model`의 transport prefix는 editable selector의 alias나 충돌 조건이 아닙니다. Request schema에 없는 필드는 422로 거부합니다.
+  - Legacy Claude gateway의 `/v1/claude-gateway/v1/messages`도 같은 SSE admission·요청 소유 cleanup을 사용합니다. `api_max_sse_connections` 포화 시 auth/schema validation 뒤, route resolution·provider 호출 전에 429와 `Retry-After: 1`을 반환하며 non-stream 요청은 SSE slot을 쓰지 않습니다. HTTP/SSE/WS reservation과 측정 load는 마지막 byte나 disconnect가 아니라 ASGI cleanup 완료 때 해제되므로, drain 중 settlement를 새 작업으로 오인하거나 guest를 조기 삭제하지 않습니다.
+  - Gateway Messages의 실제 text delta도 first-text latency 표본에 포함되며 ping·tool event는 표본이 아닙니다. SSE 시작 전 reservation과 시작 후 measured SSE load는 별개입니다.
+* **Provider 선택**: body `provider`와 `X-Lumen-Provider` header가 서로 다르면 400 `provider_header_conflict`입니다. `model`의 transport prefix는 editable selector의 alias나 충돌 조건이 아닙니다. Request schema에 없는 필드는 OpenAI 계열에서 422로 거부합니다. Anthropic Messages 계열은 Anthropic API와 같은 400 `invalid_request_error`로 각 필드를 `<field>: <reason>` 형식으로 명시하고 입력값을 되돌려 보내지 않습니다.
 
 ### 6.2 Output token budget
 
@@ -521,12 +539,10 @@ FastAPI 프레임워크 특성에 따라 HTTP 예외 발생 시 반환되는 JSO
 * **Anthropic 호환 에러 응답 (`POST /v1/messages`)**:
   ```json
   {
-    "detail": {
-      "type": "error",
-      "error": {
-        "type": "invalid_request_error",
-        "message": "API 키 월 사용 한도를 초과했습니다"
-      }
+    "type": "error",
+    "error": {
+      "type": "rate_limit_error",
+      "message": "API 키 월 사용 한도를 초과했습니다"
     }
   }
   ```
@@ -546,14 +562,14 @@ FastAPI 프레임워크 특성에 따라 HTTP 예외 발생 시 반환되는 JSO
 
 | Status Code | 원인 및 설명 |
 | --- | --- |
-| **400 Bad Request** | 둘 이상의 인증 헤더 동시 사용(동일 API key를 `X-API-Key`+`Authorization: Bearer`로 중복 전달한 경우는 제외), SSE 커서 불일치/손상 |
+| **400 Bad Request** | 둘 이상의 인증 헤더 동시 사용(동일 API key를 `X-API-Key`+`Authorization: Bearer`로 중복 전달한 경우는 제외), SSE 커서 불일치/손상, Anthropic Messages 계열(`/v1/messages`, `count_tokens`, legacy gateway) request schema 위반(`invalid_request_error`) |
 | **401 Unauthorized** | 인증 헤더 누락, 유효하지 않거나 만료된 API Key 또는 Keystone Token |
 | **402 Payment Required** | Native Completion 호출 시 당월 Credit Quota 초과 |
 | **403 Forbidden** | 요청에 필요한 Scope 부족, API Key의 Project ID와 `X-Project-Id` 불일치 |
 | **404 Not Found** | CHAT_API_HOSTS 미일치로 인한 은닉 404, 존재하지 않는 Conversation/Run ID |
 | **409 Conflict** | 동일 `Idempotency-Key`에 다른 Intent 전달, Key limit 수치 상충 |
 | **410 Gone** | SSE Event Cursor 만료 |
-| **422 Unprocessable Entity** | `Idempotency-Key`가 구문상 올바른 UUID 형식이 아님, Request body 검증 실패 |
+| **422 Unprocessable Entity** | `Idempotency-Key`가 구문상 올바른 UUID 형식이 아님, Request body 검증 실패(Anthropic Messages 계열 제외) |
 | **429 Too Many Requests** | Compat Completion 호출 시 당월 Credit Quota 초과 |
 | **502 Bad Gateway** | 업스트림 LLM Provider 네트워크/응답 오류 |
 | **503 Service Unavailable** | 요청 처리 시점에 DB 연결/스토어 장애가 발생한 경우. Worker 부재만으로는 503을 반환하지 않으며 수락된 작업은 Queued 상태로 유지됨 |
@@ -580,9 +596,14 @@ import { randomUUID } from "node:crypto";
 
 const LUMEN_API_KEY = process.env.LUMEN_API_KEY;
 const LUMEN_PROVIDER_MODEL = process.env.LUMEN_PROVIDER_MODEL;
+const LUMEN_ORIGIN = process.env.LUMEN_ORIGIN ?? "http://localhost:8012";
+const LUMEN_MODEL = process.env.LUMEN_MODEL;
 
 if (!LUMEN_API_KEY) {
   throw new Error("LUMEN_API_KEY environment variable is required");
+}
+if (!LUMEN_PROVIDER_MODEL || !LUMEN_MODEL) {
+  throw new Error("LUMEN_PROVIDER_MODEL and LUMEN_MODEL environment variables are required");
 }
 
 // 1. OpenAI 호환 Lumen Durable Completion (OpenAI base_url은 /v1 필수)

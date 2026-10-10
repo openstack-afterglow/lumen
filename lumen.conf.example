@@ -1,5 +1,5 @@
 # 환경변수는 이 TOML 값보다 우선한다. 실제 secret을 저장소에 넣지 않는다.
-# LUMEN_CONFIG_FILE로 다른 파일을 지정할 수 있다.
+# LUMEN_CONFIG_FILE로 다른 파일을 지정할 수 있다. 명시된 파일은 누락/빈 TOML 시 실패한다.
 
 [keystone]
 keystone_auth_url = "https://keystone.example/v3"
@@ -33,10 +33,30 @@ redis_db_index = 8
 lumen_encryption_key = "CHANGE_TO_64_HEX_CHARACTERS"
 service_chat_enabled = true
 worker_concurrency = 4
+# Fixed workers keep existing text/media service; run batch on a separate process.
+worker_workload_classes = ["online_text", "online_media"]
 worker_heartbeat_seconds = 5
 worker_drain_seconds = 300
+# Admission rejects new HTTP/SSE requests with 429 and WS handshakes with 503;
+# draining refuses new traffic without terminating established streams/sessions.
 api_max_active_requests = 256
 api_max_sse_connections = 256
+api_max_websocket_connections = 64
+api_max_body_bytes = 220200960
+batch_enabled = false
+batch_dispatch_window = 8
+batch_project_dispatch_window = 32
+batch_native_max_items = 1000
+batch_native_max_bytes = 10485760
+batch_jsonl_max_rows = 50000
+batch_jsonl_max_bytes = 200000000
+batch_jsonl_max_line_bytes = 4194304
+batch_validation_chunk_rows = 100
+batch_validation_chunk_bytes = 1048576
+batch_upload_slots = 4
+batch_result_ttl_days = 7
+batch_input_ttl_days = 30
+batch_cancel_grace_seconds = 600
 
 # Opt-in only after provisioning distinct trusted/sandbox projects, dedicated internal
 # CA and guest images. Override the whole mapping with RUNTIME_CONFIG JSON if needed.
@@ -53,14 +73,128 @@ max_parallel_cloud_operations = 4
 managed_networks = []
 cloud_profiles = []
 pools = []
-# tls = { ca_file = "/etc/lumen/runtime/ca.pem", ca_key_file = "/etc/lumen/runtime/ca.key", cert_file = "/etc/lumen/runtime/controller.pem", key_file = "/etc/lumen/runtime/controller.key" }
-# dispatch_key = { file = "/etc/lumen/runtime/dispatch.key" }
+guest_profiles = []
+workload_pools = {}
+# Supply measured deployment budgets, including fixed/controller/maintenance
+# connections and each pool's reserved replacement surge. Never guess cloud quotas.
+# db_connection_budget = OPERATOR_DB_BUDGET
+# pg_connection_budget = OPERATOR_PG_BUDGET
+# fixed_db_connection_reserve = OPERATOR_FIXED_DB_RESERVE
+# controller_db_connection_reserve = OPERATOR_CONTROLLER_DB_RESERVE
+# fixed_pg_connection_reserve = OPERATOR_FIXED_PG_RESERVE
+# controller_pg_connection_reserve = OPERATOR_CONTROLLER_PG_RESERVE
+# tls = { ca_file = "/etc/lumen/controller/ca.pem", ca_key_file = "/etc/lumen/controller/ca.key", cert_file = "/etc/lumen/controller/controller.pem", key_file = "/etc/lumen/controller/controller.key", operator_client_cert_file = "/etc/lumen/controller/worker.pem", operator_client_key_file = "/etc/lumen/controller/worker.key" }
+# dispatch_key = { file = "/etc/lumen/controller/dispatch.key" }
+
+# Managed topology templates remain commented so the disabled example loads.
+# Before using array tables, remove pools=[], cloud_profiles=[], guest_profiles=[]
+# and workload_pools={} above. Supply real Nova/Octavia IDs, OCI digest, image hash,
+# matching trusted cloud/guest profiles and measured per-pool DB/PG reservations.
+# [lumen.runtime_config.workload_pools]
+# online_text = "text"
+# online_media = "media"
+# batch = "batch"
+#
+# [[lumen.runtime_config.guest_profiles]]
+# id = "api-service"
+# role = "api"
+# config_file = "/etc/lumen/controller/guest-api.conf" # controller-only, root-owned 0600
+# config_sha256 = "REPLACE_WITH_CONFIG_SHA256"
+# config_keys = ["service_chat_enabled", "api_max_active_requests", "api_max_sse_connections", "api_max_websocket_connections"]
+# secret_env_names = ["DATABASE_URL", "REDIS_URL", "LUMEN_ENCRYPTION_KEY"]
+# secrets = { DATABASE_URL = { file = "/etc/lumen/controller/database-url" }, REDIS_URL = { file = "/etc/lumen/controller/redis-url" }, LUMEN_ENCRYPTION_KEY = { file = "/etc/lumen/controller/encryption-key" } }
+# image = "REPLACE_WITH_RELEASE_OCI_DIGEST_REF"
+# plugin_digest = "REPLACE_WITH_PLUGIN_SHA256"
+# schema_version = OPERATOR_SCHEMA_VERSION # match inspected release artifact; not migration number
+# protocol_version = 2
+# Worker profiles use role="worker", their own allowlists and matching release image.
+# Profiles are fetched after bootstrap by mTLS GET /v1/runtime/guest-config;
+# config/secret bytes, cloud credentials and controller keys never enter user-data.
+#
+# [[lumen.runtime_config.pools]]
+# name = "api"
+# role = "api"
+# backend = "nova"
+# enabled = true
+# cloud_profile_id = "OPERATOR_TRUSTED_PROFILE"
+# guest_profile_id = "api-service"
+# image = "REPLACE_WITH_RELEASE_OCI_DIGEST_REF"
+# architecture = "x86_64" # use only an architecture proven on the target Nova compute
+# network_id = "OPERATOR_NETWORK_ID"
+# security_group_ids = ["OPERATOR_SECURITY_GROUP_ID"]
+# min_replicas = 2
+# max_replicas = OPERATOR_API_MAX
+# max_surge = 1
+# boot_timeout_seconds = 600
+# idle_seconds = 300
+# drain_seconds = 300
+# max_lifetime_seconds = 86400
+# db_connections_per_process = OPERATOR_API_DB_CONNECTIONS
+# pg_connections_per_process = OPERATOR_API_PG_CONNECTIONS
+# db_connection_budget = OPERATOR_API_DB_RESERVATION
+# pg_connection_budget = OPERATOR_API_PG_RESERVATION
+# profile = { backend = "nova", flavor_id = "OPERATOR_API_FLAVOR_ID", guest_image_id = "OPERATOR_API_GLANCE_ID", guest_image_hash = "REPLACE_WITH_GLANCE_SHA256" }
+# ingress = { ingress_pool_id = "OPERATOR_OCTAVIA_POOL_ID", ingress_vip = "OPERATOR_OCTAVIA_VIP", ingress_subnet_id = "OPERATOR_SUBNET_ID", ingress_member_port = 8012, api_readiness_port = 8013, api_target_active_requests = 8, api_target_ttft_ms = 500 }
+# Kolla dynamic routing: lumen_api_dynamic_ingress_vip must match ingress_vip,
+# and lumen_api_dynamic_ingress_port (default lumen_api_port) must match ingress_member_port.
+# Use /v1/ready for Octavia/HAProxy health monitors; /v1/health is liveness only.
+# Both HAProxy listeners use lumen_api_proxy_idle_timeout_seconds=3600 by default;
+# set Octavia timeout_client_data and timeout_member_data to the same value in ms
+# (3600000 by default), connect timeout 5 s, LEAST_CONNECTIONS, no persistence.
+# Declare provider support for weight=0 drain + provisioning-status reads in Kolla.
+# Drain keeps admin_state_up=true and polls member + pool ACTIVE before deletion;
+# controller-owned member tags bind resource/generation/address/port/subnet.
+#
+# [[lumen.runtime_config.pools]]
+# name = "text"
+# role = "worker"
+# workload_class = "online_text"
+# cold_service_time_ms = 30000
+# min_replicas = 1
+# max_replicas = OPERATOR_TEXT_MAX
+# max_surge = 1
+# guest_profile_id = "text-service"
+# backend = "nova"
+# profile = { backend = "nova", flavor_id = "OPERATOR_TEXT_FLAVOR_ID", guest_image_id = "OPERATOR_WORKER_GLANCE_ID", guest_image_hash = "REPLACE_WITH_GLANCE_SHA256" }
+# Copy the api pool's common cloud/image/network/budget fields; omit ingress.
+#
+# [[lumen.runtime_config.pools]]
+# name = "media"
+# role = "worker"
+# workload_class = "online_media"
+# cold_service_time_ms = 120000
+# min_replicas = 1
+# max_replicas = OPERATOR_MEDIA_MAX
+# max_surge = 1
+# guest_profile_id = "media-service"
+# backend = "nova"
+# profile = { backend = "nova", flavor_id = "OPERATOR_MEDIA_FLAVOR_ID", guest_image_id = "OPERATOR_WORKER_GLANCE_ID", guest_image_hash = "REPLACE_WITH_GLANCE_SHA256" }
+# Copy the api pool's common cloud/image/network/budget fields; omit ingress.
+#
+# [[lumen.runtime_config.pools]]
+# name = "batch"
+# role = "worker"
+# workload_class = "batch"
+# cold_service_time_ms = 60000
+# min_replicas = 0
+# max_replicas = OPERATOR_BATCH_MAX
+# max_surge = 1
+# guest_profile_id = "batch-service"
+# backend = "nova"
+# profile = { backend = "nova", flavor_id = "OPERATOR_BATCH_FLAVOR_ID", guest_image_id = "OPERATOR_WORKER_GLANCE_ID", guest_image_hash = "REPLACE_WITH_GLANCE_SHA256" }
+# Copy the api pool's common cloud/image/network/budget fields; omit ingress.
 
 [lumen.runtime_config.project_quota_defaults]
 max_active_children = 0
 max_active_sandboxes = 0
 max_sandbox_seconds = 0
 max_credit_reservation = "0"
+
+[lumen.runtime_config.renewal]
+enabled = true
+leaf_ttl_seconds = 3600
+renew_interval_seconds = 1200
+overlap_seconds = 120
 
 
 # Installed plugin approval. Only exact distribution/name/version entries load; a

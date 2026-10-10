@@ -34,37 +34,27 @@ def test_generation_application_rejects_unrequired_generation():
 
 
 @pytest.mark.asyncio
-async def test_apply_claimed_skips_superseded_plaintext_hash(monkeypatch):
-    class Session:
-        async def get(self, model, memory_id):
-            return SimpleNamespace(
-                id=memory_id,
-                user_id="user",
-                project_id="project",
-                workspace_id=None,
-                status="active",
-                content="ciphertext",
-            )
+async def test_apply_snapshot_skips_superseded_plaintext_hash(monkeypatch):
 
     class Index:
         async def upsert(self, vector):
             raise AssertionError("superseded content must not be indexed")
 
-    row = SimpleNamespace(
+    claim = memory_outbox.ClaimedMemoryMutation(
+        change_seq=1,
         memory_id=7,
         mutation="upsert",
         content_hash="a" * 64,
-        required_generations=[1],
-        applied_generations=[],
-        status="running",
-        lease_owner="worker",
-        lease_expires_at=object(),
+        required_generations=(1,),
+        plaintext="newer plaintext",
+        user_id="user",
+        project_id="project",
+        workspace_id=None,
+        active=True,
     )
     monkeypatch.setattr(memory_outbox, "configured_memory_index", lambda: Index())
-    monkeypatch.setattr(memory_outbox, "decrypt_chat_content", lambda value: "newer plaintext")
 
-    assert await memory_outbox.apply_claimed(Session(), row) is True
-    assert row.status == "completed"
+    assert await memory_outbox._apply_snapshot(claim) == {1}
 
 
 @pytest.mark.asyncio
@@ -121,6 +111,9 @@ async def test_claim_one_releases_mysql_transaction_before_external_work(monkeyp
         def begin(self):
             return Transaction()
 
+        async def connection(self, *, execution_options):
+            assert execution_options == {"isolation_level": "READ COMMITTED"}
+
         async def get(self, _model, _memory_id):
             return SimpleNamespace(
                 id=7,
@@ -147,6 +140,7 @@ async def test_claim_one_releases_mysql_transaction_before_external_work(monkeyp
     monkeypatch.setattr(memory_outbox, "activate_pending_generations", lambda *_args, **_kwargs: _return(0))
     monkeypatch.setattr(memory_outbox, "claim_next", lambda *_args, **_kwargs: _return(row))
     monkeypatch.setattr(memory_outbox, "decrypt_chat_content", lambda _value: "plaintext")
+    monkeypatch.setattr(memory_outbox.auxiliary, "lock_admission", lambda *_args: _return(object()))
 
     claim = await memory_outbox.claim_one(owner="worker")
 

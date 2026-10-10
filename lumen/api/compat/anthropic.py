@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable, Mapping
+from contextlib import aclosing
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from lumen.auth import require_api_key_scopes
+from lumen.auth import ensure_scopes, require_api_key_scopes
 from lumen.services import completion_api as core
+from lumen.services.inference_authority import completion_scopes
+from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 
 from .streaming import events_with_ping
 
@@ -37,6 +40,8 @@ class AnthropicMessagesRequest(BaseModel):
     container: dict[str, Any] | None = None
     output_config: dict[str, Any] | None = None
 
+    # Closed on purpose: an unknown field such as Claude Code auto mode's `safeguards` is answered
+    # with an Anthropic 400 that names it (see lumen.main), so the client retries without it.
     model_config = {"extra": "forbid"}
 
 
@@ -104,6 +109,26 @@ def anthropic_error_response(status_code: int, message: str) -> JSONResponse:
     )
 
 
+def anthropic_validation_message(errors: Iterable[Mapping[str, Any]]) -> str:
+    """Name each rejected request field as the Anthropic API does, never echoing the input.
+
+    Claude Code recovers from a rejected capability only when a 400 names the field, e.g.
+    ``safeguards: Extra inputs are not permitted`` moves auto mode to its local classifier.
+    """
+    parts: list[str] = []
+    seen: set[str] = set()
+    for error in errors:
+        loc = [str(part) for part in error.get("loc", ())]
+        if len(loc) > 1 and loc[0] == "body":
+            loc = loc[1:]
+        message = str(error.get("msg") or "Invalid value")
+        text = f"{'.'.join(loc)}: {message}" if loc else message
+        if text not in seen:
+            seen.add(text)
+            parts.append(text)
+    return "; ".join(parts) or "Invalid request"
+
+
 def anthropic_protocol_headers(request: Request) -> dict[str, str]:
     """Forward only Anthropic protocol headers, never caller credentials."""
     headers: dict[str, str] = {}
@@ -129,12 +154,14 @@ def _event(payload: dict) -> str:
     response_model=AnthropicMessagesResponse,
     openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
 )
+@admit_sse
 async def messages(
     body: AnthropicMessagesRequest,
     request: Request,
     x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider"),
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
+    ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
     try:
         provider = core.select_api_provider(body.provider, x_lumen_provider)
         resolved = await core.resolve_api(body.model, provider=provider)
@@ -161,16 +188,19 @@ async def messages(
 
     if not body.stream:
         return JSONResponse(content=result)
+    # The provider stream is already open; the SSE owner closes it even if the body never starts.
+    register_sse_resource(request, result)
 
     async def generate() -> AsyncIterator[str]:
-        try:
-            async for payload in events_with_ping(result):
-                if payload is None:
-                    yield 'event: ping\ndata: {"type":"ping"}\n\n'
-                else:
-                    yield _event(payload)
-        except Exception:
-            yield _event(anthropic_error(502, "upstream model error"))
+        async with aclosing(events_with_ping(result)) as events:
+            try:
+                async for payload in events:
+                    if payload is None:
+                        yield 'event: ping\ndata: {"type":"ping"}\n\n'
+                    else:
+                        yield _event(payload)
+            except Exception:
+                yield _event(anthropic_error(502, "upstream model error"))
 
     return StreamingResponse(
         generate(),

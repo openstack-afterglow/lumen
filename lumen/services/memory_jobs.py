@@ -9,8 +9,10 @@ from sqlalchemy import or_, select
 
 from lumen.models.chat_jobs import ChatJob
 from lumen.models.chat_runs import ChatRun
+from lumen.services import auxiliary
 from lumen.services import memory_store as ms
 from lumen.services.memory_extract import generate_memory_if_applicable
+from lumen.services.worker_routing import use_read_committed
 
 _KIND = "memory_extract"
 _LEASE_SECONDS = 120
@@ -47,6 +49,7 @@ async def enqueue_completed_run_in_transaction(session, run: ChatRun, *, memory_
         )
 
 
+@auxiliary.retry_db
 async def _claim_one(*, owner: str) -> tuple[str, str, str, str, str] | None:
     from lumen.db import get_session_factory
 
@@ -55,6 +58,9 @@ async def _claim_one(*, owner: str) -> tuple[str, str, str, str, str] | None:
         return None
     now = _now()
     async with factory() as session, session.begin():
+        await use_read_committed(session)
+        if await auxiliary.lock_admission(session, owner) is None:
+            return None
         job = (
             await session.execute(
                 select(ChatJob)
@@ -70,6 +76,7 @@ async def _claim_one(*, owner: str) -> tuple[str, str, str, str, str] | None:
                 .order_by(ChatJob.next_at, ChatJob.created_at)
                 .limit(1)
                 .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if job is None or job.run_id is None or job.conversation_id is None:
@@ -101,7 +108,7 @@ async def _apply_and_complete(
     if factory is None:
         raise RuntimeError("chat DB is unavailable")
     async with factory() as session, session.begin():
-        job = await session.get(ChatJob, job_id, with_for_update=True)
+        job = await session.get(ChatJob, job_id, with_for_update=True, populate_existing=True)
         if job is None or job.status != "running" or job.lease_owner != owner:
             return False
         applied = {"add": 0, "update": 0, "delete": 0}
@@ -119,6 +126,7 @@ async def _apply_and_complete(
         return True
 
 
+@auxiliary.retry_db
 async def _retry(job_id: str, *, owner: str) -> None:
     from lumen.db import get_session_factory
 
@@ -126,7 +134,7 @@ async def _retry(job_id: str, *, owner: str) -> None:
     if factory is None:
         return
     async with factory() as session, session.begin():
-        job = await session.get(ChatJob, job_id, with_for_update=True)
+        job = await session.get(ChatJob, job_id, with_for_update=True, populate_existing=True)
         if job is None or job.status != "running" or job.lease_owner != owner:
             return
         job.status = "queued"
@@ -136,11 +144,17 @@ async def _retry(job_id: str, *, owner: str) -> None:
         job.next_at = _now() + timedelta(seconds=min(60, 2 ** min(job.attempts, 6)))
 
 
+@auxiliary.worker_step
 async def process_one(*, owner: str) -> bool:
     """Claim and process at most one completed-response memory job."""
     claimed = await _claim_one(owner=owner)
     if claimed is None:
         return False
+    async with auxiliary.keep_lease(owner=owner, model=ChatJob, key=claimed[0]):
+        return await _process_claimed(claimed, owner=owner)
+
+
+async def _process_claimed(claimed: tuple[str, str, str, str, str], *, owner: str) -> bool:
     job_id, run_id, conversation_id, project_id, user_id = claimed
     try:
         ops = await generate_memory_if_applicable(

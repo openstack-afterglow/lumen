@@ -1,4 +1,8 @@
 ---
+- name: Pull | Build pinned source images when requested
+  ansible.builtin.include_tasks: source_build.yml
+  when: lumen_source_mode | default(false) | bool
+
 - name: Pull | Pull Lumen images
   become: true
   community.docker.docker_image:

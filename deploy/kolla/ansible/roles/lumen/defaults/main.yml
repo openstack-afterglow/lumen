@@ -1,7 +1,7 @@
 ---
 # Lumen kolla role defaults
 
-lumen_image_tag: "0.6.2"
+lumen_image_tag: "0.6.7"
 lumen_image_namespace: "ghcr.io/openstack-afterglow"
 lumen_api_image: "{{ lumen_image_namespace }}/lumen-api"
 lumen_worker_image: "{{ lumen_image_namespace }}/lumen-worker"
@@ -26,6 +26,29 @@ lumen_run_preconditions: true
 lumen_api_port: 8012
 lumen_api_listen_address: "{{ 'api' | kolla_address(inventory_hostname) }}"
 lumen_api_listen_port: 18012
+# Keep long-lived SSE and WebSocket connections open; Octavia data timeouts must
+# use the same value in milliseconds. Connect timeout remains 5 seconds.
+lumen_api_proxy_idle_timeout_seconds: 3600
+lumen_api_max_active_requests: 256
+lumen_api_max_sse_connections: 256
+lumen_api_max_websocket_connections: 64
+lumen_api_max_body_bytes: 220200960
+
+# Batch is opt-in. These limits mirror the typed application settings.
+lumen_batch_enabled: false
+lumen_batch_dispatch_window: 8
+lumen_batch_project_dispatch_window: 32
+lumen_batch_native_max_items: 1000
+lumen_batch_native_max_bytes: 10485760
+lumen_batch_jsonl_max_rows: 50000
+lumen_batch_jsonl_max_bytes: 200000000
+lumen_batch_jsonl_max_line_bytes: 4194304
+lumen_batch_validation_chunk_rows: 100
+lumen_batch_validation_chunk_bytes: 1048576
+lumen_batch_upload_slots: 4
+lumen_batch_result_ttl_days: 7
+lumen_batch_input_ttl_days: 30
+lumen_batch_cancel_grace_seconds: 600
 lumen_database_name: "lumen"
 lumen_database_user: "lumen"
 lumen_database_address: "{{ database_address }}"
@@ -102,6 +125,8 @@ lumen_s3_secret_key: ""
 lumen_s3_region: "default"
 lumen_s3_server_side_encryption: ""
 lumen_s3_kms_key_id: ""
+lumen_clamav_host: ""
+lumen_clamav_port: 3310
 
 # Lumen Sandbox & External Chat API Hosts
 lumen_sandbox_api_key: ""
@@ -132,6 +157,18 @@ lumen_worker_drain_seconds: 300
 # never guesses image/flavor/network IDs. Secrets stay file/env references.
 lumen_runtime_enabled: false
 lumen_runtime_config: {}
+# Operator-supplied deployment evidence. Empty/false defaults deliberately fail
+# closed for enabled managed pools rather than inventing image/provider support.
+lumen_runtime_ca_expiry_margin_seconds: 3600
+lumen_runtime_glance_image_evidence: {}
+lumen_runtime_guest_artifact_evidence: {}
+lumen_runtime_octavia_weight_zero_supported: false
+lumen_runtime_octavia_status_query_supported: false
+lumen_runtime_octavia_member_tags_supported: false
+# Actual Octavia listener data timeouts (milliseconds), not inferred from Kolla.
+lumen_runtime_octavia_timeout_client_data: 0
+lumen_runtime_octavia_timeout_member_data: 0
+lumen_media_enabled: false
 lumen_controller_listen_address: "{{ 'api' | kolla_address(inventory_hostname) }}"
 lumen_controller_listen_port: 8013
 # Root-owned controller-only signing key and CA/TLS secrets; never mount this
@@ -143,6 +180,46 @@ lumen_worker_runtime_volumes: "{{ [lumen_worker_secrets_dir ~ ':/etc/lumen/contr
 # Optional dynamic API pool: when set, both Kolla HAProxy listeners point at the
 # operator's Octavia VIP instead of the inventory nodes.
 lumen_api_dynamic_ingress_vip: ""
+lumen_api_dynamic_ingress_port: "{{ lumen_api_port }}"
+# Kolla uses presence (not truthiness) to replace inventory backends. Combining
+# an empty mapping therefore preserves the stock inventory loop when unset.
+lumen_api_dynamic_ingress_members: "{{ {'custom_member_list': ['server lumen-octavia ' ~ ('[' ~ lumen_api_dynamic_ingress_vip ~ ']' if ':' in lumen_api_dynamic_ingress_vip else lumen_api_dynamic_ingress_vip) ~ ':' ~ lumen_api_dynamic_ingress_port ~ ' check inter 2s fall 3 rise 2']} if lumen_api_dynamic_ingress_vip | length > 0 else {} }}"
+
+lumen_api_haproxy:
+  enabled: "{{ enable_lumen_api | bool }}"
+  external: false
+  port: "{{ lumen_api_port }}"
+  listen_port: "{{ lumen_api_listen_port }}"
+  host_group: lumen
+  frontend_http_extra:
+    - "option forwardfor"
+    - "timeout client {{ lumen_api_proxy_idle_timeout_seconds }}s"
+  backend_http_extra:
+    - "option httpchk GET /v1/ready"
+    - "http-check expect status 200"
+    - "timeout connect 5s"
+    - "timeout server {{ lumen_api_proxy_idle_timeout_seconds }}s"
+    - "timeout tunnel {{ lumen_api_proxy_idle_timeout_seconds }}s"
+
+lumen_public_haproxy:
+  enabled: "{{ enable_lumen_api | bool and lumen_public_haproxy_enabled | bool }}"
+  external: true
+  external_fqdn: "{{ lumen_public_haproxy_fqdn }}"
+  mode: http
+  with_frontend: true
+  with_backend: true
+  host_group: lumen
+  port: "{{ lumen_api_port }}"
+  listen_port: "{{ lumen_api_listen_port }}"
+  frontend_http_extra:
+    - "option forwardfor"
+    - "timeout client {{ lumen_api_proxy_idle_timeout_seconds }}s"
+  backend_http_extra:
+    - "option httpchk GET /v1/ready"
+    - "http-check expect status 200"
+    - "timeout connect 5s"
+    - "timeout server {{ lumen_api_proxy_idle_timeout_seconds }}s"
+    - "timeout tunnel {{ lumen_api_proxy_idle_timeout_seconds }}s"
 
 lumen_service_environments:
   lumen-api:
@@ -231,17 +308,7 @@ lumen_services:
       retries: 3
       start_period: 30s
     haproxy:
-      lumen-api:
-        enabled: "{{ enable_lumen_api | bool }}"
-        external: false
-        port: "{{ lumen_api_port }}"
-        listen_port: "{{ lumen_api_listen_port }}"
-        host_group: lumen
-        frontend_http_extra:
-          - "option forwardfor"
-        backend_http_extra:
-          - "option httpchk GET /v1/health"
-          - "http-check expect status 200"
+      lumen-api: "{{ lumen_api_haproxy | combine(lumen_api_dynamic_ingress_members) }}"
 
   lumen-worker:
     container_name: lumen_worker
@@ -272,20 +339,6 @@ lumen_public_haproxy_services:
     group: lumen
     enabled: "{{ enable_lumen_api | bool and lumen_public_haproxy_enabled | bool }}"
     haproxy:
-      lumen-public:
-        enabled: "{{ enable_lumen_api | bool and lumen_public_haproxy_enabled | bool }}"
-        external: true
-        external_fqdn: "{{ lumen_public_haproxy_fqdn }}"
-        mode: http
-        with_frontend: true
-        with_backend: true
-        host_group: lumen
-        port: "{{ lumen_api_port }}"
-        listen_port: "{{ lumen_api_listen_port }}"
-        frontend_http_extra:
-          - "option forwardfor"
-        backend_http_extra:
-          - "option httpchk GET /v1/health"
-          - "http-check expect status 200"
+      lumen-public: "{{ lumen_public_haproxy | combine(lumen_api_dynamic_ingress_members) }}"
 
 lumen_haproxy_services: "{{ lumen_services | combine(lumen_public_haproxy_services, recursive=True) }}"

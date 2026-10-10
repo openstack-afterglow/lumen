@@ -82,26 +82,83 @@
     - enable_lumen | bool
     - lumen_enable_pgvector | bool
 
-- name: Precheck | Verify Lumen agent runtime configuration
-  ansible.builtin.assert:
-    that:
-      - lumen_runtime_config is mapping
-      - lumen_runtime_config.deployment_id is defined
-      - lumen_runtime_config.controller_url is defined and lumen_runtime_config.controller_url is match('^https://')
-      - lumen_runtime_config.tls is defined
-      - lumen_runtime_config.dispatch_key is defined
-      - lumen_runtime_config.managed_networks is defined and lumen_runtime_config.managed_networks | length > 0
-      - lumen_runtime_config.cloud_profiles is defined and lumen_runtime_config.cloud_profiles | length > 0
-      - lumen_runtime_config.pools is defined and lumen_runtime_config.pools | length > 0
-    fail_msg: >-
-      lumen_runtime_config must declare deployment_id, an https controller_url, tls material,
-      a dispatch_key reference, managed_networks CIDRs, cloud_profiles and pools before
-      lumen_runtime_enabled can be true; the role never guesses cloud identifiers.
-  run_once: true
+- name: Precheck | Validate typed runtime and deployment prerequisites
+  become: true
+  block:
+    - name: Precheck | Allocate release validator script
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .lumen-precheck.py
+      register: lumen_precheck_script
+
+    - name: Precheck | Stage release validator script
+      ansible.builtin.copy:
+        src: validate_runtime_precheck.py
+        dest: "{{ lumen_precheck_script.path }}"
+        owner: root
+        group: root
+        mode: "0400"
+
+    - name: Precheck | Run validator in canonical release image
+      ansible.builtin.command:
+        argv: "{{ ['docker', 'run', '--rm', '-i', '--pull=never', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--volume', lumen_precheck_script.path ~ ':/precheck.py:ro'] + (['--volume', lumen_controller_secrets_dir ~ ':/etc/lumen/controller:ro'] if lumen_runtime_enabled | bool else []) + ['--entrypoint', 'python', lumen_api_image_ref, '/precheck.py', 'material'] }}"
+        stdin: "{{ lumen_precheck_input | to_json }}"
+      vars:
+        lumen_precheck_input:
+          runtime_enabled: "{{ lumen_runtime_enabled | bool }}"
+          runtime_config: "{{ lumen_runtime_config }}"
+          ca_expiry_margin_seconds: "{{ lumen_runtime_ca_expiry_margin_seconds }}"
+          glance_image_evidence: "{{ lumen_runtime_glance_image_evidence }}"
+          guest_artifact_evidence: "{{ lumen_runtime_guest_artifact_evidence }}"
+          octavia_weight_zero_supported: "{{ lumen_runtime_octavia_weight_zero_supported }}"
+          octavia_status_query_supported: "{{ lumen_runtime_octavia_status_query_supported }}"
+          octavia_member_tags_supported: "{{ lumen_runtime_octavia_member_tags_supported }}"
+          octavia_timeout_client_data: "{{ lumen_runtime_octavia_timeout_client_data }}"
+          octavia_timeout_member_data: "{{ lumen_runtime_octavia_timeout_member_data }}"
+          dynamic_ingress_vip: "{{ lumen_api_dynamic_ingress_vip }}"
+          dynamic_ingress_port: "{{ lumen_api_dynamic_ingress_port }}"
+          proxy_idle_timeout_seconds: "{{ lumen_api_proxy_idle_timeout_seconds }}"
+          shared_external_frontend: "{{ lumen_public_haproxy_enabled | bool and haproxy_single_external_frontend | default(false) | bool }}"
+          external_single_frontend_options: "{{ haproxy_external_single_frontend_options | default([]) }}"
+          batch_enabled: "{{ lumen_batch_enabled | bool }}"
+          media_enabled: "{{ lumen_media_enabled | default(false) | bool }}"
+          storage:
+            endpoint_url: "{{ lumen_s3_endpoint_url }}"
+            bucket: "{{ lumen_s3_bucket }}"
+            access_key: "{{ lumen_s3_access_key }}"
+            secret_key: "{{ lumen_s3_secret_key }}"
+            server_side_encryption: "{{ lumen_s3_server_side_encryption }}"
+            kms_key_id: "{{ lumen_s3_kms_key_id }}"
+          scanner:
+            host: "{{ lumen_clamav_host }}"
+            port: "{{ lumen_clamav_port }}"
+      register: lumen_runtime_precheck_result
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Precheck | Require release validator execution
+      ansible.builtin.assert:
+        that:
+          - lumen_runtime_precheck_result.rc == 0
+        fail_msg: "runtime_precheck_execution: canonical Lumen image must run its typed validator"
+
+    - name: Precheck | Require typed prerequisites with stable reasons
+      ansible.builtin.assert:
+        that:
+          - (lumen_runtime_precheck_result.stdout | from_json).ok
+        fail_msg: "{{ (lumen_runtime_precheck_result.stdout | from_json).reasons | join(', ') }}"
+  always:
+    - name: Precheck | Remove release validator script
+      ansible.builtin.file:
+        path: "{{ lumen_precheck_script.path }}"
+        state: absent
+      when: lumen_precheck_script.path is defined
   tags: precheck
   when:
     - enable_lumen | bool
-    - lumen_runtime_enabled | bool
+    - inventory_hostname in groups['lumen']
 
 - name: Precheck | Verify Lumen controller secret material
   become: true
@@ -121,7 +178,7 @@
       - lumen_dispatch_key_stat.stat.mode in ['0600', '0400']
       - lumen_dispatch_key_stat.stat.isreg
       - lumen_dispatch_key_stat.stat.uid == 0
-    fail_msg: "{{ lumen_controller_dispatch_key_file }} must exist with mode 0600/0400 on every lumen host"
+    fail_msg: "runtime_dispatch_key_permissions: {{ lumen_controller_dispatch_key_file }} must exist with mode 0600/0400 on every lumen host"
   tags: precheck
   when:
     - enable_lumen | bool
@@ -142,7 +199,7 @@
       - ([lumen_runtime_config.tls.ca_file, lumen_runtime_config.tls.operator_client_cert_file, lumen_runtime_config.tls.operator_client_key_file] | unique | list | length) == 3
       - lumen_runtime_config.tls.ca_key_file not in [lumen_runtime_config.tls.ca_file, lumen_runtime_config.tls.operator_client_cert_file, lumen_runtime_config.tls.operator_client_key_file]
       - lumen_runtime_config.tls.key_file not in [lumen_runtime_config.tls.ca_file, lumen_runtime_config.tls.operator_client_cert_file, lumen_runtime_config.tls.operator_client_key_file]
-    fail_msg: "runtime TLS files must reside under /etc/lumen/controller with separate worker client material"
+    fail_msg: "runtime_controller_mount: runtime TLS files must reside under /etc/lumen/controller with separate worker client material"
   tags: precheck
   when:
     - enable_lumen | bool
@@ -167,7 +224,7 @@
       - lumen_worker_secrets_stat.stat.uid == 0
       - lumen_worker_secrets_stat.stat.gid == 0
       - lumen_worker_secrets_stat.stat.mode == '0750'
-    fail_msg: "{{ lumen_worker_secrets_dir }} must be root:root mode 0750"
+    fail_msg: "runtime_worker_mount_permissions: {{ lumen_worker_secrets_dir }} must be root:root mode 0750"
   tags: precheck
   when:
     - enable_lumen | bool
@@ -197,31 +254,9 @@
       - (lumen_worker_secrets_inventory.files | selectattr('isreg') | list | length) == 3
       - (lumen_worker_secrets_inventory.files | selectattr('mode', 'in', ['0440', '0640', '0444', '0644']) | list | length) == 3
       - (lumen_worker_secrets_inventory.files | selectattr('path', 'equalto', lumen_worker_secrets_dir ~ '/' ~ (lumen_runtime_config.tls.operator_client_key_file | basename)) | map(attribute='mode') | first) in ['0440', '0640']
-    fail_msg: "worker TLS mount must contain only regular, root:root public CA and client cert/key; client key must be group-readable without world access"
+    fail_msg: "runtime_worker_mount_material: worker TLS mount must contain only regular, root:root public CA and client cert/key; client key must be group-readable without world access"
   tags: precheck
   when:
     - enable_lumen | bool
     - lumen_runtime_enabled | bool
     - inventory_hostname in groups['lumen']
-
-- name: Precheck | Verify Lumen API image accessibility
-  become: true
-  ansible.builtin.command:
-    cmd: "docker manifest inspect {{ lumen_api_image }}:{{ lumen_image_tag }}"
-  register: lumen_image_check
-  failed_when: false
-  changed_when: false
-  run_once: true
-  delegate_to: "{{ groups['lumen'] | first }}"
-  tags: precheck
-  when: enable_lumen | bool
-
-- name: Precheck | Warn if Lumen API image is inaccessible
-  ansible.builtin.debug:
-    msg: "WARNING: Cannot access {{ lumen_api_image }}:{{ lumen_image_tag }}. Ensure registry credentials are configured."
-  when:
-    - enable_lumen | bool
-    - lumen_image_check is defined
-    - lumen_image_check.rc != 0
-  run_once: true
-  tags: precheck

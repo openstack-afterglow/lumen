@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any, Literal
 from urllib.parse import parse_qs
 
@@ -20,9 +21,11 @@ from lumen.api.compat.anthropic import (
     anthropic_protocol_headers,
 )
 from lumen.api.compat.streaming import events_with_ping
-from lumen.auth import Principal, require_api_key_scopes, require_token
+from lumen.auth import Principal, ensure_scopes, require_api_key_scopes, require_token
 from lumen.services import claude_gateway as gateway
 from lumen.services import completion_api as core
+from lumen.services.inference_authority import completion_scopes
+from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 
 public_router = APIRouter()
 internal_router = APIRouter()
@@ -205,11 +208,13 @@ async def hello():
 
 
 @public_router.post("/v1/messages")
+@admit_sse
 async def messages(
     body: AnthropicMessagesRequest,
     request: Request,
     token_info: Principal = Depends(require_gateway_write),
 ):
+    ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
     try:
         _model, resolved = await _resolved_gateway_model()
         await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"))
@@ -237,19 +242,22 @@ async def messages(
 
     if not body.stream:
         return JSONResponse(result)
+    # The provider stream is already open; the SSE owner closes it even if the body never starts.
+    register_sse_resource(request, result)
 
     async def stream() -> AsyncIterator[str]:
-        try:
-            async for item in events_with_ping(result, ping_seconds=15):
-                if item is None:
-                    yield 'event: ping\ndata: {"type":"ping"}\n\n'
-                else:
-                    event_type = item.get("type", "message")
-                    payload = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-                    yield f"event: {event_type}\ndata: {payload}\n\n"
-        except Exception:
-            payload = json.dumps(anthropic_error(502, "upstream model error"), separators=(",", ":"))
-            yield f"event: error\ndata: {payload}\n\n"
+        async with aclosing(events_with_ping(result, ping_seconds=15)) as events:
+            try:
+                async for item in events:
+                    if item is None:
+                        yield 'event: ping\ndata: {"type":"ping"}\n\n'
+                    else:
+                        event_type = item.get("type", "message")
+                        payload = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                        yield f"event: {event_type}\ndata: {payload}\n\n"
+            except Exception:
+                payload = json.dumps(anthropic_error(502, "upstream model error"), separators=(",", ":"))
+                yield f"event: error\ndata: {payload}\n\n"
 
     return StreamingResponse(
         stream(),

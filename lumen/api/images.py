@@ -5,9 +5,9 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
 
 from lumen.auth import Principal, require_scopes
+from lumen.models.api_requests import ImageEditRequest, ImageGenerationRequest
 from lumen.models.chat_contracts import ChatRunDescriptor
 from lumen.services import assets, credit
 from lumen.services.conversation_store import ChatStorageUnavailable
@@ -16,21 +16,6 @@ from lumen.services.durable_runs.images import admit_image_run
 from lumen.services.providers.errors import ProviderValidationError
 
 router = APIRouter()
-
-
-class ImageGenerationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    model_id: str = Field(min_length=1, max_length=190)
-    provider_id: int | None = None
-    prompt: str = Field(min_length=1)
-    size: str = "auto"
-    quality: str = "auto"
-    n: int = Field(default=1, ge=1)
-
-
-class ImageEditRequest(ImageGenerationRequest):
-    input_asset_id: UUID
 
 
 def image_error(exc: Exception) -> HTTPException:
@@ -61,6 +46,7 @@ async def admit(
     idempotency_key: UUID,
     input_asset_id: UUID | None = None,
     api_provider: str | None = None,
+    required_scopes: tuple[str, ...] | None = None,
 ) -> ChatRunDescriptor:
     request = payload.model_dump(mode="json")
     if api_provider is not None:
@@ -76,6 +62,7 @@ async def admit(
             client_request_id=str(idempotency_key),
             source=principal.get("source", "web"),
             api_key_id=principal.get("api_key_id"),
+            required_scopes=required_scopes,
         )
     except (
         durable_errors.DurableRunError,

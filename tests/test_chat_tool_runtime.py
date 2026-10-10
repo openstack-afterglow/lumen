@@ -17,6 +17,8 @@ from lumen.services.tool_runtime import bindings, contracts, selection
 from lumen.services.tool_runtime import dispatch as tool_runtime
 from lumen.services.tools import ToolContext
 
+pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
+
 _CTX = ToolContext(project_id="p1", user_id="u1")
 
 def _custom_row(**overrides):

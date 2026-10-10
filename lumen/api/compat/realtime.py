@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 from uuid import uuid4
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
+from lumen.auth import ensure_scopes
 from lumen.config import get_settings
 from lumen.services import api_key_store
 from lumen.services.durable_runs.realtime import admit_realtime_session, run_realtime_session
+from lumen.services.infrastructure.api_load import admit_websocket
 
 from ..realtime import origin_allowed
 
@@ -34,9 +36,14 @@ async def _principal(websocket: WebSocket) -> dict | None:
     info = await api_key_store.verify_key(keys[0])
     if info is None or "compat:realtime:write" not in info.get("scopes", ()):
         return None
+    try:
+        ensure_scopes({**info, "auth_type": "api_key"}, "compat:realtime:write")
+    except HTTPException:
+        return None
     return info
 
 
+@admit_websocket
 async def _compat_socket(websocket: WebSocket, *, wire: str):
     principal = await _principal(websocket)
     if principal is None:

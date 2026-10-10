@@ -10,10 +10,9 @@ import socket
 import subprocess
 import sys
 
-# Teardown discards the stack and its volumes after logs were collected and the
-# exit code was decided, so a graceful stop buys nothing. The worker and fake
-# provider run as PID 1 without a SIGTERM handler and would otherwise wait out
-# compose's 10s default in two dependency waves.
+# Only this disposable, uniquely named test stack uses a forced teardown after
+# collecting logs. Production workers and Nova guests must drain without a
+# forced timeout; this command is not an operational shutdown recipe.
 _TEARDOWN = ["down", "-v", "--remove-orphans", "--timeout", "1"]
 
 
@@ -31,6 +30,10 @@ def _free_loopback_port() -> str:
 
 def _compose_env(layer: str) -> dict[str, str]:
     env = os.environ.copy()
+    # The manual agent-runtime profile is exercised with direct Compose commands,
+    # never inherited from an operator shell by the no-cloud test-layer runner.
+    env["COMPOSE_PROFILES"] = ""
+    env["RUNTIME_CONFIG"] = '{"enabled":false}'
     env["COMPOSE_PROJECT_NAME"] = (
         os.environ.get("LUMEN_TEST_COMPOSE_PROJECT") or f"lumen-{layer}-{os.getpid()}-{secrets.token_hex(4)}"
     )
@@ -135,9 +138,10 @@ def run_system(extra_args: list[str] | None = None) -> int:
                 "-d",
                 "--wait",
                 "--wait-timeout",
-                "180",
+                "600",
                 "lumen-api",
                 "lumen-worker",
+                "lumen-batch-worker",
             ],
             env=env,
         )

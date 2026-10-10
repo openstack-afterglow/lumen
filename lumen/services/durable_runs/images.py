@@ -6,11 +6,13 @@ import asyncio
 import base64
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import UTC
 from decimal import Decimal
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumen.config import get_settings
 from lumen.crypto import encrypt_chat_content
@@ -41,6 +43,16 @@ from .errors import (
     DurableRunProviderResultUnknown,
 )
 from .lifecycle import _cancel_requested, _require_owned_running_lease
+from .media import (
+    IO_BLOCKED,
+    MediaAuthorizationRevoked,
+    authorize_media_in_transaction,
+    confirmed_media_rejection,
+    lock_media_run_for_io,
+    lock_media_source_in_transaction,
+    media_io_allowed,
+    validate_batch_media_io_in_transaction,
+)
 
 _SEGMENT = "image:1"
 _MAX_SOURCE_BYTES = 5 * 1024 * 1024
@@ -49,19 +61,34 @@ _MAX_SOURCE_BYTES = 5 * 1024 * 1024
 def _intent(request: dict) -> dict:
     return {"kind": "image", "model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
             "prompt": request.get("prompt"), "size": request.get("size", "auto"), "quality": request.get("quality", "auto"),
-            "n": request.get("n", 1), "source_asset_id": request.get("source_asset_id")}
+            "n": request.get("n", 1), "source_asset_id": request.get("source_asset_id", request.get("input_asset_id"))}
 
 
-async def admit_image_run(request: dict, *, project_id: str, user_id: str, client_request_id: str,
-                          source: str = "web", api_key_id: int | None = None):
-    """Return a prior identical run before credential checks or any provider-side work."""
-    from .admission import existing_run_for_intent
+@dataclass(frozen=True)
+class PreparedImageRun:
+    payload: dict
+    capability_snapshot: dict
+    pricing_snapshot: dict
+    required_scopes: tuple[str, ...]
+    source_asset_id: str | None
+    project_id: str
+    user_id: str
 
+
+async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
+                            source: str = "web", api_key_id: int | None = None,
+                            required_scopes: tuple[str, ...] | None = None) -> PreparedImageRun:
+    """Freeze one finite image request without inference or source-byte I/O."""
+    if "model" in request:
+        # OpenAI-compatible JSON body (Batch /v1/images/generations): same limits as the sync route.
+        if request.get("response_format", "b64_json") != "b64_json":
+            raise DurableRunInputError("Only response_format=b64_json is supported")
+        if request.get("provider") is not None and request.get("provider_id") is not None:
+            raise DurableRunInputError("Specify only one of provider and provider_id")
+        required_scopes = required_scopes or ("compat:images:write",)
+        request = {**request, "model_id": request["model"],
+                   "provider_id": request.get("provider_id") if request.get("provider") is None else request["provider"]}
     intent = _intent(request)
-    previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
-                                              client_request_id=client_request_id, intent=intent, conversation_id=None)
-    if previous is not None:
-        return previous
     model_id = request.get("model_id")
     provider_id = request.get("provider_id")
     if (not isinstance(model_id, str) or not model_id or not isinstance(request.get("prompt"), str)
@@ -80,7 +107,7 @@ async def admit_image_run(request: dict, *, project_id: str, user_id: str, clien
     if (route is None or (provider_number is not None and provider_number != route["provider_id"])
             or (api_provider is not None and api_provider != route["api_provider"])):
         raise DurableRunInputError("image provider or model is unavailable")
-    source_asset_id = request.get("source_asset_id")
+    source_asset_id = intent["source_asset_id"]
     if source_asset_id is not None:
         if not isinstance(source_asset_id, str):
             raise DurableRunInputError("invalid source asset")
@@ -112,41 +139,83 @@ async def admit_image_run(request: dict, *, project_id: str, user_id: str, clien
         pricing["required_token_modalities"] = ["image_output", *(["image_input"] if source_asset_id is not None else [])]
     else:
         pricing["image_per_unit"] = format(unit_price, "f")
-    factory = _factory()
+    pricing["bound_credits"] = format(bound, "f")
+    scopes = required_scopes or ("native:images:write", *(("native:assets:read",) if source_asset_id else ()))
+    return PreparedImageRun(intent, capability, pricing, scopes, source_asset_id, project_id, user_id)
+
+
+async def persist_image_run_in_transaction(
+    session: AsyncSession, prepared: PreparedImageRun, *, project_id: str, user_id: str,
+    client_request_id: str, source: str = "web", api_key_id: int | None = None,
+    workload_class: str | None = None, batch_id: str | None = None,
+    allowed_scopes: frozenset[str] | None = None,
+) -> ChatRun:
+    """Bind the frozen request in the caller's transaction; never commit, hold credit or wake.
+
+    Default class is ``online_media``; a Batch caller passes ``workload_class="batch"``
+    with its locked ``batch_id``. The pool is resolved from persisted configuration.
+    """
+    from lumen.services.worker_routing import resolve_worker_route
+
+    from .admission import _lock_run_configurations
+
+    if (prepared.project_id, prepared.user_id) != (project_id, user_id):
+        raise DurableRunInputError("prepared image owner changed")
+    intent, capability, pricing = prepared.payload, prepared.capability_snapshot, prepared.pricing_snapshot
+    existing = (await session.execute(select(ChatRun).where(ChatRun.project_id == project_id,
+        ChatRun.user_id == user_id, ChatRun.client_request_id == client_request_id)
+        .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    if existing is not None:
+        if existing.request_fingerprint != _fingerprint(intent):
+            raise DurableRunConflict("idempotency_key_reused_with_different_intent")
+        return existing
+    route = await resolve_worker_route(session, run_kind="image", workload_class=workload_class, batch_id=batch_id)
+    await _lock_run_configurations(session, capability, model_name=capability["model_name"])
+    await authorize_media_in_transaction(session, user_id=user_id, project_id=project_id,
+        api_key_id=api_key_id, required_scopes=prepared.required_scopes, allowed_scopes=allowed_scopes)
+    run = ChatRun(id=str(uuid.uuid4()), run_scope="image", run_kind="image", project_id=project_id,
+        user_id=user_id, model_name=capability["model_name"], source=source, api_key_id=api_key_id,
+        workload_class=route.workload_class, worker_pool_id=route.worker_pool_id, batch_id=batch_id,
+        client_request_id=client_request_id, request_fingerprint=_fingerprint(intent), fingerprint_version=1,
+        execution_protocol_version=1, capability_snapshot=capability, pricing_snapshot=pricing,
+        request_payload=encrypt_chat_content(json.dumps({**intent, "execution_protocol_version": 1,
+                                                       "required_scopes": list(prepared.required_scopes)})),
+        status="queued", last_seq=0, current_ordinal=0)
+    session.add(run)
+    if prepared.source_asset_id is not None:
+        row = await lock_media_source_in_transaction(session, asset_id=prepared.source_asset_id, user_id=user_id,
+            project_id=project_id, run_kind="image", pricing=pricing, batch_id=batch_id)
+        session.add(ChatRunAsset(run_id=run.id, asset_id=row.id, purpose="input"))
+    session.add(ChatRunProvider(run_id=run.id, purpose="executor", provider_id=capability["provider_id"],
+        model_id=capability["model_id"], provider_label=capability["provider_name"],
+        model_label=capability["model_name"], config_version_hash=capability["config_version_hash"]))
+    await append_event(session, run, _event(run, "run.started", {"conversation_id": None,
+        "temp_thread_id": None, "model_name": run.model_name, "effective_features": {}, "run_kind": "image"}))
+    await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+    return run
+
+
+async def admit_image_run(request: dict, *, project_id: str, user_id: str, client_request_id: str,
+                          source: str = "web", api_key_id: int | None = None,
+                          required_scopes: tuple[str, ...] | None = None):
+    """Preserve UUID idempotency before checks, then commit before the Redis hint."""
+    from .admission import existing_run_for_intent
+
+    intent = _intent(request)
+    previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
+        client_request_id=client_request_id, intent=intent, conversation_id=None)
+    if previous is not None:
+        return previous
+    prepared = await prepare_image_run(request, project_id=project_id, user_id=user_id, source=source,
+                                       api_key_id=api_key_id, required_scopes=required_scopes)
     try:
-        async with factory() as session, session.begin():
-            existing = (await session.execute(select(ChatRun).where(ChatRun.project_id == project_id,
-                        ChatRun.user_id == user_id, ChatRun.client_request_id == client_request_id).with_for_update())).scalar_one_or_none()
-            if existing is not None:
-                if existing.request_fingerprint != _fingerprint(intent):
-                    raise DurableRunConflict("idempotency_key_reused_with_different_intent")
-                return descriptor(existing)
-            from .admission import _lock_run_configurations
-            await _lock_run_configurations(session, capability, model_name=route["model_name"])
-            run = ChatRun(id=str(uuid.uuid4()), run_scope="image", run_kind="image", project_id=project_id,
-                          user_id=user_id, model_name=route["model_name"], source=source, api_key_id=api_key_id,
-                          client_request_id=client_request_id, request_fingerprint=_fingerprint(intent), fingerprint_version=1,
-                          execution_protocol_version=1, capability_snapshot=capability, pricing_snapshot=pricing,
-                          request_payload=encrypt_chat_content(json.dumps({**intent, "execution_protocol_version": 1})),
-                          status="queued", last_seq=0, current_ordinal=0)
-            session.add(run)
-            if source_asset_id is not None:
-                row = (await session.execute(select(ChatAsset).where(ChatAsset.id == source_asset_id,
-                       ChatAsset.user_id == user_id, ChatAsset.project_id == project_id,
-                       ChatAsset.status == "clean").with_for_update())).scalar_one_or_none()
-                if row is None or row.mime_type not in {"image/png", "image/jpeg", "image/webp"} or row.size_bytes > _MAX_SOURCE_BYTES:
-                    raise DurableRunInputError("source image is unavailable")
-                session.add(ChatRunAsset(run_id=run.id, asset_id=row.id, purpose="input"))
-            session.add(ChatRunProvider(run_id=run.id, purpose="executor", provider_id=route["provider_id"],
-                       model_id=route["model_id"], provider_label=route["provider_name"],
-                       model_label=route["model_name"], config_version_hash=route["config_version_hash"]))
-            await append_event(session, run, _event(run, "run.started", {"conversation_id": None,
-                  "temp_thread_id": None, "model_name": run.model_name, "effective_features": {}, "run_kind": "image"}))
-            await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+        async with _factory()() as session, session.begin():
+            run = await persist_image_run_in_transaction(session, prepared, project_id=project_id, user_id=user_id,
+                client_request_id=client_request_id, source=source, api_key_id=api_key_id)
             created = descriptor(run)
     except IntegrityError:
         previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
-                          client_request_id=client_request_id, intent=intent, conversation_id=None)
+            client_request_id=client_request_id, intent=intent, conversation_id=None)
         if previous is None:
             raise
         return previous
@@ -160,20 +229,21 @@ async def _image_segment_start(run_id: str, *, owner: str, bound: Decimal) -> st
     async def transaction():
         async with factory() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-            run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
-                   .with_for_update().execution_options(populate_existing=True))).scalar_one()
-            _require_owned_running_lease(run, owner)
+            run, blocked = await lock_media_run_for_io(session, run_id, owner=owner)
             segment = await prepare_segment(session, run, segment_id=_SEGMENT, ordinal=1, endpoint="image_generation")
             await session.flush()
             if segment.status == "completed":
                 return "completed"
             if segment.status != "prepared":
                 return "unknown"
-            if run.cancel_requested_at is not None:
-                return "canceled"
+            if blocked is not None:
+                return blocked
             if bound <= 0 or bound >= Decimal("10000000000") or bound != bound.quantize(Decimal("0.00000001")):
                 raise DurableRunInputError("image credit reservation is invalid")
-            await credit.reserve_media_credit_in_transaction(session, user_id=run.user_id,
+            await validate_batch_media_io_in_transaction(session, run)
+            if "bound_credits" in run.pricing_snapshot and bound != Decimal(run.pricing_snapshot["bound_credits"]):
+                raise DurableRunInputError("image credit reservation changed")
+            await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id,
                 project_id=run.project_id, api_key_id=run.api_key_id, bound=bound)
             reservation = ChatModelCallReservation(run_id=run.id, segment_id=_SEGMENT,
                                                   bound_credits=bound, status="reserved")
@@ -297,8 +367,10 @@ async def _settle_image(run_id: str, *, owner: str) -> None:
     await budgets.retry_deadlocks(transaction)
 
 
-async def _read_source(*, asset_id: str, user_id: str, project_id: str) -> tuple[bytes, str]:
-    opened = await assets.open_download(asset_id=asset_id, user_id=user_id, project_id=project_id)
+async def _read_source(*, asset_id: str, user_id: str, project_id: str, run_id: str | None = None) -> tuple[bytes, str]:
+    # A Batch run reads its accepted input pin even if the asset was later deleted.
+    opened = (await assets.open_run_input_download(asset_id=asset_id, run_id=run_id, user_id=user_id, project_id=project_id)
+              if run_id is not None else await assets.open_download(asset_id=asset_id, user_id=user_id, project_id=project_id))
     if opened.mime_type not in {"image/png", "image/jpeg", "image/webp"} or opened.size_bytes > _MAX_SOURCE_BYTES:
         await asyncio.to_thread(opened.body.close)
         raise DurableRunInputError("source image is not a bounded scanned image")
@@ -358,16 +430,15 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
                       error_code="canceled" if canceled else None, safe_message="image run canceled" if canceled else None)
         return True
     try:
-        if await _cancel_requested(run_id):
-            await _finish(run_id, status="canceled", message_id=None, owner=owner, error_code="canceled", safe_message="image run canceled")
+        blocked, is_batch = await media_io_allowed(run_id, owner=owner)
+        if blocked is not None:
+            await _finish(run_id, status="canceled", message_id=None, owner=owner, error_code=blocked, safe_message="image run canceled")
             return True
         route = await routing.resolve_model_snapshot(capability_snapshot)
         if route is None:
             raise DurableRunInputError("image provider configuration changed")
         source_id = payload.get("source_asset_id")
         source_data = source_mime = None
-        if source_id:
-            source_data, source_mime = await _read_source(asset_id=source_id, user_id=payload["user_id"], project_id=payload["project_id"])
         token_mode = pricing_snapshot.get("billing_basis", "unit") == "tokens"
         if token_mode:
             # Preflight against admission-frozen prices; the resolver fence above still rejects config changes.
@@ -381,16 +452,27 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
             raise DurableRunInputError("image price changed after admission")
         bound = credit.credits_for_cost(price if token_mode else price * pricing_snapshot["count"],
                        Decimal(pricing_snapshot["margin_multiplier"]), Decimal(pricing_snapshot["credit_per_usd"]))
+        if source_id:
+            source_data, source_mime = await _read_source(asset_id=source_id, user_id=payload["user_id"],
+                project_id=payload["project_id"], run_id=run_id if is_batch else None)
         state = await _image_segment_start(run_id, owner=owner, bound=bound)
-        if state == "canceled":
-            await _finish(run_id, status="canceled", message_id=None, owner=owner, error_code="canceled", safe_message="image run canceled")
+        if state in IO_BLOCKED:
+            await _finish(run_id, status="canceled", message_id=None, owner=owner, error_code=state, safe_message="image run canceled")
             return True
         if state == "unknown":
             raise DurableRunProviderResultUnknown("image provider result cannot be replayed")
         if state == "started":
-            generated = await image_transport.generate_images(route, prompt=payload["prompt"], size=pricing_snapshot["size"],
-                         quality=pricing_snapshot["quality"], n=pricing_snapshot["count"],
-                         source_image=source_data, source_mime=source_mime)
+            try:
+                generated = await image_transport.generate_images(route, prompt=payload["prompt"],
+                             size=pricing_snapshot["size"], quality=pricing_snapshot["quality"],
+                             n=pricing_snapshot["count"], source_image=source_data, source_mime=source_mime)
+            except image_transport.ImageTransportError as exc:
+                # Batch only: a confirmed refusal settles at zero; anything else stays unknown.
+                if not is_batch or confirmed_media_rejection(exc) is None:
+                    raise
+                await _finish(run_id, status="failed", message_id=None, owner=owner, error_code="provider_rejected",
+                              safe_message="upstream provider rejected the request")
+                return True
             outputs = generated.images
             if len(outputs) != pricing_snapshot["count"]:
                 raise DurableRunProviderResultUnknown("provider returned a different image count")
@@ -409,6 +491,14 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
         canceled = await _cancel_requested(run_id)
         await _finish(run_id, status="canceled" if canceled else "completed", message_id=None, owner=owner,
                       error_code="canceled" if canceled else None, safe_message="image run canceled" if canceled else None)
+    except MediaAuthorizationRevoked:
+        # Raised before any reservation or provider I/O committed: definite, not unknown.
+        from .execution import logger
+        try:
+            await _finish(run_id, status="failed", message_id=None, owner=owner,
+                          error_code="api_key_unauthorized", safe_message="image request is no longer authorized")
+        except Exception:
+            logger.exception("image run finalization deferred run_id=%s", run_id)
     except Exception:
         from .execution import logger
         logger.exception("durable image execution failed run_id=%s", run_id)

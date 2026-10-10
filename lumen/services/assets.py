@@ -29,6 +29,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from lumen.config import get_settings
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
+from lumen.models.chat_batches import ChatBatch, ChatBatchItem
 from lumen.models.chat_contracts import UserAssetInputPart, UserTextInputPart, validate_user_input_parts
 from lumen.services.conversation_store import ChatStorageUnavailable
 
@@ -298,31 +299,16 @@ def _assert_scanner_host(host: str) -> None:
 
 
 async def scan_file(path: Path) -> None:
-    config = _asset_config()
-    host = str(config["scanner_host"])
-    _assert_scanner_host(host)
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, int(config["scanner_port"])), timeout=10)
-        writer.write(b"zINSTREAM\0")
         with path.open("rb") as source:
-            while chunk := source.read(64 * 1024):
-                writer.write(struct.pack("!I", len(chunk)))
-                writer.write(chunk)
-                await writer.drain()
-        writer.write(struct.pack("!I", 0))
-        await writer.drain()
-        reply = await asyncio.wait_for(reader.read(1024), timeout=10)
+            async def chunks() -> AsyncIterator[bytes]:
+                while chunk := source.read(64 * 1024):
+                    yield chunk
+
+            async for _ in scanned_chunks(chunks()):
+                pass
     except (OSError, TimeoutError) as exc:
         raise AssetUnavailable("chat asset scanner is unavailable") from exc
-    finally:
-        if "writer" in locals():
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
-    if not reply.endswith(b"OK\0"):
-        raise AssetError("파일 보안 검사에 실패했습니다")
 
 
 def _s3_client(config: dict[str, str | int]):
@@ -374,19 +360,84 @@ def _put_object(
     key: str,
     asset: InspectedAsset,
 ) -> None:
-    params: dict[str, object] = {"ContentType": asset.mime_type}
-    if config["encryption"] != "none":
-        params["ServerSideEncryption"] = str(config["encryption"])
-    if config["encryption"] == "aws:kms":
-        params["SSEKMSKeyId"] = str(config["kms_key"])
-    client = _s3_client(config)
-    _ensure_bucket(client, bucket)
-    with path.open("rb") as source:
-        client.upload_fileobj(source, bucket, key, ExtraArgs=params)
+    put_file(path, config=config, bucket=bucket, key=key, mime_type=asset.mime_type)
 
 
 def _delete_object(*, config: dict[str, str | int], bucket: str, key: str) -> None:
     _s3_client(config).delete_object(Bucket=bucket, Key=key)
+
+
+def object_storage_config() -> dict[str, str | int]:
+    """Shared private storage/scanner policy; callers impose their own file policy."""
+    return _asset_config()
+
+
+def object_client(config: dict[str, str | int]):
+    return _s3_client(config)
+
+
+def object_parameters(config: dict[str, str | int], mime_type: str) -> dict[str, object]:
+    params: dict[str, object] = {"ContentType": mime_type}
+    if config["encryption"] != "none":
+        params["ServerSideEncryption"] = str(config["encryption"])
+    if config["encryption"] == "aws:kms":
+        params["SSEKMSKeyId"] = str(config["kms_key"])
+    return params
+
+
+def put_file(path: Path, *, config: dict[str, str | int], bucket: str, key: str, mime_type: str) -> None:
+    client = _s3_client(config)
+    _ensure_bucket(client, bucket)
+    with path.open("rb") as source:
+        client.upload_fileobj(source, bucket, key, ExtraArgs=object_parameters(config, mime_type))
+
+
+def start_multipart(client, *, config: dict[str, str | int], bucket: str, key: str) -> str:
+    _ensure_bucket(client, bucket)
+    return client.create_multipart_upload(
+        Bucket=bucket, Key=key, **object_parameters(config, "application/jsonl")
+    )["UploadId"]
+
+
+def abort_multipart_uploads(client, *, bucket: str, key: str) -> None:
+    """Abort incomplete attempts for exactly this deterministic key, including pages."""
+    _ensure_bucket(client, bucket)
+    for page in client.get_paginator("list_multipart_uploads").paginate(Bucket=bucket, Prefix=key):
+        for upload in page.get("Uploads", []):
+            if upload["Key"] == key:
+                client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload["UploadId"])
+
+
+async def scanned_chunks(source: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """Stream through ClamAV. Consumers must not publish until this iterator ends."""
+    config = _asset_config()
+    host = str(config["scanner_host"])
+    _assert_scanner_host(host)
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, int(config["scanner_port"])), 10)
+        writer.write(b"zINSTREAM\0")
+        async for data in source:
+            for offset in range(0, len(data), 64 * 1024):
+                chunk = data[offset:offset + 64 * 1024]
+                writer.write(struct.pack("!I", len(chunk)))
+                writer.write(chunk)
+                await writer.drain()
+                yield chunk
+        writer.write(struct.pack("!I", 0))
+        await writer.drain()
+        reply = await asyncio.wait_for(reader.read(1024), 10)
+        if not reply.endswith(b"OK\0"):
+            raise AssetError("파일 보안 검사에 실패했습니다")
+    except (OSError, TimeoutError) as exc:
+        raise AssetUnavailable("chat asset scanner is unavailable") from exc
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
 
 
 def _row(asset: ChatAsset) -> dict:
@@ -643,6 +694,29 @@ async def open_download(*, asset_id: str, user_id: str, project_id: str) -> Asse
     asset = await _owned_asset(asset_id=asset_id, user_id=user_id, project_id=project_id)
     if asset.status != "clean":
         raise AssetError("asset is not available")
+    return await _open_object(asset)
+
+
+async def open_run_input_download(*, asset_id: str, run_id: str, user_id: str, project_id: str) -> AssetDownload:
+    """Open an accepted run input; deletion after binding blocks reuse, not this pinned run."""
+    factory = _require_session_factory()
+    try:
+        async with factory() as session:
+            asset = (await session.execute(select(ChatAsset).join(
+                ChatRunAsset, ChatRunAsset.asset_id == ChatAsset.id).where(
+                ChatAsset.id == asset_id, ChatAsset.user_id == user_id, ChatAsset.project_id == project_id,
+                ChatAsset.status.in_(("clean", "deleting")), ChatRunAsset.run_id == run_id,
+                ChatRunAsset.purpose == "input"))).scalar_one_or_none()
+            if asset is None:
+                raise AssetError("asset is not available")
+            session.expunge(asset)
+    except SQLAlchemyError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat asset을 조회하지 못했습니다") from exc
+    return await _open_object(asset)
+
+
+async def _open_object(asset: ChatAsset) -> AssetDownload:
     config = _asset_config()
     bucket = asset.bucket_name or str(config["bucket"])
 
@@ -672,7 +746,7 @@ async def delete_asset(*, asset_id: str, user_id: str, project_id: str) -> dict:
     factory = _require_session_factory()
     try:
         async with factory() as session:
-            query = select(ChatAsset).where(ChatAsset.id == asset_id).with_for_update()
+            query = select(ChatAsset).where(ChatAsset.id == asset_id).with_for_update().execution_options(populate_existing=True)
             asset = (await session.execute(query)).scalar_one_or_none()
             if asset is None:
                 raise AssetError("asset not found")
@@ -684,10 +758,16 @@ async def delete_asset(*, asset_id: str, user_id: str, project_id: str) -> dict:
             run_ref = await session.scalar(
                 select(ChatRunAsset.asset_id).where(ChatRunAsset.asset_id == asset_id).limit(1)
             )
+            batch_ref = await session.scalar(
+                select(ChatBatchItem.input_asset_id).join(ChatBatch, ChatBatch.id == ChatBatchItem.batch_id).where(
+                    ChatBatchItem.input_asset_id == asset_id,
+                    ChatBatch.status.not_in(("completed", "failed", "cancelled", "expired")),
+                ).limit(1)
+            )
             asset.status = "deleting"
             asset.deleting_at = datetime.now(UTC)
             await session.commit()
-            return {"id": asset_id, "pending_cleanup": bool(message_ref or run_ref)}
+            return {"id": asset_id, "pending_cleanup": bool(message_ref or run_ref or batch_ref)}
     except SQLAlchemyError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat asset을 삭제하지 못했습니다") from exc

@@ -6,6 +6,7 @@ from sqlalchemy import delete, select, update
 
 from lumen.models.chat_agent_platform import ChatRunInteraction
 from lumen.models.chat_contracts import ChatRunResponse
+from lumen.models.chat_infrastructure import ChatWorkerRegistration
 from lumen.models.chat_runs import (
     ChatRun,
     ChatRunEventRow,
@@ -14,6 +15,7 @@ from lumen.models.chat_runs import (
     ChatTempThread,
     ChatToolApproval,
 )
+from lumen.services import worker_routing
 from lumen.services.run_protocol_v2 import transition_allowed
 from lumen.services.run_store import (
     NONTERMINAL,
@@ -27,6 +29,21 @@ from lumen.services.run_store import (
 
 from .common import _LEASE_SECONDS, _event, _factory, _now
 from .errors import DurableRunConflict, DurableRunLeaseLost, DurableRunNotFound
+
+# One fenced provider call per run; its hold is keyed by segment "{run_kind}:1".
+_SINGLE_CALL_KINDS = frozenset({"image", "tts", "stt", "realtime", "api_completion"})
+
+
+async def _retain_unsettled_call_hold(session, run: ChatRun) -> None:
+    """A queued run canceled with an unsettled hold keeps it as ``unknown``; never released."""
+    from lumen.models.chat_runs import ChatModelCallReservation
+
+    reservation = (await session.execute(select(ChatModelCallReservation).where(
+        ChatModelCallReservation.run_id == run.id, ChatModelCallReservation.segment_id == f"{run.run_kind}:1",
+    ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    if reservation is not None and reservation.status == "reserved":
+        reservation.status = "unknown"
+        reservation.settled_at = _now()
 
 
 def _require_owned_running_lease(run: ChatRun, owner: str) -> None:
@@ -132,9 +149,15 @@ async def _request_cancelled_transaction(
         else:
             run = await budgets.lock_run(session, run_id, order=order, lock_class="root")
             root = run
-        if run.status in NONTERMINAL and run.cancel_requested_at is None:
+        # Recovery requeues collected single-call results solely for settlement. Cancelling
+        # them must not strand a billable checkpoint or turn its known hold into unknown.
+        settlement_only = (
+            run.status == "queued" and run.run_kind in _SINGLE_CALL_KINDS
+            and await worker_routing.has_provider_checkpoint(session, run.id)
+        )
+        if run.status in NONTERMINAL and run.cancel_requested_at is None and not settlement_only:
             run.cancel_requested_at = _now()
-        immediate = (run.execution_protocol_version == 2 or run.run_kind in {"image", "tts", "stt", "realtime"}) and run.status in {
+        immediate = not settlement_only and (run.execution_protocol_version == 2 or run.run_kind in _SINGLE_CALL_KINDS) and run.status in {
             "awaiting_input",
             "queued",
             "waiting_children",
@@ -187,6 +210,8 @@ async def _request_cancelled_transaction(
                 )
             if not transition_allowed(run.status, "finalizing", cancel_or_failure=True):
                 raise DurableRunConflict("cancellation cannot finalize this run")
+            if run.run_kind in _SINGLE_CALL_KINDS:
+                await _retain_unsettled_call_hold(session, run)
             run.status = "finalizing"
             await append_event(session, run, _event(run, "run.stage.changed", {"stage": "finalizing"}))
             message_id = await _cancel_streaming_assistant_message(session, run)
@@ -346,8 +371,13 @@ async def fail_waiting_run(run_id: str, *, error_code: str, safe_message: str) -
         await wake_run(wake)
     return finalized
 
-async def recover_stale_runs(*, owner: str, limit: int = 16) -> list[str]:
-    """Requeue pre-I/O and completed work; indeterminate provider calls fail closed."""
+async def recover_stale_runs(*, owner: str, registration_id: str, limit: int = 16) -> list[str]:
+    """Requeue pre-I/O and completed work; indeterminate provider calls fail closed.
+
+    Any worker may reconcile any expired lease (DB-only, no provider I/O). Only requeued
+    runs this registration may itself claim are returned for launch; others remain
+    queued for their own class/pool.
+    """
     from .execution import _finish
 
     factory = _factory()
@@ -355,6 +385,7 @@ async def recover_stale_runs(*, owner: str, limit: int = 16) -> list[str]:
     failed_run_ids: list[str] = []
     requeued_run_ids: list[str] = []
     async with factory() as session, session.begin():
+        registration = await session.get(ChatWorkerRegistration, registration_id)
         stale_runs = (
             (
                 await session.execute(
@@ -395,7 +426,9 @@ async def recover_stale_runs(*, owner: str, limit: int = 16) -> list[str]:
             run.status = "queued"
             run.lease_owner = None
             run.lease_expires_at = None
-            requeued_run_ids.append(run.id)
+            run.worker_registration_id = None
+            if registration is not None and worker_routing.run_matches_registration(run, registration):
+                requeued_run_ids.append(run.id)
     for run_id, fenced in failed_run_ids:
         await _finish(
             run_id,
@@ -411,4 +444,5 @@ async def recover_stale_runs(*, owner: str, limit: int = 16) -> list[str]:
 async def _renew_lease(run_id: str, owner: str) -> bool:
     factory = _factory()
     async with factory() as session, session.begin():
+        await worker_routing.use_read_committed(session)
         return await renew_run_lease(session, run_id, owner=owner) is not None

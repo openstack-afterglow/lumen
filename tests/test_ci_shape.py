@@ -96,11 +96,28 @@ def test_reusable_ci_jobs_override_the_implicit_success_check() -> None:
 
 
 def test_no_job_uses_a_self_hosted_runner() -> None:
-    for name in ("ci.yml", "docker-build.yml", "release.yml"):
-        for job_name, job in _workflow(name)["jobs"].items():
+    workflows = sorted(WORKFLOWS.glob("*.yml"))
+    assert {path.name for path in workflows} >= {"ci.yml", "docker-build.yml", "release.yml", "nova-guest.yml"}
+    for path in workflows:
+        for job_name, job in _workflow(path.name)["jobs"].items():
             if "uses" in job:
                 continue
-            assert "self-hosted" not in str(job["runs-on"]), f"{name}:{job_name}"
+            runners = [job["runs-on"]]
+            runners += [entry.get("runner") for entry in job.get("strategy", {}).get("matrix", {}).get("include", [])]
+            for runner in runners:
+                assert runner is None or "self-hosted" not in str(runner), f"{path.name}:{job_name}"
+
+
+def test_guest_publication_is_dispatch_only_and_reviewer_gated() -> None:
+    workflow = _workflow("nova-guest.yml")
+    jobs = workflow["jobs"]
+
+    assert set(_triggers(workflow)) == {"workflow_dispatch"}
+    assert workflow["permissions"] == {"contents": "read"}
+    writers = {name for name, job in jobs.items() if job.get("permissions", {}).get("contents") == "write"}
+    assert writers == {"publish"}
+    assert {name for name, job in jobs.items() if job.get("environment") == "nova-guest-build"} == {"build", "publish"}
+    assert set(_needs(jobs["publish"])) == {"validate", "build"} and _needs(jobs["build"]) == ["validate"]
 
 
 # --- identical-tree PR dedup (rule 9) -------------------------------------------

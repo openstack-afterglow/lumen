@@ -27,6 +27,7 @@ from lumen.services.infrastructure.bootstrap import _ca, make_bootstrap_router
 from lumen.services.infrastructure.config import RuntimeConfig
 from lumen.services.infrastructure.controller import ResourceController
 from lumen.services.infrastructure.dispatch import make_dispatch_router
+from lumen.services.infrastructure.identity import make_identity_router
 from lumen.services.infrastructure.nova import NovaProvider
 from lumen.services.infrastructure.transport import resolve_operator_key
 from lumen.services.infrastructure.zun import ZunProvider
@@ -67,6 +68,7 @@ def internal_app(config: RuntimeConfig) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.include_router(make_bootstrap_router(config, resolve_operator_key(config.dispatch_key)))
     app.include_router(make_dispatch_router(config))
+    app.include_router(make_identity_router(config))
     return app
 
 
@@ -118,8 +120,7 @@ def build_providers(config: RuntimeConfig) -> dict[str, object]:
 
 
 async def run_controller(config: RuntimeConfig, providers: dict[str, object], *,
-                         stop: asyncio.Event | None = None,
-                         db_pool_size: int = 20, db_overflow: int = 10) -> None:
+                         stop: asyncio.Event | None = None) -> None:
     """Preflight providers and serve bootstrap/dispatch alongside reconciliation."""
     if config.tls is None:
         raise ValueError("controller TLS material is required")
@@ -146,8 +147,7 @@ async def run_controller(config: RuntimeConfig, providers: dict[str, object], *,
                 raise ValueError(f"missing provider for pool {pool.name}")
             await asyncio.to_thread(providers[pool.name].preflight, pool)
     logger.info("controller preflight complete enabled_pools=%d", enabled_pools)
-    controller = ResourceController(config, providers, owner=f"{os.uname().nodename}-{uuid.uuid4()}",
-                                    db_pool_size=db_pool_size, db_overflow=db_overflow)
+    controller = ResourceController(config, providers, owner=f"{os.uname().nodename}-{uuid.uuid4()}")
     server = internal_server(config)
     server_task = asyncio.create_task(server.serve())
     reconcile_task = asyncio.create_task(controller.run())
@@ -203,8 +203,7 @@ async def _serve() -> None:
         registry.load()
         await registry.start(build_host())
         providers = build_providers(config)
-        await run_controller(config, providers, db_pool_size=settings.database_pool_size,
-                             db_overflow=settings.database_max_overflow)
+        await run_controller(config, providers)
     finally:
         try:
             await registry.close()

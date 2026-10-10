@@ -8,6 +8,7 @@ from lumen_plugin_api.contracts import PluginError
 from lumen_plugin_api.tools import validate_tool_arguments
 
 from lumen.services import mcp_client, tools
+from lumen.services.inference_authority import authorize_tool_dispatch
 from lumen.services.tools import ToolContext
 
 from . import bindings, contracts, managed, selection
@@ -37,6 +38,7 @@ async def context_execute_result(name: str, args: dict, ctx: ToolContext) -> con
     """Execute a tool and preserve whether its result may become a user-visible part."""
     if not ctx.tools_enabled:
         return contracts.ToolExecutionResult("Tool execution is disabled by this run's policy.")
+    await authorize_tool_dispatch(ctx)
     if isinstance(ctx.binding_session, contracts.ToolBindingSession):
         binding = (await bindings._legacy_dynamic_bindings(ctx)).get(name)
         if binding is not None:

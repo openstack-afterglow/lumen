@@ -90,7 +90,7 @@ FROM python:3.12-slim AS lumen-test
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl openssl \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" appuser \
     && adduser appuser root \
@@ -104,8 +104,12 @@ COPY --chown=appuser:appuser lumen_console/ ./lumen_console/
 COPY --chown=appuser:appuser packages/lumen-plugin-api/ ./packages/lumen-plugin-api/
 COPY --chown=appuser:appuser plugins/ ./plugins/
 COPY --chown=appuser:appuser tests/ ./tests/
+# SDK HTTP clients need only imports; avoid an extra unpinned build-backend fetch.
+# OpenAI and Pillow already come from the frozen service dependency layer.
+COPY --chown=appuser:appuser sdk/lumen_sdk/ ./sdk/lumen_sdk/
 
 ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH="/app/sdk"
 
 USER appuser
 

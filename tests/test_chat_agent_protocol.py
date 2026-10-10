@@ -115,7 +115,7 @@ async def test_v2_dispatch_validates_before_executing_binding():
     assert called is False
 
 
-async def test_legacy_dispatch_preserves_invalid_argument_failure(monkeypatch):
+async def test_legacy_dispatch_preserves_invalid_argument_failure(monkeypatch, synthetic_inference_store):
     called = False
 
     async def execute(_arguments, _context):
@@ -154,7 +154,7 @@ async def test_legacy_dispatch_preserves_invalid_argument_failure(monkeypatch):
     assert called is False
 
 
-async def test_legacy_builtin_rejects_invalid_arguments_before_handler(monkeypatch):
+async def test_legacy_builtin_rejects_invalid_arguments_before_handler(monkeypatch, synthetic_inference_store):
     called = False
 
     async def execute_tool(*_args):
