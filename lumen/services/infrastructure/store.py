@@ -6,6 +6,7 @@ create is observed by identity; neither a lease takeover nor a timeout repeats i
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import uuid4
@@ -55,13 +56,19 @@ def _factory():
     return factory
 
 
-async def sync_pools(config: RuntimeConfig) -> list[ChatRuntimePool]:
-    """Sync operator config without resetting leases or demand history."""
+async def sync_pools(config: RuntimeConfig, *, leader_check: Callable[[], Awaitable[None]]) -> list[ChatRuntimePool]:
+    """Leader-only config sync; preserve SQL leases and demand history.
+
+    Recheck after waiting for row locks and before commit. Redis publication is
+    separately conditional on current leadership; Redis is not a SQL write fence.
+    """
     rows = []
     async with _factory()() as session, session.begin():
+        await leader_check()
         existing = list((await session.execute(select(ChatRuntimePool).where(
             ChatRuntimePool.deployment_id == config.deployment_id).with_for_update()
         )).scalars())
+        await leader_check()
         by_name = {row.name: row for row in existing}
         for definition in config.pools:
             profile = config.profile(definition.cloud_profile_id)
@@ -93,6 +100,7 @@ async def sync_pools(config: RuntimeConfig) -> list[ChatRuntimePool]:
             if row.name not in {definition.name for definition in config.pools} and row.enabled:
                 row.enabled = False
                 row.desired_revision += 1
+        await leader_check()
     return rows
 
 
@@ -123,6 +131,18 @@ async def renew_pool_lease(pool_id: str, owner: str, fence: int, lease_seconds: 
         if not _owns(pool, owner, fence):
             return False
         pool.reconcile_lease_expires_at = _now() + timedelta(seconds=lease_seconds)
+        return True
+
+
+async def release_pool_lease(pool_id: str, owner: str, fence: int) -> bool:
+    """Relinquish only this SQL fence, after all of its external work settles."""
+    async with _factory()() as session, session.begin():
+        pool = (await session.execute(select(ChatRuntimePool).where(
+            ChatRuntimePool.id == pool_id).with_for_update())).scalar_one_or_none()
+        if pool is None or pool.reconcile_lease_owner != owner or pool.reconcile_fence != fence:
+            return False
+        pool.reconcile_lease_owner = _UNCLAIMED
+        pool.reconcile_lease_expires_at = None
         return True
 
 

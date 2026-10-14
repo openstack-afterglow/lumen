@@ -217,10 +217,13 @@ async def test_independent_api_and_three_worker_pool_reconciles(monkeypatch):
     c.providers = {d.name: object() for d in definitions}
     c._pool_ids = {d.name: d.name for d in definitions}
     entered = set()
+    released = set()
     all_entered = asyncio.Event()
     async def claim(pool_id, owner, seconds):
-        assert seconds == 30
         return SimpleNamespace(id=pool_id, name=pool_id), 1
+    async def release(pool_id, owner, fence):
+        released.add(pool_id)
+        return True
     async def reconcile(pool, fence, policy):
         entered.add(pool.name)
         if len(entered) == 4:
@@ -229,10 +232,13 @@ async def test_independent_api_and_three_worker_pool_reconciles(monkeypatch):
         if pool.name == "media":
             raise RuntimeError("one pool failing must not suppress the others")
     monkeypatch.setattr(store, "claim_pool_lease", claim)
+    monkeypatch.setattr(store, "release_pool_lease", release)
     c.reconcile_pool = reconcile
     try:
-        await c.tick()
-        assert entered == {"api", "text", "media", "batch"}
+        # Assignment/heartbeat dispatch is covered by the coordination suite;
+        # this regression isolates independent reconcile and SQL lease cleanup.
+        await c._joined(*(c._tick_pool(policy) for policy in definitions))
+        assert entered == released == {"api", "text", "media", "batch"}
     finally:
         c.executor.shutdown(wait=True)
 

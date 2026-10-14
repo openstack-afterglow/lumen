@@ -1,6 +1,80 @@
 # 테스트
 
+## 0.6.8 local qualification (2026-10-14)
+
+This unpublished release integrates latest dev `bc2fefd8c95ee6a09973461ac95d1058b906192f` and every preserved public WIP scope. Fresh qualification receipts cover the isolated integrated Lumen clone with source unchanged since integration. Native `uv lock --offline` generated the root0.6.8 lock; historical receipts below remain evidence for their original snapshots, not substitutes for these fresh results. Evidence is recorded in `release-qualification-receipts.md`, with private proof root `release-all-20261014T073153Z-c2ba90` (private values are not reproduced).
+
+| Local gate | Actual result | Scope |
+| --- | --- | --- |
+| `env -u LUMEN_TEST_DATABASE_URL -u LUMEN_TEST_REDIS_URL uv run --no-sync lumen-test contract -q` | Service **3,179 passed / 344 deselected**; SDK **128 passed**; service and SDK Ruff passed | CPython 3.12.13; local, not CI |
+| `lumen-test integration -q` | **313 passed / 3,210 deselected** | Disposable Compose MariaDB+Redis project, torn down |
+| `lumen-test system -q` | **31 passed** | Disposable Compose; locally built native arm64 API/worker/batch-worker/migrate images, fake Keystone/provider, MinIO, ClamAV and Postgres |
+| Redacted gitleaks scan | **55 public-diff files, no findings** | Public diff only; not a whole-repository security audit |
+
+**Production read-only baseline (2026-10-14, no mutation):** Running Lumen `bc2fefd` (`v0.6.7`); scripted full ledger comparison against integrated manifest paths and SHA-256 matched **26/26 (001–026)**, with no pending, unknown or drifted entries. **026 is already applied; 0.6.8 needs no production migration.** This does not prove new-runtime acceptance or change production. Installations missing026 still require the documented stopped-writer migration procedure.
+
+**Not yet done:** CI execution, immutable0.6.8 tag and wheel release, GHCR amd64+arm64 publication and execution of those published artifacts; amd64 image execution; native IAM/Keystone and real-provider acceptance; production rollout. Local arm64 system execution is not controller/sandbox or dual-platform release qualification. No commit, push, tag, publication, operator change or deployment is evidenced by these receipts. Keep coordinated API/worker/controller cutover (no mixed old/new controller cohort) and complete guest drain before stopping the supervisor: unchanged `guest_api` sends SIGTERM, then SIGKILL after at most ten seconds regardless of outer Docker/systemd stop limits.
+
+### Remaining release commands and prerequisites
+
+Authoritative commands come from `lumen/scripts/test_layers.py`, `.github/workflows/{ci,release,docker-build}.yml` and the native infrastructure recipes below. Run only on a disposable qualification environment, with Python3.12, uv, Docker Engine/Compose/Buildx, dependency/base-image access and adequate disk. Do not inherit operator `LUMEN_TEST_DATABASE_URL` or `LUMEN_TEST_REDIS_URL`: the integration runner accepts those overrides. Each Compose gate tears down its selected project's volumes; never choose a development/production project.
+
+```sh
+uv sync --python 3.12 --extra service --extra dev --frozen
+uv run --frozen --extra service --extra dev lumen-test contract -q
+LUMEN_TEST_COMPOSE_PROJECT=lumen-068-qualification-integration uv run --frozen --extra service --extra dev lumen-test integration -q
+LUMEN_TEST_COMPOSE_PROJECT=lumen-068-qualification-system uv run --frozen --extra service --extra dev lumen-test system -q
+uv run --frozen --extra service --extra dev pytest tests/test_kolla_assets.py -q
+uv build --wheel
+```
+
+`contract` includes service/SDK pytest and both Ruff scopes. In addition, CI builds/tests each default plugin with `uv build --wheel --out-dir dist <package>` and `uv run --project <package> --extra testing pytest -q <package>/tests`, for `plugins/{database-mariadb,memory-default,tools-default,skills-default,mcp-default}`. Build `packages/lumen-plugin-api` and `packages/lumen-sandbox` wheels with the same build command. Standalone sandbox test command is `uv run --project packages/lumen-sandbox --extra testing pytest -q packages/lumen-sandbox/tests`; full namespace/cgroup/tmpfs isolation needs native Linux, not macOS skips or a nonprivileged import. Root publication uses `python -m build --wheel --outdir dist` and verifies root tag/version lockstep plus installed Kolla shared assets. Parent must inspect packaged SQL/manifest and helpers after clean root-wheel `--no-deps` installation.
+
+For each target `lumen-api`, `lumen-worker`, `lumen-controller`, `lumen-sandbox`, reproduce `docker-build.yml` with `docker buildx build --platform linux/amd64,linux/arm64 --file docker/Dockerfile --target <target> --output type=oci,dest=<target>-0.6.8.oci .`. Then build/load each platform separately with `--platform linux/<arch> --load --tag <target>:0.6.8-<arch>` and execute it on a matching runner. API/worker/controller offline probe: `docker run --rm --network none --entrypoint python <image> -c 'import platform,lumen,lumen.main,lumen.worker,lumen.controller; print(platform.machine(),lumen.__version__)'`, followed by migration CLI `--help`. Sandbox must execute its independent distribution import, `node --version` and `python --version`; build/import alone is not Linux isolation or configured-cloud acceptance. Record immutable revision/digest/platform evidence separately from canonical Compose HTTP/provider/journal consumers and eventual publication/deployment.
+
+The architecture review is stamped against the current working source using `python3 scripts/check_architecture.py --stamp --summary "0.6.8 documentation/architecture evidence review: fresh local contract3179/SDK128/Ruff/integration313/arm64-system31 and public-diff scan clean; read-only production ledger001-026 matches, no production migration; CI/tag/GHCR dual-platform publication and execution, native IAM/provider and rollout pending; no source changes"`, followed by `python3 scripts/check_architecture.py`. Parent owns the final staged release check: stage the reviewed document/source and run `python3 scripts/check_architecture.py --staged`; if source changes, review again and use the matching `--stamp --staged` before that check. Do not manually edit the marker digest/UTC. No consent backfill, stopped-writer/drain/backup and mixed-version/rollback hazards remain documented in [operations](operations.md); schema-first applies where the ledger has missing migrations, not to the already-matched production026 ledger.
+
 Lumen의 테스트 시스템은 로컬 개발부터 외부 배포 검증까지 명확한 경계를 가진 4가지 계층(Contract, Integration, System, Deployment)으로 구성됩니다.
+
+## Afterglow MCP discovery·queued-turn ownership 복구 (2026-10-13, local-only)
+
+Paired change `repair-mcp-authorization-tool-discovery`의 증거는 `/Users/pieroot/.local/share/afterglow-proofs/afterglow-mcp-repair-xgt8rj01/`에 있다. 명시적으로 승인된 cloud read 도구를 legacy on-demand catalogue에 포함하고 한국어 capability 검색을 지원하며, 모든 durable admission은 선택 authority나 absence를 freeze한다. Initial preview/provider는 history2개와 `list_available_tools`만 사용하고 manage 위임도 legacy mutation을 노출하지 않는다.
+
+| 실행 경계 | 관측 결과 |
+|---|---|
+| 최종 contract/SDK | Service3125passed/320deselected/21dependency warnings, SDK128passed, root/SDK Ruff 통과. 초기 cache-pricing fixture3실패는 event-bound current ordinal 계약으로 이관한 뒤 통과했다. |
+| Native SQL queued-turn 회귀 |5passed. 첫 provider model-response를 consumer가 dequeue하기 전에 두 번째 provider turn을 시작시키며 각 tool result와 assistant 메시지·최종 run 상태가 원래 persisted turn에 확정되는지 검증한다. Producer mutable current identity를 사용하지 않는다. |
+| Native bindings/plugin HTTP | 실제 TCP Afterglow bridge·SQL/Redis·installed SDK10checks: 한국어 cloud/VM schema 적재·후속 요청 포함·VM 조회, foreign/disabled authority 거부, legacy mutation 비노출. |
+| Canonical system | 기존 system Compose의 built API/worker·migration/bootstrap·SQL/Redis/SSE와 소유 fake provider에서13checks 통과. 실제 provider3rounds initial3→discovery/cloud schema→SDK VM 결과→최종 completed, 명시적 grant 승인/선택과 종료204철회를 확인했다. |
+| Compiled Afterglow UI | Native conversation201/completion202/SSE200→completed. Event journal의 `list_available_tools`와 `afterglow_vm_list` completed 및 합성 VM 응답 표시. Context inspector light/dark×390/768/1440 총6조건 overflow0·panelInside·initial3schemas이며 실제 initial provider 집합과 일치한다. |
+| Multi-arch image | API/worker canonical targets를 arm64/amd64 빌드·실행하여 aarch64/x86_64·exit0·host source SHA parity를 확인했다. Full system workload는 arm64, amd64는 Docker Desktop emulation 실행/parity다. |
+
+System 실행은 새로운 실제 결함도 드러냈다: 첫 tool result가 queued된 동안 producer가 다음 provider turn으로 진행하여 mutable turn identity가 바뀌었고 run이 실패했다. Private graph event에 발행 시점 originating ordinal을 담고 consumer/replay/finalization을 persisted turn에 묶어 수정했다. Public event protocol/journal schema/migration/config 변화는 없다.
+
+Paired Afterglow의 restricted credential은 실제 target-token 역할 snapshot을 사용하고 Keystone payload에서 역할을 생략하며 반환 project/role ID가 정확히 맞아야 활성화한다. Native Lumen의 current service-authority DAG 계약을 token-role 기반으로 되돌리는 변경이 아니다. OAuth HTTP six combinations35checks·Afterglow 회귀164/306의 자세한 범위와 full gate는 Afterglow `docs/testing.md`에 기록한다.
+
+Scope-only architecture는 base `24e6ae46e7673772b7ef4b2f176b1802258c4235`+owned source/tests10paths이며 working/staged guard `0dfe7c4a5c333f97d4ea839052c561029f9dcd62b0a1d1ef6943019ec899fd3d`/422files 통과했다. Shared review/index·무관한 concurrent source·private inputs는 보존했다. IAM directory/catalog, browser session/permissions, provider 및 VM inventory는 합성이고 API/worker·SDK·SQL/Redis/SSE·compiled frontend는 실제 local 실행이다. Production rollout·live IAM/cloud mutation·paid inference·원래 key/schema·mixed-version/writer 호환성은 미검증이다.
+
+Paired Afterglow의 최종 격리 `npm run test:gate`도 통과했다: backend5769/frontend3300+runner9/contract174/real-datastore functional150(27deselected), Ruff check/format586files. PowerShell36skip과 기존 Svelte warning3개는 유지한다. Shared 전체 concurrent tree나 production 수용으로 승격하지 않으며 native API/worker source 변경 없이 문서·archive·소유 리소스 정리로 마무리했다.
+
+
+## MCP owner consent·ordinary key expiry canonical 검증 (2026-10-11, local-only)
+
+증거 정본은 `/Users/pieroot/.local/share/afterglow-proofs/lumen-settings-consent-20261011/native/canonical_summary.json`과 그 네 JSON/JSONL, `canonical_executed_commands.txt`다. API/worker packaged image를 arm64·amd64에서 각각 실행하여 UID/GID1000·aarch64/x86_64·exit0을 관측했다. 각 실행67assertions·57real TCP HTTP·manifest001–026의 checksum runner 적용26개, 합계 **4runs/268assertions/228HTTP/104migration applications**이며 새 소유 schema4개만 사용했다. SQL ledger는 manifest와 정확히 일치한다. 기존013 expiry·새026 owner activation을 실제 적용했으며 기존 global source에 consent backfill은 없다.
+
+- **MCP**: Global publication은 기본 실행 off다. Exact user/project/current config 승인, 다른 owner/project 격리, stale revision400/no commit, idempotent 승인 generation 유지, disable/re-enable 뒤 frozen snapshot 거부를 확인했다. OAuth opt-in만으로는 부족하고 matching connected synthetic token의 실제 encrypted SQL 저장과 승인 둘 다 있어야 실행 가능하다. Deactivation은 연결/locked refresh를 fence하고 stale token revision은 실행하지 못한다. Catalogue는 private credentials를 반환하지 않으며 사용자 직접 MCP HTTP CRUD와 다른 owner 거부를 유지한다.
+- **발급·인증**: Fresh `issuance-policy`의 current owner scope-capability·keys-editor·quota/null ceiling을 실행했다. 이름/scopes/monthly25/future aware UTC expiry를 POST 한 번·observed SQL commit 한 번으로 원자 저장하고 SQL로 독립 확인했다. Nullable expiry는 기존처럼 인증된다. Naive/past422, over-quota409, over-scope403은 새 row/commit0이며 목록은 secret/hash를 제외하고 project를 격리한다. 실제 revoke 뒤 HTTP401/verifierNone이다.
+- **Expiry 양성 대조군**: 실제 시계가 expiry를 지난 뒤 HTTP401/verifierNone, 독립 healthy SQL expiry read와 nonexpired-key HTTP200을 함께 확인했다. Expiry row 조작은 없다. 유효할 때 SQL-seeded queued run에 만료 뒤 실제 packaged `_DurableExecutionHooks._start`를 직접 호출하여 `inference_authority_revoked`·rollback·새 execution segment/provider-start intent commit0을 확인했다. HTTP run admission·worker claim/graph/PostgreSQL execution을 수행했다고 보고하지 않는다.
+- **실패 이력**: 이전 `summary.json`과 `native_smoke_20261011103756_379be88fbe.json`은 SQL2013 뒤 원래 hostport59795 connection refused를 보존한다. Parent가 소유 MariaDB OOMKilled=true/exit137을 관측하고 소유 Compose만 복구했다. 당시 expiry assertion은 datastore 장애로 confounded되어 폐기했으며 위 양성 대조군 canonical 네 실행으로 누락 증거를 대체했다. 환경 장애를 expiry 제품 결함이나 성공으로 바꾸지 않는다.
+- **실제/합성·범위**: Source bind mount 없이 `/app` source/auth/handler/crypto/store와 real MariaDB/Redis DB11/TCP HTTP를 실행했다. Directory authority, remote discovery, OAuth token origin과 queued orchestration만 합성이다. Native11개 runtime source SHA-256은 API/worker 두 architecture에서 같고 당시 current host receipt와 일치한다. `auth.py`, durable execution과 migration013은 이번 feature에서 변경하지 않는다. Live IAM/OAuth exchange, remote MCP tool invocation, paid inference, production deployment·snapshot/원래 키·mixed-version/양방향 writer-schema도 증명하지 않는다.
+- **동반 cloud receipt**: Afterglow `cloud/qualification-summary.json` 최종 두 architecture exit0은 **2runs/42checks/80source HTTP/74installed-SDK fakeIAM HTTP**다. Same-site/current role ceiling, legacy nonconsent denial, idempotence와 늦은 approval/credential-generation race409를 실행했지만 cloud identity와 Keystone HTTP는 합성이고 SQL-only schema 준비는 migration-runner proof가 아니다. 초기 Settings/driver/SQL timeout/OOM connection refused/Redis scratch cleanup 실패를 보존한다. 이 cloud 성공이나 오래된 system receipt를 현재 native main readiness로 승격하지 않는다.
+- **별도 actual-process readiness**: `../processes/process_qualification_20261011200112_269657e7.json`은 canonical API/worker를 두 architecture에서 수정하지 않은 lifespan/entrypoint로 실행했다. 실제 migration001–026, `/v1/health`·`/v1/ready`200(database/plugins/checkpointer=true), private PostgreSQL 초기화, persisted accepting=1·advancing heartbeat·active0과 protected route의 missing/foreign synthetic credential401을 확인했다. Application work/provider/model/usage row는0이며 이 idle readiness를 실제 inference/worker graph 성공으로 승격하지 않는다. amd64는 Docker Desktop emulation이다. Shared bridge는 egress-filtered가 아니며 packet-captured outbound0도 주장하지 않는다. 이 실행이 만든 process container만 정상 종료했고 parent datastore/volume/network는 보존했다.
+- **Compiled UI**: 동반 Afterglow `../ui/compiled-browser-qualification.json`에 read/manage consent·remote opt-in·revoked filter·target-project atomic ordinary key issue·cancel reset의 실제 compiled browser10시나리오와 두 architecture/theme/반응형·네 locale 총32조건을 기록한다. Browser identity/permissions/policy/API는 named synthetic 응답이며 native datastore HTTP receipt와 다른 증거 계층이다.
+- **회귀와 동반 gate**: Native 전체 integration은288passed/3133deselected였다. 동반 Afterglow 최종 consent endpoint/DB/migration82개·feature Ruff8files, consumer contracts156, frontend341files/2909+runner9와 i18n check/scan이 통과했다. Full Afterglow `npm run test:gate`는 installer PTY timeout으로 성공하지 않았고 별도 whole lint의 무관한 import3건·admin quota Svelte Props1error/기존 warnings2개도 보존한다. Config/code/테스트 suite를 우회해 green으로 만들지 않았다. 최신 공유 expiry model/UTC 직렬화는 별도 host-source cloud21checks/40sourceHTTP/37fakeIAM HTTP와82개 회귀에서 확인했으며 기존 canonical image와 최신 source 전체의 byte parity로 승격하지 않는다. 증거는 `../tests/gate-summary.json`·`../tests/final-cloud-regressions.json`이며 운영 영향·commit/push·publish/deploy는 없다.
+- **독립 전체 suite 후속 결과**: Paired Afterglow backend unit4990개와 원래 functional 전체118개/23deselected가 통과했다. Functional 초기 frozen migration fixture의 MariaDB CHECK exception 기대 불일치116passed/2failed는 보존했고, 이미 수정된 current shared user test를 변경 없이 overlay한 최종 suite가 통과했다. Three-path source overlay·owned store·실패/성공 범위는 `../tests/final-functional.json`, unit summary는 `../tests/backend-unit-summary.log`에 기록한다. 이를 full npm gate green으로 합치지 않는다.
+
+Exact owned overlay·별도 prerequisite-current source·parent full-current gate scope는 proof root의 `architecture/qualification.json`과 최종 `architecture/final-qualification.json`에서 구분한다. Native baseline `aef4136145242cc5b9895fd2dc6c6a1b35e984e5`+owned16paths의 working stamp/check와 별도 index staged check는 최종에도 digest `c2091ce1ad325b0aa724ddc6621468a4b01a09a809c6083b6583ad387353cc59`/497files였다. Contract의 `test_mcp_oauth.py` shorthand는 실제 `tests/test_chat_mcp_oauth.py`로 해석했다. Feature가 수정하지 않은 current auth·Batch/durable media 의존성6paths를 따로 기록한 prerequisite-current snapshot은 `f5b7206030ce2a9a3de9b00028b34af7dab9ee62f3ffc7cd0deae99052b515d5`/497files다. Full source-input SHA·exact paths·guard commands·실제 shared/snapshot index와 shared review marker 보존을 기록한다. Guard freshness/static closure는 standalone runtime·dynamic dependency·전체 gate 성공을 뜻하지 않는다. 최종 process/browser/회귀 증거와 미검증 운영 경계는 위에 구분하며 공유 Git index/root review marker는 변경하지 않는다.
+
 
 ## 테스트 계층 개요
 
@@ -342,3 +416,100 @@ OpenStack CI(Zuul/DevStack/Tempest) 관례와 유사하게:
 CI 계약/스토어 테스트는 plugin manifest/entry-point ABI, cloud operation lease/fence 및 ambiguous create 격리, worker 등록·heartbeat를 점검한다. Image build는 amd64/arm64 산출물을 만들지만 실제 Nova/Zun cloud 권한, guest image hash, Octavia pool membership, controller CA/TLS/bootstrap token 경계, namespace/cgroup/firewall, API/worker drain 또는 parent→child→sandbox artifact end-to-end를 증명하지 않는다. 특정 실행이 아직 관찰되지 않았으면 `live-verified`로 표시하지 않는다.
 
 실배포 승격에서는 중지/백업/015~018 migration-twice 후 동일 plugin wheel·config의 API/worker/controller 시작과 `/v1/ready`를 확인한다. Trusted/sandbox project와 CIDR 분리, Nova profile preflight(Zun adapter는 isolation 강제 부재로 모든 pool이 거부됨), certificate/CSR 1회 교환 및 replay 거부, generation/fingerprint-bound worker heartbeat/plugin digest, sandbox `/readyz`와 mTLS/dispatch 거부, 실제 네트워크 차단/격리, agent budget cap, child `waiting_resource`→ready→join/cancel 및 reservation 정산을 각각 관측한다. API 부하에서는 실제 SSE 첫 text TTFT/active 수집, 2-sample high·300초 low scale, telemetry 누락 시 ingress drain/no scale-in을 확인한다. Under load에서는 SIGTERM worker drain/lease 유지, unknown create adoption 또는 확증 부재 후 삭제, ingress drain/backup restore의 일관성을 확인한다. 외부 Keystone/Afterglow public API·OpenStack 공급자 실증은 Deployment layer 소유이며 fake provider나 in-process assertion의 증거와 구별해 기록한다.
+
+## Balanced infrastructure controller acceptance (test-passed)
+
+Archived native change: `openspec/changes/archive/2026-10-13-balanced-infrastructure-controller/`; durable spec: [balanced infrastructure controller](../openspec/specs/balanced-infrastructure-controller/spec.md). Acceptance is **test-passed locally**, not live-verified, from the parent's 2026-10-14 receipt below. This documentation update records those results without rerunning the tests or stamping the shared checkout. Older controller/integration/system receipts above do not qualify this change.
+
+### Parent execution receipt (2026-10-14; local only)
+
+- **Source/evidence:** The parent ran checks on a frozen public clone of the repository's current working tree, including concurrent WIP, synced byte-for-byte from the canonical checkout. Lumen snapshot: 657 git-visible files; manifest digest `887c81e4dde5932364e9a9439c7e3abc4093d0cb1aca7afcab864eb1545fb440` (SHA-256 of compact sorted JSON path→file-SHA-256 map). Proof root: `/Users/pieroot/.local/share/afterglow-proofs/afterglow-process-ownership-n7xrnua4/` (logs, JUnit XML, execution JSON per lane). These are parent receipts, not a new whole-dirty-checkout review.
+- **Focused non-integration lane:** `-m "not integration and not system" tests/test_infrastructure_coordination.py tests/test_chat_infrastructure.py tests/test_runtime_scaling.py tests/test_chat_worker.py`: **110 passed**.
+- **Integration:** `python -m lumen.scripts.test_layers integration -q -s -rs -k "infrastructure_coordination or infrastructure_store or worker_workload_isolation"`: **110 passed, 3393 deselected** (infrastructure_store 78, coordination_integration 24, worker_workload_isolation 8). The runner owned disposable Compose MariaDB+Redis and removed them afterwards. Passed coverage includes `test_real_redis_real_sql_multiprocess_synthetic_provider_smoke[ON,OFF]`, `test_late_join_and_digest_changes_reassign_only_eligible_members`, `test_redis_crash_takeover_refuses_sql_claim_until_sql_expiry[ON,OFF]`, `test_assignment_loss_inside_sql_lock_refuses_guest_drain_post[ON,OFF]` and ON/OFF store drain/takeover cases. ON/OFF means `innodb_snapshot_isolation` where parametrized. Logged `TimeoutError: synthetic accepted create response lost` tracebacks are the expected synthetic provider path, not failed assertions.
+- **Contract gate:** `python -m lumen.scripts.test_layers contract`: service **3159 passed, 344 deselected**; root Ruff (`lumen tests`) passed; SDK **128 passed**; SDK Ruff passed.
+- **Repository-wide Ruff:** `ruff check .` retains only the HEAD-baseline SIM102 in `deploy/kolla/ansible/roles/lumen/files/validate_runtime_precheck.py`. The seven F811 findings in `tests/integration/test_infrastructure_coordination_integration.py` were fixed by rebinding the shared `pool` fixture through `import test_infrastructure_store` / `pool = test_infrastructure_store.pool`. CI does not run `ruff format` (HEAD has 244 unformatted files); no formatting qualification is claimed.
+- **Architecture:** The scope-qualified architecture stamp is in the parent receipt (isolated clone, shared marker untouched). Do not run `scripts/check_architecture.py --stamp` or edit the existing architecture review digest/UTC/summary for this documentation update.
+- **Common fixture/authority boundary:** Disposable owned fixtures only: Docker MariaDB 11.4 (tmpfs, loopback `127.0.0.1:56498`) and Docker Redis 7 (loopback `127.0.0.1:56497`) for the common verification setup; Lumen integration used its runner-owned disposable Compose fixtures as noted above. Providers were synthetic loopback HTTP or in-process fakes. No private config, credentials, live OpenStack/Keystone/K3s/Nova/Octavia/Glance/KVM, paid inference, deployment, image publication, commit, stage or push. `test-passed` means the recorded command passed locally, NOT `live-verified`.
+- **Not qualified anywhere:** Production Redis/Sentinel failover or async-replication lease/journal loss, promoted-node TIME skew, mixed-version rolling upgrade, live provider/cloud, deployment.
+- **Not exercised:** autonomous slow heartbeat beyond the tests' accelerated cadence, killed-process recovery outside the tests, real Redis server/network outage (outage cases are synthetic), real Nova/Octavia, guest mTLS, paid inference, mixed-version, deployment.
+
+### Boundaries and acceptance obligations
+
+| Layer / source | Actual execution boundary when run | Synthetic or unproved boundary |
+| --- | --- | --- |
+| `tests/test_infrastructure_coordination.py` | Native assignment algorithm and `ResourceController` task/gate/drain code, actual async tasks and blocked SDK-shaped threads | Redis and SQL seams; no datastore Lua/transactions, HTTP guest, Nova/Octavia or provider acceptance |
+| `tests/integration/test_infrastructure_coordination_integration.py` | Canonical disposable MariaDB/Redis fixture; Redis `TIME`/Lua and independent spawned processes; native SQL pool claim/renew/release and locked-effect fencing where selected by the smoke | Provider/SDK-shaped effect hooks and orchestration are synthetic; not configured-cloud preflight, full controller listener, guest bootstrap/mTLS, ingress, HTTP inference or packaged process deployment |
+| Existing `tests/integration/test_infrastructure_store.py` and `test_worker_workload_isolation.py` | Native real-SQL lease/generation/unknown-operation, ingress ordering and workload/pool competing-claim regressions | Provider/cloud and some controller seams remain synthetic; not live cloud or paid inference |
+
+Parent acceptance must demonstrate exact-digest eligibility; deterministic common-eligibility count spread ≤1; constrained late-join useful work; nonleader publication rejection; current-read nonresurrection; Redis-time expiry independent of process clocks; persistent registry versus ephemeral members; heartbeat/unrelated pool progress through blocked registry/SDK work; configured pool cadence/no duplicate task; and leadership-loss rollback after SQL row-lock wait. Handoff evidence must distinguish mapping from actual SQL authority and show that assignment loss/Redis errors block later submission, submitted effects drain before matching-fence release/leave, stale release cannot clear a successor, and crashed owners/unknown creates do not cause replay. Expected outcomes are not observations until exercised.
+
+### Executable local recipe for the parent
+
+Run from the native Lumen checkout after all owned code/tests land. Prerequisites: supported Python/uv, frozen service+dev dependencies, reachable Docker daemon/Compose and permission to create **disposable local test** resources. Do not point these commands at production, a reused development schema/project, or existing credentials. The native `lumen-test integration` runner starts only canonical MariaDB/Redis, waits for health, applies native migrations, passes `DATABASE_URL`/`REDIS_URL` and test encryption key to pytest, and tears down its unique project in `finally`. Its teardown is intentionally destructive to that disposable project, not an operator shutdown/drain procedure.
+
+The following commands are a recipe, not execution receipts. `env -u` removes endpoint/project/port overrides so the runner chooses a unique `lumen-integration-{pid}-{hex}` project and dynamic loopback ports. The native SQL fixture is available, so use real SQL; no fake-SQL fallback can count as this smoke. Keep stdout, skip reasons, JUnit and source hashes outside the checkout; do not capture shell environment or secret config.
+
+```bash
+uv sync --extra service --extra dev --frozen
+set -o pipefail
+PROOF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lumen-balanced-controller.XXXXXX")"
+shasum -a 256 lumen/services/infrastructure/_coordination.py \
+  lumen/services/infrastructure/controller.py lumen/services/infrastructure/store.py \
+  tests/test_infrastructure_coordination.py \
+  tests/integration/test_infrastructure_coordination_integration.py \
+  tests/test_runtime_scaling.py tests/integration/test_infrastructure_store.py \
+  | tee "$PROOF_DIR/source-sha256.txt"
+
+# New contracts plus affected existing pool lifecycle/worker consumers.
+uv run --frozen pytest -q -m "not integration and not system" \
+  tests/test_infrastructure_coordination.py tests/test_chat_infrastructure.py \
+  tests/test_runtime_scaling.py tests/test_chat_worker.py \
+  --junitxml="$PROOF_DIR/controller-contract.xml" \
+  | tee "$PROOF_DIR/controller-contract.log"
+
+# New real-Redis/real-SQL integration module, including independent-process smoke.
+# -k matches the module name; canonical runner prepends `pytest -m integration tests`.
+env -u LUMEN_TEST_DATABASE_URL -u LUMEN_TEST_REDIS_URL \
+  -u LUMEN_TEST_COMPOSE_PROJECT -u MARIADB_PORT -u REDIS_PORT \
+  uv run --frozen lumen-test integration -q -s -rs \
+  -k infrastructure_coordination \
+  --junitxml="$PROOF_DIR/controller-coordination.xml" \
+  | tee "$PROOF_DIR/controller-coordination.log"
+
+# Preserve existing actual SQL effect/claim consumers as a separate receipt.
+env -u LUMEN_TEST_DATABASE_URL -u LUMEN_TEST_REDIS_URL \
+  -u LUMEN_TEST_COMPOSE_PROJECT -u MARIADB_PORT -u REDIS_PORT \
+  uv run --frozen lumen-test integration -q -rs \
+  -k "infrastructure_store or worker_workload_isolation" \
+  --junitxml="$PROOF_DIR/controller-consumers.xml" \
+  | tee "$PROOF_DIR/controller-consumers.log"
+```
+
+Do not append positional test files to `lumen-test integration` and assume they limit its built-in `tests` argument; use its forwarded `-k` expression as above. Fixture startup/migration failure is a failed prerequisite, not a passed smoke. Missing environment/Redis/SQL connectivity must be reported explicitly, including skipped tests; a successful runner exit with skips is not proof that the skipped boundary ran. Assertions or cleanup failures after healthy fixture startup are failures, never a reason to silently downgrade to synthetic stores.
+
+Before promoting results, record actual process identities/exit states, observed assignment snapshots/leader and Redis time, pool IDs/SQL owner+fence, ordered synthetic effect entry/settlement/release events, late-join and crash sequence, outage mechanism and recovery, and the exact source/test scope. State whether TTL/cadence was accelerated in tests; accelerated expiry does not measure the production 30-second deadline or an end-to-end failover SLA. Do not label an injected Redis-read failure as a real Redis server/network outage, or a synthetic SDK effect as an OpenStack submission. Retain parent full-gate/stamp results as separate receipts; this recipe does not review or qualify the entire concurrent dirty checkout.
+
+### Exact real-SQL multiprocess smoke and limits
+
+The coordinated smoke selector is `test_real_redis_real_sql_multiprocess_synthetic_provider_smoke`. To run **only that smoke instead of** the integration-module command above:
+
+```bash
+env -u LUMEN_TEST_DATABASE_URL -u LUMEN_TEST_REDIS_URL \
+  -u LUMEN_TEST_COMPOSE_PROJECT -u MARIADB_PORT -u REDIS_PORT \
+  uv run --frozen lumen-test integration -q -s -rs \
+  -k test_real_redis_real_sql_multiprocess_synthetic_provider_smoke \
+  --junitxml="$PROOF_DIR/controller-multiprocess.xml" \
+  | tee "$PROOF_DIR/controller-multiprocess.log"
+```
+
+The native real-SQL pool fixture parametrizes `innodb_snapshot_isolation=ON|OFF`. Each invocation seeds three configured pools (`workers`, `media`, `batch`) and one requested resource per pool, then spawns fresh Python interpreters A/B/C with independent Redis and native SQL connections. Children use actual `PoolCoordinator`, `ResourceController.tick()`, `_tick_pool`, native pool leases, resource/operation SQL journal and fenced SDK-thread execution. Only `reconcile_pool` is narrowed to the requested-resource path and the provider is synthetic; no configured cloud connection or guest readiness/scaling runs. Test setup's registry-seeding callback is not a leadership-fence proof; child registry sync uses the native leader checks, and separate lock-wait tests qualify those checks.
+
+Assertions require three distinct child PIDs, one pool per owner, stable assignment through two commanded ticks, exactly one synthetic create per pool by its assigned owner, two SQL create operations `succeeded` and the accepted-but-response-lost batch operation `unknown`, no batch create replay on tick two, SQL fences incremented and pool leases released after work. Children receive `stop`, join/leave/close connections, and must exit zero; test-owned keys/resources/operations/extra pools are cleaned up. These assertions passed in the parent's ON/OFF integration run recorded above. Successful assertions/JUnit are the receipt; `-s` does not itself emit a standalone JSON stream of all PIDs, assignments or effect timings. Raw traces must be collected explicitly and identified by source rather than fabricated from this recipe.
+
+This smoke runs simultaneous eligible processes, not a staggered late join or killed-owner exercise. It sets `reconcile_interval_seconds=0.01` and clears per-pool/registry due times between commanded ticks, so it does not measure production cadence, sustained autonomous `run()` heartbeat or slow-work failover. Default 30-second participation is retained. `test_real_redis_elapsed_participation_ttl_expires_without_score_edits` separately shortens only its test participation TTL to one second and waits 1.1 seconds before the survivor heartbeat; it exercises real elapsed Redis expiry without score edits, not the production 30-second interval or a killed-process handoff. Other Redis expiry/crash-takeover regressions accelerate test-owned participant scores relative to actual Redis `TIME` (and SQL lease expiry where applicable); those are simulated expiry, not measured real-time process crashes. Late joins/digest changes are separate real-Redis coordinator tests. Blocked-registry/SDK heartbeat, sibling drain/cancellation and Redis-outage admission are separate contracts with synthetic SQL/coordination seams. An injected `ConnectionError` is not a paused Redis server or network partition. A real Redis outage, long-duration independent-process heartbeat and actual killed-controller recovery therefore remain unexercised unless the parent supplies separate authorized receipts.
+
+The integration-module selector also includes `test_sql_registry_rechecks_leader_after_actual_row_lock_wait`, `test_sql_registry_leader_checks_rollback_every_write_boundary`, `test_sql_release_is_exact_owner_and_fence_cas_and_preserves_fence_monotonicity` and `test_sql_release_waits_for_in_flight_fenced_sdk_effect`. Those use the real MariaDB fixture (ON/OFF); they cover actual row-lock ordering/rollback and stale release, with synthetic leadership/effect hooks where specified, not an atomic cross-store Redis/SQL transaction.
+
+The final integration filename deliberately differs from the root contract filename: native pytest prepend imports and test directories without `__init__.py` otherwise collide on identical module basenames. The canonical `-k infrastructure_coordination` selector continues to match it. `test_assignment_loss_inside_sql_lock_refuses_guest_drain_post` adds actual SQL locking with synthetic assignment snapshots/guest transport and asserts no outbound POST after loss; it does not send a real guest request.
+
+Parent-confirmed changed/review scope additionally includes `tests/test_runtime_scaling.py::test_independent_api_and_three_worker_pool_reconciles` and `tests/integration/test_infrastructure_store.py::test_four_pools_reconcile_owned_sql_demand_with_batch_zero_cold_start`. These existing tests now directly join `_tick_pool(...)` lifecycle/demand execution and inspect SQL release where applicable; the new coordination suites own dispatcher/heartbeat assertions. `tests/test_chat_infrastructure.py`, `tests/test_chat_worker.py` and unchanged `tests/integration/test_worker_workload_isolation.py` remain preserved consumers. The parent's focused/integration/contract results above supersede the earlier authored-only status; they do not add whole-checkout-review or production evidence.

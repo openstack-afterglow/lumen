@@ -416,6 +416,25 @@ class ChatMcpServer(Base):
     )
 
 
+class ChatMcpActivation(Base):
+    """Owner/project approval for one exact administrator-published MCP revision."""
+
+    __tablename__ = "chat_mcp_activations"
+
+    mcp_server_id: Mapped[int] = mapped_column(
+        BIGINT, ForeignKey("chat_mcp_servers.id", ondelete="CASCADE"), primary_key=True
+    )
+    owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    owner_project_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
+    config_version: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    generation: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+    __table_args__ = (Index("idx_chat_mcp_activation_owner", "owner_user_id", "owner_project_id"),)
+
+
 class ChatMcpOAuthConnection(Base):
     """Per-user/project OAuth token bundle for a remote MCP server."""
 

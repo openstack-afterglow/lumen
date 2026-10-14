@@ -52,6 +52,12 @@ API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만
 | Memory/usage | `GET/POST /v1/memories`, `GET /v1/memories/document`, search, patch/delete; `GET /v1/usage`, `/keys`, `/timeseries`, `/records` |
 | Keystone-only key/admin management / scoped resources | `/v1/api-keys`, owner limits와 `/v1/admin/*`는 Keystone-only. Agent/workspace/code/Git 및 `/v1/assets`는 해당 service action과 owner scope를 요구하며 API key도 stored scope와 current leaf가 모두 있어야 함 |
 
+## MCP owner activation과 ordinary key 발급
+
+`GET /v1/mcp-servers`는 global catalogue와 본인 row를 반환한다. Global 행의 `server_is_active`는 관리자 publication, `activation_is_active`는 현재 owner consent, `is_active`는 실제 실행 가능 상태다. `?active_only=true`는 미승인·stale config·비활성·OAuth 미연결 행을 제외한다. `PATCH /v1/mcp-servers/{id}/activation`은 `native:mcp:write` 아래 authenticated user/project를 사용하며 strict `{is_active:boolean,config_version:positive integer}`만 허용한다. 추가 필드·잘못된 형식은422, stale config는400, owner/resource 부재는404, store 장애는503이다. 설정 변경은 재승인해야 하고 disable/re-enable generation은 이전 frozen 실행을 되살리지 않는다. 기존 user-owned 직접 CRUD는 별도다. OAuth start/PKCE·status/disconnect는 유지하며 activation만으로 token을 만들거나 연결 완료를 주장하지 않는다. Headers/token은 공개 catalogue에서 제외한다.
+
+Keystone-only `GET /v1/api-keys/issuance-policy`는 fresh keys-editor/current owner 권한 아래 `allowed_scopes`, 각 scope의 `scope_capabilities` 및 owner quota ceiling을 반환한다. 이 조회는 키를 만들지 않는다. `POST /v1/api-keys`는 `name`, 허용 subset의 중복 없는 `scopes`, optional positive Decimal `monthly_credit_limit`/`weekly_credit_limit`, nullable `expires_at`를 한 transaction으로 저장한다. Expiry는 미래 timezone-aware datetime만 허용하고 UTC로 정규화한다. 생략/null은 기존 무만료 계약이며 migration013을 재사용한다. 잘못된/naive/past expiry는422, scope/권한 거부는403, owner quota 충돌은409이고 발급을 commit하지 않는다. 평문 `key`는201 발급 응답에서만 보이며 이후 목록은 expiry metadata만 포함하고 secret/hash를 반환하지 않는다. Current revoke/expiry·owner/scope 검증은 다음 요청과 새 provider/tool I/O 전에 계속 적용한다. 완료 checkpoint 회수·정산을 소급 취소하지 않는다.
+
 ## Batch API
 
 `batch_enabled=false`가 기본값이며 이때 모든 Batch/Files route는 503 `batch_unavailable`이다. Batch/Files scope는 발급 가능하지만 `DEFAULT_API_KEY_SCOPES`에는 추가되지 않는다. 두 계약은 같은 `chat_batches` 원장과 기존 durable run/hold/usage ledger를 사용한다. 항목 실행은 batch-only worker의 일반 claim을 거치고, provider 호출은 한 번만 한다. 불명확한 결과는 `unknown`으로 남으며 자동 재호출하지 않는다. Upstream provider의 Batch API나 할인은 사용하지 않고 frozen Lumen 가격으로 정산한다.
@@ -210,10 +216,11 @@ API 키 발급·목록·이름·owner 한도 관리는 Keystone-only이며 curre
 
 ### API 키 관리 route
 
-- `POST /v1/api-keys`: 새 API 키 발급 (Keystone-only). Body: `name`, `scopes` (기본값 `models:read` + `compat:completions:write`, Native 연동 시 필요한 native scope를 명시적으로 요청해야 함), 선택적 `monthly_credit_limit`, 선택적 `weekly_credit_limit`. 발급 응답(201)에서만 1회성 평문 `key`를 반환하며, 이후 조회 projection 및 모든 HTTP 응답에서 secret 및 SHA-256 hash가 절대로 반환되지 않는다. 독립형 Compose 시드 키는 `lumen-connection` CLI 매니페스트로만 확인 가능하다.
+- `POST /v1/api-keys`: 새 API 키 발급 (Keystone-only). Body: `name`, `scopes` (기본값 `models:read` + `compat:completions:write`도 current owner subset이어야 함), 선택적 nullable `expires_at`, `monthly_credit_limit`, `weekly_credit_limit`. 미래 timezone-aware expiry만 허용하고 UTC로 정규화하며 naive/past/equal-now 값은 422다. 이름·scope·expiry·owner 한도를 한 transaction에서 저장한다. 생략/null expiry는 기존 무만료 수명을 유지한다. 201에서만 평문 `key`를 한 번 반환하고 목록에는 hash/secret을 반환하지 않는다. Expiry는 UTC offset-bearing ISO로 조회된다. 독립형 Compose 시드 키는 `lumen-connection` CLI 매니페스트로만 확인 가능하다.
 - `GET /v1/api-keys`: 소유자의 API 키 목록과 당월·당주 사용량 및 한도 projection을 반환한다. 사용량이 0인 키도 포함된다.
 - `PATCH /v1/api-keys/{key_id}`: 소유자 API 키 이름 변경. Body는 `{"name": str}`이며 `min_length=1`, `max_length=100`, 공백만 있는 이름은 422다. 폐기된 키도 이름을 바꿀 수 있다. 소유권 불일치 시 403, 키 미존재 시 404다.
 - `PATCH /v1/api-keys/{key_id}/limits`: 소유자 API 키 한도 수정. Body는 두 키가 모두 필수인 nullable `{"monthly_credit_limit": Decimal | null, "weekly_credit_limit": Decimal | null}`이며, `null` 지정 시 해당 기간의 소유자 한도를 해제한다. 소유권 불일치 시 403, 키 미존재 시 404다.
+- `GET /v1/api-keys/issuance-policy`: Keystone-only `native:keys:write`와 fresh current owner의 `lumen-keys_editor`를 검사한다. 실제 허용된 `allowed_scopes`, scope별 leaf 대안 `scope_capabilities`, nullable Decimal 월·주 quota ceiling을 반환한다. `native:keys:*` 자체는 발급 대상이 아니다. Target project는 인증된 scope/header이고 body의 owner 주장이 아니다. Client는 해당 scope를 현재 project permission과 다시 교집합하여 제안해야 한다.
 - `GET /v1/admin/api-keys`: 관리자 전용 키 목록 조회 (`require_admin`). Query parameters: `owner_user_id`, `owner_project_id`, `before_id` (cursor, `gt=0`), `limit` (기본값 50, range 1..200, `id DESC` 정렬). 당월 zero-usage 키를 포함하며 `owner_user_id`, `owner_project_id`를 반환한다.
 - `PATCH /v1/admin/api-keys/{key_id}/limits`: 관리자 전용 ceiling 수정 (`require_admin`). Body는 `{"monthly_credit_limit": Decimal | null}`. `null`은 관리자 ceiling 해제다. 관리자 ceiling을 기존 소유자 월 한도 또는 주간 한도 이하로 낮추면 같은 트랜잭션에서 두 소유자 한도도 새 ceiling으로 자동 하향(clamp)된다. 관리자 주간 ceiling column은 두지 않는다.
 
@@ -248,6 +255,14 @@ API 키 발급·목록·이름·owner 한도 관리는 Keystone-only이며 curre
 - 본인 사용량 요약: `GET /v1/usage/summary`는 `month_credited_cost`, `week_credited_cost`, `quota_used`, `quota_max`, `quota_weekly_max`를 함께 반환한다. 독립 주간 ceiling이 없을 때 `quota_weekly_max=0`이지만 월 ceiling은 계속 강제된다.
 - 관리자 사용자 상세: `GET /v1/admin/stats/users/{user_id}`는 `range=7d|30d|90d|1y|all`, 선택적 `source=web|api`, `before_id`, `limit`을 받고 기간 metadata, 전체·모델별·source별 aggregate와 timestamp/token/raw USD/credited cost/API-key attribution을 포함한 immutable ledger page를 반환한다.
 - 이력 및 격리 사용량 Surface: 기존 `GET /v1/usage/keys` (기간별 historical 집계) 및 `GET /v1/usage/records` (현재 키로 격리된 레코드 커서 조회)는 기존 계약을 유지하며 당월 관리 뷰와 구별된다.
+
+## Remote MCP 카탈로그와 owner 활성화
+
+`GET /v1/mcp-servers`는 관리자 global source와 자신의 직접 등록 source를 보여 주며 `?active_only=true`는 실제 실행 가능한 행만 반환한다. Global publication만으로 opt-in하지 않는다. Metadata의 `server_is_active`는 관리자가 공개한 상태, `activation_is_active`는 authenticated owner의 승인, `is_active`는 설정/OAuth까지 반영한 실제 사용 가능 상태다. `config_version`, `activation_config_version`, `activation_generation`을 반환하고 private headers/client secret/token은 제외한다.
+
+`PATCH /v1/mcp-servers/{id}/activation`은 `native:mcp:write`와 현재 MCP-editor를 요구하며 strict `{is_active:boolean,config_version:positive integer}`를 받는다. Owner user/project는 인증에서만 얻는다. 같은 configuration의 반복 승인은 epoch를 늘리지 않고 disable/re-enable는 frozen selection을 무효화한다. 설정 변경·unavailable target은 400, user-owned source를 activation catalogue로 승인하려는 요청은 403, 추가 owner field/string boolean은 422다. 관리자 대신 사용자 opt-in을 만드는 admin endpoint는 없다.
+
+OAuth는 opt-in과 별개다. 승인 후 기존 Keystone-only `POST /v1/mcp-servers/{id}/oauth/start`와 PKCE browser 연결을 완료해야 matching current token으로 실행하며 opt-in만 된 연결 대기 상태도 비활성화할 수 있다. Direct 사용자 MCP CRUD·administrator global CRUD는 유지한다. Migration026은 기존 global 서버의 owner approval을 backfill하지 않는다.
 
 ## Active-path message history
 

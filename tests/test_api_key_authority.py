@@ -1,6 +1,8 @@
 """Keys attenuate current effective owner authority, never replace it."""
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -328,3 +330,235 @@ async def test_gateway_mint_revalidates_authority_after_approval(monkeypatch, au
             device_code="dc_secret", grant_type=gateway.DEVICE_GRANT_TYPE, client_id="claude-code")
     assert (error.value.status_code, error.value.code) == (status, code)
     assert session.added == [] and grant.status == "approved" and grant.issued_api_key_id is None
+
+
+class IssuanceSession(KeySession):
+    def __init__(self):
+        super().__init__(None)
+        self.rollbacks = 0
+        self.quota_reads = 0
+
+    @asynccontextmanager
+    async def begin(self):
+        try:
+            yield self
+        except Exception:
+            self.rollbacks += 1
+            self.added.clear()
+            raise
+        else:
+            self.commits += 1
+
+
+def issuance_store(monkeypatch, *, monthly="100", weekly="20"):
+    session = IssuanceSession()
+    monkeypatch.setattr(aks, "_require_db", lambda: lambda: session)
+
+    async def quota(current_session, user_id):
+        assert current_session is session and user_id == "u"
+        session.quota_reads += 1
+        return aks.SystemQuota(Decimal(monthly), Decimal(weekly))
+
+    monkeypatch.setattr(aks, "_get_system_quota", quota)
+    return session
+
+
+@pytest.mark.parametrize("expires_at", [
+    datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1),
+    datetime.now(UTC) - timedelta(seconds=1),
+])
+async def test_service_rejects_naive_or_past_expiry_before_issuance(monkeypatch, expires_at):
+    session = issuance_store(monkeypatch)
+    lookup = current_roles(monkeypatch, ["member", "lumen-keys_editor", "lumen-chat_user"])
+    with pytest.raises(aks.ApiKeyInvalidExpiry):
+        await aks.create_key("u", "p", "invalid", [_CHAT], expires_at=expires_at)
+    lookup.assert_not_awaited()
+    assert session.added == [] and session.commits == 0 and session.quota_reads == 0
+
+
+@pytest.mark.parametrize("expires_at", [None, datetime.now(UTC) + timedelta(days=1)])
+async def test_creation_commits_expiry_and_both_limits_atomically(monkeypatch, expires_at):
+    session = issuance_store(monkeypatch)
+    current_roles(monkeypatch, ["member", "lumen-keys_editor", "lumen-chat_user"])
+    issued = await aks.create_key(
+        "u", "p", "atomic", [_CHAT], Decimal("100"), Decimal("20"), expires_at=expires_at)
+    assert session.commits == 1 and session.rollbacks == 0 and session.quota_reads == 1
+    [row] = session.added
+    assert row.expires_at == expires_at
+    assert row.scopes == [_CHAT]
+    assert row.owner_monthly_credit_limit == Decimal("100")
+    assert row.owner_weekly_credit_limit == Decimal("20")
+    assert row.key_hash == aks._hash_key(issued["key"])
+    assert issued["expires_at"] == (expires_at.isoformat() if expires_at else None)
+    assert issued["effective_monthly_credit_limit"] == "100"
+    assert issued["effective_weekly_credit_limit"] == "20"
+
+
+@pytest.mark.parametrize("monthly,weekly", [("100.00000001", "20"), ("100", "20.00000001")])
+async def test_expiry_never_relaxes_owner_limit_ceilings(monkeypatch, monthly, weekly):
+    session = issuance_store(monkeypatch)
+    current_roles(monkeypatch, ["member", "lumen-keys_editor", "lumen-chat_user"])
+    with pytest.raises(aks.ApiKeyLimitConflict):
+        await aks.create_key("u", "p", "over quota", [_CHAT], Decimal(monthly), Decimal(weekly),
+                             expires_at=datetime.now(UTC) + timedelta(days=1))
+    assert session.commits == 0 and session.added == [] and session.rollbacks == 1
+
+
+async def test_expiry_never_relaxes_scope_ceiling(monkeypatch):
+    session = issuance_store(monkeypatch)
+    current_roles(monkeypatch, ["member", "lumen-keys_editor", "lumen-chat_user"])
+    with pytest.raises(aks.ApiKeyForbidden):
+        await aks.create_key("u", "p", "over scope", [_CHAT, "native:tools:execute"],
+                             expires_at=datetime.now(UTC) + timedelta(days=1))
+    assert session.commits == 0 and session.added == [] and session.quota_reads == 0
+
+
+@pytest.mark.parametrize("expiry_kind,status", [("naive", 422), ("past", 422), ("future", 201), ("null", 201)])
+async def test_creation_http_validates_expiry_and_returns_atomic_limits(monkeypatch, expiry_kind, status):
+    session = issuance_store(monkeypatch)
+    roles = ["member", "lumen-keys_editor", "lumen-chat_user"]
+    current_roles(monkeypatch, roles)
+    test_app = FastAPI()
+    test_app.include_router(api_keys.router)
+    test_app.dependency_overrides[auth.get_token_info] = lambda: {
+        "user_id": "u", "project_id": "p", "roles": roles, "is_system_admin": False}
+    now = datetime.now(UTC)
+    expiry = {"naive": (now + timedelta(days=1)).replace(tzinfo=None).isoformat(),
+              "past": (now - timedelta(seconds=1)).isoformat(),
+              "future": (now + timedelta(days=1)).isoformat(), "null": None}[expiry_kind]
+    async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://test") as client:
+        response = await client.post("/api-keys", json={
+            "scopes": [_CHAT], "expires_at": expiry, "monthly_credit_limit": "50", "weekly_credit_limit": "10"})
+    assert response.status_code == status
+    if status == 201:
+        assert session.commits == 1
+        assert response.json()["expires_at"] == expiry
+        assert response.json()["owner_monthly_credit_limit"] == "50"
+        assert response.json()["owner_weekly_credit_limit"] == "10"
+    else:
+        assert session.added == [] and session.commits == 0
+
+
+async def test_api_key_expiry_http_failure_is_unauthorized_not_scope_denial(monkeypatch):
+    stored_key(monkeypatch, expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    current_roles(monkeypatch, ["member", "lumen-chat_user"])
+    request = Request({"type": "http", "method": "GET", "path": "/",
+                       "headers": [(b"x-api-key", _RAW.encode())]})
+    with pytest.raises(HTTPException) as error:
+        await auth.get_principal(request)
+    assert error.value.status_code == 401
+
+
+async def test_null_expiry_credentials_continue_to_authenticate(monkeypatch):
+    stored_key(monkeypatch, expires_at=None)
+    current_roles(monkeypatch, ["member", "lumen-chat_user"])
+    request = Request({"type": "http", "method": "GET", "path": "/",
+                       "headers": [(b"x-api-key", _RAW.encode())]})
+    principal = await auth.get_principal(request)
+    assert principal["expires_at"] is None
+    auth.ensure_scopes(principal, _CHAT)
+
+
+async def test_key_expiring_after_lookup_is_denied_at_execution_revalidation(monkeypatch):
+    session = stored_key(monkeypatch, expires_at=datetime.now(UTC) + timedelta(days=1))
+    current_roles(monkeypatch, ["member", "lumen-chat_user"])
+    principal = await aks.verify_key(_RAW)
+    assert principal is not None
+    session.row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    with pytest.raises(aks.ApiKeyForbidden):
+        await aks.authorize_api_key_in_transaction(
+            session, api_key_id=principal["api_key_id"], user_id="u", project_id="p", required_scopes=(_CHAT,))
+    with pytest.raises(aks.ApiKeyForbidden):
+        await aks.current_api_key_scopes(session, api_key_id=7, user_id="u", project_id="p")
+
+
+@pytest.mark.parametrize("monthly,weekly,expected", [
+    ("100", "20", {"monthly_credit_limit": "100", "weekly_credit_limit": "20"}),
+    ("100", "0", {"monthly_credit_limit": "100", "weekly_credit_limit": "100"}),
+    ("0", "20", {"monthly_credit_limit": None, "weekly_credit_limit": "20"}),
+    ("0", "0", {"monthly_credit_limit": None, "weekly_credit_limit": None}),
+])
+async def test_owner_issuance_policy_uses_existing_quota_ceilings_without_admin_key_limit(monkeypatch, monthly, weekly, expected):
+    session = issuance_store(monkeypatch, monthly=monthly, weekly=weekly)
+    assert await aks.owner_issuance_policy("u") == expected
+    assert session.quota_reads == 1 and session.commits == 0
+
+
+@pytest.mark.parametrize("roles,admin,status", [
+    (["member", "lumen-keys_editor"], False, 200),
+    (["member", "lumen-keys_editor", "lumen-chat_user", "lumen-tools_user"], False, 200),
+    (["lumen_editor"], False, 403),
+    (["member", "lumen-inventory_reader"], False, 403),
+    (["admin"], True, 200),
+])
+async def test_issuance_policy_needs_keys_editor_not_inventory_and_exposes_exact_scope_contract(monkeypatch, roles, admin, status):
+    current_roles(monkeypatch, roles, system_admin=admin)
+    test_app = FastAPI()
+    test_app.include_router(api_keys.router)
+    test_app.dependency_overrides[auth.get_token_info] = lambda: {
+        "user_id": "u", "project_id": "p", "roles": roles, "is_system_admin": admin}
+    policy = AsyncMock(return_value={"monthly_credit_limit": "100", "weekly_credit_limit": "20"})
+    monkeypatch.setattr(aks, "owner_issuance_policy", policy)
+    async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://test") as client:
+        response = await client.get("/api-keys/issuance-policy")
+    assert response.status_code == status
+    if status == 200:
+        body = response.json()
+        expected = sorted(service_authority.allowed_scopes(roles, admin) & aks.API_KEY_SCOPES)
+        assert body["allowed_scopes"] == expected
+        assert body["scope_capabilities"] == {
+            scope: sorted(service_authority.SCOPE_CAPABILITIES[scope]) for scope in expected}
+        assert body["monthly_credit_limit"] == "100" and body["weekly_credit_limit"] == "20"
+        policy.assert_awaited_once_with("u")
+    else:
+        policy.assert_not_awaited()
+
+
+def test_expiry_validator_rejects_exact_now_and_accepts_the_next_instant(monkeypatch):
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2099, 1, 1, tzinfo=UTC)
+
+    monkeypatch.setattr(aks, "datetime", FrozenDatetime)
+    now = FrozenDatetime.now(UTC)
+    with pytest.raises(aks.ApiKeyInvalidExpiry, match="future"):
+        aks.validate_expires_at(now)
+    assert aks.validate_expires_at(now + timedelta(microseconds=1)) == now + timedelta(microseconds=1)
+
+
+def test_api_and_service_expiry_normalize_offsets_to_utc():
+    expires_at = datetime.fromisoformat("2099-01-01T09:00:00+09:00")
+    expected = datetime(2099, 1, 1, tzinfo=UTC)
+    assert aks.validate_expires_at(expires_at) == expected
+    body = api_keys.ApiKeyCreateBody.model_validate({"expires_at": expires_at.isoformat()})
+    assert body.expires_at == expected and body.expires_at.tzinfo is UTC
+
+
+async def test_issuance_policy_rechecks_current_owner_without_authority_cache(monkeypatch):
+    request_roles = ["member", "lumen-keys_editor", "lumen-chat_user", "lumen-tools_user"]
+    lookup = current_roles(monkeypatch, request_roles)
+    policy = AsyncMock(return_value={"monthly_credit_limit": None, "weekly_credit_limit": None})
+    monkeypatch.setattr(aks, "owner_issuance_policy", policy)
+    token_info = {"user_id": "u", "project_id": "p", "roles": request_roles, "is_system_admin": False}
+    first = await api_keys.get_api_key_issuance_policy(token_info)
+    assert "native:tools:execute" in first["allowed_scopes"]
+    lookup.return_value = {"roles": ["member", "lumen-keys_editor", "lumen-chat_user"], "is_system_admin": False}
+    second = await api_keys.get_api_key_issuance_policy(token_info)
+    assert "native:tools:execute" not in second["allowed_scopes"]
+    lookup.return_value = {"roles": ["member", "lumen-chat_user"], "is_system_admin": False}
+    with pytest.raises(HTTPException) as error:
+        await api_keys.get_api_key_issuance_policy(token_info)
+    assert error.value.status_code == 403
+    assert lookup.await_count == 3 and policy.await_count == 2
+
+
+async def test_issuance_policy_owner_authority_outage_is_503_without_quota_fallback(monkeypatch):
+    current_roles(monkeypatch, ["member", "lumen-keys_editor"]).side_effect = HTTPException(status_code=503)
+    policy = AsyncMock()
+    monkeypatch.setattr(aks, "owner_issuance_policy", policy)
+    with pytest.raises(HTTPException) as error:
+        await api_keys.get_api_key_issuance_policy({
+            "user_id": "u", "project_id": "p", "roles": ["member", "lumen-keys_editor"], "is_system_admin": False})
+    assert error.value.status_code == 503
+    policy.assert_not_awaited()

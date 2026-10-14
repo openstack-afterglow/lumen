@@ -1244,6 +1244,7 @@ async def _execute_with_usage_event(monkeypatch, usage_event: dict, *, component
         conversation_id=None,
         user_message_id=None,
         assistant_message_id=None,
+        current_ordinal=0,
         capability_snapshot={},
         pricing_snapshot={
             **_frozen_snapshot(_CACHE_PRICES),

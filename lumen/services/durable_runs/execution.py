@@ -644,9 +644,7 @@ class _DurableExecutionHooks:
         self.skill_snapshots = skill_snapshots or []
         self.user_id = user_id
         self.project_id = project_id
-        self.active_turn_ordinal: int | None = None
         self.force_compaction = False
-        self.active_message_id: str | None = None
         self._conversation_id: str | None = None
         self._temp_thread_id: str | None = None
 
@@ -1339,14 +1337,10 @@ class _DurableExecutionHooks:
         if turn is None:
             raise DurableRunError("failed to create a durable run turn")
         run.current_ordinal = turn_ordinal
-        self.active_turn_ordinal = turn_ordinal
-        if run.conversation_id is None:
-            self.active_message_id = f"temp:{run.id}:assistant:{turn_ordinal}"
-        else:
+        if run.conversation_id is not None:
             if turn.assistant_message_id is None:
                 raise DurableRunError("persistent run turn is missing its assistant message")
             run.assistant_message_id = turn.assistant_message_id
-            self.active_message_id = str(turn.assistant_message_id)
 
     async def _credit_lineage(self, session):
         """Acquire quota and lineage before the segment ledger, including on completion."""
@@ -1709,10 +1703,8 @@ class _DurableExecutionHooks:
             call_id=tool_call_id,
         )
 
-    async def replay_turn_projection(self) -> dict[str, Any]:
-        """Read the committed display projection for the active durable turn."""
-        if self.active_turn_ordinal is None:
-            raise DurableRunError("active durable turn is not set")
+    async def replay_turn_projection(self, *, turn_ordinal: int) -> dict[str, Any]:
+        """Read the committed display projection for one event-owned durable turn."""
         factory = _factory()
         async with factory() as session:
             run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id))).scalar_one()
@@ -1720,7 +1712,7 @@ class _DurableExecutionHooks:
                 await session.execute(
                     select(ChatRunTurn).where(
                         ChatRunTurn.run_id == self.run_id,
-                        ChatRunTurn.ordinal == self.active_turn_ordinal,
+                        ChatRunTurn.ordinal == turn_ordinal,
                     )
                 )
             ).scalar_one_or_none()
@@ -2137,6 +2129,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             owner=owner,
         )
 
+    message_turn_ordinal = run.current_ordinal
     citations: list[dict[str, Any]] = []
     tool_invocations: dict[str, dict[str, Any]] = {}
     tool_results: dict[str, dict[str, Any]] = {}
@@ -2201,14 +2194,14 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         async with factory() as session, session.begin():
             run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one()
             _require_owned_running_lease(run, owner)
-            if execution_hooks.active_turn_ordinal is None:
+            if message_turn_ordinal is None:
                 raise DurableRunError("finalized durable turn is not set")
             turn = (
                 await session.execute(
                     select(ChatRunTurn)
                     .where(
                         ChatRunTurn.run_id == run.id,
-                        ChatRunTurn.ordinal == execution_hooks.active_turn_ordinal,
+                        ChatRunTurn.ordinal == message_turn_ordinal,
                     )
                     .with_for_update()
                 )
@@ -2361,14 +2354,14 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
 
         async def hydrate_replayed_turn() -> None:
             nonlocal hydrated_turn_ordinal, text, reasoning, pending_deltas, pending_first_at
-            if execution_hooks.active_turn_ordinal == hydrated_turn_ordinal:
+            if message_turn_ordinal == hydrated_turn_ordinal:
                 return
-            projection = await execution_hooks.replay_turn_projection()
+            projection = await execution_hooks.replay_turn_projection(turn_ordinal=message_turn_ordinal)
             text = [projection["text"]] if projection["text"] else []
             reasoning = [projection["reasoning"]] if projection["reasoning"] else []
             pending_deltas = {"text": [], "reasoning": []}
             pending_first_at = None
-            hydrated_turn_ordinal = execution_hooks.active_turn_ordinal
+            hydrated_turn_ordinal = message_turn_ordinal
 
         await credit.precheck(user_id, project_id, api_key_id=getattr(run, "api_key_id", None))
         engine_iterator = engine.stream(
@@ -2406,7 +2399,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             execution_hooks=execution_hooks,
             execution_protocol_version=run.execution_protocol_version,
             lumen_snapshot=payload.get("lumen_snapshot") if isinstance(payload.get("lumen_snapshot"), dict) else None,
-            lumen_snapshot_frozen=run.execution_protocol_version == 2,
+            lumen_snapshot_frozen=True,
             approval_mode=approval_mode if isinstance(approval_mode, str) else None,
             workspace_write_mode=workspace_write_mode,
             resume=resume,
@@ -2447,15 +2440,42 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
                 break
             next_event_task = asyncio.create_task(anext(engine_iterator))
             ensure_lease()
-            active_message_id = execution_hooks.active_message_id
-            if active_message_id is not None and active_message_id != message_id:
-                if message_id is not None:
+            # The graph can prepare a later provider turn while these queued
+            # events are still draining. Its mutable active identity is not
+            # the identity of the event being persisted.
+            event_turn_ordinal = event.get("_durable_turn_ordinal", message_turn_ordinal)
+            if isinstance(event_turn_ordinal, bool) or not isinstance(event_turn_ordinal, int) or event_turn_ordinal < 0:
+                raise DurableRunError("durable event turn is invalid")
+            if (
+                event_turn_ordinal != message_turn_ordinal
+                or message_id is None
+                or (
+                    conversation_id is None and message_id == f"temp:{run_id}"
+                    and "_durable_turn_ordinal" in event
+                )
+            ):
+                async with factory() as session, session.begin():
+                    active_run = (
+                        await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())
+                    ).scalar_one()
+                    _require_owned_running_lease(active_run, owner)
+                    active_turn = await session.get(ChatRunTurn, (run_id, event_turn_ordinal))
+                    if active_turn is None or (conversation_id is not None and active_turn.assistant_message_id is None):
+                        raise DurableRunError("durable event turn is unavailable")
+                    active_message_id = (
+                        str(active_turn.assistant_message_id) if conversation_id is not None
+                        else f"temp:{run_id}:assistant:{event_turn_ordinal}"
+                    )
+                if message_id is not None and event_turn_ordinal > message_turn_ordinal:
                     if await flush_deltas():
                         return True
                     await finalize_current_turn()
+                message_turn_ordinal = event_turn_ordinal
                 message_id = active_message_id
                 text = []
                 reasoning = []
+                tool_invocations.clear()
+                tool_results.clear()
                 pending_deltas = {"text": [], "reasoning": []}
                 pending_first_at = None
                 hydrated_turn_ordinal = None

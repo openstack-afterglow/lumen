@@ -28,6 +28,7 @@ from lumen.db import get_session_factory
 from lumen.models.chat_infrastructure import ChatRuntimePool, ChatRuntimeResource
 from lumen.services.durable_runs import lifecycle
 from lumen.services.infrastructure import bootstrap, store
+from lumen.services.infrastructure._coordination import HEARTBEAT_SECONDS, PoolCoordinator
 from lumen.services.infrastructure.config import PoolConfig, RuntimeConfig
 from lumen.services.infrastructure.guest_api import api_load
 from lumen.services.infrastructure.identity import accepted_fingerprints
@@ -49,6 +50,7 @@ class PoolLeaseLost(RuntimeError):
 
 
 _LEASE = contextvars.ContextVar("runtime_pool_lease", default=None)
+_POOL = contextvars.ContextVar("runtime_pool_target", default=None)
 
 
 class ResourceController:
@@ -69,6 +71,12 @@ class ResourceController:
         self._stopping = asyncio.Event()
         self._retry: dict[str, tuple[float, int]] = {}
         self._api_load: dict[str, tuple[float, int, int | None]] = {}
+        self._coordinator: PoolCoordinator | None = None
+        self._pool_tasks: dict[str, asyncio.Task] = {}
+        self._pool_due: dict[str, float] = {}
+        self._registry_task: asyncio.Task | None = None
+        self._registry_due = 0.0
+        self._leader: str | None = None
 
     def stop(self) -> None:
         self._stopping.set()
@@ -79,6 +87,7 @@ class ResourceController:
             lease = _LEASE.get()
             if lease is not None and not await store.pool_lease_owned(lease[0], self.owner, lease[1]):
                 raise PoolLeaseLost()
+            await self._check_assignment()
             return await self._settled(function, *args)
 
     async def _fenced_cloud(self, resource, fence: int, function, *args, action: str | None = None):
@@ -100,6 +109,7 @@ class ResourceController:
             return await self._renewed_effect(lease, function, *args)
 
     async def _renewed_effect(self, lease, function, *args):
+        await self._check_assignment()
         # The row lock orders takeover after this write. Renew the locked row while
         # SDK polling settles; the transaction publishes the final lease deadline.
         done = asyncio.Event()
@@ -128,30 +138,122 @@ class ResourceController:
     def _due(self, key: str) -> bool:
         return self._retry.get(key, (0, 0))[0] <= asyncio.get_running_loop().time()
 
+    async def _check_assignment(self, name: str | None = None) -> None:
+        name = name or _POOL.get()
+        if self._stopping.is_set():
+            raise PoolLeaseLost()
+        if self._coordinator is None or name is None:
+            return
+        try:
+            snapshot = await self._coordinator.current()
+        except Exception as exc:
+            raise PoolLeaseLost() from exc
+        if snapshot.assignments.get(name) != self.owner:
+            raise PoolLeaseLost()
+
+    @staticmethod
+    async def _joined(*awaitables):
+        """Drain every sibling before propagating failure or cancellation."""
+        group = asyncio.gather(*awaitables, return_exceptions=True)
+        try:
+            results = await asyncio.shield(group)
+        except asyncio.CancelledError:
+            while not group.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait({group})
+            raise
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
+
+    async def _sync_registry(self) -> None:
+        try:
+            async def leader_check():
+                if self._stopping.is_set() or (await self._coordinator.current()).leader != self.owner:
+                    raise PoolLeaseLost()
+            await leader_check()
+            rows = await store.sync_pools(self.config, leader_check=leader_check)
+            definitions = {pool.name: pool for pool in self.config.pools if pool.enabled}
+            await self._coordinator.publish_registry({
+                row.name: {"id": row.id, "digest": definitions[row.name].digest()}
+                for row in rows if row.enabled and row.name in definitions
+            })
+        except PoolLeaseLost:
+            logger.info("pool registry leadership lost")
+        except Exception:
+            logger.exception("pool registry synchronization failed")
+
     async def run(self) -> None:
         try:
-            self._pool_ids = {row.name: row.id for row in await store.sync_pools(self.config)}
             while not self._stopping.is_set():
                 try:
                     await self.tick()
                 except Exception:
-                    logger.exception("resource controller tick failed")
+                    # Redis failure is fail-closed for dispatch, not a fallback to
+                    # every controller discovering/claiming every SQL pool.
+                    logger.exception("resource controller dispatcher failed")
                 try:
-                    await asyncio.wait_for(self._stopping.wait(), timeout=self.config.reconcile_interval_seconds)
+                    await asyncio.wait_for(self._stopping.wait(), timeout=min(
+                        HEARTBEAT_SECONDS, self.config.reconcile_interval_seconds))
                 except TimeoutError:
                     pass
         finally:
-            # Never cancel an in-flight cloud thread: an ambiguous create must
-            # remain durable intent for the next leader, not a lost future.
-            self.executor.shutdown(wait=True)
+            self.stop()
+            try:
+                await self._joined(*self._pool_tasks.values(), *(
+                    [self._registry_task] if self._registry_task is not None else []))
+            finally:
+                if self._coordinator is not None:
+                    try:
+                        await self._coordinator.leave()
+                    except Exception:
+                        logger.warning("controller participation will expire after shutdown")
+                # No thread cancellation or detached cloud effect on shutdown.
+                self.executor.shutdown(wait=True)
 
     async def tick(self) -> None:
-        await asyncio.gather(*(self._tick_pool(definition) for definition in self.config.pools
-            if definition.enabled and definition.name in self.providers and definition.name in self._pool_ids))
+        """Refresh participation and launch assigned work; never await pool I/O."""
+        if self._stopping.is_set():
+            return
+        if self._coordinator is None:
+            self._coordinator = PoolCoordinator(self.config.deployment_id, self.owner, {
+                pool.name: pool.digest() for pool in self.config.pools
+                if pool.enabled and pool.name in self.providers
+            })
+        snapshot = await self._coordinator.heartbeat()
+        now = asyncio.get_running_loop().time()
+        if snapshot.leader != self._leader:
+            self._registry_due = 0.0
+            self._leader = snapshot.leader
+        if (snapshot.leader == self.owner and now >= self._registry_due
+                and (self._registry_task is None or self._registry_task.done())):
+            self._registry_task = asyncio.create_task(self._sync_registry())
+            self._registry_due = now + self.config.reconcile_interval_seconds
+        self._pool_ids = {
+            name: target["id"] for name, target in snapshot.registry.items()
+            if snapshot.assignments.get(name) == self.owner
+        }
+        for name, task in list(self._pool_tasks.items()):
+            if task.done():
+                task.result()
+                del self._pool_tasks[name]
+        for definition in self.config.pools:
+            if (definition.name in self._pool_ids and definition.name not in self._pool_tasks
+                    and now >= self._pool_due.get(definition.name, 0)):
+                self._pool_tasks[definition.name] = asyncio.create_task(self._tick_pool(definition))
+                self._pool_due[definition.name] = now + self.config.reconcile_interval_seconds
 
     async def _tick_pool(self, definition: PoolConfig) -> None:
-        pool_id = self._pool_ids[definition.name]
-        claim = await store.claim_pool_lease(pool_id, self.owner, 30)
+        try:
+            await self._check_assignment(definition.name)
+            pool_id = self._pool_ids[definition.name]
+            claim = await store.claim_pool_lease(pool_id, self.owner, 30)
+        except PoolLeaseLost:
+            return
+        except Exception:
+            logger.exception("pool %s lease claim failed", definition.name)
+            return
         if claim is None:
             return
         pool, fence = claim
@@ -161,20 +263,33 @@ class ResourceController:
                 try:
                     await asyncio.wait_for(done.wait(), 10)
                 except TimeoutError:
-                    if not await store.renew_pool_lease(pool.id, self.owner, fence, 30):
+                    try:
+                        if not await store.renew_pool_lease(pool.id, self.owner, fence, 30):
+                            return
+                    except Exception:
+                        logger.exception("pool %s lease renewal failed", pool.name)
                         return
         renewal = asyncio.create_task(renew())
         token = _LEASE.set((pool.id, fence))
+        target = _POOL.set(definition.name)
         try:
+            await self._check_assignment()
             await self.reconcile_pool(pool, fence, definition)
         except PoolLeaseLost:
-            logger.info("pool %s reconcile lease lost", pool.name)
+            logger.info("pool %s reconcile role or lease lost", pool.name)
         except Exception:
             logger.exception("pool %s reconcile failed", pool.name)
         finally:
+            _POOL.reset(target)
             _LEASE.reset(token)
             done.set()
             await renewal
+            # Includes siblings and actual SDK thread settlement. Redis assignment
+            # loss never forcibly clears another incarnation's SQL fence.
+            try:
+                await store.release_pool_lease(pool.id, self.owner, fence)
+            except Exception:
+                logger.exception("pool %s lease release failed; waiting for expiry", pool.name)
 
     async def _resources(self, pool_id: str) -> list[ChatRuntimeResource]:
         factory = get_session_factory()
@@ -216,14 +331,16 @@ class ResourceController:
             except Exception:
                 logger.exception("owned resource scan failed for pool %s", pool.name)
                 self._backoff(f"list:{pool.id}")
-        await asyncio.gather(*(
+        await self._joined(*(
             self._reconcile_resource(resource, pool, definition, fence, provider, owned) for resource in resources
         ))
+        await self._check_assignment()
         resources = await self._resources(pool.id)
-        await asyncio.gather(*(
+        await self._joined(*(
             self._advance_readiness(resource, pool, fence, definition) for resource in resources
             if resource.desired_state != "deleting"
         ))
+        await self._check_assignment()
         resources = await self._resources(pool.id)
         if definition.role == "sandbox":
             await self._fail_expired_waiters(resources)
@@ -259,6 +376,7 @@ class ResourceController:
 
     async def _advance_readiness(self, resource: ChatRuntimeResource, pool: ChatRuntimePool,
                                   fence: int, definition: PoolConfig) -> None:
+        await self._check_assignment()
         if resource.observed_state == "draining" and resource.role == "api":
             await self._probe_api_load(resource, fence, definition)
             return
@@ -290,6 +408,7 @@ class ResourceController:
         if not self._due(key):
             return
         try:
+            await self._check_assignment()
             await self.transport.request(
                 address=resource.address, port=resource.port or self.config.listen_port,
                 role=resource.role, resource_id=resource.id, generation=resource.generation,
@@ -310,6 +429,7 @@ class ResourceController:
         if not self._due(key):
             return False
         try:
+            await self._check_assignment()
             response = await self.transport.request(
                 address=resource.address, port=resource.port or self.config.listen_port,
                 role="api", resource_id=resource.id, generation=resource.generation,
@@ -518,6 +638,7 @@ class ResourceController:
         return reason
 
     async def _advance_drain(self, resource: ChatRuntimeResource, fence: int, definition: PoolConfig) -> None:
+        await self._check_assignment()
         if resource.role == "worker":
             await store.request_delete(resource.id, self.owner, fence)
             return
@@ -532,6 +653,7 @@ class ResourceController:
             if row is None or not store._owns(lease, self.owner, fence) or row.drain_requested_at is None:
                 raise PoolLeaseLost()
             lease.reconcile_lease_expires_at = store._now() + timedelta(seconds=30)
+            await self._check_assignment()
             response = await self.transport.request(address=row.address, port=row.port or self.config.listen_port,
                 role="api", resource_id=row.id, generation=row.generation, method="POST", path="/v1/drain",
                 certificate_fingerprints=frozenset(accepted_fingerprints(row)),
@@ -563,6 +685,7 @@ class ResourceController:
 
     async def _scale(self, pool: ChatRuntimePool, fence: int, definition: PoolConfig,
                      resources: list[ChatRuntimeResource], *, retirement_reason: str | None = None) -> None:
+        await self._check_assignment()
         now = datetime.now(UTC)
         healthy_workers = (await store.healthy_worker_resources(pool.id)
                            if definition.role == "worker" else set())
@@ -664,6 +787,7 @@ class ResourceController:
     async def _reconcile_resource(self, resource: ChatRuntimeResource, pool: ChatRuntimePool,
                                   definition: PoolConfig, fence: int, provider,
                                   owned: list[Observation] | None) -> None:
+        await self._check_assignment()
         key = resource.id
         if not self._due(key):
             return
@@ -685,6 +809,7 @@ class ResourceController:
 
     async def _reconcile_create(self, resource: ChatRuntimeResource, definition: PoolConfig,
                                 fence: int, provider) -> None:
+        await self._check_assignment()
         operation = await store.claim_operation(resource.id, resource.generation, "create", self.owner, fence)
         if operation is None:
             return

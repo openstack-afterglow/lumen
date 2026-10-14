@@ -39,6 +39,13 @@ class McpServerBody(BaseModel):
     is_active: bool | None = None
 
 
+class McpActivationBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    is_active: bool = Field(strict=True)
+    config_version: int = Field(strict=True, ge=1)
+
+
 class AdminMcpServerBody(McpServerBody):
     """Administrator-approved OAuth or static-header MCP source."""
 
@@ -233,11 +240,13 @@ def _owner(token_info: dict) -> tuple[str, str]:
 
 
 @user_router.get("/mcp-servers")
-async def user_list_mcp(token_info: dict = Depends(require_scopes("native:extensions:read"))):
+async def user_list_mcp(
+    active_only: bool = False, token_info: dict = Depends(require_scopes("native:extensions:read"))
+):
     uid, pid = _owner(token_info)
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
-        return await es.list_for_user("mcp", user_id=uid, project_id=pid)
+        return await es.list_for_user("mcp", user_id=uid, project_id=pid, active_only=active_only)
     except es.ChatStorageUnavailable:
         return []
     except _EXC as exc:
@@ -253,6 +262,20 @@ async def user_create_mcp(body: McpServerBody, token_info: dict = Depends(requir
         )
         return {**source, **(await mcp_oauth.detect(source["id"], user_id=uid, project_id=pid))}
     except _EXC + (mcp_oauth.McpOAuthError,) as exc:
+        raise _http(exc) from exc
+
+
+@user_router.patch("/mcp-servers/{item_id}/activation")
+async def user_activate_mcp(
+    item_id: int, body: McpActivationBody, token_info: dict = Depends(require_scopes("native:mcp:write"))
+):
+    uid, pid = _owner(token_info)
+    try:
+        return await es.set_mcp_activation(
+            item_id, user_id=uid, project_id=pid,
+            is_active=body.is_active, config_version=body.config_version,
+        )
+    except _EXC as exc:
         raise _http(exc) from exc
 
 

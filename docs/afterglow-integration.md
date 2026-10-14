@@ -363,12 +363,14 @@ Context preview는 exact LiteLLM `max_input_tokens`와 검토된 override를 사
 | --- | --- |
 | `messages` / `system_prompt` / `summary` | 활성 경로 메시지·대화 자체의 지침·압축 요약 투영 |
 | `memory` / `workspace` / `skills` / `agent` | `_apply_context`가 선주입한 system preamble; `items`는 이름/ID만 노출 |
-| `tools` / `mcp_tools` | 실제 요청에 실린 function·MCP 스키마. preview는 MCP 원격 discovery를 하지 않으므로 `included=false`, `count=null`이고 `uncounted`에 포함됩니다 |
-| `deferred_tools` | 최초 요청에 실리지 않는 재료(`load_policy=on_demand` 확장은 `list_available_tools` 이후에만 적재, managed 도구는 현재 어떤 binding 경로에서도 노출되지 않음). 예산에 포함되지 않으므로 `complete`를 떨어뜨리지 않습니다 |
+| `tools` / `mcp_tools` | 실제 요청에 실린 function·MCP 스키마. preview가 원격 MCP discovery를 생략하는 항목은 `included=false`, `count=null`로 `uncounted`에 남깁니다. 이미 알려진 내장 schema와 원격 discovery는 구분합니다 |
+| `deferred_tools` | 최초 요청에 실리지 않는 `load_policy=on_demand` 확장과 선택된 managed 재료. on-demand 확장은 `list_available_tools` 이후에만 적재하고, managed search/fetch/advisor schema의 기존 비노출 경로는 바꾸지 않습니다. 예산에 포함되지 않는 재료는 `complete`를 떨어뜨리지 않습니다 |
 | `attachments` | 텍스트 투영이 표현하지 못하는 non-text 입력 파트 |
 | `overhead` | 요청 framing/priming 토큰 |
 
 Preview의 tool 스키마 집합은 실행기가 실제로 보내는 집합(내장 도구 + `list_available_tools` 카탈로그 + `preloaded` 확장)과 정확히 일치합니다. 커스텀 도구 이름·스키마는 binding과 동일한 투영(`custom__{id}__{name}_{digest}` + `additionalProperties=false`)을 공유하며, 정규 destination이 없어 binding이 제외하는 확장은 preview에서도 계수하거나 deferred로 제시하지 않습니다.
+
+Afterglow MCP가 활성화되어도 최초3개 schema(`list_my_conversations`, `get_conversation_detail`, `list_available_tools`)만 보이는 것은 정상 지연 로딩입니다. Catalogue는 같은 user/project에 명시적으로 선택된 위임 snapshot의 cloud read 도구를 한국어 클라우드·가상머신·스토리지 capability 검색으로 찾고 적재합니다. Legacy chat은 manage 위임에서도 mutation을 노출하지 않습니다. 모든 durable admission은 선택 snapshot이나 absence를 고정하며, disabled/foreign/stale/revoked snapshot을 현재 선택이나 privileged credential로 대신하지 않습니다.
 
 모델 한도를 알 수 없거나(`context_window_unknown`) 토큰 계수가 불가능해도(`token_count_unavailable`) breakdown은 사라지지 않습니다. 계수가 가능하면 값이 있는 완전한 구성을 그대로 제공하고, 계수가 불가능하면 토큰만 `null`로 비운 뒤 이름·개수를 유지한 채 `complete=false`로 보고합니다. `items[]`는 128개로 제한되지만 `count`는 잘리기 전 실제 총계입니다. request scope에서 모델이 `list_available_tools`로 적재한 도구는 `deferred_tools`에서 제거되어 `tools`/`mcp_tools`로 계수되므로, 같은 도구가 포함과 지연에 동시에 나타나지 않습니다.
 

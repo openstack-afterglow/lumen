@@ -1001,10 +1001,12 @@ async def test_four_pools_reconcile_owned_sql_demand_with_batch_zero_cold_start(
         assert (active, queued) == (0, 2) and oldest is not None
         active, queued, oldest = await store.eligible_worker_demand(ids["batch"])
         assert (active, queued) == (0, 4) and oldest is not None
-        # The first high sample creates nothing; the second produces independently clamped targets.
-        await c.tick()
+        # Exercise SQL demand/target reconciliation directly; the separate real
+        # Redis multiprocess suite covers the nonblocking assignment dispatcher.
+        # The first high sample creates nothing; the second clamps each target.
+        await c._joined(*(c._tick_pool(definition) for definition in definitions))
         assert await asyncio.gather(*(store.occupancy(pool_id) for pool_id in ids.values())) == [0] * 4
-        await c.tick()
+        await c._joined(*(c._tick_pool(definition) for definition in definitions))
         expected = {"api": 2, "text": 2, "media": 3, "batch": 5}
         async with factory() as session:
             for name, count in expected.items():

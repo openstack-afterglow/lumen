@@ -1,4 +1,5 @@
 """Synthetic HTTP and pre-I/O fences; no Keystone, provider, DB, or worker credentials."""
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -524,3 +525,35 @@ async def test_denied_automatic_intrinsic_compaction_preserves_safe_plain_chat_i
     provider.assert_not_awaited()
     authority.assert_awaited_once_with("owner", "project")
 
+
+
+async def test_queued_key_expiration_rejects_new_tool_intent_before_provider_start(monkeypatch):
+    roles = ["member", "lumen-chat_user", "lumen-tools_user"]
+    monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
+        "roles": roles, "is_system_admin": False}))
+    key = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True,
+                          revoked_at=None, expires_at=datetime.now(UTC) + timedelta(days=1),
+                          scopes=["native:runs:write", "native:tools:execute"])
+    # Key is valid when work is admitted, but expires while waiting for a worker.
+    await api_key_store.authorize_api_key_in_transaction(
+        Session(key), user_id="owner", project_id="project", api_key_id=7,
+        required_scopes=("native:runs:write", "native:tools:execute"))
+    key.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=7,
+                          agent_id=None, capability_snapshot={})
+    segment = SimpleNamespace(status="prepared")
+
+    class QueuedSession(Session):
+        async def execute(self, statement):
+            return SimpleNamespace(scalar_one=lambda: run, scalar_one_or_none=lambda: key)
+
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: QueuedSession(run))
+    monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *args: None)
+    monkeypatch.setattr(execution, "prepare_segment", AsyncMock(return_value=segment))
+    monkeypatch.setattr(execution, "_payload", lambda _: {"features": {"tool_policy": {"mode": "none"}}})
+    started = []
+    monkeypatch.setattr(execution, "begin_segment_io", lambda value: started.append(value))
+    hooks = execution._DurableExecutionHooks(run_id="run", owner="worker-authority")
+    with pytest.raises(DurableRunInputError, match="inference_authority_revoked"):
+        await hooks._start(segment_id="tool:1", ordinal=1, endpoint="tool", turn_ordinal=1, call_id="call")
+    assert segment.status == "prepared" and started == []

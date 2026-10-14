@@ -38,6 +38,9 @@ Native 요청과 agent 정의는 `plugin_tool_ids`/`plugin_skill_ids`(UUID, 최�
 
 기존 per-user custom HTTP tool은 `/v1/custom-tools` row와 `tool_ids`에서 선택하여 `default-tools`의 내부 `custom_http` binding으로 실행한다. `custom_http`는 관리자 설치 `plugin-bindings` catalogue export가 아니며 별도의 권한·설정 경로를 만들지 않는다. Remote MCP의 점·하이픈 등 provider-safe하지 않은 원래 method 이름은 충돌 방지 digest를 붙인 공개 tool 이름으로 투영하고, 실제 RPC method는 frozen `McpSnapshot.remote_tool_names`에 따로 보존한다. 기존 안전한 이름은 그대로 유지한다.
 
+Administrator global remote MCP는 catalogue publication과 owner user/project opt-in을 분리한다. `extensions_store`는 `chat_mcp_activations`의 정확한 config/generation을 effective selection에 반영하고, `mcp_oauth`는 matching connected token을 별도 요구한다. Admission·preview·frozen revalidation·새 MCP I/O에서 현재 opt-in/config를 다시 검사한다. Positive activation generation은 snapshot fingerprint에 포함하므로 disable/re-enable나 admin config 변경은 queued 승인/도구 선택을 무효화한다. User-owned direct source의 기존 CRUD와 epoch-zero identity는 유지한다.
+
+
 Managed sandbox `run_code`(effect `process`, source `workspace`)는 run에 배정된 ready sandbox generation이 있고 `process` effect가 허용된 v2 run에만 등록된다. Worker는 operator key를 갖지 않고 controller에 `POST /v1/dispatch-capabilities`로 lease fence/run/resource generation/call fingerprint에 묶인 capability를 요청한 뒤, identity-pinned internal mTLS transport로 `POST /v1/executions`, `GET /v1/executions/{id}`, `GET /v1/artifacts/{id}`를 호출한다. artifact는 worker가 pull하여 기존 asset ingest를 거친 뒤 참조된다. 기존 외부 `chat_sandbox_url` workspace 통합은 별도 profile로 남는다.
 
 ## Skill과 컨텍스트

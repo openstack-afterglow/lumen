@@ -26,7 +26,7 @@ from .common import (
     _event,
     _factory,
     _fingerprint,
-    _freeze_v2_lumen_snapshot,
+    _freeze_lumen_snapshot,
     _freeze_v2_tool_call_limit,
     _now,
     _require_supported_execution_protocol_version,
@@ -325,11 +325,10 @@ async def create_persistent_run(
         "required_scopes": capability_snapshot.get("required_scopes", ()),
     }, agent_id=agent_id))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
-    request_payload = await _freeze_v2_lumen_snapshot(
+    request_payload = await _freeze_lumen_snapshot(
         request_payload,
         user_id=user_id,
         project_id=project_id,
-        execution_protocol_version=execution_protocol_version,
     )
     fingerprint = _fingerprint(intent)
     factory = _factory()
@@ -520,11 +519,10 @@ async def create_run(
         "required_scopes": capability_snapshot.get("required_scopes", ()),
     }, agent_id=agent_id))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
-    request_payload = await _freeze_v2_lumen_snapshot(
+    request_payload = await _freeze_lumen_snapshot(
         request_payload,
         user_id=user_id,
         project_id=project_id,
-        execution_protocol_version=execution_protocol_version,
     )
     fingerprint = _fingerprint(intent)
     factory = _factory()
@@ -709,11 +707,10 @@ async def create_temp_run(
         **request_payload, "required_scopes": capability_snapshot.get("required_scopes", ()),
     }))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
-    request_payload = await _freeze_v2_lumen_snapshot(
+    request_payload = await _freeze_lumen_snapshot(
         request_payload,
         user_id=user_id,
         project_id=project_id,
-        execution_protocol_version=execution_protocol_version,
     )
     fingerprint = _fingerprint(intent)
     factory = _factory()

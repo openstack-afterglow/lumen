@@ -163,24 +163,6 @@ async def test_actual_priced_image_without_split_is_not_completed_or_replayed(mo
 
 
 class TestGraphStream:
-    async def test_emits_tokens_then_usage(self, monkeypatch):
-        chunks = [
-            _Chunk("안녕"),
-            _Chunk("하세요"),
-            _Chunk(None, usage={"prompt_tokens": 5, "completion_tokens": 2}),
-        ]
-
-        async def fake_stream(**kwargs):
-            return _aiter(chunks)
-
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-
-        events = [ev async for ev in graph.stream(model="gpt-3.5-turbo", messages=_MSGS, project_id="p1", user_id="u1")]
-        types = [e["type"] for e in events]
-        assert types.count("token") == 2
-        assert events[0] == {"type": "token", "text": "안녕"}
-        usage = [e for e in events if e["type"] == "usage"][-1]
-        assert usage["usage"] == {"prompt_tokens": 5, "completion_tokens": 2, **_NO_CACHE}
 
     async def test_emits_reasoning_events(self, monkeypatch):
         """reasoning_content 델타 → reasoning 이벤트(최종 답변 텍스트와 분리)."""

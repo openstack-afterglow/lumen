@@ -585,6 +585,16 @@ def _build_graph(params: dict, ctx: ToolContext):
             return await callback(**payload)
         return None
 
+    def turn_writer(turn_ordinal: int):
+        emit = get_stream_writer()
+        if not getattr(hooks, "journals_tool_events", False):
+            return emit
+
+        def write(event: dict) -> None:
+            emit({**event, "_durable_turn_ordinal": turn_ordinal})
+
+        return write
+
     async def tool_activity_metadata(tool_name: str) -> tuple[str, str]:
         v2_bindings = params.get("v2_bindings")
         if isinstance(v2_bindings, dict):
@@ -594,13 +604,15 @@ def _build_graph(params: dict, ctx: ToolContext):
         return await selection.context_tool_activity_metadata(tool_name, ctx)
 
     async def call_model(state: ChatState) -> dict:
-        writer = get_stream_writer()
+        round_index = int(state.get("loop_count", 0))
+        writer = turn_writer(round_index)
         model_turn_count = int(state.get("model_turn_count", 0))
         if params.get("execution_protocol_version") == 2:
             max_model_turns = int(params.get("max_model_turns", 8))
             if not 1 <= max_model_turns <= 16 or model_turn_count < 0:
                 raise RuntimeError("v2 model-turn limit is invalid")
             if model_turn_count >= max_model_turns:
+                writer = turn_writer(max(0, round_index - 1))
                 writer(
                     {
                         "type": "warning",
@@ -633,7 +645,6 @@ def _build_graph(params: dict, ctx: ToolContext):
                         restored,
                         include_managed=False,
                     )
-        round_index = int(state.get("loop_count", 0))
         schemas = (
             _v2_tool_schemas(v2_bindings)
             if isinstance(v2_bindings, dict)
@@ -1142,7 +1153,8 @@ def _build_graph(params: dict, ctx: ToolContext):
         return "finalize"
 
     async def execute_tools(state: ChatState) -> dict:
-        writer = get_stream_writer()
+        round_index = int(state.get("loop_count", 0))
+        writer = turn_writer(round_index)
         messages = list(state["messages"])
         approved_tool_calls = state.get("pending_tool_calls", [])
         denied_tool_calls = state.get("denied_tool_calls", [])
@@ -1167,7 +1179,6 @@ def _build_graph(params: dict, ctx: ToolContext):
         def call_id_for(tool_call: dict) -> str:
             return _internal_tool_call_id(tool_call)
 
-        round_index = int(state.get("loop_count", 0))
         tool_messages: list[dict[str, str]] = []
         citations_by_url = {item["url"]: item for item in state.get("citations", []) if item.get("url")}
         journals_tool_events = bool(getattr(hooks, "journals_tool_events", False))
@@ -1509,10 +1520,10 @@ def _build_graph(params: dict, ctx: ToolContext):
         pending = state.get("pending_delegations") or []
         if not pending:
             return {"pending_delegations": [], "child_wait_group_id": None}
-        writer = get_stream_writer()
         messages = list(state["messages"])
         # execute_tools already advanced loop_count for this round.
         round_index = int(state.get("loop_count", 1)) - 1
+        writer = turn_writer(round_index)
         journals_tool_events = bool(getattr(hooks, "journals_tool_events", False))
         tool_messages: list[dict[str, str]] = []
         parsed: list[tuple[dict, child_runs.DelegationCall | None, str | None]] = []
@@ -1652,7 +1663,7 @@ def _build_graph(params: dict, ctx: ToolContext):
     async def finalize(state: ChatState) -> dict:
         if state.get("model_failed"):
             return {"messages": state["messages"]}
-        writer = get_stream_writer()
+        writer = turn_writer(max(0, int(state.get("model_turn_count", 1)) - 1))
         if state.get("citations"):
             writer({"type": "citations", "items": state["citations"]})
         usage_event = {"type": "usage", "usage": state.get("usage", {"prompt_tokens": 0, "completion_tokens": 0})}
