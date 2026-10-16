@@ -71,15 +71,20 @@ async def sync_pools(config: RuntimeConfig, *, leader_check: Callable[[], Awaita
         await leader_check()
         by_name = {row.name: row for row in existing}
         for definition in config.pools:
-            profile = config.profile(definition.cloud_profile_id)
+            profile = config.profile(definition.cloud_profile_id) if definition.backend != "kubernetes" else None
+            cluster = (config.kubernetes_cluster(definition.profile.cluster_profile_id)
+                       if definition.backend == "kubernetes" else None)
             guest = next((item for item in config.guest_profiles if item.id == definition.guest_profile_id), None)
             row = by_name.get(definition.name)
             if row is None:
                 row = ChatRuntimePool(id=str(uuid4()), deployment_id=config.deployment_id, name=definition.name)
                 session.add(row)
             values = dict(role=definition.role, backend=definition.backend, enabled=definition.enabled,
-                          cloud_profile_id=definition.cloud_profile_id, project_id=profile.project_id,
-                          region_name=profile.region_name, image_ref=definition.image,
+                          cloud_profile_id=definition.cloud_profile_id,
+                          project_id=profile.project_id if profile else None,
+                          region_name=profile.region_name if profile else None,
+                          cluster_profile_id=cluster.id if cluster else None,
+                          namespace=cluster.namespace if cluster else None, image_ref=definition.image,
                           profile_digest=definition.digest(), min_replicas=definition.min_replicas,
                           max_replicas=definition.max_replicas, slots_per_worker=definition.slots_per_worker,
                           target_wait_seconds=definition.target_wait_seconds,
@@ -179,7 +184,8 @@ async def _insert_resource(session: AsyncSession, pool: ChatRuntimePool, *, role
                                    logical_project_id=logical_project_id, logical_user_id=logical_user_id,
                                    run_id=run_id, desired_state="requested", observed_state="requested",
                                    request_fingerprint=request_fingerprint, cloud_profile_id=pool.cloud_profile_id,
-                                   cloud_project_id=pool.project_id, image_ref=image_ref, policy_digest=policy_digest,
+                                   cloud_project_id=pool.project_id, cluster_profile_id=pool.cluster_profile_id,
+                                   namespace=pool.namespace, image_ref=image_ref, policy_digest=policy_digest,
                                    guest_profile_id=pool.guest_profile_id if role in {"api", "worker"} else None,
                                    guest_profile_digest=pool.guest_profile_digest if role in {"api", "worker"} else None,
                                    deadline_at=deadline)
@@ -467,16 +473,23 @@ async def occupancy(pool_id: str, *, session: AsyncSession | None = None) -> int
 
 
 async def assign_sandbox(session: AsyncSession, *, run: ChatRun, config: RuntimeConfig,
-                         deadline_at: datetime, order: LockOrder) -> ChatRuntimeResource:
-    """Caller-owned transaction: run and create intent commit or roll back together."""
+                         deadline_at: datetime, order: LockOrder,
+                         pool_name: str | None = None) -> ChatRuntimeResource:
+    """Atomically assign an explicit tool pool, or the existing no-network Nova code pool."""
     order.take("resource")
     if run.assigned_resource_id:
         existing = (await session.execute(select(ChatRuntimeResource).where(
             ChatRuntimeResource.id == run.assigned_resource_id).with_for_update())).scalar_one_or_none()
-        if existing:
-            return existing
-        raise ResourceUnavailable("assigned_resource_missing")
-    pools = [p for p in config.pools if p.enabled and p.role == "sandbox"]
+        if (existing is None or existing.run_id != run.id or existing.role != "sandbox"
+                or existing.logical_project_id != run.project_id or existing.logical_user_id != run.user_id
+                or existing.desired_state == "deleting" or existing.observed_state in {"deleted", "failed"}):
+            raise ResourceUnavailable("assigned_resource_missing")
+        selected = await session.get(ChatRuntimePool, existing.pool_id)
+        if selected is None or (pool_name is not None and selected.name != pool_name):
+            raise ResourceUnavailable("sandbox_pool_mismatch")
+        return existing
+    pools = [p for p in config.pools if p.enabled and p.role == "sandbox"
+             and (p.name == pool_name if pool_name is not None else getattr(p, "backend", "nova") == "nova")]
     if not pools:
         raise ResourceUnavailable("sandbox_pool_unavailable")
     for definition in pools:
@@ -484,6 +497,9 @@ async def assign_sandbox(session: AsyncSession, *, run: ChatRun, config: Runtime
             ChatRuntimePool.deployment_id == config.deployment_id,
             ChatRuntimePool.name == definition.name).with_for_update())).scalar_one_or_none()
         if not pool or not pool.enabled or pool.role != "sandbox":
+            continue
+        def_backend = getattr(definition, "backend", None)
+        if def_backend and pool.backend != def_backend:
             continue
         if await occupancy(pool.id, session=session) >= pool.max_replicas:
             continue
@@ -523,8 +539,12 @@ async def register_worker(*, worker_identity: str, boot_id: str, capacity: int,
             or any(value not in worker_routing.WORKER_WORKLOAD_CLASSES for value in classes)
             or ("batch" in classes and len(classes) != 1)):
         raise ValueError("invalid worker workload classes")
-    if resource_id is None and (resource_generation is not None or certificate_fingerprint is not None):
-        raise ResourceUnavailable("worker_identity_mismatch")
+    if resource_id is None:
+        from lumen.services.infrastructure.fixed_worker import approved_fingerprint
+
+        if (resource_generation is not None or (certificate_fingerprint is not None
+                and not approved_fingerprint(get_settings().runtime_config, certificate_fingerprint))):
+            raise ResourceUnavailable("worker_identity_mismatch")
     async with _factory()() as session, session.begin():
         await worker_routing.use_read_committed(session)
         # resource -> registration lock order, matching claim/heartbeat/drain.
@@ -551,7 +571,8 @@ async def register_worker(*, worker_identity: str, boot_id: str, capacity: int,
             row = ChatWorkerRegistration(id=str(uuid4()), worker_identity=worker_identity, boot_id=boot_id,
                                          resource_id=resource_id, pool_id=resource.pool_id if resource else None,
                                          resource_generation=resource_generation,
-                                         certificate_fingerprint=resource.certificate_fingerprint if resource else None,
+                                         certificate_fingerprint=(resource.certificate_fingerprint
+                                                                  if resource else certificate_fingerprint),
                                          protocol_versions=list(protocol_versions), plugin_digest=plugin_digest,
                                          schema_version=schema_version, capacity=capacity,
                                          workload_classes=classes)
@@ -599,10 +620,13 @@ async def heartbeat_worker(registration_id: str, *, accepting: bool,
             if locked is None:
                 return None
             row, resource = locked
-            if (certificate_fingerprint is not None or resource_generation is not None) and (
-                resource is None or not accepts_fingerprint(resource, certificate_fingerprint)
+            if resource is None:
+                if (resource_generation is not None or certificate_fingerprint != row.certificate_fingerprint):
+                    return None
+            elif ((certificate_fingerprint is not None or resource_generation is not None) and (
+                not accepts_fingerprint(resource, certificate_fingerprint)
                 or (resource_generation is not None and resource.generation != resource_generation)
-            ):
+            )):
                 return None
             now = _now()
             live = await worker_routing.live_run_leases(session, row.id, now=now)

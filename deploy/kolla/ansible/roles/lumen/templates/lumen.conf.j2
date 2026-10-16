@@ -50,6 +50,7 @@ runtime_config = {{ ((lumen_runtime_config | combine({'enabled': true, 'listen_h
 {% endif %}
 
 [chat]
+chat_execution_protocol_version = {{ lumen_chat_execution_protocol_version }}
 chat_default_model = {{ lumen_chat_default_model | to_json }}
 chat_compat_run_timeout_seconds = {{ lumen_chat_compat_run_timeout_seconds }}
 claude_gateway_base_url = {{ lumen_claude_gateway_base_url | to_json }}

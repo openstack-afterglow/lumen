@@ -150,13 +150,13 @@ class RemoteTransport:
         self._http.validate_url(configured["url"])
         return MultiServerMCPClient({"remote": configured}, handle_tool_errors=False)
 
-    async def list_tools(self, server: dict[str, Any]) -> list[dict[str, Any]]:
+    async def list_tools(self, server: dict[str, Any], *, context: ExecutionContext | None = None) -> list[dict[str, Any]]:
         async def run():
             tools = await self._client(server).get_tools(server_name="remote")
             return [{"name": t.name, "description": t.description or t.name, "input_schema": _schema(t)} for t in tools[:40]]
         return await asyncio.wait_for(run(), timeout=_TIMEOUT)
 
-    async def call_tool(self, server: dict[str, Any], name: str, arguments: dict[str, Any]) -> McpToolOutput:
+    async def call_tool(self, server: dict[str, Any], name: str, arguments: dict[str, Any], *, context: ExecutionContext) -> McpToolOutput:
         if not isinstance(arguments, dict):
             raise ValueError("MCP tool arguments must be an object")
         async def run():
@@ -173,7 +173,7 @@ def _fingerprint(value: object) -> str:
 
 
 class RemoteMcp:
-    manifest = PluginManifest(id="remote-mcp", kind="mcp", version="0.1.0", required_capabilities=("extensions", "public_http", "mcp_connections"))
+    manifest = PluginManifest(id="remote-mcp", kind="mcp", version="0.1.1", required_capabilities=("extensions", "public_http", "mcp_connections"))
 
     def __init__(self) -> None:
         self._extensions = None
@@ -202,13 +202,20 @@ class RemoteMcp:
             raise PluginError("plugin_unavailable", "Remote MCP plugin has not started")
         return self.transport, self._oauth
 
-    async def list_tools(self, server: dict[str, Any]) -> list[dict[str, Any]]:
+    async def list_tools(self, server: dict[str, Any], *, context: ExecutionContext | None = None) -> list[dict[str, Any]]:
         transport, _ = self._ready()
-        return await transport.list_tools(server)
+        return await transport.list_tools(server, context=context)
 
-    async def call_tool(self, server: dict[str, Any], name: str, arguments: dict[str, Any]) -> McpToolOutput:
+    async def call_tool(self, server: dict[str, Any], name: str, arguments: dict[str, Any], *, context: ExecutionContext, expected_credential_epoch: int | None) -> McpToolOutput:
         transport, _ = self._ready()
-        return await transport.call_tool(server, name, arguments)
+        connection(server, transport._http_factory)
+        expected_configuration = _fingerprint({k: v for k, v in server.items() if k != "headers"})
+        current, epoch = await self._server(server.get("id"), Namespace(user_id=context.user_id, project_id=context.project_id))
+        if epoch != expected_credential_epoch or (epoch is not None and (type(expected_credential_epoch) is not int or expected_credential_epoch < 1)):
+            raise PluginError("plugin_authority_revoked")
+        if _fingerprint({k: v for k, v in current.items() if k != "headers"}) != expected_configuration:
+            raise PluginError("plugin_configuration_changed")
+        return await transport.call_tool(current, name, arguments, context=context)
 
     async def detect(self, server_id: int, namespace: Namespace) -> dict[str, Any]:
         return await self._ready()[1].detect(server_id, namespace)
@@ -272,7 +279,7 @@ class RemoteMcp:
             definitions = []
             remote_tool_names: dict[str, str] = {}
             for item in tools:
-                effect = (server.get("effect_overrides") or {}).get(item["name"], "read")
+                effect = (server.get("effect_overrides") or {}).get(item["name"], "external_mutation")
                 if effect not in {"read", "external_mutation"}:
                     raise PluginError("plugin_configuration_changed")
                 name = _provider_tool_name(server_id, item["name"])
@@ -285,19 +292,25 @@ class RemoteMcp:
             snapshots.append(McpSnapshot(authority="remote", namespace=selection.namespace, identity=identity, server_id=server_id, config_version=server["config_version"], credential_epoch=epoch, fingerprint=fingerprint, tools=tuple(definitions), remote_tool_names=remote_tool_names))
         return tuple(snapshots)
 
-    async def revalidate(self, snapshot: McpSnapshot) -> None:
-        if snapshot.authority != "remote" or snapshot.server_id is None or snapshot.identity.plugin_id != self.manifest.id:
-            raise PluginError("plugin_authority_revoked")
-        server, epoch = await self._server(snapshot.server_id, snapshot.namespace)
+    def _validate_snapshot_server(self, snapshot: McpSnapshot, server: dict[str, Any], epoch: int | None) -> None:
         fingerprint = _fingerprint({k: v for k, v in server.items() if k != "headers"})
         if server["config_version"] != snapshot.config_version or epoch != snapshot.credential_epoch or fingerprint != snapshot.fingerprint:
             raise PluginError("plugin_configuration_changed")
 
-    async def bind(self, snapshot: McpSnapshot, context: ExecutionContext) -> tuple[ToolBinding, ...]:
-        if (context.user_id, context.project_id) != (snapshot.namespace.user_id, snapshot.namespace.project_id):
+    async def revalidate(self, snapshot: McpSnapshot) -> None:
+        if snapshot.authority != "remote" or snapshot.server_id is None or snapshot.identity.plugin_id != self.manifest.id:
             raise PluginError("plugin_authority_revoked")
-        await self.revalidate(snapshot)
-        server, _ = await self._server(snapshot.server_id, snapshot.namespace)
+        server, epoch = await self._server(snapshot.server_id, snapshot.namespace)
+        self._validate_snapshot_server(snapshot, server, epoch)
+
+    async def bind(self, snapshot: McpSnapshot, context: ExecutionContext) -> tuple[ToolBinding, ...]:
+        if ((context.user_id, context.project_id) != (snapshot.namespace.user_id, snapshot.namespace.project_id)
+                or snapshot.authority != "remote" or snapshot.server_id is None or snapshot.identity.plugin_id != self.manifest.id):
+            raise PluginError("plugin_authority_revoked")
+        server, epoch = await self._server(snapshot.server_id, snapshot.namespace)
+        self._validate_snapshot_server(snapshot, server, epoch)
+        # Preserve immutable approval metadata, not the resolved secret headers.
+        server = json.loads(json.dumps({k: v for k, v in server.items() if k != "headers"}, default=str))
         url = urlsplit(server["url"])
         destination_origin = f"{url.scheme}://{url.netloc}"
         bindings = []
@@ -311,11 +324,10 @@ class RemoteMcp:
             if _provider_tool_name(snapshot.server_id, method) != definition.name:
                 raise PluginError("plugin_configuration_changed", "remote MCP tool name changed")
             async def execute(args: dict[str, Any], ctx: ExecutionContext, *, method=method):
-                if (ctx.user_id, ctx.project_id) != (snapshot.namespace.user_id, snapshot.namespace.project_id):
+                if ((ctx.user_id, ctx.project_id) != (snapshot.namespace.user_id, snapshot.namespace.project_id)
+                        or ctx.run_id != context.run_id):
                     raise PluginError("plugin_authority_revoked")
-                await self.revalidate(snapshot)
-                server, _ = await self._server(snapshot.server_id, snapshot.namespace)
-                output = await self.call_tool(server, method, args)
+                output = await self.call_tool(server, method, args, context=ctx, expected_credential_epoch=snapshot.credential_epoch)
                 return ToolExecutionResult(status="completed", model_content=output.text, generated_files=[GeneratedToolFile(name=f.name, media_type=f.media_type, data=f.data) for f in output.files])
             bindings.append(ToolBinding(definition=definition, execute=execute, config_fingerprint=snapshot.fingerprint, destination_origin=destination_origin))
         return tuple(bindings)

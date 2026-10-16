@@ -1,6 +1,59 @@
-# Standalone sandbox image contract (0.1.0)
+# Sandbox image contract (0.1.1)
 
-Main owns the Dockerfile/build/rollout. Install only the `lumen-sandbox` wheel and its declared dependencies (no `lumen`, `lumen-plugin-api`, service credentials, Docker socket or host mounts). Targets: linux/amd64 and linux/arm64. **No image build or deployment is provided by this package.** The daemon refuses non-Linux hosts.
+The `lumen-sandbox` target in `docker/Dockerfile` supports linux/amd64 and linux/arm64. It contains only the `lumen-sandbox` wheel and its declared Python dependencies, the pinned Node runtime, and the tools described below (no `lumen`, `lumen-plugin-api`, service credentials, Docker socket or host mounts). Both daemon entry points refuse non-Linux hosts. The default command remains the root-managed standalone daemon; the Kubernetes provider explicitly overrides it.
+
+## Kubernetes image and tool contract
+
+The Kubernetes provider runs `lumen-sandbox-kubernetes` as uid/gid **4300:4300**, with `readOnlyRootFilesystem`, all capabilities dropped, and no privilege escalation. `/work` is the per-run, bounded `emptyDir` tmpfs; `HOME=/work` and `TMPDIR=/work/tmp`. Writable daemon state is mounted separately at `/state`. The provider supplies `SANDBOX_STATE_DIR=/state`, `SANDBOX_WORKSPACE_DIR=/work`, `SANDBOX_TOOL_MANIFEST=/opt/lumen-tools/manifest.json`, its SHA-256 in `SANDBOX_TOOL_MANIFEST_SHA256`, and the bootstrap/resource/limit configuration required by `kubernetes_server.py`. The image's root-manager defaults below apply only to the standalone entry point, not to this Kubernetes override. No tool downloads or package installation occur at runtime.
+
+### Reproducible tool installation
+
+- Node **24.21.0**, installed at `/opt/node` with `/usr/bin/node`, uses the existing per-architecture archive SHA-256 pins in the Dockerfile. Other architectures fail the build.
+- `@playwright/mcp` **0.0.83**, registry integrity `sha512-oNcl+Ae2/IAjhfPeP46BfIkSakfmprY+aOtkv5MjrQ4lPav4/yNtPhL0iq8SlIM90oApWgBDUxaNKvktazUKOg==`.
+- `@modelcontextprotocol/server-filesystem` **1.0.0**, registry integrity `sha512-2fN6qhpsiPSBAe0ev1qDPk4sCWdULCZQTuYc4ZY7+BDWQ1XCxLB+7dqStF2ZflgG4G/9vTwQsjxh7pjFqrrpcg==`.
+- `packages/lumen-sandbox/tools/package-lock.json` pins the complete npm dependency graph with integrity hashes; the image installs it with `npm ci --omit=dev --ignore-scripts`. MCP's exact Playwright dependency is **1.64.0-alpha-1790635538000**, with Chromium revision **1247**, browser version **155.0.8059.12**. That lockfile's Playwright CLI installs its matching Chromium and OS dependencies at build time, using `install --with-deps --no-shell chromium` for each target architecture. `/opt/ms-playwright/chromium` points to that bundled executable, not a separately installed Google Chrome channel.
+- `/opt/lumen-tools` and `/opt/ms-playwright` are root-owned, world-readable/searchable, and not writable by the workload. All profile commands use absolute node/script paths.
+
+Playwright is headless and isolated (in-memory browser profile), with artifacts under `/work`. Its committed JSON config explicitly selects the bundled Chromium executable; `--browser chromium` alone is not used to select a Chrome channel. **Chromium's own sandbox defaults ON** (`browser.launchOptions.chromiumSandbox=true`). The parent/operator **must confirm real browser navigation and snapshot behavior on the target gVisor runtime** before promotion; local Docker results do not qualify gVisor. If measurement requires disabling the Chromium sandbox inside the outer sandbox, build and approve a distinct image with `--build-arg PLAYWRIGHT_CHROMIUM_SANDBOX=false`; Playwright then supplies Chromium's `--no-sandbox`. Only literal `true` and `false` are accepted. This is an image-build parameter, not a caller-controlled MCP argument or an automatic fallback. Pin the chosen image digest and review its config as well as its manifest. Disabling Chromium's sandbox weakens defense in depth.
+
+The version-1 manifest defines `playwright` and `filesystem`. The filesystem server receives only `/work` as its allowed root. Approved tool names, descriptions and exact `tools/list` input schemas are committed in `tools/manifest.json`; changes to dependency versions require recollecting those schemas from the actual pinned servers. Effects use core's `read`, `workspace_write`, `process`, and `external_mutation` vocabulary. Read-only operations are `read`; filesystem mutations are `workspace_write`; browser interactions that may mutate a remote site are `external_mutation`. `browser_run_code_unsafe`, `browser_evaluate`, and `browser_file_upload` are never approved. MCP startup requires every approved tool to be advertised, but ignores additional advertised tools; HTTP dispatch rejects any tool not approved by the manifest with `400 unapproved_tool`.
+
+| Profile / effect | Approved tools |
+| --- | --- |
+| `playwright` / `workspace_write` | `browser_console_messages`, `browser_find`, `browser_network_requests`, `browser_network_request`, `browser_take_screenshot`, `browser_snapshot`, `browser_wait_for` |
+| `playwright` / `external_mutation` | `browser_close`, `browser_resize`, `browser_handle_dialog`, `browser_emulate_media`, `browser_drop`, `browser_fill_form`, `browser_press_key`, `browser_type`, `browser_navigate`, `browser_navigate_back`, `browser_click`, `browser_drag`, `browser_hover`, `browser_select_option`, `browser_tabs` |
+| `filesystem` / `read` | `read_file`, `read_text_file`, `read_media_file`, `read_multiple_files`, `list_directory`, `list_directory_with_sizes`, `directory_tree`, `search_files`, `get_file_info`, `list_allowed_directories` |
+| `filesystem` / `workspace_write` | `write_file`, `edit_file`, `create_directory`, `move_file` |
+
+Browser observer tools are conservatively `workspace_write`, not `read`: this pinned version can persist their output artifacts, including the implicit snapshot produced by `browser_wait_for`. Only operations that cannot mutate workspace or remote state are marked `read`. The authoritative effect Literal is `lumen_plugin_api.tools.ToolDefinition`; `lumen/services/tool_runtime/contracts.py` uses the same four-value set.
+
+### Extracting the operator manifest
+
+Extract the exact bytes from the **approved image digest**, not from a mutable tag or a reformatted JSON copy. For example, from the repository root:
+
+```bash
+IMAGE='registry.example/lumen-sandbox@sha256:REPLACE_WITH_APPROVED_DIGEST'
+container=$(docker create "$IMAGE")
+docker cp "$container:/opt/lumen-tools/manifest.json" ./lumen-tools-manifest.json
+docker cp "$container:/opt/lumen-tools/playwright.config.json" ./lumen-playwright-config.json
+docker rm "$container"
+shasum -a 256 ./lumen-tools-manifest.json
+```
+
+Set the Kubernetes profile's `tool_manifest_file` to the absolute controller-side path of `lumen-tools-manifest.json` and `tool_manifest_sha256` to the printed 64-character lowercase hash. Set the sandbox image reference to the same immutable digest. The provider passes the hash to the pod, which validates the baked manifest bytes before starting. The manifest hash covers the allow-list; the image digest additionally binds browser config, dependencies, and executable bytes. Multi-architecture images must carry identical manifest bytes, and each platform must be qualified independently.
+
+### Kubernetes tool qualification
+
+Build the canonical targets (from the repository root):
+
+```bash
+docker buildx build --platform linux/arm64 -f docker/Dockerfile --target lumen-sandbox --load -t lumen-sandbox:k8s-arm64 .
+docker buildx build --platform linux/amd64 -f docker/Dockerfile --target lumen-sandbox --load -t lumen-sandbox:k8s-amd64 .
+```
+
+For each image, run both manifest commands as real stdio MCP sessions with `--user 4300:4300 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /work:uid=4300,gid=4300,mode=0700`, and `HOME=/work`, `TMPDIR=/work/tmp`. Send `initialize`, `notifications/initialized`, and `tools/list`; compare every approved schema. On native arm64 additionally call `browser_navigate` for `https://example.com`, `browser_snapshot`, and filesystem write/read inside `/work`. Record image IDs, sizes, manifest hashes, and exact results. A failed browser launch is a failed qualification, never a reason to silently disable the sandbox. Confirm the selected sandbox mode separately under live gVisor. Run package pytest and ruff after image/runtime qualification.
+
+Local Docker Desktop qualification built both canonical architectures and exercised both profiles with the restrictions above. All 22 approved Playwright and 14 filesystem schemas/descriptions matched the real servers; filesystem write/read passed on both architectures. Node reported `v24.21.0` with `arm64`/`x64` respectively, and Chromium reported `Google Chrome for Testing 155.0.8059.12`. The native arm64 **default sandbox-ON** browser calls failed with `No usable sandbox!`: under these restrictions `unshare(CLONE_NEWUSER)` returned `EPERM`, with `NoNewPrivs=1`, seccomp filtering enabled, and no effective capabilities. A separately tagged arm64 image built with `PLAYWRIGHT_CHROMIUM_SANDBOX=false` passed real `https://example.com` navigation (title `Example Domain`), snapshot, and filesystem write/read under the same outer restrictions. This proves the opt-in packaging path only; the default browser and target-gVisor acceptance remain unqualified. No automatic downgrade was introduced.
 
 ## Required image and host
 

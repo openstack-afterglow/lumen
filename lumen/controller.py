@@ -28,6 +28,7 @@ from lumen.services.infrastructure.config import RuntimeConfig
 from lumen.services.infrastructure.controller import ResourceController
 from lumen.services.infrastructure.dispatch import make_dispatch_router
 from lumen.services.infrastructure.identity import make_identity_router
+from lumen.services.infrastructure.kubernetes import KubernetesProvider
 from lumen.services.infrastructure.nova import NovaProvider
 from lumen.services.infrastructure.transport import resolve_operator_key
 from lumen.services.infrastructure.zun import ZunProvider
@@ -110,6 +111,13 @@ def build_providers(config: RuntimeConfig) -> dict[str, object]:
     ca_pem = Path(config.tls.ca_file).read_text(encoding="ascii")
     for pool in config.pools:
         if not pool.enabled:
+            continue
+        if pool.backend == "kubernetes":
+            cluster = config.kubernetes_cluster(pool.profile.cluster_profile_id)
+            providers[pool.name] = KubernetesProvider(
+                cluster, pool, config.deployment_id,
+                controller_url=config.controller_url, controller_ca_pem=ca_pem,
+            )
             continue
         cloud = config.profile(pool.cloud_profile_id)
         provider = NovaProvider if pool.backend == "nova" else ZunProvider

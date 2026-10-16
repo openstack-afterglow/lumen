@@ -141,7 +141,10 @@ async def _request_cancelled_transaction(
         ).scalar_one_or_none() is not None
         quota = None
         root = None
-        if is_child or has_children or identity.execution_mode == "code" or identity.credit_ceiling is not None:
+        if (
+            is_child or has_children or identity.execution_mode == "code" or identity.credit_ceiling is not None
+            or getattr(identity, "assigned_resource_id", None) is not None
+        ):
             quota = await budgets.lock_project_quota(session, identity.project_id, order=order)
         if is_child:
             _quota, root, _ancestors = await children._lock_lineage(session, identity, order, quota=quota)
@@ -260,11 +263,15 @@ async def _request_cancelled_transaction(
                 ),
                 release_resource=not has_children,
             )
-        if immediate and not is_child and run.execution_mode == "code":
+        if immediate and not is_child and (run.execution_mode == "code" or getattr(run, "assigned_resource_id", None) is not None):
             await budgets.settle_root_sandbox(session, quota=quota, root=run, order=order)
         if immediate and not is_child and quota is not None:
             await budgets.close_root_budget(session, quota=quota, root=run, order=order)
-        release_self = immediate and ((not is_child and run.execution_mode == "code") or (is_child and has_children))
+        # Ordinary chat can retain a ready MCP sandbox while paused for another approval.
+        release_self = immediate and (
+            (not is_child and (run.execution_mode == "code" or getattr(run, "assigned_resource_id", None) is not None))
+            or (is_child and has_children)
+        )
         if finalized or release_self:
             from lumen.services.infrastructure import store as infra_store
 
@@ -317,7 +324,10 @@ async def fail_waiting_run(run_id: str, *, error_code: str, safe_message: str) -
                 quota, root, _ancestors = await children._lock_lineage(session, identity, order)
                 run = await budgets.lock_run(session, run_id, order=order, lock_class="child")
             else:
-                if has_children or identity.execution_mode == "code" or identity.credit_ceiling is not None:
+                if (
+                    has_children or identity.execution_mode == "code" or identity.credit_ceiling is not None
+                    or getattr(identity, "assigned_resource_id", None) is not None
+                ):
                     quota = await budgets.lock_project_quota(session, identity.project_id, order=order)
                 run = await budgets.lock_run(session, run_id, order=order, lock_class="root")
                 root = run
@@ -351,11 +361,11 @@ async def fail_waiting_run(run_id: str, *, error_code: str, safe_message: str) -
                     result=children.child_result_payload(status="failed", error_code=error_code, summary="", artifacts=[]),
                     release_resource=not has_children,
                 )
-            elif run.execution_mode == "code":
+            elif run.execution_mode == "code" or getattr(run, "assigned_resource_id", None) is not None:
                 await budgets.settle_root_sandbox(session, quota=quota, root=run, order=order)
             if run.parent_run_id is None and quota is not None:
                 await budgets.close_root_budget(session, quota=quota, root=run, order=order)
-            release_self = (run.parent_run_id is None and run.execution_mode == "code") or (run.parent_run_id is not None and has_children)
+            release_self = (run.parent_run_id is None and (run.execution_mode == "code" or getattr(run, "assigned_resource_id", None) is not None)) or (run.parent_run_id is not None and has_children)
             if finalized or release_self:
                 from lumen.services.infrastructure import store as infra_store
 

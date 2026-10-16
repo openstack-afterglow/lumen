@@ -95,7 +95,7 @@ def _load_toml() -> dict[str, Any]:
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
+    model_config = SettingsConfigDict(extra="ignore", case_sensitive=False, hide_input_in_errors=True)
 
     plugin_config: PluginRuntimeConfig = Field(default_factory=PluginRuntimeConfig)
     runtime_config: RuntimeConfig = Field(default_factory=RuntimeConfig)
