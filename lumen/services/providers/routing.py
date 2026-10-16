@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -15,9 +16,10 @@ from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun, ChatRunProvider
 from lumen.services.capabilities import reasoning_explicitly_unsupported
+from lumen.services.litellm_client import direct_provider_route
 from lumen.services.run_store import NONTERMINAL
 
-from .credentials import ProviderAuthRef, api_model_name, resolve_api_key, short_model_name
+from .credentials import ProviderAuthRef, api_key_source, api_model_name, resolve_api_key, short_model_name
 from .errors import (
     ActiveRunConfigurationConflict,
     AmbiguousModelRouteError,
@@ -29,10 +31,49 @@ from .pricing import (
     _effective_cache_prices,
     _effective_capabilities,
     _kind,
+    _model_public,
+    _per_million_price,
     _pricing_aware_capabilities,
+    _provider_public,
     _resolved_base_prices,
     _resolved_cache_prices,
 )
+
+# Catalog-issued exact route identity: ``lumen/<provider_id>/<model_id>``. Only the
+# canonical positive-integer form is reserved; every other string stays a public ID.
+_CLI_ROUTE_ID = re.compile(r"lumen/([1-9][0-9]{0,18})/([1-9][0-9]{0,18})")
+_MAX_ROW_ID = 9223372036854775807
+# Capability keys the coding-CLI catalog projects verbatim from the effective route
+# capabilities; absent keys stay absent rather than being invented.
+_CLI_CAPABILITY_KEYS = (
+    "context_limit",
+    "max_output_tokens",
+    "input_modalities",
+    "output_modalities",
+    "function_calling",
+    "tool_call",
+    "parallel_function_calling",
+    "reasoning",
+    "reasoning_options",
+    "vision",
+    "streaming",
+)
+
+
+def cli_route_id(provider_id: int, model_id: int) -> str:
+    """Stable exact provider/model route token issued by the coding-CLI catalog."""
+    return f"lumen/{provider_id}/{model_id}"
+
+
+def parse_cli_route_id(value: str) -> tuple[int, int] | None:
+    """Return ``(provider_id, model_id)`` for a canonical route token, else ``None``."""
+    match = _CLI_ROUTE_ID.fullmatch(value)
+    if match is None:
+        return None
+    provider_id, model_id = int(match.group(1)), int(match.group(2))
+    if provider_id > _MAX_ROW_ID or model_id > _MAX_ROW_ID:
+        return None
+    return provider_id, model_id
 
 
 def _require_db():
@@ -366,6 +407,11 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None, mod
     ``provider`` is the administrator-editable public selector. ``provider_type``
     is the execution transport an endpoint's vendor wire protocol fixes.
     """
+    route_ids = parse_cli_route_id(model_name)
+    if route_ids is not None:
+        return await _resolve_cli_route(
+            *route_ids, provider=provider, model_kind=model_kind, provider_id=provider_id, provider_type=provider_type
+        )
     candidates = {
         model_name,
         f"perplexity/{model_name}",
@@ -480,6 +526,168 @@ async def list_api_models(*, model_kind: str = "text") -> list[dict]:
                 }
                 for model, provider in rows
             ]
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def _resolve_cli_route(
+    route_provider_id: int,
+    route_model_id: int,
+    *,
+    provider: str | None,
+    model_kind: str,
+    provider_id: int | None,
+    provider_type: str | None,
+) -> dict | None:
+    """Resolve exactly one active provider/model pair; never fall back by name or rank.
+
+    Every caller-supplied selector still narrows the route, so a conflicting
+    provider, provider type, provider id or model kind finds nothing.
+    """
+    if provider_id is not None and provider_id != route_provider_id:
+        return None
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            stmt = (
+                select(LlmModel, LlmProvider)
+                .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
+                .where(
+                    LlmModel.id == route_model_id,
+                    LlmModel.provider_id == route_provider_id,
+                    LlmProvider.id == route_provider_id,
+                    LlmModel.model_kind == model_kind,
+                    LlmModel.is_active.is_(True),
+                    LlmProvider.is_active.is_(True),
+                )
+            )
+            if provider is not None:
+                stmt = stmt.where(LlmProvider.api_provider == provider)
+            if provider_type is not None:
+                stmt = stmt.where(LlmProvider.provider_type == provider_type)
+            row = (await session.execute(stmt)).first()
+            return _resolved_model(*row) if row is not None else None
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+def _cli_transport_protocols(model: LlmModel, provider: LlmProvider) -> tuple[str, ...]:
+    """Compatibility protocols the stateless transport can actually execute for this route.
+
+    API-key routes use LiteLLM's native/cross-protocol adapters. Custom OpenAI
+    bases are not known to serve native Responses, so the catalog offers Messages
+    only without changing their existing transport. Anthropic subscription supports
+    Messages only; ChatGPT device auth and subscription-prefixed models support neither.
+    """
+    auth_mode = getattr(provider, "auth_mode", "api_key")
+    if auth_mode == "anthropic_subscription":
+        return ("messages",) if provider.provider_type == "anthropic" else ()
+    if auth_mode != "api_key" or provider.provider_type == "chatgpt":
+        return ()
+    if model.model_name.startswith(("chatgpt/", "anthropic-subscription/")):
+        return ()
+    if provider.provider_type == "openai" and not direct_provider_route("openai", provider.api_base):
+        return ("messages",)
+    return ("messages", "responses")
+
+
+def _tools_explicitly_disabled(stored: object) -> bool:
+    """Only a stored override/models.dev flag is authoritative; a negative probe is not."""
+    if not isinstance(stored, dict):
+        return False
+    if "tool_call" in stored:
+        return stored["tool_call"] is False
+    return stored.get("function_calling") is False
+
+
+def _price_text(value: Decimal | None) -> str | None:
+    """Exact per-million decimal string without trailing zeros (prices are never negative)."""
+    return format(value.normalize(), "f") if value is not None else None
+
+
+def _cli_model_row(model: LlmModel, provider: LlmProvider) -> dict:
+    auth_mode = getattr(provider, "auth_mode", "api_key")
+    key_configured = api_key_source(provider) is not None
+    input_price, output_price, price_source, _ = _resolved_base_prices(model, provider)
+    public = _model_public(
+        model,
+        effective_input_price_per_million=_per_million_price(input_price),
+        effective_output_price_per_million=_per_million_price(output_price),
+        effective_price_source=price_source,
+        provider_type=provider.provider_type,
+        api_provider=provider.api_provider,
+        provider_sort_order=provider.sort_order,
+        auth_mode=auth_mode,
+        api_key_configured=key_configured,
+        api_base=provider.api_base,
+    )
+    effective = public.get("effective_capabilities") or {}
+    protocols = _cli_transport_protocols(model, provider)
+    if auth_mode == "api_key":
+        # A keyless route is executable only against an operator-set endpoint (local servers).
+        configured = key_configured or bool(provider.api_base)
+    else:
+        configured = bool(_provider_public(provider)["has_credentials"])
+    text_gate = (effective.get("feature_gates") or {}).get("text") or {}
+    input_modalities = effective.get("input_modalities")
+    output_modalities = effective.get("output_modalities")
+    if not protocols:
+        reason = "subscription_protocol_unsupported"
+    elif not configured:
+        reason = "provider_credentials_missing"
+    elif input_price is None or output_price is None:
+        reason = "pricing_unavailable"
+    elif (
+        text_gate.get("available") is False
+        or effective.get("streaming") is False
+        # Empty imported lists carry unknown metadata, not an authoritative text refusal.
+        or (isinstance(input_modalities, list) and bool(input_modalities) and "text" not in input_modalities)
+        or (isinstance(output_modalities, list) and bool(output_modalities) and "text" not in output_modalities)
+    ):
+        reason = "text_unavailable"
+    elif _tools_explicitly_disabled(model.capabilities):
+        reason = "tools_disabled"
+    else:
+        reason = None
+    return {
+        "id": cli_route_id(provider.id, model.id),
+        "api_model_name": public["api_model_name"],
+        "display_name": public["display_name"],
+        "provider": provider.api_provider,
+        "provider_name": provider.name,
+        "provider_type": provider.provider_type,
+        "protocols": list(protocols) if reason is None else [],
+        "usable": reason is None,
+        "disabled_reason": reason,
+        "capabilities": {key: effective[key] for key in _CLI_CAPABILITY_KEYS if key in effective},
+        "input_price_per_million": _price_text(_per_million_price(input_price)),
+        "output_price_per_million": _price_text(_per_million_price(output_price)),
+    }
+
+
+async def list_cli_models() -> list[dict]:
+    """Active text routes for coding CLIs, in configured provider/model order, without secrets.
+
+    Credential presence is read from configuration only; nothing is decrypted.
+    """
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            rows = (
+                await session.execute(
+                    select(LlmModel, LlmProvider)
+                    .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
+                    .where(
+                        LlmModel.is_active.is_(True),
+                        LlmModel.model_kind == "text",
+                        LlmProvider.is_active.is_(True),
+                    )
+                    .order_by(LlmProvider.sort_order, LlmProvider.id, LlmModel.sort_order, LlmModel.id)
+                )
+            ).all()
+            return [_cli_model_row(model, provider) for model, provider in rows]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc

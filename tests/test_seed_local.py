@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 
 from lumen.scripts.seed_local import (
     _LOCAL_KEY_SCOPES,
@@ -54,6 +55,8 @@ def test_required_scope_rotation_predicate() -> None:
     assert {"compat:images:write", "compat:audio:write", "compat:realtime:write"} <= set(_LOCAL_KEY_SCOPES)
     assert {"native:images:write", "native:audio:write", "native:realtime:write",
             "native:assets:read", "native:assets:write"} <= set(_LOCAL_KEY_SCOPES)
+    assert {"native:batches:read", "native:batches:write", "compat:batches:read", "compat:batches:write",
+            "compat:files:read", "compat:files:write"} <= set(_LOCAL_KEY_SCOPES)
 
     # Complete current scopes -> satisfied
     assert is_scope_satisfied(_LOCAL_KEY_SCOPES, _LOCAL_KEY_SCOPES) is True
@@ -78,16 +81,16 @@ def test_required_scope_rotation_predicate() -> None:
 
 def test_seed_key_current_requires_local_owner_project_and_scopes() -> None:
     current = {
-        "user_id": "local-console-user",
-        "project_id": "local-console-project",
+        "user_id": "keystone-owner-id",
+        "project_id": "keystone-project-id",
         "api_key_id": 1,
         "scopes": tuple(_LOCAL_KEY_SCOPES),
     }
-    assert is_seed_key_current(current) is True
-    assert is_seed_key_current({**current, "user_id": "foreign-user"}) is False
-    assert is_seed_key_current({**current, "project_id": "foreign-project"}) is False
-    assert is_seed_key_current({**current, "scopes": ("models:read",)}) is False
-    assert is_seed_key_current(None) is False
+    assert is_seed_key_current(current, "keystone-owner-id", "keystone-project-id") is True
+    assert is_seed_key_current({**current, "user_id": "foreign-user"}, "keystone-owner-id", "keystone-project-id") is False
+    assert is_seed_key_current({**current, "project_id": "foreign-project"}, "keystone-owner-id", "keystone-project-id") is False
+    assert is_seed_key_current({**current, "scopes": ("models:read",)}, "keystone-owner-id", "keystone-project-id") is False
+    assert is_seed_key_current(None, "keystone-owner-id", "keystone-project-id") is False
 
 
 def test_write_connection_manifest_schema_and_permissions(tmp_path: Path) -> None:
@@ -239,6 +242,13 @@ def _setup_seed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, providers: dict
     from lumen.scripts import seed_local
 
     monkeypatch.setenv("DATABASE_URL", "mysql+aiomysql://lumen:lumen@localhost/lumen")
+    from lumen.service_authority import SERVICE_CAPABILITIES
+
+    monkeypatch.setenv("LUMEN_LOCAL_OWNER_USER_ID", "keystone-owner-id")
+    monkeypatch.setenv("LUMEN_LOCAL_OWNER_PROJECT_ID", "keystone-project-id")
+    monkeypatch.setattr(seed_local, "resolve_project_authority", AsyncMock(return_value={
+        "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False,
+    }))
     monkeypatch.setenv("LUMEN_LOCAL_SEED_PATH", str(tmp_path / "api-key"))
     monkeypatch.setenv("LUMEN_LOCAL_CONNECTION_PATH", str(tmp_path / "connection.json"))
     for name in ("OPENAI_API_KEY", "GEMINI_API_KEY", "LUMEN_LOCAL_PROVIDER_BASE_URL",
@@ -260,6 +270,57 @@ def _setup_seed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, providers: dict
     monkeypatch.setattr(seed_local.api_key_store, "verify_key", AsyncMock(return_value=None))
     monkeypatch.setattr(seed_local.api_key_store, "create_key", AsyncMock(return_value={"key": "sk-afgl-new"}))
     return seed_local, bootstrap, create_provider, create_model, update_provider
+
+
+@pytest.mark.parametrize("missing", ["LUMEN_LOCAL_OWNER_USER_ID", "LUMEN_LOCAL_OWNER_PROJECT_ID"])
+async def test_seed_requires_explicit_real_owner_before_provider_changes(monkeypatch, tmp_path, missing):
+    local, bootstrap, create_provider, create_model, _ = _setup_seed(monkeypatch, tmp_path, {}, [])
+    monkeypatch.delenv(missing)
+    with pytest.raises(RuntimeError, match=missing):
+        await local.seed()
+    local.resolve_project_authority.assert_not_awaited()
+    bootstrap.assert_not_awaited()
+    create_provider.assert_not_awaited()
+    create_model.assert_not_awaited()
+    local.api_key_store.create_key.assert_not_awaited()
+    assert not (tmp_path / "api-key").exists()
+
+
+@pytest.mark.parametrize("authority", [
+    {"roles": ["member"], "is_system_admin": False},
+    {"roles": ["member", "lumen-keys_editor", "lumen-chat_user"], "is_system_admin": False},
+    HTTPException(status_code=403, detail="membership removed"),
+    HTTPException(status_code=503, detail="Keystone unavailable"),
+])
+async def test_seed_rejects_unusable_owner_before_provider_changes(monkeypatch, tmp_path, authority):
+    local, bootstrap, create_provider, create_model, _ = _setup_seed(monkeypatch, tmp_path, {}, [])
+    if isinstance(authority, Exception):
+        local.resolve_project_authority.side_effect = authority
+    else:
+        local.resolve_project_authority.return_value = authority
+    with pytest.raises(RuntimeError, match="current Keystone"):
+        await local.seed()
+    local.resolve_project_authority.assert_awaited_once_with("keystone-owner-id", "keystone-project-id")
+    bootstrap.assert_not_awaited()
+    create_provider.assert_not_awaited()
+    create_model.assert_not_awaited()
+    local.api_key_store.create_key.assert_not_awaited()
+    assert not (tmp_path / "connection.json").exists()
+
+
+async def test_seed_rotates_owned_outdated_key_with_current_delete_scope(monkeypatch, tmp_path):
+    local, _, _, _, _ = _setup_seed(monkeypatch, tmp_path, {}, [])
+    (tmp_path / "api-key").write_text("sk-afgl-old\n")
+    local.api_key_store.verify_key.return_value = {
+        "user_id": "keystone-owner-id", "project_id": "keystone-project-id",
+        "api_key_id": 7, "scopes": ("models:read",),
+    }
+    revoke = AsyncMock()
+    monkeypatch.setattr(local.api_key_store, "revoke_key", revoke)
+    await local.seed()
+    revoke.assert_awaited_once_with(7, "keystone-owner-id", "keystone-project-id")
+    local.api_key_store.create_key.assert_awaited_once()
+    assert (tmp_path / "api-key").read_text() == "sk-afgl-new\n"
 
 
 @pytest.mark.asyncio
@@ -331,7 +392,7 @@ async def test_seed_custom_fake_route_and_rotates_missing_media_scopes(
     old_key = tmp_path / "api-key"
     old_key.write_text("sk-afgl-legacy\n")
     local.api_key_store.verify_key.return_value = {
-        "user_id": "local-console-user", "project_id": "local-console-project", "api_key_id": 7,
+        "user_id": "keystone-owner-id", "project_id": "keystone-project-id", "api_key_id": 7,
         "scopes": tuple(scope for scope in _LOCAL_KEY_SCOPES if scope != "native:assets:read"),
     }
     revoke = AsyncMock()
@@ -340,8 +401,9 @@ async def test_seed_custom_fake_route_and_rotates_missing_media_scopes(
     create_provider.assert_not_awaited()
     assert create_model.await_args.kwargs["provider_id"] == 3
     assert create_model.await_args.kwargs["model_name"] == "fake-gpt-4"
-    revoke.assert_awaited_once_with(7, "local-console-user", "local-console-project")
+    revoke.assert_awaited_once_with(7, "keystone-owner-id", "keystone-project-id")
     assert "native:assets:read" in local.api_key_store.create_key.await_args.args[3]
+    assert local.api_key_store.create_key.await_args.args[:2] == ("keystone-owner-id", "keystone-project-id")
     assert old_key.read_text() == "sk-afgl-new\n"
     assert json.loads((tmp_path / "connection.json").read_text())["model"] == "fake-gpt-4"
 

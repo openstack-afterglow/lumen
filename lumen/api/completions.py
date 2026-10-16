@@ -15,11 +15,11 @@ import logging
 from time import monotonic
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
-from lumen.auth import Principal, require_scopes
+from lumen.auth import Principal, ensure_scopes, get_principal, require_scopes
 from lumen.config import get_settings
 from lumen.models.chat_contracts import (
     AgentBudget,
@@ -46,6 +46,7 @@ from lumen.services.chat_admission import (
 )
 from lumen.services.durable_runs import admission, common, interactions, lifecycle, queries
 from lumen.services.durable_runs import errors as durable_errors
+from lumen.services.infrastructure.api_load import admit_sse
 from lumen.services.run_store import NONTERMINAL
 
 logger = logging.getLogger(__name__)
@@ -1141,8 +1142,10 @@ def _cursor(last_event_id: str | None, after_seq: int | None, run_id: str) -> in
 
 
 @router.get("/runs/{run_id}/events")
+@admit_sse
 async def run_events(
     run_id: str,
+    request: Request,
     after_seq: int | None = Query(default=None, ge=0),
     last_event_id: str | None = Header(default=None),
     token_info: Principal = Depends(require_scopes("native:runs:read")),
@@ -1281,8 +1284,12 @@ async def resolve_run_interaction(
 
 
 @router.post("/runs/{run_id}/cancel")
-async def cancel_run(run_id: str, token_info: Principal = Depends(require_scopes("native:runs:write"))):
+async def cancel_run(run_id: str, token_info: Principal = Depends(get_principal)):
     try:
+        scopes = await queries.owned_run_cancel_scopes(
+            run_id=run_id, project_id=token_info["project_id"], user_id=token_info["user_id"]
+        )
+        ensure_scopes(token_info, *scopes)
         return await lifecycle.request_cancelled(
             run_id=run_id, project_id=token_info["project_id"], user_id=token_info["user_id"]
         )

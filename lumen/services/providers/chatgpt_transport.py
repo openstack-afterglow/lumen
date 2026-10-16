@@ -283,8 +283,13 @@ async def acompletion(
     credential: dict,
     stream: bool,
     optional_params: dict,
+    single_attempt: bool = False,
 ) -> Any:
-    """Execute one ChatGPT subscription request without process-global auth state."""
+    """Execute one ChatGPT subscription request without process-global auth state.
+
+    ``single_attempt`` (durable Batch) never re-sends the POST after a
+    connection error, so an ambiguous delivery stays a single provider request.
+    """
     canonical_model = litellm_model_name(canonical_subscription_model_name(model, "chatgpt_device"))
     access_token = _credential_value(credential, "access_token")
     account_id = _credential_value(credential, "account_id")
@@ -334,7 +339,12 @@ async def acompletion(
     if not isinstance(input_items, (str, list)):
         raise ProviderSubscriptionError("subscription_auth_invalid_response", 502)
 
-    http_client = _StrictAsyncHTTPHandler(timeout=_REQUEST_TIMEOUT, ssl_verify=True)
+    if single_attempt:
+        from lumen.services.litellm_client import single_attempt_http_handler
+
+        http_client = single_attempt_http_handler(_StrictAsyncHTTPHandler, timeout=_REQUEST_TIMEOUT, ssl_verify=True)
+    else:
+        http_client = _StrictAsyncHTTPHandler(timeout=_REQUEST_TIMEOUT, ssl_verify=True)
     try:
         raw_stream = await BaseLLMHTTPHandler().async_response_api_handler(
             model=canonical_model,

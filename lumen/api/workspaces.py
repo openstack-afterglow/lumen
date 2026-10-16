@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from lumen.auth import get_token_info
+from lumen.auth import require_scopes
 from lumen.services import workspace_store as ws
 
 router = APIRouter()
@@ -36,7 +36,7 @@ def _map_error(exc: Exception) -> HTTPException:
 
 
 @router.post("/workspaces", status_code=201)
-async def create_workspace(payload: WorkspaceCreate, token_info: dict = Depends(get_token_info)):
+async def create_workspace(payload: WorkspaceCreate, token_info: dict = Depends(require_scopes("native:conversations:write"))):
     try:
         return await ws.create_workspace(owner_user_id=token_info["user_id"], **payload.model_dump())
     except (ws.WorkspaceValidationError, ws.ChatStorageUnavailable) as exc:
@@ -44,7 +44,7 @@ async def create_workspace(payload: WorkspaceCreate, token_info: dict = Depends(
 
 
 @router.get("/workspaces")
-async def list_workspaces(token_info: dict = Depends(get_token_info)):
+async def list_workspaces(token_info: dict = Depends(require_scopes("native:conversations:read"))):
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
         return await ws.list_workspaces(user_id=token_info["user_id"])
@@ -53,7 +53,7 @@ async def list_workspaces(token_info: dict = Depends(get_token_info)):
 
 
 @router.get("/workspaces/{workspace_id}")
-async def get_workspace(workspace_id: int, token_info: dict = Depends(get_token_info)):
+async def get_workspace(workspace_id: int, token_info: dict = Depends(require_scopes("native:conversations:read"))):
     try:
         return await ws.get_workspace(workspace_id, user_id=token_info["user_id"])
     except (ws.WorkspaceNotFound, ws.WorkspaceForbidden, ws.ChatStorageUnavailable) as exc:
@@ -61,7 +61,7 @@ async def get_workspace(workspace_id: int, token_info: dict = Depends(get_token_
 
 
 @router.patch("/workspaces/{workspace_id}")
-async def update_workspace(workspace_id: int, payload: WorkspaceUpdate, token_info: dict = Depends(get_token_info)):
+async def update_workspace(workspace_id: int, payload: WorkspaceUpdate, token_info: dict = Depends(require_scopes("native:conversations:write"))):
     try:
         return await ws.update_workspace(
             workspace_id, user_id=token_info["user_id"], patch=payload.model_dump(exclude_unset=True)
@@ -71,7 +71,7 @@ async def update_workspace(workspace_id: int, payload: WorkspaceUpdate, token_in
 
 
 @router.delete("/workspaces/{workspace_id}", status_code=204)
-async def delete_workspace(workspace_id: int, token_info: dict = Depends(get_token_info)):
+async def delete_workspace(workspace_id: int, token_info: dict = Depends(require_scopes("native:conversations:delete"))):
     try:
         await ws.delete_workspace(workspace_id, user_id=token_info["user_id"])
     except (ws.WorkspaceNotFound, ws.WorkspaceForbidden, ws.ChatStorageUnavailable) as exc:

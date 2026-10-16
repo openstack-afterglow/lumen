@@ -13,6 +13,7 @@ from lumen.config import get_settings
 from lumen.services import credit
 from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.durable_runs.realtime import admit_realtime_session, run_realtime_session
+from lumen.services.infrastructure.api_load import admit_websocket
 from lumen.services.providers.errors import ProviderValidationError
 
 router = APIRouter()
@@ -67,6 +68,7 @@ async def create_session(
 
 
 @router.websocket("/chat/realtime/sessions/{session_id}/ws")
+@admit_websocket
 async def realtime_socket(websocket: WebSocket, session_id: UUID):
     if not origin_allowed(websocket):
         await websocket.close(code=4403)

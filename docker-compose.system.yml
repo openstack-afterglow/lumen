@@ -3,9 +3,144 @@ x-fake-provider-keys: &fake-provider-keys
   OPENAI_API_KEY: fake-provider-key
   GEMINI_API_KEY: ""
 
+# This bundle exists only in the disposable system stack. Never disable TLS verification.
+x-test-trust: &test-trust
+  SSL_CERT_FILE: /trust/ca-bundle.pem
+  REQUESTS_CA_BUNDLE: /trust/ca-bundle.pem
+  AWS_CA_BUNDLE: /trust/ca-bundle.pem
+  LITELLM_LOCAL_MODEL_COST_MAP: "True"
+
+# Media transports deliberately ignore environment proxy/CA overrides. Install the
+# mounted test CA into certifi's default bundle only in these disposable containers.
+x-worker-command: &worker-command
+  - /bin/sh
+  - -ec
+  - >-
+    cp /trust/ca-bundle.pem "$$(python -c 'import certifi; print(certifi.where())')";
+    exec python -m lumen.worker
+
+x-worker-health: &worker-health
+  test:
+    - CMD
+    - python
+    - -c
+    - >-
+      import socket, pymysql;
+      c = pymysql.connect(host='mariadb', user='lumen', password='lumen', database='lumen', connect_timeout=3);
+      q = c.cursor();
+      q.execute('SELECT COUNT(*) FROM chat_worker_registrations WHERE worker_identity=%s AND accepting=1 AND heartbeat_at > UTC_TIMESTAMP() - INTERVAL 30 SECOND', (socket.gethostname() + ':1',));
+      assert q.fetchone()[0] == 1
+  interval: 3s
+  timeout: 5s
+  start_period: 30s
+  retries: 20
+
 services:
+  # Fresh CA and leaf keys per compose project; only public CA bytes reach API/workers/tests.
+  # All keys and objects disappear with the canonical `down -v` teardown.
+  test-ca:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: lumen-test
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    user: root
+    networks: [isolated]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        mkdir -p /trust /tls/provider /tls/minio
+        openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+          -keyout /tmp/ca.key -out /trust/ca-bundle.pem -subj '/CN=Lumen isolated system CA' \
+          -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign'
+        for service in provider minio; do
+          if [ "$$service" = provider ]; then
+            sans='DNS:api.openai.com,DNS:generativelanguage.googleapis.com,DNS:fake-provider,DNS:localhost'
+          else
+            sans='DNS:minio,DNS:localhost,IP:127.0.0.1'
+          fi
+          openssl req -new -newkey rsa:2048 -nodes -keyout /tls/$$service/private.key \
+            -out /tmp/$$service.csr -subj "/CN=$$service"
+          printf 'subjectAltName=%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' "$$sans" > /tmp/$$service.ext
+          openssl x509 -req -in /tmp/$$service.csr -CA /trust/ca-bundle.pem -CAkey /tmp/ca.key \
+            -CAcreateserial -out /tls/$$service/public.crt -days 2 -extfile /tmp/$$service.ext
+          chmod 755 /tls/$$service
+          chmod 644 /tls/$$service/public.crt /tls/$$service/private.key
+        done
+        chmod 755 /trust
+        chmod 644 /trust/ca-bundle.pem
+        rm -f /tmp/ca.key /tmp/provider.csr /tmp/provider.ext /tmp/minio.csr /tmp/minio.ext /trust/ca-bundle.srl
+    volumes:
+      - system-test-ca:/trust
+      - system-provider-tls:/tls/provider
+      - system-minio-tls:/tls/minio
+
+  minio:
+    # Public MinIO image repositories are unavailable. Build from the official
+    # versioned release assets with per-architecture checksums (no runtime fetch).
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM debian:12-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+        ARG TARGETARCH
+        RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+            && rm -rf /var/lib/apt/lists/*
+        RUN set -eu; \
+            case "$${TARGETARCH}" in \
+              amd64) sha=53e2a2cb16c5366ea6fbbc479c19ddb4c6a0948273e752f740fb1fbf27bb817c ;; \
+              arm64) sha=6c2f3142c94240206123177f4ba1e360daa5d1e0a4962e90757ef4f92c3ab57c ;; \
+              *) echo "Unsupported MinIO architecture: $${TARGETARCH}" >&2; exit 1 ;; \
+            esac; \
+            curl --fail --location --retry 3 \
+              "https://github.com/minio/minio/releases/download/RELEASE.2025-04-22T22-12-26Z/minio.linux-$${TARGETARCH}.RELEASE.2025-04-22T22-12-26Z" \
+              --output /usr/local/bin/minio; \
+            printf '%s  /usr/local/bin/minio\n' "$$sha" | sha256sum --check -; \
+            chmod 755 /usr/local/bin/minio
+        ENTRYPOINT ["/usr/local/bin/minio"]
+    command: ["server", "/data", "--certs-dir", "/tls/minio", "--console-address", ":9001"]
+    networks: [isolated]
+    environment:
+      MINIO_ROOT_USER: system-minio
+      MINIO_ROOT_PASSWORD: system-minio-password-only
+      MINIO_BROWSER: "off"
+    depends_on:
+      test-ca:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--cacert", "/trust/ca-bundle.pem", "-fsS", "https://localhost:9000/minio/health/ready"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - system-minio:/data
+      - system-minio-tls:/tls/minio:ro
+      - system-test-ca:/trust:ro
+
+  clamav:
+    # Official multi-arch image includes signatures. Never download databases during tests.
+    image: clamav/clamav-debian:1.4.3@sha256:1d261f9c83ef2bbeef3915c7792f125e5707500fde0019d53547461747b90374
+    networks: [isolated]
+    environment:
+      CLAMAV_NO_FRESHCLAMD: "true"
+      # Accept the 200MB JSONL input contract and these synthetic result files.
+      # Oversized content must fail scan, never be silently accepted as clean.
+      CLAMD_CONF_StreamMaxLength: 512M
+      CLAMD_CONF_MaxFileSize: 512M
+      CLAMD_CONF_MaxScanSize: 512M
+      CLAMD_CONF_AlertExceedsMax: "yes"
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 5s
+      timeout: 5s
+      start_period: 6m
+      retries: 24
+
   mariadb:
     image: mariadb:11
+    # Host pytest uses published ports; only these data services are dual-homed.
+    networks: [default, isolated]
     environment:
       MYSQL_DATABASE: lumen
       MYSQL_USER: lumen
@@ -13,9 +148,10 @@ services:
       MYSQL_ROOT_PASSWORD: local-root-only
     healthcheck:
       test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
-      interval: 3s
+      interval: 2s
       timeout: 5s
-      retries: 20
+      start_period: 5s
+      retries: 50
     ports:
       - "127.0.0.1:${MARIADB_PORT:-33306}:3306"
     volumes:
@@ -24,27 +160,50 @@ services:
 
   redis:
     image: redis:7
+    networks: [default, isolated]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 3s
+      interval: 2s
       timeout: 5s
-      retries: 20
+      start_period: 5s
+      retries: 50
     ports:
       - "127.0.0.1:${REDIS_PORT:-36379}:6379"
 
   # Real PostgreSQL for the encrypted protocol-v2 LangGraph checkpointer. Ordinary v1 smoke
   # keeps running without it; the agent-runtime scenarios below require it.
   postgres:
-    image: pgvector/pgvector:0.8.6-pg16
+    image: pgvector/pgvector:0.8.6-pg16@sha256:a36250871de0833b8757561c72f2477ef1ddd1101afa4e617fb552e0de514c6b
+    networks: [isolated]
     environment:
       POSTGRES_DB: lumen
       POSTGRES_USER: lumen
       POSTGRES_PASSWORD: lumen
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lumen -d lumen"]
-      interval: 3s
+      interval: 2s
       timeout: 5s
-      retries: 20
+      start_period: 5s
+      retries: 50
+
+  # Explicit synthetic directory boundary; no production auth fallback or host credentials.
+  fake-keystone:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: lumen-test
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    command: ["python", "tests/system/fake_keystone.py"]
+    environment:
+      PORT: "5000"
+    networks: [isolated]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/health"]
+      interval: 2s
+      timeout: 5s
+      start_period: 5s
+      retries: 50
 
   fake-provider:
     build:
@@ -56,11 +215,26 @@ services:
     command: ["python", "tests/system/fake_openai.py"]
     environment:
       PORT: "8080"
+      HTTPS_PORT: "443"
+      TLS_CERT_FILE: /tls/provider/public.crt
+      TLS_KEY_FILE: /tls/provider/private.key
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    depends_on:
+      test-ca:
+        condition: service_completed_successfully
+    volumes:
+      - system-provider-tls:/tls/provider:ro
+      - system-test-ca:/trust:ro
+    networks:
+      isolated:
+        aliases: [api.openai.com, generativelanguage.googleapis.com]
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
-      interval: 3s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health && curl --cacert /trust/ca-bundle.pem -fsS https://localhost/health"]
+      interval: 2s
       timeout: 5s
-      retries: 20
+      start_period: 5s
+      retries: 50
 
   migrate:
     build:
@@ -70,8 +244,28 @@ services:
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
     command: ["lumen-migrate", "--apply"]
+    networks: [isolated]
     environment: &lumen-environment
       DATABASE_URL: mysql+aiomysql://lumen:lumen@mariadb:3306/lumen
+      KEYSTONE_AUTH_URL: http://fake-keystone:5000/v3
+      KEYSTONE_ADMIN_USERNAME: synthetic-directory
+      KEYSTONE_ADMIN_PASSWORD: synthetic-directory-password
+      KEYSTONE_ADMIN_PROJECT: synthetic-directory-project
+      KEYSTONE_DOMAIN: Default
+      <<: *test-trust
+      BATCH_ENABLED: "true"
+      CHAT_ASSET_S3_ENDPOINT: https://minio:9000
+      CHAT_ASSET_S3_BUCKET: system-assets
+      CHAT_ASSET_S3_ACCESS_KEY: system-minio
+      CHAT_ASSET_S3_SECRET_KEY: system-minio-password-only
+      CHAT_ASSET_S3_REGION: us-east-1
+      CHAT_ASSET_S3_SERVER_SIDE_ENCRYPTION: none
+      CHAT_CLAMAV_HOST: clamav
+      CHAT_CLAMAV_PORT: "3310"
+      LUMEN_BOOTSTRAP_MODELS_JSON: >-
+        [{"provider":"openai","model_name":"gpt-image-1","model_kind":"image","media_pricing":{"image_variants":{"1024x1024:high":"0.05"}}},
+         {"provider":"openai","model_name":"tts-1","model_kind":"tts","media_pricing":{"billing_basis":"characters","audio_per_character":"0.000015"}},
+         {"provider":"openai","model_name":"whisper-1","model_kind":"stt","media_pricing":{"audio_input_per_minute":"0.006"}}]
       REDIS_URL: redis://redis:6379/0
       LUMEN_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       CHAT_API_HOSTS: localhost,127.0.0.1,lumen-api
@@ -91,6 +285,10 @@ services:
     depends_on:
       mariadb:
         condition: service_healthy
+      test-ca:
+        condition: service_completed_successfully
+    volumes:
+      - system-test-ca:/trust:ro
 
   seed-local:
     build:
@@ -100,6 +298,7 @@ services:
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
     command: ["lumen-seed-local"]
+    networks: [isolated]
     environment:
       <<: [*lumen-environment, *fake-provider-keys]
       LUMEN_LOCAL_PROVIDER_NAME: fake-openai
@@ -108,6 +307,8 @@ services:
       LUMEN_LOCAL_INPUT_PRICE_PER_MILLION: "1"
       LUMEN_LOCAL_MODEL: ${LUMEN_LOCAL_MODEL:-fake-gpt-4}
       LUMEN_LOCAL_CONTEXT_LIMIT: "16384"
+      LUMEN_LOCAL_OWNER_USER_ID: system-owner
+      LUMEN_LOCAL_OWNER_PROJECT_ID: system-project
       LUMEN_LOCAL_SEED_PATH: /seed/api-key
       LUMEN_LOCAL_CONNECTION_PATH: /seed/connection.json
       LUMEN_LOCAL_PUBLIC_BASE_URL: http://127.0.0.1:8012/v1
@@ -115,18 +316,30 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      test-ca:
+        condition: service_completed_successfully
       fake-provider:
+        condition: service_healthy
+      fake-keystone:
         condition: service_healthy
     volumes:
       - system-seed:/seed
+      - system-test-ca:/trust:ro
 
   lumen-api:
+    networks: [isolated]
     build:
       context: .
       dockerfile: docker/Dockerfile
       target: lumen-api
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        cp /trust/ca-bundle.pem "$$(python -c 'import certifi; print(certifi.where())')";
+        exec uvicorn lumen.main:app --host 0.0.0.0 --port 8012
     environment:
       <<: [*lumen-environment, *fake-provider-keys]
     depends_on:
@@ -136,21 +349,31 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8012/v1/health || exit 1"]
-      interval: 3s
+      interval: 2s
       timeout: 5s
-      retries: 20
+      start_period: 5s
+      retries: 50
+    volumes:
+      - system-test-ca:/trust:ro
 
   lumen-worker:
+    networks: [isolated]
     build:
       context: .
       dockerfile: docker/Dockerfile
       target: lumen-worker
       args:
         AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    command: *worker-command
     environment:
       <<: [*lumen-environment, *fake-provider-keys]
+      WORKER_WORKLOAD_CLASSES: '["online_text","online_media"]'
     depends_on:
       seed-local:
         condition: service_completed_successfully
@@ -158,12 +381,47 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
+    healthcheck: *worker-health
+    volumes:
+      - system-test-ca:/trust:ro
+
+  lumen-batch-worker:
+    networks: [isolated]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: lumen-worker
+      args:
+        AFTERGLOW_CRYPTO_REF: ${AFTERGLOW_CRYPTO_REF:-}
+    command: *worker-command
+    environment:
+      <<: [*lumen-environment, *fake-provider-keys]
+      WORKER_WORKLOAD_CLASSES: '["batch"]'
+    depends_on:
+      seed-local:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
+    healthcheck: *worker-health
+    volumes:
+      - system-test-ca:/trust:ro
 
   # Manual development-only controller profile, not part of lumen-test system.
   # Requires explicit runtime config, TLS and a built sandbox image on a disposable Docker host.
   # The Docker socket is never mounted in production; this profile is not cloud/isolation acceptance.
   lumen-controller:
     profiles: ["agent-runtime"]
+    networks: [isolated]
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -175,7 +433,7 @@ services:
       <<: *lumen-environment
       LUMEN_CONTROLLER_PROVIDER_FACTORY: tests.system.docker_provider:create
       LUMEN_SANDBOX_IMAGE: ${LUMEN_SANDBOX_IMAGE:-lumen-sandbox:system}
-      LUMEN_SYSTEM_NETWORK: ${COMPOSE_PROJECT_NAME:-lumen-system}_default
+      LUMEN_SYSTEM_NETWORK: ${COMPOSE_PROJECT_NAME:-lumen-system}_isolated
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -186,6 +444,7 @@ services:
       - system-runtime-tls:/etc/lumen/runtime
 
   system-tests:
+    networks: [isolated]
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -195,6 +454,9 @@ services:
     command: ["pytest", "-m", "system", "tests/system"]
     environment:
       LUMEN_API_BASE_URL: http://lumen-api:8012
+      <<: *test-trust
+      LUMEN_FAKE_PROVIDER_URL: http://fake-provider:8080
+      LUMEN_FAKE_KEYSTONE_URL: http://fake-keystone:5000
       LUMEN_SEED_KEY_FILE: /seed/api-key
       LUMEN_CONNECTION_FILE: /seed/connection.json
       LUMEN_MODEL_NAME: fake-gpt-4
@@ -206,11 +468,26 @@ services:
       lumen-api:
         condition: service_healthy
       lumen-worker:
-        condition: service_started
+        condition: service_healthy
+      lumen-batch-worker:
+        condition: service_healthy
     volumes:
       - system-seed:/seed:ro
+      - system-test-ca:/trust:ro
 
 volumes:
   system-mariadb:
   system-seed:
   system-runtime-tls:
+  system-test-ca:
+  system-provider-tls:
+  system-minio-tls:
+  system-minio:
+
+# DNS aliases intercept hard-coded providers. API/workers/tests/provider/storage are
+# isolated from public egress. MariaDB/Redis also join the ordinary default network
+# so host integration pytest can use their loopback-only published ports.
+networks:
+  default: {}
+  isolated:
+    internal: true

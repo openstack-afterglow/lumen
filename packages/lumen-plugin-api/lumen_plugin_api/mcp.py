@@ -12,6 +12,7 @@ from .contracts import ContractModel, ExecutionContext, Namespace, Plugin, Plugi
 from .tools import ToolBinding, ToolDefinition
 
 
+
 class McpSnapshot(ContractModel):
     authority: Literal["remote", "afterglow"]
     namespace: Namespace
@@ -53,8 +54,8 @@ class McpProvider(Plugin, Protocol):
 
 
 class McpRemoteProvider(McpProvider, Protocol):
-    async def list_tools(self, server: dict[str, Any]) -> list[dict[str, Any]]: ...
-    async def call_tool(self, server: dict[str, Any], name: str, arguments: dict[str, Any]) -> McpToolOutput: ...
+    async def list_tools(self, server: dict[str, Any], *, context: ExecutionContext | None = None) -> list[dict[str, Any]]: ...
+    async def call_tool(self, server: dict[str, Any], name: str, arguments: dict[str, Any], *, context: ExecutionContext, expected_credential_epoch: int | None) -> McpToolOutput: ...
 
 
 class McpConnection(ContractModel):

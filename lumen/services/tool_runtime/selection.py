@@ -56,11 +56,20 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
     from lumen.services import extensions_store as es
     from lumen.services import mcp_oauth
 
+    expected_credential_versions = dict(ctx.expected_mcp_credential_versions or ())
     try:
         # reveal_secrets=True: 실행에는 복호화된 실제 인증 헤더가 필요(API 응답용 마스킹 dict 아님).
         items = await es.list_for_user(
             "mcp", user_id=ctx.user_id, project_id=ctx.project_id, active_only=True, reveal_secrets=True
         )
+        # An OAuth execution needs admission's exact epoch before refresh/discovery.
+        items = [
+            server for server in items
+            if server.get("auth_mode") != "oauth" or (
+                type(expected_credential_versions.get(server.get("id"))) is int
+                and expected_credential_versions[server["id"]] > 0
+            )
+        ]
         # OAuth access tokens are per user/project. Public and administrator-approved
         # sources never accept user-provided secret variables.
         oauth_headers_by_server = (
@@ -68,7 +77,6 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
             if any(server.get("auth_mode") == "oauth" for server in items)
             else {}
         )
-        expected_credential_versions = dict(ctx.expected_mcp_credential_versions or ())
         credential_versions = (
             await es.mcp_credential_versions(
                 list(expected_credential_versions), user_id=ctx.user_id, project_id=ctx.project_id
@@ -103,6 +111,17 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
             continue
         usable.append(server)
     return _frozen_selection(_selected(usable, ctx.selected_mcp_ids), ctx, "mcp")
+
+
+def _mcp_config_fingerprint(server: dict) -> str:
+    """Freeze execution configuration and consent, excluding secrets and run headers."""
+    from lumen.services import extensions_store as es
+
+    return contracts._v2_config_fingerprint({
+        "selection": es.selection_fingerprint(server),
+        "effect_overrides": server.get("effect_overrides"),
+        "oauth_scopes": server.get("oauth_scopes"),
+    })
 
 
 def _mcp_schema(server_id: int, tool: dict) -> dict:
@@ -155,7 +174,11 @@ async def context_tool_schemas(ctx: ToolContext) -> list[dict]:
         from . import bindings
 
         dynamic_bindings = await bindings._legacy_dynamic_bindings(ctx)
-        return [*await tools.tool_schemas(), *(bindings._binding_schema(binding) for binding in dynamic_bindings.values())]
+        return [
+            *await tools.tool_schemas(),
+            *(bindings._binding_schema(binding) for binding in dynamic_bindings.values()
+              if binding.definition.source != "mcp" or binding.definition.effect == "read"),
+        ]
     schemas = await tools.tool_schemas()
     for name, enabled in (
         (managed._MANAGED_SEARCH_TOOL, ctx.managed_search),
@@ -173,6 +196,7 @@ async def context_tool_schemas(ctx: ToolContext) -> list[dict]:
         schemas.append({"type": "function", "function": function})
     for server in await _load_mcp(ctx):
         server_id = server.get("id")
-        for tool_def in await mcp_client.list_tools(server):
-            schemas.append(_mcp_schema(server_id, tool_def))
+        for tool_def in await mcp_client.list_tools(server, context=contracts.execution_context(ctx)):
+            if contracts._v2_effect((server.get("effect_overrides") or {}).get(tool_def["name"])) == "read":
+                schemas.append(_mcp_schema(server_id, tool_def))
     return schemas

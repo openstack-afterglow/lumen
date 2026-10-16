@@ -3,9 +3,11 @@
 completion_api 코어와 api_key_store.verify_key 를 monkeypatch 해 실제 litellm/DB 없이 검증한다.
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 
+import anyio
 import litellm
 import pytest
 from litellm.exceptions import BadRequestError
@@ -14,10 +16,14 @@ from lumen.api.compat import anthropic as an
 from lumen.api.compat import openai as oa
 from lumen.auth import get_principal
 from lumen.main import app
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import capabilities, litellm_client, openai_compat
 from lumen.services import completion_api as core
+from lumen.services.completion_format import nonstream_response
 
 _H = {"Authorization": "Bearer sk-afgl-test"}
+
+pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
 
 
 @pytest.fixture(autouse=True)
@@ -41,7 +47,7 @@ class TestOpenAITranslate:
             "completion_tokens": 2,
             "credited_cost": 0.1,
         }
-        r = oa.nonstream_response(result, cmpl_id="chatcmpl-x", created=1)
+        r = nonstream_response(result, cmpl_id="chatcmpl-x", created=1)
         assert r["object"] == "chat.completion"
         assert r["choices"][0]["message"]["content"] == "hi"
         assert r["usage"]["total_tokens"] == 5
@@ -56,7 +62,7 @@ class TestOpenAITranslate:
             "credited_cost": 0.0,
             "tool_calls": [{"id": "call_1", "function": {"name": "f", "arguments": "{}"}}],
         }
-        r = oa.nonstream_response(result, cmpl_id="c", created=1)
+        r = nonstream_response(result, cmpl_id="c", created=1)
         assert r["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "f"
 
     def test_chunk_dict(self):
@@ -180,6 +186,288 @@ class TestCompletionCoreContract:
         assert len(event_ids) == 2
         assert event_ids[0] == event_ids[1]
 
+    async def test_chat_stream_close_at_delta_closes_upstream_and_bills_once(self, monkeypatch):
+        upstream = {"closed": False}
+
+        async def fake_provider_stream(*_args, **_kwargs):
+            async def chunks():
+                try:
+                    for text in ("first", "second"):
+                        yield SimpleNamespace(usage=None, choices=[SimpleNamespace(
+                            delta=SimpleNamespace(content=text, reasoning_content=None, tool_calls=None),
+                            finish_reason=None,
+                        )])
+                finally:
+                    upstream["closed"] = True
+
+            return chunks()
+
+        billed = []
+
+        async def fake_bill(_resolved, _messages, text, _usage, *, event_id, **_kwargs):
+            billed.append((text, event_id))
+            return 1, 1, 0.0
+
+        monkeypatch.setattr(core.litellm_client, "acompletion_stream", fake_provider_stream)
+        monkeypatch.setattr(core, "_bill", fake_bill)
+        stream = core.complete_stream(
+            resolved={"model_name": "test-model", "margin_multiplier": 1},
+            messages=[{"role": "user", "content": "hello"}],
+            user_id="u1", project_id="p1", api_key_id=7, max_tokens=32, temperature=None,
+        )
+        assert (await anext(stream))["content"] == "first"
+        await stream.aclose()  # client disconnect while suspended at a delta yield
+
+        assert upstream["closed"] is True
+        assert [text for text, _ in billed] == ["first"]
+
+    async def test_chat_stream_disconnect_cancel_at_upstream_read_still_bills(self, monkeypatch):
+        # uvicorn ASGI 2.3 disconnect: an AnyIO scope cancel lands at the pending provider read.
+        read_blocked = asyncio.Event()
+        upstream = {"closed": False}
+
+        async def fake_provider_stream(*_args, **_kwargs):
+            async def chunks():
+                try:
+                    yield SimpleNamespace(usage=None, choices=[SimpleNamespace(
+                        delta=SimpleNamespace(content="first", reasoning_content=None, tool_calls=None),
+                        finish_reason=None,
+                    )])
+                    read_blocked.set()
+                    await anyio.sleep_forever()
+                finally:
+                    upstream["closed"] = True
+
+            return chunks()
+
+        billed = []
+
+        async def fake_bill(_resolved, _messages, text, _usage, **_kwargs):
+            await asyncio.sleep(0)
+            billed.append(text)
+            return 1, 1, 0.0
+
+        monkeypatch.setattr(core.litellm_client, "acompletion_stream", fake_provider_stream)
+        monkeypatch.setattr(core, "_bill", fake_bill)
+        scope_holder = []
+
+        async def consumer():
+            with anyio.CancelScope() as scope:
+                scope_holder.append(scope)
+                async for _event in core.complete_stream(
+                    resolved={"model_name": "test-model", "margin_multiplier": 1},
+                    messages=[{"role": "user", "content": "hello"}],
+                    user_id="u1", project_id="p1", api_key_id=7, max_tokens=32, temperature=None,
+                ):
+                    pass
+
+        task = asyncio.create_task(consumer())
+        try:
+            await asyncio.wait_for(read_blocked.wait(), 2)
+            scope_holder[0].cancel()
+            await asyncio.wait_for(task, 2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert upstream["closed"] is True
+        assert billed == ["first"]
+
+    async def test_responses_stream_close_releases_iterator_without_aclose_and_bills(self, monkeypatch):
+        class HttpxResponse:
+            closed = False
+
+            async def aclose(self):
+                self.closed = True
+
+        class LiteLLMResponsesIterator:  # LiteLLM's iterator exposes only its httpx response
+            def __init__(self):
+                self.response = HttpxResponse()
+                self.events = iter([
+                    {"type": "response.output_text.delta", "delta": "partial"},
+                    {"type": "response.output_text.delta", "delta": " more"},
+                ])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.events)
+                except StopIteration:
+                    raise StopAsyncIteration from None
+
+        upstream = LiteLLMResponsesIterator()
+
+        async def provider(**_kwargs):
+            return upstream
+
+        billed = []
+
+        async def fake_bill(_resolved, _messages, text, _usage, **_kwargs):
+            billed.append(text)
+            return 1, 1, 0.0
+
+        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
+        monkeypatch.setattr(core, "_bill", fake_bill)
+        events = await core.complete_responses(
+            resolved={"model_name": "gpt-5", "provider_type": "openai", "capabilities": {"reasoning": True}},
+            input="hello", stream=True, user_id="u1", project_id="p1", api_key_id=7, options={},
+        )
+        assert (await anext(events))["delta"] == "partial"
+        await events.aclose()
+
+        assert upstream.response.closed is True
+        assert billed == ["partial"]
+
+    async def test_never_iterated_responses_stream_closes_its_http_response(self, monkeypatch):
+        class HttpxResponse:
+            closed = False
+
+            async def aclose(self):
+                self.closed = True
+
+        class LiteLLMResponsesIterator:
+            response = HttpxResponse()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise AssertionError("an unstarted body must not read upstream")
+
+        upstream = LiteLLMResponsesIterator()
+
+        async def provider(**_kwargs):
+            return upstream
+
+        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
+        events = await core.complete_responses(
+            resolved={"model_name": "gpt-5", "provider_type": "openai", "capabilities": {"reasoning": True}},
+            input="hello", stream=True, user_id="u1", project_id="p1", api_key_id=7, options={},
+        )
+        await events.aclose()  # ASGI owner cleanup when the route body never started
+        await events.aclose()  # idempotent
+        assert upstream.response.closed is True
+
+    async def test_anthropic_stream_is_started_before_return_and_closes_unread(self, monkeypatch):
+        state = {"started": False, "closed": False}
+
+        async def provider(**_kwargs):
+            async def chunks():
+                state["started"] = True
+                try:
+                    yield {"type": "message_start", "message": {"usage": {"input_tokens": 3, "output_tokens": 0}}}
+                    yield {"type": "message_stop"}
+                finally:
+                    state["closed"] = True
+
+            return chunks()
+
+        async def fake_bill(*_args, **_kwargs):
+            return 1, 1, 0.0
+
+        monkeypatch.setattr(core.litellm_client, "aanthropic_messages", provider)
+        monkeypatch.setattr(core, "_with_passthrough_compaction", lambda options, **_kwargs: options)
+        monkeypatch.setattr(core, "_bill", fake_bill)
+        resolved = {"model_name": "claude-test", "provider_type": "anthropic"}
+        common = {"resolved": resolved, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16,
+                  "stream": True, "user_id": "u1", "project_id": "p1", "api_key_id": 7, "options": {}}
+
+        unread = await core.complete_anthropic(**common)
+        # LiteLLM releases its pooled connection on close only once the chain started.
+        assert state["started"] is True and state["closed"] is False
+        await unread.aclose()
+        assert state["closed"] is True
+
+        state.update(started=False, closed=False)
+        events = [event async for event in await core.complete_anthropic(**common)]
+        assert [event["type"] for event in events] == ["message_start", "message_stop"]
+
+    async def test_anthropic_first_event_failure_is_an_http_error(self, monkeypatch):
+        async def provider(**_kwargs):
+            async def chunks():
+                raise RuntimeError("private upstream detail")
+                yield  # pragma: no cover
+
+            return chunks()
+
+        monkeypatch.setattr(core.litellm_client, "aanthropic_messages", provider)
+        monkeypatch.setattr(core, "_with_passthrough_compaction", lambda options, **_kwargs: options)
+        with pytest.raises(core.CompletionError) as failure:
+            await core.complete_anthropic(
+                resolved={"model_name": "claude-test", "provider_type": "anthropic"},
+                messages=[{"role": "user", "content": "hi"}], max_tokens=16, stream=True,
+                user_id="u1", project_id="p1", api_key_id=7, options={},
+            )
+        assert (failure.value.status_code, failure.value.message) == (502, "upstream model error")
+
+    @pytest.mark.parametrize("failure", [RuntimeError("private upstream detail"),
+        core.errors.ProviderSubscriptionError("subscription_rate_limited", 429)])
+    async def test_anthropic_priming_failure_closes_provider_before_service_return(self, monkeypatch, failure):
+        import anyio
+
+        class Upstream:
+            closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise failure
+
+            async def aclose(self):
+                await anyio.sleep(0)
+                self.closed = True
+
+        upstream = Upstream()
+
+        async def provider(**_kwargs):
+            return upstream
+
+        monkeypatch.setattr(core.litellm_client, "aanthropic_messages", provider)
+        monkeypatch.setattr(core, "_with_passthrough_compaction", lambda options, **_kwargs: options)
+        with pytest.raises(core.CompletionError) as caught:
+            await core.complete_anthropic(
+                resolved={"model_name": "claude-test", "provider_type": "anthropic"},
+                messages=[{"role": "user", "content": "hi"}], max_tokens=16, stream=True,
+                user_id="u1", project_id="p1", api_key_id=7, options={},
+            )
+        assert caught.value.status_code == getattr(failure, "status_code", 502)
+        assert upstream.closed
+
+    async def test_cancelled_anthropic_priming_shields_provider_close(self, monkeypatch):
+        import anyio
+
+        class Upstream:
+            closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await anyio.sleep_forever()
+
+            async def aclose(self):
+                await anyio.sleep(0)
+                self.closed = True
+
+        upstream = Upstream()
+
+        async def provider(**_kwargs):
+            return upstream
+
+        monkeypatch.setattr(core.litellm_client, "aanthropic_messages", provider)
+        monkeypatch.setattr(core, "_with_passthrough_compaction", lambda options, **_kwargs: options)
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await core.complete_anthropic(
+                resolved={"model_name": "claude-test", "provider_type": "anthropic"},
+                messages=[{"role": "user", "content": "hi"}], max_tokens=16, stream=True,
+                user_id="u1", project_id="p1", api_key_id=7, options={},
+            )
+        assert upstream.closed
+
     async def test_public_resolver_maps_ambiguous_missing_and_storage_failures(self, monkeypatch):
         async def ambiguous(*_args, **_kwargs):
             raise core.errors.AmbiguousModelRouteError("ambiguous")
@@ -284,9 +572,9 @@ def _auth(monkeypatch):
             "user_id": "u1",
             "project_id": "p1",
             "api_key_id": 7,
-            "scopes": ("models:read", "compat:completions:write"),
+            "scopes": ("models:read", "compat:completions:write", "native:tools:execute"),
             "source": "api",
-            "roles": [],
+            "roles": ["member", *SERVICE_CAPABILITIES],
             "is_system_admin": False,
         }
 
@@ -1388,16 +1676,15 @@ class TestDiscoveryAndHostGate:
         assert " (" not in body["models_endpoint"]
 
     async def test_discovery_uses_configured_public_origin(self, client, monkeypatch):
-        from types import SimpleNamespace
+        from lumen.config import get_settings
 
-        monkeypatch.setattr(
-            "lumen.api.compat.discovery.get_settings",
-            lambda: SimpleNamespace(public_api_base="https://lumen.example"),
-        )
+        monkeypatch.setattr(get_settings(), "public_api_base", "https://lumen.example")
         body = (await client.get("/v1/compat")).json()
         assert body["profiles"]["openai_stateless"]["sdk_base_url"] == "https://lumen.example/v1"
         assert body["profiles"]["openai_lumen"]["sdk_base_url"] == "https://lumen.example/v1"
         assert body["profiles"]["lumen_native"]["sdk_base_url"] == "https://lumen.example"
+        assert body["batches"]["openai"]["batches"] == "https://lumen.example/v1/batches"
+        assert body["batches"]["native"]["batches"] == "https://lumen.example/v1/chat/batches"
 
     async def test_blocked_host_404(self, client, monkeypatch):
         from types import SimpleNamespace
@@ -1630,8 +1917,64 @@ class TestAnthropicEndpoint:
             json={"model": "claude", "max_tokens": 0, "messages": [{"role": "user", "content": "hi"}]},
             headers=_H,
         )
-        assert missing.status_code == 422
-        assert negative.status_code == 422
+        assert missing.status_code == 400
+        assert missing.json() == {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "max_tokens: Field required"},
+        }
+        assert negative.status_code == 400
+        assert negative.json()["error"]["message"].startswith("max_tokens: ")
+
+    @pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+    async def test_claude_code_safeguards_get_named_400_without_echo(self, client, _auth, monkeypatch, path):
+        # Claude Code auto mode retries without `safeguards` (and classifies locally) only after an
+        # HTTP 400 whose message names the field; the former 422 ended every auto-mode session.
+        async def forbidden(**_kwargs):
+            raise AssertionError("provider must not be called")
+
+        monkeypatch.setattr(core, "complete_anthropic", forbidden)
+        monkeypatch.setattr(core, "count_anthropic_tokens", forbidden)
+        body = {
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "safeguards": [{"type": "dangerous_tool_use", "classifier_context": {"home_dir": "/Users/private-home"}}],
+        }
+        if path == "/v1/messages":
+            body["max_tokens"] = 16
+        response = await client.post(
+            path,
+            json=body,
+            headers={**_H, "anthropic-beta": "dangerous-tool-use-2026-09-03"},
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "safeguards: Extra inputs are not permitted"},
+        }
+        assert response.headers["cache-control"] == "no-store"
+        assert "/Users/private-home" not in response.text
+
+    async def test_many_unknown_fields_preserve_safeguards_rejection_without_inputs(self, client, _auth):
+        unknown = {f"unknown_{index}": "private-value" for index in range(2048)}
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "claude",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+                **unknown,
+                "safeguards": [{"classifier_context": {"home_dir": "/private/classifier-context"}}],
+            },
+            headers=_H,
+        )
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        fields = [part.split(":", 1)[0] for part in error["message"].split("; ")]
+        assert fields == [*unknown, "safeguards"]
+        assert "private-value" not in response.text
+        assert "/private/classifier-context" not in response.text
 
 
 class TestResponsesEndpoint:

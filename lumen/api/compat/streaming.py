@@ -6,15 +6,17 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
-_BACKGROUND_DRAINS: set[asyncio.Task] = set()
+import anyio
+
+from lumen.services.infrastructure.api_load import close_stream_iterator
 
 
 async def _drain(pending: asyncio.Task, iterator: AsyncIterator[Any]) -> None:
     try:
         await pending
-        async for _ in iterator:
-            pass
-    except Exception:
+    except StopAsyncIteration:
+        return
+    async for _ in iterator:
         pass
 
 
@@ -36,7 +38,11 @@ async def events_with_ping(source: AsyncIterator[dict], *, ping_seconds: float =
             pending = None
             yield item
     finally:
-        if pending is not None:
-            drain = asyncio.create_task(_drain(pending, iterator))
-            _BACKGROUND_DRAINS.add(drain)
-            drain.add_done_callback(_BACKGROUND_DRAINS.discard)
+        # Disconnect stops delivery, not ownership of an already-started provider
+        # read or its settlement. Keep the ASGI owner alive until both complete.
+        with anyio.CancelScope(shield=True):
+            try:
+                if pending is not None:
+                    await _drain(pending, iterator)
+            finally:
+                await close_stream_iterator(iterator)

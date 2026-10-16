@@ -14,6 +14,7 @@ from lumen.models.chat_contracts import (
     UserAssetInputPart,
     validate_user_input_parts,
 )
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import capabilities, chat_admission, context_store, credit
 from lumen.services import conversation_store as cs
 from lumen.services.durable_runs import admission, common, queries
@@ -24,6 +25,7 @@ from lumen.services.providers import routing as ps
 _BASE = "/api/v1/chat/conversations"
 _HEADERS = {"Idempotency-Key": "d27ac16a-0e5b-465f-89cc-eefe6e9d0001"}
 
+pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
 
 def _request(text: str = "hello", **extra):
     return {"parts": [{"type": "text", "text": text}], "model_id": "gpt-3.5-turbo", "features": {}, **extra}
@@ -1366,7 +1368,7 @@ class TestApiKeyLimitAdmission:
                     "native:tools:execute",
                 ),
                 "source": "api",
-                "roles": [],
+                "roles": ["member", *SERVICE_CAPABILITIES],
                 "is_system_admin": False,
             }
 

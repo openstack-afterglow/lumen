@@ -150,6 +150,58 @@ class TestOpenAPIContract:
 
         _check_refs(schema)
 
+    def test_openapi_documents_batch_and_file_routes_with_scopes_and_bodies(self):
+        schema = app.openapi()
+        paths = schema["paths"]
+        schemas = schema["components"]["schemas"]
+        api_key_only = [{"APIKeyBearer": []}, {"XApiKey": []}]
+        expected = {
+            ("/v1/chat/batches", "post"): "native:batches:write",
+            ("/v1/chat/batches", "get"): "native:batches:read",
+            ("/v1/chat/batches/{batch_id}", "get"): "native:batches:read",
+            ("/v1/chat/batches/{batch_id}/items", "get"): "native:batches:read",
+            ("/v1/chat/batches/{batch_id}/cancel", "post"): "native:batches:write",
+            ("/v1/files", "post"): "compat:files:write",
+            ("/v1/files", "get"): "compat:files:read",
+            ("/v1/files/{file_id}", "get"): "compat:files:read",
+            ("/v1/files/{file_id}", "delete"): "compat:files:write",
+            ("/v1/files/{file_id}/content", "get"): "compat:files:read",
+            ("/v1/batches", "post"): "compat:batches:write",
+            ("/v1/batches", "get"): "compat:batches:read",
+            ("/v1/batches/{batch_id}", "get"): "compat:batches:read",
+            ("/v1/batches/{batch_id}/cancel", "post"): "compat:batches:write",
+        }
+        for (path, method), scope in expected.items():
+            operation = paths[path][method]
+            assert operation["x-required-api-key-scopes"] == [scope], (path, method)
+            if path.startswith(("/v1/files", "/v1/batches")):
+                assert operation["security"] == api_key_only, (path, method)
+            else:
+                assert {"KeystoneToken": []} in operation["security"], (path, method)
+
+        native_create = paths["/v1/chat/batches"]["post"]
+        assert native_create["requestBody"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/NativeBatchCreateRequest"
+        }
+        assert any(param["name"] == "Idempotency-Key" and param["required"] for param in native_create["parameters"])
+        assert native_create["x-conditional-api-key-scopes"]["operation images.edits"] == [
+            "native:images:write", "native:assets:read",
+        ]
+        assert "202" in native_create["responses"]
+        compat_create = paths["/v1/batches"]["post"]
+        assert compat_create["requestBody"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/OpenAIBatchCreateRequest"
+        }
+        assert compat_create["x-conditional-api-key-scopes"]["endpoint /v1/images/generations"] == ["compat:images:write"]
+        assert "multipart/form-data" in paths["/v1/files"]["post"]["requestBody"]["content"]
+        for name in ("NativeBatchCreateRequest", "NativeBatchItemRequest", "OpenAIBatchCreateRequest",
+                     "OutputExpiresAfter", "NativeBatchDescriptor", "NativeBatchPage", "NativeBatchItemPage",
+                     "OpenAIBatchObject", "OpenAIBatchList", "OpenAIFileObject", "OpenAIFileList", "OpenAIFileDeleted"):
+            assert name in schemas, name
+        batch_object = schemas["OpenAIBatchObject"]["properties"]
+        assert batch_object["created_at"]["type"] == "integer"
+        assert {"lumen_batch", "openai_batch"} <= set(schema["x-profiles"])
+
 
 class FakeAccessInfo:
     def __init__(
@@ -178,8 +230,15 @@ class FakeTokenPlugin:
         return self._access_info
 
 
+@pytest.fixture
+def current_authority(monkeypatch):
+    async def resolve(user_id, project_id):
+        return {"roles": ["member"], "is_system_admin": user_id == "sys-admin-1"}
+    monkeypatch.setattr(deps, "resolve_project_authority", resolve)
+
+
 @pytest.mark.parametrize("dependency", [deps.get_principal, deps.require_token])
-async def test_slow_keystone_validation_does_not_block_public_requests(dependency, monkeypatch):
+async def test_slow_keystone_validation_does_not_block_public_requests(dependency, monkeypatch, current_authority):
     started, release = Event(), Event()
 
     def validate(*_args, **_kwargs):
@@ -240,7 +299,9 @@ class TestKeystoneProjectScoping:
         assert info["roles"] == ["member", "admin"]
         assert info["auth_token"] == "rescoped-token-789"
 
-    async def test_scoped_keystone_token_propagation_in_get_principal_and_require_token(self, monkeypatch):
+    async def test_scoped_keystone_token_propagation_in_get_principal_and_require_token(
+        self, monkeypatch, current_project_authority
+    ):
         access_info = FakeAccessInfo(
             auth_token="rescoped-token-999",
             project_id="proj-777",
@@ -252,6 +313,7 @@ class TestKeystoneProjectScoping:
 
         monkeypatch.setattr("keystoneauth1.identity.v3.Token", lambda **kwargs: fake_token)
         monkeypatch.setattr("keystoneauth1.session.Session", lambda **kwargs: None)
+        monkeypatch.setattr(deps, "_is_system_admin", lambda user_id: False)
 
         from starlette.requests import Request
 
@@ -335,7 +397,7 @@ class TestKeystoneProjectScoping:
         assert principal["api_key_id"] == 42
         assert principal["scopes"] == ("read", "write")
 
-    async def test_keystone_bearer_token_support(self, monkeypatch):
+    async def test_keystone_bearer_token_support(self, monkeypatch, current_authority):
         monkeypatch.setattr(
             deps,
             "validate_token",
@@ -349,7 +411,7 @@ class TestKeystoneProjectScoping:
         assert info["token"] == "tok123"
         assert info["project_id"] == "p1"
 
-    async def test_system_admin_foreign_target_project_success(self, monkeypatch):
+    async def test_system_admin_foreign_target_project_success(self, monkeypatch, current_authority):
         access_info = FakeAccessInfo(
             auth_token="admin-rescoped-tok",
             project_id="home-proj",
@@ -432,7 +494,7 @@ class TestKeystoneProjectScoping:
             )
         assert ei.value.status_code == 403
 
-    async def test_system_admin_same_target_project_success(self, monkeypatch):
+    async def test_system_admin_same_target_project_success(self, monkeypatch, current_authority):
         access_info = FakeAccessInfo(
             auth_token="admin-tok-same",
             project_id="home-proj",

@@ -216,6 +216,9 @@ async def create_lumen_temp_run(
     )
     capability_snapshot["extensions"] = _capability_extension_snapshot({"tools": [], "mcp": []})
     capability_snapshot["execution_protocol_version"] = protocol_version
+    from lumen.services.inference_authority import model_required_scopes
+
+    capability_snapshot["required_scopes"] = ["compat:completions:write", *model_required_scopes(resolved)]
 
     effective_output_tokens = max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
     capabilities = resolved.get("capabilities") or {}

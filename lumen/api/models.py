@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
@@ -324,7 +324,7 @@ class ModelCreateRequest(BaseModel):
     media_pricing: dict | None = None
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
-    # Optional prompt-cache rates, independent of each other and of the input/output pair.
+    # Optional prompt-cache rates, independent of each other and of input/output prices.
     # Unset rates use the exact direct-provider catalog; unset cache read then stays
     # unpriced, while unset writes inherit input (5m) and then 5m (1h) for new runs.
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -364,14 +364,6 @@ class ModelCreateRequest(BaseModel):
             raise ValueError("가격이 저장 정밀도보다 작습니다")
         return value
 
-    @model_validator(mode="after")
-    def _price_pair(self):
-        if self.model_kind == "text" and (self.input_price_per_million is None) != (
-            self.output_price_per_million is None
-        ):
-            raise ValueError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
-        return self
-
 
 class ModelUpdateRequest(BaseModel):
     model_name: str | None = Field(default=None, max_length=190)
@@ -381,7 +373,7 @@ class ModelUpdateRequest(BaseModel):
     media_pricing: dict | None = None
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
-    # Optional prompt-cache rates, independent of each other and of the input/output pair.
+    # Optional prompt-cache rates, independent of each other and of input/output prices.
     # Unset rates use the exact direct-provider catalog; unset cache read then stays
     # unpriced, while unset writes inherit input (5m) and then 5m (1h) for new runs.
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -416,18 +408,22 @@ class ModelUpdateRequest(BaseModel):
             raise ValueError("가격이 저장 정밀도보다 작습니다")
         return value
 
-    @model_validator(mode="after")
-    def _price_pair(self):
-        # A PATCH may target a media model whose text directions are priced
-        # independently; the repository enforces the text pair on the stored kind.
-        price_fields = {"input_price_per_million", "output_price_per_million"}
-        if self.model_kind != "text" or not self.model_fields_set & price_fields:
-            return self
-        if not price_fields <= self.model_fields_set or (
-            (self.input_price_per_million is None) != (self.output_price_per_million is None)
-        ):
-            raise ValueError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
-        return self
+
+class ModelReorderRequest(BaseModel):
+    provider_id: int = Field(strict=True, gt=0, le=9223372036854775807)
+    expected_model_ids: list[Annotated[int, Field(strict=True, gt=0, le=9223372036854775807)]] = Field(
+        min_length=1, max_length=500,
+    )
+    model_ids: list[Annotated[int, Field(strict=True, gt=0, le=9223372036854775807)]] = Field(
+        min_length=1, max_length=500,
+    )
+
+    model_config = {"protected_namespaces": (), "extra": "forbid"}
+
+    @field_validator("expected_model_ids", "model_ids")
+    @classmethod
+    def validate_model_order(cls, value):
+        return repository.validate_model_order(value)
 
 
 class ModelResponse(BaseModel):
@@ -871,6 +867,21 @@ async def create_model(payload: ModelCreateRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
+
+
+@router.post("/admin/models/reorder", status_code=204)
+async def reorder_models(payload: ModelReorderRequest):
+    try:
+        await repository.reorder_models(**payload.model_dump())
+    except errors.ProviderNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers=_NO_STORE) from exc
+    except (errors.ModelOrderConflictError, errors.ActiveRunConfigurationConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc), headers=_NO_STORE) from exc
+    except errors.ProviderValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc), headers=_NO_STORE) from exc
+    except errors.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc), headers=_NO_STORE) from exc
+    return Response(status_code=204, headers=_NO_STORE)
 
 
 @router.patch("/admin/models/{model_id}", response_model=ModelResponse)

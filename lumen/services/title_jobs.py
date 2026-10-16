@@ -20,9 +20,12 @@ from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_db import ChatConversation, ChatMessage, ChatUsageLog
 from lumen.models.chat_jobs import ChatJob
 from lumen.models.chat_runs import ChatRun
-from lumen.services import credit, litellm_client, message_graph, title_summary
+from lumen.services import auxiliary, credit, litellm_client, message_graph, title_summary
+from lumen.services.api_key_store import ApiKeyForbidden
+from lumen.services.inference_authority import authorize_run_generation
 from lumen.services.providers import routing as ps
 from lumen.services.usage_breakdown import CACHE_USAGE_KEYS, UsageBreakdown
+from lumen.services.worker_routing import use_read_committed
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +82,7 @@ def _summary_prices(run: ChatRun) -> dict[str, Any]:
 
 
 async def _get_for_update(session, model, key):
-    try:
-        return await session.get(model, key, with_for_update=True)
-    except TypeError:
-        return await session.get(model, key)
+    return await session.get(model, key, with_for_update=True, populate_existing=True)
 
 
 def _terminal_title_status(error_code: str) -> str:
@@ -101,6 +101,7 @@ async def _terminalize_pending_title(
         conversation.title_status = _terminal_title_status(error_code)
 
 
+@auxiliary.retry_db
 async def _requeue_stored_result(job_id: str, *, owner: str) -> None:
     """Make a durably stored provider result immediately replayable."""
     from lumen.db import get_session_factory
@@ -215,7 +216,8 @@ async def enqueue_completed_run_in_transaction(session, run: ChatRun) -> bool:
     return True
 
 
-async def _recover_one() -> bool:
+@auxiliary.retry_db
+async def _recover_one(*, owner: str) -> bool:
     """Recover a never-reserved first exchange without scanning empty conversations."""
     from lumen.db import get_session_factory
 
@@ -231,6 +233,9 @@ async def _recover_one() -> bool:
         ChatRun.assistant_message_id.is_not(None),
     )
     async with factory() as session, session.begin():
+        await use_read_committed(session)
+        if await auxiliary.lock_admission(session, owner) is None:
+            return False
         conversation = (
             await session.execute(
                 select(ChatConversation)
@@ -268,6 +273,7 @@ async def _recover_one() -> bool:
         return True
 
 
+@auxiliary.retry_db
 async def _claim_one(*, owner: str) -> dict[str, Any] | None:
     from lumen.db import get_session_factory
 
@@ -276,6 +282,9 @@ async def _claim_one(*, owner: str) -> dict[str, Any] | None:
         return None
     now = _now()
     async with factory() as session, session.begin():
+        await use_read_committed(session)
+        if await auxiliary.lock_admission(session, owner) is None:
+            return None
         job = (
             await session.execute(
                 select(ChatJob)
@@ -291,6 +300,7 @@ async def _claim_one(*, owner: str) -> dict[str, Any] | None:
                 .order_by(ChatJob.next_at, ChatJob.created_at)
                 .limit(1)
                 .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if job is None:
@@ -324,7 +334,8 @@ async def _claim_one(*, owner: str) -> dict[str, Any] | None:
         }
 
 
-async def _mark_provider_started(job_id: str, *, owner: str, expected_revision: int) -> None:
+@auxiliary.retry_db
+async def _mark_provider_started(job_id: str, *, owner: str, expected_revision: int, resolved: dict | None = None) -> None:
     from lumen.db import get_session_factory
 
     factory = get_session_factory()
@@ -334,10 +345,15 @@ async def _mark_provider_started(job_id: str, *, owner: str, expected_revision: 
         job = await _get_for_update(session, ChatJob, job_id)
         if job is None or job.status != "running" or job.lease_owner != owner:
             raise RuntimeError("title job lease lost")
+        run = await session.get(ChatRun, job.run_id)
+        if run is None or run.conversation_id != job.conversation_id:
+            raise ApiKeyForbidden("title source run is unavailable")
+        await authorize_run_generation(session, run, resolved=resolved)
         job.progress = {"state": "provider_started", "expected_revision": expected_revision}
         job.lease_expires_at = _now() + timedelta(seconds=_LEASE_SECONDS)
 
 
+@auxiliary.retry_db
 async def _store_result(job: dict[str, Any], result: title_summary.TitleResult) -> None:
     from lumen.db import get_session_factory
 
@@ -366,6 +382,7 @@ async def _store_result(job: dict[str, Any], result: title_summary.TitleResult) 
         row.lease_expires_at = _now() + timedelta(seconds=_LEASE_SECONDS)
 
 
+@auxiliary.retry_db
 async def _mark_failed(job_id: str, *, owner: str, error_code: str) -> None:
     from lumen.db import get_session_factory
 
@@ -378,6 +395,8 @@ async def _mark_failed(job_id: str, *, owner: str, error_code: str) -> None:
             return
         row.status = "failed"
         row.error_code = error_code
+        row.lease_owner = None
+        row.lease_expires_at = None
         payload = _json_load(row.payload)
         row.progress = {
             "state": "failed",
@@ -386,6 +405,7 @@ async def _mark_failed(job_id: str, *, owner: str, error_code: str) -> None:
         await _terminalize_pending_title(session, row, error_code, payload=payload)
 
 
+@auxiliary.retry_db
 async def _retry_before_provider(job_id: str, *, owner: str, attempts: int) -> None:
     from lumen.db import get_session_factory
 
@@ -394,6 +414,8 @@ async def _retry_before_provider(job_id: str, *, owner: str, attempts: int) -> N
         return
     async with factory() as session, session.begin():
         row = await _get_for_update(session, ChatJob, job_id)
+        if row is None or row.status != "running" or row.lease_owner != owner:
+            return
         if attempts <= 3:
             row.status = "queued"
             row.next_at = _now() + timedelta(seconds=2**attempts)
@@ -413,6 +435,7 @@ async def _retry_before_provider(job_id: str, *, owner: str, attempts: int) -> N
             await _terminalize_pending_title(session, row, "title_storage_unavailable", payload=payload)
 
 
+@auxiliary.retry_db
 async def _apply_result(job: dict[str, Any]) -> bool:
     """CAS title and append independent system usage exactly once."""
     from lumen.db import get_session_factory
@@ -530,6 +553,7 @@ def _decimal_or_none(value: object) -> Decimal | None:
     return result if result.is_finite() else None
 
 
+@auxiliary.worker_step
 async def process_one(*, owner: str) -> bool:
     """Claim one title job, then periodically recover one never-reserved first exchange."""
     global _next_recovery_at
@@ -540,9 +564,14 @@ async def process_one(*, owner: str) -> bool:
         if now < _next_recovery_at:
             return False
         _next_recovery_at = now + _RECOVERY_INTERVAL
-        return await _recover_one()
+        return await _recover_one(owner=owner)
     if claimed.get("terminal"):
         return True
+    async with auxiliary.keep_lease(owner=owner, model=ChatJob, key=claimed["job_id"]):
+        return await _process_claimed(claimed, owner=owner)
+
+
+async def _process_claimed(claimed: dict[str, Any], *, owner: str) -> bool:
     job_id = claimed["job_id"]
     payload = claimed["payload"]
     expected = int(payload.get("expected_title_revision", _EXPECTED_REVISION))
@@ -563,9 +592,12 @@ async def process_one(*, owner: str) -> bool:
         # Quota/storage checks happen before the write-ahead provider fence;
         # failures here are safe to retry without risking a duplicate call.
         await credit.precheck(str(payload["user_id"]), str(payload["project_id"]), None)
-        await _mark_provider_started(job_id, owner=owner, expected_revision=expected)
+        await _mark_provider_started(job_id, owner=owner, expected_revision=expected, resolved=resolved)
     except credit.QuotaExceeded:
         await _mark_failed(job_id, owner=owner, error_code="quota_exceeded")
+        return True
+    except ApiKeyForbidden:
+        await _mark_failed(job_id, owner=owner, error_code="inference_authority_revoked")
         return True
     except Exception:
         logger.warning("title job preflight failed job=%s", job_id, exc_info=True)

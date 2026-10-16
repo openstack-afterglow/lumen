@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+# An explicitly dated snapshot is intentionally historical; keep signature and
+# package hash authentication, but do not reject its expired Valid-Until field.
+printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99-lumen-snapshot

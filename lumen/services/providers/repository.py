@@ -23,6 +23,7 @@ from .credentials import (
 )
 from .errors import (
     ChatStorageUnavailable,
+    ModelOrderConflictError,
     ModelsDevImportConflictError,
     ProviderNotFoundError,
     ProviderValidationError,
@@ -37,7 +38,6 @@ from .pricing import (
     _resolved_base_prices,
     _to_decimal,
     _validate_cache_prices,
-    _validate_price_pair,
     validate_media_pricing,
 )
 from .routing import _lock_mutable_route, _require_db
@@ -62,6 +62,16 @@ def validate_sort_order(value: int) -> int:
     return value
 
 
+def validate_model_order(value: list[int]) -> list[int]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 500:
+        raise ProviderValidationError("모델 ID 목록은 1개 이상 500개 이하여야 합니다")
+    if any(type(model_id) is not int or not 1 <= model_id <= 9223372036854775807 for model_id in value):
+        raise ProviderValidationError("모델 ID는 양의 정수여야 합니다")
+    if len(set(value)) != len(value):
+        raise ProviderValidationError("모델 ID 목록에는 중복이 없어야 합니다")
+    return value
+
+
 def validate_provider_name(value: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value.strip()) > 100:
         raise ProviderValidationError("name 은 100자 이하의 비어 있지 않은 문자열이어야 합니다")
@@ -82,15 +92,12 @@ def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: t
     return validate_media_pricing(kind, media_pricing)
 
 
-def _validate_text_prices(kind: str, input_price_per_million, output_price_per_million):
-    """Text keeps its paired input/output rule; media prices only its applicable directions."""
-    if kind == "text":
-        return _validate_price_pair(input_price_per_million, output_price_per_million)
+def _validate_text_prices(input_price_per_million, output_price_per_million):
+    """Store each text direction independently, including legacy text-kind media models."""
     return (
         _per_token_price(input_price_per_million, "input_price_per_million"),
         _per_token_price(output_price_per_million, "output_price_per_million"),
     )
-
 
 
 def validate_provider_auth_configuration(
@@ -359,8 +366,8 @@ async def create_model(
         input_price_per_million, output_price_per_million, cache_read_price_per_million,
         cache_write_price_per_million, cache_write_1h_price_per_million,
     ))
-    input_price, output_price = _validate_text_prices(model_kind, input_price_per_million, output_price_per_million)
-    # Cache rates are optional and independent of each other and of the input/output pair.
+    input_price, output_price = _validate_text_prices(input_price_per_million, output_price_per_million)
+    # Cache rates are optional and independent of each other and of input/output prices.
     cache_prices = _validate_cache_prices(
         {
             "cache_read_price_per_million": cache_read_price_per_million,
@@ -414,7 +421,9 @@ async def create_model(
                 price_source=(
                     ("manual" if media_pricing else None)
                     if model_kind != "text"
-                    else "manual" if input_price is not None else None
+                    else "manual"
+                    if input_price is not None or output_price is not None
+                    else None
                 ),
                 capabilities=(capabilities or None),
                 capability_source=("override" if capabilities else None),
@@ -475,6 +484,38 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
+async def reorder_models(
+    *, provider_id: int, expected_model_ids: list[int], model_ids: list[int],
+) -> None:
+    """Compare and replace a provider's complete display order in one transaction."""
+    if type(provider_id) is not int or not 1 <= provider_id <= 9223372036854775807:
+        raise ProviderValidationError("provider_id는 양의 정수여야 합니다")
+    validate_model_order(expected_model_ids)
+    validate_model_order(model_ids)
+    factory = _require_db()
+    try:
+        async with factory() as session, session.begin():
+            provider, models = await _lock_mutable_route(session, provider_id=provider_id)
+            if provider is None:
+                raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
+            current_ids = [model.id for model in sorted(models, key=lambda model: (model.sort_order, model.id))]
+            if expected_model_ids != current_ids or set(model_ids) != set(current_ids):
+                raise ModelOrderConflictError("모델 순서 또는 목록이 변경되었습니다. 전체 목록을 다시 조회하세요")
+            rows_by_id = {model.id: model for model in models}
+            for rank, model_id in enumerate(model_ids):
+                row = rows_by_id[model_id]
+                if row.sort_order != rank:
+                    # Rank is not a configuration/price version change, including legacy media rows.
+                    await session.execute(
+                        update(LlmModel)
+                        .where(LlmModel.id == model_id)
+                        .values(sort_order=rank, updated_at=row.updated_at)
+                    )
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
 async def update_model(model_id: int, patch: dict) -> dict:
     factory = _require_db()
     if "sort_order" in patch:
@@ -517,10 +558,6 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 )),
             )
             media_pricing = _validate_kind_prices(target_kind, media_pricing, token_prices)
-            if target_kind == "text" and (
-                has_input_price != has_output_price or (token_prices[0] is None) != (token_prices[1] is None)
-            ):
-                raise ProviderValidationError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
             if target_kind != getattr(row, "model_kind", "text"):
                 if row.is_title_model or row.is_memory_model:
                     raise ProviderValidationError("title/memory 모델은 text 종류만 허용합니다")
@@ -566,13 +603,13 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 else:
                     row.sort_order = patch["sort_order"]
             if has_input_price or has_output_price:
-                input_price, output_price = _validate_text_prices(target_kind, token_prices[0], token_prices[1])
+                input_price, output_price = _validate_text_prices(token_prices[0], token_prices[1])
                 if has_input_price:
                     row.input_price = input_price
                 if has_output_price:
                     row.output_price = output_price
                 if target_kind == "text":
-                    row.price_source = "manual" if input_price is not None else None
+                    row.price_source = "manual" if input_price is not None or output_price is not None else None
                     row.price_metadata = None
             for column, price in cache_prices.items():
                 setattr(row, column, price)

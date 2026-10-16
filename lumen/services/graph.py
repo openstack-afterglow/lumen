@@ -585,6 +585,16 @@ def _build_graph(params: dict, ctx: ToolContext):
             return await callback(**payload)
         return None
 
+    def turn_writer(turn_ordinal: int):
+        emit = get_stream_writer()
+        if not getattr(hooks, "journals_tool_events", False):
+            return emit
+
+        def write(event: dict) -> None:
+            emit({**event, "_durable_turn_ordinal": turn_ordinal})
+
+        return write
+
     async def tool_activity_metadata(tool_name: str) -> tuple[str, str]:
         v2_bindings = params.get("v2_bindings")
         if isinstance(v2_bindings, dict):
@@ -593,28 +603,8 @@ def _build_graph(params: dict, ctx: ToolContext):
                 return binding.definition.source, binding.definition.activity_category
         return await selection.context_tool_activity_metadata(tool_name, ctx)
 
-    async def call_model(state: ChatState) -> dict:
-        writer = get_stream_writer()
-        model_turn_count = int(state.get("model_turn_count", 0))
-        if params.get("execution_protocol_version") == 2:
-            max_model_turns = int(params.get("max_model_turns", 8))
-            if not 1 <= max_model_turns <= 16 or model_turn_count < 0:
-                raise RuntimeError("v2 model-turn limit is invalid")
-            if model_turn_count >= max_model_turns:
-                writer(
-                    {
-                        "type": "warning",
-                        "code": "model_turn_limit_exceeded",
-                        "safe_message": "Run model-turn limit reached.",
-                    }
-                )
-                return {
-                    "pending_tool_calls": [],
-                    "final_text": state.get("final_text") or "Run model-turn limit reached.",
-                    "model_failed": False,
-                }
-
-        messages = list(state["messages"])
+    async def restore_deferred_bindings() -> None:
+        # Approval and tool nodes can resume without another provider turn.
         v2_bindings = params.get("v2_bindings")
         if isinstance(ctx.binding_session, contracts.ToolBindingSession) and not ctx.binding_session.loaded_names:
             restored = await boundary("loaded_tool_names")
@@ -633,7 +623,33 @@ def _build_graph(params: dict, ctx: ToolContext):
                         restored,
                         include_managed=False,
                     )
+
+    async def call_model(state: ChatState) -> dict:
         round_index = int(state.get("loop_count", 0))
+        writer = turn_writer(round_index)
+        model_turn_count = int(state.get("model_turn_count", 0))
+        if params.get("execution_protocol_version") == 2:
+            max_model_turns = int(params.get("max_model_turns", 8))
+            if not 1 <= max_model_turns <= 16 or model_turn_count < 0:
+                raise RuntimeError("v2 model-turn limit is invalid")
+            if model_turn_count >= max_model_turns:
+                writer = turn_writer(max(0, round_index - 1))
+                writer(
+                    {
+                        "type": "warning",
+                        "code": "model_turn_limit_exceeded",
+                        "safe_message": "Run model-turn limit reached.",
+                    }
+                )
+                return {
+                    "pending_tool_calls": [],
+                    "final_text": state.get("final_text") or "Run model-turn limit reached.",
+                    "model_failed": False,
+                }
+
+        messages = list(state["messages"])
+        v2_bindings = params.get("v2_bindings")
+        await restore_deferred_bindings()
         schemas = (
             _v2_tool_schemas(v2_bindings)
             if isinstance(v2_bindings, dict)
@@ -1032,6 +1048,7 @@ def _build_graph(params: dict, ctx: ToolContext):
         return {"classified_tool_calls": classified}
 
     async def await_input(state: ChatState) -> dict:
+        await restore_deferred_bindings()
         bindings = params.get("v2_bindings")
         if not isinstance(bindings, dict):
             return {}
@@ -1113,6 +1130,8 @@ def _build_graph(params: dict, ctx: ToolContext):
             if item.get("policy_limited") is True or item.get("effect_denied") is True:
                 continue
             if item.get("requires_approval") is not True:
+                # Reads in a gated batch still need their matching provider result.
+                approved.append(tool_call)
                 continue
             call_id = _v2_tool_call_id(tool_call)
             if decision_by_call.get(call_id) == "approve":
@@ -1142,13 +1161,15 @@ def _build_graph(params: dict, ctx: ToolContext):
         return "finalize"
 
     async def execute_tools(state: ChatState) -> dict:
-        writer = get_stream_writer()
+        await restore_deferred_bindings()
+        round_index = int(state.get("loop_count", 0))
+        writer = turn_writer(round_index)
         messages = list(state["messages"])
         approved_tool_calls = state.get("pending_tool_calls", [])
         denied_tool_calls = state.get("denied_tool_calls", [])
         effect_denied_tool_calls = state.get("effect_denied_tool_calls", [])
         policy_limited_tool_calls = state.get("policy_limited_tool_calls", [])
-        delegation_enabled = bool(params.get("delegation_enabled"))
+        delegation_enabled = ctx.tools_enabled and bool(params.get("delegation_enabled"))
         delegation_calls = [
             tool_call
             for tool_call in approved_tool_calls
@@ -1167,7 +1188,6 @@ def _build_graph(params: dict, ctx: ToolContext):
         def call_id_for(tool_call: dict) -> str:
             return _internal_tool_call_id(tool_call)
 
-        round_index = int(state.get("loop_count", 0))
         tool_messages: list[dict[str, str]] = []
         citations_by_url = {item["url"]: item for item in state.get("citations", []) if item.get("url")}
         journals_tool_events = bool(getattr(hooks, "journals_tool_events", False))
@@ -1509,10 +1529,10 @@ def _build_graph(params: dict, ctx: ToolContext):
         pending = state.get("pending_delegations") or []
         if not pending:
             return {"pending_delegations": [], "child_wait_group_id": None}
-        writer = get_stream_writer()
         messages = list(state["messages"])
         # execute_tools already advanced loop_count for this round.
         round_index = int(state.get("loop_count", 1)) - 1
+        writer = turn_writer(round_index)
         journals_tool_events = bool(getattr(hooks, "journals_tool_events", False))
         tool_messages: list[dict[str, str]] = []
         parsed: list[tuple[dict, child_runs.DelegationCall | None, str | None]] = []
@@ -1553,6 +1573,8 @@ def _build_graph(params: dict, ctx: ToolContext):
         if calls:
             segment_id = f"delegation:{round_index}"
             try:
+                if not ctx.tools_enabled or not params.get("delegation_enabled"):
+                    raise child_runs.ChildFailure("tool_not_allowed", "agent delegation is disabled")
                 group = await boundary("delegations_prepared", segment_id=segment_id, calls=calls)
             except child_runs.ChildFailure as exc:
                 # The whole group is refused before any child exists; every call fails identically.
@@ -1652,7 +1674,7 @@ def _build_graph(params: dict, ctx: ToolContext):
     async def finalize(state: ChatState) -> dict:
         if state.get("model_failed"):
             return {"messages": state["messages"]}
-        writer = get_stream_writer()
+        writer = turn_writer(max(0, int(state.get("model_turn_count", 1)) - 1))
         if state.get("citations"):
             writer({"type": "citations", "items": state["citations"]})
         usage_event = {"type": "usage", "usage": state.get("usage", {"prompt_tokens": 0, "completion_tokens": 0})}
@@ -1706,9 +1728,9 @@ async def pending_interrupt(run_id: str) -> dict[str, Any] | None:
     """
     if not chat_checkpointer.available:
         return None
-    compiled = StateGraph(ChatState).add_node("noop", lambda state: state).set_entry_point("noop").compile(
-        checkpointer=chat_checkpointer.saver
-    )
+    # LangGraph derives pending tasks and interrupts from graph topology. Inspect
+    # with the executed graph; compilation and state reads never run its nodes.
+    compiled = _build_graph({}, None)
     snapshot = await compiled.aget_state({"configurable": {"thread_id": run_id}})
     checkpoint_id = (snapshot.config or {}).get("configurable", {}).get("checkpoint_id") if snapshot else None
     for task in getattr(snapshot, "tasks", ()) or ():
@@ -1784,7 +1806,7 @@ async def stream(
         "max_tool_calls": max_tool_calls,
         "allowed_direct_effects": frozenset(allowed_direct_effects) if allowed_direct_effects is not None else None,
         "native_web_search": native_web_search,
-        "delegation_enabled": delegation_enabled,
+        "delegation_enabled": tools_enabled and delegation_enabled,
     }
     ctx = ToolContext(
         project_id=project_id,
@@ -1816,16 +1838,38 @@ async def stream(
                 params["v2_bindings"],
                 include_managed=True,
             )
-        if delegation_enabled:
+        if tools_enabled and delegation_enabled:
             delegate = _delegate_binding()
             params["v2_bindings"][delegate.definition.name] = delegate
-        if sandbox_lease is not None and "process" in (params["allowed_direct_effects"] or frozenset()):
-            # Only runs with an assigned ready sandbox AND process authority expose run_code;
-            # read-only children keep their sandbox allocation but never this binding.
+        if tools_enabled and sandbox_lease is not None:
             from lumen.services import sandbox_binding
 
-            run_code = sandbox_binding.run_code_binding(ctx, lease_owner=sandbox_lease[0], fence=sandbox_lease[1])
-            params["v2_bindings"][run_code.definition.name] = run_code
+            if "process" in (params["allowed_direct_effects"] or frozenset()):
+                # A worker lease permits lazy MCP allocation, not code execution: only
+                # an assigned ready Nova resource implements the run_code endpoint.
+                target = await sandbox_binding.assigned_sandbox(run_id) if run_id else None
+                if target is not None and target.backend == "nova":
+                    run_code = sandbox_binding.run_code_binding(ctx, lease_owner=sandbox_lease[0], fence=sandbox_lease[1])
+                    params["v2_bindings"][run_code.definition.name] = run_code
+
+            from lumen.config import get_settings
+            from lumen.services.infrastructure.tool_manifest import ToolManifestError, load_tool_manifest
+
+            for pool in get_settings().runtime_config.pools:
+                if pool.enabled and pool.role == "sandbox" and pool.backend == "kubernetes":
+                    profiles = load_tool_manifest(pool.profile.tool_manifest_file, pool.profile.tool_manifest_sha256)
+                    for profile in profiles:
+                        for definition in profile.tools:
+                            if definition.name in params["v2_bindings"]:
+                                raise ToolManifestError()
+                            params["v2_bindings"][definition.name] = sandbox_binding.kubernetes_mcp_binding(
+                                ctx,
+                                lease_owner=sandbox_lease[0],
+                                fence=sandbox_lease[1],
+                                profile_id=profile.id,
+                                tool_def=definition,
+                                pool_name=pool.name,
+                            )
     graph = _build_graph(params, ctx)
     config = {"configurable": {"thread_id": run_id}} if run_id else None
     graph_input: dict[str, list[dict]] | Command = (

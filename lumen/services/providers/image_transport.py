@@ -45,6 +45,11 @@ _MIMES = {"image/png", "image/jpeg", "image/webp"}
 class ImageTransportError(RuntimeError):
     """An image provider failed or returned an unusable bounded result."""
 
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        # Only the integer upstream status survives; provider bodies are never retained.
+        self.status_code = status_code
+
 
 @dataclass(frozen=True)
 class ImageResult:
@@ -218,11 +223,13 @@ async def _post(url: str, *, headers: dict, count: int, json_body: dict | None =
     max_bytes = count * _MAX_RESPONSE_BYTES_PER_IMAGE + 65536
     try:
         async with (
-            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False) as client,
+            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False,
+                              transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False)) as client,
             client.stream("POST", url, headers=headers, json=json_body, data=form, files=files) as response,
         ):
             if response.status_code != 200:
-                raise ImageTransportError(f"image provider returned HTTP {response.status_code}")
+                raise ImageTransportError(f"image provider returned HTTP {response.status_code}",
+                                          status_code=response.status_code)
             if response.headers.get("content-length", "").isdecimal() and int(response.headers["content-length"]) > max_bytes:
                 raise ImageTransportError("image provider response exceeds size limit")
             chunks = bytearray()

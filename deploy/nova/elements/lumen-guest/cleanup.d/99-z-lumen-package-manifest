@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+: "${TARGET_ROOT:?DIB target root is required}"
+: "${DIB_LUMEN_STAGING:?Verified staging directory is required}"
+cp "$TARGET_ROOT/usr/share/lumen-guest/packages.tsv" "$DIB_LUMEN_STAGING/installed-packages.tsv"

@@ -61,22 +61,24 @@ def _enc(v: str | None) -> str | None:
     return encrypt_chat_content(v) if v else v
 
 
-def _public(row: ChatAgent, *, owner_view: bool = False) -> dict:
-    """에이전트 공개 dict. 공개 에이전트는 instructions 를 공유(허브 복제 대상)한다."""
+def _public(row: ChatAgent, *, owner_view: bool = False, include_private: bool = True) -> dict:
+    """Serialize owner configuration or an explicitly public hub template."""
     return {
         "id": row.id,
         "owner_user_id": row.owner_user_id,
         "name": row.name,
         "description": row.description,
         "avatar": row.avatar,
-        "instructions": _dec(row.instructions),
+        **({"instructions": _dec(row.instructions)} if include_private else {}),
         "model_name": row.model_name,
-        "params": row.params or {},
-        "mcp_ids": row.mcp_ids or [],
-        "tool_ids": row.tool_ids or [],
-        "skill_ids": getattr(row, "skill_ids", None) or [],
-        "plugin_tool_ids": (row.plugin_tool_ids or []) if owner_view else [],
-        "plugin_skill_ids": (row.plugin_skill_ids or []) if owner_view else [],
+        **({
+            "params": row.params or {},
+            "mcp_ids": row.mcp_ids or [],
+            "tool_ids": row.tool_ids or [],
+            "skill_ids": getattr(row, "skill_ids", None) or [],
+            "plugin_tool_ids": (row.plugin_tool_ids or []) if owner_view else [],
+            "plugin_skill_ids": (row.plugin_skill_ids or []) if owner_view else [],
+        } if include_private else {}),
         "visibility": row.visibility,
         "cloned_from_id": row.cloned_from_id,
         "clone_count": row.clone_count,
@@ -162,8 +164,8 @@ async def create_agent(
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def list_agents(*, user_id: str, project_id: str) -> list[dict]:
-    """List only the caller's project-owned agents."""
+async def list_agents(*, user_id: str, project_id: str, include_private: bool = True) -> list[dict]:
+    """List only the caller's project-owned agents, optionally without private configuration."""
     factory = _require_db()
     try:
         async with factory() as session:
@@ -178,7 +180,7 @@ async def list_agents(*, user_id: str, project_id: str) -> list[dict]:
                 .scalars()
                 .all()
             )
-            return [_public(r, owner_view=True) for r in rows]
+            return [_public(r, owner_view=True, include_private=include_private) for r in rows]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
