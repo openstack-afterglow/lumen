@@ -1060,3 +1060,198 @@ async def test_known_boot_timeout_reclaim_requires_full_owned_observation(pool):
         assert deletes == ["owned-server"] and await store.occupancy(pool.id) == 0
     finally:
         c.executor.shutdown(wait=True)
+
+
+@pytest.fixture
+async def lazy_chat_sandbox(pool, monkeypatch):
+    from lumen.models.chat_infrastructure import ChatAgentReservation, ChatProjectAgentQuota
+    from lumen.services import sandbox_binding
+    from lumen.services.infrastructure.config import PoolConfig, ProjectQuotaDefaults
+
+    factory = get_session_factory()
+    definition = PoolConfig.model_validate_json(json.dumps({
+        "name": pool.name, "role": "sandbox", "backend": "kubernetes", "enabled": True,
+        "image": "registry.example/sandbox@sha256:" + "a" * 64, "architecture": "x86_64",
+        "min_replicas": 0, "max_replicas": 4,
+        "sandbox": {"workspace_bytes": 128 * 1024**2, "memory_bytes": 1024**3,
+                    "cpu_millis": 1000, "pids_limit": 256},
+        "profile": {"backend": "kubernetes", "cluster_profile_id": "cluster",
+                    "tool_manifest_file": "/test/tools.json", "tool_manifest_sha256": "b" * 64,
+                    "controller_ingress_cidrs": ["192.0.2.11/32"], "bootstrap_egress_cidrs": ["192.0.2.11/32"]},
+    }))
+    runtime = SimpleNamespace(
+        enabled=True, deployment_id=pool.deployment_id, pools=(definition,), pool=lambda _name: definition,
+        project_quota_defaults=ProjectQuotaDefaults(max_active_sandboxes=1, max_sandbox_seconds=3600),
+    )
+    settings = SimpleNamespace(runtime_config=runtime)
+    monkeypatch.setattr(sandbox_binding, "get_settings", lambda: settings)
+    monkeypatch.setattr("lumen.config.get_settings", lambda: settings)
+    async with factory() as session, session.begin():
+        row = await session.get(ChatRuntimePool, pool.id)
+        row.role, row.backend = "sandbox", "kubernetes"
+        row.cloud_profile_id, row.project_id = None, None
+        row.cluster_profile_id, row.namespace = "cluster", "runs"
+        row.image_ref, row.profile_digest = definition.image, definition.digest()
+    project = "lazy-it-" + uuid.uuid4().hex
+    run_ids = []
+
+    async def create_run(**values):
+        run_id = str(uuid.uuid4())
+        run_ids.append(run_id)
+        run = ChatRun(
+            id=run_id, run_scope="temp", run_kind="completion", execution_mode="chat",
+            project_id=project, user_id=project, model_name="fixture-model", capability_snapshot={}, pricing_snapshot={},
+            client_request_id=str(uuid.uuid4()), request_fingerprint=uuid.uuid4().hex,
+            fingerprint_version=1, execution_protocol_version=2, status="running",
+            lease_owner="worker#1", lease_fence=1, lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        for key, value in values.items():
+            setattr(run, key, value)
+        async with factory() as session, session.begin():
+            session.add(run)
+        return run_id
+
+    try:
+        yield SimpleNamespace(factory=factory, create_run=create_run, project=project, pool=definition)
+    finally:
+        async with factory() as session, session.begin():
+            resource_ids = list((await session.scalars(select(ChatRuntimeResource.id).where(
+                ChatRuntimeResource.run_id.in_(run_ids)
+            ))).all())
+            await session.execute(delete(ChatResourceOperation).where(ChatResourceOperation.resource_id.in_(resource_ids)))
+            await session.execute(delete(ChatRuntimeResource).where(ChatRuntimeResource.id.in_(resource_ids)))
+            await session.execute(delete(ChatAgentReservation).where(ChatAgentReservation.run_id.in_(run_ids)))
+            await session.execute(delete(ChatRunEventRow).where(ChatRunEventRow.run_id.in_(run_ids)))
+            for run_id in reversed(run_ids):
+                await session.execute(delete(ChatRun).where(ChatRun.id == run_id))
+            await session.execute(delete(ChatProjectAgentQuota).where(ChatProjectAgentQuota.project_id == project))
+
+
+@pytest.mark.parametrize("condition", ["canceled", "terminal", "lease_expired", "takeover", "root_canceled", "deadline"])
+async def test_lazy_allocation_rejects_stale_authority_before_mutation(lazy_chat_sandbox, condition):
+    from lumen.services.sandbox_binding import SandboxDispatchError, ensure_sandbox_for_run
+
+    f = lazy_chat_sandbox
+    fields = {}
+    if condition == "canceled":
+        fields["cancel_requested_at"] = datetime.now(UTC)
+    elif condition == "terminal":
+        fields["status"] = "completed"
+    elif condition == "lease_expired":
+        fields["lease_expires_at"] = datetime.now(UTC) - timedelta(seconds=1)
+    elif condition == "takeover":
+        fields.update(lease_owner="worker#2", lease_fence=2)
+    elif condition == "root_canceled":
+        root_id = await f.create_run(cancel_requested_at=datetime.now(UTC))
+        fields.update(root_run_id=root_id, parent_run_id=root_id)
+    else:
+        fields["deadline_at"] = datetime.now(UTC) - timedelta(seconds=1)
+    run_id = await f.create_run(**fields)
+    with pytest.raises(SandboxDispatchError) as error:
+        await ensure_sandbox_for_run(run_id, lease_owner="worker#1", fence=1, pool_name=f.pool.name, wait_timeout=0)
+    assert error.value.code == "run_lease_invalid"
+    async with f.factory() as session:
+        run = await session.get(ChatRun, run_id)
+        assert run.assigned_resource_id is None and run.runtime_pool_id is None
+        assert await session.scalar(select(ChatRuntimeResource.id).where(ChatRuntimeResource.run_id == run_id)) is None
+
+
+@pytest.mark.parametrize("ceiling", [None, 30])
+async def test_lazy_chat_sandbox_quota_and_cancellation_reuse(lazy_chat_sandbox, ceiling):
+    from lumen.models.chat_infrastructure import ChatAgentReservation, ChatProjectAgentQuota
+    from lumen.services.durable_runs import lifecycle
+    from lumen.services.sandbox_binding import SandboxDispatchError, ensure_sandbox_for_run
+
+    f = lazy_chat_sandbox
+    first = await f.create_run(sandbox_seconds_ceiling=ceiling)
+    second = await f.create_run(sandbox_seconds_ceiling=ceiling)
+    with pytest.raises(SandboxDispatchError) as error:
+        await ensure_sandbox_for_run(first, lease_owner="worker#1", fence=1, pool_name=f.pool.name, wait_timeout=0)
+    assert error.value.code == "sandbox_timeout"
+    async with f.factory() as session:
+        run = await session.get(ChatRun, first)
+        quota = await session.get(ChatProjectAgentQuota, f.project)
+        assert run.credit_ceiling is None and run.sandbox_seconds_ceiling == ceiling
+        assert quota.active_sandboxes == 1
+        assert quota.sandbox_seconds_reserved == (ceiling or 1800)
+    with pytest.raises(SandboxDispatchError) as error:
+        await ensure_sandbox_for_run(second, lease_owner="worker#1", fence=1, pool_name=f.pool.name, wait_timeout=0)
+    assert error.value.code == "child_budget_exhausted"
+    async with f.factory() as session, session.begin():
+        run = await session.get(ChatRun, first)
+        run.status = "awaiting_input"
+        resource = await session.get(ChatRuntimeResource, run.assigned_resource_id)
+        resource.observed_state = "ready"
+        resource.ready_at = datetime.now(UTC) - timedelta(seconds=5)
+    response = await lifecycle.request_cancelled(run_id=first, project_id=f.project, user_id=f.project)
+    assert response.status == "canceled"
+    async with f.factory() as session:
+        quota = await session.get(ChatProjectAgentQuota, f.project)
+        run = await session.get(ChatRun, first)
+        resource = await session.get(ChatRuntimeResource, run.assigned_resource_id)
+        holds = (await session.scalars(select(ChatAgentReservation).where(ChatAgentReservation.run_id == first))).all()
+        assert quota.active_sandboxes == 0 and quota.sandbox_seconds_reserved == 0
+        assert resource.desired_state == "deleting"
+        assert {hold.kind: hold.status for hold in holds} == {"sandbox_slot": "released", "sandbox_seconds": "settled"}
+    with pytest.raises(SandboxDispatchError) as error:
+        await ensure_sandbox_for_run(second, lease_owner="worker#1", fence=1, pool_name=f.pool.name, wait_timeout=0)
+    assert error.value.code == "sandbox_timeout"
+    async with f.factory() as session:
+        assert (await session.get(ChatProjectAgentQuota, f.project)).active_sandboxes == 1
+        assert (await session.get(ChatRun, second)).assigned_resource_id is not None
+
+
+@pytest.mark.parametrize("forged_dispatch", [False, True])
+async def test_expired_approval_denial_resumes_only_authenticated_dispatch(lazy_chat_sandbox, monkeypatch, forged_dispatch):
+    from unittest.mock import AsyncMock
+
+    from lumen import crypto
+    from lumen.models.chat_runs import ChatToolApproval
+    from lumen.services.durable_runs import interactions
+    from lumen.services.durable_runs.errors import DurableRunError
+
+    f = lazy_chat_sandbox
+    now = datetime.now(UTC)
+    monkeypatch.setattr(crypto, "_get_key", lambda: bytes.fromhex("ab" * 32))
+    monkeypatch.setattr(interactions, "get_settings", lambda: SimpleNamespace(chat_execution_protocol_version=2))
+    monkeypatch.setattr(interactions, "_now", lambda: now)
+    monkeypatch.setattr(interactions, "wake_run", AsyncMock())
+    run_id = await f.create_run()
+    calls = [{
+        "call_id": "expired-navigation", "name": "browser_navigate",
+        "arguments": json.dumps({"url": "https://example.com/approval-expiry"}),
+        "source": "mcp", "effect": "external_mutation", "tool_definition_hash": "a" * 64,
+        "config_fingerprint": "b" * 64, "expected_state_revision": 7, "writer_fence": 11,
+    }]
+    await interactions._reconcile_v2_approval_interrupt(run_id=run_id, owner="worker#1", calls=calls, resume=False)
+    async with f.factory() as session, session.begin():
+        approval = await session.scalar(select(ChatToolApproval).where(ChatToolApproval.run_id == run_id))
+        if forged_dispatch:
+            approval.tool_name = "browser_delete_everything"
+    now += timedelta(minutes=16)
+    if forged_dispatch:
+        with pytest.raises(DurableRunError):
+            await interactions.expire_pending_inputs()
+        async with f.factory() as session:
+            run = await session.get(ChatRun, run_id)
+            approval = await session.scalar(select(ChatToolApproval).where(ChatToolApproval.run_id == run_id))
+            event_types = list((await session.scalars(select(ChatRunEventRow.event_type).where(
+                ChatRunEventRow.run_id == run_id
+            ).order_by(ChatRunEventRow.seq))).all())
+            assert run.status == "awaiting_input" and run.lease_owner is None
+            assert approval.status == "pending" and approval.decision_hmac is None
+            assert "tool.approval_resolved" not in event_types
+        return
+
+    assert await interactions.expire_pending_inputs() == [run_id]
+    async with f.factory() as session, session.begin():
+        run = await session.get(ChatRun, run_id)
+        approval = await session.scalar(select(ChatToolApproval).where(ChatToolApproval.run_id == run_id))
+        assert run.status == "queued" and run.lease_owner is None and run.lease_expires_at is None
+        assert approval.status == "denied" and approval.decided_by_user_id is None
+        assert approval.decision_hmac and approval.expected_state_revision == 7 and approval.writer_fence == 11
+        run.status, run.lease_owner, run.lease_fence = "running", "worker#2", 2
+        run.lease_expires_at = now + timedelta(minutes=1)
+    assert await interactions._reconcile_v2_approval_interrupt(
+        run_id=run_id, owner="worker#2", calls=calls, resume=True
+    ) == [{"call_id": "expired-navigation", "decision": "deny"}]

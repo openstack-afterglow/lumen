@@ -246,7 +246,8 @@ async def test_v2_mcp_binding_persists_embedded_file_bytes(monkeypatch):
     async def load_mcp(_ctx):
         return [{"id": 8, "url": "https://mcp.example/api", "name": "reports"}]
 
-    async def list_tools(_server):
+    async def list_tools(_server, *, context):
+        assert (context.user_id, context.project_id, context.run_id) == ("user-1", "project-1", "run-1")
         return [
             {
                 "name": "render_report",
@@ -255,7 +256,11 @@ async def test_v2_mcp_binding_persists_embedded_file_bytes(monkeypatch):
             }
         ]
 
-    async def call_tool(_server, _tool_name, _arguments):
+    async def call_tool(_server, _tool_name, _arguments, *, context, expected_credential_epoch):
+        assert expected_credential_epoch is None
+        assert (context.user_id, context.project_id, context.run_id, context.call_id) == (
+            "user-1", "project-1", "run-1", "call-1",
+        )
         return tool_runtime.mcp_client.McpToolOutput(
             text="Created report.csv",
             files=(
@@ -356,7 +361,8 @@ async def test_v2_dynamic_bindings_namespace_names_and_freeze_effects(monkeypatc
     async def load_mcp(_ctx):
         return [{"id": 8, "url": "https://Mcp.Example.com/api", "effect_overrides": {"inspect-status": "read"}}]
 
-    async def list_tools(_server):
+    async def list_tools(_server, *, context):
+        assert (context.user_id, context.project_id) == ("user", "project")
         return [
             {
                 "name": "inspect-status",
@@ -465,7 +471,7 @@ async def test_v2_remote_bindings_require_canonical_destinations(monkeypatch):
     async def load_mcp(_ctx):
         return [{"id": 10, "url": "https://localhost/api"}]
 
-    async def list_tools(_server):
+    async def list_tools(_server, *, context):
         raise AssertionError("invalid MCP destinations must not be discovered")
 
     monkeypatch.setattr(tool_runtime, "_load_custom", load_custom)

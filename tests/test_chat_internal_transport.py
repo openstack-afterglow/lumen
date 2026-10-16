@@ -69,7 +69,8 @@ def _store(tmp_path, stem, key, certificate):
 
 
 @pytest.mark.asyncio
-async def test_internal_transport_never_sends_capability_before_pin_and_san(tmp_path, monkeypatch):
+@pytest.mark.parametrize("large_mcp_result", [False, True])
+async def test_internal_transport_never_sends_capability_before_pin_and_san(tmp_path, monkeypatch, large_mcp_result):
     ca_key = ec.generate_private_key(ec.SECP256R1())
     ca_cert = _certificate(ca_key, x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, "Lumen test CA")]), ca_key)
@@ -91,6 +92,9 @@ async def test_internal_transport_never_sends_capability_before_pin_and_san(tmp_
     server_context.verify_mode = ssl.CERT_REQUIRED
     received = []
     notices = asyncio.Queue()
+    response_body = (json.dumps({"state": "succeeded", "mcp_result": {"content": [
+        {"type": "image", "mimeType": "image/png", "data": "A" * (3 * 1024 * 1024)}
+    ]}}).encode() if large_mcp_result else b"ok")
 
     async def handle(reader, writer):
         try:
@@ -100,7 +104,8 @@ async def test_internal_transport_never_sends_capability_before_pin_and_san(tmp_
         received.append(data)
         notices.put_nowait(None)
         if data:
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(response_body)).encode()
+                         + b"\r\nConnection: close\r\n\r\n" + response_body)
             await writer.drain()
         writer.close()
 
@@ -114,7 +119,7 @@ async def test_internal_transport_never_sends_capability_before_pin_and_san(tmp_
     # The production address gate rejects loopback; this test isolates TLS using
     # local sockets instead of needing an operator-managed private network.
     monkeypatch.setattr(transport, "_address", lambda address, port: address)
-    path = f"/v1/artifacts/{uuid4()}"
+    path = f"/v1/{'executions' if large_mcp_result else 'artifacts'}/{uuid4()}"
 
     async def attempt(*, fingerprint, identity):
         return await transport.request(address="127.0.0.1", port=port, role="sandbox",
@@ -133,7 +138,7 @@ async def test_internal_transport_never_sends_capability_before_pin_and_san(tmp_
             await attempt(fingerprint=fingerprint, identity=str(uuid4()))
         await asyncio.wait_for(notices.get(), 2)
         assert received[-1] == b""
-        assert await attempt(fingerprint=fingerprint, identity=resource_id) == b"ok"
+        assert await attempt(fingerprint=fingerprint, identity=resource_id) == response_body
         await asyncio.wait_for(notices.get(), 2)
         assert b"authorization: bearer " + b"top-secret-capability" in received[-1].lower()
     finally:

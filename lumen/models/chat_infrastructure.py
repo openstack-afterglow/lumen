@@ -17,7 +17,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from lumen.db import Base
 
 POOL_ROLES = ("api", "worker", "sandbox")
-BACKENDS = ("nova", "zun")
+BACKENDS = ("nova", "zun", "kubernetes")
 RESOURCE_STATES = ("requested", "creating", "unknown", "booting", "ready", "unavailable", "draining", "deleting", "deleted", "failed")
 OCCUPYING_STATES = frozenset({"requested", "creating", "unknown", "booting", "ready", "unavailable", "draining", "deleting", "failed"})
 OPERATION_ACTIONS = ("create", "observe", "bootstrap", "delete", "ingress_register", "ingress_deregister")
@@ -47,9 +47,11 @@ class ChatRuntimePool(Base):
     workload_class: Mapped[str | None] = mapped_column(VARCHAR(20))
     backend: Mapped[str] = mapped_column(VARCHAR(10), nullable=False)
     enabled: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
-    cloud_profile_id: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
-    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
-    region_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
+    cloud_profile_id: Mapped[str | None] = mapped_column(VARCHAR(190))
+    project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    region_name: Mapped[str | None] = mapped_column(VARCHAR(190))
+    cluster_profile_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    namespace: Mapped[str | None] = mapped_column(VARCHAR(63))
     image_ref: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
     profile_digest: Mapped[str] = mapped_column(CHAR(64), nullable=False)
     guest_profile_id: Mapped[str | None] = mapped_column(VARCHAR(190))
@@ -89,7 +91,7 @@ class ChatRuntimePool(Base):
     __table_args__ = (
         Index("uq_runtime_pool_name", "deployment_id", "name", unique=True),
         CheckConstraint("role IN ('api','worker','sandbox')", name="ck_runtime_pool_role"),
-        CheckConstraint("backend IN ('nova','zun')", name="ck_runtime_pool_backend"),
+        CheckConstraint("backend IN ('nova','zun','kubernetes')", name="ck_runtime_pool_backend"),
         CheckConstraint("min_replicas >= 0 AND max_replicas >= min_replicas", name="ck_runtime_pool_replicas"),
         CheckConstraint(
             "workload_class IN ('online_text','online_media','batch')", name="ck_runtime_pool_workload_class"
@@ -113,8 +115,10 @@ class ChatRuntimeResource(Base):
     desired_state: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="requested")
     observed_state: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="requested")
     request_fingerprint: Mapped[str] = mapped_column(CHAR(64), nullable=False)
-    cloud_profile_id: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
-    cloud_project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    cloud_profile_id: Mapped[str | None] = mapped_column(VARCHAR(190))
+    cloud_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    cluster_profile_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    namespace: Mapped[str | None] = mapped_column(VARCHAR(63))
     provider_id: Mapped[str | None] = mapped_column(VARCHAR(190))
     address: Mapped[str | None] = mapped_column(VARCHAR(190))
     port: Mapped[int | None] = mapped_column(INT)
@@ -153,6 +157,7 @@ class ChatRuntimeResource(Base):
 
     __table_args__ = (
         Index("uq_runtime_resource_provider", "cloud_profile_id", "cloud_project_id", "provider_id", unique=True),
+        Index("uq_runtime_resource_cluster_provider", "cluster_profile_id", "namespace", "provider_id", unique=True),
         Index("uq_runtime_resource_run_generation", "run_id", "generation", unique=True),
         Index("idx_runtime_resource_pool_state", "pool_id", "observed_state"),
         Index("idx_runtime_resource_desired", "desired_state", "deadline_at"),

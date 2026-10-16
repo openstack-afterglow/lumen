@@ -37,6 +37,7 @@ def _settings(**overrides):
         worker_drain_seconds=300,
         worker_workload_classes=["online_text", "online_media"],
         batch_enabled=False,
+        runtime_config=SimpleNamespace(enabled=False, pools=[]),
     )
     base.update(overrides)
     return SimpleNamespace(**base)

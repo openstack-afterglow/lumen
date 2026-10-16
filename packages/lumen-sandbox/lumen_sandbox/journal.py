@@ -79,6 +79,14 @@ class Journal:
                 self.db.execute("ROLLBACK")
                 raise
 
+    def workspace_revision(self, fence: int) -> int:
+        """Read the run-global persisted revision without reserving or replaying a call."""
+        with self.lock:
+            highest, revision = self.db.execute("SELECT fence, revision FROM run").fetchone()
+            if fence < highest:
+                raise Conflict("stale fence")
+            return revision
+
     def highest_fence(self) -> int:
         with self.lock:
             return self.db.execute("SELECT fence FROM run").fetchone()[0]

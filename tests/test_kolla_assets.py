@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -90,6 +91,8 @@ def _kolla_environment(inventory, *, native=False):
         bool=lambda value: str(value).lower() in {"true", "yes", "on", "1"},
         combine=combine,
         to_json=json.dumps,
+        from_json=json.loads,
+        basename=lambda value: Path(value).name,
         kolla_address=lambda network, host: inventory["hostvars"][host][f"{network}_address"],
     )
     return environment
@@ -326,7 +329,8 @@ def test_kolla_yaml_and_jinja_validity():
     parsed_ast = jinja_env.parse(template_content)
     assert parsed_ast is not None
 
-def test_runtime_enabled_kolla_config_loads_as_typed_settings(tmp_path):
+@pytest.mark.parametrize("backend", ["nova", "kubernetes"])
+def test_runtime_enabled_kolla_config_loads_as_typed_settings(tmp_path, backend):
     from jinja2 import meta
 
     source = (ROLE_DIR / "templates" / "lumen.conf.j2").read_text(encoding="utf-8")
@@ -376,12 +380,56 @@ def test_runtime_enabled_kolla_config_loads_as_typed_settings(tmp_path):
                         "guest_image_hash": "a" * 64},
         }],
     }
+    if backend == "kubernetes":
+        manifest = b'{"version":1,"profiles":[]}'
+        runtime.update(cloud_profiles=[], guest_profiles=[], workload_pools={},
+            kubernetes_clusters=[{
+                "id": "cluster", "server": "https://kubernetes.example:6443",
+                "ca_file": "/etc/lumen/controller/kubernetes/ca.pem",
+                "bearer_token": {"file": "/etc/lumen/controller/kubernetes/token.env"},
+                "namespace": "runs", "runtime_class_name": "sandbox", "runtime_class_handler": "runsc",
+                "cluster_cidrs": ["10.42.0.0/16", "10.43.0.0/16"],
+                "qualification_file": "/etc/lumen/controller/kubernetes/qualification.json",
+            }],
+            fixed_workers=[{"id": "worker-a", "certificate_fingerprint": "f" * 64}],
+            pools=[{
+                "name": "mcp", "role": "sandbox", "backend": "kubernetes", "enabled": True,
+                "image": "registry.example/sandbox@sha256:" + "a" * 64, "architecture": "x86_64",
+                "min_replicas": 0, "max_replicas": 5,
+                "profile": {"backend": "kubernetes", "cluster_profile_id": "cluster",
+                            "tool_manifest_file": "/etc/lumen/controller/kubernetes/manifest.json",
+                            "tool_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+                            "controller_ingress_cidrs": ["192.168.50.10/32"],
+                            "bootstrap_egress_cidrs": ["192.168.50.11/32"]},
+                "sandbox": {"workspace_bytes": 16 * 1024**2, "memory_bytes": 256 * 1024**2,
+                            "cpu_millis": 1000, "pids_limit": 128},
+            }])
+        from lumen.services.infrastructure.config import PoolConfig
+
+        cluster = runtime["kubernetes_clusters"][0]
+        qualification = json.dumps({
+            "version": 1, "server": cluster["server"], "namespace": cluster["namespace"],
+            "namespace_uid": "00000000-0000-0000-0000-000000000001",
+            "runtime_class_uid": "00000000-0000-0000-0000-000000000002",
+            "runtime_class_name": cluster["runtime_class_name"],
+            "runtime_class_handler": cluster["runtime_class_handler"],
+            "cluster_cidrs": cluster["cluster_cidrs"],
+            "pool_digest": PoolConfig.model_validate_json(json.dumps(runtime["pools"][0]), strict=True).digest(),
+            "runtime_class_spec_sha256": hashlib.sha256(b'{"handler":"runsc"}').hexdigest(),
+            "runtime_probe_sha256": "d" * 64, "cni_probe_sha256": "e" * 64, "measured_pids_max": 128,
+        }).encode()
+        for name, data in (("manifest.json", manifest), ("qualification.json", qualification)):
+            (tmp_path / name).write_bytes(data)
+        cluster["qualification_sha256"] = hashlib.sha256(qualification).hexdigest()
+        runtime["tls"].update(worker_client_cert_file="/etc/lumen/controller/fixed-worker.pem",
+                              worker_client_key_file="/etc/lumen/controller/fixed-worker-key.pem")
     values = dict.fromkeys(meta.find_undeclared_variables(environment.parse(source)), "")
     values.update(
         lumen_runtime_enabled=True, lumen_runtime_config=runtime,
         lumen_controller_listen_address="10.42.0.5", lumen_controller_listen_port=8013,
         lumen_worker_concurrency=4, lumen_worker_heartbeat_seconds=5,
         lumen_worker_drain_seconds=300, lumen_chat_compat_run_timeout_seconds=300,
+        lumen_chat_execution_protocol_version=1,
         lumen_api_max_active_requests=256, lumen_api_max_sse_connections=256,
         lumen_api_max_websocket_connections=64, lumen_api_max_body_bytes=220200960,
         lumen_batch_enabled=False, lumen_batch_dispatch_window=8,
@@ -401,31 +449,130 @@ def test_runtime_enabled_kolla_config_loads_as_typed_settings(tmp_path):
     result = subprocess.run(
         [sys.executable, "-c", "import json; from lumen.config import get_settings; "
          "c = get_settings().runtime_config; "
-         "print(json.dumps([c.enabled, c.listen_host, c.pools[0].cloud_profile_id]))"],
+         "print(json.dumps(c.model_dump(mode='json', exclude_none=True)))"],
         env={"LUMEN_CONFIG_FILE": str(config_file), "PATH": os.environ.get("PATH", ""),
              "PYTHONPATH": str(REPO_ROOT)},
         capture_output=True, text=True, check=True, timeout=20,
     )
-    assert json.loads(result.stdout) == [True, "10.42.0.5", "trusted"]
+    typed = json.loads(result.stdout)
+    assert typed["enabled"] is True
+    assert typed["listen_host"] == "10.42.0.5"
+    assert typed["pools"][0]["backend"] == backend
+    if backend == "nova":
+        assert typed["pools"][0]["cloud_profile_id"] == "trusted"
+        assert typed["workload_pools"] == {"online_text": "workers"}
+    else:
+        assert typed["cloud_profiles"] == typed["guest_profiles"] == []
+        assert typed["workload_pools"] == {}
+        assert typed["kubernetes_clusters"] == runtime["kubernetes_clusters"]
+        assert typed["fixed_workers"] == runtime["fixed_workers"]
+        for field, value in runtime["pools"][0]["profile"].items():
+            assert typed["pools"][0]["profile"][field] == value
+        assert typed["tls"]["worker_client_cert_file"] == runtime["tls"]["worker_client_cert_file"]
+        assert typed["tls"]["worker_client_key_file"] == runtime["tls"]["worker_client_key_file"]
 
 
-def test_runtime_worker_mount_excludes_controller_signing_keys():
-    from jinja2.nativetypes import NativeEnvironment
-
+@pytest.mark.parametrize("enabled", [False, True])
+def test_runtime_worker_mount_excludes_controller_signing_keys(enabled):
+    values = _resolved_kolla_defaults(["lumen_worker_runtime_volumes"], {
+        "lumen_runtime_enabled": enabled, "enable_lumen_worker": True,
+        "lumen_worker_secrets_dir": "/srv/worker-client",
+        "lumen_controller_secrets_dir": "/srv/controller-only",
+    })
+    expected = ["/srv/worker-client:/etc/lumen/controller:ro"] if enabled else []
+    assert values["lumen_worker_runtime_volumes"] == expected
     defaults = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
-    environment = NativeEnvironment()
-    environment.filters["bool"] = bool
-    render = environment.from_string
-    for enabled in (False, True):
-        worker_mounts = render(defaults["lumen_worker_runtime_volumes"]).render(
-            lumen_runtime_enabled=enabled, lumen_worker_secrets_dir="/srv/worker-client",
-        )
-        mounts = render(defaults["lumen_services"]["lumen-worker"]["volumes"]).render(
-            lumen_worker_runtime_volumes=worker_mounts,
-        )
-        assert isinstance(mounts, list)
-        assert ("/srv/worker-client:/etc/lumen/controller:ro" in mounts) is enabled
-        assert not any("/etc/kolla/lumen/controller" in mount for mount in mounts)
+    mounts = _kolla_environment({}, native=True).from_string(
+        defaults["lumen_services"]["lumen-worker"]["volumes"],
+    ).render(**values)
+    assert mounts == [
+        "/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro", "kolla_logs:/var/log/kolla/", *expected,
+    ]
+
+
+def _worker_directory_contract(*, with_manifest=False):
+    tasks = yaml.safe_load((ROLE_DIR / "tasks" / "precheck.yml").read_text(encoding="utf-8"))
+    assertions = [task for task in tasks if "ansible.builtin.assert" in task]
+    directory = next(task for task in assertions if task["ansible.builtin.assert"]["fail_msg"].startswith(
+        "runtime_worker_mount_permissions:"))
+    material = next(task for task in assertions if task["ansible.builtin.assert"]["fail_msg"].startswith(
+        "runtime_worker_mount_material:"))
+    tls = {"ca_file": "/etc/lumen/controller/ca.pem",
+           "worker_client_cert_file": "/etc/lumen/controller/worker.pem",
+           "worker_client_key_file": "/etc/lumen/controller/worker-key.pem",
+           "operator_client_cert_file": "/etc/lumen/controller/operator.pem",
+           "operator_client_key_file": "/etc/lumen/controller/operator-key.pem"}
+    files = [{"path": "/srv/worker-client/" + Path(tls[field]).name,
+              "uid": 0, "gid": 0, "isreg": True, "isdir": False, "islnk": False,
+              "mode": "0640" if field == "worker_client_key_file" else "0644"}
+             for field in ("ca_file", "worker_client_cert_file", "worker_client_key_file")]
+    inventory = {"files": [entry["path"].replace("/srv/worker-client/", "/etc/lumen/worker-precheck/")
+                           for entry in files], "directories": [], "manifests": []}
+    if with_manifest:
+        manifest = "/etc/lumen/worker-precheck/kubernetes/deep/manifest.json"
+        inventory["files"].append(manifest)
+        inventory["manifests"].append(manifest)
+        inventory["directories"] = ["/etc/lumen/worker-precheck/kubernetes", "/etc/lumen/worker-precheck/kubernetes/deep"]
+        for path in [manifest, *inventory["directories"]]:
+            directory = path != manifest
+            files.append({"path": path.replace("/etc/lumen/worker-precheck/", "/srv/worker-client/"),
+                          "uid": 0, "gid": 0, "isreg": not directory, "isdir": directory,
+                          "islnk": False, "mode": "0750" if directory else "0644"})
+    context = {"lumen_worker_secrets_dir": "/srv/worker-client", "lumen_runtime_config": {"tls": tls},
+               "lumen_worker_secrets_stat": {"stat": {"isdir": True, "islnk": False,
+                                                       "uid": 0, "gid": 0, "mode": "0750"}},
+               "lumen_worker_secrets_inventory": {"files": files},
+               "lumen_runtime_precheck_result": {"stdout": json.dumps({"worker_inventory": inventory})}}
+    return directory, material, context
+
+
+def _rendered_assertions_accept(task, context):
+    context = dict(context)
+    native = _kolla_environment(context, native=True)
+    for name, value in task.get("vars", {}).items():
+        context[name] = native.from_string(value).render(**context)
+    environment = _kolla_environment(context)
+    return all(environment.compile_expression(condition)(**context)
+               for condition in task["ansible.builtin.assert"]["that"])
+
+
+@pytest.mark.parametrize("fault", [None, "not-directory", "symlink", "owner", "group", "mode"])
+def test_worker_directory_metadata_assertions_are_effective(fault):
+    directory, _, context = _worker_directory_contract()
+    metadata = context["lumen_worker_secrets_stat"]["stat"]
+    if fault:
+        field, value = {"not-directory": ("isdir", False), "symlink": ("islnk", True),
+                        "owner": ("uid", 1000), "group": ("gid", 1000), "mode": ("mode", "0770")}[fault]
+        metadata[field] = value
+    assert _rendered_assertions_accept(directory, context) is (fault is None)
+
+
+@pytest.mark.parametrize("fault", [
+    None, "missing-key", "operator-cert", "operator-key", "owner", "group", "symlink", "world-key",
+    "private-key-unreadable", "writable-cert", "ca-key.pem", "server-key.pem", "dispatch.key",
+    "token.env", "qualification.json", "manifest.json", ".hidden", "subdirectory",
+])
+def test_worker_directory_allowlist_rejects_leakage_and_misbinding(fault):
+    _, material, context = _worker_directory_contract()
+    files = context["lumen_worker_secrets_inventory"]["files"]
+    if fault == "missing-key":
+        files.pop()
+    elif fault in {"operator-cert", "operator-key"}:
+        index, name = (1, "operator.pem") if fault == "operator-cert" else (2, "operator-key.pem")
+        files[index]["path"] = "/srv/worker-client/" + name
+    elif fault in {"owner", "group", "symlink", "world-key", "private-key-unreadable", "writable-cert"}:
+        index, field, value = {
+            "owner": (0, "uid", 1000), "group": (0, "gid", 1000), "symlink": (1, "isreg", False),
+            "world-key": (2, "mode", "0644"), "private-key-unreadable": (2, "mode", "0600"),
+            "writable-cert": (1, "mode", "0664"),
+        }[fault]
+        files[index][field] = value
+        if fault == "symlink":
+            files[index]["islnk"] = True
+    elif fault is not None:
+        files.append({**files[0], "path": "/srv/worker-client/" + fault,
+                      "isreg": fault != "subdirectory"})
+    assert _rendered_assertions_accept(material, context) is (fault is None)
 
 
 def test_kolla_package_and_image_version_contract():
@@ -487,6 +634,41 @@ def test_kolla_precheck_encryption_key_uncoupled():
     assert "lumen_encryption_key is regex('^[0-9a-fA-F]{64}$')" in precheck_raw, (
         "Precheck must require 64 hex characters fail-closed"
     )
+
+
+@pytest.mark.parametrize("version", [1, 2, 0, 3, "2", "invalid"])
+def test_kolla_precheck_chat_protocol_matches_supported_versions(version):
+    tasks = yaml.safe_load((ROLE_DIR / "tasks" / "precheck.yml").read_text(encoding="utf-8"))
+    task = next(task for task in tasks if task["name"] == "Precheck | Verify Lumen chat execution protocol")
+    conditions = task["ansible.builtin.assert"]["that"]
+    environment = _kolla_environment(_kolla_inventory())
+    assert all(environment.compile_expression(condition)(lumen_chat_execution_protocol_version=version)
+               for condition in conditions) is (version in (1, 2))
+
+
+@pytest.mark.parametrize("version, enabled, url, accepted", [
+    (1, False, "", True),
+    (2, False, "postgresql://checkpoint.example/lumen", False),
+    (2, True, "", False),
+    (2, True, "https://checkpoint.example/lumen", False),
+    (2, True, "postgresql://checkpoint.example/lumen", True),
+    (2, True, "postgres://checkpoint.example/lumen", True),
+])
+def test_kolla_precheck_v2_requires_enabled_postgres_checkpointer(version, enabled, url, accepted):
+    tasks = yaml.safe_load((ROLE_DIR / "tasks" / "precheck.yml").read_text(encoding="utf-8"))
+    task = next(task for task in tasks if task["name"] == "Precheck | Require protocol v2 checkpointer configuration")
+    environment = _kolla_environment(_kolla_inventory())
+    environment.tests["match"] = lambda value, pattern: re.match(pattern, value) is not None
+    values = {
+        "enable_lumen": True,
+        "lumen_chat_execution_protocol_version": version,
+        "lumen_enable_checkpointer": enabled,
+        "lumen_checkpointer_postgres_url": url,
+    }
+    applies = all(environment.compile_expression(condition)(**values) for condition in task["when"])
+    configured = all(environment.compile_expression(condition)(**values)
+                     for condition in task["ansible.builtin.assert"]["that"])
+    assert (not applies or configured) is accepted
 
 
 def test_kolla_main_tasks_action_validation():
@@ -740,3 +922,69 @@ def test_kolla_config_escapes_operator_strings_as_toml():
     config = tomllib.loads(environment.from_string(source).render(**values))
     assert config["keystone"]["keystone_admin_password"] == value
     assert config["chat"]["chat_asset_s3_secret_key"] == value
+
+
+@pytest.mark.parametrize(("runtime_enabled", "worker_enabled"), [
+    (False, False), (False, True), (True, False), (True, True),
+])
+def test_worker_directory_prechecks_only_apply_to_enabled_runtime_workers(runtime_enabled, worker_enabled):
+    tasks = yaml.safe_load((ROLE_DIR / "tasks" / "precheck.yml").read_text(encoding="utf-8"))
+    directory, material, _ = _worker_directory_contract()
+    inspection = [task for task in tasks if task.get("register") in {
+        "lumen_worker_secrets_stat", "lumen_worker_secrets_inventory",
+    }]
+    assert len(inspection) == 2
+    context = {"enable_lumen": "yes", "lumen_runtime_enabled": runtime_enabled,
+               "enable_lumen_worker": worker_enabled, "inventory_hostname": "controller1",
+               "groups": {"lumen": ["controller1"]}, "lumen_worker_secrets_dir": "/srv/worker-client"}
+    environment = _kolla_environment(context)
+    for task in [directory, material, *inspection]:
+        applies = all(environment.compile_expression(condition)(**context) for condition in task["when"])
+        assert applies is (runtime_enabled and worker_enabled)
+    stat = next(task["ansible.builtin.stat"] for task in inspection if "ansible.builtin.stat" in task)
+    find = next(task["ansible.builtin.find"] for task in inspection if "ansible.builtin.find" in task)
+    assert environment.from_string(stat["path"]).render(**context) == "/srv/worker-client"
+    assert environment.from_string(find["paths"]).render(**context) == "/srv/worker-client"
+    assert find["hidden"] is True
+    assert find["file_type"] == "any"
+    assert find["recurse"] is True
+    assert find["follow"] is False
+
+
+@pytest.mark.parametrize("mode", ["0444", "0644"])
+def test_worker_directory_accepts_enabled_manifest_and_exact_nested_ancestors(mode):
+    _, material, context = _worker_directory_contract(with_manifest=True)
+    files = context["lumen_worker_secrets_inventory"]["files"]
+    next(entry for entry in files if entry["path"].endswith("manifest.json"))["mode"] = mode
+    assert _rendered_assertions_accept(material, context)
+
+
+@pytest.mark.parametrize("fault", [
+    "missing", "flattened", "manifest-owner", "manifest-group", "manifest-private-mode", "manifest-group-mode",
+    "manifest-writable", "manifest-symlink", "ancestor-missing", "ancestor-owner", "ancestor-group",
+    "ancestor-mode", "ancestor-symlink", "extra-file", "extra-directory",
+])
+def test_worker_directory_rejects_manifest_and_nested_inventory_faults(fault):
+    _, material, context = _worker_directory_contract(with_manifest=True)
+    files = context["lumen_worker_secrets_inventory"]["files"]
+    manifest = next(entry for entry in files if entry["path"].endswith("manifest.json"))
+    ancestor = next(entry for entry in files if entry["path"].endswith("kubernetes/deep"))
+    if fault == "missing":
+        files.remove(manifest)
+    elif fault == "flattened":
+        manifest["path"] = "/srv/worker-client/manifest.json"
+    elif fault == "ancestor-missing":
+        files.remove(ancestor)
+    elif fault.startswith("extra-"):
+        directory = fault == "extra-directory"
+        files.append({**manifest, "path": "/srv/worker-client/kubernetes/deep/unexpected",
+                      "isreg": not directory, "isdir": directory, "mode": "0750" if directory else "0644"})
+    else:
+        entry = ancestor if fault.startswith("ancestor-") else manifest
+        field, value = {
+            "owner": ("uid", 1000), "group": ("gid", 1000), "private-mode": ("mode", "0600"),
+            "group-mode": ("mode", "0640"), "writable": ("mode", "0664"),
+            "mode": ("mode", "0755"), "symlink": ("islnk", True),
+        }[fault.split("-", 1)[1]]
+        entry[field] = value
+    assert not _rendered_assertions_accept(material, context)

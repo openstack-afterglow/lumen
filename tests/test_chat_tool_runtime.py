@@ -6,6 +6,7 @@
 """
 
 import json
+from dataclasses import replace
 
 import pytest
 from lumen_plugin_api.contracts import ExecutionContext, PluginError
@@ -305,17 +306,447 @@ class TestSelectionFilter:
         assert selection._selected(items, (1, 3)) == [{"id": 1}, {"id": 3}]  # 부분
 
 
+class TestRemoteMcpSafety:
+    @pytest.mark.parametrize("effect", [None, "unknown", "external_mutation", "workspace_write", "process"])
+    @pytest.mark.parametrize("with_session", [False, True])
+    async def test_v1_fabricated_direct_name_blocks_nonread_effects(self, monkeypatch, effect, with_session):
+        import lumen.services.extensions_store as es
+
+        server = {
+            "id": 7, "transport": "http", "url": "https://mcp.example/x",
+            "effect_overrides": {} if effect is None else {"fabricated-delete": effect},
+        }
+
+        async def list_for_user(kind, **kwargs):
+            assert (kwargs["user_id"], kwargs["project_id"]) == ("u1", "p1")
+            return [server] if kind == "mcp" else []
+
+        async def unexpected_call(*args, **kwargs):
+            raise AssertionError("v1 must not dispatch a nonread MCP method")
+
+        monkeypatch.setattr(es, "list_for_user", list_for_user)
+        monkeypatch.setattr(bindings.mcp_client, "call_tool", unexpected_call)
+        ctx = replace(_CTX, binding_session=contracts.ToolBindingSession() if with_session else None)
+        result = await tool_runtime.context_execute_result("mcp__7__fabricated-delete", {}, ctx)
+
+        assert result.status == "failed"
+        assert result.warning_code == "tool_approval_required"
+
+    @pytest.mark.parametrize("effect", [None, "external_mutation", "workspace_write", "process"])
+    @pytest.mark.parametrize("name", ["mcp__7__fabricated", "fabricated_remote_name"])
+    async def test_v1_dynamic_dispatch_blocks_nonread_binding_without_schema_filter(self, monkeypatch, effect, name):
+        async def unexpected_execute(arguments, context):
+            raise AssertionError("v1 must not execute a nonread remote binding")
+
+        binding = ToolBinding(
+            definition=ToolDefinition(
+                name=name, description="Remote mutation", source="mcp",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                effect=contracts._v2_effect(effect),
+            ),
+            execute=unexpected_execute,
+        )
+
+        async def dynamic_bindings(ctx):
+            return {name: binding}
+
+        monkeypatch.setattr(bindings, "_legacy_dynamic_bindings", dynamic_bindings)
+        ctx = replace(_CTX, binding_session=contracts.ToolBindingSession())
+        result = await tool_runtime.context_execute_result(name, {}, ctx)
+
+        assert result.status == "failed"
+        assert result.warning_code == "tool_approval_required"
+
+    @pytest.mark.parametrize("load_policy", ["preloaded", "on_demand"])
+    async def test_v1_loads_and_dispatches_only_explicit_remote_reads(self, monkeypatch, load_policy):
+        import lumen.services.extensions_store as es
+
+        server = {
+            "id": 7, "name": "remote", "transport": "http", "url": "https://mcp.example/x",
+            "load_policy": load_policy, "effect_overrides": {"search": "read", "delete": "external_mutation"},
+        }
+        calls = []
+
+        async def list_for_user(kind, **kwargs):
+            return [server] if kind == "mcp" else []
+
+        async def list_tools(server, *, context):
+            assert context == contracts.execution_context(ctx)
+            return [{"name": name, "description": "remote tool", "input_schema": {"type": "object", "properties": {}}}
+                    for name in ("search", "delete", "unknown")]
+
+        async def call_tool(server, name, arguments, *, context, expected_credential_epoch):
+            assert expected_credential_epoch is None
+            calls.append((name, arguments, context))
+            return "read result"
+
+        monkeypatch.setattr(es, "list_for_user", list_for_user)
+        monkeypatch.setattr(bindings.mcp_client, "list_tools", list_tools)
+        monkeypatch.setattr(bindings.mcp_client, "call_tool", call_tool)
+        # Durable dispatch has already committed its authority fence at tool_started.
+        ctx = replace(
+            _CTX, run_id="run-1", tool_call_id="call-1", execution_hooks=object(),
+            binding_session=contracts.ToolBindingSession(),
+        )
+        await selection.context_tool_schemas(ctx)
+        if load_policy == "on_demand":
+            catalog = await tool_runtime.context_execute_result("list_available_tools", {"query": "remote"}, ctx)
+            loaded = json.loads(catalog.content)["loaded_tools"]
+            assert len(loaded) == 1
+        remote = [binding for binding in ctx.binding_session.legacy_bindings.values()
+                  if binding.definition.source == "mcp"]
+        assert len(remote) == 1
+        assert remote[0].definition.effect == "read"
+        result = await tool_runtime.context_execute_result(remote[0].definition.name, {}, ctx)
+
+        assert result.content == "read result"
+        assert calls == [("search", {}, contracts.execution_context(ctx))]
+
+    @pytest.mark.parametrize(("field", "value"), [
+        ("url", "https://other.example/x"), ("config_version", 2),
+        ("effect_overrides", {"search": "external_mutation"}),
+        ("transport", "sse"), ("auth_mode", "admin"), ("load_policy", "on_demand"),
+        ("activation_generation", 2), ("is_active", False),
+    ])
+    async def test_v2_frozen_mcp_config_change_blocks_actual_dispatch(self, monkeypatch, field, value):
+        import lumen.services.extensions_store as es
+
+        current = {
+            "id": 7, "name": "remote", "transport": "http", "url": "https://mcp.example/x",
+            "config_version": 1, "activation_generation": 1, "auth_mode": "none",
+            "load_policy": "preloaded", "is_active": True, "effect_overrides": {"search": "read"},
+        }
+
+        async def list_for_user(kind, **kwargs):
+            assert kwargs["active_only"] is True
+            if kind == "mcp":
+                assert kwargs["reveal_secrets"] is True
+                return [current] if current["is_active"] else []
+            return []
+
+        async def list_tools(server, *, context):
+            return [{"name": "search", "input_schema": {"type": "object", "properties": {}}}]
+
+        async def unexpected_call(*args, **kwargs):
+            raise AssertionError("changed frozen MCP configuration must not dispatch")
+
+        monkeypatch.setattr(es, "list_for_user", list_for_user)
+        monkeypatch.setattr(bindings.mcp_client, "list_tools", list_tools)
+        monkeypatch.setattr(bindings.mcp_client, "call_tool", unexpected_call)
+        ctx = replace(_CTX, run_id="run-1")
+        resolved = await bindings.v2_tool_bindings(ctx, include_platform=False)
+        binding, = resolved.values()
+        frozen_config = binding.config_fingerprint
+        current[field] = value
+        result = await binding.execute({}, replace(ctx, tool_call_id="approved-call"))
+
+        assert result.status == "failed"
+        assert result.error_code == "extension_unavailable"
+        assert binding.config_fingerprint == frozen_config
+
+    @pytest.mark.parametrize(("field", "value"), [
+        ("user_id", "other-user"), ("project_id", "other-project"), ("run_id", "other-run"),
+    ])
+    async def test_v2_frozen_mcp_owner_change_blocks_dispatch(self, monkeypatch, field, value):
+        server = {"id": 7, "url": "https://mcp.example/x", "effect_overrides": {"search": "read"}}
+
+        async def no_custom(ctx):
+            return []
+
+        async def load_mcp(ctx):
+            # Both owners can access the same global row; access alone cannot authorize reuse.
+            return [server]
+
+        async def list_tools(server, *, context):
+            return [{"name": "search", "input_schema": {"type": "object", "properties": {}}}]
+
+        async def unexpected_call(*args, **kwargs):
+            raise AssertionError("a frozen binding cannot be moved to a different owner/run")
+
+        monkeypatch.setattr(bindings, "_load_custom", no_custom)
+        monkeypatch.setattr(bindings, "_load_mcp", load_mcp)
+        monkeypatch.setattr(bindings.mcp_client, "list_tools", list_tools)
+        monkeypatch.setattr(bindings.mcp_client, "call_tool", unexpected_call)
+        ctx = replace(_CTX, run_id="run-1")
+        resolved = await bindings.v2_tool_bindings(ctx, include_platform=False)
+        binding, = resolved.values()
+        result = await binding.execute({}, replace(ctx, **{field: value}))
+
+        assert result.status == "failed"
+        assert result.error_code == "extension_unavailable"
+
+    async def test_v2_mcp_identity_excludes_secret_headers(self, monkeypatch):
+
+        server = {
+            "id": 7, "url": "https://mcp.example/x", "effect_overrides": {}, "config_version": 1,
+            "headers": {"Authorization": "Bearer initial-secret"},
+        }
+        calls = []
+
+        async def no_custom(ctx):
+            return []
+
+        async def load_mcp(ctx):
+            return [server]
+
+        async def list_tools(server, *, context):
+            return [{"name": "unknown", "input_schema": {"type": "object", "properties": {}}}]
+
+        async def call_tool(server, name, arguments, *, context, expected_credential_epoch):
+            assert expected_credential_epoch is None
+            calls.append((dict(server["headers"]), context))
+            return "result"
+
+        monkeypatch.setattr(bindings, "_load_custom", no_custom)
+        monkeypatch.setattr(bindings, "_load_mcp", load_mcp)
+        monkeypatch.setattr(bindings.mcp_client, "list_tools", list_tools)
+        monkeypatch.setattr(bindings.mcp_client, "call_tool", call_tool)
+        ctx = replace(_CTX, run_id="run-1")
+        first, = (await bindings.v2_tool_bindings(ctx, include_platform=False)).values()
+        assert first.definition.effect == "external_mutation"
+        server["headers"] = {"Authorization": "Bearer refreshed-secret"}
+        second, = (await bindings.v2_tool_bindings(replace(ctx, run_id="run-2"), include_platform=False)).values()
+        result = await first.execute({}, replace(ctx, tool_call_id="approved-call"))
+
+        assert first.config_fingerprint == second.config_fingerprint
+        assert result.status == "completed"
+        assert calls == [(server["headers"], contracts.execution_context(replace(ctx, tool_call_id="approved-call")))]
+
+
+    @pytest.mark.parametrize("auth_mode", ["oauth", "none", "admin"])
+    async def test_v2_forwards_frozen_epoch_across_token_refresh(self, monkeypatch, auth_mode):
+        server = {
+            "id": 7, "url": "https://mcp.example/x", "auth_mode": auth_mode,
+            "effect_overrides": {"search": "read"}, "credential_epoch": 99,
+            "headers": {"Authorization": "Bearer initial-secret"},
+        }
+        calls = []
+
+        async def no_custom(ctx):
+            return []
+
+        async def load_mcp(ctx):
+            return [server]
+
+        async def list_tools(server, *, context):
+            return [{"name": "search", "input_schema": {"type": "object", "properties": {}}}]
+
+        async def call_tool(server, name, arguments, *, context, expected_credential_epoch):
+            calls.append((expected_credential_epoch, dict(server["headers"])))
+            return "refreshed result"
+
+        monkeypatch.setattr(bindings, "_load_custom", no_custom)
+        monkeypatch.setattr(bindings, "_load_mcp", load_mcp)
+        monkeypatch.setattr(bindings.mcp_client, "list_tools", list_tools)
+        monkeypatch.setattr(bindings.mcp_client, "call_tool", call_tool)
+        ctx = replace(_CTX, run_id="run-1", expected_mcp_credential_versions=((7, 3),))
+        binding, = (await bindings.v2_tool_bindings(ctx, include_platform=False)).values()
+        fingerprint = binding.config_fingerprint
+        server["headers"] = {"Authorization": "Bearer refreshed-secret"}
+        result = await binding.execute({}, replace(ctx, expected_mcp_credential_versions=((7, 99),)))
+
+        assert result.status == "completed"
+        assert calls == [(3 if auth_mode == "oauth" else None, server["headers"])]
+        assert binding.config_fingerprint == fingerprint
+
+    @pytest.mark.parametrize("epochs", [None, (), ((8, 3),), ((7, 0),), ((7, True),)])
+    async def test_missing_frozen_oauth_epoch_blocks_call(self, monkeypatch, epochs):
+        server = {"id": 7, "url": "https://mcp.example/x", "auth_mode": "oauth",
+                  "effect_overrides": {"search": "read"}, "credential_epoch": 3}
+
+        async def no_custom(ctx):
+            return []
+
+        async def load_mcp(ctx):
+            return [server]
+
+        async def unexpected_call(*args, **kwargs):
+            pytest.fail("missing frozen OAuth epoch must not reach provider/socket")
+
+        monkeypatch.setattr(bindings, "_load_custom", no_custom)
+        monkeypatch.setattr(bindings, "_load_mcp", load_mcp)
+        monkeypatch.setattr(selection, "_load_mcp", load_mcp)
+        monkeypatch.setattr(bindings.mcp_client, "list_tools", unexpected_call)
+        monkeypatch.setattr(bindings.mcp_client, "call_tool", unexpected_call)
+        ctx = replace(_CTX, expected_mcp_credential_versions=epochs)
+        assert await bindings.v2_tool_bindings(ctx, include_platform=False) == {}
+        legacy = await tool_runtime.context_execute_result("mcp__7__search", {}, ctx)
+        assert legacy.status == "failed"
+        assert legacy.warning_code == "plugin_authority_revoked"
+        assert legacy.content == "MCP 도구 실행 중 오류가 발생했습니다."
+
+    @pytest.mark.parametrize("mutation", ["rotated", "revoked"])
+    async def test_provider_resolution_mutation_blocks_dispatch(self, monkeypatch, mutation):
+        server = {"id": 7, "url": "https://mcp.example/x", "auth_mode": "oauth",
+                  "effect_overrides": {"search": "read"}}
+        state = {"epoch": 3, "active": True, "dispatched": False}
+        received = []
+
+        async def no_custom(ctx):
+            return []
+
+        async def load_mcp(ctx):
+            return [server]
+
+        async def list_tools(server, *, context):
+            return [{"name": "search", "input_schema": {"type": "object", "properties": {}}}]
+
+        class Provider:
+            async def call_tool(self, server, name, arguments, *, context, expected_credential_epoch):
+                received.append(expected_credential_epoch)
+                if not state["active"] or expected_credential_epoch != state["epoch"]:
+                    raise PluginError("plugin_authority_revoked", "private provider detail")
+                state["dispatched"] = True
+                return bindings.mcp_client.McpToolOutput(text="dispatched", files=())
+
+        def provider_resolution():
+            if mutation == "rotated":
+                state["epoch"] = 4
+            else:
+                state["active"] = False
+            return Provider()
+
+        monkeypatch.setattr(bindings, "_load_custom", no_custom)
+        monkeypatch.setattr(bindings, "_load_mcp", load_mcp)
+        monkeypatch.setattr(bindings.mcp_client, "list_tools", list_tools)
+        monkeypatch.setattr(bindings.mcp_client, "_provider", provider_resolution)
+        ctx = replace(_CTX, expected_mcp_credential_versions=((7, 3),))
+        binding, = (await bindings.v2_tool_bindings(ctx, include_platform=False)).values()
+        result = await binding.execute({}, ctx)
+        assert received == [3]
+        assert state["dispatched"] is False
+        assert result.status == "failed"
+        assert result.error_code == "plugin_authority_revoked"
+        assert "private provider detail" not in result.model_dump_json()
+
+    @pytest.mark.parametrize("code", [
+        "plugin_authority_revoked", "plugin_configuration_changed", "plugin_unavailable", "plugin_incompatible", None,
+    ])
+    async def test_typed_failure_is_failed_in_v2_and_legacy_boundaries(self, monkeypatch, code):
+        server = {"id": 7, "url": "https://mcp.example/x", "effect_overrides": {"search": "read"}}
+
+        async def no_custom(ctx):
+            return []
+
+        async def load_mcp(ctx):
+            return [server]
+
+        async def list_tools(server, *, context):
+            return [{"name": "search", "input_schema": {"type": "object", "properties": {}}}]
+
+        async def call_tool(server, name, arguments, *, context, expected_credential_epoch):
+            assert expected_credential_epoch is None
+            if code is None:
+                raise OSError("private provider detail")
+            raise PluginError(code, "private provider detail")
+
+        monkeypatch.setattr(bindings, "_load_custom", no_custom)
+        monkeypatch.setattr(bindings, "_load_mcp", load_mcp)
+        monkeypatch.setattr(selection, "_load_mcp", load_mcp)
+        monkeypatch.setattr(bindings.mcp_client, "list_tools", list_tools)
+        monkeypatch.setattr(bindings.mcp_client, "call_tool", call_tool)
+        ctx = replace(_CTX, expected_mcp_credential_versions=((7, 3),))
+        binding, = (await bindings.v2_tool_bindings(ctx, include_platform=False)).values()
+        v2 = await binding.execute({}, ctx)
+        assert v2.status == "failed"
+        assert v2.error_code == (code or "plugin_unavailable")
+        assert v2.display and v2.display[0].text == v2.model_content
+        assert "private provider detail" not in v2.model_dump_json()
+        session = contracts.ToolBindingSession(legacy_preloaded=True, legacy_bindings={binding.definition.name: binding})
+        dynamic = await tool_runtime.context_execute_result(binding.definition.name, {}, replace(ctx, binding_session=session))
+        direct = await tool_runtime.context_execute_result("mcp__7__search", {}, ctx)
+        for result in (dynamic, direct):
+            assert result.status == "failed"
+            assert result.warning_code == (code or "plugin_unavailable")
+            assert result.visible is True
+            assert result.content == "MCP 도구 실행 중 오류가 발생했습니다."
+        assert await tool_runtime.context_execute("mcp__7__search", {}, ctx) == direct.content
+
+
+    @pytest.mark.parametrize("auth_mode", ["oauth", "none", "admin"])
+    async def test_direct_call_forwards_admitted_epoch(self, monkeypatch, auth_mode):
+        server = {"id": 7, "auth_mode": auth_mode, "credential_epoch": 99,
+                  "effect_overrides": {"search": "read"}}
+        ctx = replace(_CTX, expected_mcp_credential_versions=((7, 3),))
+        calls = []
+
+        async def load_mcp(context):
+            return [server]
+
+        async def call_tool(server, name, args, *, context, expected_credential_epoch):
+            assert context == contracts.execution_context(ctx)
+            calls.append(expected_credential_epoch)
+            return "read result"
+
+        monkeypatch.setattr(selection, "_load_mcp", load_mcp)
+        monkeypatch.setattr(bindings.mcp_client, "call_tool", call_tool)
+        assert await tool_runtime.context_execute("mcp__7__search", {}, ctx) == "read result"
+        assert calls == [3 if auth_mode == "oauth" else None]
+
+    async def test_unadmitted_oauth_selection_never_resolves_or_refreshes_tokens(self, monkeypatch):
+        from lumen.services import extensions_store as es
+        from lumen.services import mcp_oauth
+
+        async def list_for_user(*args, **kwargs):
+            return [{"id": 7, "auth_mode": "oauth"}]
+
+        async def unexpected_oauth(*args, **kwargs):
+            pytest.fail("unadmitted OAuth cannot resolve/refresh credentials")
+
+        monkeypatch.setattr(es, "list_for_user", list_for_user)
+        monkeypatch.setattr(mcp_oauth, "headers_for_user", unexpected_oauth)
+        assert await selection._load_mcp(_CTX) == []
+
+
+    @pytest.mark.parametrize("condition", ["missing_epoch", "rotated", "revoked"])
+    async def test_real_selection_authority_filter_preserves_failed_status(self, monkeypatch, condition):
+        from lumen.services import extensions_store as es
+        from lumen.services import mcp_oauth
+
+        async def list_for_user(*args, **kwargs):
+            return [{
+                "id": 7, "transport": "http", "url": "https://mcp.example/x",
+                "auth_mode": "oauth", "effect_overrides": {"search": "read"},
+            }]
+
+        async def headers_for_user(**kwargs):
+            if condition == "missing_epoch":
+                pytest.fail("missing epoch must not resolve or refresh credentials")
+            return {} if condition == "revoked" else {7: {"Authorization": "Bearer current-token"}}
+
+        async def credential_versions(*args, **kwargs):
+            return {7: 4 if condition == "rotated" else 3}
+
+        async def unexpected_call(*args, **kwargs):
+            pytest.fail("authority-filtered server must never dispatch")
+
+        monkeypatch.setattr(es, "list_for_user", list_for_user)
+        monkeypatch.setattr(es, "mcp_credential_versions", credential_versions)
+        monkeypatch.setattr(mcp_oauth, "headers_for_user", headers_for_user)
+        monkeypatch.setattr(bindings.mcp_client, "call_tool", unexpected_call)
+        ctx = replace(_CTX, selected_mcp_ids=(7,), expected_mcp_credential_versions=(
+            () if condition == "missing_epoch" else ((7, 3),)
+        ))
+        result = await tool_runtime.context_execute_result("mcp__7__search", {}, ctx)
+        assert result.status == "failed"
+        assert result.warning_code == "extension_unavailable"
+        assert result.content == "선택되지 않았거나 접근 불가한 MCP 서버입니다."
+        assert await tool_runtime.context_execute("mcp__7__search", {}, ctx) == result.content
+
+
 class TestMcpTools:
     async def test_selected_mcp_tool_prefixed_schema(self, monkeypatch):
         import lumen.services.extensions_store as es
 
         async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False):
             if kind == "mcp":
-                return [{"id": 7, "name": "srv", "transport": "http", "url": "https://mcp.example/x"}]
+                return [{"id": 7, "name": "srv", "transport": "http", "url": "https://mcp.example/x",
+                         "effect_overrides": {"search": "read"}}]
             return []  # 커스텀 tool 없음
 
-        async def fake_list_tools(server):
-            return [{"name": "search", "description": "d", "input_schema": {"type": "object"}}]
+        async def fake_list_tools(server, *, context):
+            assert context == contracts.execution_context(_CTX)
+            return [{"name": "search", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
         monkeypatch.setattr(selection.mcp_client, "list_tools", fake_list_tools)
@@ -330,10 +761,13 @@ class TestMcpTools:
 
         async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False):
             if kind == "mcp":
-                return [{"id": 7, "name": "srv", "transport": "http", "url": "https://mcp.example/x"}]
+                return [{"id": 7, "name": "srv", "transport": "http", "url": "https://mcp.example/x",
+                         "effect_overrides": {"search": "read"}}]
             return []
 
-        async def fake_call_tool(server, tool_name, args):
+        async def fake_call_tool(server, tool_name, args, *, context, expected_credential_epoch):
+            assert expected_credential_epoch is None
+            assert context == contracts.execution_context(_CTX)
             captured.update(server_id=server["id"], tool=tool_name, args=args)
             return "결과"
 
@@ -461,12 +895,17 @@ class TestMcpTools:
         async def connected_headers(*, user_id, project_id):
             return {7: {"Authorization": "Bearer user-oauth-token"}}
 
+        async def credential_versions(*args, **kwargs):
+            return {7: 3}
+
+        ctx = replace(_CTX, expected_mcp_credential_versions=((7, 3),))
+        monkeypatch.setattr(es, "mcp_credential_versions", credential_versions)
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
         monkeypatch.setattr(oauth, "headers_for_user", no_headers)
-        assert await selection._load_mcp(_CTX) == []
+        assert await selection._load_mcp(ctx) == []
 
         monkeypatch.setattr(oauth, "headers_for_user", connected_headers)
-        servers = await selection._load_mcp(_CTX)
+        servers = await selection._load_mcp(ctx)
         assert servers[0]["headers"]["Authorization"] == "Bearer user-oauth-token"
 
 
@@ -530,13 +969,14 @@ class TestDeferredToolBinding:
                     "id": 7,
                     "name": "Notion",
                     "url": "https://mcp.example.test",
-                    "effect_overrides": {},
+                    "effect_overrides": {"notion-search": "read"},
                     "config_version": 1,
                     "load_policy": "on_demand",
                 }
             ]
 
-        async def discovered_tools(_server):
+        async def discovered_tools(_server, *, context):
+            assert (context.user_id, context.project_id) == ("u1", "p1")
             return [
                 {
                     "name": "notion-search",

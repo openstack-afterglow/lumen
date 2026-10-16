@@ -276,3 +276,93 @@ async def test_identity_payload_is_bounded_and_schema_errors_are_safe():
             response = await client.post("/v1/runtime/identity/activate", content=raw)
             assert response.status_code == status and response.json() == {"detail": code}
             assert "secret-invalid-id" not in response.text
+
+@pytest.mark.asyncio
+async def test_fixed_worker_dispatch_authorization_and_rejection(monkeypatch):
+    from lumen.services.infrastructure import dispatch
+    from lumen.services.infrastructure.config import FixedWorkerIdentity
+    from lumen.services.infrastructure.dispatch import DispatchRejected
+
+    now = datetime.now(UTC)
+    config = RuntimeConfig(
+        deployment_id="test",
+        dispatch_key=SecretRef(env="TEST_DISPATCH_KEY"),
+        fixed_workers=(FixedWorkerIdentity(id="worker1", certificate_fingerprint="f" * 64),),
+    )
+    monkeypatch.setenv("TEST_DISPATCH_KEY", "operator-secret-32-bytes-long-key-ref")
+
+    run_id = str(uuid4())
+    resource_id = str(uuid4())
+    run = SimpleNamespace(
+        id=run_id, lease_owner="worker1#1", lease_fence=1, status="running",
+        cancel_requested_at=None, lease_expires_at=now + timedelta(minutes=5),
+        assigned_resource_id=resource_id, root_run_id=None, worker_registration_id="reg-1",
+    )
+    resource = SimpleNamespace(
+        id=resource_id, generation=1, run_id=run_id, role="sandbox", observed_state="ready",
+        desired_state="requested", address="10.0.0.5", port=8013, certificate_fingerprint="s" * 64,
+    )
+    registration = SimpleNamespace(
+        id="reg-1", resource_id=None, certificate_fingerprint="f" * 64,
+        worker_identity="worker1", heartbeat_at=now,
+    )
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def get(self, model, ident):
+            return run if ident == run_id else None
+        async def execute(self, query):
+            qstr = str(query)
+            if "chat_runs" in qstr:
+                return SimpleNamespace(scalar_one_or_none=lambda: run)
+            if "chat_runtime_resources" in qstr:
+                return SimpleNamespace(scalar_one_or_none=lambda: resource)
+            if "chat_worker_registrations" in qstr:
+                return SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: registration))
+            return SimpleNamespace(scalar_one_or_none=lambda: None, scalars=lambda: SimpleNamespace(first=lambda: None))
+
+    monkeypatch.setattr(dispatch, "get_session_factory", lambda: lambda: FakeSession())
+
+    grant = await dispatch.authorize_dispatch(
+        config,
+        client_identity="spiffe://lumen/fixed-worker/worker1",
+        client_fingerprint="f" * 64,
+        run_id=run_id,
+        lease_owner="worker1#1",
+        resource_id=resource_id,
+        generation=1,
+        method="GET",
+        path=f"/v1/executions/{uuid4()}",
+    )
+    assert grant.address == "10.0.0.5"
+    assert grant.certificate_fingerprint == "s" * 64
+    assert grant.capability
+
+    with pytest.raises(DispatchRejected, match="dispatch unavailable"):
+        await dispatch.authorize_dispatch(
+            config,
+            client_identity="spiffe://lumen/fixed-worker/worker1",
+            client_fingerprint="wrong" * 12 + "0000",
+            run_id=run_id,
+            lease_owner="worker1#1",
+            resource_id=resource_id,
+            generation=1,
+            method="GET",
+            path=f"/v1/executions/{uuid4()}",
+        )
+
+    with pytest.raises(DispatchRejected, match="dispatch unavailable"):
+        await dispatch.authorize_dispatch(
+            config,
+            client_identity="spiffe://lumen/fixed-worker/unapproved",
+            client_fingerprint="f" * 64,
+            run_id=run_id,
+            lease_owner="worker1#1",
+            resource_id=resource_id,
+            generation=1,
+            method="GET",
+            path=f"/v1/executions/{uuid4()}",
+        )

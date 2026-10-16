@@ -10,13 +10,15 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import re
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 Role = Literal["api", "worker", "sandbox"]
 WorkloadClass = Literal["online_text", "online_media", "batch"]
-Backend = Literal["nova", "zun"]
+Backend = Literal["nova", "zun", "kubernetes"]
 
 
 class _Frozen(BaseModel):
@@ -110,6 +112,8 @@ class TlsMaterial(_Frozen):
     # The HTTPS listener's server key must never be reused as a client credential.
     operator_client_cert_file: str | None = Field(default=None, min_length=1, max_length=1024)
     operator_client_key_file: str | None = Field(default=None, min_length=1, max_length=1024)
+    worker_client_cert_file: str | None = Field(default=None, min_length=1, max_length=1024)
+    worker_client_key_file: str | None = Field(default=None, min_length=1, max_length=1024)
 
     @model_validator(mode="after")
     def client_pair(self) -> TlsMaterial:
@@ -118,6 +122,14 @@ class TlsMaterial(_Frozen):
         if (self.operator_client_cert_file == self.cert_file
                 or self.operator_client_key_file == self.key_file):
             raise ValueError("operator probe client material must differ from listener material")
+        if (self.worker_client_cert_file is None) != (self.worker_client_key_file is None):
+            raise ValueError("fixed worker client certificate and key must be configured together")
+        if self.worker_client_cert_file is not None:
+            reserved = {self.cert_file, self.key_file, self.ca_file, self.ca_key_file,
+                        self.operator_client_cert_file, self.operator_client_key_file}
+            if (self.worker_client_cert_file in reserved or self.worker_client_key_file in reserved
+                    or self.worker_client_cert_file == self.worker_client_key_file):
+                raise ValueError("fixed worker identity must be separate from listener, CA and operator probe material")
         return self
 
 
@@ -133,6 +145,67 @@ class CloudProfile(_Frozen):
     application_credential_id: str = Field(min_length=1, max_length=190)
     application_credential_secret: SecretRef
     purpose: Literal["trusted", "sandbox"]
+
+def _cidrs(values: tuple[str, ...], *, hosts: bool = False) -> None:
+    for value in values:
+        network = ipaddress.ip_network(value, strict=True)
+        if hosts and network.prefixlen != network.max_prefixlen:
+            raise ValueError("controller and DNS CIDRs must identify exact host addresses")
+
+
+class KubernetesClusterProfile(_Frozen):
+    """Explicit API endpoint and pinned operator qualification; no ambient kubeconfig."""
+
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    server: str = Field(max_length=2048)
+    ca_file: str = Field(pattern=r"^/", max_length=1024)
+    bearer_token: SecretRef
+    namespace: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    runtime_class_name: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
+    runtime_class_handler: str = Field(pattern=r"^(?:runsc|kata(?:-[a-z0-9]+)*)$", max_length=63)
+    cluster_cidrs: tuple[str, ...] = Field(min_length=1)
+    qualification_file: str = Field(pattern=r"^/", max_length=1024)
+    qualification_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def explicit_endpoint(self) -> KubernetesClusterProfile:
+        url = urlsplit(self.server)
+        if (url.scheme != "https" or not url.hostname or url.username or url.password
+                or url.path not in {"", "/"} or url.query or url.fragment
+                or any(char.isspace() for char in self.server)):
+            raise ValueError("Kubernetes server must be an explicit clean HTTPS origin")
+        _ = url.port
+        _cidrs(self.cluster_cidrs)
+        return self
+
+
+class KubernetesProfile(_Frozen):
+    backend: Literal["kubernetes"] = "kubernetes"
+    cluster_profile_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    tool_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tool_manifest_file: str = Field(pattern=r"^/", max_length=1024)
+    tool_manifest_path: str = Field(default="/opt/lumen-tools/manifest.json", pattern=r"^/", max_length=1024)
+    controller_ingress_cidrs: tuple[str, ...] = Field(min_length=1, max_length=32)
+    bootstrap_egress_cidrs: tuple[str, ...] = Field(min_length=1, max_length=32)
+    dns_server_cidrs: tuple[str, ...] = Field(default=(), max_length=8)
+    egress_deny_cidrs: tuple[str, ...] = Field(default=(), max_length=64)
+    egress: Literal["none", "public"] = "none"
+
+    @model_validator(mode="after")
+    def bounded_network(self) -> KubernetesProfile:
+        for values in (self.controller_ingress_cidrs, self.bootstrap_egress_cidrs, self.dns_server_cidrs):
+            _cidrs(values, hosts=True)
+        _cidrs(self.egress_deny_cidrs)
+        if self.egress == "public" and not self.dns_server_cidrs:
+            raise ValueError("public Kubernetes egress requires explicit DNS servers")
+        if self.egress == "public" and len(self.dns_server_cidrs) > 3:
+            raise ValueError("public Kubernetes egress supports at most three DNS servers")
+        if self.egress == "none" and self.dns_server_cidrs:
+            raise ValueError("offline Kubernetes profile cannot enable DNS egress")
+        if any(part in {".", ".."} for part in self.tool_manifest_path.split("/")[1:]):
+            raise ValueError("tool manifest image path must be canonical")
+        return self
+
 
 
 class NovaProfile(_Frozen):
@@ -196,11 +269,11 @@ class PoolConfig(_Frozen):
     role: Role
     backend: Backend
     enabled: bool = False
-    cloud_profile_id: str = Field(min_length=1, max_length=64)
+    cloud_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
     image: str = Field(min_length=1, max_length=255)
     architecture: Literal["x86_64", "aarch64"]
-    network_id: str = Field(min_length=1, max_length=190)
-    security_group_ids: tuple[str, ...] = Field(min_length=1)
+    network_id: str | None = Field(default=None, min_length=1, max_length=190)
+    security_group_ids: tuple[str, ...] | None = Field(default=None, min_length=1)
     min_replicas: int = Field(ge=0, le=10000)
     max_replicas: int = Field(ge=0, le=10000)
     max_surge: int = Field(default=1, ge=0, le=100)
@@ -218,7 +291,7 @@ class PoolConfig(_Frozen):
     pg_connection_budget: int | None = Field(default=None, ge=0, le=1000000)
     db_connections_per_process: int = Field(default=30, ge=1, le=10000)
     pg_connections_per_process: int = Field(default=0, ge=0, le=10000)
-    profile: Annotated[NovaProfile | ZunProfile, Field(discriminator="backend")]
+    profile: Annotated[NovaProfile | ZunProfile | KubernetesProfile, Field(discriminator="backend")]
     sandbox: SandboxPolicy | None = None
     ingress: IngressConfig | None = None
 
@@ -232,6 +305,11 @@ class PoolConfig(_Frozen):
         # Normalize only the JSON array; strict validation still checks every ID.
         if info.mode == "json" and isinstance(values.get("security_group_ids"), list):
             values["security_group_ids"] = tuple(values["security_group_ids"])
+        if info.mode == "json" and isinstance(values.get("profile"), dict) and values["profile"].get("backend") == "kubernetes":
+            values["profile"] = dict(values["profile"])
+            for key in ("controller_ingress_cidrs", "bootstrap_egress_cidrs", "dns_server_cidrs", "egress_deny_cidrs"):
+                if isinstance(values["profile"].get(key), list):
+                    values["profile"][key] = tuple(values["profile"][key])
         if values.get("role") == "sandbox":
             values.setdefault("max_lifetime_seconds", 1800)
         if values.get("role") == "worker":
@@ -249,6 +327,20 @@ class PoolConfig(_Frozen):
     def enabled_pool_is_complete(self) -> PoolConfig:
         if self.profile.backend != self.backend:
             raise ValueError("pool backend must match its profile backend")
+        if self.backend == "kubernetes":
+            if self.role != "sandbox" or self.min_replicas != 0:
+                raise ValueError("Kubernetes supports only on-demand sandbox pools with min_replicas=0")
+            if any(value is not None for value in (self.cloud_profile_id, self.network_id, self.security_group_ids)):
+                raise ValueError("Kubernetes pools forbid OpenStack-only fields")
+            if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", self.image):
+                raise ValueError("Kubernetes image must be immutable @sha256")
+            if self.max_replicas < 1:
+                raise ValueError("Kubernetes pool requires a finite positive max_replicas")
+            if self.sandbox and (self.sandbox.cpu_millis > 64000
+                    or self.sandbox.memory_bytes > 256 * 1024**3 or self.sandbox.pids_limit > 65536):
+                raise ValueError("Kubernetes sandbox resource limits exceed supported finite bounds")
+        elif any(value is None for value in (self.cloud_profile_id, self.network_id, self.security_group_ids)):
+            raise ValueError("Nova/Zun pools require cloud_profile_id, network_id and security_group_ids")
         if self.backend == "zun":
             if self.role != "sandbox":
                 raise ValueError("Zun supports only sandbox pools; trusted API/worker require Nova")
@@ -304,6 +396,11 @@ class ProjectQuotaDefaults(_Frozen):
     max_sandbox_seconds: int = Field(default=0, ge=0)
     max_credit_reservation: str = Field(default="0", pattern=r"^\d+(\.\d{1,8})?$")
 
+class FixedWorkerIdentity(_Frozen):
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    certificate_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 
 class RuntimeConfig(_Frozen):
     enabled: bool = False
@@ -320,10 +417,12 @@ class RuntimeConfig(_Frozen):
     managed_networks: tuple[str, ...] = ()
     max_parallel_cloud_operations: int = Field(default=4, ge=1, le=32)
     cloud_profiles: tuple[CloudProfile, ...] = ()
+    kubernetes_clusters: tuple[KubernetesClusterProfile, ...] = ()
     pools: tuple[PoolConfig, ...] = ()
     project_quota_defaults: ProjectQuotaDefaults = Field(default_factory=ProjectQuotaDefaults)
     renewal: RenewalPolicy = Field(default_factory=RenewalPolicy)
     guest_profiles: tuple[GuestProfile, ...] = ()
+    fixed_workers: tuple[FixedWorkerIdentity, ...] = ()
     workload_pools: dict[WorkloadClass, str] = Field(default_factory=dict)
     db_connection_budget: int | None = Field(default=None, ge=1, le=1000000)
     pg_connection_budget: int | None = Field(default=None, ge=1, le=1000000)
@@ -337,6 +436,13 @@ class RuntimeConfig(_Frozen):
         profiles = {profile.id: profile for profile in self.cloud_profiles}
         if len(profiles) != len(self.cloud_profiles):
             raise ValueError("duplicate cloud profile id")
+        clusters = {profile.id: profile for profile in self.kubernetes_clusters}
+        if len(clusters) != len(self.kubernetes_clusters):
+            raise ValueError("duplicate Kubernetes cluster profile id")
+        if len({worker.id for worker in self.fixed_workers}) != len(self.fixed_workers):
+            raise ValueError("duplicate fixed worker identity id")
+        if len({worker.certificate_fingerprint for worker in self.fixed_workers}) != len(self.fixed_workers):
+            raise ValueError("duplicate fixed worker certificate fingerprint")
         names = [pool.name for pool in self.pools]
         if len(set(names)) != len(names):
             raise ValueError("duplicate pool name")
@@ -353,6 +459,10 @@ class RuntimeConfig(_Frozen):
             if pool is None or pool.role != "worker" or pool.workload_class != workload:
                 raise ValueError("workload_pools must map each class to its matching worker pool")
         for pool in self.pools:
+            if isinstance(pool.profile, KubernetesProfile):
+                if pool.profile.cluster_profile_id not in clusters:
+                    raise ValueError(f"pool {pool.name} references unknown Kubernetes cluster profile")
+                continue
             profile = profiles.get(pool.cloud_profile_id)
             if profile is None:
                 raise ValueError(f"pool {pool.name} references unknown cloud profile")
@@ -418,6 +528,12 @@ class RuntimeConfig(_Frozen):
             if candidate.id == profile_id:
                 return candidate
         raise KeyError(profile_id)
+    def kubernetes_cluster(self, profile_id: str) -> KubernetesClusterProfile:
+        for candidate in self.kubernetes_clusters:
+            if candidate.id == profile_id:
+                return candidate
+        raise KeyError(profile_id)
+
 
     def public_view(self) -> dict[str, Any]:
         """Serialization for admin inventory; credential references are redacted."""
@@ -427,12 +543,16 @@ class RuntimeConfig(_Frozen):
             "pools": [
                 {
                     **pool.model_dump(mode="json", exclude={"profile"}),
-                    "backend_profile": pool.profile.model_dump(mode="json", exclude={"registry_proxy"}),
+                    "backend_profile": pool.profile.model_dump(mode="json", exclude={"registry_proxy", "tool_manifest_file"}),
                 }
                 for pool in self.pools
             ],
             "cloud_profiles": [
                 profile.model_dump(mode="json", exclude={"application_credential_id", "application_credential_secret"})
                 for profile in self.cloud_profiles
+            ],
+            "kubernetes_clusters": [
+                profile.model_dump(mode="json", exclude={"bearer_token", "ca_file", "qualification_file"})
+                for profile in self.kubernetes_clusters
             ],
         }

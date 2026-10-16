@@ -39,7 +39,7 @@ class DefaultTools:
     manifest = PluginManifest(
         id="default-tools",
         kind="tools",
-        version="0.1.0",
+        version="0.1.1",
         required_capabilities=("conversations", "extensions", "advisor", "public_http"),
         exports=(
             *(tool.export for tool in BUILTIN_TOOLS),

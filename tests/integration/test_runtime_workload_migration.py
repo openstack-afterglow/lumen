@@ -45,7 +45,7 @@ async def test_runtime_backfill_and_batch_ledger_survive_repeat_migration(snapsh
     migrations = load_manifest()
     additions = [migration for migration in migrations if migration.logical_id in {
         "022-runtime-routing", "023-trusted-identity", "024-batch-ledger",
-        "025-batch-expiry-default",
+        "025-batch-expiry-default", "027-kubernetes-sandboxes",
     }]
     tables: list[str] = []
     run_ids = {kind: str(uuid.uuid4()) for kind in (

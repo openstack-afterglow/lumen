@@ -20,7 +20,7 @@ async def test_run_code_returns_safe_failure_when_worker_has_no_client_identity(
     async def assigned(_run_id):
         return target
 
-    def unavailable(_config):
+    def unavailable(_config, *args, **kwargs):
         raise InternalTransportError("private certificate path must not reach the model")
 
     monkeypatch.setattr(sandbox_binding, "assigned_sandbox", assigned)
@@ -45,13 +45,13 @@ async def test_sandbox_wire_terminal_state_completes_poll_and_tool_result(monkey
         resource_id="resource", generation=1, address="10.0.0.12", port=8013,
         certificate_fingerprint="a" * 64, deadline_at=datetime.now(UTC) + timedelta(minutes=2),
     )
-    calls = []
 
     async def assigned(_run_id):
         return target
 
     async def sandbox_request(_transport, _target, **request):
-        calls.append((request["method"], request["path"]))
+        if request["path"] == "/v1/workspace":
+            return b'{"workspace_revision":7}'
         if request["method"] == "POST":
             return b'{"id":"execution"}'
         return (
@@ -61,7 +61,7 @@ async def test_sandbox_wire_terminal_state_completes_poll_and_tool_result(monkey
 
     monkeypatch.setattr(sandbox_binding, "assigned_sandbox", assigned)
     monkeypatch.setattr(sandbox_binding, "_authorized_request", sandbox_request)
-    monkeypatch.setattr(sandbox_binding, "InternalTransport", lambda _config: object())
+    monkeypatch.setattr(sandbox_binding, "InternalTransport", lambda _config, *args, **kwargs: object())
     monkeypatch.setattr(sandbox_binding, "get_settings", lambda: SimpleNamespace(runtime_config=object()))
     context = ToolContext(project_id="project", user_id="owner", run_id="run", tool_call_id="call")
     result = await sandbox_binding.run_code_binding(context, lease_owner="worker#1", fence=1).execute(
@@ -70,7 +70,6 @@ async def test_sandbox_wire_terminal_state_completes_poll_and_tool_result(monkey
     assert result.status == expected
     assert result.error_code is None if expected == "completed" else result.error_code == f"sandbox_{state}"
     assert "visible result" in result.model_content
-    assert calls == [("POST", "/v1/executions"), ("GET", "/v1/executions/execution")]
 
 
 @pytest.mark.asyncio

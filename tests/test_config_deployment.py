@@ -34,6 +34,7 @@ redis_url = "redis://:test-redis-pass@valkey:6379/8"
 lumen_encryption_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 [chat]
+chat_execution_protocol_version = 2
 chat_checkpointer_postgres_url = "postgresql://checkpointer:pass@postgres:5432/checkpointer_db"
 chat_memory_pgvector_url = "postgresql://pgvector:pass@postgres:5432/pgvector_db"
 chat_asset_s3_endpoint = "https://s3.example.com"
@@ -67,6 +68,7 @@ claude_gateway_provider = "anthropic"
     assert raw["database_url"] == "mysql+aiomysql://lumen:test-db-pass@mariadb:3306/lumen"
     assert raw["redis_url"] == "redis://:test-redis-pass@valkey:6379/8"
     assert raw["lumen_encryption_key"] == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    assert raw["chat_execution_protocol_version"] == 2
     assert raw["chat_checkpointer_postgres_url"] == "postgresql://checkpointer:pass@postgres:5432/checkpointer_db"
     assert raw["chat_memory_pgvector_url"] == "postgresql://pgvector:pass@postgres:5432/pgvector_db"
     assert raw["chat_asset_s3_region"] == "default"
@@ -85,6 +87,7 @@ claude_gateway_provider = "anthropic"
     assert settings.database_url == "mysql+aiomysql://lumen:test-db-pass@mariadb:3306/lumen"
     assert settings.redis_url == "redis://:test-redis-pass@valkey:6379/8"
     assert settings.lumen_encryption_key == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    assert settings.chat_execution_protocol_version == 2
     assert settings.chat_checkpointer_postgres_url == "postgresql://checkpointer:pass@postgres:5432/checkpointer_db"
     assert settings.chat_memory_pgvector_url == "postgresql://pgvector:pass@postgres:5432/pgvector_db"
     assert settings.chat_asset_s3_region == "default"
@@ -101,7 +104,7 @@ claude_gateway_provider = "anthropic"
 def test_lumen_environment_variable_overrides(monkeypatch, tmp_path):
     """Test environment variable overrides hitting exact Settings fields."""
     config_file = tmp_path / "lumen.conf"
-    config_file.write_text('[lumen]\nservice_chat_enabled = true\n')
+    config_file.write_text('[lumen]\nservice_chat_enabled = true\n[chat]\nchat_execution_protocol_version = 1\n')
     monkeypatch.setenv("LUMEN_CONFIG_FILE", str(config_file))
     monkeypatch.setenv("KEYSTONE_AUTH_URL", "http://env-keystone:5000/v3")
     monkeypatch.setenv("KEYSTONE_ADMIN_USERNAME", "env-user")
@@ -110,6 +113,7 @@ def test_lumen_environment_variable_overrides(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_URL", "mysql+aiomysql://env:env@env-db:3306/env")
     monkeypatch.setenv("REDIS_URL", "redis://:env-redis@env-valkey:6379/8")
     monkeypatch.setenv("LUMEN_ENCRYPTION_KEY", "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210")
+    monkeypatch.setenv("CHAT_EXECUTION_PROTOCOL_VERSION", "2")
     monkeypatch.setenv("CHAT_CHECKPOINTER_POSTGRES_URL", "postgresql://env:env@env-pg:5432/env_cp")
     monkeypatch.setenv("CHAT_MEMORY_PGVECTOR_URL", "postgresql://env:env@env-pg:5432/env_pv")
     monkeypatch.setenv("CHAT_ASSET_S3_ACCESS_KEY", "env-s3-ak")
@@ -136,6 +140,7 @@ def test_lumen_environment_variable_overrides(monkeypatch, tmp_path):
     assert settings.database_url == "mysql+aiomysql://env:env@env-db:3306/env"
     assert settings.redis_url == "redis://:env-redis@env-valkey:6379/8"
     assert settings.lumen_encryption_key == "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+    assert settings.chat_execution_protocol_version == 2
     assert settings.chat_checkpointer_postgres_url == "postgresql://env:env@env-pg:5432/env_cp"
     assert settings.chat_memory_pgvector_url == "postgresql://env:env@env-pg:5432/env_pv"
     assert settings.chat_asset_s3_access_key == "env-s3-ak"
@@ -238,6 +243,16 @@ def test_get_lumen_encryption_key_strict_validation():
     s_non_hex = Settings(lumen_encryption_key="z" * 64)
     with pytest.raises(ValueError, match=r"Lumen encryption key must be exactly 64 hex characters"):
         _ = s_non_hex.get_lumen_encryption_key
+
+
+def test_chat_execution_protocol_version_defaults_and_validation():
+    with patch.dict(os.environ, {}, clear=True):
+        assert Settings().chat_execution_protocol_version == 1
+        for version in (1, 2):
+            assert Settings(chat_execution_protocol_version=version).chat_execution_protocol_version == version
+        for version in (0, 3, -1):
+            with pytest.raises(ValueError, match="chat_execution_protocol_version must be 1 or 2"):
+                Settings(chat_execution_protocol_version=version)
 
 
 def test_chat_compat_run_timeout_seconds_bounds_validation():

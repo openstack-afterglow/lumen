@@ -6,10 +6,16 @@ Lumen은 LiteLLM provider 실행, LangGraph/LangChain agent runtime, 대화·dur
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: published root `lumen` release `0.6.8` (`pyproject.toml`, `lumen/__init__.py`, native uv-generated `uv.lock`)와 packaged Kolla API/worker/controller image defaults `0.6.8`. Release commit `2417886bc6f320f3b0f0438ed0fe5b8ab12c2640`의 exact-SHA CI와 tag `0.6.8` Package Release/Docker가 성공했고 API/worker는 DMS Lab production에 배포됐다. 독립 `lumen-sdk` `0.2.1`, discovery/API contract `1.0.0`, plugins/sandbox/dependencies 및 operator-owned source-build/guest/OCI pins는 유지한다. Dev `bc2fefd8c95ee6a09973461ac95d1058b906192f` 위에 preserved MCP owner consent/key expiry, delegated cloud discovery/queued graph turn ownership, balanced infrastructure controller와 credential-isolation regressions를 통합한다. Direct-system assignment discovery/current role-ID DAG, original session project, current owner/key/new-I/O fencing과 완료 checkpoint 정산은 보존한다. Migration026은 legacy consent backfill이 없으며 production ledger에 이미 적용되어0.6.8 production migration은 필요 없다. Local qualification과 production receipt는 아래와 같고 과거 qualification은 원래 snapshot의 증거로만 유지한다.
+- 버전: 현재 root candidate는 `lumen` `0.6.9` (`pyproject.toml`, `lumen/__init__.py`, uv-generated `uv.lock`)다. 마지막 published/deployed release는 `0.6.8`, commit `2417886bc6f320f3b0f0438ed0fe5b8ab12c2640`이며 아래 과거 receipt는 그 snapshot만 증명한다. 이번 MCP 계약·구현은 immutable wheel identity를 재사용하지 않도록 `lumen-plugin-api`와 MCP/memory/tools/skills default plugin을 `0.1.1`, database plugin을 `0.1.2`로 함께 pin하고 manifest·기본/예시 allowlist를 맞춘다. 독립 SDK `0.2.1`, plugin `api_version=1`, public discovery/API contract `1.0.0`, sandbox 및 operator-owned guest/source/image pins는 별도 계약을 유지한다. Migration027은 runtime pool/resource의 OpenStack scope를 nullable로 바꾸고 Kubernetes cluster/namespace scope와 provider identity index 및 backend domain을 추가한다. 기존026 consent와 current owner/key/role fencing은 보존한다. 신규 writer는027 적용 전 schema와 호환되지 않으며, 기존 writer와 Kubernetes row를 혼용하지 않는다. `0.6.9`의 release/운영 qualification은 별도 최종 receipt가 필요하다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
+
+### 0.6.9 candidate evidence boundary (2026-10-15)
+
+현재 cohort는 release candidate이며 publication/production 수용을 주장하지 않는다. [Local receipts](docs/testing.md#069-candidate-local-evidence-2026-10-15)는 Linux arm64 Compose browser 수용, **실패한 frozen OCI cohort와 별도 diagnostic 성공**, 부분 native v2 실행을 구분한다. 이후 CPU ceiling·tini/SIGTERM·runtime compatibility 수정과 plugin 재버전까지 포함한 최종 source/image 재qualification은 pending이다. 과거 0.6.8 production receipt는 새 cohort의 증거가 아니다.
+
+Playwright 및 향후 서버 사이드 MCP 툴은 상시 전용 서버 배포가 아닌, 연결된 Kubernetes 클러스터에서 생성되는 실행별 온디맨드 sandbox를 사용한다. Pinned tool manifest 기반의 비루트 경량 컨테이너가 run 단위로 필요한 stdio MCP subprocess만 지연 구동하며, 실행 완료/취소/만료 시 파드를 회수한다. 기존 Zun 1.40 영구 배포 및 zun_compute digest 패치 계획은 이 온디맨드 sandbox 구조로 전면 대체되었다.
 
 ### 0.6.8 qualification and rollout boundary (2026-10-14)
 
@@ -78,6 +84,10 @@ Subscription transport(`anthropic_subscription`)도 API-key 경로와 같이 `li
 
 플러그인 경계: `default-skills`는 DB skill ID가 선택된 경우에만 필요하며 다른 승인된 skills binding만 고른 요청은 해당 provider에서 resolve한다. Per-user custom HTTP는 기존 `/v1/custom-tools`의 선택/인가 경로를 유지하고 plugin catalogue export를 추가하지 않는다. Remote MCP snapshot은 provider-safe한 공개 tool 이름과 별도의 원래 RPC method를 묶어 dispatch에 재사용한다. 이는 기존 authority·MariaDB journal 및 API/worker 책임 분리를 바꾸지 않는다.
 
+On-demand tool sandbox: Playwright 및 향후 서버 사이드 MCP 툴은 상시 전용 서버나 Zun 컨테이너가 아닌, 연결된 Kubernetes 클러스터에서 생성되는 실행별 격리 sandbox(`lumen-sandbox-kubernetes`)를 사용한다. 승인된 이미지 내 매니페스트(`tool_manifest_file`, `tool_manifest_sha256`)에 선언된 stdio MCP 프로세스만 필요한 시점에 지연 구동하고, 실행 중 브라우저 세션·상태를 유지하며, terminal lifecycle 또는 데드라인 도달 시 파드와 프로세스를 완전히 회수한다. 워커는 controller로부터 live run lease 기반 mTLS capability를 발급받아 sandbox와 직접 통신하며, 게스트 내부에는 클러스터 자격증명이나 운영자 키가 전달되지 않는다.
+
+일반 temporary/persistent chat도 tools authority가 켜져 있으면 명시적 agent budget 없이 pinned browser/filesystem 도구를 발견할 수 있다. 첫 실제 호출에서 live run lease와 frozen runtime/pool identity를 검증하고 기존 project sandbox slot/seconds ledger를 원자 예약한다. 모든 assigned root terminal 경로가 사용량을 정산하고 resource 삭제 intent를 기록한다. MCP 호출은 authenticated workspace revision을 조회하여 서로 다른 도구·새 approval worker가 동일 journal revision을 사용하며, media 결과는 generated tool file로 전달한다. 자동 approval 만료는 frozen dispatch 검증 후 서명된 deny로 재개한다. 이 불변식의 최종 native/production 증거는 아직 pending이다.
+
 Ingress enable/create holds the pool lease row lock until the actual SDK thread settles, including cancellation, and renews the locked lease while waiting. Durable one-shot ingress intent survives response loss/restart; reconciliation adopts only exact resource/generation tags plus name/address/port/subnet identity. A known or just-observed member ID stays pinned through adoption/re-enable and requires a direct SDK read; disappearance cannot cause an unclaimed new create. A not-ACTIVE pool may defer a create intent only when no member write was submitted, under the same owner/fence with attempts=0. Submitted ambiguous creates retain quota and are never blindly resubmitted. Unavailable API guests with a recorded member can enter fenced drain, but VM deletion still requires applied weight zero, fresh zero counters/current-fence acknowledgment and confirmed member removal. Live cloud rollout remains unverified.
 
 ## System context
@@ -104,7 +114,7 @@ flowchart LR
     Child --> Journal
     Journal --> Intent[resource intent and worker registrations]
     Intent --> Controller[fenced lumen-controller]
-    Controller --> Cloud[Nova VM / Zun adapter rejected pending isolation]
+    Controller --> Cloud[Nova VM / Kubernetes sandbox / Zun rejected]
     Cloud --> Sandbox[per-run isolated sandbox]
     Worker --> Dispatch[controller-issued fenced capability]
     Dispatch --> Sandbox
@@ -159,7 +169,7 @@ flowchart LR
 | `lumen/api/batches.py`, `lumen/api/compat/{batches,files}.py` | native mixed Batch와 OpenAI Files/Batch auth·scope·body limit·DTO mapping | route → `services.batches`/`services.batch_files`; 실행은 worker만 |
 | `packages/lumen-plugin-api/`, `plugins/`, `lumen/plugins/` | versioned Protocol/DTO·conformance, five independently packaged defaults, approved registry/host capabilities | core → public plugin API/registry; plugin wheels → public API only |
 | `lumen/services/durable_runs/{children,budgets}.py`, `lumen/services/sandbox_binding.py` | durable child wait/join/settlement와 per-run fenced sandbox tool | graph/worker → MariaDB ledger/resource assignment → internal capability |
-| `lumen/services/infrastructure/`, `lumen/controller.py` | fenced pool/resource reconcile, Nova provider, disabled-until-isolated Zun adapter, guest mTLS readiness/dispatch, measured API scaling and Octavia ingress | controller → MariaDB intent + operator cloud credentials; public SSRF transport 별도 |
+| `lumen/services/infrastructure/`, `lumen/controller.py` | fenced pool/resource reconcile, Nova provider, Kubernetes on-demand sandbox provider, disabled-until-isolated Zun adapter, guest mTLS readiness/dispatch, measured API scaling and Octavia ingress | controller → MariaDB intent + operator cloud/Kubernetes credentials; public SSRF transport 별도 |
 | `lumen/api/plugins.py`, `lumen/api/agent_runtime.py` | owner/admin plugin bindings, run children, admin quota/pool/resource inventory | authenticated route → binding/resource stores |
 | `docker/Dockerfile`, `docker-compose*.yml`, `deploy/kolla/ansible/roles/lumen/` | root runtime와 controller/sandbox/test 이미지, opt-in runtime profile, Kolla role/shared data | operator → service processes; cloud profile IDs와 secret은 operator 소유 |
 | `.github/workflows/docker-build.yml`, `.github/workflows/ci.yml`, `lumen/scripts/test_layers.py`, `docker-compose.system.yml` | CI 진입점과 이미지 게시, 재사용 test workflow, layered test CLI와 system process stack | push/PR → `docker-build.yml` → `ci.yml` → `test_layers` → compose stack |
@@ -320,6 +330,8 @@ Afterglow cloud read bindings are now eligible for the legacy on-demand catalogu
 
 Graph custom events carry a private originating turn ordinal captured by their node writer. The durable consumer resolves the assistant message from that persisted `ChatRunTurn`, and uses its own event-bound ordinal for finalization and replay hydration. The producer's later `active_message_id`/`active_turn_ordinal` is not a queued event's owner. This fixes a real fake-provider container failure after successful cloud catalogue loading: a later provider round could advance while an earlier tool result was draining and incorrectly abort the run. Replay does not finalize a later partial message while rewinding to older committed results. Public typed events, journal schema, lease fencing, authority and provider retry policy are unchanged.
 
+Durable interrupt inspection compiles the executed graph topology without running nodes; a no-op graph loses LangGraph's pending approval task. Fresh worker contexts restore on-demand bindings from completed catalogue journal entries at provider, approval and tool node entrypoints, so direct approval/dispatch resume does not depend on another model turn. Restoration does not bypass frozen definition/config/destination/effect or current owner/credential checks. Local graph/run/agent protocol regressions passed107, including deferred approve/deny and config-drift denial; native encrypted-checkpointer acceptance is independently qualified.
+
 ## Data and contracts
 
 - **Authoritative MariaDB**: provider/model catalog, owner/project-bound `chat_message_graphs`, immutable encrypted `chat_messages`, per-conversation explicit `chat_conversation_messages` reachability, separately owned `chat_conversation_active_path` projection/revision/title, run/event/turn/segment/lease journal, ordinary/expiring legacy-device API-key hash·scope·owner/admin 한도, hashed one-time custom device grants, quota policy/wallet, encrypted provider credentials, extension/skill/memory metadata와 immutable usage ledger가 정본이다. Indexed projection은 normal read path이고 graph parent는 audit/branch operation을 보존한다. A nullable origin conversation ID is provenance, never an authorization predicate. Secret-bearing content crosses the encryption boundary; do not copy ciphertext or raw secrets into response.
@@ -449,7 +461,7 @@ docker 검증 상태:
 | tool/MCP/skill | `lumen/services/tool_runtime/`, `lumen/services/mcp_adapter.py`, `lumen/services/extensions_store.py` | SSRF/owner/version/fingerprint contract, `docs/agent-platform.md`, tool tests; implementation status must remain honest |
 | plugin authoring/selection | `packages/lumen-plugin-api/`, `plugins/`, `lumen/plugins/`, migrations 015 | independent wheel conformance와 operator allowlist, owner-scoped binding snapshot/revoke, plugin status/API/SDK, `docs/agent-platform.md` |
 | child/agent quota and checkpoint | `lumen/services/durable_runs/{children,budgets,execution}.py`, `lumen/services/graph.py`, migrations 016 | MariaDB lock order·idempotent join/cancel/settlement, v2 encrypted checkpoint, owner child API, `docs/agent-platform.md` |
-| Nova/Zun/runtime identity | `lumen/services/infrastructure/`, `lumen/controller.py`, `packages/lumen-sandbox/`, `docker/Dockerfile` | operator cloud project separation, bootstrap/TLS, real isolation and multiarch image, `docs/operations.md`/`docs/security.md`; mock != live |
+| Nova/Kubernetes/Zun/runtime identity | `lumen/services/infrastructure/`, `lumen/controller.py`, `packages/lumen-sandbox/`, `docker/Dockerfile` | operator cloud/cluster separation, bootstrap/TLS, real Pod-native isolation and multiarch image, `docs/operations.md`/`docs/security.md`; mock != live |
 | memory/checkpointer/assets | `lumen/services/semantic_memory.py`, `checkpointer.py`, `assets.py`, relevant models/migrations | MariaDB authority vs PostgreSQL/S3 optional boundary, migrations, operations/security docs |
 | auth/project scope | `lumen/auth.py`, API dependencies, SDK proxy | Keystone/API-key matrix, target-project invariant, security docs and auth tests |
 | deployment/config | `pyproject.toml`, `docker/Dockerfile`, `docker-compose*.yml`, `lumen/config.py`, `deploy/kolla/ansible/roles/lumen/` | root wheel shared data, service-extra boundary, root build context/stages, migration/bootstrap order, independent image defaults, operations docs and Kolla tests |
@@ -473,9 +485,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "99cbccf4f6685ba8dbbc5666e4d90339d24a0b8b1a5ac5f9bf5fde5708f57e69",
-  "reviewed_at": "2026-10-14T11:20:23Z",
-  "summary": "0.6.8 post-rollout documentation review: docs-only update recording exact-SHA CI, tag Package Release and multi-arch image publication and the 2026-10-14 DMS Lab production rollout receipt (terminal gate, exact cold restore, unchanged migration ledger and providers, three new worker registrations, readiness). Residual risks: the old 0.6.7 dms-controller3 worker was SIGKILLed after the 300 s drain because its registration kept auxiliary_active=1 with zero live leases, and REDIS_URL targets the read-only dms-controller1 Valkey replica. No source, schema, configuration or Kolla role change."
+  "source_sha256": "5fddb39a6b211a87502728b8c4e64c09bb223ee03aa9a1b7051942f517835036",
+  "reviewed_at": "2026-10-16T08:05:24Z",
+  "summary": "Lumen 0.6.9 on-demand Kubernetes sandboxes, Drover cluster integration, gVisor isolation, tool manifest pinning and dual-arch image qualification"
 }
 ```
 <!-- architecture-review:end -->
