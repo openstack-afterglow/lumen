@@ -377,8 +377,11 @@ def test_runtime_enabled_kolla_config_loads_as_typed_settings(tmp_path):
         }],
     }
     values = dict.fromkeys(meta.find_undeclared_variables(environment.parse(source)), "")
+    role_defaults = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
+    values.update(_resolved_kolla_defaults(set(values) & set(role_defaults)))
     values.update(
         lumen_runtime_enabled=True, lumen_runtime_config=runtime,
+        lumen_policy_file="/etc/lumen/policy.yaml", lumen_policy_dirs=[],
         lumen_controller_listen_address="10.42.0.5", lumen_controller_listen_port=8013,
         lumen_worker_concurrency=4, lumen_worker_heartbeat_seconds=5,
         lumen_worker_drain_seconds=300, lumen_chat_compat_run_timeout_seconds=300,

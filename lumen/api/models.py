@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 
 from lumen.auth import require_admin
 from lumen.services import model_discovery, models_dev
-from lumen.services.providers import billing, credentials, errors, repository, subscriptions
+from lumen.services.providers import accounts, billing, credentials, errors, repository, subscriptions
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
@@ -28,7 +28,7 @@ _CLAUDE_SUBSCRIPTION_TOKEN = re.compile(r"sk-ant-oat[A-Za-z0-9._-]*\Z")
 # --- 프로바이더 ---
 class ProviderCreateRequest(BaseModel):
     name: str = Field(..., max_length=100)
-    provider_type: str = Field(default="openai", max_length=40)  # litellm custom_llm_provider
+    provider_type: str = Field(default="openai", max_length=40)
     api_provider: str = Field(default="openai", max_length=40)
     sort_order: int = Field(default=0, strict=True, ge=0, le=2147483647)
     auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"] = "api_key"
@@ -38,6 +38,7 @@ class ProviderCreateRequest(BaseModel):
     billing_admin_key: str | None = Field(default=None, max_length=1000)
     margin_multiplier: float = Field(default=1.0, ge=0)
     is_active: bool = True
+    selection_policy: Literal["priority", "weighted"] = "priority"
 
     model_config = {"extra": "forbid"}
 
@@ -86,6 +87,8 @@ class ProviderUpdateRequest(BaseModel):
     billing_admin_key: str | None = Field(default=None, max_length=1000)
     margin_multiplier: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
+    selection_policy: Literal["explicit", "priority", "weighted"] | None = None
+    selected_credential_id: int | None = Field(default=None, strict=True, gt=0)
 
     model_config = {"extra": "forbid"}
 
@@ -148,6 +151,8 @@ class ProviderResponse(BaseModel):
     created_at: str | None
     updated_at: str | None
     models_dev_provider_id: str | None = None
+    selection_policy: Literal["explicit", "priority", "weighted"] = "priority"
+    selected_credential_id: int | None = None
 
 
 class ProviderBillingBalance(BaseModel):
@@ -727,7 +732,7 @@ class AvailableModelsError(BaseModel):
 class AvailableModelsResponse(BaseModel):
     provider_id: int
     fetched_at: str
-    source: Literal["api", "litellm", "none"]
+    source: Literal["api", "catalog", "none"]
     live_status: Literal["success", "empty", "unsupported", "error"]
     complete: bool
     error: AvailableModelsError | None = None
@@ -908,3 +913,180 @@ async def delete_model(model_id: int):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
+
+
+class ProviderAccountCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    is_active: bool = True
+    priority: int = Field(default=0, strict=True, ge=0, le=2147483647)
+    weight: int = Field(default=1, strict=True, ge=1, le=2147483647)
+    allowed_model_ids: list[int] | None = None
+    allowed_capabilities: list[str] | None = None
+    quota_group: str | None = Field(default=None, max_length=100)
+    model_config = {"extra": "forbid"}
+
+
+class ProviderAccountUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    is_active: bool | None = None
+    priority: int | None = Field(default=None, strict=True, ge=0, le=2147483647)
+    weight: int | None = Field(default=None, strict=True, ge=1, le=2147483647)
+    allowed_model_ids: list[int] | None = None
+    allowed_capabilities: list[str] | None = None
+    quota_group: str | None = Field(default=None, max_length=100)
+    model_config = {"extra": "forbid"}
+
+
+class ProviderCredentialCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    api_key: SecretStr | None = None
+    api_key_env: str | None = Field(default=None, max_length=128)
+    is_active: bool = True
+    priority: int = Field(default=0, strict=True, ge=0, le=2147483647)
+    weight: int = Field(default=1, strict=True, ge=1, le=2147483647)
+    allowed_model_ids: list[int] | None = None
+    allowed_capabilities: list[str] | None = None
+    expires_at: datetime | None = None
+    cooldown_until: datetime | None = None
+    model_config = {"extra": "forbid"}
+
+
+class ProviderCredentialUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    api_key: SecretStr | None = None
+    api_key_env: str | None = Field(default=None, max_length=128)
+    is_active: bool | None = None
+    priority: int | None = Field(default=None, strict=True, ge=0, le=2147483647)
+    weight: int | None = Field(default=None, strict=True, ge=1, le=2147483647)
+    allowed_model_ids: list[int] | None = None
+    allowed_capabilities: list[str] | None = None
+    expires_at: datetime | None = None
+    cooldown_until: datetime | None = None
+    model_config = {"extra": "forbid"}
+
+
+class ProviderCredentialResponse(BaseModel):
+    id: int
+    account_id: int
+    name: str
+    auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"]
+    generation: int
+    is_active: bool
+    priority: int
+    weight: int
+    api_key_configured: bool
+    api_key_source: str | None
+    api_key_env: str | None
+    subscription_status: str
+    subscription_expires_at: datetime | None
+    allowed_model_ids: list[int] | None
+    allowed_capabilities: list[str] | None
+    expires_at: datetime | None = None
+    cooldown_until: datetime | None = None
+
+
+class ProviderAccountResponse(ProviderAccountCreate):
+    id: int
+    provider_id: int
+    credentials: list[ProviderCredentialResponse]
+
+
+def _credential_patch(payload):
+    patch = payload.model_dump(exclude_unset=True)
+    if isinstance(patch.get("api_key"), SecretStr):
+        patch["api_key"] = patch["api_key"].get_secret_value()
+    return patch
+
+
+async def _account_action(operation, response):
+    from sqlalchemy.exc import IntegrityError, OperationalError
+    try:
+        result = await operation
+        response.headers.update(_NO_STORE)
+        return result
+    except IntegrityError:
+        raise HTTPException(409, "account or credential conflicts with existing configuration", headers=_NO_STORE) from None
+    except OperationalError:
+        raise HTTPException(503, "provider credential storage unavailable", headers=_NO_STORE) from None
+    except (errors.ProviderNotFoundError, errors.ProviderValidationError, errors.ProviderSubscriptionError,
+            errors.ProviderConfigurationChangedError, errors.ProviderAuthAttemptConflict, errors.ChatStorageUnavailable) as exc:
+        raise _map_subscription_error(exc) from None
+
+
+@router.get("/admin/providers/{provider_id}/accounts", response_model=list[ProviderAccountResponse])
+async def list_provider_accounts(provider_id: int, response: Response):
+    return await _account_action(accounts.list_accounts(provider_id), response)
+
+
+@router.post("/admin/providers/{provider_id}/accounts", response_model=ProviderAccountResponse, status_code=201)
+async def create_provider_account(provider_id: int, payload: ProviderAccountCreate, response: Response):
+    return await _account_action(accounts.create_account(provider_id, payload.model_dump()), response)
+
+
+@router.patch("/admin/providers/{provider_id}/accounts/{account_id}", response_model=ProviderAccountResponse)
+async def update_provider_account(provider_id: int, account_id: int, payload: ProviderAccountUpdate, response: Response):
+    return await _account_action(accounts.update_account(provider_id, account_id, payload.model_dump(exclude_unset=True)), response)
+
+
+@router.delete("/admin/providers/{provider_id}/accounts/{account_id}", status_code=204)
+async def delete_provider_account(provider_id: int, account_id: int):
+    response = Response(status_code=204, headers=_NO_STORE)
+    await _account_action(accounts.delete_account(provider_id, account_id), response)
+    return response
+
+
+@router.get("/admin/providers/{provider_id}/accounts/{account_id}/usage")
+async def provider_account_usage(provider_id: int, account_id: int, response: Response):
+    return await _account_action(accounts.account_usage(provider_id, account_id), response)
+
+
+@router.post("/admin/providers/{provider_id}/accounts/{account_id}/credentials", response_model=ProviderCredentialResponse, status_code=201)
+async def create_provider_credential(provider_id: int, account_id: int, payload: ProviderCredentialCreate, response: Response):
+    return await _account_action(accounts.create_credential(provider_id, account_id, _credential_patch(payload)), response)
+
+
+@router.patch("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}", response_model=ProviderCredentialResponse)
+async def update_provider_credential(provider_id: int, account_id: int, credential_id: int, payload: ProviderCredentialUpdate, response: Response):
+    return await _account_action(accounts.update_credential(provider_id, account_id, credential_id, _credential_patch(payload)), response)
+
+
+@router.delete("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}", status_code=204)
+async def delete_provider_credential(provider_id: int, account_id: int, credential_id: int):
+    response = Response(status_code=204, headers=_NO_STORE)
+    await _account_action(accounts.delete_credential(provider_id, account_id, credential_id), response)
+    return response
+
+
+@router.put("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/auth/token", response_model=ProviderCredentialResponse)
+async def set_credential_subscription_token(provider_id: int, account_id: int, credential_id: int, payload: SubscriptionTokenRequest, response: Response):
+    return await _account_action(subscriptions.set_subscription_token(provider_id, account_id=account_id,
+        credential_id=credential_id, token=payload.token.get_secret_value(), expires_at=payload.expires_at), response)
+
+
+@router.delete("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/auth", status_code=204)
+async def disconnect_credential_subscription(provider_id: int, account_id: int, credential_id: int):
+    response = Response(status_code=204, headers=_NO_STORE)
+    await _account_action(subscriptions.disconnect_subscription(provider_id, account_id=account_id, credential_id=credential_id), response)
+    return response
+
+
+@router.post("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/auth/device", response_model=DeviceAuthStartResponse, status_code=201)
+async def begin_credential_device_auth(provider_id: int, account_id: int, credential_id: int, response: Response, admin_info: dict = Depends(require_admin)):
+    result = await _account_action(subscriptions.begin_device_auth(provider_id, account_id=account_id,
+        credential_id=credential_id, user_id=admin_info["user_id"], project_id=admin_info["project_id"]), response)
+    response.status_code = 201 if result.pop("_created", False) else 200
+    return result
+
+
+@router.post("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/auth/device/{attempt_id}/poll", response_model=DeviceAuthStatusResponse)
+async def poll_credential_device_auth(provider_id: int, account_id: int, credential_id: int, attempt_id: str, response: Response, admin_info: dict = Depends(require_admin)):
+    return await _account_action(subscriptions.poll_device_auth(provider_id, attempt_id, account_id=account_id,
+        credential_id=credential_id, user_id=admin_info["user_id"], project_id=admin_info["project_id"]), response)
+
+
+@router.delete("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/auth/device/{attempt_id}", status_code=204)
+async def cancel_credential_device_auth(provider_id: int, account_id: int, credential_id: int, attempt_id: str, admin_info: dict = Depends(require_admin)):
+    response = Response(status_code=204, headers=_NO_STORE)
+    await _account_action(subscriptions.cancel_device_auth(provider_id, attempt_id, account_id=account_id,
+        credential_id=credential_id, user_id=admin_info["user_id"], project_id=admin_info["project_id"]), response)
+    return response

@@ -11,11 +11,20 @@ from lumen.services.providers import errors
 
 
 def _provider(monkeypatch, provider_type="anthropic", api_base=None, api_key="secret-key", auth_mode="api_key"):
+    from lumen.services.providers import credentials
+
+    async def resolve(ref):
+        assert ref["credential_id"] == 3
+        return {"api_key": api_key}
+
+    monkeypatch.setattr(credentials, "resolve_inference_credential", resolve)
     async def get_provider(provider_id):
         return {
             "provider_type": provider_type,
             "api_base": api_base,
-            "api_key": api_key,
+            "api_key": None,
+            "provider_auth": {"provider_id": provider_id, "account_id": 2, "credential_id": 3,
+                              "generation": 0, "auth_mode": auth_mode},
             "auth_mode": auth_mode,
         }
 
@@ -42,7 +51,7 @@ def _page(data=(), *, more=False, last_id=None):
 def _no_static(monkeypatch):
     monkeypatch.setattr(
         model_discovery,
-        "_litellm_static",
+        "_catalog_static",
         lambda _ptype: (_ for _ in ()).throw(AssertionError("live discovery must not use a static catalog")),
     )
 
@@ -448,22 +457,22 @@ async def test_subscription_and_unknown_providers_never_send_credentials(monkeyp
 
     monkeypatch.setattr(httpx, "AsyncClient", forbidden)
     monkeypatch.setattr(
-        model_discovery, "_litellm_static", lambda pt: ["claude-opus-4-1"] if pt == "anthropic" else ["command-r"]
+        model_discovery, "_catalog_static", lambda pt: ["claude-opus-4-1"] if pt == "anthropic" else ["command-r"]
     )
     _provider(monkeypatch, provider_type="anthropic", auth_mode="anthropic_subscription", api_key=None)
     subscription = await model_discovery.discover_models(1)
     assert subscription["models"] == ["anthropic-subscription/claude-opus-4-1"]
-    assert subscription["source"] == "litellm" and subscription["live_status"] == "unsupported"
+    assert subscription["source"] == "catalog" and subscription["live_status"] == "unsupported"
     assert subscription["complete"] is False
     _provider(monkeypatch, provider_type="azure")
     unsupported = await model_discovery.discover_models(2)
-    assert unsupported["source"] == "litellm" and unsupported["live_status"] == "unsupported"
+    assert unsupported["source"] == "catalog" and unsupported["live_status"] == "unsupported"
     assert unsupported["models"] == ["command-r"]
 
 
 async def test_chatgpt_subscription_normalizes_namespace_without_http(monkeypatch):
     _provider(monkeypatch, provider_type="chatgpt", auth_mode="chatgpt_device", api_key=None)
-    monkeypatch.setattr(model_discovery, "_litellm_static", lambda pt: ["gpt-5.3-codex", "chatgpt/gpt-5.2-codex"])
+    monkeypatch.setattr(model_discovery, "_catalog_static", lambda pt: ["gpt-5.3-codex", "chatgpt/gpt-5.2-codex"])
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: (_ for _ in ()).throw(AssertionError("unexpected HTTP")))
     result = await model_discovery.discover_models(7)
     assert result["models"] == ["chatgpt/gpt-5.2-codex", "chatgpt/gpt-5.3-codex"]
@@ -553,7 +562,7 @@ class TestDiscoveryEndpoint:
 
 
 async def test_live_openai_discovery_separates_operations_without_name_guesses(monkeypatch):
-    import litellm
+    from lumen.services import provider_metadata
 
     _provider(monkeypatch, provider_type="openai")
     _no_static(monkeypatch)
@@ -561,7 +570,7 @@ async def test_live_openai_discovery_separates_operations_without_name_guesses(m
              "listener": "audio_transcription", "voice": "realtime", "assistant": "chat"}
     catalog = {name: {"mode": mode, "litellm_provider": "openai"} for name, mode in modes.items()}
     catalog["wrong-provider"] = {"mode": "image_generation", "litellm_provider": "gemini"}
-    monkeypatch.setattr(litellm, "model_cost", catalog)
+    monkeypatch.setattr(provider_metadata, "_catalog", lambda: catalog)
     ids = [*catalog, "unknown-image-looking"]
     _transport(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": name} for name in ids]}))
     result = await model_discovery.discover_models(1)
@@ -576,11 +585,11 @@ async def test_live_openai_discovery_separates_operations_without_name_guesses(m
 
 
 async def test_gemini_image_generation_and_bidi_are_not_registered_as_text(monkeypatch):
-    import litellm
+    from lumen.services import provider_metadata
 
     _provider(monkeypatch, provider_type="gemini")
     _no_static(monkeypatch)
-    monkeypatch.setattr(litellm, "model_cost", {
+    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {
         "gemini/opaque-renderer": {"mode": "image_generation", "litellm_provider": "gemini"},
     })
     _transport(monkeypatch, lambda request: httpx.Response(200, json={"models": [

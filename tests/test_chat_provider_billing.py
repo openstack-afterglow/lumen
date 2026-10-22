@@ -25,6 +25,13 @@ def _provider(
         encrypted_api_key="ciphertext",
         encrypted_billing_admin_key="billing-ciphertext" if has_billing_admin_key else None,
         api_key_env=None,
+        selection_policy="priority",
+        accounts=[SimpleNamespace(id=provider_id, provider_id=provider_id, is_active=True,
+            priority=0, weight=1, allowed_model_ids=None, allowed_capabilities=None,
+            credentials=[SimpleNamespace(id=provider_id, account_id=provider_id, auth_mode=auth_mode,
+                generation=0, is_active=True, priority=0, weight=1, allowed_model_ids=None,
+                allowed_capabilities=None, encrypted_api_key="ciphertext", api_key_env=None,
+                subscription_status="disconnected")])],
     )
 
 
@@ -454,7 +461,10 @@ async def test_bulk_status_isolates_live_failure_and_never_calls_unsupported_pro
         }
 
     monkeypatch.setattr(billing, "_load_providers_and_usage", fake_load)
-    monkeypatch.setattr(billing, "resolve_api_key", lambda _provider: "secret-key")
+    async def resolve_credential(_ref):
+        return {"api_key": "secret-key"}
+
+    monkeypatch.setattr(billing, "resolve_inference_credential", resolve_credential)
     monkeypatch.setattr(billing, "_request_json", fake_request)
 
     result = await billing.list_provider_billing()

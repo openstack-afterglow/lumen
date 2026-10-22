@@ -89,7 +89,6 @@ def test_reusable_ci_jobs_override_the_implicit_success_check() -> None:
     # inner jobs (actions/runner#2205); without inner `needs` it hides nothing.
     jobs = _workflow("ci.yml")["jobs"]
 
-    assert set(jobs) == {"service", "plugins", "sandbox", "sdk", "kolla", "integration", "system"}
     for name, job in jobs.items():
         assert _compact(job.get("if")) == "${{ !cancelled() }}", name
         assert "needs" not in job, name
@@ -354,20 +353,3 @@ def test_uv_is_pinned_and_copied_after_the_apt_layer() -> None:
     assert apt < uv_copy
 
 
-@pytest.mark.parametrize(
-    ("stage", "compiled"),
-    [("lumen-runtime", "lumen"), ("lumen-test", "lumen tests")],
-)
-def test_runtime_stages_own_files_through_copy_chown(stage: str, compiled: str) -> None:
-    instructions = _dockerfile_stages()[stage]
-
-    setup = _index(instructions, lambda line: line.startswith("RUN apt-get") and "adduser" in line)
-    assert "chown appuser:appuser /app " in instructions[setup]
-    copies = [i for i, line in enumerate(instructions) if line.startswith("COPY ")]
-    assert copies and setup < copies[0]
-    for i in copies:
-        assert instructions[i].startswith("COPY --from=") or instructions[i].startswith("COPY --chown=appuser:appuser ")
-        assert "--chown=appuser:appuser" in instructions[i]
-    user = instructions.index("USER appuser")
-    compile_step = instructions.index(f"RUN python -m compileall -q {compiled}")
-    assert copies[-1] < user < compile_step

@@ -1,6 +1,6 @@
 """OpenAI/Anthropic 호환 엔드포인트 — 순수 변환 + 엔드포인트(인증·shape·스트림).
 
-completion_api 코어와 api_key_store.verify_key 를 monkeypatch 해 실제 litellm/DB 없이 검증한다.
+completion_api 코어와 api_key_store.verify_key 를 monkeypatch 해 외부 provider/DB 없이 검증한다.
 """
 
 import asyncio
@@ -8,18 +8,45 @@ import json
 from types import SimpleNamespace
 
 import anyio
-import litellm
+import httpx
 import pytest
-from litellm.exceptions import BadRequestError
 
 from lumen.api.compat import anthropic as an
 from lumen.api.compat import openai as oa
 from lumen.auth import get_principal
 from lumen.main import app
 from lumen.service_authority import SERVICE_CAPABILITIES
-from lumen.services import capabilities, litellm_client, openai_compat
+from lumen.services import capabilities, openai_compat, provider_client
 from lumen.services import completion_api as core
 from lumen.services.completion_format import nonstream_response
+from lumen.services.provider_client import ProviderObject
+from lumen.services.provider_errors import BadRequestError
+
+
+def _responses_runtime_wire(monkeypatch):
+    state = {"reads": 0, "closed": False, "requests": []}
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for text in ("partial", " more"):
+                state["reads"] += 1
+                yield f'data: {json.dumps({"type": "response.output_text.delta", "delta": text})}\n\n'.encode()
+            yield b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+
+        async def aclose(self):
+            state["closed"] = True
+
+    def handle(request):
+        state["requests"].append(json.loads(request.content))
+        return httpx.Response(200, headers={"content-type": "text/event-stream",
+            "X-Lumen-Bifrost-Contract": "single-attempt-v1"}, stream=Body())
+
+    async def ready():
+        return "http://127.0.0.1:18643", "internal-token"
+
+    monkeypatch.setattr(provider_client, "get_bifrost_runtime", ready)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(handle))
+    return state
 
 _H = {"Authorization": "Bearer sk-afgl-test"}
 
@@ -146,15 +173,10 @@ class TestCompletionCoreContract:
     async def test_failed_primary_billing_reuses_event_id_for_fallback(self, monkeypatch):
         async def fake_provider_stream(*_args, **_kwargs):
             async def chunks():
-                yield SimpleNamespace(
-                    usage=None,
-                    choices=[
-                        SimpleNamespace(
-                            delta=SimpleNamespace(content="partial", reasoning_content=None, tool_calls=None),
-                            finish_reason="stop",
-                        )
-                    ],
-                )
+                yield ProviderObject(usage=None, choices=[{
+                    "delta": {"content": "partial", "reasoning_content": None, "tool_calls": None},
+                    "finish_reason": "stop",
+                }])
 
             return chunks()
 
@@ -166,7 +188,7 @@ class TestCompletionCoreContract:
                 raise RuntimeError("first billing attempt failed")
             return 1, 1, 0.0
 
-        monkeypatch.setattr(core.litellm_client, "acompletion_stream", fake_provider_stream)
+        monkeypatch.setattr(core.provider_client, "acompletion_stream", fake_provider_stream)
         monkeypatch.setattr(core, "_bill", fake_bill)
 
         events = []
@@ -193,10 +215,10 @@ class TestCompletionCoreContract:
             async def chunks():
                 try:
                     for text in ("first", "second"):
-                        yield SimpleNamespace(usage=None, choices=[SimpleNamespace(
-                            delta=SimpleNamespace(content=text, reasoning_content=None, tool_calls=None),
-                            finish_reason=None,
-                        )])
+                        yield ProviderObject(usage=None, choices=[{
+                            "delta": {"content": text, "reasoning_content": None, "tool_calls": None},
+                            "finish_reason": None,
+                        }])
                 finally:
                     upstream["closed"] = True
 
@@ -208,7 +230,7 @@ class TestCompletionCoreContract:
             billed.append((text, event_id))
             return 1, 1, 0.0
 
-        monkeypatch.setattr(core.litellm_client, "acompletion_stream", fake_provider_stream)
+        monkeypatch.setattr(core.provider_client, "acompletion_stream", fake_provider_stream)
         monkeypatch.setattr(core, "_bill", fake_bill)
         stream = core.complete_stream(
             resolved={"model_name": "test-model", "margin_multiplier": 1},
@@ -229,10 +251,10 @@ class TestCompletionCoreContract:
         async def fake_provider_stream(*_args, **_kwargs):
             async def chunks():
                 try:
-                    yield SimpleNamespace(usage=None, choices=[SimpleNamespace(
-                        delta=SimpleNamespace(content="first", reasoning_content=None, tool_calls=None),
-                        finish_reason=None,
-                    )])
+                    yield ProviderObject(usage=None, choices=[{
+                        "delta": {"content": "first", "reasoning_content": None, "tool_calls": None},
+                        "finish_reason": None,
+                    }])
                     read_blocked.set()
                     await anyio.sleep_forever()
                 finally:
@@ -247,7 +269,7 @@ class TestCompletionCoreContract:
             billed.append(text)
             return 1, 1, 0.0
 
-        monkeypatch.setattr(core.litellm_client, "acompletion_stream", fake_provider_stream)
+        monkeypatch.setattr(core.provider_client, "acompletion_stream", fake_provider_stream)
         monkeypatch.setattr(core, "_bill", fake_bill)
         scope_holder = []
 
@@ -273,42 +295,14 @@ class TestCompletionCoreContract:
         assert upstream["closed"] is True
         assert billed == ["first"]
 
-    async def test_responses_stream_close_releases_iterator_without_aclose_and_bills(self, monkeypatch):
-        class HttpxResponse:
-            closed = False
-
-            async def aclose(self):
-                self.closed = True
-
-        class LiteLLMResponsesIterator:  # LiteLLM's iterator exposes only its httpx response
-            def __init__(self):
-                self.response = HttpxResponse()
-                self.events = iter([
-                    {"type": "response.output_text.delta", "delta": "partial"},
-                    {"type": "response.output_text.delta", "delta": " more"},
-                ])
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                try:
-                    return next(self.events)
-                except StopIteration:
-                    raise StopAsyncIteration from None
-
-        upstream = LiteLLMResponsesIterator()
-
-        async def provider(**_kwargs):
-            return upstream
-
+    async def test_responses_stream_close_releases_transport_and_bills_partial_text(self, monkeypatch):
+        state = _responses_runtime_wire(monkeypatch)
         billed = []
 
         async def fake_bill(_resolved, _messages, text, _usage, **_kwargs):
             billed.append(text)
             return 1, 1, 0.0
 
-        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
         monkeypatch.setattr(core, "_bill", fake_bill)
         events = await core.complete_responses(
             resolved={"model_name": "gpt-5", "provider_type": "openai", "capabilities": {"reasoning": True}},
@@ -316,39 +310,21 @@ class TestCompletionCoreContract:
         )
         assert (await anext(events))["delta"] == "partial"
         await events.aclose()
-
-        assert upstream.response.closed is True
+        assert state["closed"] is True
+        assert state["reads"] == 1
+        assert len(state["requests"]) == 1
         assert billed == ["partial"]
 
-    async def test_never_iterated_responses_stream_closes_its_http_response(self, monkeypatch):
-        class HttpxResponse:
-            closed = False
-
-            async def aclose(self):
-                self.closed = True
-
-        class LiteLLMResponsesIterator:
-            response = HttpxResponse()
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                raise AssertionError("an unstarted body must not read upstream")
-
-        upstream = LiteLLMResponsesIterator()
-
-        async def provider(**_kwargs):
-            return upstream
-
-        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
+    async def test_never_iterated_responses_stream_closes_without_reading_upstream(self, monkeypatch):
+        state = _responses_runtime_wire(monkeypatch)
         events = await core.complete_responses(
             resolved={"model_name": "gpt-5", "provider_type": "openai", "capabilities": {"reasoning": True}},
             input="hello", stream=True, user_id="u1", project_id="p1", api_key_id=7, options={},
         )
-        await events.aclose()  # ASGI owner cleanup when the route body never started
-        await events.aclose()  # idempotent
-        assert upstream.response.closed is True
+        await events.aclose()
+        await events.aclose()
+        assert state["closed"] is True and state["reads"] == 0
+        assert len(state["requests"]) == 1
 
     async def test_anthropic_stream_is_started_before_return_and_closes_unread(self, monkeypatch):
         state = {"started": False, "closed": False}
@@ -367,7 +343,7 @@ class TestCompletionCoreContract:
         async def fake_bill(*_args, **_kwargs):
             return 1, 1, 0.0
 
-        monkeypatch.setattr(core.litellm_client, "aanthropic_messages", provider)
+        monkeypatch.setattr(core.provider_client, "aanthropic_messages", provider)
         monkeypatch.setattr(core, "_with_passthrough_compaction", lambda options, **_kwargs: options)
         monkeypatch.setattr(core, "_bill", fake_bill)
         resolved = {"model_name": "claude-test", "provider_type": "anthropic"}
@@ -375,7 +351,7 @@ class TestCompletionCoreContract:
                   "stream": True, "user_id": "u1", "project_id": "p1", "api_key_id": 7, "options": {}}
 
         unread = await core.complete_anthropic(**common)
-        # LiteLLM releases its pooled connection on close only once the chain started.
+        # Prime the lazy iterator so unread-response cleanup still runs its finally.
         assert state["started"] is True and state["closed"] is False
         await unread.aclose()
         assert state["closed"] is True
@@ -392,7 +368,7 @@ class TestCompletionCoreContract:
 
             return chunks()
 
-        monkeypatch.setattr(core.litellm_client, "aanthropic_messages", provider)
+        monkeypatch.setattr(core.provider_client, "aanthropic_messages", provider)
         monkeypatch.setattr(core, "_with_passthrough_compaction", lambda options, **_kwargs: options)
         with pytest.raises(core.CompletionError) as failure:
             await core.complete_anthropic(
@@ -425,7 +401,7 @@ class TestCompletionCoreContract:
         async def provider(**_kwargs):
             return upstream
 
-        monkeypatch.setattr(core.litellm_client, "aanthropic_messages", provider)
+        monkeypatch.setattr(core.provider_client, "aanthropic_messages", provider)
         monkeypatch.setattr(core, "_with_passthrough_compaction", lambda options, **_kwargs: options)
         with pytest.raises(core.CompletionError) as caught:
             await core.complete_anthropic(
@@ -457,7 +433,7 @@ class TestCompletionCoreContract:
         async def provider(**_kwargs):
             return upstream
 
-        monkeypatch.setattr(core.litellm_client, "aanthropic_messages", provider)
+        monkeypatch.setattr(core.provider_client, "aanthropic_messages", provider)
         monkeypatch.setattr(core, "_with_passthrough_compaction", lambda options, **_kwargs: options)
         with anyio.CancelScope() as scope:
             scope.cancel()
@@ -504,23 +480,23 @@ class TestCompletionCoreContract:
             if kwargs["model"] == "gpt-4.1-mini" and (
                 "reasoning" in kwargs or "reasoning.encrypted_content" in kwargs.get("include", [])
             ):
-                raise BadRequestError("Unsupported parameter: reasoning.effort", "gpt-4.1-mini", "openai")
+                raise BadRequestError()
             return {"output": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
 
         async def billed(*_args, **_kwargs):
             return None
 
-        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
+        monkeypatch.setattr(core.provider_client, "aresponses", provider)
         monkeypatch.setattr(core, "_bill", billed)
         options = {
             "reasoning": {"effort": "medium", "summary": "auto"},
             "include": ["reasoning.encrypted_content", "message.output_text.logprobs"],
             "prompt_cache_key": "codex-session",
         }
-        monkeypatch.setattr(litellm, "model_cost", {
+        monkeypatch.setattr(capabilities, "catalog_model_metadata", lambda model, *args: {
             "gpt-4.1-mini": {"supports_reasoning": False},
             "gpt-5": {"supports_reasoning": True},
-        })
+        }.get(model, {}))
         routes = (
             ("gpt-4.1-mini", False, None, None),
             ("gpt-5", True, None, None),
@@ -549,9 +525,9 @@ class TestCompletionCoreContract:
 
     async def test_responses_reports_provider_bad_request_as_sanitized_client_error(self, monkeypatch):
         async def provider(**_kwargs):
-            raise BadRequestError("private upstream detail", "gpt-5", "openai")
+            raise BadRequestError(message="private upstream detail")
 
-        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
+        monkeypatch.setattr(core.provider_client, "aresponses", provider)
         with pytest.raises(core.CompletionError) as failure:
             await core.complete_responses(
                 resolved={"model_name": "gpt-5", "provider_type": "openai", "capabilities": {"reasoning": True}},
@@ -583,7 +559,7 @@ def _auth(monkeypatch):
 
 @pytest.fixture
 def _core(monkeypatch):
-    async def fake_resolve(model, *, provider=None):
+    async def fake_resolve(model, *, provider=None, operation="chat"):
         return {
             "model_name": model,
             "api_model_name": model,
@@ -692,8 +668,8 @@ class TestOpenAIEndpoint:
 
         monkeypatch.setattr(core, "resolve_api", resolve)
         monkeypatch.setattr(core, "precheck", precheck)
-        monkeypatch.setattr(core.litellm_client, "acompletion", forbidden)
-        monkeypatch.setattr(core.litellm_client, "acompletion_stream", forbidden)
+        monkeypatch.setattr(core.provider_client, "acompletion", forbidden)
+        monkeypatch.setattr(core.provider_client, "acompletion_stream", forbidden)
         monkeypatch.setattr(core.credit, "apply_usage", forbidden)
         response = await client.post("/v1/chat/completions", headers=_H, json={
             "model": "saved-model", "stream": stream,
@@ -740,7 +716,7 @@ class TestOpenAIEndpoint:
         calls = []
         canonical = "openai/gpt-5.6-luna"
 
-        async def resolve(model, *, provider=None):
+        async def resolve(model, *, provider=None, operation="chat"):
             calls.append((model, provider))
             return {
                 "model_name": f"perplexity/{model}",
@@ -862,7 +838,7 @@ class TestOpenAIEndpoint:
         async def fake_precheck(user_id, project_id, api_key_id=None):
             calls.append((user_id, project_id, api_key_id))
 
-        async def fake_resolve(model, *, provider=None):
+        async def fake_resolve(model, *, provider=None, operation="chat"):
             return {
                 "model_name": model,
                 "api_model_name": model,
@@ -901,7 +877,7 @@ class TestOpenAIEndpoint:
         async def forbidden_provider(**kw):
             raise AssertionError("provider complete_once/complete_stream must not be called")
 
-        async def fake_resolve(model, *, provider=None):
+        async def fake_resolve(model, *, provider=None, operation="chat"):
             return {
                 "model_name": model,
                 "api_model_name": model,
@@ -939,7 +915,7 @@ class TestOpenAIEndpoint:
     async def test_openai_tool_choice_forwarded(self, client, _auth, monkeypatch):
         received_extra = {}
 
-        async def fake_resolve(model, *, provider=None):
+        async def fake_resolve(model, *, provider=None, operation="chat"):
             return {
                 "model_name": model,
                 "api_model_name": model,
@@ -950,9 +926,9 @@ class TestOpenAIEndpoint:
         async def fake_acompletion(*args, **kw):
             nonlocal received_extra
             received_extra = kw.get("extra") or {}
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None), finish_reason="stop")],
-                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            return ProviderObject(
+                choices=[{"message": {"content": "ok", "tool_calls": None}, "finish_reason": "stop"}],
+                usage={"prompt_tokens": 1, "completion_tokens": 1},
             )
 
         async def fake_precheck(*_args, **_kwargs):
@@ -963,7 +939,7 @@ class TestOpenAIEndpoint:
 
         monkeypatch.setattr(core, "resolve_api", fake_resolve)
         monkeypatch.setattr(core, "precheck", fake_precheck)
-        monkeypatch.setattr("lumen.services.completion_api.litellm_client.acompletion", fake_acompletion)
+        monkeypatch.setattr(core.provider_client, "acompletion", fake_acompletion)
         monkeypatch.setattr(core, "_bill", fake_bill)
 
         tc = {"type": "function", "function": {"name": "get_weather"}}
@@ -1710,15 +1686,20 @@ class TestDiscoveryAndHostGate:
 
 class TestAnthropicTransport:
     async def test_raw_sse_bytes_are_incrementally_decoded_into_native_events(self):
-        async def chunks():
-            yield b'event: message_start\r\ndata: {"type":"message_start"}\r'
-            yield (
-                b"\n\r\nevent: content_block_delta\ndata: "
-                b'{"type":"content_block_delta","delta":{"type":"text_delta","text":"h\xc3'
-            )
-            yield b'\xa9"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}'
+        class Chunks(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'event: message_start\r\ndata: {"type":"message_start"}\r'
+                yield (
+                    b"\n\r\nevent: content_block_delta\ndata: "
+                    b'{"type":"content_block_delta","delta":{"type":"text_delta","text":"h\xc3'
+                )
+                yield b'\xa9"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
 
-        events = [event async for event in litellm_client._anthropic_stream_events(chunks())]
+        response = httpx.Response(200, stream=Chunks(), request=httpx.Request("POST", "http://127.0.0.1/messages"))
+        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response))
+        stream = provider_client.ProviderStream(response, client, "messages")
+        events = [event async for event in stream]
+        assert stream.completed is True and response.is_closed and client.is_closed
 
         assert [event["type"] for event in events] == [
             "message_start",
@@ -1764,7 +1745,7 @@ class TestAnthropicEndpoint:
     async def test_provider_header_selects_route_and_conflict_is_400(self, client, _auth, _core, monkeypatch):
         calls = []
 
-        async def resolve(model, *, provider=None):
+        async def resolve(model, *, provider=None, operation="chat"):
             calls.append((model, provider))
             return {"model_name": model, "api_model_name": model, "api_provider": provider, "provider_name": provider}
 
@@ -1793,7 +1774,7 @@ class TestAnthropicEndpoint:
     async def test_native_request_options_are_not_lossily_converted(self, client, _auth, monkeypatch):
         captured = {}
 
-        async def resolve(model, *, provider=None):
+        async def resolve(model, *, provider=None, operation="chat"):
             return {
                 "model_name": model,
                 "api_model_name": model,
@@ -1855,7 +1836,7 @@ class TestAnthropicEndpoint:
         assert response.json()["content"][0]["signature"] == "sig"
 
     async def test_quota_error_is_top_level_and_provider_not_called(self, client, _auth, monkeypatch):
-        async def resolve(model, *, provider=None):
+        async def resolve(model, *, provider=None, operation="chat"):
             return {"model_name": model, "api_model_name": model, "provider_name": provider}
 
         async def precheck(*_args, **_kwargs):
@@ -1879,7 +1860,7 @@ class TestAnthropicEndpoint:
         }
 
     async def test_count_tokens_preserves_anthropic_protocol_headers(self, client, _auth, monkeypatch):
-        async def resolve(model, *, provider=None):
+        async def resolve(model, *, provider=None, operation="chat"):
             return {"model_name": model, "provider_name": provider or "anthropic"}
 
         async def count(*, resolved, payload, anthropic_headers):

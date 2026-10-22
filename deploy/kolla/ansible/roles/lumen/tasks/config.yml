@@ -9,6 +9,16 @@
     group: root
   when: inventory_hostname in groups['lumen']
 
+- name: Config | Ensure operator policy directory exists without replacing rules
+  become: true
+  ansible.builtin.file:
+    path: "{{ lumen_policy_directory }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  when: inventory_hostname in groups['lumen']
+
 - name: Config | Render lumen.conf
   become: true
   ansible.builtin.template:

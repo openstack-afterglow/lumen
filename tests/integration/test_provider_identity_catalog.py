@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from lumen.crypto import encrypt_llm_provider_key
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.scripts.migrate import MIGRATIONS, _statements, load_manifest
-from lumen.services.providers import repository, routing
+from lumen.services.providers import credentials, repository, routing
 from lumen.services.providers.errors import AmbiguousModelRouteError
 
 pytestmark = pytest.mark.integration
@@ -23,10 +23,12 @@ pytestmark = pytest.mark.integration
 @pytest.mark.parametrize("model_kind", ["text", "image"])
 async def test_catalog_backfill_rename_rank_and_encrypted_transport_survive_reload(monkeypatch, model_kind):
     engine = create_async_engine(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
-    prefix = f"catalog_{uuid.uuid4().hex[:10]}_"
+    prefix = f"cat_{uuid.uuid4().hex[:8]}_"
 
     def namespace_sql(connection, cursor, statement, parameters, context, executemany):
-        return statement.replace("llm_", f"{prefix}llm_").replace("chat_run", f"{prefix}chat_run"), parameters
+        for stem in ("llm_", "chat_", "fk_provider_", "chk_provider_", "fk_auth_"):
+            statement = statement.replace(stem, prefix + stem)
+        return statement, parameters
 
     event.listen(engine.sync_engine, "before_cursor_execute", namespace_sql, retval=True)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -34,6 +36,7 @@ async def test_catalog_backfill_rename_rank_and_encrypted_transport_survive_relo
     monkeypatch.setattr(routing, "_require_db", lambda: factory)
     migrations = load_manifest()
     catalog_migration = next(item for item in migrations if item.logical_id == "021-provider-identity-catalog-order")
+    account_migration = next(item for item in migrations if item.logical_id == "027-provider-account-credentials")
     encrypted = encrypt_llm_provider_key("isolated-provider-key")
     try:
         async with engine.begin() as connection:
@@ -51,6 +54,9 @@ async def test_catalog_backfill_rename_rank_and_encrypted_transport_survive_relo
             await connection.exec_driver_sql("CREATE TABLE chat_runs (id CHAR(36) PRIMARY KEY, status VARCHAR(20))")
             await connection.exec_driver_sql(
                 "CREATE TABLE chat_run_providers (run_id CHAR(36), provider_id BIGINT, model_id BIGINT)"
+            )
+            await connection.exec_driver_sql(
+                "CREATE TABLE chat_usage_logs (event_id VARCHAR(64) PRIMARY KEY, created_at DATETIME)"
             )
             # A fixed past clock makes any timestamp bump by selector/rank edits change the route hash.
             await connection.exec_driver_sql(
@@ -83,6 +89,11 @@ async def test_catalog_backfill_rename_rank_and_encrypted_transport_survive_relo
                 """)
             for statement in _statements(MIGRATIONS / catalog_migration.relative_path):
                 await connection.exec_driver_sql(statement)
+            assert (await connection.exec_driver_sql(
+                "SELECT id, api_provider, sort_order FROM llm_providers ORDER BY id"
+            )).all() == [(1, "openai", 0), (2, "openai", 0)]
+            for statement in _statements(MIGRATIONS / account_migration.relative_path):
+                await connection.exec_driver_sql(statement)
 
         backfilled = await repository.list_providers()
         assert [(p["id"], p["api_provider"], p["sort_order"]) for p in backfilled] == [
@@ -92,7 +103,8 @@ async def test_catalog_backfill_rename_rank_and_encrypted_transport_survive_relo
         with pytest.raises(AmbiguousModelRouteError):
             await routing.resolve_api_model("shared-id", provider="openai", model_kind=model_kind)
         original = await routing.resolve_api_model("shared-id", provider_id=2, model_kind=model_kind)
-        assert original["api_key"] == "isolated-provider-key"
+        assert original["api_key"] is None
+        assert (await credentials.resolve_inference_credential(original["provider_auth"]))["api_key"] == "isolated-provider-key"
         assert original["provider_type"] == "openai"
 
         # Preserve a frozen route through selector/order-only edits.
@@ -119,7 +131,9 @@ async def test_catalog_backfill_rename_rank_and_encrypted_transport_survive_relo
         assert selected["provider_id"] == 2 and selected["model_id"] == 12
         assert selected["api_provider"] == "nvidia" and selected["provider_type"] == "openai"
         assert selected["api_base"] == original["api_base"]
-        assert selected["api_key"] == original["api_key"]
+        assert selected["api_key"] is None
+        assert selected["provider_auth"] == original["provider_auth"]
+        assert (await credentials.resolve_inference_credential(selected["provider_auth"]))["api_key"] == "isolated-provider-key"
         assert (await routing.resolve_api_model("shared-id", provider="openai", model_kind=model_kind))[
             "model_id"
         ] == 11
@@ -127,8 +141,9 @@ async def test_catalog_backfill_rename_rank_and_encrypted_transport_survive_relo
             await routing.resolve_api_model("shared-id", model_kind=model_kind)
         async with factory() as session:
             stored = (await session.execute(select(LlmProvider).where(LlmProvider.id == 2))).scalar_one()
-            assert stored.encrypted_api_key == encrypted
-            assert stored.encrypted_api_key != "isolated-provider-key"
+            credential = stored.accounts[0].credentials[0]
+            assert credential.encrypted_api_key == encrypted
+            assert credential.encrypted_api_key != "isolated-provider-key"
             assert stored.auth_mode == "api_key"
         for entity in (LlmProvider, LlmModel):
             with pytest.raises(DBAPIError):
@@ -140,7 +155,11 @@ async def test_catalog_backfill_rename_rank_and_encrypted_transport_survive_relo
             for table in (
                 "chat_run_providers",
                 "chat_runs",
+                "chat_provider_usage",
+                "chat_usage_logs",
                 "llm_provider_auth_attempts",
+                "llm_provider_credentials",
+                "llm_provider_accounts",
                 "llm_models",
                 "llm_providers",
             ):

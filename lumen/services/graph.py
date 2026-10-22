@@ -1,13 +1,12 @@
-"""Phase 2 chat_engine — LangGraph + litellm 에이전트 루프(내부 툴, MCP 미포함).
+"""LangGraph chat_engine — provider-neutral 에이전트 루프.
 
-설계 결정(2026-07-18):
-- litellm_client 를 그대로 쓰고(ChatLiteLLM/langchain-community 미도입), LangGraph 는 그래프 구조·
-  상태·스트리밍만 담당한다. 에이전트 루프(모델↔툴)는 노드 내부에서 돌린다.
-- litellm 은 LangChain 모델이 아니므로 stream_mode="messages" 대신 **stream_mode="custom" +
-  get_stream_writer()** 로 토큰/툴 이벤트를 emit 한다.
+실행 경계:
+- provider_client가 고정된 route·credential로 단일 공급자 요청을 소유한다.
+- LangGraph는 상태·스트리밍과 모델↔툴 루프를 담당한다. 공급자 오류 후 reasoning/key를 바꾸어 재시도하지 않는다.
+- stream_mode="custom" + get_stream_writer()로 토큰·툴 이벤트를 emit한다.
 - 툴은 자체 루프로 실행: 스트리밍하며 텍스트 델타와 tool_call 델타를 누적하고, tool_call 이 있으면
   **테넌트 안전(tools.execute_tool, ToolContext)** 하게 실행 후 결과를 붙여 다음 턴으로 넘긴다.
-- 멀티스텝(툴 호출로 여러 litellm 콜) usage 를 합산해 마지막에 1회 emit → 엔드포인트가 과금.
+- 멀티스텝 공급자 usage를 합산해 마지막에 1회 emit → durable worker가 정산한다.
 - 이벤트 계약: token / tool_call / usage / error → completions 엔드포인트가 SSE 로 중계.
 - 대화 전사는 MySQL chat_messages(source of truth)에서 매 요청 로드해 messages 로 주입.
 - 외부 MCP 서버 연동은 pydantic/uvicorn/httpx 핀 이동 필요(별도 결정) — 여기선 내부 툴만.
@@ -28,7 +27,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from lumen_plugin_api.tools import CodePart, ToolBinding
 
-from lumen.services import agent_runtime_v2, litellm_client, native_compaction
+from lumen.services import agent_runtime_v2, native_compaction, provider_client, provider_metadata
 from lumen.services.checkpointer import chat_checkpointer
 from lumen.services.providers.errors import ProviderSubscriptionError
 from lumen.services.tool_runtime import bindings, contracts, dispatch, selection
@@ -44,34 +43,10 @@ logger = logging.getLogger(__name__)
 
 _MAX_TOOL_STEPS = 4  # 툴 실행 라운드 상한(무한 루프 방지) — 초과 시 마지막 턴을 최종 답변으로
 
-# Frozen route configuration hashes whose reasoning parameters were rejected.
-_REASONING_UNSUPPORTED: set[str] = set()
-# Frozen route configuration hashes that require explicit none for tool requests.
-_TOOL_REASONING_EXPLICIT_NONE: set[str] = set()
-# Frozen routes whose implicit none was rejected; other routes/versions are unaffected.
-_TOOL_REASONING_NONE_REJECTED: set[str] = set()
 _MAX_INTERNAL_TOOL_CALL_ID = 190
 _DELEGATE_TOOL_NAME = "delegate_agent"
 
 
-def _requires_explicit_none_for_tools(
-    model: str,
-    custom_llm_provider: str | None,
-    reasoning_effort: str | None,
-    reasoning_can_be_disabled: bool,
-) -> bool:
-    """Make OpenAI's implicit automatic reasoning explicit only for tool requests.
-
-    The route's frozen capabilities must advertise disabling: gpt-5 and gpt-5-mini list
-    only minimal..high, and LiteLLM forwards ``none`` to them unchanged.
-    """
-    normalized_effort = reasoning_effort.strip().lower() if isinstance(reasoning_effort, str) else None
-    return (
-        custom_llm_provider == "openai"
-        and reasoning_can_be_disabled
-        and model.strip().lower().startswith("gpt-5")
-        and normalized_effort in {None, "", "auto"}
-    )
 
 
 class _BoundaryAbort(RuntimeError):
@@ -84,16 +59,8 @@ def _abort_code(payload: Any) -> str | None:
     return None
 
 
-def _is_tool_reasoning_conflict(error: Exception) -> bool:
-    """OpenAI Chat Completions가 tool+기본 추론을 거부했는지 판별한다."""
-    message = str(error).lower()
-    return "function tools" in message and "reasoning_effort" in message
 
 
-def _is_reasoning_none_rejection(error: Exception) -> bool:
-    """The provider rejected the `none` value itself (gpt-5: minimal..high only), not the request."""
-    message = str(error).lower()
-    return "reasoning_effort" in message and "none" in message and not _is_tool_reasoning_conflict(error)
 
 
 class ChatState(TypedDict, total=False):
@@ -142,7 +109,7 @@ def _delta_content(delta) -> str | None:
 
 
 def _delta_reasoning(delta) -> str | None:
-    """추론 델타(reasoning_content) 추출 — litellm 이 provider 무관하게 정규화한 필드."""
+    """공급자 어댑터가 정규화한 reasoning_content 델타를 추출한다."""
     reasoning = getattr(delta, "reasoning_content", None)
     if reasoning is None and isinstance(delta, dict):
         reasoning = delta.get("reasoning_content")
@@ -263,7 +230,7 @@ def _extract_citations(chunk, delta, acc: dict[str, dict]) -> None:
             if value is not None and (replace or existing.get(key) is None):
                 existing[key] = value
 
-    # LiteLLM may preserve raw Sonar/Agent results at the response or delta level.
+    # Provider adapters may preserve raw Sonar/Agent results at the response or delta level.
     provider_fields = _get(delta, "provider_specific_fields") or {}
     for carrier in (chunk, _get(chunk, "provider_specific_fields"), provider_fields):
         for item in _get(carrier, "search_results") or []:
@@ -299,7 +266,7 @@ def _extract_citations(chunk, delta, acc: dict[str, dict]) -> None:
             },
         )
 
-    # LiteLLM's Anthropic-unified protocol carries both document citations
+    # Normalized Anthropic events carry both document citations
     # (`char_location`/`page_location`, keyed by document_index) and native
     # search citations (`web_search_result_location`, keyed by URL) through the
     # same citation field, so the shape — not the transport — selects the kind.
@@ -412,11 +379,10 @@ def _round_usage_for_sum(
 
 
 def _compaction_blocks(chunk, delta) -> list[dict]:
-    """Read provider-native compaction blocks off one streamed chunk.
+    """Read normalized cumulative provider-native compaction snapshots.
 
-    LiteLLM accumulates the blocks it has seen so far and re-publishes the whole
-    list on every chunk that carries one, so the last non-empty read wins rather
-    than being appended to.
+    Each reported list replaces the preceding snapshot; appending it would
+    duplicate blocks when a later chunk carries the same accumulated content.
     """
     for carrier in (_get(delta, "provider_specific_fields"), _get(chunk, "provider_specific_fields")):
         blocks = native_compaction.sanitize_blocks(_get(carrier, "compaction_blocks"))
@@ -585,6 +551,16 @@ def _build_graph(params: dict, ctx: ToolContext):
             return await callback(**payload)
         return None
 
+    def turn_writer(turn_ordinal: int):
+        emit = get_stream_writer()
+        if not getattr(hooks, "journals_tool_events", False):
+            return emit
+
+        def write(event: dict) -> None:
+            emit({**event, "_durable_turn_ordinal": turn_ordinal})
+
+        return write
+
     async def tool_activity_metadata(tool_name: str) -> tuple[str, str]:
         v2_bindings = params.get("v2_bindings")
         if isinstance(v2_bindings, dict):
@@ -594,13 +570,15 @@ def _build_graph(params: dict, ctx: ToolContext):
         return await selection.context_tool_activity_metadata(tool_name, ctx)
 
     async def call_model(state: ChatState) -> dict:
-        writer = get_stream_writer()
+        round_index = int(state.get("loop_count", 0))
+        writer = turn_writer(round_index)
         model_turn_count = int(state.get("model_turn_count", 0))
         if params.get("execution_protocol_version") == 2:
             max_model_turns = int(params.get("max_model_turns", 8))
             if not 1 <= max_model_turns <= 16 or model_turn_count < 0:
                 raise RuntimeError("v2 model-turn limit is invalid")
             if model_turn_count >= max_model_turns:
+                writer = turn_writer(max(0, round_index - 1))
                 writer(
                     {
                         "type": "warning",
@@ -633,7 +611,6 @@ def _build_graph(params: dict, ctx: ToolContext):
                         restored,
                         include_managed=False,
                     )
-        round_index = int(state.get("loop_count", 0))
         schemas = (
             _v2_tool_schemas(v2_bindings)
             if isinstance(v2_bindings, dict)
@@ -656,28 +633,10 @@ def _build_graph(params: dict, ctx: ToolContext):
         # Do not send its instructions to another model call before rechecking.
         await boundary("revalidate_skills")
 
-        reasoning_route_key = params.get("reasoning_route_key")
         reasoning_effort = params.get("reasoning_effort")
-        if reasoning_effort != "none" and reasoning_route_key in _REASONING_UNSUPPORTED:
-            reasoning_effort = None
-        # A capability-derived `none` is a guess; a conflict-proven one is not.
-        implicit_none_for_tools = (
-            bool(schemas)
-            and reasoning_route_key not in _TOOL_REASONING_EXPLICIT_NONE
-            and reasoning_route_key not in _TOOL_REASONING_NONE_REJECTED
-            and _requires_explicit_none_for_tools(
-                params["model"],
-                params.get("custom_llm_provider"),
-                reasoning_effort,
-                bool(params.get("reasoning_can_be_disabled")),
-            )
-        )
-        disable_reasoning_for_tools = implicit_none_for_tools or (
-            bool(schemas) and reasoning_route_key in _TOOL_REASONING_EXPLICIT_NONE
-        )
         attempt = 0
 
-        async def open_stream(effort, *, disable_reasoning: bool = False):
+        async def open_stream(effort):
             nonlocal attempt
             attempt += 1
             replay_payload = await boundary(
@@ -690,16 +649,15 @@ def _build_graph(params: dict, ctx: ToolContext):
             if isinstance(replay_payload, dict):
                 return None, replay_payload
             try:
-                provider_extra = {"reasoning_effort": "none"} if disable_reasoning else {}
+                provider_extra = {}
                 if params.get("response_format") is not None:
                     provider_extra["response_format"] = params["response_format"]
-                # Provider-native compaction. The route resolves the absolute
-                # trigger up front; an unsupported transport resolves to None so
-                # the parameter is never sent where LiteLLM would drop it.
+                # Native compaction uses the frozen absolute trigger only on
+                # routes that advertise support for this protocol feature.
                 if params.get("native_compaction") is not None:
                     provider_extra["context_management"] = params["native_compaction"]
                 return (
-                    await litellm_client.acompletion_stream(
+                    await provider_client.acompletion_stream(
                         model=params["model"],
                         messages=messages,
                         tools=schemas,
@@ -716,25 +674,14 @@ def _build_graph(params: dict, ctx: ToolContext):
                     None,
                 )
             except BaseException as exc:
-                logger.warning("litellm 스트림 초기화 오류 model=%s error_type=%s", params.get("model"), type(exc).__name__)
-                # Durable hooks abort the round at provider_failed, so learn before the boundary:
-                # the next round or run then avoids the rejected shape instead of repeating it.
-                if schemas and reasoning_route_key and isinstance(exc, Exception):
-                    if disable_reasoning and implicit_none_for_tools and _is_reasoning_none_rejection(exc):
-                        _TOOL_REASONING_NONE_REJECTED.add(reasoning_route_key)
-                    elif not disable_reasoning and _is_tool_reasoning_conflict(exc):
-                        _TOOL_REASONING_EXPLICIT_NONE.add(reasoning_route_key)
-                        _TOOL_REASONING_NONE_REJECTED.discard(reasoning_route_key)
+                logger.warning("provider stream initialization failed model=%s error_type=%s", params.get("model"), type(exc).__name__)
                 failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
                 if _abort_code(failure) is not None:
                     raise _BoundaryAbort(_abort_code(failure))
                 raise
 
         try:
-            response, replay_payload = await open_stream(
-                None if disable_reasoning_for_tools else reasoning_effort,
-                disable_reasoning=disable_reasoning_for_tools,
-            )
+            response, replay_payload = await open_stream(reasoning_effort)
         except _BoundaryAbort as exc:
             writer(
                 {
@@ -747,52 +694,10 @@ def _build_graph(params: dict, ctx: ToolContext):
         except Exception as exc:
             if isinstance(exc, ProviderSubscriptionError):
                 writer({"type": "error", "code": exc.code, "message": exc.message})
-                return {"model_failed": True, "pending_tool_calls": []}
-            if implicit_none_for_tools and not _is_reasoning_none_rejection(exc):
-                # A guessed `none` must not fall into the generic branch, which would
-                # demote a reasoning-capable model into _REASONING_UNSUPPORTED.
-                logger.warning("litellm 스트리밍 오류 model=%s error_type=%s", params.get("model"), type(exc).__name__)
-                writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
-                return {"model_failed": True, "pending_tool_calls": []}
-            if implicit_none_for_tools:
-                logger.warning("tool 요청의 암묵적 reasoning none 거부 — provider 기본값으로 재시도 model=%s", params["model"])
-                try:
-                    response, replay_payload = await open_stream(reasoning_effort)
-                except ProviderSubscriptionError as retry_error:
-                    writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
-                    return {"model_failed": True, "pending_tool_calls": []}
-                except Exception as retry_error:
-                    logger.warning("litellm 스트리밍 오류 model=%s error_type=%s", params.get("model"), type(retry_error).__name__)
-                    writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
-                    return {"model_failed": True, "pending_tool_calls": []}
-            elif schemas and _is_tool_reasoning_conflict(exc):
-                logger.warning("tool 요청의 기본 reasoning을 명시적으로 비활성화해 재시도 model=%s", params["model"])
-                try:
-                    response, replay_payload = await open_stream(None, disable_reasoning=True)
-                except ProviderSubscriptionError as retry_error:
-                    writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
-                    return {"model_failed": True, "pending_tool_calls": []}
-                except Exception as retry_error:
-                    logger.warning("litellm 스트리밍 오류 model=%s error_type=%s", params.get("model"), type(retry_error).__name__)
-                    writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
-                    return {"model_failed": True, "pending_tool_calls": []}
-            elif reasoning_effort and reasoning_effort != "none":
-                logger.warning("reasoning 포함 요청 실패 — reasoning 없이 재시도 model=%s", params.get("model"))
-                try:
-                    response, replay_payload = await open_stream(None)
-                except ProviderSubscriptionError as retry_error:
-                    writer({"type": "error", "code": retry_error.code, "message": retry_error.message})
-                    return {"model_failed": True, "pending_tool_calls": []}
-                except Exception as retry_error:
-                    logger.warning("litellm 스트리밍 오류 model=%s error_type=%s", params.get("model"), type(retry_error).__name__)
-                    writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
-                    return {"model_failed": True, "pending_tool_calls": []}
-                if reasoning_route_key:
-                    _REASONING_UNSUPPORTED.add(reasoning_route_key)
             else:
-                logger.warning("litellm 스트리밍 오류 model=%s error_type=%s", params.get("model"), type(exc).__name__)
+                logger.warning("provider stream failed model=%s error_type=%s", params.get("model"), type(exc).__name__)
                 writer({"type": "error", "message": "모델 응답 중 오류가 발생했습니다"})
-                return {"model_failed": True, "pending_tool_calls": []}
+            return {"model_failed": True, "pending_tool_calls": []}
 
         citations_by_url = {item["url"]: item for item in state.get("citations", []) if item.get("url")}
         if replay_payload is not None:
@@ -832,7 +737,7 @@ def _build_graph(params: dict, ctx: ToolContext):
             round_compaction_blocks: list[dict] = []
             requires_terminal = (
                 params.get("custom_llm_provider") == "openai"
-                and litellm_client.direct_provider_route("openai", params.get("api_base"))
+                and provider_metadata.direct_provider_route("openai", params.get("api_base"))
             )
             try:
                 async for chunk in response:
@@ -854,7 +759,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                     usage = _get(chunk, "usage")
                     if usage is not None:
                         final_usage = usage
-                if requires_terminal and not litellm_client.direct_openai_stream_completed(response):
+                if requires_terminal and not provider_client.direct_openai_stream_completed(response):
                     raise RuntimeError("OpenAI Responses stream ended without response.completed")
             except ProviderSubscriptionError as exc:
                 failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
@@ -870,7 +775,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                 writer({"type": "error", "code": exc.code, "message": exc.message})
                 return {"model_failed": True, "pending_tool_calls": []}
             except Exception as error:
-                logger.warning("litellm 스트림 소비 오류 model=%s error_type=%s", params.get("model"), type(error).__name__)
+                logger.warning("공급자 스트림 소비 오류 model=%s error_type=%s", params.get("model"), type(error).__name__)
                 failure = await boundary("provider_failed", round_index=round_index, attempt=attempt)
                 if _abort_code(failure) is not None:
                     writer(
@@ -893,7 +798,7 @@ def _build_graph(params: dict, ctx: ToolContext):
                 # The token-counter fallback has no provider cache report to split.
                 tool_payload = json.dumps(tool_calls, ensure_ascii=False, sort_keys=True) if tool_calls else ""
                 round_usage = UsageBreakdown.from_totals(
-                    *litellm_client.extract_usage(params["model"], messages, "".join(text_parts) + tool_payload, None)
+                    *provider_metadata.extract_usage(params["model"], messages, "".join(text_parts) + tool_payload, None)
                 )
             response_text = "".join(text_parts)
             # Validate each actual call before aggregation; a later split cannot
@@ -1142,7 +1047,8 @@ def _build_graph(params: dict, ctx: ToolContext):
         return "finalize"
 
     async def execute_tools(state: ChatState) -> dict:
-        writer = get_stream_writer()
+        round_index = int(state.get("loop_count", 0))
+        writer = turn_writer(round_index)
         messages = list(state["messages"])
         approved_tool_calls = state.get("pending_tool_calls", [])
         denied_tool_calls = state.get("denied_tool_calls", [])
@@ -1167,7 +1073,6 @@ def _build_graph(params: dict, ctx: ToolContext):
         def call_id_for(tool_call: dict) -> str:
             return _internal_tool_call_id(tool_call)
 
-        round_index = int(state.get("loop_count", 0))
         tool_messages: list[dict[str, str]] = []
         citations_by_url = {item["url"]: item for item in state.get("citations", []) if item.get("url")}
         journals_tool_events = bool(getattr(hooks, "journals_tool_events", False))
@@ -1509,10 +1414,10 @@ def _build_graph(params: dict, ctx: ToolContext):
         pending = state.get("pending_delegations") or []
         if not pending:
             return {"pending_delegations": [], "child_wait_group_id": None}
-        writer = get_stream_writer()
         messages = list(state["messages"])
         # execute_tools already advanced loop_count for this round.
         round_index = int(state.get("loop_count", 1)) - 1
+        writer = turn_writer(round_index)
         journals_tool_events = bool(getattr(hooks, "journals_tool_events", False))
         tool_messages: list[dict[str, str]] = []
         parsed: list[tuple[dict, child_runs.DelegationCall | None, str | None]] = []
@@ -1652,7 +1557,7 @@ def _build_graph(params: dict, ctx: ToolContext):
     async def finalize(state: ChatState) -> dict:
         if state.get("model_failed"):
             return {"messages": state["messages"]}
-        writer = get_stream_writer()
+        writer = turn_writer(max(0, int(state.get("model_turn_count", 1)) - 1))
         if state.get("citations"):
             writer({"type": "citations", "items": state["citations"]})
         usage_event = {"type": "usage", "usage": state.get("usage", {"prompt_tokens": 0, "completion_tokens": 0})}
@@ -1733,8 +1638,6 @@ async def stream(
     max_tokens: int | None = None,
     temperature: float | None = None,
     reasoning_effort: str | None = None,
-    reasoning_can_be_disabled: bool = False,
-    reasoning_route_key: str | None = None,
     selected_tool_ids: tuple[int, ...] | None = None,
     selected_mcp_ids: tuple[int, ...] | None = None,
     expected_mcp_credential_versions: tuple[tuple[int, int], ...] | None = None,
@@ -1773,8 +1676,6 @@ async def stream(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "reasoning_effort": reasoning_effort,
-        "reasoning_can_be_disabled": reasoning_can_be_disabled,
-        "reasoning_route_key": reasoning_route_key,
         "execution_hooks": execution_hooks,
         "response_format": response_format,
         "execution_protocol_version": execution_protocol_version,

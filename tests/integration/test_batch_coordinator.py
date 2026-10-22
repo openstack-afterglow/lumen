@@ -13,11 +13,17 @@ import os
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4, uuid5
 
 import pytest
+from provider_fixtures import configured_provider
 from sqlalchemy import delete, event, func, select, text
+from sqlalchemy.exc import OperationalError
 
+from lumen import auth
+from lumen.auth import resolve_project_authority
 from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content
 from lumen.db import close_db, get_session_factory, init_db
@@ -26,11 +32,13 @@ from lumen.models.chat_batches import ChatBatch, ChatBatchFile, ChatBatchItem, C
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_infrastructure import ChatWorkerRegistration
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunEventRow, ChatRunSegment
-from lumen.services import assets, batch_files, batches
-from lumen.services.durable_runs import images
+from lumen.services import assets, batch_files, batches, provider_metadata
+from lumen.services.api_key_store import ApiKeyForbidden
+from lumen.services.durable_runs import api_completion, audio, images
 from lumen.services.durable_runs.budgets import retry_deadlocks
+from lumen.services.durable_runs.common import _payload
+from lumen.services.durable_runs.media import MediaAuthorizationRevoked
 from lumen.services.infrastructure.store import register_worker
-from lumen.services.providers import routing
 from lumen.services.run_store import claim_queued_run, complete_segment_io
 from lumen.services.worker_routing import use_read_committed
 
@@ -68,7 +76,7 @@ async def batch_db(request, monkeypatch):
     async with factory() as session, session.begin():
         actual = (await session.execute(text("SELECT @@SESSION.innodb_snapshot_isolation"))).scalar_one()
         assert bool(actual) == (request.param == "ON")
-        provider = LlmProvider(name="batch-provider-" + nonce, provider_type="openai", is_active=True,
+        provider = configured_provider(name="batch-provider-" + nonce, provider_type="openai", is_active=True,
                                margin_multiplier=Decimal("1"))
         session.add(provider)
         await session.flush()
@@ -77,7 +85,7 @@ async def batch_db(request, monkeypatch):
         session.add(model)
         await session.flush()
         model_id, provider_id = model.id, provider.id
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-private-key")
+    
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
 
     async def forbidden_provider(*_args, **_kwargs):
@@ -140,7 +148,7 @@ async def batch_db(request, monkeypatch):
 
     try:
         yield SimpleNamespace(factory=factory, project_id=project_id, user_id=user_id, owner=online,
-            native=native, create=create, tick=tick, claim=claim, get=get, items=items,
+            model_id=model_id, provider_id=provider_id, native=native, create=create, tick=tick, claim=claim, get=get, items=items,
             input_file=input_file, openai=openai)
     finally:
         async with factory() as session, session.begin():
@@ -153,10 +161,173 @@ async def batch_db(request, monkeypatch):
             await session.execute(delete(ChatBatchFile).where(ChatBatchFile.project_id == project_id))
             await session.execute(delete(ChatBatchProjectQueue).where(ChatBatchProjectQueue.project_id == project_id))
             await session.execute(delete(ChatWorkerRegistration).where(ChatWorkerRegistration.id.in_([online, runner])))
-            await session.execute(delete(LlmModel).where(LlmModel.id == model_id))
+            await session.execute(delete(LlmModel).where(LlmModel.provider_id == provider_id))
             await session.execute(delete(LlmProvider).where(LlmProvider.id == provider_id))
         event.remove(engine.sync_engine, "connect", configure_snapshot)
         await close_db()
+
+
+@pytest.fixture
+def reduced_batch_directory(batch_db, monkeypatch):
+    """Keep raw owner system-admin while revoking a reduced credential's leaf.
+
+    Exercise the production ID resolver rather than granting a mocked list of
+    scopes; all user/project/domain, role graph and raw system facts are synthetic.
+    """
+    db = batch_db
+    catalog = {"member-id": "member", "admin-id": "admin", "chat-id": "lumen-chat_user",
+               "images-id": "lumen-images_user", "audio-id": "lumen-audio_user"}
+    granted = {"member-id", "chat-id", "images-id", "audio-id"}
+
+    class Directory:
+        users = projects = domains = SimpleNamespace(get=lambda identifier: SimpleNamespace(
+            id=identifier, enabled=True, domain_id="native-domain"))
+
+        def get(self, path):
+            parsed = urlsplit(path)
+            query = parse_qs(parsed.query)
+            if parsed.path == "/roles":
+                payload = {"roles": [{"id": rid, "name": name} for rid, name in catalog.items()]}
+            elif parsed.path == "/role_inferences":
+                payload = {"role_inferences": []}
+            elif parsed.path == "/role_assignments":
+                if query.get("scope.system") == ["all"]:
+                    rows = [{"role": {"id": "admin-id"}, "user": {"id": db.user_id},
+                             "scope": {"system": {"all": True}}}]
+                else:
+                    rows = [{"role": {"id": rid}, "user": {"id": db.user_id},
+                             "scope": {"project": {"id": db.project_id}}} for rid in sorted(granted)]
+                payload = {"role_assignments": rows}
+            elif parsed.path == f"/users/{db.user_id}/groups":
+                payload = {"groups": []}
+            else:
+                raise AssertionError(path)
+            return None, payload
+
+    monkeypatch.setattr(auth, "_get_admin_ks_client", Directory)
+    lookup = AsyncMock(wraps=resolve_project_authority)
+    monkeypatch.setattr(auth, "resolve_project_authority", lookup)
+    authority = {"credential_restricted": True, "user_id": db.user_id,
+                 "source_project_id": db.project_id, "source_system_scope": "",
+                 "issued_role_ids": sorted(granted)}
+    return SimpleNamespace(authority=authority, granted=granted, lookup=lookup)
+
+
+@pytest.mark.parametrize("operation,leaf", [
+    ("chat.completions", "chat-id"), ("responses", "chat-id"),
+    ("images.generations", "images-id"), ("audio.speech", "audio-id"),
+])
+@pytest.mark.parametrize("revoke_at", ["validation", "materialization", "provider_start"])
+async def test_reduced_batch_ceiling_survives_owner_system_admin_and_leaf_revocation(
+        batch_db, reduced_batch_directory, monkeypatch, operation, leaf, revoke_at):
+    db, directory = batch_db, reduced_batch_directory
+    authority = directory.authority
+    if operation in {"chat.completions", "responses", "audio.speech"}:
+        async with db.factory() as session, session.begin():
+            model = LlmModel(provider_id=db.provider_id, model_name=("tts-1" if operation == "audio.speech"
+                else "batch-text-" + uuid4().hex), model_kind="tts" if operation == "audio.speech" else "text",
+                media_pricing={"audio_per_second": "0.001"} if operation == "audio.speech" else None,
+                input_price=Decimal("0.000001"), output_price=Decimal("0.000002"), price_source="manual",
+                capabilities={"context_limit": 8192}, capability_source="override", is_active=True)
+            session.add(model)
+            await session.flush()
+            model_id, model_name = model.id, model.model_name
+        monkeypatch.setattr(provider_metadata, "count_context_tokens", lambda *_args, **_kwargs:
+            provider_metadata.ContextTokenCount(tokens=10, measurement="tokenizer"))
+        if operation == "audio.speech":
+            body = {"model_id": str(model_id), "input": "hello", "voice": "alloy"}
+        elif operation == "responses":
+            body = {"model": model_name, "input": "hello", "max_output_tokens": 16}
+        else:
+            body = {"model": model_name, "messages": [{"role": "user", "content": "hello"}], "max_tokens": 16,
+                    "credential_authority": {"issued_role_ids": ["admin-id"]},
+                    "_credential_authority": {"issued_role_ids": ["admin-id"]}}
+    else:
+        body = db.native().items[0].body
+    request = NativeBatchCreateRequest.model_validate({"items": [
+        {"custom_id": f"reduced-{i}", "operation": operation, "body": body} for i in range(2)],
+        "metadata": {"credential_authority": "forged-admin", "issued_role_ids": "admin-id"}})
+    view, _ = await batches.create_native_batch(project_id=db.project_id, user_id=db.user_id, api_key_id=None,
+        scopes=None, source="web", idempotency_key=str(uuid4()), request=request, credential_authority=authority)
+    assert all(item.capability_snapshot == {"credential_authority": authority} for item in await db.items(view.id))
+    if revoke_at == "validation":
+        directory.granted.remove(leaf)
+    before = directory.lookup.await_count
+    await db.tick()
+    assert directory.lookup.await_count - before == 1
+    assert directory.lookup.await_args.kwargs == {"credential_authority": authority}
+    if revoke_at == "validation":
+        failed = await db.get(view.id)
+        assert failed.status == "failed"
+        assert [error["code"] for error in failed.errors] == ["api_key_unauthorized"] * 2
+        assert all(item.run_id is None for item in await db.items(view.id))
+    else:
+        assert (await db.get(view.id)).status == "in_progress"
+        frozen = await db.items(view.id)
+        assert all(item.capability_snapshot["credential_authority"] == authority for item in frozen)
+        if revoke_at == "materialization":
+            directory.granted.remove(leaf)
+        before = directory.lookup.await_count
+        await db.tick()
+        assert directory.lookup.await_count - before == 1
+        assert directory.lookup.await_args.kwargs == {"credential_authority": authority}
+        items = await db.items(view.id)
+        if revoke_at == "materialization":
+            assert all(item.run_id is None and item.state == "failed" and item.error_code == "api_key_unauthorized"
+                       for item in items)
+        else:
+            for item, original in zip(items, frozen, strict=True):
+                async with db.factory() as session:
+                    run = await session.get(ChatRun, item.run_id)
+                    assert run.capability_snapshot == original.capability_snapshot
+                    assert run.capability_snapshot["credential_authority"] == authority
+                    assert _payload(run)["_credential_authority"] == authority
+                    assert set(_payload(run)["required_scopes"]) == set(item.required_scopes)
+            item = items[0]
+            claimed = await db.claim(item.run_id)
+            assert claimed is not None
+            directory.granted.remove(leaf)
+            before = directory.lookup.await_count
+            with pytest.raises(ApiKeyForbidden if operation in {"chat.completions", "responses"}
+                               else MediaAuthorizationRevoked):
+                if operation in {"chat.completions", "responses"}:
+                    await api_completion._segment_start(item.run_id, owner=claimed.lease_owner, operation=operation,
+                        required_scopes=tuple(item.required_scopes), bound=Decimal(claimed.pricing_snapshot["bound_credits"]))
+                elif operation == "audio.speech":
+                    await audio._start(item.run_id, owner=claimed.lease_owner, kind="tts",
+                                       bound=Decimal(claimed.pricing_snapshot["bound_credits"]))
+                else:
+                    await images._image_segment_start(item.run_id, owner=claimed.lease_owner, bound=Decimal("1"))
+            assert directory.lookup.await_count - before == 1
+            assert directory.lookup.await_args.kwargs == {"credential_authority": authority}
+            async with db.factory() as session:
+                run = await session.get(ChatRun, item.run_id)
+                assert run.provider_started_at is None and run.reserved_credits == 0
+                assert await session.scalar(select(func.count()).select_from(ChatModelCallReservation).where(
+                    ChatModelCallReservation.run_id == item.run_id)) == 0
+                assert await session.scalar(select(func.count()).select_from(ChatRunSegment).where(
+                    ChatRunSegment.run_id == item.run_id, ChatRunSegment.status == "provider_started")) == 0
+    # The owner still has raw system-admin. Only the reduced credential lost the
+    # operation leaf; falling back to the owner would incorrectly authorize I/O.
+    assert (await resolve_project_authority(db.user_id, db.project_id))["is_system_admin"] is True
+    reduced = await resolve_project_authority(db.user_id, db.project_id, credential_authority=authority)
+    assert reduced["is_system_admin"] is False
+    revoked_role = {"chat-id": "lumen-chat_user", "images-id": "lumen-images_user", "audio-id": "lumen-audio_user"}[leaf]
+    assert revoked_role not in reduced["roles"]
+
+
+async def test_native_idempotency_cannot_erase_or_replace_reduced_provenance(batch_db, reduced_batch_directory):
+    db, directory = batch_db, reduced_batch_directory
+    kwargs = dict(project_id=db.project_id, user_id=db.user_id, api_key_id=None, scopes=None, source="web",
+                  idempotency_key="original-ceiling", request=db.native())
+    view, created = await batches.create_native_batch(**kwargs, credential_authority=directory.authority)
+    assert created
+    replay, created = await batches.create_native_batch(**kwargs, credential_authority=directory.authority)
+    assert replay.id == view.id and not created
+    for replacement in (None, {**directory.authority, "issued_role_ids": ["member-id", "images-id"]}):
+        with pytest.raises(batches.BatchConflict, match="idempotency key reused"):
+            await batches.create_native_batch(**kwargs, credential_authority=replacement)
+    assert (await db.items(view.id))[0].capability_snapshot == {"credential_authority": directory.authority}
 
 
 async def test_duplicate_native_create_and_conflict(batch_db):
@@ -312,6 +483,29 @@ async def test_validation_resolves_owner_authority_once_per_chunk(batch_db, curr
         assert all(item.run_id is None for item in await db.items(view.id))
 
 
+async def test_materialization_resolves_authority_without_holding_batch_locks(batch_db, current_project_authority):
+    # Directory latency must not extend the locked, deadlock-retried materialization transaction.
+    db = batch_db
+    view, _ = await db.create(2)
+    granted = current_project_authority.return_value
+    lock_probes = []
+
+    async def probe_then_grant(*_args):
+        async with db.factory() as session, session.begin():
+            try:
+                await session.execute(text("SELECT id FROM chat_batches WHERE id = :id FOR UPDATE NOWAIT"),
+                                      {"id": view.id})
+                lock_probes.append("free")
+            except OperationalError:
+                lock_probes.append("locked")
+        return granted
+
+    current_project_authority.side_effect = probe_then_grant
+    await db.tick(3)
+    assert lock_probes and set(lock_probes) == {"free"}
+    assert sum(item.run_id is not None for item in await db.items(view.id)) == 2
+
+
 async def test_expiry_of_never_started_items(batch_db):
     db = batch_db
     view, _ = await db.create(3)
@@ -397,7 +591,6 @@ async def test_cancel_grace_freezes_unknown_without_releasing_hold(batch_db):
 ])
 async def test_batch_image_executor_refusal_is_single_call_and_preserves_accounting(
         batch_db, monkeypatch, status, hold_status, error_code):
-    from lumen.services.durable_runs.common import _payload
     from lumen.services.providers import image_transport
 
     db = batch_db

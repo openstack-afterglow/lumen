@@ -14,7 +14,7 @@ from lumen.models.batch_contracts import NativeBatchCreateRequest
 from lumen.models.chat_batches import ChatBatchItem
 from lumen.services import batches
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
-from lumen.services.durable_runs import api_completion
+from lumen.services.durable_runs import api_completion, audio, images
 
 pytestmark = pytest.mark.usefixtures("current_project_authority")
 
@@ -128,17 +128,30 @@ async def test_native_create_rejects_missing_item_scope_immediately(monkeypatch)
     assert error.value.code == "missing_scope"
 
 
-def test_prepared_payload_round_trip_uses_frozen_snapshots_not_reresolution():
+@pytest.mark.parametrize(("operation", "prepared_type", "persist"), [
+    ("chat.completions", api_completion.PreparedApiCompletion, api_completion.persist_api_completion_run_in_transaction),
+    ("responses", api_completion.PreparedApiCompletion, api_completion.persist_api_completion_run_in_transaction),
+    ("images.generations", images.PreparedImageRun, images.persist_image_run_in_transaction),
+    ("images.edits", images.PreparedImageRun, images.persist_image_run_in_transaction),
+    ("audio.speech", audio.PreparedAudioRun, audio.persist_audio_run_in_transaction),
+    ("audio.transcriptions", audio.PreparedAudioRun, audio.persist_audio_run_in_transaction),
+])
+def test_prepared_payload_round_trip_uses_frozen_snapshots_not_reresolution(operation, prepared_type, persist):
     batch = SimpleNamespace(project_id="p", user_id="u")
-    item = ChatBatchItem(operation="responses", request_ciphertext=batches._seal({"operation": "responses", "model": "fixture"}),
-        capability_snapshot={"version": "frozen"}, pricing_snapshot={"rate": "0.25"}, required_scopes=["compat:completions:write"])
-    prepared, persist = batches._prepared(batch, item)
-    assert isinstance(prepared, api_completion.PreparedApiCompletion)
-    assert prepared.payload == {"operation": "responses", "model": "fixture"}
+    authority = {"credential_restricted": True, "user_id": "u", "source_project_id": "p",
+                 "source_system_scope": "", "issued_role_ids": ["member-id", "batch-leaf-id"]}
+    snapshot = {"version": "frozen", "credential_authority": authority}
+    item = ChatBatchItem(operation=operation,
+        request_ciphertext=batches._seal({"operation": operation, "model": "fixture"}),
+        capability_snapshot=snapshot, pricing_snapshot={"rate": "0.25"},
+        required_scopes=["native:batches:write", "compat:completions:write"])
+    prepared, actual_persist = batches._prepared(batch, item)
+    assert isinstance(prepared, prepared_type)
+    assert prepared.payload == {"operation": operation, "model": "fixture"}
     assert prepared.pricing_snapshot == {"rate": "0.25"}
-    assert prepared.capability_snapshot == {"version": "frozen"}
-    assert prepared.required_scopes == ("compat:completions:write",)
-    assert persist is api_completion.persist_api_completion_run_in_transaction
+    assert prepared.capability_snapshot == snapshot
+    assert prepared.required_scopes == ("native:batches:write", "compat:completions:write")
+    assert actual_persist is persist
     assert "fixture" not in item.request_ciphertext
 
 
@@ -175,6 +188,48 @@ async def test_current_key_authorization_never_falls_back_to_keystone(monkeypatc
     check.side_effect = ApiKeyAuthorityUnavailable("directory down")
     with pytest.raises(batches.BatchUnavailable):
         await batches._authority(batch)
+
+
+@pytest.mark.parametrize("operation", ["chat.completions", "responses"])
+async def test_text_preparation_retains_trusted_ceiling_not_body_metadata(monkeypatch, operation):
+    batch = SimpleNamespace(project_id="p", user_id="u", api_key_id=None, contract="native")
+    authority = {"credential_restricted": True, "user_id": "u", "source_project_id": "p",
+                 "source_system_scope": "", "issued_role_ids": ["member-id", "chat-id"]}
+    body = {"model": "fixture", **({"input": "hi"} if operation == "responses" else {
+        "messages": [{"role": "user", "content": "hi"}],
+        "credential_authority": {"issued_role_ids": ["admin-id"]},
+        "_credential_authority": {"issued_role_ids": ["admin-id"]}})}
+    original = api_completion.PreparedApiCompletion(payload={"operation": operation},
+        capability_snapshot={"operation": operation}, pricing_snapshot={},
+        required_scopes=batches._scopes(operation, "native", body), project_id="p", user_id="u")
+    prepare = AsyncMock(return_value=original)
+    monkeypatch.setattr(api_completion, "prepare_api_completion_run", prepare)
+    prepared = await batches._prepare(batch, operation, body, frozenset(original.required_scopes), authority)
+    assert prepared.capability_snapshot["credential_authority"] == authority
+    assert prepared.payload["_credential_authority"] == authority
+    assert "credential_authority" not in original.capability_snapshot
+    authority["issued_role_ids"].append("later-id")
+    assert prepared.capability_snapshot["credential_authority"]["issued_role_ids"] == ["member-id", "chat-id"]
+    assert prepared.payload["_credential_authority"]["issued_role_ids"] == ["member-id", "chat-id"]
+
+
+async def test_native_chunk_authority_forwards_original_ceiling(monkeypatch):
+    class Session:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(batches, "_factory", lambda: Session)
+    authority = {"credential_restricted": True, "user_id": "u", "source_project_id": "p",
+                 "source_system_scope": "", "issued_role_ids": ["member-id", "images-id"]}
+    check = AsyncMock(return_value=frozenset({"native:images:write", "native:batches:write"}))
+    monkeypatch.setattr(batches, "current_api_key_scopes", check)
+    batch = SimpleNamespace(project_id="p", user_id="u", api_key_id=None, contract="native")
+    assert await batches._authority(batch, authority) == check.return_value
+    assert check.await_count == 1
+    assert check.await_args.kwargs == {"api_key_id": None, "user_id": "u", "project_id": "p",
+                                      "credential_authority": authority}
 
 
 async def test_result_jsonl_routes_success_http_failure_and_unknown(monkeypatch):

@@ -34,6 +34,8 @@ from lumen.services.extensions_store import (
     ExtensionNotFound,
     ExtensionSecretUnavailable,
     _clean_oauth_scopes,
+    _mcp_effectively_active,
+    _owner_activations,
 )
 
 logger = logging.getLogger(__name__)
@@ -223,6 +225,8 @@ class SqlMcpConnectionStore(McpConnectionStore):
                     request.completed_at = _now()
                 expired_or_used = True
             else:
+                # Only unrestricted human start may create this owner-only state.
+                # Pre-cutover states require expiry/reapproval, not provenance inference.
                 # Callback credentials are the persisted browser-bound state, not
                 # request headers. Revalidate that owner's current management
                 # authority before the plugin can exchange any authorization code.
@@ -324,6 +328,7 @@ class SqlMcpConnectionStore(McpConnectionStore):
             )).scalars().all()
             if not rows:
                 return ()
+            activations = await _owner_activations(session, namespace.user_id, namespace.project_id)
             servers = {
                 server.id: server for server in (
                     await session.execute(select(ChatMcpServer).where(
@@ -335,6 +340,7 @@ class SqlMcpConnectionStore(McpConnectionStore):
                 _connection(row)
                 for row in rows
                 if _oauth_configuration_matches(servers.get(row.mcp_server_id), row.server_config_version)
+                and _mcp_effectively_active(servers[row.mcp_server_id], activations.get(row.mcp_server_id))
             )
 
     async def disconnect(self, server_id: int, namespace: Namespace) -> None:
@@ -357,6 +363,9 @@ class SqlMcpConnectionStore(McpConnectionStore):
                 raise McpOAuthError("OAuth connection is no longer active")
             if not _oauth_configuration_matches(server, row.server_config_version):
                 raise McpOAuthError("OAuth connection configuration changed")
+            activations = await _owner_activations(session, row.owner_user_id, row.owner_project_id)
+            if not _mcp_effectively_active(server, activations.get(row.mcp_server_id)):
+                raise McpOAuthError("MCP activation was disabled or changed")
             yield _RefreshLease(row)
 
 

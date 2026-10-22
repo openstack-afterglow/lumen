@@ -2,135 +2,122 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 from types import SimpleNamespace
 
 import httpx
-import litellm
 import pytest
-from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 
 from lumen.config import get_settings
-from lumen.services import api_key_store, completion_api, credit, litellm_client
+from lumen.services import api_key_store, completion_api, credit, provider_client, provider_errors, provider_metadata
 from lumen.services.durable_runs import api_completion, execution
 from lumen.services.durable_runs.errors import DurableRunInputError
 from lumen.services.providers.errors import ProviderSubscriptionError
 
 pytestmark = pytest.mark.usefixtures("current_project_authority")
-_URL = "https://provider.test/v1/responses"
+_RUNTIME = "http://127.0.0.1:18643"
 
 
-def _disconnecting_handler(base: type | None, calls: list[str]) -> AsyncHTTPHandler:
-    def disconnect(request: httpx.Request) -> httpx.Response:
-        calls.append(str(request.url))
-        raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+def _runtime(monkeypatch, handler):
+    async def ready():
+        return _RUNTIME, "internal-token"
 
-    handler = litellm_client.single_attempt_http_handler() if base is None else base()
-    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(disconnect))
-    return handler
+    monkeypatch.setattr(provider_client, "get_bifrost_runtime", ready)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(handler))
 
 
-async def test_stock_litellm_handler_resends_a_post_after_a_disconnect():
-    calls: list[str] = []
-    handler = _disconnecting_handler(AsyncHTTPHandler, calls)
-    # The stock handler opens a second connection for the same POST; the test
-    # network guard intercepts that duplicate provider request.
-    with pytest.raises(AssertionError, match="unmocked outbound HTTP"):
-        await handler.post(_URL, json={"input": "hello"})
-    assert calls == [_URL]
-    await handler.close()
+@pytest.mark.parametrize("operation", ["chat", "responses"])
+@pytest.mark.parametrize("outcome", ["disconnect", "timeout", 400, 429, 503])
+async def test_durable_provider_attempt_never_resends(monkeypatch, operation, outcome):
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        if outcome == "disconnect":
+            raise httpx.RemoteProtocolError("ambiguous disconnect", request=request)
+        if outcome == "timeout":
+            raise httpx.ReadTimeout("ambiguous timeout", request=request)
+        return httpx.Response(outcome, headers={"X-Lumen-Bifrost-Contract": "single-attempt-v1"},
+            json={"error": {"code": "upstream_rejected", "message": "upstream-private-secret"}})
+
+    _runtime(monkeypatch, handle)
+    expected = {
+        "disconnect": provider_errors.APIConnectionError,
+        "timeout": provider_errors.Timeout,
+        400: provider_errors.BadRequestError,
+        429: provider_errors.RateLimitError,
+        503: provider_errors.InternalServerError,
+    }[outcome]
+    with pytest.raises(expected) as failure:
+        if operation == "chat":
+            await provider_client.acompletion("model-x", [{"role": "user", "content": "hi"}],
+                api_key="request-key", custom_llm_provider="openai", provider_once=True)
+        else:
+            await provider_client.aresponses(model="model-x", input="hi", stream=False,
+                api_base=None, api_key="request-key", custom_llm_provider="openai", provider_auth=None,
+                provider_once=True)
+    assert len(calls) == 1
+    assert str(calls[0].url) == f"{_RUNTIME}/v1/execute"
+    assert json.loads(calls[0].content)["single_attempt"] is True
+    assert "upstream-private-secret" not in str(failure.value)
+    assert failure.value.known_rejection is (outcome in {400, 429})
 
 
-async def test_single_attempt_handler_surfaces_a_disconnect_without_resending():
-    calls: list[str] = []
-    handler = _disconnecting_handler(None, calls)
-    with pytest.raises(httpx.RemoteProtocolError):
-        await handler.post(_URL, json={"input": "hello"})
-    assert calls == [_URL]
-    await handler.close()
+@pytest.mark.parametrize("provider,api_base", [
+    ("openai", None), ("openai", "https://gateway.internal/v1"),
+    ("anthropic", None), ("gemini", None), ("perplexity", None),
+])
+@pytest.mark.parametrize("provider_once", [False, True])
+async def test_online_and_durable_calls_use_the_same_single_attempt_contract(monkeypatch, provider, api_base, provider_once):
+    calls = []
+
+    def handle(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, headers={"X-Lumen-Bifrost-Contract": "single-attempt-v1"},
+            json={"choices": [{"message": {"content": "accepted"}, "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 2, "completion_tokens": 1}})
+
+    _runtime(monkeypatch, handle)
+    result = await provider_client.acompletion("model-x", [{"role": "user", "content": "hi"}],
+        api_base=api_base, api_key="request-key", custom_llm_provider=provider, provider_once=provider_once)
+    assert len(calls) == 1
+    assert calls[0]["single_attempt"] is True
+    assert calls[0]["provider"] == provider and calls[0]["api_base"] == api_base
+    assert result.choices[0].message.content == "accepted"
+    assert result.usage.prompt_tokens == 2
 
 
-@pytest.mark.parametrize(
-    ("provider_type", "api_base", "expects_handler"),
-    [
-        ("openai", "https://gateway.internal/v1", False),
-        ("openai", None, True),
-        ("anthropic", None, True),
-        ("gemini", None, True),
-    ],
-)
-async def test_provider_once_chat_disables_every_retry_layer(monkeypatch, provider_type, api_base, expects_handler):
-    seen: list[dict] = []
+@pytest.mark.parametrize("provider_type", ["chatgpt", "unknown-provider"])
+async def test_provider_once_refuses_unproven_adapters_before_io(monkeypatch, provider_type):
+    def forbidden(request):
+        pytest.fail("unsupported route reached transport")
 
-    async def fake_acompletion(**kwargs):
-        seen.append(kwargs)
-        return SimpleNamespace(choices=[])
-
-    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
-    await litellm_client.acompletion(
-        "model-x", [{"role": "user", "content": "hi"}], api_base=api_base, api_key="k",
-        custom_llm_provider=provider_type, max_tokens=16, provider_once=True,
-    )
-    [kwargs] = seen
-    assert kwargs["num_retries"] == 0 and kwargs["max_retries"] == 0
-    assert ("client" in kwargs) is expects_handler
-    if expects_handler:
-        assert type(kwargs["client"]).single_connection_post_request is not AsyncHTTPHandler.single_connection_post_request
-
-
-async def test_online_chat_call_keeps_litellm_defaults(monkeypatch):
-    seen: list[dict] = []
-
-    async def fake_acompletion(**kwargs):
-        seen.append(kwargs)
-        return SimpleNamespace(choices=[])
-
-    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
-    await litellm_client.acompletion("model-x", [{"role": "user", "content": "hi"}], custom_llm_provider="anthropic")
-    assert not {"num_retries", "max_retries", "client"} & set(seen[0])
-
-
-@pytest.mark.parametrize("provider_type", ["deepseek", "perplexity", "openrouter", None])
-async def test_provider_once_refuses_adapters_without_a_single_attempt_proof(monkeypatch, provider_type):
-    async def forbidden(**_kwargs):
-        raise AssertionError("provider must not be called")
-
-    monkeypatch.setattr(litellm, "acompletion", forbidden)
+    _runtime(monkeypatch, forbidden)
     with pytest.raises(ValueError, match="provider_once_unsupported"):
-        await litellm_client.acompletion(
-            "model-x", [{"role": "user", "content": "hi"}], api_key="k",
-            custom_llm_provider=provider_type, provider_once=True,
-        )
+        await provider_client.acompletion("model-x", [], custom_llm_provider=provider_type, provider_once=True)
 
 
-async def test_provider_once_responses_uses_a_single_attempt_client(monkeypatch):
-    seen: list[dict] = []
+async def test_provider_once_refuses_streaming_responses_before_io(monkeypatch):
+    def forbidden(request):
+        pytest.fail("durable streaming route reached transport")
 
-    async def fake_aresponses(**kwargs):
-        seen.append(kwargs)
-        return {"output": []}
-
-    monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
-    await litellm_client.aresponses(
-        model="model-x", input="hi", stream=False, api_base="https://gateway.internal/v1", api_key="k",
-        custom_llm_provider="openai", provider_auth=None, provider_once=True,
-    )
-    assert seen[0]["num_retries"] == 0 and seen[0]["max_retries"] == 0 and "client" in seen[0]
+    _runtime(monkeypatch, forbidden)
     with pytest.raises(ValueError, match="provider_once_unsupported"):
-        await litellm_client.aresponses(
-            model="model-x", input="hi", stream=True, api_base=None, api_key="k",
-            custom_llm_provider="openai", provider_auth=None, provider_once=True,
-        )
-    assert len(seen) == 1
+        await provider_client.aresponses(model="model-x", input="hi", stream=True, api_base=None,
+            api_key="request-key", custom_llm_provider="openai", provider_auth=None, provider_once=True)
 
 
 def _route(**overrides) -> dict:
     route = {
         "model_name": "gpt-test", "api_model_name": "gpt-test", "api_provider": "openai", "provider_type": "openai",
         "provider_id": 1, "model_id": 2, "provider_name": "OpenAI", "model_kind": "text",
-        "config_version_hash": "hash", "api_base": None, "api_key": "k", "provider_auth": None,
+        "config_version_hash": "hash", "api_base": None, "api_key": None,
+        "provider_account_id": 11, "provider_credential_id": 12, "provider_credential_generation": 3,
+        "provider_auth": {"provider_id": 1, "account_id": 11, "credential_id": 12, "generation": 3,
+                          "auth_mode": "api_key", "model_id": 2, "required_capabilities": []},
         "input_price_per_token": Decimal("0.000001"), "output_price_per_token": Decimal("0.000002"),
         "margin_multiplier": Decimal("1"), "capabilities": {"context_limit": 1000}, "cache_price_sources": {},
         "price_source": "manual", "price_version": None,
@@ -143,13 +130,13 @@ def _route(**overrides) -> dict:
 def route_catalog(monkeypatch):
     catalog = {"route": _route(), "tokens": 10}
 
-    async def resolve_api(model, *, provider=None):
+    async def resolve_api(model, *, provider=None, operation="chat"):
         return dict(catalog["route"])
 
     monkeypatch.setattr(completion_api, "resolve_api", resolve_api)
     monkeypatch.setattr(
-        litellm_client, "count_context_tokens",
-        lambda *_args, **_kwargs: litellm_client.ContextTokenCount(tokens=catalog["tokens"], measurement="tokenizer"),
+        provider_metadata, "count_context_tokens",
+        lambda *_args, **_kwargs: provider_metadata.ContextTokenCount(tokens=catalog["tokens"], measurement="tokenizer"),
     )
     return catalog
 
@@ -168,6 +155,12 @@ async def test_chat_admission_freezes_default_output_and_worst_case_bound(route_
     assert Decimal(prepared.pricing_snapshot["bound_credits"]) == expected
     assert prepared.required_scopes == ("compat:completions:write",)
     assert prepared.capability_snapshot["operation"] == "chat.completions"
+    assert prepared.capability_snapshot["provider_account_id"] == 11
+    assert prepared.capability_snapshot["provider_credential_id"] == 12
+    assert prepared.capability_snapshot["provider_credential_generation"] == 3
+    assert "api_key" not in prepared.capability_snapshot
+    route_catalog["route"]["provider_auth"]["generation"] = 99
+    assert prepared.capability_snapshot["provider_auth"]["generation"] == 3
 
 
 async def test_responses_admission_sends_the_frozen_output_budget(route_catalog):
@@ -187,7 +180,7 @@ async def test_responses_admission_sends_the_frozen_output_budget(route_catalog)
         ("chat.completions", {"tools": [{"type": "web_search"}]}, {}, 10, "provider_builtin_tool_unsupported"),
         ("chat.completions", {}, {"capabilities": {}}, 10, "context_window_unknown"),
         ("chat.completions", {}, {"output_price_per_token": None}, 10, "pricing_unavailable"),
-        ("chat.completions", {}, {"provider_type": "deepseek"}, 10, "provider_once_unsupported"),
+        ("chat.completions", {}, {"provider_type": "chatgpt"}, 10, "provider_once_unsupported"),
         ("chat.completions", {}, {}, 1001, "context_length_exceeded"),
         ("chat.completions", {"model": "lumen"}, {}, 10, "virtual_model_unsupported"),
         ("responses", {"context_management": [{"type": "compaction"}]}, {}, 10, "provider_compaction_unsupported"),
@@ -387,7 +380,7 @@ async def test_successful_call_checkpoints_the_wire_envelope_before_settlement(e
 
 
 async def test_confirmed_provider_rejection_releases_through_settlement(executor):
-    executor["invoke"] = litellm.BadRequestError(message="bad", model="gpt-test", llm_provider="openai")
+    executor["invoke"] = provider_errors.BadRequestError()
     executor["settle"] = "rejected"
     await _run_executor()
     [(result, usage)] = executor["checkpoints"]
@@ -399,9 +392,9 @@ async def test_confirmed_provider_rejection_releases_through_settlement(executor
 @pytest.mark.parametrize(
     "failure",
     [
-        litellm.Timeout(message="slow", model="gpt-test", llm_provider="openai"),
-        litellm.APIConnectionError(message="reset", llm_provider="openai", model="gpt-test"),
-        litellm.InternalServerError(message="boom", llm_provider="openai", model="gpt-test"),
+        provider_errors.Timeout(),
+        provider_errors.APIConnectionError(),
+        provider_errors.InternalServerError(),
         ProviderSubscriptionError("subscription_upstream_unavailable", 503),
         httpx.RemoteProtocolError("Server disconnected"),
     ],

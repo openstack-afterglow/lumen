@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
-from lumen.auth import Principal, ensure_scopes, get_principal, require_scopes
+from lumen.auth import Principal, credential_authority_snapshot, ensure_scopes, get_principal, require_scopes
 from lumen.config import get_settings
 from lumen.models.chat_contracts import (
     AgentBudget,
@@ -159,6 +159,7 @@ async def create_completion(
             "client_timezone": payload.client_timezone,
         }
         intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+        intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
             user_id=user_id,
@@ -311,6 +312,7 @@ async def regenerate_message(
         "reasoning_effort": payload.reasoning_effort,
     }
     intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
     try:
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
@@ -415,6 +417,7 @@ async def retry_failed_run(
         "source_run_id": run_id,
     }
     intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
     try:
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
@@ -632,6 +635,7 @@ async def temp_completion(
         "code_workspace_id": payload.code_workspace_id,
     }
     intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
     try:
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
@@ -869,6 +873,7 @@ async def compact_conversation(
         "expected_context_revision": payload.expected_context_revision,
     }
     intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
     try:
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
@@ -940,7 +945,7 @@ async def compact_conversation(
     if not state.can_compact:
         raise HTTPException(status_code=422, detail="nothing_to_compact")
 
-    from lumen.services.litellm_client import count_context_tokens
+    from lumen.services.provider_metadata import count_context_tokens
 
     retained, _older = context_manager._required_messages(planned["input_messages"])
     retained_count = count_context_tokens(resolved["model_name"], retained, planned["tool_schemas"]).tokens
@@ -1009,6 +1014,7 @@ async def compact_temp_thread(
         "expected_context_revision": payload.expected_context_revision,
     }
     intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
     try:
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
@@ -1080,7 +1086,7 @@ async def compact_temp_thread(
     if not state.can_compact:
         raise HTTPException(status_code=422, detail="nothing_to_compact")
 
-    from lumen.services.litellm_client import count_context_tokens
+    from lumen.services.provider_metadata import count_context_tokens
 
     retained, _older = context_manager._required_messages(planned["input_messages"])
     retained_count = count_context_tokens(resolved["model_name"], retained, planned["tool_schemas"]).tokens

@@ -63,6 +63,19 @@ class HealthResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from lumen.services.bifrost_runtime import close_bifrost_runtime
+
+    try:
+        async with _service_lifespan(app):
+            yield
+    finally:
+        # Uvicorn has drained HTTP/SSE before lifespan exit; service cleanup
+        # below completes before the private provider child receives SIGTERM.
+        await close_bifrost_runtime()
+
+
+@asynccontextmanager
+async def _service_lifespan(app: FastAPI):
     configure_logging("api")
     settings = get_settings()
     registry = get_registry()
@@ -79,6 +92,9 @@ async def lifespan(app: FastAPI):
             unhealthy_seconds=settings.database_unhealthy_seconds,
         )
     await registry.start(build_host())
+    from lumen.services.bifrost_runtime import start_bifrost_runtime
+
+    await start_bifrost_runtime()
 
     if settings.chat_checkpointer_postgres_url:
         from lumen.services.checkpointer import chat_checkpointer
@@ -324,6 +340,7 @@ from lumen.api import (
     claude_gateway,
 )
 from lumen.api import plugins as plugin_routes
+from lumen.api import policy as policy_routes
 from lumen.api.compat import anthropic as compat_anthropic
 from lumen.api.compat import audio as compat_audio
 from lumen.api.compat import batches as compat_batches
@@ -337,6 +354,7 @@ from lumen.auth import require_chat_api_host
 
 # Chat routers already declare their complete route paths. Mount once at `/v1`
 # so the SDK and Afterglow BFF preserve the public contract exactly.
+app.include_router(policy_routes.router, prefix="/v1", tags=["Policy"])
 app.include_router(plugin_routes.admin_router, prefix="/v1", tags=["Plugin Administration"])
 app.include_router(plugin_routes.router, prefix="/v1", tags=["Plugin Catalogue"])
 app.include_router(agent_runtime_routes.admin_router, prefix="/v1", tags=["Agent Runtime Administration"])

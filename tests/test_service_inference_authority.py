@@ -1,4 +1,6 @@
 """Synthetic HTTP and pre-I/O fences; no Keystone, provider, DB, or worker credentials."""
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -178,8 +180,9 @@ async def test_revoked_key_denied_before_new_io(monkeypatch):
 
 @pytest.mark.parametrize("state", ["prepared", "completed", "provider_started"])
 async def test_durable_authority_only_checked_for_new_io(monkeypatch, state):
+    metadata = reduced_authority()
     run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, agent_id=None,
-                          capability_snapshot={})
+                          capability_snapshot={"credential_authority": metadata})
     segment = SimpleNamespace(status=state, result_payload="{}", usage_payload="{}")
     monkeypatch.setattr(execution, "_factory", lambda: lambda: Session(run))
     monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *args: None)
@@ -195,6 +198,7 @@ async def test_durable_authority_only_checked_for_new_io(monkeypatch, state):
             await hooks._start(segment_id="tool:1", ordinal=1, endpoint="tool", turn_ordinal=1, call_id="call")
         authorization.assert_awaited_once()
         assert "native:tools:execute" in authorization.await_args.kwargs["required_scopes"]
+        assert authorization.await_args.kwargs["credential_authority"] == metadata
     else:
         await hooks._start(segment_id="tool:1", ordinal=1, endpoint="tool", turn_ordinal=1, call_id="call")
         authorization.assert_not_awaited()
@@ -301,7 +305,7 @@ async def test_automatic_title_fence_checks_root_owner_and_key_before_new_io(mon
     from lumen.services import title_jobs
     job = SimpleNamespace(status="running", lease_owner="worker", run_id="run", conversation_id="conv", progress={})
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7 if cause == "revoked" else None,
-                          source="web", run_scope="persistent", conversation_id="conv")
+                          source="web", run_scope="persistent", conversation_id="conv", capability_snapshot={})
     class JobSession(Session):
         async def get(self, model, key, **kwargs):
             return job if model is ChatJob else run
@@ -334,7 +338,7 @@ async def test_title_completed_result_replay_does_not_reauthorize_or_invoke(monk
 async def test_automatic_memory_generation_denies_current_downgraded_owner(monkeypatch, cause):
     from lumen.services import memory_extract
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7 if cause == "revoked" else None,
-                          source="web", run_scope="persistent")
+                          source="web", run_scope="persistent", capability_snapshot={})
     class RunSession(Session):
         async def get(self, *args, **kwargs):
             return run
@@ -348,7 +352,7 @@ async def test_automatic_memory_generation_denies_current_downgraded_owner(monke
     monkeypatch.setattr(memory_extract.ms, "list_memories", AsyncMock(return_value=[]))
     monkeypatch.setattr(memory_extract.cs, "list_messages_for_run", AsyncMock(return_value=[{"role": "user", "content": "remember"}]))
     provider = AsyncMock(side_effect=AssertionError("memory provider started after downgrade"))
-    monkeypatch.setattr(memory_extract.litellm_client, "acompletion", provider)
+    monkeypatch.setattr(memory_extract.provider_client, "acompletion", provider)
     assert await memory_extract.generate_memory_if_applicable(conversation_id="conv", project_id="project", run_id="run", user_id="owner") is None
     provider.assert_not_awaited()
 
@@ -368,7 +372,7 @@ async def test_auxiliary_model_uses_its_own_intrinsic_capability(monkeypatch, re
     roles = ["member", "lumen-chat_user", "lumen-history_reader", *(["lumen-tools_user"] if tools else [])]
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={"roles": roles, "is_system_admin": False}))
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=None, source="web",
-                          run_scope="persistent", conversation_id="conv")
+                          run_scope="persistent", conversation_id="conv", capability_snapshot={})
     resolved = {"capabilities": {"web_search_required": required}}
     if required and not tools:
         with pytest.raises(api_key_store.ApiKeyForbidden):
@@ -383,7 +387,7 @@ async def test_auxiliary_intrinsic_search_preserves_key_scope_attenuation(monkey
     key = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True, revoked_at=None,
                           expires_at=None, scopes=["native:runs:write", "native:conversations:read"])
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7, source="api",
-                          run_scope="persistent", conversation_id="conv")
+                          run_scope="persistent", conversation_id="conv", capability_snapshot={})
     with pytest.raises(api_key_store.ApiKeyForbidden):
         await inference_authority.authorize_run_generation(Session(key), run,
             resolved={"capabilities": {"web_search_required": True}})
@@ -401,7 +405,7 @@ async def test_denied_intrinsic_title_terminalizes_only_title_not_completed_chat
                           progress={}, payload="synthetic encrypted payload")
     conversation = SimpleNamespace(title_revision=1, title_status="pending", title=None)
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=None, source="web",
-                          run_scope="persistent", conversation_id="conv", status="completed")
+                          run_scope="persistent", conversation_id="conv", status="completed", capability_snapshot={})
     class JobSession(Session):
         async def get(self, model, key, **kwargs):
             return job if model is ChatJob else conversation if model is ChatConversation else run
@@ -425,7 +429,7 @@ async def test_denied_intrinsic_memory_completes_optional_job_without_mutating_c
     from lumen.services import memory_extract, memory_jobs
 
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=None, source="web",
-                          run_scope="persistent", conversation_id="conv", status="completed")
+                          run_scope="persistent", conversation_id="conv", status="completed", capability_snapshot={})
     job = SimpleNamespace(status="running", lease_owner="worker")
     class MemorySession(Session):
         async def get(self, model, key, **kwargs):
@@ -444,7 +448,7 @@ async def test_denied_intrinsic_memory_completes_optional_job_without_mutating_c
     provider = AsyncMock(side_effect=AssertionError("intrinsic memory provider started without tools authority"))
     apply = AsyncMock(side_effect=AssertionError("denied extraction mutated stored memory"))
     retry = AsyncMock()
-    monkeypatch.setattr(memory_extract.litellm_client, "acompletion", provider)
+    monkeypatch.setattr(memory_extract.provider_client, "acompletion", provider)
     monkeypatch.setattr(memory_jobs.ms, "apply_automatic_ops_in_transaction", apply)
     monkeypatch.setattr(memory_jobs, "_retry", retry)
     assert await memory_jobs._process_claimed(("job", "run", "conv", "project", "owner"), owner="worker")
@@ -514,7 +518,7 @@ async def test_denied_automatic_intrinsic_compaction_preserves_safe_plain_chat_i
     authority = AsyncMock(return_value={"roles": ["member", "lumen-chat_user", "lumen-history_reader"], "is_system_admin": False})
     monkeypatch.setattr(auth, "resolve_project_authority", authority)
     provider = AsyncMock(side_effect=AssertionError("intrinsic summary provider started without tools authority"))
-    monkeypatch.setattr(execution.litellm_client, "acompletion", provider)
+    monkeypatch.setattr(execution.provider_client, "acompletion", provider)
     messages = [{"role": "user", "content": "accepted plain chat"}]
     result = await execution._DurableExecutionHooks(run_id="run", owner="worker").prepare_context(
         messages=messages, tool_schemas=[], round_index=0)
@@ -524,3 +528,289 @@ async def test_denied_automatic_intrinsic_compaction_preserves_safe_plain_chat_i
     provider.assert_not_awaited()
     authority.assert_awaited_once_with("owner", "project")
 
+
+
+async def test_queued_key_expiration_rejects_new_tool_intent_before_provider_start(monkeypatch):
+    roles = ["member", "lumen-chat_user", "lumen-tools_user"]
+    monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
+        "roles": roles, "is_system_admin": False}))
+    key = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True,
+                          revoked_at=None, expires_at=datetime.now(UTC) + timedelta(days=1),
+                          scopes=["native:runs:write", "native:tools:execute"])
+    # Key is valid when work is admitted, but expires while waiting for a worker.
+    await api_key_store.authorize_api_key_in_transaction(
+        Session(key), user_id="owner", project_id="project", api_key_id=7,
+        required_scopes=("native:runs:write", "native:tools:execute"))
+    key.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=7,
+                          agent_id=None, capability_snapshot={})
+    segment = SimpleNamespace(status="prepared")
+
+    class QueuedSession(Session):
+        async def execute(self, statement):
+            return SimpleNamespace(scalar_one=lambda: run, scalar_one_or_none=lambda: key)
+
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: QueuedSession(run))
+    monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *args: None)
+    monkeypatch.setattr(execution, "prepare_segment", AsyncMock(return_value=segment))
+    monkeypatch.setattr(execution, "_payload", lambda _: {"features": {"tool_policy": {"mode": "none"}}})
+    started = []
+    monkeypatch.setattr(execution, "begin_segment_io", lambda value: started.append(value))
+    hooks = execution._DurableExecutionHooks(run_id="run", owner="worker-authority")
+    with pytest.raises(DurableRunInputError, match="inference_authority_revoked"):
+        await hooks._start(segment_id="tool:1", ordinal=1, endpoint="tool", turn_ordinal=1, call_id="call")
+    assert segment.status == "prepared" and started == []
+
+
+def reduced_authority():
+    return {"credential_restricted": True, "user_id": "owner", "source_project_id": "project",
+            "source_system_scope": "", "issued_role_ids": ["member-id", "chat-id", "tools-id", "audio-id", "images-id", "history-id"]}
+
+
+def retained_admin_with_reduced_leaf(monkeypatch, metadata):
+    """Missing metadata deliberately gives the still-current owner's full admin authority."""
+    state = SimpleNamespace(revoked=False)
+
+    async def current(user_id, project_id, *, credential_authority=None):
+        assert (user_id, project_id) == ("owner", "project")
+        if credential_authority is None:
+            return {"roles": [], "is_system_admin": True}
+        assert credential_authority == metadata
+        return {"roles": ["member"] if state.revoked else ["member", "lumen-chat_user",
+            "lumen-tools_user", "lumen-audio_user", "lumen-images_user", "lumen-history_reader"],
+            "is_system_admin": False}
+
+    lookup = AsyncMock(side_effect=current)
+    monkeypatch.setattr(auth, "resolve_project_authority", lookup)
+    return state, lookup
+
+
+@pytest.mark.parametrize("by_id", [False, True])
+async def test_auxiliary_generation_retains_original_ceiling_at_shared_fresh_gate(monkeypatch, by_id):
+    metadata = reduced_authority()
+    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None,
+        source="web", run_scope="persistent", conversation_id="conv",
+        capability_snapshot={"credential_authority": metadata})
+    session = Session(None)
+    session.get = AsyncMock(return_value=run)
+    session.execute = AsyncMock(side_effect=AssertionError("web gate performed key SQL"))
+    monkeypatch.setattr(inference_authority, "get_session_factory", lambda: lambda: session)
+    provider = AsyncMock()
+
+    async def start():
+        if by_id:
+            await inference_authority.authorize_run_generation_by_id(run_id="run", user_id="owner", project_id="project")
+        else:
+            await inference_authority.authorize_run_generation(session, run)
+        await provider()
+
+    await start()
+    provider.assert_awaited_once_with()
+    provider.reset_mock()
+    state.revoked = True
+    with pytest.raises(api_key_store.ApiKeyForbidden):
+        await start()
+    lookup.assert_awaited_with("owner", "project", credential_authority=metadata)
+    provider.assert_not_awaited()
+    session.execute.assert_not_awaited()
+
+
+async def test_non_durable_tool_dispatch_preserves_ceiling_before_provider(monkeypatch):
+    from lumen.services.tool_runtime import dispatch
+    from lumen.services.tools import ToolContext
+
+    metadata = reduced_authority()
+    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=None,
+        capability_snapshot={"credential_authority": metadata})
+    session = Session(None)
+    session.get = AsyncMock(return_value=run)
+    session.execute = AsyncMock(side_effect=AssertionError("web tool gate performed key SQL"))
+    monkeypatch.setattr(inference_authority, "get_session_factory", lambda: lambda: session)
+    ctx = ToolContext(user_id="owner", project_id="project", run_id="run")
+    await inference_authority.authorize_tool_dispatch(ctx)
+    state.revoked = True
+    provider = AsyncMock(side_effect=AssertionError("MCP started after issued leaf revocation"))
+    monkeypatch.setattr(dispatch.mcp_client, "call_tool", provider)
+    with pytest.raises(api_key_store.ApiKeyForbidden):
+        await dispatch.context_execute_result("mcp__1__search", {}, ctx)
+    lookup.assert_awaited_with("owner", "project", credential_authority=metadata)
+    provider.assert_not_awaited()
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("kind", "scope"), [
+    ("image", "native:images:write"), ("tts", "native:audio:write"), ("stt", "native:audio:write"),
+])
+async def test_finite_media_fresh_gate_keeps_original_ceiling_before_source_or_hold(monkeypatch, kind, scope):
+    from lumen.services.durable_runs import media
+
+    metadata = reduced_authority()
+    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None,
+        run_kind=kind, model_name="synthetic", capability_snapshot={"credential_authority": metadata}, pricing_snapshot={})
+    monkeypatch.setattr("lumen.services.durable_runs.admission._lock_run_configurations", AsyncMock())
+    monkeypatch.setattr(media, "_payload", lambda _: {"required_scopes": [scope],
+        "source_asset_id": "source" if kind == "image" else None,
+        "input_asset_id": "source" if kind != "image" else None})
+    source = AsyncMock()
+    monkeypatch.setattr(media, "lock_media_source_in_transaction", source)
+    session = Session(None)
+    session.execute = AsyncMock(side_effect=AssertionError("denied media gate reached SQL"))
+    await media.validate_batch_media_io_in_transaction(session, run)
+    source.assert_awaited_once()
+    source.reset_mock()
+    state.revoked = True
+    with pytest.raises(media.MediaAuthorizationRevoked):
+        await media.validate_batch_media_io_in_transaction(session, run)
+    lookup.assert_awaited_with("owner", "project", credential_authority=metadata)
+    source.assert_not_awaited()
+    session.execute.assert_not_awaited()
+
+
+async def test_realtime_fresh_gate_retains_original_ceiling_before_hold_and_provider_start(monkeypatch):
+    from lumen.services.durable_runs import realtime
+
+    metadata = reduced_authority()
+    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, source="web",
+        lease_owner="worker", last_seq=0, capability_snapshot={"credential_authority": metadata},
+        pricing_snapshot={"bound_credits": "1"}, provider_started_at=None)
+    segment = SimpleNamespace(status="prepared")
+    session = Session(None)
+    session.flush = AsyncMock()
+    reservations = []
+    session.add = reservations.append
+    monkeypatch.setattr(realtime, "_factory", lambda: lambda: session)
+    monkeypatch.setattr(realtime, "claim_realtime_run", AsyncMock(return_value=run))
+    monkeypatch.setattr(realtime, "prepare_segment", AsyncMock(return_value=segment))
+    monkeypatch.setattr(realtime, "_payload", lambda _: {"required_scopes": ["native:realtime:write"]})
+    hold = AsyncMock()
+    monkeypatch.setattr(realtime.credit, "reserve_call_credit_in_transaction", hold)
+    monkeypatch.setattr(realtime, "append_event", AsyncMock())
+    starts = []
+    monkeypatch.setattr(realtime, "begin_segment_io", lambda value: starts.append(value))
+    await realtime._start("run", owner="worker", user_id="owner", project_id="project")
+    hold.assert_awaited_once()
+    assert starts == [segment] and run.provider_started_at is not None
+    assert len(reservations) == 1
+    hold.reset_mock()
+    starts.clear()
+    reservations.clear()
+    run.provider_started_at = None
+    state.revoked = True
+    with pytest.raises(DurableRunInputError, match="inference_authority_revoked"):
+        await realtime._start("run", owner="worker", user_id="owner", project_id="project")
+    lookup.assert_awaited_with("owner", "project", credential_authority=metadata)
+    hold.assert_not_awaited()
+    assert starts == [] and run.provider_started_at is None and segment.status == "prepared"
+    assert reservations == []
+
+
+@pytest.mark.parametrize("kind", ["image", "tts", "stt"])
+@pytest.mark.parametrize("segment_state", ["prepared", "completed", "provider_started"])
+async def test_finite_media_ceiling_fences_hold_but_not_committed_checkpoint(monkeypatch, kind, segment_state):
+    from lumen.services.durable_runs import audio as durable_audio
+    from lumen.services.durable_runs import images as durable_images
+    from lumen.services.durable_runs import media
+
+    module = durable_images if kind == "image" else durable_audio
+    metadata = reduced_authority()
+    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    scope = "native:images:write" if kind == "image" else "native:audio:write"
+    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, source="web",
+        run_kind=kind, model_name="synthetic", last_seq=0,
+        capability_snapshot={"credential_authority": metadata}, pricing_snapshot={"bound_credits": "1"},
+        provider_started_at=None)
+    segment = SimpleNamespace(status=segment_state)
+    session = Session(None)
+    session.flush = AsyncMock()
+    reservations = []
+    session.add = reservations.append
+    monkeypatch.setattr(module, "_factory", lambda: lambda: session)
+    monkeypatch.setattr(module, "lock_media_run_for_io", AsyncMock(return_value=(run, None)))
+    monkeypatch.setattr(module, "prepare_segment", AsyncMock(return_value=segment))
+    monkeypatch.setattr("lumen.services.durable_runs.admission._lock_run_configurations", AsyncMock())
+    monkeypatch.setattr(media, "_payload", lambda _: {"required_scopes": [scope]})
+    monkeypatch.setattr(module, "append_event", AsyncMock())
+    hold = AsyncMock()
+    monkeypatch.setattr(module.credit, "reserve_call_credit_in_transaction", hold)
+    starts = []
+    monkeypatch.setattr(module, "begin_segment_io", lambda value: starts.append(value))
+
+    async def start():
+        if kind == "image":
+            return await module._image_segment_start("run", owner="worker", bound=Decimal("1"))
+        return await module._start("run", owner="worker", bound=Decimal("1"), kind=kind)
+
+    if segment_state == "prepared":
+        assert await start() == "started"
+        hold.assert_awaited_once()
+        assert starts == [segment] and len(reservations) == 1
+        hold.reset_mock()
+        starts.clear()
+        reservations.clear()
+        run.provider_started_at = None
+        state.revoked = True
+        with pytest.raises(media.MediaAuthorizationRevoked):
+            await start()
+        lookup.assert_awaited_with("owner", "project", credential_authority=metadata)
+    else:
+        state.revoked = True
+        assert await start() == ("completed" if segment_state == "completed" else "unknown")
+        lookup.assert_not_awaited()
+    hold.assert_not_awaited()
+    assert starts == [] and reservations == [] and run.provider_started_at is None
+    assert segment.status == segment_state
+
+
+@pytest.mark.parametrize("segment_state", ["prepared", "completed", "provider_started"])
+async def test_api_generation_segment_keeps_ceiling_before_hold_without_reauthorizing_replay(monkeypatch, segment_state):
+    from lumen.services.durable_runs import api_completion
+
+    metadata = reduced_authority()
+    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, batch_id="batch",
+        model_name="synthetic", last_seq=0, cancel_requested_at=None, provider_started_at=None,
+        capability_snapshot={"credential_authority": metadata})
+    segment = SimpleNamespace(status=segment_state)
+    session = Session(run)
+    session.scalar = AsyncMock(return_value="batch")
+    session.flush = AsyncMock()
+    reservations = []
+    session.add = reservations.append
+    monkeypatch.setattr(api_completion, "_factory", lambda: lambda: session)
+    monkeypatch.setattr(api_completion, "_require_owned_running_lease", lambda *_args: None)
+    monkeypatch.setattr(api_completion.worker_routing, "lock_open_batch", AsyncMock(return_value=True))
+    monkeypatch.setattr(api_completion, "prepare_segment", AsyncMock(return_value=segment))
+    monkeypatch.setattr("lumen.services.durable_runs.admission._lock_run_configurations", AsyncMock())
+    monkeypatch.setattr(api_completion, "append_event", AsyncMock())
+    hold = AsyncMock()
+    monkeypatch.setattr(api_completion.credit, "reserve_call_credit_in_transaction", hold)
+    starts = []
+    monkeypatch.setattr(api_completion, "begin_segment_io", lambda value: starts.append(value))
+
+    async def start():
+        return await api_completion._segment_start("run", owner="worker", operation="chat.completions",
+            required_scopes=("compat:completions:write",), bound=Decimal("1"))
+
+    if segment_state == "prepared":
+        assert await start() == "started"
+        hold.assert_awaited_once()
+        assert starts == [segment] and len(reservations) == 1
+        hold.reset_mock()
+        starts.clear()
+        reservations.clear()
+        run.provider_started_at = None
+        state.revoked = True
+        with pytest.raises(api_key_store.ApiKeyForbidden):
+            await start()
+        lookup.assert_awaited_with("owner", "project", credential_authority=metadata)
+    else:
+        state.revoked = True
+        assert await start() == ("completed" if segment_state == "completed" else "unknown")
+        lookup.assert_not_awaited()
+    hold.assert_not_awaited()
+    assert starts == [] and reservations == [] and run.provider_started_at is None
+    assert segment.status == segment_state

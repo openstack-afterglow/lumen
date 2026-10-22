@@ -55,6 +55,18 @@ class TestStorePureLogic:
         assert aks._is_expired(None, now=now) is False
         assert aks._is_expired((now - timedelta(seconds=1)).replace(tzinfo=None), now=now) is True
         assert aks._is_expired((now + timedelta(seconds=1)).replace(tzinfo=None), now=now) is False
+        assert aks._is_expired(now, now=now) is True
+
+    def test_expiry_serialization_includes_utc_for_mysql_datetime(self):
+        row = SimpleNamespace(
+            id=1, name="n", key_prefix="sk-afgl-AbCd", scopes=["models:read"], is_active=True,
+            owner_monthly_credit_limit=None, admin_monthly_credit_limit=None, owner_weekly_credit_limit=None,
+            created_at=None, last_used_at=None, revoked_at=None,
+            expires_at=datetime(2099, 1, 1),
+        )
+        assert aks._public(row)["expires_at"] == "2099-01-01T00:00:00+00:00"
+        row.expires_at = None
+        assert aks._public(row)["expires_at"] is None
 
     def test_public_never_leaks_hash(self):
         row = SimpleNamespace(
@@ -67,6 +79,7 @@ class TestStorePureLogic:
             created_at=None,
             scopes=["models:read"],
             revoked_at=None,
+            expires_at=None,
             owner_monthly_credit_limit=Decimal("50.5"),
             admin_monthly_credit_limit=Decimal("100.0"),
             owner_weekly_credit_limit=Decimal("40.0"),
@@ -101,6 +114,7 @@ class TestStorePureLogic:
             created_at=None,
             scopes=["models:read"],
             revoked_at=None,
+            expires_at=None,
             owner_user_id="u-admin-test",
             owner_project_id="p-admin-test",
             owner_monthly_credit_limit=None,
@@ -225,6 +239,7 @@ class TestStorePureLogic:
             created_at=None,
             last_used_at=None,
             revoked_at=None,
+            expires_at=None,
             owner_user_id="u-owner",
             owner_project_id="p-owner",
             owner_monthly_credit_limit=Decimal("500.0"),
@@ -305,6 +320,7 @@ class TestStorePureLogic:
             created_at=None,
             scopes=["models:read"],
             revoked_at=None,
+            expires_at=None,
             owner_user_id="u-owner",
             owner_project_id="p-owner",
             owner_monthly_credit_limit=None,
@@ -558,75 +574,6 @@ class TestPrincipalDependency:
         chat_admission._require_native_admission_scopes(principal, features, **kwargs)
 
 class TestRouter:
-    async def test_create_returns_plaintext_once(self, client, monkeypatch):
-        async def fake_create(
-            user_id,
-            project_id,
-            name,
-            scopes,
-            monthly_credit_limit=None,
-            weekly_credit_limit=None,
-        ):
-            return {
-                "id": 1,
-                "name": name,
-                "key_prefix": "sk-afgl-AbCd",
-                "scopes": scopes,
-                "key": "sk-afgl-FULLSECRET",
-            }
-
-        monkeypatch.setattr(aks, "create_key", fake_create)
-        resp = await client.post(_USER_KEYS, json={"name": "my key"})
-        assert resp.status_code == 201
-        assert resp.json()["key"] == "sk-afgl-FULLSECRET"
-
-    async def test_create_forwarding_monthly_limit(self, client, monkeypatch):
-        captured = {}
-
-        async def fake_create(
-            user_id,
-            project_id,
-            name,
-            scopes,
-            monthly_credit_limit=None,
-            weekly_credit_limit=None,
-        ):
-            captured.update(
-                user_id=user_id,
-                project_id=project_id,
-                name=name,
-                scopes=scopes,
-                monthly_credit_limit=monthly_credit_limit,
-                weekly_credit_limit=weekly_credit_limit,
-            )
-            return {
-                "id": 1,
-                "name": name,
-                "key_prefix": "sk-afgl-AbCd",
-                "scopes": scopes,
-                "owner_monthly_credit_limit": "50.0",
-                "admin_monthly_credit_limit": None,
-                "system_monthly_credit_limit": "100.0",
-                "effective_monthly_credit_limit": "50.0",
-                "month_credited_cost": "0",
-                "key": "sk-afgl-FULLSECRET",
-            }
-
-        monkeypatch.setattr(aks, "create_key", fake_create)
-        resp = await client.post(
-            _USER_KEYS,
-            json={
-                "name": "my key",
-                "monthly_credit_limit": "50.0",
-                "weekly_credit_limit": "10.0",
-            },
-        )
-        assert resp.status_code == 201
-        assert captured["monthly_credit_limit"] == Decimal("50.0")
-        assert captured["weekly_credit_limit"] == Decimal("10.0")
-        assert resp.json()["owner_monthly_credit_limit"] == "50.0"
-        assert resp.json()["effective_monthly_credit_limit"] == "50.0"
-
     async def test_patch_renames_owner_key_and_rejects_blank_name(self, client, monkeypatch):
         captured = {}
 

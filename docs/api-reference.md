@@ -4,7 +4,24 @@
 
 ## 인증과 scope
 
-Keystone token과 API key는 모두 현재 enabled owner/project 및 effective Keystone role-ID graph의 service action을 요구한다. Parent 이름이나 token role snapshot은 권한의 대체재가 아니고 graph edge 제거는 다음 요청 및 새 provider I/O에 적용된다. API Key는 `X-API-Key: sk-afgl-...` 또는 `Authorization: Bearer sk-afgl-...`로 보낸다. Compat text route (`/v1/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API key만 허용하며 Keystone token 사용 시 401이다. 한 요청에 credential 둘 이상을 보내면 400이나 동일한 key의 `X-API-Key` + Bearer 중복은 허용한다. API key의 `X-Project-Id`는 key owner project와 같아야 한다. `X-Lumen-Provider`는 관리자 설정 `api_provider` 선택자이며 body `provider`와 충돌하면 400이다. Transport prefix를 선택자 alias로 해석하지 않는다.
+Keystone token/API key 모두 fresh enabled owner/project, exact global native assignments와 service-local oslo.policy action을 요구한다. `lumen_reader/user/editor/admin` 단독 grade는 registered defaults에서 허용하며 service edge와 member/reader co-role은 필요 없다. Native role list를 leaf로 합성하지 않는다. API key는 `X-API-Key: sk-afgl-...` 또는 Bearer로 전송하고 stored scope가 추가 ceiling이다. Compat text/model route는 API key 전용이다. Original token/scope, foreign target와 downstream credential 경계는 policy override와 독립적이다.
+
+Native project action은 registered policy가 current native roles를 평가한다. Verified human raw `system:all` global admin은 기본 alternative이지만 모든 admin route는 별도로 verified system authority와 `system:admin` policy를 요구한다. Project `admin` 및 `lumen_admin`은 system identity가 아니다. Caller original `X-Auth-Token`/Bearer와 connection scope의 `X-Project-Id`를 유지하며 다른 logical target은 verified human만 `X-Target-Project-Id`로 선택한다. Key는 foreign project/target/admin route를 사용할 수 없고 user/project ownership과 provider prerequisites는 유지한다.
+
+Original human source가 system/unscoped이고 home project가 없다면 `X-Project-Id`를 생략하고 explicit `X-Target-Project-Id`를 보낸다. Current raw direct/group/inferred system admin과 enabled native identities/domains를 검증한다. Projectless nonadmin 또는 explicit target 없는 요청은 거부한다. Empty original connection project와 actual system/unscoped source를 보존하며 logical target/ambient credentials로 보충하지 않는다.
+
+Submitted original token은 exchange 전에 Keystone SDK로 검사한다. Trust/application-credential/OAuth 및 missing/unknown authentication method credential은 original source project만 허용하며 current role IDs와 original issued-role-ID ceiling을 교차한다. Owner의 human system-admin override를 빌리거나 foreign target/admin route/더 넓은 key scope로 확장할 수 없다. Same-source permitted service leaf는 native baseline을 포함한 original ceiling 안에서 사용 가능하다. Bind/access-rule credential은 unsupported 403이다. Key issuance/policy는 fresh current owner authority뿐 아니라 authenticated caller ceiling도 요구한다. Disabled/deleted identity/domain은 403, malformed/unavailable directory metadata는 503, invalid/expired original token은 401이다.
+
+Authority directory의 collection은 완전한 raw HTTP envelope여야 한다. Roles/inferences/groups/assignments에서 `links.next`, `truncated` 또는 malformed envelope/rows가 있으면 503으로 거부하며 partial authority를 사용하지 않는다.
+
+Restricted original authority는 native admission 이후의 queued execution에도 보존된다. Non-secret source/issued-ID ceiling이 run capability snapshot과 idempotency identity에 묶이고 child/Batch/media/realtime 및 auxiliary generation으로 전달된다. Current owner가 system admin을 유지해도 current issued leaf가 revoke되면 새로운 provider/tool I/O는 거부한다. Raw caller bearer는 journal에 저장하지 않으며 이미 committed된 I/O의 recovery/settlement는 취소하지 않는다.
+
+`POST /v1/mcp-servers/{id}/oauth/start`와 legacy device approve/deny는 unrestricted human Keystone session 전용이다. Restricted Trust/application-credential/OAuth token은 interactive management approval state/cookie를 만들 수 없으며 403이다. Ordinary permitted same-source service actions와 별도 ceiling-bounded ordinary key issuance는 유지한다.
+
+### Policy capabilities
+
+Authenticated `GET /v1/policy/capabilities` has no service-entitlement prerequisite. Response: `{"service":"lumen","capabilities":["lumen-inventory_reader"],"actions":["models:read"]}` (illustrative subset). Both lists are sorted/deterministic; enabled authenticated callers without allowed actions receive empty arrays. Actions are the registered exact scope names plus human-only `system:admin`; UI capabilities are singleton-action-family projections, not token roles and not proof that every action in a family is allowed. The same current YAML and stored-key ceiling authorize the actual route and worker. No file path, credentials or policy contents are returned. Native policy reload updates subsequent evaluations; BFFs must not reconstruct grades locally or authorize by coarse UI labels.
+
 
 | Surface | API-key scope | Keystone only |
 | --- | --- | --- |
@@ -23,7 +40,7 @@ Keystone token과 API key는 모두 현재 enabled owner/project 및 effective K
 | agents and code/Git management | `native:agents:read` / `native:agents:write` / `native:agents:delete` (private detail/clone/config uses write) | 아니오 |
 | workspaces | `native:conversations:read` / `native:conversations:write` / `native:conversations:delete` | 아니오 |
 | `/v1/api-keys` / owner limits / revoke | internal route actions `native:keys:read|write|delete` (not issuable key scopes) | 예 |
-| `/v1/admin/*` | verified effective system `admin`, not tenant/domain admin | 예 |
+| `/v1/admin/*` | human verified raw direct/group/inferred system `admin`, not reduced token or tenant/domain admin | 예 |
 
 Scope는 current owner leaf와 교집합으로만 사용할 수 있다. 발급은 `lumen-keys_editor`와 requested scope 전체의 subset을 요구하며 default `models:read, compat:completions:write`도 자동 확대되지 않는다. Reader는 inventory/history, chat-user는 text generation, images-user는 image generation, audio-user는 finite/realtime audio, tools-user는 tool/skill/agent/provider search execution을 각각 허용한다. Config는 assets/agents/MCP/keys editor leaf, history/memory write/delete는 history-editor, resource/file/asset/extension/agent/key destruction은 resources-admin으로 분리된다. 실제 mapping은 `lumen/service_authority.py`의 단일 `SCOPE_CAPABILITIES`를 따른다. Nonreader action은 effective native `member`도 필요하며 `reader` baseline은 read-only다.
 
@@ -49,6 +66,42 @@ API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만
 | MCP connector bundles | `GET /v1/admin/mcp-bundles`, `POST /v1/admin/mcp-bundles/{slug}/install` (`require_admin`). Slugs are `notion` and `github`. Install materializes a `scope="global"` MCP source and is idempotent by destination: a second call returns the existing row with `created=false` and never rewrites it, because rewriting bumps `config_version` and revokes every user's OAuth connection. Bundles carry no credential; each user then authorizes through the existing `/v1/mcp-servers/{id}/oauth` flow. An installed connector a user has not connected is silently absent from that user's runs rather than warning on each one. |
 | Memory/usage | `GET/POST /v1/memories`, `GET /v1/memories/document`, search, patch/delete; `GET /v1/usage`, `/keys`, `/timeseries`, `/records` |
 | Keystone-only key/admin management / scoped resources | `/v1/api-keys`, owner limits와 `/v1/admin/*`는 Keystone-only. Agent/workspace/code/Git 및 `/v1/assets`는 해당 service action과 owner scope를 요구하며 API key도 stored scope와 current leaf가 모두 있어야 함 |
+
+## Provider account and credential administration
+
+All paths below are relative to `/v1/admin/providers/{provider_id}` and require the existing **human Keystone verified system-admin** boundary (`require_admin`), not an ordinary API key. `provider_id` identifies the endpoint; account and credential IDs are numeric and must belong to that endpoint. Responses expose configuration/status/provenance only, never plaintext key, subscription token or ciphertext. Account/auth actions use no-store responses; Afterglow mirrors them under `/api/v1/chat/admin/providers/{provider_id}` and applies provider-route no-store on success and handled failures.
+
+| Method | Relative path | Contract |
+| --- | --- | --- |
+| GET / POST | `/accounts` | List accounts including nested credential metadata / create account (201). |
+| PATCH / DELETE | `/accounts/{account_id}` | Update account / delete account and its credentials (204). |
+| GET | `/accounts/{account_id}/usage` | `{provider_id,account_id,credentials:[{credential_id,requests,prompt_tokens,completion_tokens,raw_cost}]}`; Lumen allocation totals, not provider invoice/balance. `raw_cost` is a Decimal string. |
+| POST | `/accounts/{account_id}/credentials` | Create credential under the endpoint's auth mode (201). |
+| PATCH / DELETE | `/accounts/{account_id}/credentials/{credential_id}` | Update / delete credential (204); no separate credential GET, use nested account list. |
+| PUT | `/accounts/{account_id}/credentials/{credential_id}/auth/token` | Subscription `{token,expires_at?}` upload; returns safe credential metadata. |
+| DELETE | `/accounts/{account_id}/credentials/{credential_id}/auth` | Disconnect selected subscription (204). |
+| POST | `/accounts/{account_id}/credentials/{credential_id}/auth/device` | Begin/reuse owner/project-bound device attempt (201 new, 200 reused). |
+| POST | `/accounts/{account_id}/credentials/{credential_id}/auth/device/{attempt_id}/poll` | Poll that exact credential/attempt under the initiating owner/project. |
+| DELETE | `/accounts/{account_id}/credentials/{credential_id}/auth/device/{attempt_id}` | Cancel that exact attempt (204). |
+
+Account create/patch fields: `name`, `is_active`, nonnegative `priority`, positive `weight`, nullable `allowed_model_ids`, nullable `allowed_capabilities`, nullable `quota_group`. Credential create/patch fields: `name`, `is_active`, `priority`, `weight`, `allowed_model_ids`, `allowed_capabilities`, nullable `expires_at`/`cooldown_until` and API-mode-only `api_key`/`api_key_env`. Names are1–100 characters; priority/weight are strict bounded integers. Unknown fields are rejected. Subscription credentials cannot contain API-key fields; auth mode belongs to the endpoint. Encrypted DB keys take precedence over an environment reference; only the environment name is stored/returned. Secret input is never a secret readback API.
+
+At **both** account and credential levels, `allowed_model_ids:null` / `allowed_capabilities:null` are unrestricted and `[]` denies all. Allowed model IDs must belong to this endpoint. Capability values are operation tags `chat,responses,messages,count_tokens,embeddings,search,image,tts,stt,realtime`, not model feature labels. Selection intersects both policies and current active/expiry/cooldown conditions. Endpoint `PATCH /v1/admin/providers/{provider_id}` accepts `selection_policy=explicit|priority|weighted` and nullable `selected_credential_id`; explicit requires an owned credential. Priority sorts ascending account/credential priority then IDs; weighted uses their weight product. This policy selects once for a **new admission**, never after an upstream failure.
+
+Credential secret/restriction/expiry/cooldown changes and disable advance `generation`. Execution freezes provider/account/credential/generation/auth-mode/model/required operations and revalidates that exact identity immediately before I/O. A stale/revoked/ineligible credential fails closed, without selecting another account, refreshing a different grant or repeating inference. Legacy incomplete references require explicit safe re-admission; unknown provider work retains its hold. Account allocations commit with the one customer ledger transaction; historical unidentifiable usage is not default-account usage. Missing resources are404, invalid configuration400/validation422, configuration/conflict409 and unavailable storage503 with sanitized messages. Subscription OAuth protocol support does not grant permission for public multi-user subscription pooling.
+
+## Owned transport and historical metadata
+
+Public caller authentication/IDs/protocols do not expose the private Go companion. `provider_client` owns single-attempt requests/streams and `provider_errors`; `bifrost_runtime` authenticates a process-local loopback child using pinned Bifrost converters, not stock gateway governance. Native Responses and Anthropic Messages/count_tokens preserve native payloads where required for fidelity. Direct media/search/Codex record `lumen-media-direct:1`, `lumen-search-http:1`, `lumen-codex-http:1`; converted text records `bifrost` and its pinned version. No retry/fallback/shadow/key rotation follows admission. Confirmed provider rejections map to sanitized public protocol errors; ambiguous failures/truncated streams remain unknown under durable accounting rather than claiming zero usage or replaying.
+
+References below to the “LiteLLM catalog” mean the frozen **1.93.0** metadata asset loaded by `provider_metadata`, not a runtime dependency/live SDK or Bifrost price source. Its existing `litellm` ledger provenance and MIT license are intentionally preserved (`lumen/data/NOTICE`). Bundled tiktoken ranks are offline estimates, not observed message framing/cache/modality usage; unknown metadata is not zero. Deployment requires matching native binary and coordinated migration027; see [operations](operations.md#private-provider-runtime-and-migration027-cutover).
+
+
+## MCP owner activation과 ordinary key 발급
+
+`GET /v1/mcp-servers`는 global catalogue와 본인 row를 반환한다. Global 행의 `server_is_active`는 관리자 publication, `activation_is_active`는 현재 owner consent, `is_active`는 실제 실행 가능 상태다. `?active_only=true`는 미승인·stale config·비활성·OAuth 미연결 행을 제외한다. `PATCH /v1/mcp-servers/{id}/activation`은 `native:mcp:write` 아래 authenticated user/project를 사용하며 strict `{is_active:boolean,config_version:positive integer}`만 허용한다. 추가 필드·잘못된 형식은422, stale config는400, owner/resource 부재는404, store 장애는503이다. 설정 변경은 재승인해야 하고 disable/re-enable generation은 이전 frozen 실행을 되살리지 않는다. 기존 user-owned 직접 CRUD는 별도다. OAuth start/PKCE·status/disconnect는 유지하며 activation만으로 token을 만들거나 연결 완료를 주장하지 않는다. Headers/token은 공개 catalogue에서 제외한다.
+
+Keystone-only `GET /v1/api-keys/issuance-policy`는 fresh keys-editor/current owner 권한 아래 `allowed_scopes`, 각 scope의 `scope_capabilities` 및 owner quota ceiling을 반환한다. 이 조회는 키를 만들지 않는다. `POST /v1/api-keys`는 `name`, 허용 subset의 중복 없는 `scopes`, optional positive Decimal `monthly_credit_limit`/`weekly_credit_limit`, nullable `expires_at`를 한 transaction으로 저장한다. Expiry는 미래 timezone-aware datetime만 허용하고 UTC로 정규화한다. 생략/null은 기존 무만료 계약이며 migration013을 재사용한다. 잘못된/naive/past expiry는422, scope/권한 거부는403, owner quota 충돌은409이고 발급을 commit하지 않는다. 평문 `key`는201 발급 응답에서만 보이며 이후 목록은 expiry metadata만 포함하고 secret/hash를 반환하지 않는다. Current revoke/expiry·owner/scope 검증은 다음 요청과 새 provider/tool I/O 전에 계속 적용한다. 완료 checkpoint 회수·정산을 소급 취소하지 않는다.
 
 ## Batch API
 
@@ -82,13 +135,13 @@ Responses·Anthropic·Gateway 스트리밍은 provider stream을 HTTP 200 전에
 
 Responses의 reasoning 필드는 해당 모델의 관리자가 명시적으로 미지원 설정을 했거나 정확한 LiteLLM catalog ID가 미지원을 확인한 경우에만 제거됩니다. 그때 `include`의 `reasoning.*` 값도 제외하며 다른 값은 보존합니다. 카탈로그에 없는 모델의 capability probe `false`는 미지원 증거가 아니므로 전달을 유지합니다. 상류가 요청을 Bad Request로 거절하면 상류 상세를 노출하지 않는 400을 반환하며 일괄 502로 바꾸지 않습니다.
 
-Compat surface는 full vendor API parity가 아니다. OpenAI 오류는 최상위 `{ "error": { "message": ..., "type": ..., "code": ... } }`, Anthropic 오류는 `{ "type": "error", "error": ... }` 구조다. `max_tokens`/`max_output_tokens`를 생략할 수 있는 OpenAI path는 기존 4096 기본값을 적용하지만, 클라이언트가 명시한 양수 output budget을 임의로 4096으로 자르지 않는다. Anthropic `max_tokens`는 필수 양수다. OpenAI 계열은 unknown request field와 schema 위반을 422로 거부한다. Anthropic Messages 계열(`/v1/messages`, `/v1/messages/count_tokens`, legacy gateway의 같은 route)은 Anthropic API처럼 400 `invalid_request_error`와 `<field>: <reason>` 메시지(예: `safeguards: Extra inputs are not permitted`)로 거부하며 입력값을 되돌려 보내지 않는다. Provider-specific 선택은 `provider` 또는 `X-Lumen-Provider`로 명시한다.
+Compat surface는 full vendor API parity가 아니다. OpenAI 오류는 `{ "error": { "message": ..., "type": ..., "code": ... } }`, Anthropic 오류는 `{ "type": "error", "error": ... }`다. OpenAI optional output budget 생략은 기존4096 기본값을 사용하지만 명시한 양수 budget은 arbitrary cap/converter minimum으로 바꾸지 않고 보존해야 한다. **이는 required contract이며 full Go의13→16 clamp 수정·재검증은 아직 pending**이다; 현재 passing claim은 `docs/testing.md`를 따른다. Anthropic max_tokens는 필수 양수다. OpenAI unknown field/schema 위반은422, Messages/count_tokens/Gateway Messages 계열은 field-specific Anthropic400 invalid_request_error이며 입력을 echo하지 않는다. Unsupported safeguards도 이 closed-schema400으로 거부한다. 공개 provider 선택은 provider 또는 X-Lumen-Provider를 사용한다.
 
 ### Claude Code direct API와 legacy Lumen device protocol
 
 Claude Code 2.1.278의 검증된 연결은 ordinary scoped API key, Anthropic origin `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, public model ID를 사용하는 direct `/v1/messages` path다. 격리된 실제 CLI process가 streaming text와 local `Bash` tool 실행 뒤 native `tool_result` continuation을 완료했다. 이 stateless payload는 Lumen browser conversation이나 durable run journal에 저장하지 않는다.
 
-Claude Code auto mode는 `ANTHROPIC_BASE_URL` gateway에도 server-side classifier review를 요청해 `dangerous-tool-use-*` beta와 top-level `safeguards`를 보낸다. Pinned LiteLLM transport는 이 body field·beta·응답 `safeguard_results`를 전달하지 못하므로 Lumen은 field를 명시한 400으로 거부한다. Client는 그 세션에서 둘을 빼고 재시도하며 자체 classifier 요청을 같은 `/v1/messages`의 일반 호출로 보낸다. 2026-10-07 실제 Claude Code 2.1.287은 classifier를 session model로, 2.1.292는 `claude-sonnet-5`로 요청했다. 이 호출도 일반 Messages처럼 routing·과금되므로 해당 public model이 활성 route여야 한다.
+Claude Code auto mode는 `ANTHROPIC_BASE_URL` gateway에도 server-side classifier review를 요청해 `dangerous-tool-use-*` beta와 top-level `safeguards`를 보낸다. Lumen의 현재 public Messages schema는 이 확장 계약을 제공하지 않으므로 field를 명시한400으로 거부한다. Client는 그 세션에서 둘을 빼고 재시도하며 자체 classifier 요청을 같은 `/v1/messages`의 일반 호출로 보낸다. 이는 client의 새 요청이지 Lumen의 same-request provider 재시도가 아니다. 2026-10-07 과거 LiteLLM transport에서 실제 Claude Code2.1.287은 classifier를 session model로,2.1.292는 `claude-sonnet-5`로 요청했다. 이 호출도 일반 Messages처럼 routing·과금되므로 해당 public model이 활성 route여야 한다. 과거 증거는 새 converter의 CLI acceptance가 아니다.
 
 Configured `${claude_gateway_base_url}`의 device routes는 Lumen custom protocol이다. `POST /oauth/device/code`는 exact fixed scopes의 10-minute grant를 만들고 Redis rate limit을 fail-closed로 적용한다. Afterglow authenticated approval 뒤 interval-valid poll이 grant를 한 번 consume해 hashed-at-rest `credential_kind="claude_gateway"` API key를 24시간 발급한다. Pending, fast polling, denial, expiry, replay, store outage는 credential 없이 OAuth 오류를 반환한다. Gateway Messages/models/settings route는 이 credential kind만 허용한다.
 
@@ -164,7 +217,7 @@ Anthropic은 `GET /v1/models?limit=200&after_id=...`, Gemini는 `GET /v1beta/mod
 
 한 조회는 20초, 25페이지, 2,000 unique 모델, 누적 5MB identity-encoded response로 제한한다. 정상 200 empty는 fallback 없이 `source=api, live_status=empty, complete=true`다. 중간 페이지 오류, 반복/누락 cursor, malformed ID/body, timeout 또는 한도 초과는 `source=none, live_status=error, complete=false, models=[], candidates=[]`다. 정적 fallback이나 부분 목록을 성공처럼 제공하지 않는다. `unsupported` 정적 참고는 account entitlement의 증거가 아니다.
 
-후보 조회 뒤 기존 모델 POST/PATCH로 표시명·정확한 입력/출력 가격·명시 capability override·활성 상태를 저장한다. 정적 레지스트리 밖 ID도 등록할 수 있으나 native text admission에는 실제 가격 쌍이 필요하다. LiteLLM이 unknown ID를 0 USD로 계산해도 exact catalog entry에 명시된 가격이 없으면 미확인이다. API가 반환한 context/token limit은 참고값이며 자동으로 vision/tools/reasoning/compaction을 활성화하지 않는다.
+후보 조회 뒤 기존 모델 POST/PATCH로 표시명·정확한 입력/출력 가격·명시 capability override·활성 상태를 저장한다. 정적 레지스트리 밖 ID도 등록할 수 있으나 native text admission에는 실제 가격 쌍이 필요하다. Exact historical catalog entry에 명시된 가격이 없으면 미확인이며0USD로 간주하지 않는다. API가 반환한 context/token limit은 참고값이며 자동으로 vision/tools/reasoning/compaction을 활성화하지 않는다.
 
 ## 모델 단가와 prompt-cache 단가
 
@@ -182,24 +235,25 @@ Fallback 기본값과 실제 catalog `above_200k` tier가 함께 있는 범주�
 
 Provider-native compaction이 한 응답에 여러 내부 iteration을 합쳐 보고하고 iteration별 5분/1시간 생성 split을 제공하지 않으면, 이 tier 판정은 합산된 보고 입력에 적용된다. 내부 호출별 청구 tier를 복원할 수 없으므로 실제 조직 청구서와 대조해야 한다.
 
-OpenAI direct API와 Gemini 2.5+는 반복되는 긴 prefix를 provider가 자동 캐싱하므로 별도 cache API 호출을 하지 않는다. Lumen의 direct Anthropic Chat Completions 호출은 LiteLLM이 지원하는 모델에 한해 마지막 system text block에 `cache_control={"type":"ephemeral"}`을 붙인다. Caller가 breakpoint를 이미 지정했으면 그대로 유지하고 custom base·subscription은 자동 주입하지 않는다. `/v1/messages`는 caller의 Anthropic-native `cache_control`을 그대로 보존한다. Gemini에서 explicit cachedContents API를 매 요청 생성하면 저장료·지연이 늘 수 있어 기본 활성화하지 않는다. 짧은 prefix는 provider 최소 토큰 수 미달 시 캐싱되지 않으며 hit는 `usage`의 cache counter로 확인한다. [LiteLLM prompt caching](https://docs.litellm.ai/docs/completion/prompt_caching) / [Gemini implicit caching](https://ai.google.dev/gemini-api/docs/caching).
+OpenAI direct API와 Gemini2.5+는 반복되는 긴 prefix를 provider가 자동 캐싱하므로 별도 cache API 호출을 하지 않는다. Lumen의 direct Anthropic chat-shaped 호출은 bundled exact metadata가 prompt caching을 지원하는 모델에 한해 마지막 system text block에 `cache_control={"type":"ephemeral"}`을 붙인다. Caller breakpoint가 있으면 보존하고 custom base·subscription에는 자동 주입하지 않는다. `/v1/messages`는 caller의 native `cache_control`을 그대로 보존한다. Gemini explicit cachedContents API는 기본 활성화하지 않는다. 짧은 prefix의 hit를 추정하지 않고 실제 `usage` counter로 확인한다. 과거 설계 참고: [LiteLLM prompt caching](https://docs.litellm.ai/docs/completion/prompt_caching); provider 동작: [Gemini implicit caching](https://ai.google.dev/gemini-api/docs/caching).
 
 Anthropic auto breakpoint는 message뿐 아니라 명시적인 tool/function 및 request-level `cache_control`도 검사한다. 어느 위치든 caller breakpoint가 있으면 system block을 추가하지 않아 provider의 최대 breakpoint 수를 넘기지 않는다.
 
-`chat_usage_logs.prompt_tokens`는 cache read/creation을 포함한 총 입력이고, `cache_read_input_tokens`, `cache_creation_5m_input_tokens`, `cache_creation_1h_input_tokens`가 실제 보고된 분할이다. `/v1/chat/completions`의 non-stream/usage SSE chunk는 `usage.prompt_tokens_details.cached_tokens`를 추가로 반환하며, `/v1/responses`·`/v1/messages`는 upstream-native usage를 유지한다. 미보고 usage의 로컬 token-counter fallback은 캐시 히트로 간주하지 않는다. TTL 분할 없는 Anthropic creation은 5분 범주다. `/v1/messages` stream이 `message_stop` 전에 끊기면 `message_start`와 받은 `message_delta`의 cache 분할을 보존하고 출력만 로컬 token count가 더 크면 대체한다. Anthropic/OpenAI/Gemini의 일반 inference 응답에는 호출별 확정 USD 청구액이 없고, LiteLLM `_hidden_params.response_cost`는 catalog로 **계산한 추정치**다. Lumen은 실제 응답 usage × resolved/frozen 단가를 원장에 기록하며 이를 provider-reported invoice라고 표시하지 않는다.
+`chat_usage_logs.prompt_tokens`는 cache read/creation을 포함한 총 입력이고 `cache_read_input_tokens`, `cache_creation_5m_input_tokens`, `cache_creation_1h_input_tokens`는 보고된 분할이다. `/v1/chat/completions`의 non-stream/usage SSE chunk는 `usage.prompt_tokens_details.cached_tokens`를 반환하며 Responses/Messages는 native usage를 유지한다. 로컬 token-counter fallback은 cache hit가 아니다. TTL 분할 없는 Anthropic creation은5분 범주다. `message_stop` 전 끊긴 Messages stream도 받은 cache 분할을 보존하고 출력만 로컬 token count가 더 크면 대체한다. 일반 provider inference는 호출별 확정USD invoice를 반환하지 않는다. 과거 LiteLLM `_hidden_params.response_cost`도 catalog 추정치였으며 현재 비용 authority는 `provider_metadata`와 resolved/frozen 가격이다. Lumen은 실제 usage × frozen 단가를 기록하고 provider-reported invoice라고 표시하지 않는다.
 
 Managed advisor cache 단가도 같은 manual→direct catalog→text write cascade 정책으로 새 admission의 `component_prices`에 고정하며 `advisor_cache_price_sources`로 provenance를 보존한다. Advisor 입력 단가는 uncached 입력에만 적용된다. 미확인 cache-read와 기존 snapshot의 누락 cache 범주는 0 USD와 `metadata.unpriced=true`를 기록하고 run usage를 `partial`로 만든다.
 
 ## API 키와 월·주간 사용 한도
 
-API 키 발급·목록·이름·owner 한도 관리는 Keystone-only이며 current `lumen-keys_editor`가 필요하다. Requested scope는 current owner action의 subset이어야 하며 기본값도 예외가 아니다. `DELETE /v1/api-keys/{key_id}`는 current `lumen-resources_admin`과 ownership을 요구하고 row/ledger를 삭제하지 않고 revoke한다. API-key credential로 key management를 호출하면 401이다. `/v1/admin/api-keys*`는 verified effective system admin만 허용한다. Local seed는 실제 owner ID/directory credential을 필요로 하고 owned stale key rotation에도 delete action을 검사한다.
+API 키 발급·목록·이름·owner 한도 관리는 Keystone-only이며 current `lumen-keys_editor` 또는 verified system admin이 필요하다. Requested scope는 current owner action의 subset이어야 하며 기본값도 예외가 아니다. `DELETE /v1/api-keys/{key_id}`는 current `lumen-resources_admin` 또는 verified system admin과 ownership을 요구하고 row/ledger를 삭제하지 않고 revoke한다. API-key credential로 key management를 호출하면 401이다. `/v1/admin/api-keys*`는 verified effective system admin만 허용한다. Local seed는 실제 owner ID/directory credential을 필요로 하고 owned stale key rotation에도 delete action을 검사한다.
 
 ### API 키 관리 route
 
-- `POST /v1/api-keys`: 새 API 키 발급 (Keystone-only). Body: `name`, `scopes` (기본값 `models:read` + `compat:completions:write`, Native 연동 시 필요한 native scope를 명시적으로 요청해야 함), 선택적 `monthly_credit_limit`, 선택적 `weekly_credit_limit`. 발급 응답(201)에서만 1회성 평문 `key`를 반환하며, 이후 조회 projection 및 모든 HTTP 응답에서 secret 및 SHA-256 hash가 절대로 반환되지 않는다. 독립형 Compose 시드 키는 `lumen-connection` CLI 매니페스트로만 확인 가능하다.
+- `POST /v1/api-keys`: 새 API 키 발급 (Keystone-only). Body: `name`, `scopes` (기본값 `models:read` + `compat:completions:write`도 current owner subset이어야 함), 선택적 nullable `expires_at`, `monthly_credit_limit`, `weekly_credit_limit`. 미래 timezone-aware expiry만 허용하고 UTC로 정규화하며 naive/past/equal-now 값은 422다. 이름·scope·expiry·owner 한도를 한 transaction에서 저장한다. 생략/null expiry는 기존 무만료 수명을 유지한다. 201에서만 평문 `key`를 한 번 반환하고 목록에는 hash/secret을 반환하지 않는다. Expiry는 UTC offset-bearing ISO로 조회된다. 독립형 Compose 시드 키는 `lumen-connection` CLI 매니페스트로만 확인 가능하다.
 - `GET /v1/api-keys`: 소유자의 API 키 목록과 당월·당주 사용량 및 한도 projection을 반환한다. 사용량이 0인 키도 포함된다.
 - `PATCH /v1/api-keys/{key_id}`: 소유자 API 키 이름 변경. Body는 `{"name": str}`이며 `min_length=1`, `max_length=100`, 공백만 있는 이름은 422다. 폐기된 키도 이름을 바꿀 수 있다. 소유권 불일치 시 403, 키 미존재 시 404다.
 - `PATCH /v1/api-keys/{key_id}/limits`: 소유자 API 키 한도 수정. Body는 두 키가 모두 필수인 nullable `{"monthly_credit_limit": Decimal | null, "weekly_credit_limit": Decimal | null}`이며, `null` 지정 시 해당 기간의 소유자 한도를 해제한다. 소유권 불일치 시 403, 키 미존재 시 404다.
+- `GET /v1/api-keys/issuance-policy`: Keystone-only `native:keys:write`와 fresh current owner의 `lumen-keys_editor`를 검사한다. 실제 허용된 `allowed_scopes`, scope별 leaf 대안 `scope_capabilities`, nullable Decimal 월·주 quota ceiling을 반환한다. `native:keys:*` 자체는 발급 대상이 아니다. Target project는 인증된 scope/header이고 body의 owner 주장이 아니다. Client는 해당 scope를 현재 project permission과 다시 교집합하여 제안해야 한다.
 - `GET /v1/admin/api-keys`: 관리자 전용 키 목록 조회 (`require_admin`). Query parameters: `owner_user_id`, `owner_project_id`, `before_id` (cursor, `gt=0`), `limit` (기본값 50, range 1..200, `id DESC` 정렬). 당월 zero-usage 키를 포함하며 `owner_user_id`, `owner_project_id`를 반환한다.
 - `PATCH /v1/admin/api-keys/{key_id}/limits`: 관리자 전용 ceiling 수정 (`require_admin`). Body는 `{"monthly_credit_limit": Decimal | null}`. `null`은 관리자 ceiling 해제다. 관리자 ceiling을 기존 소유자 월 한도 또는 주간 한도 이하로 낮추면 같은 트랜잭션에서 두 소유자 한도도 새 ceiling으로 자동 하향(clamp)된다. 관리자 주간 ceiling column은 두지 않는다.
 
@@ -234,6 +288,14 @@ API 키 발급·목록·이름·owner 한도 관리는 Keystone-only이며 curre
 - 본인 사용량 요약: `GET /v1/usage/summary`는 `month_credited_cost`, `week_credited_cost`, `quota_used`, `quota_max`, `quota_weekly_max`를 함께 반환한다. 독립 주간 ceiling이 없을 때 `quota_weekly_max=0`이지만 월 ceiling은 계속 강제된다.
 - 관리자 사용자 상세: `GET /v1/admin/stats/users/{user_id}`는 `range=7d|30d|90d|1y|all`, 선택적 `source=web|api`, `before_id`, `limit`을 받고 기간 metadata, 전체·모델별·source별 aggregate와 timestamp/token/raw USD/credited cost/API-key attribution을 포함한 immutable ledger page를 반환한다.
 - 이력 및 격리 사용량 Surface: 기존 `GET /v1/usage/keys` (기간별 historical 집계) 및 `GET /v1/usage/records` (현재 키로 격리된 레코드 커서 조회)는 기존 계약을 유지하며 당월 관리 뷰와 구별된다.
+
+## Remote MCP 카탈로그와 owner 활성화
+
+`GET /v1/mcp-servers`는 관리자 global source와 자신의 직접 등록 source를 보여 주며 `?active_only=true`는 실제 실행 가능한 행만 반환한다. Global publication만으로 opt-in하지 않는다. Metadata의 `server_is_active`는 관리자가 공개한 상태, `activation_is_active`는 authenticated owner의 승인, `is_active`는 설정/OAuth까지 반영한 실제 사용 가능 상태다. `config_version`, `activation_config_version`, `activation_generation`을 반환하고 private headers/client secret/token은 제외한다.
+
+`PATCH /v1/mcp-servers/{id}/activation`은 `native:mcp:write`와 현재 MCP-editor를 요구하며 strict `{is_active:boolean,config_version:positive integer}`를 받는다. Owner user/project는 인증에서만 얻는다. 같은 configuration의 반복 승인은 epoch를 늘리지 않고 disable/re-enable는 frozen selection을 무효화한다. 설정 변경·unavailable target은 400, user-owned source를 activation catalogue로 승인하려는 요청은 403, 추가 owner field/string boolean은 422다. 관리자 대신 사용자 opt-in을 만드는 admin endpoint는 없다.
+
+OAuth는 opt-in과 별개다. 승인 후 기존 Keystone-only `POST /v1/mcp-servers/{id}/oauth/start`와 PKCE browser 연결을 완료해야 matching current token으로 실행하며 opt-in만 된 연결 대기 상태도 비활성화할 수 있다. Direct 사용자 MCP CRUD·administrator global CRUD는 유지한다. Migration026은 기존 global 서버의 owner approval을 backfill하지 않는다.
 
 ## Active-path message history
 

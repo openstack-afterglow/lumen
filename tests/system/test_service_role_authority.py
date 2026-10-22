@@ -1,4 +1,4 @@
-"""Real API/worker -> installed Keystone SDK -> current graph -> synthetic provider.
+"""Real API/worker -> installed Keystone SDK -> current roles/policy -> synthetic provider.
 
 All runtime calls use public HTTP. The queued revalidation cases copy a frozen
 request from an HTTP-completed image into an offline-pool MariaDB fixture; they
@@ -11,13 +11,67 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from system.fake_keystone import CONTROL_TOKEN, OWNER_TOKEN, PROJECT_ID
+from system.fake_keystone import (
+    ADMIN_LEAVES,
+    CONTROL_TOKEN,
+    DIRECTORY_PROJECT_ID,
+    DIRECTORY_TOKEN,
+    EDITOR_LEAVES,
+    OWNER_TOKEN,
+    PROJECT_ID,
+    READER_LEAVES,
+    USER_LEAVES,
+)
 from system.test_process_stack import _poll_run_until_terminal
 
 pytestmark = pytest.mark.system
 
 
-def test_current_graph_downgrade_at_native_and_compat_http_boundaries():
+def test_system_admin_target_key_cannot_substitute_tenant_scope():
+    api_url = os.environ.get("LUMEN_API_BASE_URL", "http://localhost:8012")
+    directory_url = os.environ.get("LUMEN_FAKE_KEYSTONE_URL", "http://fake-keystone:5000")
+    owner_headers = {
+        "X-Auth-Token": DIRECTORY_TOKEN,
+        "X-Project-Id": DIRECTORY_PROJECT_ID,
+        "X-Target-Project-Id": PROJECT_ID,
+    }
+    control_headers = {"X-Test-Control-Token": CONTROL_TOKEN}
+    created_id = None
+    with httpx.Client(base_url=api_url, timeout=30, trust_env=False) as api, \
+            httpx.Client(base_url=directory_url, timeout=10, trust_env=False) as directory:
+        assert directory.post("/_control/reset", headers=control_headers, json={}).status_code == 200
+        try:
+            target_read = api.get("/v1/api-keys", headers=owner_headers)
+            assert target_read.status_code == 200, target_read.text
+            own_read = api.get("/v1/api-keys", headers={
+                "X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID,
+            })
+            assert own_read.status_code == 200, own_read.text
+            forbidden_target = api.get("/v1/api-keys", headers={
+                "X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID,
+                "X-Target-Project-Id": DIRECTORY_PROJECT_ID,
+            })
+            assert forbidden_target.status_code == 403, forbidden_target.text
+            issued = api.post("/v1/api-keys", headers=owner_headers,
+                              json={"name": "system target isolation", "scopes": ["models:read"]})
+            assert issued.status_code == 201, issued.text
+            key = issued.json()
+            created_id = key["id"]
+            for key_headers in ({"X-API-Key": key["key"]}, {"Authorization": "Bearer " + key["key"]}):
+                assert api.get("/v1/models", headers=key_headers).status_code == 200
+                for header in ("X-Project-Id", "X-Target-Project-Id"):
+                    own = api.get("/v1/models", headers={**key_headers, header: PROJECT_ID})
+                    assert own.status_code == 200, own.text
+                    foreign = api.get("/v1/models", headers={**key_headers, header: DIRECTORY_PROJECT_ID})
+                    assert foreign.status_code == 403, foreign.text
+        finally:
+            assert directory.post("/_control/reset", headers=control_headers, json={}).status_code == 200
+            if created_id is not None:
+                cleanup = api.delete(f"/v1/api-keys/{created_id}", headers=owner_headers)
+                assert cleanup.status_code in {200, 204}, cleanup.text
+
+
+def test_current_assignment_downgrade_at_native_and_compat_http_boundaries():
     api_url = os.environ.get("LUMEN_API_BASE_URL", "http://localhost:8012")
     directory_url = os.environ.get("LUMEN_FAKE_KEYSTONE_URL", "http://fake-keystone:5000")
     provider_url = os.environ.get("LUMEN_FAKE_PROVIDER_URL", "http://fake-provider:8080")
@@ -42,7 +96,7 @@ def test_current_graph_downgrade_at_native_and_compat_http_boundaries():
             assert response.status_code == 200, response.text
             assert response.json()["choices"][0]["message"]["content"] == "Hello from fake provider!"
             change = directory.post("/_control/configure", headers=control_headers,
-                json={"remove_edges": [{"prior": "lumen_editor", "implied": "lumen-keys_editor"}]})
+                json={"owner_roles": ["lumen_user"]})
             assert change.status_code == 200, change.text
             denied_issue = api.post("/v1/api-keys", headers=owner_headers, json={"name": "must deny", "scopes": scopes})
             assert denied_issue.status_code == 403, denied_issue.text
@@ -51,7 +105,7 @@ def test_current_graph_downgrade_at_native_and_compat_http_boundaries():
                 json={"model": model, "messages": [{"role": "user", "content": "existing key remains usable"}]})
             assert allowed.status_code == 200, allowed.text
             change = directory.post("/_control/configure", headers=control_headers,
-                json={"remove_edges": [{"prior": "lumen_user", "implied": "lumen-chat_user"}]})
+                json={"owner_roles": ["lumen_reader"]})
             assert change.status_code == 200, change.text
             assert api.get("/v1/models", headers=key_headers).status_code == 200
             before = _provider_stats(provider)
@@ -291,9 +345,8 @@ def test_key_issuance_requires_requested_scope_subset_of_current_owner_leaves(au
 def test_current_owner_leaves_are_independent_at_native_and_compat_http(authority_http, removed_action):
     api, directory, provider, created_ids = authority_http
     _, headers = _issue_owned_key(api, created_ids, _BROAD_SCOPES)
-    _directory_change(directory, {"remove_edges": [
-        {"prior": "lumen_user", "implied": f"lumen-{removed_action}_user"},
-    ]})
+    retained = (ADMIN_LEAVES | EDITOR_LEAVES | READER_LEAVES | USER_LEAVES) - {f"lumen-{removed_action}_user"}
+    _directory_change(directory, {"owner_roles": sorted(retained)})
     assert api.get("/v1/models", headers=headers).status_code == 200
     before = _provider_stats(provider)
     denied_markers = []
@@ -353,7 +406,7 @@ def test_revoked_key_is_denied_before_provider_at_all_native_and_compat_boundari
     _assert_no_provider_io(provider, before, markers)
 
 
-@pytest.mark.parametrize("loss", ["graph", "revocation"])
+@pytest.mark.parametrize("loss", ["assignment", "revocation"])
 def test_queued_media_worker_revalidates_current_authority_before_new_io(authority_http, loss):
     """A copied frozen HTTP image request, not a mocked worker/admission, is released."""
     from urllib.parse import unquote, urlsplit
@@ -395,10 +448,9 @@ def test_queued_media_worker_revalidates_current_authority_before_new_io(authori
         db.commit()
         queued = api.get(f"/v1/runs/{queued_id}", headers=_OWNER_HEADERS)
         assert queued.status_code == 200 and queued.json()["status"] == "queued", queued.text
-        if loss == "graph":
-            _directory_change(directory, {"remove_edges": [
-                {"prior": "lumen_user", "implied": "lumen-images_user"},
-            ]})
+        if loss == "assignment":
+            retained = (ADMIN_LEAVES | EDITOR_LEAVES | READER_LEAVES | USER_LEAVES) - {"lumen-images_user"}
+            _directory_change(directory, {"owner_roles": sorted(retained)})
         else:
             revoked = api.delete(f"/v1/api-keys/{key_id}", headers=_OWNER_HEADERS)
             assert revoked.status_code in {200, 204}, revoked.text

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -17,8 +18,9 @@ from lumen.crypto import encrypt_chat_content
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import assets, credit
-from lumen.services.litellm_client import UsageCost
+from lumen.services.provider_metadata import UsageCost
 from lumen.services.providers import audio_transport, routing
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.errors import AmbiguousModelRouteError, ProviderValidationError
 from lumen.services.providers.pricing import (
     duration_cost_usd,
@@ -39,6 +41,7 @@ from lumen.services.run_store import (
 from lumen.services.usage_breakdown import UsageBreakdown
 
 from . import budgets
+from .admission import _intent_with_credential_authority
 from .common import _event, _factory, _fingerprint, _now, descriptor, wake_run
 from .errors import (
     DurableRunConflict,
@@ -192,13 +195,14 @@ class PreparedAudioRun:
 async def prepare_audio_run(request: dict, *, project_id: str, user_id: str,
                             source: str = "web", api_key_id: int | None = None,
                             operation: str | None = None,
-                            required_scopes: tuple[str, ...] | None = None) -> PreparedAudioRun:
+                            required_scopes: tuple[str, ...] | None = None,
+                            credential_authority: dict | None = None) -> PreparedAudioRun:
     """Freeze speech/transcription without inference or downloading source bytes."""
     if operation is not None:
         if operation not in {"audio.speech", "audio.transcriptions"}:
             raise DurableRunInputError("unsupported audio operation")
         request = {**request, "kind": "tts" if operation == "audio.speech" else "stt"}
-    intent = _intent(request)
+    intent = _intent_with_credential_authority(_intent(request), credential_authority)
     kind = intent["kind"]
     model_id, provider_id = intent["model_id"], intent["provider_id"]
     if not isinstance(model_id, str) or not model_id or (provider_id is not None and not isinstance(provider_id, (str, int))):
@@ -255,7 +259,10 @@ async def prepare_audio_run(request: dict, *, project_id: str, user_id: str,
         raise DurableRunInputError("audio credit reservation is invalid")
     pricing["bound_credits"] = format(bound, "f")
     capability = {key: route[key] for key in ("provider_id", "model_id", "provider_name", "model_name", "model_kind", "config_version_hash")}
+    capability.update(execution_identity(route))
     capability["effective_features"] = {}
+    if credential_authority is not None:
+        capability["credential_authority"] = deepcopy(credential_authority)
     scopes = required_scopes or ("native:audio:write", *(("native:assets:read",) if kind == "stt" else ()))
     return PreparedAudioRun(intent, capability, json.loads(json.dumps(pricing)), scopes,
                             intent.get("input_asset_id"), project_id, user_id)
@@ -265,6 +272,7 @@ async def persist_audio_run_in_transaction(
     session: AsyncSession, prepared: PreparedAudioRun, *, project_id: str, user_id: str,
     client_request_id: str, source: str = "web", api_key_id: int | None = None,
     workload_class: str | None = None, batch_id: str | None = None,
+    allowed_scopes: frozenset[str] | None = None,
 ) -> ChatRun:
     """Atomically bind a finite request in the caller's session; never commit, hold credit or wake.
 
@@ -278,6 +286,7 @@ async def persist_audio_run_in_transaction(
     if (prepared.project_id, prepared.user_id) != (project_id, user_id):
         raise DurableRunInputError("prepared audio owner changed")
     intent, capability, pricing = prepared.payload, prepared.capability_snapshot, prepared.pricing_snapshot
+    intent = _intent_with_credential_authority(intent, capability.get("credential_authority"))
     kind = intent["kind"]
     existing = (await session.execute(select(ChatRun).where(ChatRun.project_id == project_id,
         ChatRun.user_id == user_id, ChatRun.client_request_id == client_request_id)
@@ -289,7 +298,8 @@ async def persist_audio_run_in_transaction(
     route = await resolve_worker_route(session, run_kind=kind, workload_class=workload_class, batch_id=batch_id)
     await _lock_run_configurations(session, capability, model_name=capability["model_name"])
     await authorize_media_in_transaction(session, user_id=user_id, project_id=project_id,
-        api_key_id=api_key_id, required_scopes=prepared.required_scopes)
+        api_key_id=api_key_id, required_scopes=prepared.required_scopes, allowed_scopes=allowed_scopes,
+        credential_authority=capability.get("credential_authority"))
     run = ChatRun(id=str(uuid.uuid4()), run_scope="audio", run_kind=kind, project_id=project_id,
         user_id=user_id, model_name=capability["model_name"], source=source, api_key_id=api_key_id,
         workload_class=route.workload_class, worker_pool_id=route.worker_pool_id, batch_id=batch_id,
@@ -305,7 +315,9 @@ async def persist_audio_run_in_transaction(
         session.add(ChatRunAsset(run_id=run.id, asset_id=asset.id, purpose="input"))
     session.add(ChatRunProvider(run_id=run.id, purpose="executor", provider_id=capability["provider_id"],
         model_id=capability["model_id"], provider_label=capability["provider_name"],
-        model_label=capability["model_name"], config_version_hash=capability["config_version_hash"]))
+        model_label=capability["model_name"], config_version_hash=capability["config_version_hash"],
+        **{key: value for key, value in execution_identity(capability).items()
+           if key not in {"provider_auth", "provider_quota_group"}}))
     await append_event(session, run, _event(run, "run.started", {"conversation_id": None,
         "temp_thread_id": None, "model_name": run.model_name, "effective_features": {}, "run_kind": kind}))
     await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
@@ -314,16 +326,18 @@ async def persist_audio_run_in_transaction(
 
 async def admit_audio_run(request: dict, *, project_id: str, user_id: str, client_request_id: str,
                           source: str = "web", api_key_id: int | None = None,
-                          required_scopes: tuple[str, ...] | None = None):
+                          required_scopes: tuple[str, ...] | None = None,
+                          credential_authority: dict | None = None):
     from .admission import existing_run_for_intent
 
-    intent = _intent(request)
+    intent = _intent_with_credential_authority(_intent(request), credential_authority)
     previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
         client_request_id=client_request_id, intent=intent, conversation_id=None)
     if previous is not None:
         return previous
     prepared = await prepare_audio_run(request, project_id=project_id, user_id=user_id, source=source,
-                                       api_key_id=api_key_id, required_scopes=required_scopes)
+                                       api_key_id=api_key_id, required_scopes=required_scopes,
+                                       credential_authority=credential_authority)
     try:
         async with _factory()() as session, session.begin():
             run = await persist_audio_run_in_transaction(session, prepared, project_id=project_id, user_id=user_id,
@@ -459,6 +473,7 @@ async def _settle(run_id: str, *, owner: str, kind: str) -> None:
                 user_id=run.user_id, project_id=run.project_id, model_name=run.model_name,
                 provider=run.capability_snapshot["provider_name"], prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                 usage_cost=usage_cost, breakdown=breakdown,
+                execution_route=run.capability_snapshot,
                 margin_multiplier=Decimal(run.pricing_snapshot["margin_multiplier"]),
                 credit_per_usd=Decimal(run.pricing_snapshot["credit_per_usd"]), source=run.source,
                 api_key_id=run.api_key_id, run_id=run.id, usage_components=components)

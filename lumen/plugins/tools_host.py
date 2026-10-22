@@ -177,8 +177,8 @@ class ToolsAdvisorAccess:
             model_content=payload[:8_192],
             display=[ToolTextPart(text=payload[:8_192])],
             usage_components={"components": [
-                _usage("web_search_requests", "web_search_request_per_unit", "request", "search"),
-                _usage("web_search_context", f"web_search_context_{context_size}_per_unit", "context", "search"),
+                _usage("web_search_requests", "web_search_request_per_unit", "request", "search", route=route),
+                _usage("web_search_context", f"web_search_context_{context_size}_per_unit", "context", "search", route=route),
             ]},
         )
 
@@ -209,7 +209,7 @@ class ToolsAdvisorAccess:
             model_content=result.advice[:8_192],
             display=[],  # advisor output stays private
             usage_components={"components": [
-                _usage(kind, price_key, "token", "advisor", model_name=model_name) | {
+                _usage(kind, price_key, "token", "advisor", model_name=model_name, route=route) | {
                     "quantity": str(quantity),
                     **({"prompt_tokens": breakdown.input_tokens} if kind.startswith("advisor_cache_") else {}),
                 }
@@ -226,10 +226,16 @@ def _truncate_utf8(value: object, maximum_bytes: int) -> str | None:
     return value if len(encoded) <= maximum_bytes else encoded[:maximum_bytes].decode("utf-8", errors="ignore")
 
 
-def _usage(kind: str, price_key: str, unit: str, source: str, *, model_name: str | None = None) -> dict[str, str]:
+def _usage(kind: str, price_key: str, unit: str, source: str, *, model_name: str | None = None,
+           route: dict | None = None) -> dict[str, Any]:
     item = {"kind": kind, "price_key": price_key, "quantity": "1", "unit": unit, "source": source}
     if model_name is not None:
         item["model_name"] = model_name
+    if route is not None:
+        from lumen.services.providers.credentials import execution_identity
+
+        item["metadata"] = {**{key: value for key, value in execution_identity(route).items()
+                               if key != "provider_auth"}, "provider_id": route.get("provider_id")}
     return item
 
 

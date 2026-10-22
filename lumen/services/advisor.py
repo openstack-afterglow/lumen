@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from lumen.services import litellm_client
+from lumen.services import provider_client, provider_metadata
 from lumen.services.providers import routing as ps
 from lumen.services.usage_breakdown import UsageBreakdown
 
@@ -71,22 +71,21 @@ async def ask_with_route(
         {"role": "user", "content": f"Current goal:\n{goal[:_MAX_VISIBLE_CHARS]}"},
     ]
     try:
-        response = await litellm_client.acompletion(
+        response = await provider_client.acompletion(
             model=route["model_name"],
             messages=messages,
             custom_llm_provider=route["provider_type"],
             api_base=route.get("api_base"),
             api_key=route.get("api_key"),
             provider_auth=route.get("provider_auth"),
-            max_tokens=_MAX_ADVISOR_TOKENS,
-            extra={"stream": False},
+            max_tokens=None if route.get("provider_type") == "chatgpt" else _MAX_ADVISOR_TOKENS,
         )
     except Exception as exc:
         raise AdvisorError("selected advisor request failed") from exc
     advice = _response_text(response)
     if advice is None:
         raise AdvisorError("selected advisor returned no text")
-    breakdown = litellm_client.extract_usage_breakdown(
+    breakdown = provider_metadata.extract_usage_breakdown(
         route["model_name"],
         messages,
         advice,

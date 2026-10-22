@@ -28,17 +28,18 @@ from lumen.services import (
     credit,
     engine,
     extensions_store,
-    litellm_client,
     native_compaction,
+    provider_client,
+    provider_metadata,
     worker_routing,
 )
 from lumen.services import conversation_store as cs
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
-from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.inference_authority import authorize_run_generation, model_required_scopes, native_run_scopes
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
 from lumen.services.message_graph import reachable_message_clause, register_message
 from lumen.services.providers import routing as ps
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.run_store import (
     NONTERMINAL,
     RunStoreError,
@@ -375,6 +376,7 @@ async def _finish_transaction(
                 source=run.source,
                 api_key_id=run.api_key_id,
                 run_id=run.id,
+                execution_route=run.capability_snapshot,
                 breakdown=usage_record.get("breakdown"),
             )
             run.usage_reconciled_at = _now()
@@ -577,7 +579,7 @@ def _provider_credit_bound(run: ChatRun, *, messages: list[dict], tool_schemas: 
     route = (capabilities.get("summary_route") or capabilities.get("capabilities")) if summary else capabilities.get("capabilities")
     route = route if isinstance(route, dict) else capabilities
     limit = route.get("context_limit")
-    count = litellm_client.count_context_tokens(
+    count = provider_metadata.count_context_tokens(
         str(route.get("model_name") or run.model_name), messages, tool_schemas
     )
     try:
@@ -586,6 +588,8 @@ def _provider_credit_bound(run: ChatRun, *, messages: list[dict], tool_schemas: 
         raise DurableRunError("bounded credit pricing is unavailable") from exc
     priced_input = input_rate > 0
     priced_output = output_rate > 0
+    if priced_output and route.get("output_budget_enforced") is False:
+        raise DurableRunError("provider does not enforce a bounded output budget")
     if priced_input and (type(limit) is not int or limit <= 0):
         raise DurableRunError("bounded provider input requires a frozen context limit")
     if priced_output and (type(max_tokens) is not int or max_tokens <= 0):
@@ -621,6 +625,8 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
         rates = [Decimal(str(prices[key])) for key in keys if prices.get(key) is not None]
         if not rates or (max(rates) > 0 and (type(limit) is not int or limit <= 0)):
             raise DurableRunError("bounded advisor input requires frozen context limit")
+        if route.get("output_budget_enforced") is False and Decimal(str(prices["advisor_output_price_per_token"])) > 0:
+            raise DurableRunError("advisor does not enforce a bounded output budget")
         usd = max(rates) * (limit if type(limit) is int else 0) + Decimal(str(prices["advisor_output_price_per_token"])) * advisor._MAX_ADVISOR_TOKENS
     else:
         return Decimal("0")
@@ -644,9 +650,7 @@ class _DurableExecutionHooks:
         self.skill_snapshots = skill_snapshots or []
         self.user_id = user_id
         self.project_id = project_id
-        self.active_turn_ordinal: int | None = None
         self.force_compaction = False
-        self.active_message_id: str | None = None
         self._conversation_id: str | None = None
         self._temp_thread_id: str | None = None
 
@@ -757,7 +761,9 @@ class _DurableExecutionHooks:
                 segment_id=segment_id,
                 source="system",
                 model_name=route.get("model_name") or run.model_name,
-                metadata={"operation": "context_compaction"},
+                metadata={"operation": "context_compaction", **{
+                    key: value for key, value in execution_identity(route).items() if key != "provider_auth"
+                }, "provider_id": route.get("provider_id")},
             )
             await credit.apply_usage_in_transaction(
                 session,
@@ -776,6 +782,7 @@ class _DurableExecutionHooks:
                 api_key_id=getattr(run, "api_key_id", None),
                 run_id=str(run.id),
                 charge_wallet=False,
+                execution_route=route,
                 usage_components=components,
                 breakdown=breakdown,
             )
@@ -856,15 +863,15 @@ class _DurableExecutionHooks:
             raise DurableRunError("context compaction route is unavailable")
         segment_completed = False
         try:
-            response = await litellm_client.acompletion(
+            response = await provider_client.acompletion(
                 model=resolved_route["model_name"],
                 messages=messages,
                 api_base=resolved_route.get("api_base"),
                 api_key=resolved_route.get("api_key"),
                 custom_llm_provider=resolved_route.get("provider_type"),
                 provider_auth=resolved_route.get("provider_auth"),
-                max_tokens=output_bound,
-                temperature=0,
+                max_tokens=None if resolved_route.get("provider_type") == "chatgpt" else output_bound,
+                temperature=None if resolved_route.get("provider_type") == "chatgpt" else 0,
                 extra={"response_format": {"type": "json_object"}},
             )
             choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
@@ -886,7 +893,7 @@ class _DurableExecutionHooks:
             observed_usage = UsageBreakdown.from_runtime(usage)
             usage_payload = (
                 observed_usage
-                or litellm_client.extract_usage_breakdown(resolved_route["model_name"], messages, content, None)
+                or provider_metadata.extract_usage_breakdown(resolved_route["model_name"], messages, content, None)
             ).as_usage_dict()
             usage_payload["required_token_modalities"] = required_modalities
             await self._complete(
@@ -1129,7 +1136,7 @@ class _DurableExecutionHooks:
                 run_context={
                     "summary_context_limit": summary_context_limit,
                     "summary_output_reserve": 512,
-                    "summary_token_counter": lambda current, tools: litellm_client.count_context_tokens(
+                    "summary_token_counter": lambda current, tools: provider_metadata.count_context_tokens(
                         summary_model_name, current, tools
                     ),
                     "previous_summary": previous_summary,
@@ -1150,7 +1157,7 @@ class _DurableExecutionHooks:
                 {
                     "summary_context_limit": summary_context_limit,
                     "summary_output_reserve": 512,
-                    "summary_token_counter": lambda current, tools: litellm_client.count_context_tokens(
+                    "summary_token_counter": lambda current, tools: provider_metadata.count_context_tokens(
                         summary_model_name, current, tools
                     ),
                     "force_compaction": self.force_compaction,
@@ -1163,7 +1170,7 @@ class _DurableExecutionHooks:
                 },
                 token_counter=lambda current, tools: (
                     context_manager._count_result(
-                        current, tools, lambda m, t: litellm_client.count_context_tokens(run.model_name, m, t)
+                        current, tools, lambda m, t: provider_metadata.count_context_tokens(run.model_name, m, t)
                     )[0]
                     or 0
                 ),
@@ -1339,14 +1346,10 @@ class _DurableExecutionHooks:
         if turn is None:
             raise DurableRunError("failed to create a durable run turn")
         run.current_ordinal = turn_ordinal
-        self.active_turn_ordinal = turn_ordinal
-        if run.conversation_id is None:
-            self.active_message_id = f"temp:{run.id}:assistant:{turn_ordinal}"
-        else:
+        if run.conversation_id is not None:
             if turn.assistant_message_id is None:
                 raise DurableRunError("persistent run turn is missing its assistant message")
             run.assistant_message_id = turn.assistant_message_id
-            self.active_message_id = str(turn.assistant_message_id)
 
     async def _credit_lineage(self, session):
         """Acquire quota and lineage before the segment ledger, including on completion."""
@@ -1454,7 +1457,8 @@ class _DurableExecutionHooks:
                     await authorize_run_generation(session, run, resolved=summary)
                 else:
                     await authorize_api_key_in_transaction(session, api_key_id=run.api_key_id,
-                        user_id=run.user_id, project_id=run.project_id, required_scopes=tuple(sorted(scopes)))
+                        user_id=run.user_id, project_id=run.project_id, required_scopes=tuple(sorted(scopes)),
+                        credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
             except ApiKeyForbidden as exc:
                 raise DurableRunInputError("inference_authority_revoked") from exc
             except ApiKeyAuthorityUnavailable as exc:
@@ -1709,10 +1713,8 @@ class _DurableExecutionHooks:
             call_id=tool_call_id,
         )
 
-    async def replay_turn_projection(self) -> dict[str, Any]:
-        """Read the committed display projection for the active durable turn."""
-        if self.active_turn_ordinal is None:
-            raise DurableRunError("active durable turn is not set")
+    async def replay_turn_projection(self, *, turn_ordinal: int) -> dict[str, Any]:
+        """Read the committed display projection for one event-owned durable turn."""
         factory = _factory()
         async with factory() as session:
             run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id))).scalar_one()
@@ -1720,7 +1722,7 @@ class _DurableExecutionHooks:
                 await session.execute(
                     select(ChatRunTurn).where(
                         ChatRunTurn.run_id == self.run_id,
-                        ChatRunTurn.ordinal == self.active_turn_ordinal,
+                        ChatRunTurn.ordinal == turn_ordinal,
                     )
                 )
             ).scalar_one_or_none()
@@ -1843,7 +1845,13 @@ def _managed_usage_components(
                 "cost_usd": format(cost, "f"),
                 "source": source,
                 "model_name": record.get("model_name") if isinstance(record.get("model_name"), str) else model_name,
-                "metadata": {"unpriced": True} if unpriced and quantity > 0 else {},
+                "metadata": {
+                    **{key: value for key, value in (record.get("metadata") or {}).items() if key in {
+                        "provider_id", "provider_account_id", "provider_credential_id",
+                        "provider_credential_generation", "provider_backend", "provider_backend_version",
+                    } and value is not None},
+                    **({"unpriced": True} if unpriced and quantity > 0 else {}),
+                },
             }
         )
     return total.quantize(Decimal("0.0000000001"), rounding=ROUND_HALF_EVEN), components
@@ -2137,6 +2145,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             owner=owner,
         )
 
+    message_turn_ordinal = run.current_ordinal
     citations: list[dict[str, Any]] = []
     tool_invocations: dict[str, dict[str, Any]] = {}
     tool_results: dict[str, dict[str, Any]] = {}
@@ -2201,14 +2210,14 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         async with factory() as session, session.begin():
             run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one()
             _require_owned_running_lease(run, owner)
-            if execution_hooks.active_turn_ordinal is None:
+            if message_turn_ordinal is None:
                 raise DurableRunError("finalized durable turn is not set")
             turn = (
                 await session.execute(
                     select(ChatRunTurn)
                     .where(
                         ChatRunTurn.run_id == run.id,
-                        ChatRunTurn.ordinal == execution_hooks.active_turn_ordinal,
+                        ChatRunTurn.ordinal == message_turn_ordinal,
                     )
                     .with_for_update()
                 )
@@ -2361,14 +2370,14 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
 
         async def hydrate_replayed_turn() -> None:
             nonlocal hydrated_turn_ordinal, text, reasoning, pending_deltas, pending_first_at
-            if execution_hooks.active_turn_ordinal == hydrated_turn_ordinal:
+            if message_turn_ordinal == hydrated_turn_ordinal:
                 return
-            projection = await execution_hooks.replay_turn_projection()
+            projection = await execution_hooks.replay_turn_projection(turn_ordinal=message_turn_ordinal)
             text = [projection["text"]] if projection["text"] else []
             reasoning = [projection["reasoning"]] if projection["reasoning"] else []
             pending_deltas = {"text": [], "reasoning": []}
             pending_first_at = None
-            hydrated_turn_ordinal = execution_hooks.active_turn_ordinal
+            hydrated_turn_ordinal = message_turn_ordinal
 
         await credit.precheck(user_id, project_id, api_key_id=getattr(run, "api_key_id", None))
         engine_iterator = engine.stream(
@@ -2384,13 +2393,11 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             api_key=resolved.get("api_key"),
             provider_auth=resolved.get("provider_auth"),
             token_rates=pricing_snapshot.get("token_rates") or {},
-            max_tokens=payload.get("max_tokens"),
-            temperature=payload.get("temperature"),
+            max_tokens=(None if (capability_snapshot.get("provider_request_defaults") or {}).get("omit_output_budget")
+                        else payload.get("max_tokens")),
+            temperature=(None if (capability_snapshot.get("provider_request_defaults") or {}).get("omit_sampling")
+                         else payload.get("temperature")),
             reasoning_effort=payload.get("reasoning_effort"),
-            reasoning_can_be_disabled=reasoning_can_be_disabled(
-                resolved.get("capabilities"), resolved.get("provider_type")
-            ),
-            reasoning_route_key=resolved.get("config_version_hash"),
             response_format=_provider_response_format(payload.get("features")),
             selected_tool_ids=selected_tool_ids,
             selected_mcp_ids=selected_mcp_ids,
@@ -2406,7 +2413,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             execution_hooks=execution_hooks,
             execution_protocol_version=run.execution_protocol_version,
             lumen_snapshot=payload.get("lumen_snapshot") if isinstance(payload.get("lumen_snapshot"), dict) else None,
-            lumen_snapshot_frozen=run.execution_protocol_version == 2,
+            lumen_snapshot_frozen=True,
             approval_mode=approval_mode if isinstance(approval_mode, str) else None,
             workspace_write_mode=workspace_write_mode,
             resume=resume,
@@ -2447,15 +2454,42 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
                 break
             next_event_task = asyncio.create_task(anext(engine_iterator))
             ensure_lease()
-            active_message_id = execution_hooks.active_message_id
-            if active_message_id is not None and active_message_id != message_id:
-                if message_id is not None:
+            # The graph can prepare a later provider turn while these queued
+            # events are still draining. Its mutable active identity is not
+            # the identity of the event being persisted.
+            event_turn_ordinal = event.get("_durable_turn_ordinal", message_turn_ordinal)
+            if isinstance(event_turn_ordinal, bool) or not isinstance(event_turn_ordinal, int) or event_turn_ordinal < 0:
+                raise DurableRunError("durable event turn is invalid")
+            if (
+                event_turn_ordinal != message_turn_ordinal
+                or message_id is None
+                or (
+                    conversation_id is None and message_id == f"temp:{run_id}"
+                    and "_durable_turn_ordinal" in event
+                )
+            ):
+                async with factory() as session, session.begin():
+                    active_run = (
+                        await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())
+                    ).scalar_one()
+                    _require_owned_running_lease(active_run, owner)
+                    active_turn = await session.get(ChatRunTurn, (run_id, event_turn_ordinal))
+                    if active_turn is None or (conversation_id is not None and active_turn.assistant_message_id is None):
+                        raise DurableRunError("durable event turn is unavailable")
+                    active_message_id = (
+                        str(active_turn.assistant_message_id) if conversation_id is not None
+                        else f"temp:{run_id}:assistant:{event_turn_ordinal}"
+                    )
+                if message_id is not None and event_turn_ordinal > message_turn_ordinal:
                     if await flush_deltas():
                         return True
                     await finalize_current_turn()
+                message_turn_ordinal = event_turn_ordinal
                 message_id = active_message_id
                 text = []
                 reasoning = []
+                tool_invocations.clear()
+                tool_results.clear()
                 pending_deltas = {"text": [], "reasoning": []}
                 pending_first_at = None
                 hydrated_turn_ordinal = None
@@ -2745,7 +2779,8 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             segment_id="executor:aggregate",
             source="executor",
             model_name=resolved["model_name"],
-            metadata={},
+            metadata={**{key: value for key, value in execution_identity(resolved).items()
+                         if key != "provider_auth"}, "provider_id": resolved.get("provider_id")},
         )
         usage_components.extend(managed_components)
         usage_record = {

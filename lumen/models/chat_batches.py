@@ -182,7 +182,8 @@ class ChatBatchItem(Base):
     # Encrypted serialized bodies only; do not replace these with plaintext JSON.
     request_ciphertext: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
     result_ciphertext: Mapped[str | None] = mapped_column(MEDIUMTEXT)
-    # NULL until validation freezes these snapshots; no provider I/O precedes validation.
+    # Reduced native admission first freezes non-secret credential authority here;
+    # validation adds provider/pricing/scopes before any provider I/O is possible.
     capability_snapshot: Mapped[dict | None] = mapped_column(JSON)
     pricing_snapshot: Mapped[dict | None] = mapped_column(JSON)
     required_scopes: Mapped[list | None] = mapped_column(JSON)

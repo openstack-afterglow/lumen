@@ -85,16 +85,13 @@ def _require_supported_execution_protocol_version(version: int) -> None:
         raise DurableRunInputError("execution protocol version 2 requires an encrypted PostgreSQL checkpointer")
 
 
-async def _freeze_v2_lumen_snapshot(
+async def _freeze_lumen_snapshot(
     request_payload: dict[str, Any],
     *,
     user_id: str,
     project_id: str,
-    execution_protocol_version: int,
 ) -> dict[str, Any]:
     """Freeze the selected Lumen grant at run admission, never at worker execution."""
-    if execution_protocol_version != 2:
-        return request_payload
     from lumen.services import mcp_adapter as mcp_lumen
 
     try:

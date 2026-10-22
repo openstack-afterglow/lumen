@@ -1,6 +1,11 @@
 ---
 # Lumen kolla role defaults
 
+# Operator-owned overrides; config tasks create only the directory, never files.
+lumen_policy_directory: "/etc/kolla/lumen/policy"
+lumen_policy_file: "/etc/lumen/policy.yaml"
+lumen_policy_dirs: ["/etc/lumen/policy.d"]
+
 lumen_image_tag: "0.6.5"
 lumen_image_namespace: "ghcr.io/openstack-afterglow"
 lumen_api_image: "{{ lumen_image_namespace }}/lumen-api"
@@ -149,6 +154,11 @@ lumen_claude_gateway_provider: ""
 lumen_worker_concurrency: 4
 lumen_worker_heartbeat_seconds: 5
 lumen_worker_drain_seconds: 300
+
+# Per-process private provider child; included in the canonical service images.
+lumen_bifrost_executable: "/usr/local/bin/lumen-bifrost"
+lumen_bifrost_startup_seconds: 30
+lumen_bifrost_shutdown_seconds: 30
 
 # Agent runtime / autoscaling (plan Steps 2-4). Disabled by default on existing
 # installations. When enabled, the operator supplies the complete typed
@@ -300,6 +310,7 @@ lumen_services:
     restart_policy: unless-stopped
     volumes:
       - "/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro"
+      - "{{ lumen_policy_directory }}:/etc/lumen/policy.d:ro"
       - "kolla_logs:/var/log/kolla/"
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://{{ lumen_api_listen_address }}:{{ lumen_api_listen_port }}/v1/health', timeout=5); assert response.status == 200"]
@@ -318,7 +329,7 @@ lumen_services:
     command: ["python", "-m", "lumen.worker"]
     network_mode: host
     restart_policy: unless-stopped
-    volumes: "{{ ['/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro', 'kolla_logs:/var/log/kolla/'] + lumen_worker_runtime_volumes }}"
+    volumes: "{{ ['/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro', lumen_policy_directory ~ ':/etc/lumen/policy.d:ro', 'kolla_logs:/var/log/kolla/'] + lumen_worker_runtime_volumes }}"
 
   lumen-controller:
     container_name: lumen_controller
@@ -332,6 +343,7 @@ lumen_services:
     restart_policy: unless-stopped
     volumes:
       - "/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro"
+      - "{{ lumen_policy_directory }}:/etc/lumen/policy.d:ro"
       - "{{ lumen_controller_secrets_dir }}:/etc/lumen/controller:ro"
       - "kolla_logs:/var/log/kolla/"
 lumen_public_haproxy_services:

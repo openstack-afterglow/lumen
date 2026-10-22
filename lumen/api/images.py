@@ -6,7 +6,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
-from lumen.auth import Principal, require_scopes
+from lumen.auth import Principal, credential_authority_snapshot, require_scopes
 from lumen.models.api_requests import ImageEditRequest, ImageGenerationRequest
 from lumen.models.chat_contracts import ChatRunDescriptor
 from lumen.services import assets, credit
@@ -63,6 +63,7 @@ async def admit(
             source=principal.get("source", "web"),
             api_key_id=principal.get("api_key_id"),
             required_scopes=required_scopes,
+            credential_authority=credential_authority_snapshot(principal),
         )
     except (
         durable_errors.DurableRunError,

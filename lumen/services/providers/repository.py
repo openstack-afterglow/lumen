@@ -10,9 +10,10 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from lumen.crypto import encrypt_llm_provider_billing_admin_key, encrypt_llm_provider_key
 from lumen.db import mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
-from lumen.services.litellm_client import direct_provider_route
 from lumen.services.models_dev import ModelsDevCatalog
+from lumen.services.provider_metadata import direct_provider_route
 
+from .accounts import _provider, create_default, default_credential, validate_selection_policy
 from .billing import billing_admin_key_supported, billing_capability_for
 from .credentials import (
     api_key_source,
@@ -182,8 +183,10 @@ async def create_provider(
     margin_multiplier=1.0,
     models_dev_provider_id: str | None = None,
     is_active: bool = True,
+    selection_policy: str = "priority",
 ) -> dict:
     factory = _require_db()
+    validate_selection_policy(selection_policy)
     name = validate_provider_name(name)
     sort_order = validate_sort_order(sort_order)
     normalized_provider_type = (provider_type or "openai").strip()
@@ -205,25 +208,25 @@ async def create_provider(
         api_provider=api_provider,
         sort_order=sort_order,
         api_base=(api_base or None) if normalized_auth_mode == "api_key" else None,
-        encrypted_api_key=(
-            encrypt_llm_provider_key(api_key) if api_key and normalized_auth_mode == "api_key" else None
-        ),
+        accounts=[],
         encrypted_billing_admin_key=(
             encrypt_llm_provider_billing_admin_key(billing_admin_key)
             if billing_admin_key
             and billing_admin_key_supported(normalized_provider_type, normalized_auth_mode, api_base)
             else None
         ),
-        api_key_env=normalize_api_key_env(api_key_env) if normalized_auth_mode == "api_key" else None,
         auth_mode=normalized_auth_mode,
         margin_multiplier=_to_decimal(margin_multiplier, "margin_multiplier"),
         models_dev_provider_id=(models_dev_provider_id or None),
+        selection_policy=selection_policy,
         is_active=is_active,
     )
     try:
         async with factory() as session, session.begin():
             session.add(row)
             await session.flush()
+            await create_default(session, row, api_key=api_key if normalized_auth_mode == "api_key" else None,
+                                 api_key_env=api_key_env if normalized_auth_mode == "api_key" else None)
             return _provider_public(row)
     except IntegrityError as exc:
         raise ProviderValidationError(f"이미 존재하는 프로바이더 이름입니다: {name}") from exc
@@ -256,7 +259,10 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
         patch["sort_order"] = validate_sort_order(patch["sort_order"])
     try:
         async with factory() as session, session.begin():
-            row, _ = await _lock_mutable_route(session, provider_id=provider_id)
+            if set(patch) <= {"api_key", "api_key_env", "selection_policy", "selected_credential_id"}:
+                row = await _provider(session, provider_id)
+            else:
+                row, _ = await _lock_mutable_route(session, provider_id=provider_id)
             if row is None:
                 raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
             current_auth_mode = getattr(row, "auth_mode", "api_key")
@@ -278,7 +284,7 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 auth_mode=target_auth_mode,
                 api_base=patch.get("api_base", row.api_base),
                 api_key=patch.get("api_key"),
-                api_key_env=patch.get("api_key_env", row.api_key_env),
+                api_key_env=patch.get("api_key_env", (default_credential(row).api_key_env if default_credential(row) else None)),
                 billing_admin_key=patch.get("billing_admin_key"),
             )
             current_billing_capability = billing_capability_for(row.provider_type, current_auth_mode, row.api_base)
@@ -299,10 +305,16 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 row.auth_mode = target_auth_mode
             if "api_base" in patch:
                 row.api_base = patch["api_base"] or None
-            if "api_key" in patch:
-                row.encrypted_api_key = encrypt_llm_provider_key(patch["api_key"]) if patch["api_key"] else None
-            if "api_key_env" in patch:
-                row.api_key_env = normalize_api_key_env(patch["api_key_env"])
+            credential = default_credential(row)
+            if {"api_key", "api_key_env"} & patch.keys():
+                if credential is None:
+                    _, credential = await create_default(session, row)
+                if "api_key" in patch:
+                    credential.encrypted_api_key = encrypt_llm_provider_key(patch["api_key"]) if patch["api_key"] else None
+                if "api_key_env" in patch:
+                    credential.api_key_env = normalize_api_key_env(patch["api_key_env"])
+                credential.generation += 1
+                credential.subscription_status = "disconnected"
             if "billing_admin_key" in patch:
                 row.encrypted_billing_admin_key = (
                     encrypt_llm_provider_billing_admin_key(patch["billing_admin_key"])
@@ -311,6 +323,14 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 )
             elif target_billing_capability != current_billing_capability:
                 row.encrypted_billing_admin_key = None
+            if {"selection_policy", "selected_credential_id"} & patch.keys():
+                policy = patch.get("selection_policy", row.selection_policy)
+                selected = patch.get("selected_credential_id", row.selected_credential_id)
+                validate_selection_policy(policy, selected)
+                if selected is not None and not any(c.id == selected for a in row.accounts for c in a.credentials):
+                    raise ProviderValidationError("selected credential does not belong to endpoint")
+                row.selection_policy = policy
+                row.selected_credential_id = selected
             if patch.get("margin_multiplier") is not None:
                 row.margin_multiplier = _to_decimal(patch["margin_multiplier"], "margin_multiplier")
             if "models_dev_provider_id" in patch:
@@ -441,7 +461,7 @@ async def create_model(
                 api_provider=provider.api_provider,
                 provider_sort_order=provider.sort_order,
                 auth_mode=auth_mode,
-                api_key_configured=api_key_source(provider) is not None,
+                api_key_configured=any(api_key_source(credential) is not None for account in provider.accounts for credential in account.credentials),
                 api_base=provider.api_base,
             )
     except IntegrityError as exc:
@@ -475,7 +495,7 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
                     api_provider=provider.api_provider,
                     provider_sort_order=provider.sort_order,
                     auth_mode=getattr(provider, "auth_mode", "api_key"),
-                    api_key_configured=api_key_source(provider) is not None,
+                    api_key_configured=any(api_key_source(credential) is not None for account in provider.accounts for credential in account.credentials),
                     api_base=provider.api_base,
                 ))
             return public_models
@@ -629,7 +649,7 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 api_provider=provider.api_provider,
                 provider_sort_order=provider.sort_order,
                 auth_mode=auth_mode,
-                api_key_configured=api_key_source(provider) is not None,
+                api_key_configured=any(api_key_source(credential) is not None for account in provider.accounts for credential in account.credentials),
                 api_base=provider.api_base,
             )
     except IntegrityError as exc:
@@ -740,7 +760,7 @@ async def import_models_dev_prices(
                     api_provider=provider.api_provider,
                     provider_sort_order=provider.sort_order,
                     auth_mode=getattr(provider, "auth_mode", "api_key"),
-                    api_key_configured=api_key_source(provider) is not None,
+                    api_key_configured=any(api_key_source(credential) is not None for account in provider.accounts for credential in account.credentials),
                     api_base=provider.api_base,
                 ))
             return public_models

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from provider_fixtures import configured_provider
 from redis.asyncio import Redis
 from sqlalchemy import delete, func, select
 
@@ -59,12 +60,10 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
 
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(
-                name=f"integration-provider-{nonce}",
-                provider_type="openai",
-                is_active=True,
-                margin_multiplier=Decimal("1"),
-            )
+            provider = configured_provider(name=f"integration-provider-{nonce}",
+            provider_type="openai",
+            is_active=True,
+            margin_multiplier=Decimal("1"),)
             session.add(provider)
             await session.flush()
             session.add(
@@ -170,8 +169,8 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
 
                 return stream()
 
-            monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_litellm_stream)
-            monkeypatch.setattr(graph.litellm_client, "direct_openai_stream_completed", lambda _stream: True)
+            monkeypatch.setattr(graph.provider_client, "acompletion_stream", fake_litellm_stream)
+            monkeypatch.setattr(graph.provider_client, "direct_openai_stream_completed", lambda _stream: True)
             registration_id = await _fixed_text_worker(run_id, run_owner)
             assert await execution.execute_queued_run(run_id, owner=run_owner, registration_id=registration_id) is True
 
@@ -379,13 +378,11 @@ async def test_subscription_model_namespace_is_unique_under_concurrent_registrat
     try:
         async with factory() as session, session.begin():
             providers = [
-                LlmProvider(
-                    name=f"subscription-provider-{index}-{nonce}",
-                    provider_type="chatgpt",
-                    auth_mode="chatgpt_device",
-                    is_active=True,
-                    margin_multiplier=Decimal("1"),
-                )
+                configured_provider(name=f"subscription-provider-{index}-{nonce}",
+                provider_type="chatgpt",
+                auth_mode="chatgpt_device",
+                is_active=True,
+                margin_multiplier=Decimal("1"),)
                 for index in range(2)
             ]
             session.add_all(providers)
@@ -644,7 +641,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
 
                 return chunks()
 
-            monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_stream)
+            monkeypatch.setattr(graph.provider_client, "acompletion_stream", fake_stream)
             worker_identity = f"onboarding-worker-{nonce}"
             registration_id = await _fixed_text_worker(run_id, worker_identity)
             assert await execution.execute_queued_run(
@@ -684,4 +681,127 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
         if fake_thread is not None:
             fake_thread.join()
         await redis.close()
+        await close_db()
+
+
+async def test_persistent_tool_round_keeps_its_message_when_provider_advances(monkeypatch):
+    """A queued tool result belongs to its emitted turn, not the producer's latest turn."""
+    from lumen.models.chat_runs import ChatRunTurn
+
+    nonce = uuid.uuid4().hex
+    user_id, project_id = f"turn-user-{nonce}", f"turn-project-{nonce}"
+    model_name = f"turn-model-{nonce}"
+
+    async def current_authority(owner_user_id, owner_project_id):
+        assert (owner_user_id, owner_project_id) == (user_id, project_id)
+        return {"roles": ["member", "lumen-chat_user", "lumen-tools_user", "lumen-history_reader",
+                          "lumen-inventory_reader", "lumen-keys_editor"], "is_system_admin": False}
+
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
+    init_db(os.environ["DATABASE_URL"], pool_size=2, max_overflow=0)
+    factory = get_session_factory()
+    second_turn_started = asyncio.Event()
+    start_provider = execution._DurableExecutionHooks.provider_started
+    stream_events = execution.engine.stream
+
+    async def provider_started(self, **kwargs):
+        result = await start_provider(self, **kwargs)
+        if kwargs["round_index"] == 1:
+            second_turn_started.set()
+        return result
+
+    async def buffered_events(**kwargs):
+        queue = asyncio.Queue()
+        finished = object()
+
+        async def produce():
+            try:
+                async for event in stream_events(**kwargs):
+                    await queue.put(event)
+            except Exception as error:
+                await queue.put(error)
+            finally:
+                await queue.put(finished)
+
+        producer = asyncio.create_task(produce())
+        try:
+            while True:
+                event = await queue.get()
+                if event is finished:
+                    return
+                if isinstance(event, Exception):
+                    raise event
+                if event.get("type") == "tool_result":
+                    await asyncio.wait_for(second_turn_started.wait(), timeout=10)
+                yield event
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+
+    monkeypatch.setattr(execution._DurableExecutionHooks, "provider_started", provider_started)
+    monkeypatch.setattr(execution.engine, "stream", buffered_events)
+    provider_calls = 0
+
+    async def provider_stream(**kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        first = provider_calls == 1
+
+        async def chunks():
+            call = SimpleNamespace(index=0, id="turn-owned-call", function=SimpleNamespace(
+                name="list_my_conversations", arguments="{}"))
+            yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+                content=None if first else "The owned conversation lookup completed.",
+                tool_calls=[call] if first else None))],
+                usage={"prompt_tokens": 5, "completion_tokens": 2})
+
+        return chunks()
+
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", provider_stream)
+    monkeypatch.setattr(graph.provider_client, "direct_openai_stream_completed", lambda _: True)
+    try:
+        async with factory() as session, session.begin():
+            provider = configured_provider(name=f"turn-provider-{nonce}", provider_type="openai", is_active=True,
+                                   margin_multiplier=Decimal("1"))
+            session.add(provider)
+            await session.flush()
+            session.add(LlmModel(provider_id=provider.id, model_name=model_name, is_active=True,
+                                input_price=Decimal("0.000001"), output_price=Decimal("0.000002"),
+                                price_source="manual"))
+        key = await api_key_store.create_key(user_id, project_id, "turn ownership", ["models:read",
+            "native:conversations:read", "native:conversations:write", "native:runs:read",
+            "native:runs:write", "native:tools:execute"], None)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver",
+                               headers={"X-Api-Key": key["key"]}) as client:
+            created = await client.post("/v1/conversations", json={"title": "Owned turn fixture"})
+            assert created.status_code == 201, created.text
+            conversation_id = created.json()["id"]
+            admitted = await client.post(f"/v1/conversations/{conversation_id}/completions",
+                headers={"Idempotency-Key": str(uuid.uuid4())}, json={"model_id": model_name,
+                    "parts": [{"type": "text", "text": "Look up my conversations."}],
+                    "features": {"memory": False, "tool_policy": {"mode": "agent_default"}}})
+            assert admitted.status_code == 202, admitted.text
+            run_id = admitted.json()["run_id"]
+            identity = f"turn-worker-{nonce}"
+            registration_id = await _fixed_text_worker(run_id, identity)
+            await execution.execute_queued_run(run_id, owner=identity, registration_id=registration_id)
+            response = await client.get(f"/v1/runs/{run_id}")
+            assert response.status_code == 200 and response.json()["status"] == "completed"
+            async with factory() as session:
+                turns = (await session.scalars(select(ChatRunTurn).where(ChatRunTurn.run_id == run_id)
+                                               .order_by(ChatRunTurn.ordinal))).all()
+                assert [turn.ordinal for turn in turns] == [0, 1]
+                assistant_ids = [turn.assistant_message_id for turn in turns]
+            history = await client.get(f"/v1/conversations/{conversation_id}/messages")
+            assert history.status_code == 200, history.text
+            by_id = {message["id"]: message for message in history.json()["messages"]}
+            messages = [by_id[message_id] for message_id in assistant_ids]
+            assert all(message["status"] == "complete" for message in messages)
+            first_parts = messages[0]["parts"]
+            assert [part["type"] for part in first_parts] == ["tool_call", "tool_result"]
+            assert first_parts[0]["call_id"] == first_parts[1]["call_id"] == "turn-owned-call"
+            assert "Owned turn fixture" in str(first_parts[1]["content"])
+            assert messages[1]["content"] == "The owned conversation lookup completed."
+            assert all(part["type"] not in {"tool_call", "tool_result"} for part in messages[1]["parts"])
+    finally:
         await close_db()

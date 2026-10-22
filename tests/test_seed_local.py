@@ -242,12 +242,10 @@ def _setup_seed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, providers: dict
     from lumen.scripts import seed_local
 
     monkeypatch.setenv("DATABASE_URL", "mysql+aiomysql://lumen:lumen@localhost/lumen")
-    from lumen.service_authority import SERVICE_CAPABILITIES
-
     monkeypatch.setenv("LUMEN_LOCAL_OWNER_USER_ID", "keystone-owner-id")
     monkeypatch.setenv("LUMEN_LOCAL_OWNER_PROJECT_ID", "keystone-project-id")
     monkeypatch.setattr(seed_local, "resolve_project_authority", AsyncMock(return_value={
-        "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False,
+        "roles": ["lumen_admin"], "is_system_admin": False,
     }))
     monkeypatch.setenv("LUMEN_LOCAL_SEED_PATH", str(tmp_path / "api-key"))
     monkeypatch.setenv("LUMEN_LOCAL_CONNECTION_PATH", str(tmp_path / "connection.json"))
@@ -318,6 +316,24 @@ async def test_seed_rotates_owned_outdated_key_with_current_delete_scope(monkeyp
     revoke = AsyncMock()
     monkeypatch.setattr(local.api_key_store, "revoke_key", revoke)
     await local.seed()
+    revoke.assert_awaited_once_with(7, "keystone-owner-id", "keystone-project-id")
+    local.api_key_store.create_key.assert_awaited_once()
+    assert (tmp_path / "api-key").read_text() == "sk-afgl-new\n"
+
+
+async def test_seed_binds_idless_grade_authority_for_policy_and_key_rotation(monkeypatch, tmp_path):
+    local, _, _, _, _ = _setup_seed(monkeypatch, tmp_path, {}, [])
+    native = {"roles": ["lumen_admin"], "is_system_admin": False}
+    local.resolve_project_authority.return_value = native
+    (tmp_path / "api-key").write_text("sk-afgl-old\n")
+    local.api_key_store.verify_key.return_value = {
+        "user_id": "keystone-owner-id", "project_id": "keystone-project-id", "api_key_id": 7,
+        "scopes": ("models:read",),
+    }
+    revoke = AsyncMock()
+    monkeypatch.setattr(local.api_key_store, "revoke_key", revoke)
+    await local.seed()
+    assert native == {"roles": ["lumen_admin"], "is_system_admin": False}
     revoke.assert_awaited_once_with(7, "keystone-owner-id", "keystone-project-id")
     local.api_key_store.create_key.assert_awaited_once()
     assert (tmp_path / "api-key").read_text() == "sk-afgl-new\n"
@@ -426,3 +442,32 @@ async def test_seed_migrates_only_unmodified_legacy_binding_without_duplicating_
     update_provider.assert_awaited_once_with(7, {"api_key_env": "OPENAI_API_KEY"})
     create_model.assert_not_awaited()
     assert json.loads((tmp_path / "connection.json").read_text())["provider_api_key_configured"] is True
+
+
+async def test_seed_policy_override_denies_before_provider_or_key_changes_and_recovers(monkeypatch, tmp_path):
+    import os
+    from types import SimpleNamespace
+
+    from lumen import config, policy
+
+    local, bootstrap, create_provider, create_model, _ = _setup_seed(monkeypatch, tmp_path, {}, [])
+    path = tmp_path / "policy.yaml"
+    path.write_text('"native:keys:write": "!"')
+    monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(
+        oslo_policy_policy_file=str(path), oslo_policy_policy_dirs=[]))
+    policy._enforcer.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="policy permission"):
+            await local.seed()
+        bootstrap.assert_not_awaited()
+        create_provider.assert_not_awaited()
+        create_model.assert_not_awaited()
+        local.api_key_store.create_key.assert_not_awaited()
+        stamp = path.stat().st_mtime + 2
+        path.write_text('"native:keys:write": "role:lumen_admin"')
+        os.utime(path, (stamp, stamp))
+        await local.seed()
+        local.api_key_store.create_key.assert_awaited_once()
+        assert (tmp_path / "api-key").read_text() == "sk-afgl-new\n"
+    finally:
+        policy._enforcer.cache_clear()

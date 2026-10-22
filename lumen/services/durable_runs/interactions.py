@@ -737,9 +737,19 @@ async def expire_pending_inputs(*, limit: int = 100) -> list[str]:
             for approval in approvals:
                 if approval.status != "pending" or not _is_due(approval.expires_at, now):
                     continue
+                dispatch_hmac = _validated_approval_dispatch_hmac(run=run, approval=approval)
                 approval.status = "denied"
                 approval.decided_at = now
                 approval.decided_by_user_id = None
+                approval.decision_hmac = _approval_decision_hmac(
+                    dispatch_hmac=dispatch_hmac,
+                    owner_user_id=run.user_id,
+                    project_id=run.project_id,
+                    call_id=approval.call_id,
+                    decision="deny",
+                    decided_by_user_id=approval.decided_by_user_id,
+                    decided_at=approval.decided_at,
+                )
                 await append_event(
                     session,
                     run,

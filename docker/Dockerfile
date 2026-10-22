@@ -1,5 +1,18 @@
 ARG AFTERGLOW_CRYPTO_REF=""
 
+# Compile on the builder architecture, targeting each image's own platform.
+# The Go module and sums pin the provider source independently of Python wheels.
+FROM --platform=$BUILDPLATFORM golang:1.27.3 AS lumen-bifrost-builder
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /src
+COPY runtime/bifrost/go.mod runtime/bifrost/go.sum ./
+RUN go mod download
+COPY runtime/bifrost/ ./
+RUN case "$TARGETOS/$TARGETARCH" in linux/amd64|linux/arm64) ;; *) exit 1 ;; esac \
+    && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+       go build -mod=readonly -trimpath -buildvcs=false -o /out/lumen-bifrost ./cmd/lumen-bifrost
+
 FROM python:3.12-slim AS lumen-builder
 ARG AFTERGLOW_CRYPTO_REF=""
 
@@ -50,7 +63,7 @@ WORKDIR /app
 # The user, directories and their ownership come before the source COPYs so
 # this layer stays cached across code changes. COPY --chown replaces a
 # recursive chown, which copied the whole venv into another layer.
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" appuser \
     && adduser appuser root \
@@ -58,6 +71,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && chown appuser:appuser /app /app/.venv /app/lumen /app/lumen_console /app/packages /app/packages/lumen-plugin-api /app/plugins /data /seed
 
 COPY --from=lumen-builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --from=lumen-bifrost-builder /out/lumen-bifrost /usr/local/bin/lumen-bifrost
+COPY --from=lumen-bifrost-builder /src/NOTICE /src/LICENSE /usr/share/doc/lumen-bifrost/
 COPY --chown=appuser:appuser pyproject.toml uv.lock LICENSE ./
 COPY --chown=appuser:appuser lumen/ ./lumen/
 COPY --chown=appuser:appuser lumen_console/ ./lumen_console/
@@ -74,6 +89,7 @@ RUN python -m compileall -q lumen
 # Import the actual migration entry point without opening a database connection.
 # This catches missing workspace distributions or editable sources before deployment.
 RUN python -m lumen.scripts.migrate --help
+RUN lumen-bifrost --version
 
 FROM lumen-runtime AS lumen-api
 CMD ["uvicorn", "lumen.main:app", "--host", "0.0.0.0", "--port", "8012"]
@@ -90,7 +106,7 @@ FROM python:3.12-slim AS lumen-test
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl openssl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl openssl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" appuser \
     && adduser appuser root \
@@ -98,6 +114,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl openssl \
     && chown appuser:appuser /app /app/.venv /app/lumen /app/lumen_console /app/packages /app/packages/lumen-plugin-api /app/plugins /app/tests /data /seed
 
 COPY --from=lumen-test-builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --from=lumen-bifrost-builder /out/lumen-bifrost /usr/local/bin/lumen-bifrost
+COPY --from=lumen-bifrost-builder /src/NOTICE /src/LICENSE /usr/share/doc/lumen-bifrost/
 COPY --chown=appuser:appuser pyproject.toml uv.lock LICENSE ./
 COPY --chown=appuser:appuser lumen/ ./lumen/
 COPY --chown=appuser:appuser lumen_console/ ./lumen_console/
@@ -114,6 +132,7 @@ ENV PYTHONPATH="/app/sdk"
 USER appuser
 
 RUN python -m compileall -q lumen tests
+RUN lumen-bifrost --version
 
 CMD ["pytest", "-m", "system", "tests/system"]
 

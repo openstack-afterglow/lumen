@@ -17,6 +17,17 @@ Lumen은 목적과 권한 수준에 따라 3가지 연동 프로필을 제공합
 
 > **선택 기준**: `model="lumen"`은 OpenAI SDK 포맷으로 백엔드 durable worker 실행과 대화하며, 특정 provider model ID 지칭 시 stateless completion 중계로 동작합니다. 대화 이력 영속화, 서버 관리형 도구/스킬/메모리, 중단-승인(Human-in-the-loop) 및 복구가 필요한 경우 Native Durable 프로필을 사용합니다.
 
+### Current private transport/account cutover (unpublished local source)
+
+Public endpoint, caller authentication, model ID/provider selector, scope and durable replay contracts remain Lumen-owned. Runtime LiteLLM has been replaced by `provider_client` (request/stream/error ownership), `provider_metadata` (offline pricing/token estimates), `bifrost_runtime` (authenticated per-process loopback child) and pinned Apache-2.0 Bifrost **converters with Lumen-owned one-send HTTP**, not the stock gateway. Native Responses/Messages/count_tokens preserve native body/SSE fidelity; official OpenAI chat-shaped requests retain the Responses bridge and custom OpenAI bases retain Chat Completions. Same-request retries, shadows, fallback, engine switches and key/account rotation are not permitted; unknown results keep their holds/checkpoints.
+
+Admission selects one endpoint-owned account/credential using explicit/priority/weighted policy and freezes the full secret-free provider/account/credential/generation/auth-mode/model/operation reference. Current enabled state, expiry/cooldown and model/operation policy are checked at every new I/O against that same identity. `allowed_capabilities` are operation tags (`chat,responses,messages,count_tokens,embeddings,search,image,tts,stt,realtime`); `null` is unrestricted and `[]` denies all. Callers do not pick private accounts or submit provider secrets in inference requests. Direct media/search/Codex retain explicit backend labels (`lumen-media-direct:1`, `lumen-search-http:1`, `lumen-codex-http:1`); text converter identity is `bifrost` plus the pinned version. All allocations share the one customer debit transaction; historical missing identity remains unknown.
+
+Afterglow's administrator `ProviderAccountsPanel` calls `/api/v1/chat/admin/providers/{provider_id}/accounts...`; the authenticated BFF preserves caller/project and forwards `/v1/admin/providers/{provider_id}/accounts...`. Native human system-admin authority remains final. CRUD, account usage, endpoint policy, credential token upload/disconnect and credential-specific device start/poll/cancel are documented in [API reference](api-reference.md#provider-account-and-credential-administration) and [native SDK](sdk.md#keystone-administrator-accountcredential-methods). Provider BFF responses and handled failures are no-store; safe metadata never reads back key/token/ciphertext. The nine-locale administrator UI clears transient secrets/device polling on close, provider/auth/project/session changes and destruction, and fences stale asynchronous responses. API-key/environment, subscription OAuth and organization billing-admin credentials remain separate. Consumer subscription protocol support is not provider permission for public multi-user pooling.
+
+“LiteLLM catalog” below means the bundled byte-identical **1.93.0 historical metadata** asset used offline by `provider_metadata`, not installed runtime code or live price discovery. Existing `litellm` price-source labels and MIT license/NOTICE are retained; manual/stored models.dev values keep precedence. Bundled tiktoken assets never download at admission and context estimates are not observed usage/cache hits. Deployment requires matching native Go binary, stopped-writer backup, migration027/rerun and coordinated API/worker cutover; see [operations](operations.md#private-provider-runtime-and-migration027-cutover). Historical CLI/provider receipts below do not qualify this new runtime; current incomplete verification is in [testing](testing.md#private-bifrost-and-account-pools-2026-10-22-local-only).
+
+
 ---
 
 ## 2. Origin 및 Base URL 규칙
@@ -171,7 +182,7 @@ claude
 
 Claude Code 2.1.278의 direct stream과 local `Bash` tool→native `tool_result` continuation을 격리된 실제 CLI process에서 확인했습니다. Lumen은 현재 client의 명시적 `context_management`와 `output_config`, native tool/thinking block, bounded `anthropic-*` protocol-header namespace를 보존합니다. Caller `Authorization`과 `x-api-key`는 provider credential로 전달하지 않습니다.
 
-Auto mode의 Claude Code는 server-side classifier review용 top-level `safeguards`와 `dangerous-tool-use-*` beta를 보냅니다. Lumen의 LiteLLM transport는 이를 upstream까지 전달할 수 없으므로 `400 invalid_request_error`(`safeguards: Extra inputs are not permitted`)로 거부하고, Claude Code는 같은 세션에서 두 값을 빼고 재시도한 뒤 자체 classifier를 일반 `/v1/messages` 호출로 실행합니다. 2026-10-07 실제 Claude Code 2.1.287과 2.1.292의 auto mode에서 400→재시도→classifier→`Bash`→최종 응답을 synthetic upstream으로 확인했습니다. Classifier 호출 model은 2.1.287이 session model, 2.1.292가 `claude-sonnet-5`였으므로 해당 model도 Lumen에서 활성이어야 합니다.
+Auto mode의 Claude Code는 server-side classifier review용 top-level `safeguards`와 `dangerous-tool-use-*` beta를 보냅니다. Lumen의 public Messages schema는 이 확장 계약을 지원하지 않아 `400 invalid_request_error`(`safeguards: Extra inputs are not permitted`)로 거부합니다. Claude Code는 같은 세션에서 두 값을 빼고 새 요청을 보낸 뒤 자체 classifier를 일반 Messages 호출로 실행합니다. 이는 Lumen의 same-request provider 재시도가 아닙니다. 2026-10-07 과거 LiteLLM transport에서 실제 Claude Code2.1.287/2.1.292의400→새 요청→classifier→Bash→최종 응답을 synthetic upstream으로 확인했습니다. Classifier model은 각각 session model/claude-sonnet-5였으므로 해당 model도 활성이어야 합니다. 새 converter의 CLI acceptance와는 별개입니다.
 
 Configured `/v1/claude-gateway` device routes는 Lumen custom protocol입니다. Current Claude Apps Gateway login은 administrator-managed `forceLoginGatewayUrl`, official `/protocol`, OIDC device authorization, refresh session을 요구하므로 이 custom route를 Claude Code `/login` 대체로 광고하지 않습니다. 기존 grant는 10분, custom credential은 24시간이고 one-time consume·fixed scopes·Redis/MariaDB fail-closed 보안 계약은 그대로 유지됩니다.
 
@@ -269,7 +280,7 @@ codex() {
 
 Codex의 `prompt_cache_key`는 provider transport로 전달합니다. 로컬 installation/session/turn 식별자가 포함된 `client_metadata`는 Lumen이 호환 입력으로 소비하되 외부 model provider에는 전달하지 않습니다. 알 수 없는 다른 request field는 계속 422로 거부합니다. 모델 catalog가 없을 때 Codex의 metadata fallback 경고는 비치명적이지만, 운영 설정에는 provider가 공개한 정확한 `model_context_window` 또는 검증된 `model_catalog_json`만 사용합니다.
 
-Codex의 알 수 없는 모델 metadata fallback은 실제 reasoning 지원 여부를 증명하지 않습니다. Responses transport는 관리자의 명시적 `reasoning=false` override 또는 LiteLLM의 **정확한 모델 ID** catalog에서 추론 미지원이 확인될 때만 `reasoning`과 `reasoning.*` include를 제외합니다. 카탈로그에 없는 모델은 probe 결과가 `false`여도 reasoning 요청을 보존하며, provider의 실제 400은 비밀 정보를 제거한 400으로 반환해 Codex의 502 재시도를 피합니다.
+Codex unknown-model metadata fallback은 reasoning 지원 여부를 증명하지 않습니다. Responses는 관리자의 명시적 reasoning=false override 또는 bundled historical catalog의 **정확한 모델 ID**에서 미지원이 확인될 때만 reasoning과 reasoning.* include를 제외합니다. Unknown은 요청을 보존하고 provider400은 상세를 제거한400으로 반환하며502로 위장하지 않습니다.
 
 2026-09-20에 설치된 `codex-cli 0.154.0`을 격리된 `CODEX_HOME`, `--strict-config`, bearer API key로 실제 containerized Lumen에 연결했습니다. Text turn이 성공했고 `exec_command` function call이 로컬에서 `CODEX_TOOL_OK`를 출력한 뒤, Codex가 `function_call_output`을 포함한 두 번째 full-input 요청을 보내 `CODEX_TOOL_CONTINUATION_OK`로 완료했습니다. 이 증거는 Lumen API와 synthetic provider의 wire/tool loop를 검증하며 live external model 품질이나 Keystone 배포를 증명하지 않습니다.
 
@@ -285,7 +296,7 @@ Codex의 알 수 없는 모델 metadata fallback은 실제 reasoning 지원 여�
 
 ## 5. 모델 디스커버리 및 Provider Credential 상태
 
-* `GET /v1/models` (OpenAI 호환 포맷): 표준 필드(`id`, `object`, `created`, `owned_by`)에 더해 같은 공개 ID를 제공하는 활성 `api_provider` 선택자의 `providers` 배열을 반환합니다. `id`는 SDK가 보내는 공개 `model` 값이며 내부 LiteLLM route key가 아닙니다.
+* `GET /v1/models` (OpenAI 호환 포맷): 표준 `id,object,created,owned_by`와 같은 공개ID의 활성 `api_provider` 선택자 `providers` 배열을 반환합니다. `id`는 SDK의 공개 model 값이며 내부 transport route나 account/credential ID가 아닙니다.
 * `GET /v1/chat/models` (Native 상세 포맷): 각 모델의 공개 `api_model_name`, `api_provider`, 표시 `provider`, 실제 연결 `provider_type`, stable `provider_id`와 운영용 내부 `model_name`을 분리합니다. Provider `provider_sort_order`·provider ID·model `sort_order`·model ID 순으로 반환하고 `provider_api_key_configured` 및 `reasoning_none_supported`를 포함합니다. `reasoning_none_supported=false`인 모델에 `reasoning_effort="none"`을 보내면 422이므로 UI는 이 값이 true일 때만 "없음"을 노출합니다.
   * `true`: 해당 모델의 provider API Key가 Lumen 서버에 정상 설정(DB 또는 환경 변수 `api_key_env`)되어 있음.
   * `false`: 명시적인 provider API Key가 등록되지 않음 (`false`인 모델 호출 시 completion 시점에 502/400 오류 발생 가능).
@@ -314,7 +325,7 @@ Perplexity provider는 base URL로 transport를 명시합니다.
 
 | Base URL | 실행 경로 | 내부 route |
 | --- | --- | --- |
-| `https://api.perplexity.ai/v1` | pinned LiteLLM Responses transport (`POST /v1/responses`; current Agent endpoint compatibility requires live confirmation) | 공개 ID에 `perplexity/` transport namespace를 한 번 더 붙인 LiteLLM route |
+| `https://api.perplexity.ai/v1` | owned Responses-native forwarding (`POST /v1/responses`; current Agent endpoint compatibility requires separate live confirmation) | 공개 ID에 `perplexity/` transport namespace를 한 번 더 붙인 저장 route; private converter에서 wire model 정규화 |
 | `https://api.perplexity.ai/router` 또는 `/router/v1` | OpenAI 호환 Router | `openai/<공개 ID>` |
 | 기존 `/v1`이 없는 Sonar 설정 | 기존 Chat Completions 호환 경로 | 저장된 legacy route 유지 |
 
@@ -324,11 +335,11 @@ Perplexity `/v1/models`와 `/router/v1/models` discovery 결과는 공개 canoni
 
 Native completion의 `features.web_search`는 실행 소유자를 명시합니다. 기존 서버-managed search는 `{"enabled": true, "mode": "managed", "provider_id": <id>}`이며, 선택된 search provider route와 기존 usage component 가격을 사용합니다. Provider-native search는 `{"enabled": true, "mode": "native", "provider_id": null}`이며 현재 chat model의 frozen executor route만 사용하고 managed provider를 선택하거나 호출하지 않습니다.
 
-Native mode는 provider가 지원하는 경우 `context_size`와 완전한 approximate location (`city`, `country`, `region`, `timezone`)을 LiteLLM mapper로 전달합니다. 도메인 allow/block 및 `max_uses`는 managed mode 전용이므로 native request에서 거부됩니다. `effective_capabilities.feature_gates.web_search`의 `mode="native"`, `available`, `pricing_available`는 opt-in 가능성만 결정하며, 검색이 실제 실행되었다는 증거가 아닙니다. `capabilities.web_search_required=true`인 Sonar 같은 모델은 이미 always-on search를 실행하므로 중복 hosted search tool을 주입하지 않습니다. Perplexity Agent의 [공식 hosted `web_search` tool](https://docs.perplexity.ai/docs/agent-api/tools/web-search)은 non-Sonar native opt-in에서 function tool과 함께 전달됩니다. Lumen은 모든 function declaration을 runtime에서 검증하며, `additionalProperties=false`이고 모든 object property가 required인 재귀적으로 closed schema에만 `strict=true`를 붙입니다. pinned LiteLLM bridge가 해당 OpenAI envelope을 Agent의 flat `type`/`name`/`description`/`parameters` wire shape로 변환합니다.
+Native mode는 provider가 지원할 때 context_size와 완전한 approximate location(city,country,region,timezone)을 owned request/converter 경계로 전달합니다. Domain allow/block와 max_uses는 managed 전용이며 native에서는 거부합니다. `effective_capabilities.feature_gates.web_search`는 opt-in 가능성이지 실행 증거가 아닙니다. `web_search_required=true`인 Sonar에 중복 hosted tool을 주입하지 않습니다. Non-Sonar native opt-in의 [공식 hosted web_search](https://docs.perplexity.ai/docs/agent-api/tools/web-search)는 function tool과 공존합니다. Function arguments는 runtime 검증하며 재귀적으로 closed/required schema에만 strict=true를 붙이고 actual Agent wire shape는 pinned converter acceptance로 검증합니다.
 
 Provider가 URL citation 또는 `url_citation` annotation을 반환하면 Lumen은 URL, title, valid inline range를 canonical citation part로 durable run 결과에 저장합니다. 이 durable citation event/part가 실제 native-search source evidence이며, configured capability만으로 source나 search-success projection을 만들지 않습니다. 선택 모델의 complete token price가 없으면 admission은 `pricing_unavailable`으로 fail closed 합니다. Native Search는 기존 token 기반 크레딧 계약을 유지하며 provider의 별도 검색 요청/툴 부가요금은 크레딧 계산에 포함하지 않습니다. 따라서 로컬 크레딧 비용을 provider 최종 청구 총액으로 해석하면 안 됩니다. Managed 검색의 별도 usage component 과금은 그대로 유지합니다.
 
-Perplexity 출처는 LiteLLM Chat Completions의 `citations`, `search_results`, message annotations뿐 아니라 Agent `response.reasoning.search_results`, `response.output_item.added`/`response.output_item.done`의 `type="search_results"`, `response.completed.output`의 search-result item에서도 수집합니다. 메타데이터만 있는 chunk는 `delta.provider_specific_fields.search_results`로 LiteLLM의 빈 delta 제거를 통과하며, 같은 URL의 title/snippet 보강은 이미 받은 inline range를 지우지 않습니다. 실제 provider가 반환하지 않거나 과거에 저장되지 않은 출처는 복원해 만들지 않습니다.
+Perplexity 출처는 Chat Completions의 citations/search_results/annotations, Agent response.reasoning.search_results, search_results output-item events와 response.completed.output에서 수집합니다. Owned normalization은 metadata-only chunk와 URL별 title/snippet 보강을 보존하고 기존 inline range를 지우지 않습니다. 실제 provider가 반환하지 않거나 과거 저장되지 않은 출처는 만들지 않습니다. 과거 LiteLLM empty-delta workaround는 현재 runtime 의존성이 아닙니다.
 
 Perplexity fallback은 공개 ID뿐 아니라 실제 API base도 구분합니다. [공식 Agent 모델 가격](https://docs.perplexity.ai/docs/agent-api/models)의 `perplexity/sonar`는 입력 $0.25/M·출력 $2.50/M이며 legacy Sonar API의 $1/M·$1/M과 다릅니다. 같은 문서의 exact `perplexity/glm-5.3` 가격은 $1.40/M·$4.40/M입니다. 수동/검토된 가격은 이 fallback보다 우선하며 미등록 모델 suffix에 가격을 추정하지 않습니다.
 
@@ -336,7 +347,7 @@ Perplexity fallback은 공개 ID뿐 아니라 실제 API base도 구분합니다
 
 첫 완료된 user/assistant 교환의 제목은 frozen summary route를 쓰는 durable title job이 생성합니다. UI는 서버의 `title_status`를 정본으로 사용해야 하며 로컬 대기 시간만으로 `pending`을 `failed`로 바꾸면 안 됩니다. worker는 idle 시 분당 한 번, 기존 job이 없는 active `auto/idle/revision=0` 대화의 완료된 첫 교환을 복구합니다. 빈 대화는 후보에서 제외하고 route/source가 없는 후보는 `unavailable`로 종료하여 뒤 후보를 막지 않습니다. legacy/수동/실패/삭제된 대화와 불확실한 provider 호출은 재실행하지 않습니다. 수동 제목 수정은 source/status와 revision을 원자적으로 갱신하여 늦은 자동 결과를 차단합니다. 로컬 seeded API key는 native conversation read/write scope를 포함하지만 production 인증 정책은 바꾸지 않습니다.
 
-Context preview는 exact LiteLLM `max_input_tokens`와 검토된 override를 사용합니다. 저장 route `perplexity/perplexity/sonar`는 catalog의 `perplexity/sonar`로 조회하며 입력 한도는 128000입니다. 등록되지 않은 GLM-5.3 같은 모델에 가족 모델의 한도나 `max_tokens`를 대입하지 않습니다. 알려진 입력 예산에서는 `input_budget - input_tokens`가 남은 용량이고, `measurement`가 tokenizer/estimated/unknown을 구분합니다.
+Context preview는 provider_metadata의 exact bundled historical max_input_tokens와 검토된 override를 사용합니다. 저장 route perplexity/perplexity/sonar는 exact catalog perplexity/sonar로 조회하며 입력 한도128000입니다. 미등록 GLM-5.3 등에 가족 모델 한도/max_tokens를 대입하지 않습니다. 알려진 예산의 remaining=input_budget-input_tokens이며 measurement는 tokenizer/estimated/unknown을 구분합니다. Offline BPE는 provider framing을 관측하지 않고 image는 역사적250token 추정, audio/video/file은 unknown입니다.
 
 | Reason code | 의미 |
 | --- | --- |
@@ -354,12 +365,14 @@ Context preview는 exact LiteLLM `max_input_tokens`와 검토된 override를 사
 | --- | --- |
 | `messages` / `system_prompt` / `summary` | 활성 경로 메시지·대화 자체의 지침·압축 요약 투영 |
 | `memory` / `workspace` / `skills` / `agent` | `_apply_context`가 선주입한 system preamble; `items`는 이름/ID만 노출 |
-| `tools` / `mcp_tools` | 실제 요청에 실린 function·MCP 스키마. preview는 MCP 원격 discovery를 하지 않으므로 `included=false`, `count=null`이고 `uncounted`에 포함됩니다 |
-| `deferred_tools` | 최초 요청에 실리지 않는 재료(`load_policy=on_demand` 확장은 `list_available_tools` 이후에만 적재, managed 도구는 현재 어떤 binding 경로에서도 노출되지 않음). 예산에 포함되지 않으므로 `complete`를 떨어뜨리지 않습니다 |
+| `tools` / `mcp_tools` | 실제 요청에 실린 function·MCP 스키마. preview가 원격 MCP discovery를 생략하는 항목은 `included=false`, `count=null`로 `uncounted`에 남깁니다. 이미 알려진 내장 schema와 원격 discovery는 구분합니다 |
+| `deferred_tools` | 최초 요청에 실리지 않는 `load_policy=on_demand` 확장과 선택된 managed 재료. on-demand 확장은 `list_available_tools` 이후에만 적재하고, managed search/fetch/advisor schema의 기존 비노출 경로는 바꾸지 않습니다. 예산에 포함되지 않는 재료는 `complete`를 떨어뜨리지 않습니다 |
 | `attachments` | 텍스트 투영이 표현하지 못하는 non-text 입력 파트 |
 | `overhead` | 요청 framing/priming 토큰 |
 
 Preview의 tool 스키마 집합은 실행기가 실제로 보내는 집합(내장 도구 + `list_available_tools` 카탈로그 + `preloaded` 확장)과 정확히 일치합니다. 커스텀 도구 이름·스키마는 binding과 동일한 투영(`custom__{id}__{name}_{digest}` + `additionalProperties=false`)을 공유하며, 정규 destination이 없어 binding이 제외하는 확장은 preview에서도 계수하거나 deferred로 제시하지 않습니다.
+
+Afterglow MCP가 활성화되어도 최초3개 schema(`list_my_conversations`, `get_conversation_detail`, `list_available_tools`)만 보이는 것은 정상 지연 로딩입니다. Catalogue는 같은 user/project에 명시적으로 선택된 위임 snapshot의 cloud read 도구를 한국어 클라우드·가상머신·스토리지 capability 검색으로 찾고 적재합니다. Legacy chat은 manage 위임에서도 mutation을 노출하지 않습니다. 모든 durable admission은 선택 snapshot이나 absence를 고정하며, disabled/foreign/stale/revoked snapshot을 현재 선택이나 privileged credential로 대신하지 않습니다.
 
 모델 한도를 알 수 없거나(`context_window_unknown`) 토큰 계수가 불가능해도(`token_count_unavailable`) breakdown은 사라지지 않습니다. 계수가 가능하면 값이 있는 완전한 구성을 그대로 제공하고, 계수가 불가능하면 토큰만 `null`로 비운 뒤 이름·개수를 유지한 채 `complete=false`로 보고합니다. `items[]`는 128개로 제한되지만 `count`는 잘리기 전 실제 총계입니다. request scope에서 모델이 `list_available_tools`로 적재한 도구는 `deferred_tools`에서 제거되어 `tools`/`mcp_tools`로 계수되므로, 같은 도구가 포함과 지연에 동시에 나타나지 않습니다.
 
@@ -406,7 +419,7 @@ Lumen 호환 API는 공급사(OpenAI/Anthropic)의 전체 API 동등성을 보�
 ### 6.2 Output token budget
 
 * OpenAI path에서 token budget을 생략하면 기존 기본값 **4096**을 사용합니다.
-* 클라이언트가 명시한 양수 `max_tokens`/`max_output_tokens`는 4096으로 잘리지 않고 provider/model validation 경계까지 그대로 전달됩니다. 0 이하 값은 request validation 또는 호환 오류로 거부됩니다.
+* 클라이언트가 명시한 양수 `max_tokens`/`max_output_tokens`는 임의4096 cap이나 converter 최소값으로 바꾸지 않고 provider/model validation 경계까지 보존해야 합니다.0이하는 request/compat validation 오류입니다. **현재 converter 전체 수용은 미완료**이며 full Go에서13→16 clamp가 발견되어 수정·재검증 중입니다. 이 문장은 required contract이지 현재 passing receipt가 아닙니다. [현재 검증](testing.md#private-bifrost-and-account-pools-2026-10-22-local-only)을 따릅니다.
 * Native durable admission의 별도 4096 output cap은 유지되며 compat provider-direct contract와 혼동하지 않습니다.
 
 ---

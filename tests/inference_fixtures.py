@@ -18,7 +18,7 @@ def synthetic_inference_store(monkeypatch, current_project_authority):
     key = SimpleNamespace(id=7, owner_user_id="u1", owner_project_id="p1", is_active=True,
                           revoked_at=None, expires_at=None, scopes=list(api_key_store.API_KEY_SCOPES))
     run = SimpleNamespace(user_id="u1", project_id="p1", api_key_id=7, source="web",
-                          run_scope="persistent", conversation_id="c1")
+                          run_scope="persistent", conversation_id="c1", capability_snapshot={})
 
     class Session:
         async def __aenter__(self):

@@ -11,7 +11,8 @@ import hashlib
 import json
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Literal
@@ -39,6 +40,7 @@ from lumen.services import auxiliary
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, current_api_key_scopes
 from lumen.services.credit import QuotaExceeded
 from lumen.services.durable_runs import api_completion, audio, images, lifecycle
+from lumen.services.durable_runs.admission import _intent_with_credential_authority
 from lumen.services.durable_runs.budgets import retry_deadlocks
 from lumen.services.durable_runs.common import wake_run
 from lumen.services.durable_runs.errors import DurableRunConflict, DurableRunInputError
@@ -214,8 +216,9 @@ async def _owned(session, *, project_id, user_id, batch_id, contract=None, lock=
     return row
 
 
-async def _create(*, project_id, user_id, api_key_id, contract, key_hash, request, input_file_id=None):
-    fingerprint = _hash(_json(request.model_dump(mode="json")))
+async def _create(*, project_id, user_id, api_key_id, contract, key_hash, request, input_file_id=None,
+                  credential_authority=None):
+    fingerprint = _hash(_json(_intent_with_credential_authority(request.model_dump(mode="json"), credential_authority)))
 
     async def transaction():
         async with _factory()() as session, session.begin():
@@ -253,7 +256,9 @@ async def _create(*, project_id, user_id, api_key_id, contract, key_hash, reques
                 for ordinal, item in enumerate(request.items, 1):
                     session.add(ChatBatchItem(batch_id=row.id, ordinal=ordinal, custom_id=item.custom_id,
                         custom_id_hash=_hash(item.custom_id), operation=item.operation,
-                        request_ciphertext=_seal(item.body)))
+                        request_ciphertext=_seal(item.body),
+                        capability_snapshot=({"credential_authority": deepcopy(credential_authority)}
+                                             if credential_authority is not None else None)))
             await session.flush()
             return _view(row), True
 
@@ -288,7 +293,8 @@ def _public_service(function):
 
 @_public_service
 async def create_native_batch(*, project_id, user_id, api_key_id, scopes, source,
-                              idempotency_key: str, request: NativeBatchCreateRequest) -> tuple[BatchView, bool]:
+                              idempotency_key: str, request: NativeBatchCreateRequest,
+                              credential_authority: dict | None = None) -> tuple[BatchView, bool]:
     _factory()
     settings = get_settings()
     if len(request.items) > settings.batch_native_max_items:
@@ -300,7 +306,7 @@ async def create_native_batch(*, project_id, user_id, api_key_id, scopes, source
     if idempotency_key is None:
         raise BatchInputError("invalid_idempotency_key")
     return await _create(project_id=project_id, user_id=user_id, api_key_id=api_key_id, contract="native",
-                         key_hash=_key_hash(idempotency_key), request=request)
+                         key_hash=_key_hash(idempotency_key), request=request, credential_authority=credential_authority)
 
 
 @_public_service
@@ -480,20 +486,22 @@ async def _keep_lease(lease):
             await retry_deadlocks(release)
 
 
-async def _authority(batch) -> frozenset[str]:
-    # One directory lookup per validation chunk, never per row: a 50,000-row file
-    # must not become 50,000 Keystone authority resolutions. Execution revalidates.
+async def _authority(batch, credential_authority=None) -> frozenset[str]:
+    # One directory lookup per chunk, outside locks. Native items share the
+    # original ceiling frozen at admission; never substitute the human owner's
+    # system-admin authority for that reduced credential.
     try:
         async with _factory()() as session:
+            kwargs = {"credential_authority": credential_authority} if credential_authority is not None else {}
             return await current_api_key_scopes(session, api_key_id=batch.api_key_id,
-                                                user_id=batch.user_id, project_id=batch.project_id)
+                                                user_id=batch.user_id, project_id=batch.project_id, **kwargs)
     except ApiKeyForbidden:
         return frozenset()
     except ApiKeyAuthorityUnavailable as exc:
         raise BatchUnavailable("inference_authority_unavailable") from exc
 
 
-async def _prepare(batch, operation, body, allowed: frozenset[str]):
+async def _prepare(batch, operation, body, allowed: frozenset[str], credential_authority=None):
     body = validate_batch_body(operation, body, contract=batch.contract)
     required = _scopes(operation, batch.contract, body)
     if not allowed.issuperset(required):
@@ -502,10 +510,15 @@ async def _prepare(batch, operation, body, allowed: frozenset[str]):
                   source="api" if batch.api_key_id is not None else "web",
                   api_key_id=batch.api_key_id, required_scopes=required)
     if operation in {"chat.completions", "responses"}:
-        return await api_completion.prepare_api_completion_run(body, operation=operation, **kwargs)
+        prepared = await api_completion.prepare_api_completion_run(body, operation=operation, **kwargs)
+        if credential_authority is not None:
+            prepared = replace(prepared,
+                capability_snapshot={**prepared.capability_snapshot, "credential_authority": deepcopy(credential_authority)},
+                payload=_intent_with_credential_authority(prepared.payload, credential_authority))
+        return prepared
     if operation.startswith("images."):
-        return await images.prepare_image_run(body, **kwargs)
-    return await audio.prepare_audio_run(body, operation=operation, **kwargs)
+        return await images.prepare_image_run(body, credential_authority=credential_authority, **kwargs)
+    return await audio.prepare_audio_run(body, operation=operation, credential_authority=credential_authority, **kwargs)
 
 
 def _prepared(batch, item):
@@ -549,7 +562,8 @@ async def _validate(lease):
             rows = (await session.execute(select(ChatBatchItem).where(ChatBatchItem.batch_id == batch.id,
                 ChatBatchItem.ordinal.in_(chosen)).order_by(ChatBatchItem.ordinal))).scalars().all()
         for item in rows:
-            records.append((item.ordinal, item.custom_id, item.operation, _unseal(item.request_ciphertext)))
+            records.append((item.ordinal, item.custom_id, item.operation, _unseal(item.request_ciphertext),
+                            (item.capability_snapshot or {}).get("credential_authority")))
         eof = not records or records[-1][0] == batch.request_total
     else:
         try:
@@ -564,16 +578,16 @@ async def _validate(lease):
                     parsed = OpenAIBatchRow.model_validate_json(line.raw)
                     if parsed.url != batch.endpoint:
                         raise BatchInputError("endpoint_mismatch")
-                    records.append((ordinal, parsed.custom_id, BATCH_ENDPOINTS[parsed.url], parsed.body))
+                    records.append((ordinal, parsed.custom_id, BATCH_ENDPOINTS[parsed.url], parsed.body, None))
                 except (ValueError, BatchInputError) as exc:
                     errors.append({"code": _input_fault(exc), "message": "Invalid batch input", "line": ordinal})
         except BatchInputError as exc:
             errors.append({"code": exc.code, "message": "Invalid batch input", "line": ordinal + 1})
     prepared = []
-    allowed = await _authority(batch) if records else frozenset()
-    for number, custom_id, operation, body in records:
+    allowed = await _authority(batch, records[0][4]) if records else frozenset()
+    for number, custom_id, operation, body, credential_authority in records:
         try:
-            value = await _prepare(batch, operation, body, allowed)
+            value = await _prepare(batch, operation, body, allowed, credential_authority)
             prepared.append((number, custom_id, operation, value))
         except (ValueError, DurableRunInputError, BatchInputError, QuotaExceeded) as exc:
             errors.append({"code": _input_fault(exc), "message": "Invalid batch input",
@@ -792,7 +806,29 @@ async def _project(lease):
     return changed
 
 
+async def _dispatch_slots(session, batch) -> int:
+    settings = get_settings()
+    project_active = (await session.execute(select(func.count()).select_from(ChatBatchItem)
+        .join(ChatBatch, ChatBatch.id == ChatBatchItem.batch_id).where(ChatBatch.project_id == batch.project_id,
+            ChatBatchItem.state.in_(("queued", "running"))))).scalar_one()
+    batch_active = (await session.execute(select(func.count()).select_from(ChatBatchItem).where(
+        ChatBatchItem.batch_id == batch.id, ChatBatchItem.state.in_(("queued", "running"))))).scalar_one()
+    return min(settings.batch_dispatch_window - batch_active,
+               settings.batch_project_dispatch_window - project_active, 100)
+
+
 async def _materialize(lease):
+    # Directory I/O never runs under the project/batch/item locks of the retried
+    # transaction: resolve current authority first, only when there is work to do.
+    if lease.batch.status != "in_progress":
+        return False
+    async with _factory()() as session:
+        pending = (await session.execute(select(ChatBatchItem.ordinal, ChatBatchItem.capability_snapshot).where(
+            ChatBatchItem.batch_id == lease.batch.id, ChatBatchItem.state == "pending").limit(1))).first()
+        if pending is None or await _dispatch_slots(session, lease.batch) <= 0:
+            return False
+    allowed = await _authority(lease.batch, (pending.capability_snapshot or {}).get("credential_authority"))
+
     async def transaction():
         wake_ids = []
         async with _factory()() as session, session.begin():
@@ -800,14 +836,7 @@ async def _materialize(lease):
             _, batch = await _locked(session, lease)
             if batch.status != "in_progress" or _utc(batch.expires_at) <= _now():
                 return wake_ids, False
-            settings = get_settings()
-            project_active = (await session.execute(select(func.count()).select_from(ChatBatchItem)
-                .join(ChatBatch, ChatBatch.id == ChatBatchItem.batch_id).where(ChatBatch.project_id == batch.project_id,
-                    ChatBatchItem.state.in_(("queued", "running"))))).scalar_one()
-            batch_active = (await session.execute(select(func.count()).select_from(ChatBatchItem).where(
-                ChatBatchItem.batch_id == batch.id, ChatBatchItem.state.in_(("queued", "running"))))).scalar_one()
-            available = min(settings.batch_dispatch_window - batch_active,
-                            settings.batch_project_dispatch_window - project_active, 100)
+            available = await _dispatch_slots(session, batch)
             if available <= 0:
                 return wake_ids, False
             items = (await session.execute(select(ChatBatchItem).where(ChatBatchItem.batch_id == batch.id,
@@ -820,7 +849,7 @@ async def _materialize(lease):
                         run = await persist(session, prepared, project_id=batch.project_id, user_id=batch.user_id,
                             client_request_id=str(uuid5(UUID(batch.id), item.custom_id)),
                             source="api" if batch.api_key_id is not None else "web", api_key_id=batch.api_key_id,
-                            workload_class="batch", batch_id=batch.id)
+                            workload_class="batch", batch_id=batch.id, allowed_scopes=allowed)
                         # No ORM relationship orders this foreign key for us.
                         await session.flush()
                         item.run_id, item.state = run.id, "queued"

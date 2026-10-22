@@ -277,6 +277,24 @@ def _closed_mcp_input_schema(raw_schema: object) -> dict:
 
 
 _CATALOG_TERM_RE = re.compile(r"[a-z0-9_]{2,}|[가-힣]{2,}", re.IGNORECASE)
+_CATALOG_CAPABILITY_ALIASES = (
+    ("클라우드", ("cloud", "nova", "cinder", "neutron")),
+    ("컴퓨트", ("compute", "nova", "vm", "server", "servers", "instance", "instances")),
+    ("컴퓨팅", ("compute", "nova", "vm", "server", "servers", "instance", "instances")),
+    ("가상머신", ("vm", "nova", "server", "servers", "instance", "instances")),
+    ("스토리지", ("storage", "cinder", "volume", "volumes", "swift", "manila")),
+    ("볼륨", ("volume", "volumes", "cinder")),
+    ("네트워크", ("network", "networks", "neutron", "subnet", "subnets")),
+)
+
+
+def _catalog_terms(value: str) -> set[str]:
+    # Split provider names too; Korean capability stems tolerate grammatical particles.
+    terms = set(_CATALOG_TERM_RE.findall(value.replace("_", " ")))
+    for stem, aliases in _CATALOG_CAPABILITY_ALIASES:
+        if stem in value:
+            terms.update(aliases)
+    return terms
 
 
 def _catalog_matches(binding: ToolBinding, query: str) -> bool:
@@ -291,8 +309,8 @@ def _catalog_matches(binding: ToolBinding, query: str) -> bool:
     query = query.casefold()
     if query in searchable:
         return True
-    query_terms = set(_CATALOG_TERM_RE.findall(query))
-    searchable_terms = set(_CATALOG_TERM_RE.findall(searchable))
+    query_terms = _catalog_terms(query)
+    searchable_terms = _catalog_terms(searchable)
     return bool(query_terms & searchable_terms)
 
 
@@ -427,9 +445,12 @@ async def v2_tool_bindings(
             raise ValueError(f"duplicate v2 tool name: {binding.definition.name}")
         bindings[binding.definition.name] = binding
 
-    if include_managed:
+    if include_managed or extension_load_policy == "on_demand":
         for binding in await _lumen_registry_bindings(ctx):
-            add(binding)
+            # Legacy chat has no managed mutation approval boundary. Delegated
+            # reads are safe to discover lazily, but mutations remain v2-only.
+            if include_managed or binding.definition.effect == "read":
+                add(binding)
 
     for custom in await _load_custom(ctx):
         if extension_load_policy is not None and custom.get("load_policy") != extension_load_policy:
