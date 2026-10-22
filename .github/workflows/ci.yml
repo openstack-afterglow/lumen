@@ -43,6 +43,23 @@ permissions:
   contents: read
 
 jobs:
+  bifrost:
+    name: Private Bifrost runtime
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.lumen_repository || github.repository }}
+          ref: ${{ inputs.lumen_ref || github.sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: runtime/bifrost/go.mod
+          cache-dependency-path: runtime/bifrost/go.sum
+      - name: Test single-attempt provider runtime
+        working-directory: runtime/bifrost
+        run: go test -mod=readonly ./...
+
   service:
     name: Service tests
     # Explicit status function: the caller's `test` job needs a `dedup` job that
@@ -63,6 +80,17 @@ jobs:
           python-version: '3.12'
           enable-cache: true
       - run: uv sync --extra service --extra dev --frozen
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: runtime/bifrost/go.mod
+          cache-dependency-path: runtime/bifrost/go.sum
+      - name: Build owned provider child for host lifecycle tests
+        working-directory: runtime/bifrost
+        run: |
+          mkdir -p "$RUNNER_TEMP/lumen-bin"
+          CGO_ENABLED=0 go build -mod=readonly -trimpath -buildvcs=false -o "$RUNNER_TEMP/lumen-bin/lumen-bifrost" ./cmd/lumen-bifrost
+          "$RUNNER_TEMP/lumen-bin/lumen-bifrost" --version
+          echo "$RUNNER_TEMP/lumen-bin" >> "$GITHUB_PATH"
       - name: Override afterglow-crypto dependency
         if: ${{ inputs.afterglow_crypto_ref != '' }}
         env:
@@ -193,6 +221,17 @@ jobs:
           python-version: '3.12'
           enable-cache: true
       - run: uv sync --extra service --extra dev --frozen
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: runtime/bifrost/go.mod
+          cache-dependency-path: runtime/bifrost/go.sum
+      - name: Build owned provider child for integration tests
+        working-directory: runtime/bifrost
+        run: |
+          mkdir -p "$RUNNER_TEMP/lumen-bin"
+          CGO_ENABLED=0 go build -mod=readonly -trimpath -buildvcs=false -o "$RUNNER_TEMP/lumen-bin/lumen-bifrost" ./cmd/lumen-bifrost
+          "$RUNNER_TEMP/lumen-bin/lumen-bifrost" --version
+          echo "$RUNNER_TEMP/lumen-bin" >> "$GITHUB_PATH"
       - name: Override afterglow-crypto dependency
         if: ${{ inputs.afterglow_crypto_ref != '' }}
         env:

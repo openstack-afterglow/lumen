@@ -258,7 +258,7 @@ def test_unknown_window_still_exposes_the_full_measured_composition():
 
 
 def test_uncountable_input_keeps_names_and_counts_without_inventing_tokens(monkeypatch):
-    from lumen.services.litellm_client import ContextTokenCount
+    from lumen.services.provider_metadata import ContextTokenCount
 
     monkeypatch.setattr(
         context_manager,

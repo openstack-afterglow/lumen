@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
-from lumen.auth import Principal, ensure_scopes, require_scopes
+from lumen.auth import Principal, credential_authority_snapshot, ensure_scopes, require_scopes
 from lumen.config import get_settings
 from lumen.models.batch_contracts import (
     BatchRequestCounts,
@@ -164,6 +164,7 @@ async def create_batch(
             source=principal.get("source", "web"),
             idempotency_key=idempotency_key,
             request=payload,
+            credential_authority=credential_authority_snapshot(principal),
         )
     except batch_service.BatchError as exc:
         raise batch_http_error(exc) from exc

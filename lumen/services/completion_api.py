@@ -1,7 +1,7 @@
 """OpenAI/Anthropic 호환 외부 API 공통 완료 코어 (stateless).
 
 웹 경로(`api/chat/completions.py` — 대화 트리 저장·자체 SSE 계약)와 **독립**이다. 서비스 계층만
-재사용한다: `provider_store.resolve_model` → `credit.precheck` → `litellm_client` 직접
+재사용한다: `provider_store.resolve_model` → `credit.precheck` → `provider_client` 직접
 스트리밍/비스트리밍(요청 `tools` pass-through) → `credit.apply_usage(source="api", api_key_id=…)`.
 대화 트리에 저장하지 않는다(stateless). 도구는 서버가 실행하지 않고 `tool_calls` 를 릴레이한다
 (표준 OpenAI/Anthropic function-calling — 호출자가 실행 후 재요청).
@@ -23,13 +23,13 @@ from decimal import Decimal
 from typing import Any, Literal, NoReturn
 
 import anyio
-from litellm.exceptions import BadRequestError
 
 from lumen.config import get_settings
-from lumen.services import context_manager, credit, litellm_client, native_compaction
+from lumen.services import context_manager, credit, native_compaction, provider_client, provider_metadata
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
 from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.inference_authority import authorize_new_io, completion_scopes
+from lumen.services.provider_errors import BadRequestError
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
 from lumen.services.providers.pricing import frozen_token_pricing
@@ -86,12 +86,12 @@ async def resolve(model: str) -> dict:
     return resolved
 
 
-async def resolve_api(model: str, *, provider: str | None = None) -> dict:
+async def resolve_api(model: str, *, provider: str | None = None, operation: str = "chat") -> dict:
     """Resolve one public compatibility API route, rejecting ambiguous catalogs."""
     if not model:
         raise CompletionError(400, "model 이 필요합니다")
     try:
-        resolved = await ps.resolve_api_model(model, provider=provider)
+        resolved = await ps.resolve_api_model(model, provider=provider, required_capabilities=(operation,))
     except errors.AmbiguousModelRouteError as exc:
         raise CompletionError(409, "model_route_ambiguous") from exc
     except errors.ChatStorageUnavailable as exc:
@@ -144,7 +144,8 @@ def billing_route(
     route["required_token_modalities"] = required
     reporting = (
         MODALITY_INPUT_REPORTING_PROVIDERS.get(str(route.get("provider_type") or ""), frozenset())
-        if protocol == "chat" and route.get("provider_auth") is None else frozenset()
+        if protocol == "chat" and (route.get("provider_auth") or {}).get("auth_mode", "api_key") == "api_key"
+        else frozenset()
     )
     for item in required:
         modality, direction = item.rsplit("_", 1)
@@ -190,7 +191,7 @@ def usage_breakdown_for_billing(
             if reported is None:
                 raise CompletionError(502, "modality_usage_unavailable")
     if breakdown is None:
-        breakdown = litellm_client.extract_usage_breakdown(model_name, messages, text, final_usage)
+        breakdown = provider_metadata.extract_usage_breakdown(model_name, messages, text, final_usage)
     return breakdown
 
 
@@ -224,7 +225,7 @@ async def _bill(
     )
     pt, ct = breakdown.input_tokens, breakdown.output_tokens
     try:
-        usage_cost = litellm_client.cost_from_usage(
+        usage_cost = provider_metadata.cost_from_usage(
             model_name,
             pt,
             ct,
@@ -261,6 +262,7 @@ async def _bill(
         conversation_id=None,
         source="api",
         api_key_id=api_key_id,
+        execution_route=resolved,
         breakdown=breakdown,
     )
     return pt, ct, credited
@@ -322,7 +324,7 @@ async def invoke_chat_once(
     *,
     resolved: dict,
     messages: list[dict],
-    max_tokens: int,
+    max_tokens: int | None,
     temperature: float | None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
@@ -336,7 +338,7 @@ async def invoke_chat_once(
     extra_kwargs: dict[str, Any] = {}
     if tool_choice is not None:
         extra_kwargs["tool_choice"] = tool_choice
-    resp = await litellm_client.acompletion(
+    resp = await provider_client.acompletion(
         resolved["model_name"],
         messages,
         api_base=resolved.get("api_base"),
@@ -379,7 +381,8 @@ async def complete_once(
         invocation = await invoke_chat_once(
             resolved=resolved,
             messages=messages,
-            max_tokens=clamp_max_tokens(max_tokens),
+            max_tokens=(None if resolved.get("provider_type") == "chatgpt" and max_tokens is None
+                        else clamp_max_tokens(max_tokens)),
             temperature=temperature,
             tools=tools,
             tool_choice=tool_choice,
@@ -464,13 +467,14 @@ async def _complete_stream(
     # (GeneratorExit) at any delta yield must still close upstream and bill.
     try:
         try:
-            gen = await litellm_client.acompletion_stream(
+            gen = await provider_client.acompletion_stream(
                 resolved["model_name"],
                 messages,
                 api_base=resolved.get("api_base"),
                 api_key=resolved.get("api_key"),
                 custom_llm_provider=resolved.get("provider_type"),
-                max_tokens=clamp_max_tokens(max_tokens),
+                max_tokens=(None if resolved.get("provider_type") == "chatgpt" and max_tokens is None
+                            else clamp_max_tokens(max_tokens)),
                 temperature=temperature,
                 tools=tools,
                 extra=extra_kwargs or None,
@@ -728,7 +732,7 @@ async def invoke_responses_once(
     ``options`` must already be the exact provider options. Provider exceptions
     propagate unchanged; ``provider_once`` disables every retry/re-send layer.
     """
-    response = await litellm_client.aresponses(
+    response = await provider_client.aresponses(
         model=resolved["model_name"],
         input=input,
         stream=False,
@@ -791,7 +795,7 @@ async def complete_responses(
         )
         return payload
     try:
-        response = await litellm_client.aresponses(
+        response = await provider_client.aresponses(
             model=resolved["model_name"],
             input=input,
             stream=stream,
@@ -870,7 +874,7 @@ async def complete_anthropic(
     options = _with_passthrough_compaction(options, resolved=resolved, protocol="anthropic")
     await _authorize_completion(user_id, project_id, api_key_id, options, resolved)
     try:
-        response = await litellm_client.aanthropic_messages(
+        response = await provider_client.aanthropic_messages(
             model=resolved["model_name"],
             messages=messages,
             max_tokens=max_tokens,
@@ -1002,13 +1006,13 @@ async def complete_anthropic(
                             raise CompletionError(502, "modality_usage_unavailable")
                     output_tokens = max(
                         reported.output_tokens if reported is not None else 0,
-                        litellm_client.count_tokens(resolved["model_name"], text=completion_text),
+                        provider_metadata.count_tokens(resolved["model_name"], text=completion_text),
                     )
                     if reported is not None and reported.input_tokens > 0:
                         partial = replace(reported, output_tokens=output_tokens)
                     else:
                         partial = UsageBreakdown.from_totals(
-                            litellm_client.count_tokens(resolved["model_name"], messages=messages),
+                            provider_metadata.count_tokens(resolved["model_name"], messages=messages),
                             output_tokens,
                         )
                     await _bill(
@@ -1034,20 +1038,26 @@ async def count_anthropic_tokens(
     anthropic_headers: dict[str, str] | None = None,
 ) -> dict[str, int]:
     """Use Anthropic's authoritative count endpoint or fail explicitly when unavailable."""
-    if resolved.get("provider_type") != "anthropic" or resolved.get("provider_auth") is not None:
+    if resolved.get("provider_type") != "anthropic":
         raise CompletionError(501, "token_count_unavailable")
-    api_key = resolved.get("api_key")
+    from lumen.services.providers.credentials import resolve_inference_credential, transport_model_name
+
+    auth = resolved.get("provider_auth")
+    if auth is not None and auth.get("auth_mode") != "api_key":
+        raise CompletionError(501, "token_count_unavailable")
+    credential = await resolve_inference_credential(auth) if auth is not None else resolved
+    api_key = credential.get("api_key")
     if not isinstance(api_key, str) or not api_key:
         raise CompletionError(501, "token_count_unavailable")
     base = str(resolved.get("api_base") or "https://api.anthropic.com").rstrip("/")
     if not base.endswith("/v1"):
         base = f"{base}/v1"
     body = dict(payload)
-    body["model"] = litellm_client.litellm_model_name(resolved["model_name"])
+    body["model"] = transport_model_name(resolved["model_name"])
     try:
         import httpx
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=False, trust_env=False) as client:
             response = await client.post(
                 f"{base}/messages/count_tokens",
                 headers={

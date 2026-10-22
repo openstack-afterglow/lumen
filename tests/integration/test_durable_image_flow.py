@@ -11,11 +11,12 @@ from contextlib import suppress
 from decimal import Decimal
 
 import pytest
+from provider_fixtures import configured_provider
 from sqlalchemy import delete, event, func, select, text
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
-from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider
+from lumen.models.chat_db import ChatUsageLog, LlmModel
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment
 from lumen.services import assets, credit
 from lumen.services.durable_runs import budgets, images, queries
@@ -47,14 +48,14 @@ async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
     async def no_wake(_run_id):
         return None
     monkeypatch.setattr(images, "wake_run", no_wake)
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"image-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"image-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()
@@ -364,7 +365,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
     user_id, project_id = f"image-token-user-{nonce}", f"image-token-project-{nonce}"
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
 
     async def no_wake(_run_id):
@@ -373,7 +374,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
     monkeypatch.setattr(images, "wake_run", no_wake)
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"image-token-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"image-token-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()

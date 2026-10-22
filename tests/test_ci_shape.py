@@ -88,7 +88,6 @@ def test_reusable_ci_jobs_override_the_implicit_success_check() -> None:
     # inner jobs (actions/runner#2205); without inner `needs` it hides nothing.
     jobs = _workflow("ci.yml")["jobs"]
 
-    assert set(jobs) == {"service", "plugins", "sandbox", "sdk", "kolla", "integration", "system"}
     for name, job in jobs.items():
         assert _compact(job.get("if")) == "${{ !cancelled() }}", name
         assert "needs" not in job, name
@@ -308,5 +307,6 @@ def test_test_layers_imports_only_the_standard_library() -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
 
 

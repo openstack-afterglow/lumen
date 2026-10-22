@@ -18,11 +18,11 @@ from sqlalchemy.pool import StaticPool
 
 from lumen.auth import get_principal
 from lumen.main import app
-from lumen.models.chat_db import LlmModel, LlmProvider
+from lumen.models.chat_db import LlmModel, LlmProvider, LlmProviderAccount, LlmProviderCredential
 from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import completion_api as core
-from lumen.services import litellm_client
-from lumen.services.providers import routing
+from lumen.services import provider_client
+from lumen.services.providers import credentials, routing
 from lumen.services.providers.errors import AmbiguousModelRouteError, ChatStorageUnavailable
 
 _H = {"Authorization": "Bearer sk-afgl-test"}
@@ -60,6 +60,8 @@ def catalog(monkeypatch):
     """Two connections expose the same public ID; inactive, unpriced and subscription routes surround them."""
     engine = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
     LlmProvider.__table__.create(engine)
+    LlmProviderAccount.__table__.create(engine)
+    LlmProviderCredential.__table__.create(engine)
     LlmModel.__table__.create(engine)
     sync_factory = sessionmaker(engine, expire_on_commit=False)
     providers = [
@@ -107,15 +109,26 @@ def catalog(monkeypatch):
         dict(id=61, provider_id=6, model_name="shared-coder", **priced),
     ]
     with sync_factory.begin() as session:
-        session.add_all([LlmProvider(margin_multiplier=Decimal("1"), **row) for row in providers])
+        for row in providers:
+            endpoint = dict(row)
+            mode = endpoint.get("auth_mode", "api_key")
+            credential = LlmProviderCredential(
+                id=endpoint["id"], name="fixture-credential", auth_mode=mode, generation=0, is_active=True,
+                priority=0, weight=1,
+                subscription_status=endpoint.pop("subscription_status", "disconnected"),
+                **{key: endpoint.pop(key) for key in (
+                    "encrypted_api_key", "encrypted_subscription_tokens",
+                ) if key in endpoint},
+            )
+            account = LlmProviderAccount(id=endpoint["id"], name="fixture-account", is_active=True, priority=0,
+                                         weight=1,
+                                         credentials=[credential])
+            session.add(LlmProvider(margin_multiplier=Decimal("1"), selection_policy="priority",
+                                    accounts=[account], **endpoint))
     with sync_factory.begin() as session:
         session.add_all([LlmModel(**row) for row in models])
 
     monkeypatch.setattr(routing, "_require_db", lambda: lambda: _Session(sync_factory()))
-    # Stored values are sentinels, not ciphertext: only execution may read a credential.
-    monkeypatch.setattr(
-        routing, "resolve_api_key", lambda provider: f"key-{provider.id}" if provider.auth_mode == "api_key" else None
-    )
     yield sync_factory
     engine.dispose()
 
@@ -166,8 +179,8 @@ def provider_calls(monkeypatch):
     async def precheck(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(litellm_client, "aanthropic_messages", messages)
-    monkeypatch.setattr(litellm_client, "aresponses", responses)
+    monkeypatch.setattr(provider_client, "aanthropic_messages", messages)
+    monkeypatch.setattr(provider_client, "aresponses", responses)
     monkeypatch.setattr(core, "_bill", bill)
     monkeypatch.setattr(core, "precheck", precheck)
     return calls
@@ -287,7 +300,8 @@ class TestCliCatalog:
         def forbidden(_provider):
             raise AssertionError("catalog must not resolve provider credentials")
 
-        monkeypatch.setattr(routing, "resolve_api_key", forbidden)
+        monkeypatch.setattr(credentials, "decrypt_llm_provider_key", forbidden)
+        monkeypatch.setattr(credentials, "resolve_inference_credential", forbidden)
 
         assert (await client.get("/v1/cli/models", headers=_H)).status_code == 200
 
@@ -347,7 +361,9 @@ class TestExactRouteResolution:
         gateway = await routing.resolve_api_model("lumen/2/21")
 
         assert (gateway["provider_id"], gateway["model_id"]) == (2, 21)
-        assert gateway["model_name"] == "shared-coder" and gateway["api_key"] == "key-2"
+        assert gateway["model_name"] == "shared-coder" and gateway["api_key"] is None
+        assert gateway["provider_auth"]["provider_id"] == 2
+        assert gateway["provider_auth"]["credential_id"] is not None
         assert gateway["api_base"] == "https://gateway.invalid/v1"
         assert (await routing.resolve_api_model("lumen/2/21", provider="nvidia", provider_type="openai"))[
             "model_id"
@@ -363,6 +379,14 @@ class TestExactRouteResolution:
         for route_id in ("lumen/6/61", "lumen/1/13", "lumen/2/11", "lumen/1/14", "lumen/9/21"):
             assert await routing.resolve_api_model(route_id) is None
         assert (await routing.resolve_api_model("lumen/1/14", model_kind="image"))["model_id"] == 14
+
+    async def test_route_id_without_an_eligible_credential_is_not_found(self, catalog):
+        with catalog.begin() as session:
+            for account in session.get(LlmProvider, 2).accounts:
+                for credential in account.credentials:
+                    credential.is_active = False
+
+        assert await routing.resolve_api_model("lumen/2/21") is None
 
     async def test_public_ids_keep_their_ambiguity_contract(self, catalog):
         with pytest.raises(AmbiguousModelRouteError):
@@ -389,11 +413,13 @@ class TestCompatRouteTargets:
         assert responses.status_code == 200, responses.text
         sent_messages, sent_responses = provider_calls["messages"][0], provider_calls["responses"][0]
         assert (sent_messages["model"], sent_messages["api_key"], sent_messages["api_base"]) == (
-            "shared-coder", "key-2", "https://gateway.invalid/v1",
+            "shared-coder", None, "https://gateway.invalid/v1",
         )
+        assert sent_messages["provider_auth"]["provider_id"] == 2
         assert (sent_responses["model"], sent_responses["api_key"], sent_responses["api_base"]) == (
-            "shared-coder", "key-1", None,
+            "shared-coder", None, None,
         )
+        assert sent_responses["provider_auth"]["provider_id"] == 1
         billed = [(route["provider_id"], route["model_id"], route["model_name"]) for route in provider_calls["billed"]]
         assert billed == [(2, 21, "shared-coder"), (1, 11, "shared-coder")]
 

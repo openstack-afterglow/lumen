@@ -1,17 +1,20 @@
 """Checkpoint/approval-ledger recovery with MariaDB and an in-memory LangGraph saver."""
 
+import base64
 import copy
 import json
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from lumen_plugin_api.tools import ToolBinding, ToolDefinition, ToolExecutionResult
 from sqlalchemy import delete, select
 
+from lumen import crypto
 from lumen.crypto import encrypt_chat_content
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_runs import ChatRun, ChatRunEventRow, ChatToolApproval
@@ -77,7 +80,7 @@ async def approval_recovery(monkeypatch):
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
     monkeypatch.setattr(interactions, "get_settings", lambda: SimpleNamespace(chat_execution_protocol_version=2))
     try:
@@ -291,3 +294,82 @@ async def test_recovery_requires_current_owned_lease(approval_recovery, invalid_
     snapshot = await _snapshot(state)
     assert snapshot.approvals == {} and snapshot.requests == []
     assert state.provider_calls == 1 and state.tool_calls == []
+
+
+def _tampered_ciphertext(plaintext: str) -> str:
+    ciphertext = encrypt_chat_content(plaintext)
+    assert ciphertext.startswith(crypto._V3_PREFIX)
+    raw = bytearray(base64.b64decode(ciphertext[len(crypto._V3_PREFIX):]))
+    raw[-1] ^= 0x01
+    return crypto._V3_PREFIX + base64.b64encode(bytes(raw)).decode()
+
+
+@pytest.mark.parametrize("corruption", ["undecryptable", "legacy", "forged"])
+async def test_unverifiable_oldest_approval_does_not_block_other_expiry(approval_recovery, monkeypatch, corruption):
+    state = approval_recovery
+    await _stream(state)
+    with pytest.raises(DurableRunLeaseLost, match="approval recovery released lease"):
+        await execution._v2_resume(run_id=state.run_id, owner=state.owner)
+    assert {row.status for row in (await _snapshot(state)).approvals.values()} == {"pending"}
+
+    now = datetime.now(UTC)
+    corrupt_run_id = str(uuid.uuid4())
+    arguments = '{"target":"corrupt"}'
+    async with state.factory() as session, session.begin():
+        session.add(ChatRun(
+            id=corrupt_run_id, run_scope="persistent", project_id=state.project, user_id=state.user,
+            model_name="scripted-approval", capability_snapshot={}, pricing_snapshot={},
+            request_payload=encrypt_chat_content('{"required_scopes":["native:runs:write"]}'),
+            client_request_id=str(uuid.uuid4()), request_fingerprint=uuid.uuid4().hex, fingerprint_version=1,
+            execution_protocol_version=2, status="awaiting_input",
+        ))
+        await session.flush()
+        # The oldest due approval cannot be authenticated, so it must never be
+        # auto-denied, resumed, or allowed to abort the shared sweep transaction.
+        session.add(ChatToolApproval(
+            run_id=corrupt_run_id, call_id="corrupt-call", tool_name="mcp_23_mutate", arguments="{}",
+            arguments_ciphertext=(
+                _tampered_ciphertext(arguments) if corruption == "undecryptable" else encrypt_chat_content(arguments)
+            ),
+            dispatch_hmac=None if corruption == "legacy" else "0" * 64,
+            preview_fingerprint="0" * 64, source="mcp", effect="external_mutation",
+            tool_definition_hash="a" * 64, config_fingerprint="a" * 64, status="pending",
+            expires_at=now - timedelta(days=1),
+        ))
+    wake_run = AsyncMock()
+    monkeypatch.setattr(interactions, "_now", lambda: now + timedelta(minutes=16))
+    monkeypatch.setattr(interactions, "wake_run", wake_run)
+    try:
+        # The sweep is global over the shared database, so assert only on this
+        # test's rows. limit=1: the unverifiable run is the oldest due approval,
+        # yet it must neither abort the sweep nor consume its only slot.
+        first = await interactions.expire_pending_inputs(limit=1)
+        assert len(first) == 1 and corrupt_run_id not in first
+        resumed = first + await interactions.expire_pending_inputs()
+        assert state.run_id in resumed and corrupt_run_id not in resumed
+        wake_run.assert_any_await(state.run_id)
+        expired = await _snapshot(state)
+        assert expired.status == "queued" and expired.owner is None
+        assert {row.status for row in expired.approvals.values()} == {"denied"}
+        assert all(row.decision_hmac and row.decided_by_user_id is None for row in expired.approvals.values())
+        async with state.factory() as session:
+            corrupt_run = await session.get(ChatRun, corrupt_run_id)
+            corrupt = await session.get(ChatToolApproval, (corrupt_run_id, "corrupt-call"))
+            corrupt_events = (await session.scalars(select(ChatRunEventRow.event_type).where(
+                ChatRunEventRow.run_id == corrupt_run_id,
+            ))).all()
+        assert corrupt_run.status == "awaiting_input"
+        assert corrupt.status == "pending" and corrupt.decision_hmac is None and corrupt.decided_at is None
+        assert corrupt_events == []
+        assert corrupt_run_id not in await interactions.expire_pending_inputs()
+        state.owner = await _claim(state)
+        assert await execution._v2_resume(run_id=state.run_id, owner=state.owner) == {
+            "kind": "tool_approval",
+            "decisions": [{"call_id": "call-1", "decision": "deny"}, {"call_id": "call-2", "decision": "deny"}],
+        }
+        assert state.provider_calls == 1 and state.tool_calls == []
+    finally:
+        async with state.factory() as session, session.begin():
+            await session.execute(delete(ChatRunEventRow).where(ChatRunEventRow.run_id == corrupt_run_id))
+            await session.execute(delete(ChatToolApproval).where(ChatToolApproval.run_id == corrupt_run_id))
+            await session.execute(delete(ChatRun).where(ChatRun.id == corrupt_run_id))

@@ -28,17 +28,18 @@ from lumen.services import (
     credit,
     engine,
     extensions_store,
-    litellm_client,
     native_compaction,
+    provider_client,
+    provider_metadata,
     worker_routing,
 )
 from lumen.services import conversation_store as cs
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
-from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.inference_authority import authorize_run_generation, model_required_scopes, native_run_scopes
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
 from lumen.services.message_graph import reachable_message_clause, register_message
 from lumen.services.providers import routing as ps
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.run_store import (
     NONTERMINAL,
     RunStoreError,
@@ -379,6 +380,7 @@ async def _finish_transaction(
                 source=run.source,
                 api_key_id=run.api_key_id,
                 run_id=run.id,
+                execution_route=run.capability_snapshot,
                 breakdown=usage_record.get("breakdown"),
             )
             run.usage_reconciled_at = _now()
@@ -581,7 +583,7 @@ def _provider_credit_bound(run: ChatRun, *, messages: list[dict], tool_schemas: 
     route = (capabilities.get("summary_route") or capabilities.get("capabilities")) if summary else capabilities.get("capabilities")
     route = route if isinstance(route, dict) else capabilities
     limit = route.get("context_limit")
-    count = litellm_client.count_context_tokens(
+    count = provider_metadata.count_context_tokens(
         str(route.get("model_name") or run.model_name), messages, tool_schemas
     )
     try:
@@ -590,6 +592,8 @@ def _provider_credit_bound(run: ChatRun, *, messages: list[dict], tool_schemas: 
         raise DurableRunError("bounded credit pricing is unavailable") from exc
     priced_input = input_rate > 0
     priced_output = output_rate > 0
+    if priced_output and route.get("output_budget_enforced") is False:
+        raise DurableRunError("provider does not enforce a bounded output budget")
     if priced_input and (type(limit) is not int or limit <= 0):
         raise DurableRunError("bounded provider input requires a frozen context limit")
     if priced_output and (type(max_tokens) is not int or max_tokens <= 0):
@@ -625,6 +629,8 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
         rates = [Decimal(str(prices[key])) for key in keys if prices.get(key) is not None]
         if not rates or (max(rates) > 0 and (type(limit) is not int or limit <= 0)):
             raise DurableRunError("bounded advisor input requires frozen context limit")
+        if route.get("output_budget_enforced") is False and Decimal(str(prices["advisor_output_price_per_token"])) > 0:
+            raise DurableRunError("advisor does not enforce a bounded output budget")
         usd = max(rates) * (limit if type(limit) is int else 0) + Decimal(str(prices["advisor_output_price_per_token"])) * advisor._MAX_ADVISOR_TOKENS
     else:
         return Decimal("0")
@@ -759,7 +765,9 @@ class _DurableExecutionHooks:
                 segment_id=segment_id,
                 source="system",
                 model_name=route.get("model_name") or run.model_name,
-                metadata={"operation": "context_compaction"},
+                metadata={"operation": "context_compaction", **{
+                    key: value for key, value in execution_identity(route).items() if key != "provider_auth"
+                }, "provider_id": route.get("provider_id")},
             )
             await credit.apply_usage_in_transaction(
                 session,
@@ -778,6 +786,7 @@ class _DurableExecutionHooks:
                 api_key_id=getattr(run, "api_key_id", None),
                 run_id=str(run.id),
                 charge_wallet=False,
+                execution_route=route,
                 usage_components=components,
                 breakdown=breakdown,
             )
@@ -858,15 +867,15 @@ class _DurableExecutionHooks:
             raise DurableRunError("context compaction route is unavailable")
         segment_completed = False
         try:
-            response = await litellm_client.acompletion(
+            response = await provider_client.acompletion(
                 model=resolved_route["model_name"],
                 messages=messages,
                 api_base=resolved_route.get("api_base"),
                 api_key=resolved_route.get("api_key"),
                 custom_llm_provider=resolved_route.get("provider_type"),
                 provider_auth=resolved_route.get("provider_auth"),
-                max_tokens=output_bound,
-                temperature=0,
+                max_tokens=None if resolved_route.get("provider_type") == "chatgpt" else output_bound,
+                temperature=None if resolved_route.get("provider_type") == "chatgpt" else 0,
                 extra={"response_format": {"type": "json_object"}},
             )
             choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
@@ -888,7 +897,7 @@ class _DurableExecutionHooks:
             observed_usage = UsageBreakdown.from_runtime(usage)
             usage_payload = (
                 observed_usage
-                or litellm_client.extract_usage_breakdown(resolved_route["model_name"], messages, content, None)
+                or provider_metadata.extract_usage_breakdown(resolved_route["model_name"], messages, content, None)
             ).as_usage_dict()
             usage_payload["required_token_modalities"] = required_modalities
             await self._complete(
@@ -1131,7 +1140,7 @@ class _DurableExecutionHooks:
                 run_context={
                     "summary_context_limit": summary_context_limit,
                     "summary_output_reserve": 512,
-                    "summary_token_counter": lambda current, tools: litellm_client.count_context_tokens(
+                    "summary_token_counter": lambda current, tools: provider_metadata.count_context_tokens(
                         summary_model_name, current, tools
                     ),
                     "previous_summary": previous_summary,
@@ -1152,7 +1161,7 @@ class _DurableExecutionHooks:
                 {
                     "summary_context_limit": summary_context_limit,
                     "summary_output_reserve": 512,
-                    "summary_token_counter": lambda current, tools: litellm_client.count_context_tokens(
+                    "summary_token_counter": lambda current, tools: provider_metadata.count_context_tokens(
                         summary_model_name, current, tools
                     ),
                     "force_compaction": self.force_compaction,
@@ -1165,7 +1174,7 @@ class _DurableExecutionHooks:
                 },
                 token_counter=lambda current, tools: (
                     context_manager._count_result(
-                        current, tools, lambda m, t: litellm_client.count_context_tokens(run.model_name, m, t)
+                        current, tools, lambda m, t: provider_metadata.count_context_tokens(run.model_name, m, t)
                     )[0]
                     or 0
                 ),
@@ -1455,7 +1464,8 @@ class _DurableExecutionHooks:
                     await authorize_run_generation(session, run, resolved=summary)
                 else:
                     await authorize_api_key_in_transaction(session, api_key_id=run.api_key_id,
-                        user_id=run.user_id, project_id=run.project_id, required_scopes=tuple(sorted(scopes)))
+                        user_id=run.user_id, project_id=run.project_id, required_scopes=tuple(sorted(scopes)),
+                        credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
             except ApiKeyForbidden as exc:
                 raise DurableRunInputError("inference_authority_revoked") from exc
             except ApiKeyAuthorityUnavailable as exc:
@@ -1842,7 +1852,13 @@ def _managed_usage_components(
                 "cost_usd": format(cost, "f"),
                 "source": source,
                 "model_name": record.get("model_name") if isinstance(record.get("model_name"), str) else model_name,
-                "metadata": {"unpriced": True} if unpriced and quantity > 0 else {},
+                "metadata": {
+                    **{key: value for key, value in (record.get("metadata") or {}).items() if key in {
+                        "provider_id", "provider_account_id", "provider_credential_id",
+                        "provider_credential_generation", "provider_backend", "provider_backend_version",
+                    } and value is not None},
+                    **({"unpriced": True} if unpriced and quantity > 0 else {}),
+                },
             }
         )
     return total.quantize(Decimal("0.0000000001"), rounding=ROUND_HALF_EVEN), components
@@ -2393,13 +2409,11 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             api_key=resolved.get("api_key"),
             provider_auth=resolved.get("provider_auth"),
             token_rates=pricing_snapshot.get("token_rates") or {},
-            max_tokens=payload.get("max_tokens"),
-            temperature=payload.get("temperature"),
+            max_tokens=(None if (capability_snapshot.get("provider_request_defaults") or {}).get("omit_output_budget")
+                        else payload.get("max_tokens")),
+            temperature=(None if (capability_snapshot.get("provider_request_defaults") or {}).get("omit_sampling")
+                         else payload.get("temperature")),
             reasoning_effort=payload.get("reasoning_effort"),
-            reasoning_can_be_disabled=reasoning_can_be_disabled(
-                resolved.get("capabilities"), resolved.get("provider_type")
-            ),
-            reasoning_route_key=resolved.get("config_version_hash"),
             response_format=_provider_response_format(payload.get("features")),
             selected_tool_ids=selected_tool_ids,
             selected_mcp_ids=selected_mcp_ids,
@@ -2781,7 +2795,8 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             segment_id="executor:aggregate",
             source="executor",
             model_name=resolved["model_name"],
-            metadata={},
+            metadata={**{key: value for key, value in execution_identity(resolved).items()
+                         if key != "provider_auth"}, "provider_id": resolved.get("provider_id")},
         )
         usage_components.extend(managed_components)
         usage_record = {

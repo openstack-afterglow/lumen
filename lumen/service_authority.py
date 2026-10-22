@@ -1,10 +1,4 @@
-"""Exact effective Lumen leaves; credential scopes only attenuate authority.
-
-Role names are intentionally not normalized. Parents confer authority only
-through the current Keystone role-ID graph resolved at authentication time.
-"""
-
-from collections.abc import Iterable
+"""Lumen UI labels and action projection, evaluated by operator oslo.policy."""
 
 READER_CAPABILITIES = frozenset({"lumen-inventory_reader", "lumen-history_reader"})
 SERVICE_CAPABILITIES = READER_CAPABILITIES | {
@@ -57,20 +51,13 @@ SCOPE_CAPABILITIES: dict[str, tuple[str, ...]] = {
 }
 
 
-def capabilities(roles: Iterable[str], is_system_admin: bool = False) -> frozenset[str]:
-    if is_system_admin:
-        return SERVICE_CAPABILITIES
-    names = set(roles)
-    if names.intersection({"admin", "manager"}):
-        return frozenset()
-    granted = names & SERVICE_CAPABILITIES
-    if "member" in names:
-        return frozenset(granted)
-    if "reader" in names:
-        return frozenset(granted & READER_CAPABILITIES)
-    return frozenset()
+def capabilities(principal: dict) -> frozenset[str]:
+    """UI labels only, never synthetic Keystone roles or a second action gate."""
+    scopes = allowed_scopes(principal)
+    return frozenset(leaves[0] for scope, leaves in SCOPE_CAPABILITIES.items() if len(leaves) == 1 and scope in scopes)
 
 
-def allowed_scopes(roles: Iterable[str], is_system_admin: bool = False) -> frozenset[str]:
-    caps = capabilities(roles, is_system_admin)
-    return frozenset(scope for scope, leaves in SCOPE_CAPABILITIES.items() if caps.intersection(leaves))
+def allowed_scopes(principal: dict) -> frozenset[str]:
+    from lumen.policy import authorize
+
+    return frozenset(scope for scope in SCOPE_CAPABILITIES if authorize(scope, principal))

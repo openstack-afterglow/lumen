@@ -20,7 +20,7 @@ from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_db import ChatConversation, ChatMessage, ChatUsageLog
 from lumen.models.chat_jobs import ChatJob
 from lumen.models.chat_runs import ChatRun
-from lumen.services import auxiliary, credit, litellm_client, message_graph, title_summary
+from lumen.services import auxiliary, credit, message_graph, provider_metadata, title_summary
 from lumen.services.api_key_store import ApiKeyForbidden
 from lumen.services.inference_authority import authorize_run_generation
 from lumen.services.providers import routing as ps
@@ -479,7 +479,7 @@ async def _apply_result(job: dict[str, Any]) -> bool:
                 int(result.get("completion_tokens", 0)),
                 **{key: result.get(key, 0) for key in CACHE_USAGE_KEYS},
             )
-            usage_cost = litellm_client.cost_from_usage(
+            usage_cost = provider_metadata.cost_from_usage(
                 model_name,
                 breakdown.input_tokens,
                 breakdown.output_tokens,
@@ -515,6 +515,7 @@ async def _apply_result(job: dict[str, Any]) -> bool:
                 source="system",
                 api_key_id=None,
                 run_id=str(payload.get("run_id") or "") or None,
+                execution_route=payload.get("summary_route"),
                 charge_wallet=False,
                 usage_components=[
                     {

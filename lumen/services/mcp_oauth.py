@@ -225,6 +225,8 @@ class SqlMcpConnectionStore(McpConnectionStore):
                     request.completed_at = _now()
                 expired_or_used = True
             else:
+                # Only unrestricted human start may create this owner-only state.
+                # Pre-cutover states require expiry/reapproval, not provenance inference.
                 # Callback credentials are the persisted browser-bound state, not
                 # request headers. Revalidate that owner's current management
                 # authority before the plugin can exchange any authorization code.

@@ -7,10 +7,26 @@ import lumen.services.capabilities as capability_service
 import lumen.services.providers.credentials as provider_credentials
 import lumen.services.providers.pricing as provider_pricing
 import lumen.services.providers.routing as provider_store
-from lumen.services.capabilities import litellm_capabilities, normalize_capabilities
+from lumen.services.capabilities import normalize_capabilities, provider_capabilities
 from lumen.services.providers.pricing import _effective_capabilities, _model_public, _pricing_aware_capabilities
 from lumen.services.providers.routing import _resolved_model, _resolved_provider
 
+
+def _attach_credentials(provider):
+    credential = SimpleNamespace(
+        id=11, account_id=9, auth_mode="api_key", generation=0, is_active=True,
+        allowed_model_ids=None, allowed_capabilities=None, encrypted_api_key="ciphertext",
+        api_key_env=None, subscription_status="configured", priority=0, weight=1,
+    )
+    account = SimpleNamespace(
+        id=9, provider_id=provider.id, credentials=[credential], is_active=True,
+        allowed_model_ids=None, allowed_capabilities=None, priority=0, weight=1, quota_group=None,
+    )
+    provider.accounts = [account]
+    provider.auth_mode = "api_key"
+    provider.selection_policy = "priority"
+    provider.selected_credential_id = None
+    return credential
 
 def _model(*, metadata: dict, input_price: str | None = "0.000001", output_price: str | None = "0.000002"):
     return SimpleNamespace(price_metadata=metadata, input_price=input_price, output_price=output_price)
@@ -44,38 +60,34 @@ def _detected_native_search_capabilities(*, available: bool, required: bool = Fa
 
 
 def test_perplexity_catalog_context_limit_uses_canonical_agent_identifier(monkeypatch):
-    import litellm
+    from lumen.services import provider_metadata
 
-    monkeypatch.setattr(
-        litellm,
-        "model_cost",
-        {"perplexity/sonar": {"max_input_tokens": 128_000}},
-    )
+    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {"perplexity/sonar": {"litellm_provider": "perplexity", "max_input_tokens": 128_000}})
     monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
 
-    capabilities = litellm_capabilities("perplexity/perplexity/sonar", "perplexity")
+    capabilities = provider_capabilities("perplexity/perplexity/sonar", "perplexity")
 
     assert capabilities["context_limit"] == 128_000
 
 
 def test_unknown_perplexity_catalog_context_limit_remains_unknown(monkeypatch):
-    import litellm
+    from lumen.services import provider_metadata
 
-    monkeypatch.setattr(litellm, "model_cost", {})
+    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {})
     monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
 
-    capabilities = litellm_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
+    capabilities = provider_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
 
     assert capabilities["context_limit"] is None
 
 
 def test_admin_override_without_a_window_keeps_the_exact_catalog_limit(monkeypatch):
     """CapabilitiesInput always serializes context_limit, so null must not erase detection."""
-    import litellm
+    from lumen.services import provider_metadata
 
-    monkeypatch.setattr(litellm, "model_cost", {"perplexity/sonar": {"max_input_tokens": 128_000}})
+    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {"perplexity/sonar": {"litellm_provider": "perplexity", "max_input_tokens": 128_000}})
     monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
-    detected = litellm_capabilities("perplexity/perplexity/sonar", "perplexity")
+    detected = provider_capabilities("perplexity/perplexity/sonar", "perplexity")
 
     stored_flag_only = normalize_capabilities({"tool_call": False, "context_limit": None}, detected)
     assert stored_flag_only["context_limit"] == 128_000
@@ -87,11 +99,11 @@ def test_admin_override_without_a_window_keeps_the_exact_catalog_limit(monkeypat
 
 
 def test_admin_override_cannot_invent_a_window_for_an_uncatalogued_model(monkeypatch):
-    import litellm
+    from lumen.services import provider_metadata
 
-    monkeypatch.setattr(litellm, "model_cost", {})
+    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {})
     monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
-    detected = litellm_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
+    detected = provider_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
 
     assert normalize_capabilities({"tool_call": True, "context_limit": None}, detected)["context_limit"] is None
 
@@ -221,7 +233,7 @@ def test_models_dev_legacy_capabilities_are_normalized_to_feature_gates():
             "tool_call": True,
             "modalities": {"input": ["text", "image"], "output": ["text", "image"]},
         },
-        litellm_capabilities("example-model", "openai"),
+        provider_capabilities("example-model", "openai"),
     )
 
     assert normalized["function_calling"] is True
@@ -234,7 +246,7 @@ def test_models_dev_pdf_modality_enables_the_document_input_gate():
         {
             "modalities": {"input": ["text", "pdf"], "output": ["text"]},
         },
-        litellm_capabilities("example-model", "openai"),
+        provider_capabilities("example-model", "openai"),
     )
 
     assert normalized["input_modalities"] == ["text", "pdf"]
@@ -242,7 +254,7 @@ def test_models_dev_pdf_modality_enables_the_document_input_gate():
 
 
 def test_stored_canonical_gates_and_detected_modalities_are_preserved():
-    detected = litellm_capabilities("example-model", "openai")
+    detected = provider_capabilities("example-model", "openai")
     detected["input_modalities"] = ["text"]
     detected["output_modalities"] = ["text"]
     normalized = normalize_capabilities(
@@ -356,14 +368,14 @@ def test_stored_canonical_modality_gates_are_not_clobbered_without_legacy_fields
                 "audio_output": {"available": True, "mode": "managed", "reason_code": None, "pricing_available": True},
             }
         },
-        litellm_capabilities("example-model", "openai"),
+        provider_capabilities("example-model", "openai"),
     )
 
     assert normalized["feature_gates"]["image_input"]["mode"] == "managed"
     assert normalized["feature_gates"]["audio_output"]["mode"] == "managed"
 
 
-def test_resolved_model_uses_a_secret_keyed_config_version_hash(monkeypatch):
+def test_resolved_model_fences_selected_credential_generation_without_decrypting(monkeypatch):
     model = SimpleNamespace(
         id=7,
         model_name="gpt-test",
@@ -381,39 +393,41 @@ def test_resolved_model_uses_a_secret_keyed_config_version_hash(monkeypatch):
         provider_type="openai",
         api_provider="openai",
         api_base="https://api.example.test/v1",
-        encrypted_api_key="ciphertext",
+        selection_policy="priority",
         is_active=True,
         margin_multiplier="1.25",
     )
-    decrypted_key = {"value": "first-secret"}
-    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: decrypted_key["value"])
+    credential = _attach_credentials(provider)
+    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: (_ for _ in ()).throw(AssertionError("route must be secret-free")))
     monkeypatch.setattr(provider_store, "derive_encryption_subkey", lambda _: b"test-hmac-key")
 
     first = _resolved_model(model, provider)
-    decrypted_key["value"] = "rotated-secret"
+    credential.generation += 1
     second = _resolved_model(model, provider)
 
     assert first["config_version_hash"] != second["config_version_hash"]
     assert first["config_version_hash"] != "first-secret"
     assert "first-secret" not in first["config_version_hash"]
+    assert first["provider_auth"]["credential_id"] == credential.id
+    assert first["api_key"] is None
 
 
-def test_resolved_provider_uses_secret_keyed_config_version_hash(monkeypatch):
+def test_resolved_provider_fences_selected_credential_generation_without_decrypting(monkeypatch):
     provider = SimpleNamespace(
         id=3,
         name="search-provider",
         provider_type="perplexity",
         api_base="https://search.example.test",
-        encrypted_api_key="ciphertext",
+        selection_policy="priority",
         is_active=True,
         margin_multiplier="1.25",
     )
-    decrypted_key = {"value": "first-secret"}
-    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: decrypted_key["value"])
+    credential = _attach_credentials(provider)
+    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: (_ for _ in ()).throw(AssertionError("route must be secret-free")))
     monkeypatch.setattr(provider_store, "derive_encryption_subkey", lambda _: b"test-hmac-key")
 
     first = _resolved_provider(provider)
-    decrypted_key["value"] = "rotated-secret"
+    credential.generation += 1
     second = _resolved_provider(provider)
 
     assert first["config_version_hash"] != second["config_version_hash"]
@@ -421,7 +435,7 @@ def test_resolved_provider_uses_secret_keyed_config_version_hash(monkeypatch):
     assert first["provider_name"] == "search-provider"
 
 
-def test_resolved_model_gates_litellm_fallback_prices(monkeypatch):
+def test_resolved_model_gates_frozen_catalog_prices(monkeypatch):
     model = SimpleNamespace(
         id=7,
         model_name="fallback-model",
@@ -439,10 +453,11 @@ def test_resolved_model_gates_litellm_fallback_prices(monkeypatch):
         provider_type="openai",
         api_provider="openai",
         api_base=None,
-        encrypted_api_key=None,
+        selection_policy="priority",
         margin_multiplier="1",
         is_active=True,
     )
+    _attach_credentials(provider)
     monkeypatch.setattr(provider_pricing, "effective_prices_per_million", lambda *_, **__: (Decimal("1"), Decimal("2")))
 
     resolved = _resolved_model(model, provider)
@@ -517,17 +532,18 @@ def test_chatgpt_subscription_capabilities_use_static_metadata_without_provider_
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("provider probe is forbidden")),
     )
 
-    capabilities = litellm_capabilities("chatgpt/gpt-5.2-codex", "chatgpt")
+    capabilities = provider_capabilities("chatgpt/gpt-5.2-codex", "chatgpt")
 
     assert capabilities["responses_api"] is True
     assert capabilities["endpoints"] == ["responses"]
     assert capabilities["structured_output"] is False
+    assert capabilities["output_budget_enforced"] is False
 
 
 def test_chatgpt_subscription_override_cannot_enable_structured_output():
     model = SimpleNamespace(
         model_name="chatgpt/gpt-5.2-codex",
-        capabilities={"structured_output": True, "tools": True},
+        capabilities={"structured_output": True, "tools": True, "output_budget_enforced": True},
         capability_source="override",
     )
 
@@ -536,6 +552,7 @@ def test_chatgpt_subscription_override_cannot_enable_structured_output():
     assert source == "override"
     assert capabilities["tools"] is True
     assert capabilities["structured_output"] is False
+    assert capabilities["output_budget_enforced"] is False
 
 
 @pytest.mark.parametrize("auth_mode", ("chatgpt_device", "anthropic_subscription"))

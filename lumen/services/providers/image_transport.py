@@ -17,6 +17,7 @@ import httpx
 
 from lumen.services.usage_breakdown import UsageBreakdown
 
+from .credentials import api_key_route_configured, resolve_route_api_key
 from .errors import ProviderValidationError
 from .pricing import (
     exact_media_price,
@@ -85,7 +86,7 @@ def _image_usage(route: dict, result: dict, provider: str) -> UsageBreakdown | N
 
 def _model(route: dict) -> tuple[str, str]:
     """Accept only canonical direct endpoints, API-key authentication and known models."""
-    if route.get("model_kind") != "image" or route.get("provider_auth") is not None:
+    if not isinstance(route, dict) or route.get("model_kind") != "image" or not api_key_route_configured(route):
         raise ProviderValidationError("image route is not directly executable")
     provider = route.get("provider_type")
     model = route.get("api_model_name")
@@ -101,8 +102,6 @@ def _model(route: dict) -> tuple[str, str]:
     if configured_base is not None and (not isinstance(configured_base, str)
                                         or configured_base.rstrip("/") not in accepted_bases):
         raise ProviderValidationError("unsupported image provider endpoint")
-    if not isinstance(route.get("api_key"), str) or not route["api_key"].strip():
-        raise ProviderValidationError("image provider credential is unavailable")
     return provider, model
 
 
@@ -262,9 +261,10 @@ async def generate_images(route: dict, *, prompt: str, size: str, quality: str, 
             raise ProviderValidationError("source image MIME is invalid")
     elif source_mime is not None:
         raise ProviderValidationError("source image MIME without data")
+    api_key = await resolve_route_api_key(route)
     if provider == "openai":
         body = {"model": model, "prompt": prompt, "size": size, "quality": quality, "n": n}
-        headers = {"Authorization": f"Bearer {route['api_key']}"}
+        headers = {"Authorization": f"Bearer {api_key}"}
         if source_image is None:
             result = await _post("https://api.openai.com/v1/images/generations", headers=headers,
                                  count=n, json_body=body)
@@ -290,7 +290,7 @@ async def generate_images(route: dict, *, prompt: str, size: str, quality: str, 
         response_format["image_size"] = quality.upper()
     result = await _post(
         "https://generativelanguage.googleapis.com/v1beta/interactions",
-        headers={"x-goog-api-key": route["api_key"]}, count=1,
+        headers={"x-goog-api-key": api_key}, count=1,
         json_body={"model": model, "input": inputs, "response_format": response_format, "store": False},
     )
     if result.get("status") != "completed":

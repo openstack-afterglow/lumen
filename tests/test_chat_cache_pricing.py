@@ -10,21 +10,20 @@ import json
 from decimal import Decimal
 from types import SimpleNamespace
 
-import litellm
 import pytest
-from litellm.llms.anthropic.chat.transformation import AnthropicConfig
 
 from lumen.api.compat import openai as openai_api
 from lumen.api.models import ModelCreateRequest, ModelResponse, ModelUpdateRequest
 from lumen.models.api_requests import OpenAIChatResponse
 from lumen.models.chat_contracts import UsageComponent, UsageUpdatedPayload
-from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider
+from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider, LlmProviderAccount, LlmProviderCredential
 from lumen.scripts.migrate import MIGRATIONS, _sha256, _statements, load_manifest
-from lumen.services import advisor, completion_api, credit, graph, litellm_client
+from lumen.services import advisor, completion_api, credit, graph, provider_metadata
 from lumen.services import stats as stats_service
 from lumen.services.chat_admission import _run_snapshots
 from lumen.services.completion_format import nonstream_response
 from lumen.services.durable_runs import execution
+from lumen.services.provider_client import ProviderObject
 from lumen.services.providers import billing, pricing, repository, routing
 from lumen.services.providers.errors import ActiveRunConfigurationConflict, ProviderValidationError
 from lumen.services.tool_runtime import managed
@@ -127,11 +126,23 @@ def _frozen_snapshot(cache_prices: dict) -> dict:
 
 
 class TestCrossEndpointLedger:
-    """The chat path (LiteLLM-normalized usage) and the /v1/messages passthrough
+    """The chat path (normalized provider usage) and /v1/messages passthrough
     (raw Anthropic usage) must write the same ledger for the same provider report."""
 
+    @pytest.fixture(autouse=True)
+    def absent_catalog_rates(self, monkeypatch):
+        # Exercise genuinely missing categories independently of bundled model defaults.
+        monkeypatch.setattr(provider_metadata, "bundled_cache_rates", lambda *_args: {})
+        monkeypatch.setattr(pricing, "bundled_cache_rates", lambda *_args: {})
+
     async def _chat_path(self, cache_prices: dict):
-        usage = AnthropicConfig().calculate_usage(json.loads(json.dumps(_RAW_ANTHROPIC_USAGE)), None)
+        # The private wire boundary supplies total-input chat usage; the raw
+        # Anthropic report excludes cached input and includes compaction rounds.
+        usage = ProviderObject(
+            prompt_tokens=390, completion_tokens=45,
+            cache_read_input_tokens=150, cache_creation_5m_input_tokens=20,
+            cache_creation_1h_input_tokens=10,
+        )
         # graph round → provider_completed journal → executor usage event.
         round_usage = graph._usage_breakdown(usage)
         replayed = graph._replayed_usage(round_usage.as_usage_dict())
@@ -155,8 +166,8 @@ class TestCrossEndpointLedger:
         runtime = completion_api._native_usage(
             {"usage": json.loads(json.dumps(_RAW_ANTHROPIC_USAGE))}, protocol="anthropic"
         )
-        breakdown = litellm_client.extract_usage_breakdown(_MODEL, [], "", runtime)
-        cost = litellm_client.cost_from_usage(
+        breakdown = provider_metadata.extract_usage_breakdown(_MODEL, [], "", runtime)
+        cost = provider_metadata.cost_from_usage(
             _MODEL,
             breakdown.input_tokens,
             breakdown.output_tokens,
@@ -224,7 +235,7 @@ class TestCrossEndpointLedger:
             captured.update(kwargs)
             return Decimal("0")
 
-        monkeypatch.setattr(completion_api.litellm_client, "aanthropic_messages", fake_messages)
+        monkeypatch.setattr(completion_api.provider_client, "aanthropic_messages", fake_messages)
         monkeypatch.setattr(completion_api, "_with_passthrough_compaction", lambda options, **_kwargs: options)
         monkeypatch.setattr(completion_api.credit, "apply_usage", apply_usage)
 
@@ -280,16 +291,16 @@ class TestProviderShapes:
         }
         assert UsageBreakdown.from_runtime(runtime).uncached_input_tokens == 200
 
-    def test_openai_chat_cached_tokens_split_from_litellm_usage(self):
-        usage = litellm.Usage(prompt_tokens=1000, completion_tokens=10, prompt_tokens_details={"cached_tokens": 800})
-        breakdown = litellm_client.extract_usage_breakdown("gpt-5.6-sol", [], "", usage)
+    def test_openai_chat_cached_tokens_split_from_provider_usage(self):
+        usage = ProviderObject(prompt_tokens=1000, completion_tokens=10, prompt_tokens_details={"cached_tokens": 800})
+        breakdown = provider_metadata.extract_usage_breakdown("gpt-5.6-sol", [], "", usage)
 
         assert (breakdown.input_tokens, breakdown.output_tokens) == (1000, 10)
         assert breakdown.cache_read_input_tokens == 800
         assert breakdown.cache_creation_input_tokens == 0
         assert breakdown.uncached_input_tokens == 200
         # The tuple API keeps prompt_tokens as total input for context accounting.
-        assert litellm_client.extract_usage("gpt-5.6-sol", [], "", usage) == (1000, 10)
+        assert provider_metadata.extract_usage("gpt-5.6-sol", [], "", usage) == (1000, 10)
 
     def test_creation_without_ttl_split_is_attributed_to_five_minutes(self):
         breakdown = UsageBreakdown.from_anthropic(
@@ -339,7 +350,7 @@ class TestCacheRates:
     )
 
     def _cost(self, **cache_prices):
-        return litellm_client.cost_from_usage(
+        return provider_metadata.cost_from_usage(
             _MODEL,
             1000,
             100,
@@ -405,7 +416,7 @@ class TestCacheRates:
         assert cost.pricing_status == "partial"
 
     def test_zero_cache_tokens_without_rate_stays_priced(self):
-        cost = litellm_client.cost_from_usage(
+        cost = provider_metadata.cost_from_usage(
             _MODEL,
             10,
             5,
@@ -418,7 +429,7 @@ class TestCacheRates:
 
     def test_breakdown_totals_must_match(self):
         with pytest.raises(ValueError):
-            litellm_client.cost_from_usage(
+            provider_metadata.cost_from_usage(
                 _MODEL,
                 999,
                 100,
@@ -592,6 +603,16 @@ class TestConfigFingerprint:
             api_base=None,
             is_active=True,
             margin_multiplier=Decimal("1.2"),
+            selection_policy="priority",
+            accounts=[LlmProviderAccount(
+                id=2, provider_id=1, name="cache-account", is_active=True,
+                priority=0, weight=1,
+                credentials=[LlmProviderCredential(
+                    id=3, account_id=2, name="cache-credential", auth_mode="api_key",
+                    api_key_env="LUMEN_CACHE_TEST_KEY", generation=0, is_active=True,
+                    priority=0, weight=1, subscription_status="disconnected",
+                )],
+            )],
         )
         model = LlmModel(
             id=10,
@@ -608,7 +629,7 @@ class TestConfigFingerprint:
 
     @pytest.fixture(autouse=True)
     def _routing(self, monkeypatch):
-        monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "key-1")
+        monkeypatch.setenv("LUMEN_CACHE_TEST_KEY", "key-1")
         monkeypatch.setattr(routing, "derive_encryption_subkey", lambda _domain: b"test-routing-key")
         monkeypatch.setattr(routing, "_effective_capabilities", lambda *_args, **_kwargs: ({}, "test"))
         monkeypatch.setattr(
@@ -724,7 +745,7 @@ class TestConfigFingerprint:
             prompt, 0, cache_creation_5m_input_tokens=1000, cache_creation_1h_input_tokens=1000,
         )
         durable = credit.usage_cost_from_pricing_snapshot(frozen, prompt_tokens=prompt, completion_tokens=0, breakdown=observed)
-        live = litellm_client.cost_from_usage(
+        live = provider_metadata.cost_from_usage(
             _MODEL, prompt, 0, input_price_per_token=resolved["input_price_per_token"],
             output_price_per_token=resolved["output_price_per_token"], price_source="manual",
             breakdown=observed, allow_catalog_cache=False,
@@ -739,6 +760,7 @@ class TestConfigFingerprint:
             assert live.pricing_snapshot[name]["source"] == source
 
     def test_admission_snapshot_freezes_cache_rates(self, monkeypatch):
+        monkeypatch.setattr(pricing, "bundled_cache_rates", lambda *_args: {})
         resolved = routing._resolved_model(*self._rows(cache_write_price=Decimal("0.0000037500")))
         summary = {**resolved, "cache_write_1h_price_per_token": Decimal("0.0000060000")}
         _capability, pricing_snapshot = _run_snapshots(resolved, {}, summary_route=summary)
@@ -777,11 +799,11 @@ class TestConfigFingerprint:
         assert resolved["cache_price_sources"]["cache_read"] == "litellm"
 
         _, snapshot = _run_snapshots(resolved, {})
-        observed = UsageBreakdown.from_runtime(litellm.Usage(
+        observed = UsageBreakdown.from_runtime(ProviderObject(
             prompt_tokens=2806, completion_tokens=2,
             prompt_tokens_details={"cached_tokens": 2038},
         ))
-        direct = litellm_client.cost_from_usage(
+        direct = provider_metadata.cost_from_usage(
             model.model_name, observed.input_tokens, observed.output_tokens,
             input_price_per_token=resolved["input_price_per_token"],
             output_price_per_token=resolved["output_price_per_token"],
@@ -817,7 +839,7 @@ class TestConfigFingerprint:
             "cache_creation_input_token_cost_above_1hr": "0.000001",
             "cache_creation_input_token_cost_above_1hr_above_200k_tokens": "0.0000015",
         }
-        monkeypatch.setitem(litellm.model_cost, catalog_key, metadata)
+        monkeypatch.setattr(provider_metadata, "_catalog", lambda: {catalog_key: metadata})
         model, provider = self._rows()
         model.model_name = model_name
         provider.provider_type = provider_type
@@ -834,7 +856,7 @@ class TestConfigFingerprint:
                 prompt, 0, cache_read_input_tokens=prompt - 100_000,
                 cache_creation_5m_input_tokens=50_000, cache_creation_1h_input_tokens=50_000,
             )
-            direct = litellm_client.cost_from_usage(
+            direct = provider_metadata.cost_from_usage(
                 model_name, prompt, 0, input_price_per_token=resolved["input_price_per_token"],
                 output_price_per_token=resolved["output_price_per_token"],
                 price_source=resolved["price_source"], provider_type=provider_type,
@@ -875,7 +897,7 @@ class TestConfigFingerprint:
         resolved = routing._resolved_model(model, provider)
         assert resolved["cache_price_sources"]["cache_read"] == "manual"
         breakdown = UsageBreakdown.from_totals(2806, 2, cache_read_input_tokens=2038)
-        cost = litellm_client.cost_from_usage(
+        cost = provider_metadata.cost_from_usage(
             model.model_name, breakdown.input_tokens, breakdown.output_tokens,
             input_price_per_token=resolved["input_price_per_token"],
             output_price_per_token=resolved["output_price_per_token"],
@@ -897,7 +919,7 @@ class TestConfigFingerprint:
             "cache_creation_5m": "fallback_input:manual",
             "cache_creation_1h": "fallback_5m:fallback_input:manual",
         }
-        assert litellm_client.effective_prices_per_million(
+        assert provider_metadata.effective_prices_per_million(
             model.model_name, "gemini", api_base=provider.api_base
         ) == (None, None)
 
@@ -909,7 +931,7 @@ class TestConfigFingerprint:
         model.output_price = Decimal("0.0000004000")
         provider.provider_type = "gemini"
         resolved = routing._resolved_model(model, provider)
-        usage = litellm.Usage(
+        usage = ProviderObject(
             prompt_tokens=2806, completion_tokens=2,
             prompt_tokens_details={"cached_tokens": 2038},
         )
@@ -925,7 +947,7 @@ class TestConfigFingerprint:
             captured.append(kwargs)
             return Decimal("0.00009798")
 
-        monkeypatch.setattr(completion_api.litellm_client, "acompletion", complete)
+        monkeypatch.setattr(completion_api.provider_client, "acompletion", complete)
         monkeypatch.setattr(completion_api.credit, "apply_usage", apply_usage)
         result = await completion_api.complete_once(
             resolved=resolved, messages=[{"role": "user", "content": "hello"}],
@@ -945,7 +967,7 @@ class TestConfigFingerprint:
                 yield SimpleNamespace(usage=usage, choices=[])
             return chunks()
 
-        monkeypatch.setattr(completion_api.litellm_client, "acompletion_stream", complete_stream)
+        monkeypatch.setattr(completion_api.provider_client, "acompletion_stream", complete_stream)
         events = [event async for event in completion_api.complete_stream(
             resolved=resolved, messages=[{"role": "user", "content": "hello"}],
             user_id="u1", project_id="p1", api_key_id=7,
@@ -1012,6 +1034,8 @@ def model_db(monkeypatch):
     engine = create_engine("sqlite:///:memory:")
     LlmProvider.__table__.create(engine)
     LlmModel.__table__.create(engine)
+    LlmProviderAccount.__table__.create(engine)
+    LlmProviderCredential.__table__.create(engine)
     sync_factory = sessionmaker(engine, expire_on_commit=False)
     ids = {"model": 100}
     monkeypatch.setattr(repository, "_require_db", lambda: lambda: _AsyncSession(sync_factory(), ids))
@@ -1334,6 +1358,7 @@ class TestInterruptedAnthropicStream:
     _START_USAGE = {"input_tokens": 100, "cache_read_input_tokens": 90_000, "output_tokens": 1}
 
     async def _interrupted_bill(self, monkeypatch, cache_prices: dict, events: list[dict], count_tokens=None) -> dict:
+        monkeypatch.setattr(provider_metadata, "bundled_cache_rates", lambda *_args: {})
         async def stream():
             for event in events:
                 yield event
@@ -1353,8 +1378,8 @@ class TestInterruptedAnthropicStream:
             assert messages is None
             return 2
 
-        monkeypatch.setattr(completion_api.litellm_client, "aanthropic_messages", fake_messages)
-        monkeypatch.setattr(completion_api.litellm_client, "count_tokens", count_tokens or reported_input_only)
+        monkeypatch.setattr(completion_api.provider_client, "aanthropic_messages", fake_messages)
+        monkeypatch.setattr(completion_api.provider_metadata, "count_tokens", count_tokens or reported_input_only)
         monkeypatch.setattr(completion_api, "_with_passthrough_compaction", lambda options, **_kwargs: options)
         monkeypatch.setattr(completion_api.credit, "apply_usage", apply_usage)
 
@@ -1426,8 +1451,8 @@ class TestInterruptedAnthropicStream:
         assert captured["breakdown"].cache_read_input_tokens == 90_000
 
     async def test_adapter_zero_start_usage_counts_the_prompt_locally(self, monkeypatch):
-        # LiteLLM's chat/completions and Responses /v1/messages adapters open
-        # with an all-zero usage; trusting it would bill the prompt as free.
+        # A provider adapter can start with all-zero provisional usage; trusting
+        # it would bill the prompt as free when the stream is interrupted.
         counted: list[str] = []
 
         def count_tokens(_model, *, messages=None, text=None):
@@ -1478,7 +1503,7 @@ class TestAdvisorCachePricing:
         async def acompletion(**_kwargs):
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content="advice"))],
-                usage=litellm.Usage(
+                usage=ProviderObject(
                     prompt_tokens=1000, completion_tokens=10, prompt_tokens_details={"cached_tokens": 800}
                 ),
             )
@@ -1486,7 +1511,7 @@ class TestAdvisorCachePricing:
         async def use_allowed(*_args):
             return True
 
-        monkeypatch.setattr(advisor.litellm_client, "acompletion", acompletion)
+        monkeypatch.setattr(advisor.provider_client, "acompletion", acompletion)
         monkeypatch.setattr(managed, "_managed_use_allowed", use_allowed)
         result = await advisor.ask_with_route(route=self._ADVISOR_ROUTE, goal="review", visible_messages=[])
         executed = await managed._execute_managed_advisor(

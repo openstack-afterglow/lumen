@@ -86,17 +86,28 @@ def _provider(**over):
         "updated_at": None,
     }
     values.update(over)
-    return SimpleNamespace(**values)
+    generation = values.pop("subscription_generation")
+    credential = SimpleNamespace(id=9, account_id=8, generation=generation,
+        auth_mode=values["auth_mode"], is_active=True, priority=0, weight=1,
+        allowed_model_ids=None, allowed_capabilities=None, expires_at=None, cooldown_until=None,
+        **{key: values.pop(key) for key in (
+            "encrypted_api_key", "api_key_env", "encrypted_subscription_tokens",
+            "subscription_status", "subscription_expires_at")})
+    account = SimpleNamespace(id=8, provider_id=values["id"], name="default", is_active=True,
+        priority=0, weight=1, allowed_model_ids=None, allowed_capabilities=None, quota_group=None,
+        credentials=[credential])
+    return SimpleNamespace(accounts=[account], selection_policy="priority", selected_credential_id=None, **values)
 
 
 def _attempt(provider, **over):
     now = datetime.now(UTC)
     values = {
         "provider_id": provider.id,
+        "credential_id": provider.accounts[0].credentials[0].id,
         "id": "attempt-1",
         "initiated_by_user_id": "admin-1",
         "initiated_by_project_id": "project-1",
-        "provider_generation": provider.subscription_generation,
+        "provider_generation": provider.accounts[0].credentials[0].generation,
         "encrypted_payload": subscriptions._encrypt(
             {"device_auth_id": "device-1", "user_code": "ABCD-EFGH", "interval": 5}
         ),
@@ -121,13 +132,16 @@ def _configure(monkeypatch, provider, attempt=None):
     session = _Session(provider, attempt)
     monkeypatch.setattr(subscriptions, "_require_db", lambda: lambda: session)
 
-    async def lock(_session, *, provider_id, model_ids=None):
+    async def lock(_session, provider_id, *, account_id=None, credential_id=None):
         assert _session is session
         assert provider_id == provider.id
-        assert model_ids is None
-        return provider, []
+        account = provider.accounts[0]
+        credential = account.credentials[0]
+        if account_id not in (None, account.id) or credential_id not in (None, credential.id):
+            raise AssertionError("wrong selected credential")
+        return provider, account, credential
 
-    monkeypatch.setattr(subscriptions, "_lock_mutable_route", lock)
+    monkeypatch.setattr(subscriptions, "lock_credential", lock)
     return session
 
 
@@ -217,10 +231,10 @@ async def test_device_poll_connects_and_clears_attempt_payload(monkeypatch):
     )
 
     assert result["status"] == "connected"
-    assert provider.subscription_generation == 1
-    assert provider.subscription_status == "configured"
+    assert provider.accounts[0].credentials[0].generation == 1
+    assert provider.accounts[0].credentials[0].subscription_status == "configured"
     assert attempt.encrypted_payload is None
-    bundle = subscriptions._decrypt(provider.encrypted_subscription_tokens)
+    bundle = subscriptions._decrypt(provider.accounts[0].credentials[0].encrypted_subscription_tokens)
     assert bundle["account_id"] == "account-1"
     assert bundle["refresh_token"] == "refresh-token"
 
@@ -240,7 +254,7 @@ async def test_cancel_clears_pending_payload_without_disconnect(monkeypatch):
 
     assert attempt.status == "cancelled"
     assert attempt.encrypted_payload is None
-    assert provider.encrypted_subscription_tokens == "existing"
+    assert provider.accounts[0].credentials[0].encrypted_subscription_tokens == "existing"
 
 
 @pytest.mark.asyncio
@@ -252,11 +266,11 @@ async def test_claude_token_is_validated_encrypted_and_resolved(monkeypatch):
 
     result = await subscriptions.set_subscription_token(provider.id, token=token, expires_at=None)
     credential = await subscriptions.resolve_subscription_credential(
-        {"provider_id": provider.id, "generation": 1, "auth_mode": "anthropic_subscription"}
+        {"provider_id": provider.id, "account_id": 8, "credential_id": 9, "generation": 1, "auth_mode": "anthropic_subscription"}
     )
 
     assert result == {"id": provider.id}
-    assert token not in provider.encrypted_subscription_tokens
+    assert token not in provider.accounts[0].credentials[0].encrypted_subscription_tokens
     assert credential["access_token"] == token
     assert credential["_fingerprint"] == subscriptions._credential_fingerprint(token)
 
@@ -288,13 +302,13 @@ async def test_refresh_rotates_tokens_without_changing_generation(monkeypatch):
 
     monkeypatch.setattr(subscriptions, "_post", post)
     credential = await subscriptions.resolve_subscription_credential(
-        {"provider_id": provider.id, "generation": 4, "auth_mode": "chatgpt_device"}
+        {"provider_id": provider.id, "account_id": 8, "credential_id": 9, "generation": 4, "auth_mode": "chatgpt_device"}
     )
 
     assert credential["access_token"] == new_access
     assert credential["refresh_token"] == "old-refresh"
-    assert provider.subscription_generation == 4
-    assert subscriptions._decrypt(provider.encrypted_subscription_tokens)["access_token"] == new_access
+    assert provider.accounts[0].credentials[0].generation == 4
+    assert subscriptions._decrypt(provider.accounts[0].credentials[0].encrypted_subscription_tokens)["access_token"] == new_access
 
 
 @pytest.mark.asyncio
@@ -321,11 +335,11 @@ async def test_invalid_refresh_marks_current_provider_reauth_required(monkeypatc
     monkeypatch.setattr(subscriptions, "_post", post)
     with pytest.raises(ProviderSubscriptionError) as raised:
         await subscriptions.resolve_subscription_credential(
-            {"provider_id": provider.id, "generation": 3, "auth_mode": "chatgpt_device"}
+            {"provider_id": provider.id, "account_id": 8, "credential_id": 9, "generation": 3, "auth_mode": "chatgpt_device"}
         )
 
     assert raised.value.code == "subscription_auth_required"
-    assert provider.subscription_status == "reauth_required"
+    assert provider.accounts[0].credentials[0].subscription_status == "reauth_required"
 
 
 @pytest.mark.asyncio
@@ -340,19 +354,19 @@ async def test_stale_rejection_cannot_overwrite_rotated_credential(monkeypatch):
         ),
     )
     _configure(monkeypatch, provider)
-    ref = {"provider_id": provider.id, "generation": 8, "auth_mode": "anthropic_subscription"}
+    ref = {"provider_id": provider.id, "account_id": 8, "credential_id": 9, "generation": 8, "auth_mode": "anthropic_subscription"}
 
     await subscriptions._mark_subscription_credential_rejected(
         ref,
         subscriptions._credential_fingerprint("sk-ant-oat01-stale_subscription_token"),
     )
-    assert provider.subscription_status == "configured"
+    assert provider.accounts[0].credentials[0].subscription_status == "configured"
 
     await subscriptions._mark_subscription_credential_rejected(
         ref,
         subscriptions._credential_fingerprint("sk-ant-oat01-current_subscription_token"),
     )
-    assert provider.subscription_status == "reauth_required"
+    assert provider.accounts[0].credentials[0].subscription_status == "reauth_required"
 
 
 def _public_subscription_provider(**over):

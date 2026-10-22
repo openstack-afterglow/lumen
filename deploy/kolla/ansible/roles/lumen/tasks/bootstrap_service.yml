@@ -12,6 +12,7 @@
     network_mode: host
     volumes:
       - "{{ lumen_config_dir }}/lumen.conf:/etc/lumen/lumen.conf:ro"
+      - "{{ lumen_policy_directory }}:/etc/lumen/policy.d:ro"
     env: &lumen_migration_env
       LUMEN_CONFIG_FILE: "/etc/lumen/lumen.conf"
       DATABASE_URL: "{{ lumen_database_url }}"
@@ -46,6 +47,7 @@
     network_mode: host
     volumes:
       - "{{ lumen_config_dir }}/lumen.conf:/etc/lumen/lumen.conf:ro"
+      - "{{ lumen_policy_directory }}:/etc/lumen/policy.d:ro"
     env:
       <<: *lumen_migration_env
       OPENAI_API_KEY: "{{ lumen_openai_api_key }}"

@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -439,6 +440,11 @@ async def prepare_delegations(
                 except DelegationDenied as exc:
                     raise ChildFailure("child_policy_denied", str(exc)) from exc
                 prepared = prepared_inputs[call.call_id]
+                capability_snapshot = dict(prepared["capability_snapshot"])
+                if "credential_authority" in (parent.capability_snapshot or {}):
+                    capability_snapshot["credential_authority"] = deepcopy(parent.capability_snapshot["credential_authority"])
+                else:
+                    capability_snapshot.pop("credential_authority", None)
                 child_id = str(uuid.uuid4())
                 child = ChatRun(
                     id=child_id,
@@ -459,8 +465,8 @@ async def prepare_delegations(
                     root_run_id=root.id,
                     delegation_call_id=call.call_id,
                     depth=int(parent.depth or 0) + 1,
-                    capability_snapshot=prepared["capability_snapshot"],
-                    required_plugin_digest=prepared["capability_snapshot"].get("required_plugin_digest"),
+                    capability_snapshot=capability_snapshot,
+                    required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
                     pricing_snapshot=prepared["pricing_snapshot"],
                     policy_snapshot={"policy": prepared["policy"].model_dump(mode="json"), "access": call.access},
                     request_payload=encrypt_chat_content(
@@ -515,7 +521,7 @@ async def prepare_delegations(
                             "conversation_id": None,
                             "temp_thread_id": None,
                             "model_name": child.model_name,
-                            "effective_features": (prepared["capability_snapshot"].get("effective_features") or {}),
+                            "effective_features": (capability_snapshot.get("effective_features") or {}),
                             "run_kind": "completion",
                         },
                     ),

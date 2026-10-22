@@ -9,6 +9,40 @@ import pytest
 from lumen.config import Settings, _config_candidates, _load_toml, get_settings, load_raw_toml
 
 
+@pytest.fixture(autouse=True)
+def _reset_deployment_config_caches():
+    load_raw_toml.cache_clear()
+    get_settings.cache_clear()
+    try:
+        # get_settings bridges TOML fields into os.environ; absent keys are not
+        # tracked by monkeypatch.delenv(..., raising=False).
+        with patch.dict(os.environ):
+            yield
+    finally:
+        load_raw_toml.cache_clear()
+        get_settings.cache_clear()
+
+
+def test_oslo_policy_toml_bridge_and_environment_precedence(monkeypatch, tmp_path):
+    path = tmp_path / "lumen.conf"
+    path.write_text('[oslo_policy]\npolicy_file = "/etc/lumen/operator.yaml"\npolicy_dirs = ["/etc/lumen/policy.d"]\n')
+    monkeypatch.setenv("LUMEN_CONFIG_FILE", str(path))
+    load_raw_toml.cache_clear()
+    get_settings.cache_clear()
+    try:
+        raw = _load_toml()
+        assert raw["oslo_policy_policy_file"] == "/etc/lumen/operator.yaml"
+        assert raw["oslo_policy_policy_dirs"] == ["/etc/lumen/policy.d"]
+        monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", "/explicit/policy.yaml")
+        monkeypatch.setenv("OSLO_POLICY_POLICY_DIRS", '["/explicit/policy.d"]')
+        settings = get_settings()
+        assert settings.oslo_policy_policy_file == "/explicit/policy.yaml"
+        assert settings.oslo_policy_policy_dirs == ["/explicit/policy.d"]
+    finally:
+        load_raw_toml.cache_clear()
+        get_settings.cache_clear()
+
+
 def test_lumen_toml_config_loading(monkeypatch, tmp_path):
     """Test loading Kolla-rendered-equivalent TOML configuration."""
     config_file = tmp_path / "lumen.conf"

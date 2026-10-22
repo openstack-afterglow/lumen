@@ -1062,6 +1062,211 @@ async def test_known_boot_timeout_reclaim_requires_full_owned_observation(pool):
         c.executor.shutdown(wait=True)
 
 
+class _Assignment:
+    """Redis assignment seam; SQL fences, claims and row state stay real MariaDB."""
+
+    def __init__(self, pool_name, owner):
+        self.pool_name, self.assignments = pool_name, {pool_name: owner}
+
+    async def current(self):
+        return SimpleNamespace(assignments=dict(self.assignments))
+
+
+def _owned_labels(pool, resource_id, fingerprint):
+    return dict(lumen_deployment=pool.deployment_id, lumen_pool=pool.name, lumen_resource=resource_id,
+                lumen_generation="1", lumen_fingerprint=fingerprint, lumen_policy=pool.profile_digest)
+
+
+async def _operation(resource_id, action):
+    async with get_session_factory()() as session:
+        return await session.scalar(select(ChatResourceOperation).where(
+            ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.action == action))
+
+
+@pytest.mark.parametrize("gate", ["redis-assignment", "sql-fence"])
+async def test_pre_submit_gate_failure_returns_create_claim_for_one_later_submission(pool, monkeypatch, gate):
+    from lumen.services.infrastructure import controller as controller_module
+    from lumen.services.infrastructure.controller import PoolLeaseLost
+    from lumen.services.infrastructure.providers import Observation
+
+    current, fence = await store.claim_pool_lease(pool.id, "controller-a", 30)
+    guest = await store.request_resource(current, role="worker", request_fingerprint="u" * 64,
+        image_ref=current.image_ref, policy_digest=current.profile_digest,
+        deadline=datetime.now(UTC) + timedelta(minutes=10), owner="controller-a", fence=fence)
+    factory = get_session_factory()
+    creates = []
+
+    class Nova:
+        requires_delivery = True
+        def create(self, intent):
+            creates.append(intent.resource_id)
+            return Observation("owned-server", "BUILD", None, None,
+                               _owned_labels(pool, intent.resource_id, "u" * 64))
+
+    real_claim = store.claim_operation
+    successor = {}
+
+    async def claim_then_lose_gate(resource_id, generation, action, owner, fence_value):
+        operation = await real_claim(resource_id, generation, action, owner, fence_value)
+        async with factory() as session, session.begin():
+            row = await session.get(ChatRuntimeResource, resource_id)
+            # Simulates a pre-create token held only in this controller's memory.
+            row.bootstrap_token_hash = "f" * 64
+            row.bootstrap_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+            if gate == "sql-fence":
+                (await session.get(ChatRuntimePool, pool.id)).reconcile_lease_expires_at = (
+                    datetime.now(UTC) - timedelta(seconds=1))
+        if gate == "sql-fence":
+            successor["claim"] = await store.claim_pool_lease(pool.id, "controller-b", 30)
+        else:
+            a._coordinator.assignments[pool.name] = "controller-b"
+        return operation
+
+    a = ResourceController(_controller_config(), {}, owner="controller-a")
+    b = ResourceController(_controller_config(), {}, owner="controller-b")
+    a._coordinator = _Assignment(pool.name, "controller-a")
+    target = controller_module._POOL.set(pool.name)
+    policy = SimpleNamespace(name=pool.name)
+    try:
+        monkeypatch.setattr(store, "claim_operation", claim_then_lose_gate)
+        [row] = await a._resources(pool.id)
+        with pytest.raises(PoolLeaseLost):
+            await a._reconcile_create(row, policy, fence, Nova())
+        monkeypatch.setattr(store, "claim_operation", real_claim)
+        assert creates == []
+        operation = await _operation(guest.id, "create")
+        assert operation.request_status == "claimed" and operation.owner == store._UNCLAIMED
+        assert operation.attempts == 1 and operation.error_code == "not_submitted"
+        [row] = await a._resources(pool.id)
+        assert row.observed_state == "requested" and row.provider_id is None
+        assert row.bootstrap_token_hash is None and row.bootstrap_expires_at is None
+
+        if gate == "sql-fence":
+            _, retry_fence = successor["claim"]
+            retry = b
+        else:
+            a._coordinator.assignments[pool.name] = "controller-a"
+            retry_fence, retry = fence, a
+        await retry._reconcile_create(row, policy, retry_fence, Nova())
+        assert creates == [guest.id]
+        operation = await _operation(guest.id, "create")
+        assert operation.request_status == "succeeded" and operation.owner == retry.owner
+        [row] = await retry._resources(pool.id)
+        assert row.provider_id == "owned-server" and row.observed_state == "creating"
+        # The submitted create is one-shot: a further pass never resubmits it.
+        await retry._reconcile_create(row, policy, retry_fence, Nova())
+        assert creates == [guest.id]
+    finally:
+        controller_module._POOL.reset(target)
+        a.executor.shutdown(wait=True)
+        b.executor.shutdown(wait=True)
+
+
+async def test_create_exception_after_sdk_entry_stays_unknown_and_is_never_resubmitted(pool):
+    from lumen.services.infrastructure import controller as controller_module
+
+    current, fence = await store.claim_pool_lease(pool.id, "controller-a", 30)
+    guest = await store.request_resource(current, role="worker", request_fingerprint="v" * 64,
+        image_ref=current.image_ref, policy_digest=current.profile_digest,
+        deadline=datetime.now(UTC) + timedelta(minutes=10), owner="controller-a", fence=fence)
+    creates = []
+
+    class Nova:
+        requires_delivery = True
+        def create(self, intent):
+            creates.append(intent.resource_id)
+            raise TimeoutError("create response lost after submission")
+
+    c = ResourceController(_controller_config(), {}, owner="controller-a")
+    c._coordinator = _Assignment(pool.name, "controller-a")
+    target = controller_module._POOL.set(pool.name)
+    policy = SimpleNamespace(name=pool.name)
+    try:
+        [row] = await c._resources(pool.id)
+        with pytest.raises(TimeoutError):
+            await c._reconcile_create(row, policy, fence, Nova())
+        operation = await _operation(guest.id, "create")
+        assert creates == [guest.id]
+        assert operation.request_status == "unknown" and operation.owner == "controller-a"
+        assert operation.error_code is None
+        [row] = await c._resources(pool.id)
+        assert row.observed_state == "unknown"
+        await c._reconcile_create(row, policy, fence, Nova())
+        assert creates == [guest.id]
+        assert await store.occupancy(pool.id) == 1
+    finally:
+        controller_module._POOL.reset(target)
+        c.executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("submitted", [False, True], ids=["assignment-lost-before-sdk", "sdk-raised"])
+async def test_delete_gate_failure_stays_retryable_but_submitted_delete_is_not_repeated(pool, monkeypatch, submitted):
+    from lumen.services.infrastructure import controller as controller_module
+    from lumen.services.infrastructure.controller import PoolLeaseLost
+    from lumen.services.infrastructure.providers import DeleteResult, Observation
+
+    current, fence = await store.claim_pool_lease(pool.id, "controller-a", 30)
+    guest = await store.request_resource(current, role="worker", request_fingerprint="w" * 64,
+        image_ref=current.image_ref, policy_digest=current.profile_digest, deadline=None,
+        owner="controller-a", fence=fence)
+    factory = get_session_factory()
+    async with factory() as session, session.begin():
+        row = await session.get(ChatRuntimeResource, guest.id)
+        row.provider_id, row.observed_state = "owned-server", "booting"
+        (await session.scalar(select(ChatResourceOperation).where(
+            ChatResourceOperation.resource_id == guest.id, ChatResourceOperation.action == "create",
+        ))).request_status = "succeeded"
+    assert await store.request_delete(guest.id, "controller-a", fence) is not None
+    deletes, fail = [], {"delete": submitted}
+
+    class Nova:
+        def observe(self, ref):
+            return Observation(ref.provider_id, "ACTIVE", None, None, {})
+        def delete(self, ref):
+            deletes.append(ref.provider_id)
+            if fail["delete"]:
+                raise TimeoutError("delete response lost after submission")
+            return DeleteResult(absent=True)
+
+    c = ResourceController(_controller_config(), {}, owner="controller-a")
+    c._coordinator = _Assignment(pool.name, "controller-a")
+    real_claim = store.claim_operation
+
+    async def claim_then_lose_assignment(*args):
+        operation = await real_claim(*args)
+        c._coordinator.assignments[pool.name] = "controller-b"
+        return operation
+
+    target = controller_module._POOL.set(pool.name)
+    policy = SimpleNamespace(name=pool.name)
+    try:
+        [row] = await c._resources(pool.id)
+        if submitted:
+            with pytest.raises(TimeoutError):
+                await c._reconcile_delete(row, policy, fence, Nova())
+            operation = await _operation(guest.id, "delete")
+            assert operation.request_status == "unknown" and operation.owner == "controller-a"
+            fail["delete"] = False
+            # Ambiguous acceptance is observed, never re-sent; ACTIVE is not absence.
+            await c._reconcile_delete(row, policy, fence, Nova())
+            assert deletes == ["owned-server"] and await store.occupancy(pool.id) == 1
+            return
+        monkeypatch.setattr(store, "claim_operation", claim_then_lose_assignment)
+        with pytest.raises(PoolLeaseLost):
+            await c._reconcile_delete(row, policy, fence, Nova())
+        monkeypatch.setattr(store, "claim_operation", real_claim)
+        assert deletes == []
+        operation = await _operation(guest.id, "delete")
+        assert operation.request_status == "claimed" and operation.owner == store._UNCLAIMED
+        assert operation.attempts == 1 and operation.error_code == "not_submitted"
+        c._coordinator.assignments[pool.name] = "controller-a"
+        await c._reconcile_delete(row, policy, fence, Nova())
+        assert deletes == ["owned-server"] and await store.occupancy(pool.id) == 0
+    finally:
+        controller_module._POOL.reset(target)
+        c.executor.shutdown(wait=True)
+
+
 @pytest.fixture
 async def lazy_chat_sandbox(pool, monkeypatch):
     from lumen.models.chat_infrastructure import ChatAgentReservation, ChatProjectAgentQuota
@@ -1208,7 +1413,6 @@ async def test_expired_approval_denial_resumes_only_authenticated_dispatch(lazy_
     from lumen import crypto
     from lumen.models.chat_runs import ChatToolApproval
     from lumen.services.durable_runs import interactions
-    from lumen.services.durable_runs.errors import DurableRunError
 
     f = lazy_chat_sandbox
     now = datetime.now(UTC)
@@ -1230,8 +1434,7 @@ async def test_expired_approval_denial_resumes_only_authenticated_dispatch(lazy_
             approval.tool_name = "browser_delete_everything"
     now += timedelta(minutes=16)
     if forged_dispatch:
-        with pytest.raises(DurableRunError):
-            await interactions.expire_pending_inputs()
+        assert run_id not in await interactions.expire_pending_inputs()
         async with f.factory() as session:
             run = await session.get(ChatRun, run_id)
             approval = await session.scalar(select(ChatToolApproval).where(ChatToolApproval.run_id == run_id))

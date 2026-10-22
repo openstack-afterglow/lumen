@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from provider_fixtures import configured_provider
 from redis.asyncio import Redis
 from sqlalchemy import delete, func, select
 
@@ -59,12 +60,10 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
 
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(
-                name=f"integration-provider-{nonce}",
-                provider_type="openai",
-                is_active=True,
-                margin_multiplier=Decimal("1"),
-            )
+            provider = configured_provider(name=f"integration-provider-{nonce}",
+            provider_type="openai",
+            is_active=True,
+            margin_multiplier=Decimal("1"),)
             session.add(provider)
             await session.flush()
             session.add(
@@ -170,8 +169,8 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
 
                 return stream()
 
-            monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_litellm_stream)
-            monkeypatch.setattr(graph.litellm_client, "direct_openai_stream_completed", lambda _stream: True)
+            monkeypatch.setattr(graph.provider_client, "acompletion_stream", fake_litellm_stream)
+            monkeypatch.setattr(graph.provider_client, "direct_openai_stream_completed", lambda _stream: True)
             registration_id = await _fixed_text_worker(run_id, run_owner)
             assert await execution.execute_queued_run(run_id, owner=run_owner, registration_id=registration_id) is True
 
@@ -379,13 +378,11 @@ async def test_subscription_model_namespace_is_unique_under_concurrent_registrat
     try:
         async with factory() as session, session.begin():
             providers = [
-                LlmProvider(
-                    name=f"subscription-provider-{index}-{nonce}",
-                    provider_type="chatgpt",
-                    auth_mode="chatgpt_device",
-                    is_active=True,
-                    margin_multiplier=Decimal("1"),
-                )
+                configured_provider(name=f"subscription-provider-{index}-{nonce}",
+                provider_type="chatgpt",
+                auth_mode="chatgpt_device",
+                is_active=True,
+                margin_multiplier=Decimal("1"),)
                 for index in range(2)
             ]
             session.add_all(providers)
@@ -644,7 +641,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
 
                 return chunks()
 
-            monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_stream)
+            monkeypatch.setattr(graph.provider_client, "acompletion_stream", fake_stream)
             worker_identity = f"onboarding-worker-{nonce}"
             registration_id = await _fixed_text_worker(run_id, worker_identity)
             assert await execution.execute_queued_run(
@@ -760,11 +757,11 @@ async def test_persistent_tool_round_keeps_its_message_when_provider_advances(mo
 
         return chunks()
 
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", provider_stream)
-    monkeypatch.setattr(graph.litellm_client, "direct_openai_stream_completed", lambda _: True)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", provider_stream)
+    monkeypatch.setattr(graph.provider_client, "direct_openai_stream_completed", lambda _: True)
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"turn-provider-{nonce}", provider_type="openai", is_active=True,
+            provider = configured_provider(name=f"turn-provider-{nonce}", provider_type="openai", is_active=True,
                                    margin_multiplier=Decimal("1"))
             session.add(provider)
             await session.flush()

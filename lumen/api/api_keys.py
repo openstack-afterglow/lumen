@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from lumen import service_authority
-from lumen.auth import ensure_scopes, get_token_info, require_admin
+from lumen.auth import credential_authority_snapshot, ensure_scopes, get_token_info, require_admin
 from lumen.services import api_key_store as aks
 
 router = APIRouter()
@@ -125,7 +125,7 @@ async def list_api_keys(token_info: dict = Depends(get_token_info)):
 @router.post("/api-keys", status_code=201)
 async def create_api_key(body: ApiKeyCreateBody, token_info: dict = Depends(get_token_info)):
     """새 API 키 발급 — 응답의 `key` 는 평문(1회만 노출, 이후 조회 불가)."""
-    ensure_scopes(token_info, "native:keys:write")
+    ensure_scopes(token_info, "native:keys:write", *body.scopes)
     try:
         return await aks.create_key(
             token_info["user_id"],
@@ -135,6 +135,7 @@ async def create_api_key(body: ApiKeyCreateBody, token_info: dict = Depends(get_
             body.monthly_credit_limit,
             body.weekly_credit_limit,
             expires_at=body.expires_at,
+            credential_authority=credential_authority_snapshot(token_info),
         )
     except _EXC as exc:
         raise _http(exc) from exc
@@ -144,7 +145,11 @@ async def create_api_key(body: ApiKeyCreateBody, token_info: dict = Depends(get_
 async def get_api_key_issuance_policy(token_info: dict = Depends(get_token_info)):
     ensure_scopes(token_info, "native:keys:write")
     try:
-        permitted = await aks.current_issuance_scopes(token_info["user_id"], token_info["project_id"])
+        permitted = await aks.current_issuance_scopes(
+            token_info["user_id"], token_info["project_id"],
+            credential_authority=credential_authority_snapshot(token_info),
+        )
+        permitted &= service_authority.allowed_scopes(token_info)
         if token_info.get("auth_type") == "api_key":
             permitted &= set(token_info.get("scopes", ()))
         allowed = sorted(permitted)

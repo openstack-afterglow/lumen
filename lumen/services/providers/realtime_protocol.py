@@ -352,7 +352,10 @@ async def relay_audio(
         raise RealtimeTransportError("session duration must exceed the upstream close timeout")
     relay_limit = max_duration_seconds - CLOSE_TIMEOUT_SECONDS if session_time else max_duration_seconds
     output_limit = 24000 * 2 * max_duration_seconds
-    url, headers = upstream_connection_spec(route)
+    from .credentials import resolve_route_api_key
+
+    api_key = await resolve_route_api_key(route)
+    url, headers = upstream_connection_spec({**route, "api_key": api_key})
     incoming = outgoing = 0
     tokens = TokenUsageMeter(provider) if token_usage else None
     loop = asyncio.get_running_loop()

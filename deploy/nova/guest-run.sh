@@ -17,6 +17,11 @@ loaded_os=$(docker image inspect --format '{{.Os}}' "$image_id")
 [[ $loaded_id == "$image_id" && $loaded_arch == "$architecture" && $loaded_os == linux ]] || {
     printf 'Loaded image digest/platform mismatch\n' >&2; exit 1;
 }
+# Prove the immutable API/worker image contains an executable native provider
+# runtime before handing it bootstrap credentials; this command opens no listener.
+docker run --rm --pull=never --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --entrypoint /usr/local/bin/lumen-bifrost \
+    "$image_id" --version
 mkdir -p -m 0700 /var/lib/lumen/identity /var/lib/lumen/drain
 if [[ $role == api ]]; then
     command=(uvicorn lumen.main:app --host 0.0.0.0 --port "$port")

@@ -13,31 +13,21 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from test_policy import operator_policy as operator_policy
 
 from lumen import auth
 from lumen.api import agents, assets, code_workspaces, conversations, extensions, memory, plugins, workspaces
 from lumen.api.compat import files
-from lumen.service_authority import READER_CAPABILITIES, SERVICE_CAPABILITIES
 from lumen.services import agent_store, conversation_store, extensions_store, mcp_oauth
 
 _IDENTIFIER = "00000000-0000-0000-0000-000000000001"
 
-# Synthetic identity-boundary results for an installed preset graph. These
-# explicit effective leaves are fixture data, never a production role expansion.
-_USER_LEAVES = READER_CAPABILITIES | {
-    "lumen-chat_user", "lumen-images_user", "lumen-audio_user", "lumen-tools_user",
-}
-_EDITOR_LEAVES = SERVICE_CAPABILITIES - {"lumen-resources_admin"}
-_PRESET_LEAVES = {
-    "lumen_reader": READER_CAPABILITIES,
-    "lumen_user": _USER_LEAVES,
-    "lumen_editor": _EDITOR_LEAVES,
-    "lumen_admin": SERVICE_CAPABILITIES,
-}
+# Native directory results contain only actual assigned roles, with no implied
+# service leaves or prerequisite native member edge.
 
 
 def _effective_roles(grade: str, baseline: str | None = "member") -> list[str]:
-    return ([baseline] if baseline else []) + [grade, *sorted(_PRESET_LEAVES[grade])]
+    return ([baseline] if baseline else []) + [grade]
 
 
 @pytest.fixture
@@ -245,7 +235,7 @@ async def test_api_key_scope_attenuates_configuration_editor(management_app, mon
     assert create.await_count == 1
 
 
-@pytest.mark.parametrize("roles", [_effective_roles("lumen_user"), _effective_roles("lumen_editor", "reader"), ["member"]])
+@pytest.mark.parametrize("roles", [_effective_roles("lumen_user"), _effective_roles("lumen_reader", "reader"), ["member"]])
 async def test_oauth_callback_rechecks_persisted_owner_before_exchange(monkeypatch, roles):
     row = SimpleNamespace(status="pending", expires_at=datetime.now(UTC) + timedelta(minutes=5),
                           owner_user_id="owner", owner_project_id="project", encrypted_payload="encrypted")
@@ -427,11 +417,16 @@ async def test_history_leaf_does_not_grant_config_inventory(management_app, path
 
 @pytest.mark.parametrize("roles", [_effective_roles("lumen_admin", None), _effective_roles("lumen_admin", "reader"),
                                    ["admin", *_effective_roles("lumen_admin")], ["manager", *_effective_roles("lumen_admin")]])
-async def test_management_requires_native_membership_not_raw_admin_name(management_app, roles):
+async def test_grade_only_management_is_independent_of_native_membership(management_app, monkeypatch, roles):
     app, principal = management_app
     principal["roles"] = roles
+    create = AsyncMock(return_value={"id": 1})
+    monkeypatch.setattr(agent_store, "create_agent", create)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
-        assert (await client.post("/v1/agents", json={"name": "agent"})).status_code == 403
+        assert (await client.post("/v1/agents", json={"name": "agent"})).status_code == 201
+    assert create.call_args.kwargs["owner_user_id"] == "owner"
+    assert create.call_args.kwargs["project_id"] == "project"
+    assert principal["is_system_admin"] is False
 
 
 async def test_mcp_editor_oauth_start_keystone_only_admin_disconnect(management_app, monkeypatch):
@@ -550,23 +545,24 @@ async def test_service_admin_agent_routes_keep_real_user_project_sql_predicates(
     assert "chat_agents.project_id = 'other-project'" in statements[0]
 
 
-@pytest.mark.parametrize("method,path,payload,removed_leaf", [
-    ("POST", "/v1/agents", {"name": "agent"}, "lumen-agents_editor"),
-    ("POST", "/v1/skills", {"name": "skill"}, "lumen-assets_editor"),
-    ("POST", "/v1/mcp-servers/1/oauth/start", None, "lumen-mcp_editor"),
-    ("DELETE", "/v1/agents/1", None, "lumen-resources_admin"),
-    ("DELETE", "/v1/conversations/conversation", None, "lumen-history_editor"),
-    ("GET", "/v1/skills?include_private=true", None, "lumen-assets_editor"),
+@pytest.mark.parametrize("method,path,payload,action", [
+    ("POST", "/v1/agents", {"name": "agent"}, "native:agents:write"),
+    ("POST", "/v1/skills", {"name": "skill"}, "native:extensions:write"),
+    ("POST", "/v1/mcp-servers/1/oauth/start", None, "native:mcp:write"),
+    ("DELETE", "/v1/agents/1", None, "native:agents:delete"),
+    ("DELETE", "/v1/conversations/conversation", None, "native:conversations:delete"),
+    ("GET", "/v1/skills?include_private=true", None, "native:extensions:write"),
 ])
-async def test_retained_parent_without_current_action_leaf_cannot_manage_resource(management_app, method, path, payload, removed_leaf):
+async def test_operator_action_deny_overrides_retained_native_grade(management_app, operator_policy, method, path, payload, action):
     app, principal = management_app
-    principal["roles"] = [role for role in _effective_roles("lumen_admin") if role != removed_leaf]
-    assert "lumen_admin" in principal["roles"]
+    principal["roles"] = ["lumen_admin"]
+    replace, _ = operator_policy
+    replace(f'"{action}": "!"')
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         assert (await client.request(method, path, json=payload)).status_code == 403
 
 
-async def test_retained_mcp_parent_cannot_restore_removed_callback_authority(monkeypatch):
+async def test_retained_grade_cannot_restore_operator_denied_callback_authority(monkeypatch, operator_policy):
     row = SimpleNamespace(status="pending", expires_at=datetime.now(UTC) + timedelta(minutes=5),
                           owner_user_id="owner", owner_project_id="project", encrypted_payload="encrypted")
     result = SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: row))
@@ -576,11 +572,12 @@ async def test_retained_mcp_parent_cannot_restore_removed_callback_authority(mon
     async def connection():
         yield session
 
-    roles = [role for role in _effective_roles("lumen_editor") if role != "lumen-mcp_editor"]
-    authority = AsyncMock(return_value={"roles": roles, "is_system_admin": False})
+    replace, _ = operator_policy
+    replace('"native:mcp:write": "!"')
+    authority = AsyncMock(return_value={"roles": ["lumen_editor"], "is_system_admin": False})
     monkeypatch.setattr(mcp_oauth, "_session", connection)
     monkeypatch.setattr(mcp_oauth, "resolve_project_authority", authority)
-    monkeypatch.setattr(mcp_oauth, "_decrypt", lambda _: pytest.fail("removed implication restored OAuth authority"))
+    monkeypatch.setattr(mcp_oauth, "_decrypt", lambda _: pytest.fail("operator-denied owner state disclosed to OAuth exchange"))
     with pytest.raises(mcp_oauth.McpOAuthError, match="management authority"):
         await mcp_oauth.SqlMcpConnectionStore().consume_state("state-hash")
     authority.assert_awaited_once_with("owner", "project")

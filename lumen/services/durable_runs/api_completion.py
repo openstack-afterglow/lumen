@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal
 
-from litellm import exceptions as litellm_errors
 from pydantic import ValidationError
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,11 +29,12 @@ from lumen.config import get_settings
 from lumen.crypto import encrypt_chat_content
 from lumen.models.api_requests import OpenAIChatRequest, ResponsesRequest
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
-from lumen.services import completion_api, credit, litellm_client, worker_routing
+from lumen.services import completion_api, credit, provider_client, provider_errors, provider_metadata, worker_routing
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
 from lumen.services.completion_format import nonstream_response
 from lumen.services.inference_authority import completion_scopes
 from lumen.services.providers import routing
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.errors import ProviderSubscriptionError
 from lumen.services.providers.pricing import frozen_token_pricing
 from lumen.services.run_store import (
@@ -64,12 +64,12 @@ _DEFAULT_SCOPES = ("compat:completions:write",)
 # hold is released at zero. Every other failure after I/O intent stays unknown.
 _REJECTION_STATUSES = frozenset({400, 401, 403, 404, 413, 415, 422, 429})
 _REJECTION_ERRORS = (
-    litellm_errors.BadRequestError,
-    litellm_errors.AuthenticationError,
-    litellm_errors.PermissionDeniedError,
-    litellm_errors.NotFoundError,
-    litellm_errors.UnprocessableEntityError,
-    litellm_errors.RateLimitError,
+    provider_errors.BadRequestError,
+    provider_errors.AuthenticationError,
+    provider_errors.PermissionDeniedError,
+    provider_errors.NotFoundError,
+    provider_errors.UnprocessableEntityError,
+    provider_errors.RateLimitError,
 )
 _SUBSCRIPTION_REJECTIONS = {
     "subscription_auth_required": 401,
@@ -160,10 +160,11 @@ async def prepare_api_completion_run(
         raise DurableRunInputError("virtual_model_unsupported")
     try:
         provider = completion_api.select_api_provider(body.provider, None)
-        route = await completion_api.resolve_api(body.model, provider=provider)
+        route = await completion_api.resolve_api(body.model, provider=provider,
+            operation="chat" if operation == "chat.completions" else "responses")
     except completion_api.CompletionError as exc:
         raise _input_error(exc) from exc
-    if not litellm_client.provider_once_supported(route.get("provider_type")):
+    if not provider_client.provider_once_supported(route.get("provider_type")):
         raise DurableRunInputError("provider_once_unsupported")
     limit = _positive_limit(route)
 
@@ -210,7 +211,7 @@ async def prepare_api_completion_run(
             "options": completion_api.responses_provider_options(options, resolved=route),
         }
 
-    count = litellm_client.count_context_tokens(route["model_name"], counted_messages, counted_tools)
+    count = provider_metadata.count_context_tokens(route["model_name"], counted_messages, counted_tools)
     if count.tokens is not None and count.tokens > limit:
         raise DurableRunInputError("context_length_exceeded")
     try:
@@ -241,6 +242,7 @@ async def prepare_api_completion_run(
         "provider_id", "model_id", "provider_name", "provider_type", "model_name", "model_kind",
         "api_model_name", "config_version_hash",
     )}
+    capability.update(execution_identity(route))
     capability.update({"operation": operation, "context_limit": limit, "effective_features": {}})
     return PreparedApiCompletion(
         payload=payload,
@@ -293,9 +295,11 @@ async def persist_api_completion_run_in_transaction(
     )
     await _lock_run_configurations(session, capability, model_name=capability["model_name"])
     try:
+        credential_authority = (capability or {}).get("credential_authority")
         if allowed_scopes is None:
             await authorize_api_key_in_transaction(session, api_key_id=api_key_id, user_id=user_id,
-                                                   project_id=project_id, required_scopes=prepared.required_scopes)
+                                                   project_id=project_id, required_scopes=prepared.required_scopes,
+                                                   credential_authority=credential_authority)
         elif not allowed_scopes.issuperset(prepared.required_scopes):
             raise ApiKeyForbidden("required scope is not currently authorized")
     except ApiKeyForbidden as exc:
@@ -318,6 +322,8 @@ async def persist_api_completion_run_in_transaction(
         run_id=run.id, purpose="executor", provider_id=capability["provider_id"], model_id=capability["model_id"],
         provider_label=capability["provider_name"], model_label=capability["model_name"],
         config_version_hash=capability["config_version_hash"],
+        **{key: value for key, value in execution_identity(capability).items()
+           if key not in {"provider_auth", "provider_quota_group"}},
     ))
     await append_event(session, run, _event(run, "run.started", {
         "conversation_id": None, "temp_thread_id": None, "model_name": run.model_name,
@@ -386,7 +392,8 @@ async def _segment_start(run_id: str, *, owner: str, operation: str, required_sc
                 return "batch_closed"
             await _lock_run_configurations(session, run.capability_snapshot, model_name=run.model_name)
             await authorize_api_key_in_transaction(session, api_key_id=run.api_key_id, user_id=run.user_id,
-                                                   project_id=run.project_id, required_scopes=required_scopes)
+                                                   project_id=run.project_id, required_scopes=required_scopes,
+                                                   credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
             await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
                                                             api_key_id=run.api_key_id, bound=bound)
             session.add(ChatModelCallReservation(run_id=run.id, segment_id=_SEGMENT, bound_credits=bound,
@@ -535,6 +542,7 @@ async def _settle(run_id: str, *, owner: str) -> Literal["completed", "rejected"
                 model_name=run.model_name, provider=run.capability_snapshot["provider_name"],
                 prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens,
                 usage_cost=usage_cost, breakdown=breakdown, margin_multiplier=margin, credit_per_usd=per_usd,
+                execution_route=run.capability_snapshot,
                 source=run.source, api_key_id=run.api_key_id, run_id=run.id, usage_components=components,
             )
             if credited > Decimal(str(reservation.bound_credits)):

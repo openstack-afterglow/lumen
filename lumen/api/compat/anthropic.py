@@ -164,7 +164,7 @@ async def messages(
     ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
     try:
         provider = core.select_api_provider(body.provider, x_lumen_provider)
-        resolved = await core.resolve_api(body.model, provider=provider)
+        resolved = await core.resolve_api(body.model, provider=provider, operation="messages")
         await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"))
         options = body.model_dump(
             exclude={"model", "provider", "messages", "max_tokens", "stream"},
@@ -223,7 +223,7 @@ async def count_tokens(
     del token_info
     try:
         provider = core.select_api_provider(body.provider, x_lumen_provider)
-        resolved = await core.resolve_api(body.model, provider=provider)
+        resolved = await core.resolve_api(body.model, provider=provider, operation="count_tokens")
         payload = body.model_dump(exclude={"provider"}, exclude_none=True)
         return await core.count_anthropic_tokens(
             resolved=resolved,

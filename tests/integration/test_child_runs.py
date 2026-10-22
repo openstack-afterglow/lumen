@@ -229,7 +229,7 @@ async def test_root_budget_ceiling_and_cancellation_settle_every_child_once(fami
 
 async def test_child_credit_overrun_blocks_child_and_parent_without_recharging_replay(family, monkeypatch):
     from lumen.models.chat_runs import ChatRunSegment
-    from lumen.services import litellm_client
+    from lumen.services import provider_metadata
     from lumen.services.durable_runs.execution import _DurableExecutionHooks
 
     factory, project, _user, root_id, _group_id, child_ids, owner = family
@@ -250,8 +250,8 @@ async def test_child_credit_overrun_blocks_child_and_parent_without_recharging_r
         root.credit_ceiling = Decimal("3")
 
     monkeypatch.setattr(
-        litellm_client, "count_context_tokens",
-        lambda *_args: litellm_client.ContextTokenCount(tokens=1, measurement="tokenizer"),
+        provider_metadata, "count_context_tokens",
+        lambda *_args: provider_metadata.ContextTokenCount(tokens=1, measurement="tokenizer"),
     )
     child_hooks = _DurableExecutionHooks(run_id=child_ids[0], owner=owner, credit_bounded=True)
     call = {"round_index": 0, "attempt": 1, "messages": [{"role": "user", "content": "hi"}],
@@ -293,7 +293,7 @@ async def test_child_credit_overrun_blocks_child_and_parent_without_recharging_r
 @pytest.mark.parametrize("target", ["root", "child"])
 async def test_bounded_call_settlement_survives_concurrent_delta(family, monkeypatch, target):
     from lumen.models.chat_runs import ChatRunSegment
-    from lumen.services import litellm_client
+    from lumen.services import provider_metadata
     from lumen.services.durable_runs.execution import _DurableExecutionHooks, _event
 
     factory, _project, _user, root_id, _group, child_ids, owner = family
@@ -309,8 +309,8 @@ async def test_bounded_call_settlement_survives_concurrent_delta(family, monkeyp
         run.lease_owner = owner
         run.lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
         (await session.get(ChatRun, root_id)).credit_ceiling = Decimal("3")
-    monkeypatch.setattr(litellm_client, "count_context_tokens",
-                        lambda *_args: litellm_client.ContextTokenCount(tokens=1, measurement="tokenizer"))
+    monkeypatch.setattr(provider_metadata, "count_context_tokens",
+                        lambda *_args: provider_metadata.ContextTokenCount(tokens=1, measurement="tokenizer"))
     hooks = _DurableExecutionHooks(run_id=run_id, owner=owner, credit_bounded=True)
     call = {"round_index": 0, "attempt": 1, "messages": [{"role": "user", "content": "hi"}],
             "tool_schemas": [], "max_tokens": 1}
@@ -344,7 +344,7 @@ async def test_bounded_call_settlement_survives_concurrent_delta(family, monkeyp
 
 
 async def test_zero_price_provider_call_keeps_fence_without_credit_headroom(family, monkeypatch):
-    from lumen.services import litellm_client
+    from lumen.services import provider_metadata
     from lumen.services.durable_runs.execution import _DurableExecutionHooks
 
     factory, _project, _user, root_id, _group_id, _child_ids, owner = family
@@ -356,8 +356,8 @@ async def test_zero_price_provider_call_keeps_fence_without_credit_headroom(fami
         }
         root.capability_snapshot = {"capabilities": {}}
     monkeypatch.setattr(
-        litellm_client, "count_context_tokens",
-        lambda *_args: litellm_client.ContextTokenCount(tokens=1, measurement="tokenizer"),
+        provider_metadata, "count_context_tokens",
+        lambda *_args: provider_metadata.ContextTokenCount(tokens=1, measurement="tokenizer"),
     )
     hooks = _DurableExecutionHooks(run_id=root_id, owner=owner, credit_bounded=True)
     call = {"round_index": 0, "attempt": 1, "messages": [{"role": "user", "content": "hi"}],
@@ -373,7 +373,7 @@ async def test_zero_price_provider_call_keeps_fence_without_credit_headroom(fami
 
 
 async def test_unknown_provider_holds_bound_and_priced_tool_is_denied_before_dispatch(family, monkeypatch):
-    from lumen.services import litellm_client
+    from lumen.services import provider_metadata
     from lumen.services.durable_runs.execution import _DurableExecutionHooks
 
     factory, _project, _user, _root_id, _group_id, child_ids, owner = family
@@ -390,8 +390,8 @@ async def test_unknown_provider_holds_bound_and_priced_tool_is_denied_before_dis
         }
         child.capability_snapshot = {"capabilities": {"context_limit": 1}}
     monkeypatch.setattr(
-        litellm_client, "count_context_tokens",
-        lambda *_args: litellm_client.ContextTokenCount(tokens=1, measurement="tokenizer"),
+        provider_metadata, "count_context_tokens",
+        lambda *_args: provider_metadata.ContextTokenCount(tokens=1, measurement="tokenizer"),
     )
     hooks = _DurableExecutionHooks(run_id=child_id, owner=owner, credit_bounded=True)
     with pytest.raises(budgets.BudgetExceeded, match="child credit ceiling"):
@@ -439,7 +439,8 @@ async def test_expired_parent_lease_requeues_prepared_children_without_an_unresu
     assert (await _snapshot(factory, project, root_id, group_id, child_ids))["quota"] == (0, 0, Decimal("0"), 0)
 
 
-async def test_two_child_group_commits_resources_and_replays_without_duplicate_reservations(monkeypatch):
+@pytest.mark.parametrize("restricted", [False, True], ids=["human-parent", "reduced-parent"])
+async def test_two_child_group_commits_resources_and_replays_without_duplicate_reservations(monkeypatch, restricted):
     """Two siblings must commit atomically despite ledger/resource lock-class boundaries."""
     from types import SimpleNamespace
 
@@ -458,6 +459,10 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
     root_id, pool_id = str(uuid.uuid4()), str(uuid.uuid4())
     owner = f"spawn-worker-{nonce}#1"
     policy = default_execution_policy().model_copy(update={"can_delegate_read": True, "max_children": 2, "max_parallel_children": 2})
+    original_authority = {
+        "credential_restricted": True, "user_id": user, "source_project_id": project,
+        "source_system_scope": "", "issued_role_ids": ["member-id", "chat-id", "tools-id"],
+    } if restricted else None
     try:
         async with factory() as session, session.begin():
             session.add(ChatProjectAgentQuota(
@@ -477,7 +482,10 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
             parent_agent.delegable_agent_ids = [child_agent.id]
             session.add(ChatRun(
                 id=root_id, run_scope="persistent", project_id=project, user_id=user,
-                model_name="scripted-parent", capability_snapshot={"execution_policy": policy.model_dump(mode="json")},
+                model_name="scripted-parent", capability_snapshot={
+                    "execution_policy": policy.model_dump(mode="json"),
+                    **({"credential_authority": original_authority} if restricted else {}),
+                },
                 pricing_snapshot={}, request_payload=encrypt_chat_content("{}"),
                 client_request_id=str(uuid.uuid4()), request_fingerprint=nonce, fingerprint_version=1,
                 agent_id=parent_agent.id, execution_protocol_version=2, status="running", lease_owner=owner,
@@ -489,7 +497,11 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
             return {
                 "policy": policy, "direct_effects": frozenset({"read"}),
                 "route": {"model_name": "scripted-child"},
-                "capability_snapshot": {}, "pricing_snapshot": {}, "extension_selection": {},
+                # Prepared child data cannot replace or invent original provenance.
+                "capability_snapshot": {"credential_authority": {
+                    "credential_restricted": True, "user_id": "foreign-owner", "source_project_id": "foreign-project",
+                    "source_system_scope": "", "issued_role_ids": ["admin-id"],
+                }}, "pricing_snapshot": {}, "extension_selection": {},
                 "plugin_tool_snapshots": [], "skill_instructions": [], "skill_snapshot": [],
                 "max_tokens": 128, "temperature": None,
             }
@@ -522,6 +534,9 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
             quota = await session.get(ChatProjectAgentQuota, project)
             root = await session.get(ChatRun, root_id)
             assert {row.id for row in rows} == set(child_ids)
+            assert all(row.capability_snapshot.get("credential_authority") == original_authority for row in rows)
+            if not restricted:
+                assert all("credential_authority" not in row.capability_snapshot for row in rows)
             assert len(resources) == 2 and {row.run_id for row in resources} == set(child_ids)
             assert all(row.assigned_resource_id in {resource.id for resource in resources} for row in rows)
             assert len(reservations) == 8 and all(row.status == "reserved" for row in reservations)

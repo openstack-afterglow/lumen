@@ -296,6 +296,72 @@ async def _historical_media_registry_applied(connection, migration: Migration) -
     return True
 
 
+async def _verify_provider_account_promotion(connection, migrations: list[Migration]) -> None:
+    """Do not promote stale account snapshots from the legacy compatibility interval."""
+    account_migration = next(
+        (item for item in migrations if item.logical_id == "027-provider-account-credentials"), None
+    )
+    if account_migration is None:
+        return
+    applied = (
+        await connection.execute(
+            text("SELECT relative_path, sha256 FROM schema_migrations WHERE logical_id = :logical_id"),
+            {"logical_id": account_migration.logical_id},
+        )
+    ).first()
+    if applied is None:
+        return
+    if applied.relative_path != account_migration.relative_path or applied.sha256 != account_migration.sha256:
+        raise MigrationLedgerError(f"applied migration identity drift: {account_migration.logical_id}")
+    primary = (
+        await connection.exec_driver_sql("""
+            SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'llm_provider_auth_attempts'
+              AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION
+        """)
+    ).scalars().all()
+    nullable = (
+        await connection.exec_driver_sql("""
+            SELECT IS_NULLABLE FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'llm_provider_auth_attempts'
+              AND COLUMN_NAME = 'credential_id'
+        """)
+    ).scalar_one_or_none()
+    if primary == ["credential_id"] and nullable == "NO":
+        return
+    reconciled = (
+        await connection.execute(text(
+            "SELECT 1 FROM schema_migrations WHERE logical_id = '028-provider-account-reconciliation'"
+        ))
+    ).scalar_one_or_none()
+    if primary != ["provider_id"] or nullable != "YES" or reconciled is not None:
+        raise MigrationLedgerError("provider account auth-attempt schema drift; stop all writers and inspect before migration")
+    drift = (
+        await connection.exec_driver_sql("""
+            SELECT provider.id FROM llm_providers AS provider
+            LEFT JOIN llm_provider_accounts AS account
+              ON account.provider_id = provider.id AND BINARY account.name = BINARY 'default'
+            LEFT JOIN llm_provider_credentials AS credential
+              ON credential.account_id = account.id AND BINARY credential.name = BINARY 'default'
+            WHERE credential.id IS NULL
+               OR NOT (BINARY provider.auth_mode <=> BINARY credential.auth_mode)
+               OR NOT (BINARY provider.encrypted_api_key <=> BINARY credential.encrypted_api_key)
+               OR NOT (BINARY provider.api_key_env <=> BINARY credential.api_key_env)
+               OR NOT (BINARY provider.encrypted_subscription_tokens <=> BINARY credential.encrypted_subscription_tokens)
+               OR NOT (BINARY provider.subscription_status <=> BINARY credential.subscription_status)
+               OR NOT (provider.subscription_expires_at <=> credential.subscription_expires_at)
+               OR NOT (provider.subscription_generation <=> credential.generation)
+            ORDER BY provider.id LIMIT 1
+        """)
+    ).first()
+    if drift is not None:
+        raise MigrationLedgerError(
+            f"provider account promotion requires credential reconciliation: provider_id={drift[0]}; "
+            "stop all legacy/account writers, reconcile default credentials with legacy provider material "
+            "while preserving both stores, then rerun; no pending migration was applied"
+        )
+
+
 async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
     if not database_url:
         raise MigrationLedgerError("database URL is required")
@@ -315,6 +381,7 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            await _verify_provider_account_promotion(connection, migrations)
         for migration in migrations:
             async with engine.begin() as connection:
                 row = (

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC
 from decimal import Decimal
@@ -19,8 +20,9 @@ from lumen.crypto import encrypt_chat_content
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import assets, credit
-from lumen.services.litellm_client import UsageCost
+from lumen.services.provider_metadata import UsageCost
 from lumen.services.providers import image_transport, routing
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.errors import AmbiguousModelRouteError
 from lumen.services.providers.pricing import frozen_token_pricing
 from lumen.services.run_store import (
@@ -34,6 +36,7 @@ from lumen.services.run_store import (
 from lumen.services.usage_breakdown import UsageBreakdown
 
 from . import budgets
+from .admission import _intent_with_credential_authority
 from .common import _event, _factory, _fingerprint, _now, descriptor, wake_run
 from .errors import (
     DurableRunConflict,
@@ -77,7 +80,8 @@ class PreparedImageRun:
 
 async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
                             source: str = "web", api_key_id: int | None = None,
-                            required_scopes: tuple[str, ...] | None = None) -> PreparedImageRun:
+                            required_scopes: tuple[str, ...] | None = None,
+                            credential_authority: dict | None = None) -> PreparedImageRun:
     """Freeze one finite image request without inference or source-byte I/O."""
     if "model" in request:
         # OpenAI-compatible JSON body (Batch /v1/images/generations): same limits as the sync route.
@@ -88,7 +92,7 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
         required_scopes = required_scopes or ("compat:images:write",)
         request = {**request, "model_id": request["model"],
                    "provider_id": request.get("provider_id") if request.get("provider") is None else request["provider"]}
-    intent = _intent(request)
+    intent = _intent_with_credential_authority(_intent(request), credential_authority)
     model_id = request.get("model_id")
     provider_id = request.get("provider_id")
     if (not isinstance(model_id, str) or not model_id or not isinstance(request.get("prompt"), str)
@@ -129,7 +133,10 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
     if bound <= 0:
         raise DurableRunInputError("image pricing must be a positive exact variant")
     capability = {key: route[key] for key in ("provider_id", "model_id", "provider_name", "model_name", "model_kind", "config_version_hash")}
+    capability.update(execution_identity(route))
     capability["effective_features"] = {}
+    if credential_authority is not None:
+        capability["credential_authority"] = deepcopy(credential_authority)
     pricing = {"billing_basis": basis, "size": size, "quality": quality,
                "count": n, "margin_multiplier": format(margin, "f"), "credit_per_usd": format(per_usd, "f")}
     if basis == "tokens":
@@ -162,6 +169,7 @@ async def persist_image_run_in_transaction(
     if (prepared.project_id, prepared.user_id) != (project_id, user_id):
         raise DurableRunInputError("prepared image owner changed")
     intent, capability, pricing = prepared.payload, prepared.capability_snapshot, prepared.pricing_snapshot
+    intent = _intent_with_credential_authority(intent, capability.get("credential_authority"))
     existing = (await session.execute(select(ChatRun).where(ChatRun.project_id == project_id,
         ChatRun.user_id == user_id, ChatRun.client_request_id == client_request_id)
         .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
@@ -172,7 +180,8 @@ async def persist_image_run_in_transaction(
     route = await resolve_worker_route(session, run_kind="image", workload_class=workload_class, batch_id=batch_id)
     await _lock_run_configurations(session, capability, model_name=capability["model_name"])
     await authorize_media_in_transaction(session, user_id=user_id, project_id=project_id,
-        api_key_id=api_key_id, required_scopes=prepared.required_scopes, allowed_scopes=allowed_scopes)
+        api_key_id=api_key_id, required_scopes=prepared.required_scopes, allowed_scopes=allowed_scopes,
+        credential_authority=capability.get("credential_authority"))
     run = ChatRun(id=str(uuid.uuid4()), run_scope="image", run_kind="image", project_id=project_id,
         user_id=user_id, model_name=capability["model_name"], source=source, api_key_id=api_key_id,
         workload_class=route.workload_class, worker_pool_id=route.worker_pool_id, batch_id=batch_id,
@@ -188,7 +197,9 @@ async def persist_image_run_in_transaction(
         session.add(ChatRunAsset(run_id=run.id, asset_id=row.id, purpose="input"))
     session.add(ChatRunProvider(run_id=run.id, purpose="executor", provider_id=capability["provider_id"],
         model_id=capability["model_id"], provider_label=capability["provider_name"],
-        model_label=capability["model_name"], config_version_hash=capability["config_version_hash"]))
+        model_label=capability["model_name"], config_version_hash=capability["config_version_hash"],
+        **{key: value for key, value in execution_identity(capability).items()
+           if key not in {"provider_auth", "provider_quota_group"}}))
     await append_event(session, run, _event(run, "run.started", {"conversation_id": None,
         "temp_thread_id": None, "model_name": run.model_name, "effective_features": {}, "run_kind": "image"}))
     await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
@@ -197,17 +208,19 @@ async def persist_image_run_in_transaction(
 
 async def admit_image_run(request: dict, *, project_id: str, user_id: str, client_request_id: str,
                           source: str = "web", api_key_id: int | None = None,
-                          required_scopes: tuple[str, ...] | None = None):
+                          required_scopes: tuple[str, ...] | None = None,
+                          credential_authority: dict | None = None):
     """Preserve UUID idempotency before checks, then commit before the Redis hint."""
     from .admission import existing_run_for_intent
 
-    intent = _intent(request)
+    intent = _intent_with_credential_authority(_intent(request), credential_authority)
     previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
         client_request_id=client_request_id, intent=intent, conversation_id=None)
     if previous is not None:
         return previous
     prepared = await prepare_image_run(request, project_id=project_id, user_id=user_id, source=source,
-                                       api_key_id=api_key_id, required_scopes=required_scopes)
+                                       api_key_id=api_key_id, required_scopes=required_scopes,
+                                       credential_authority=credential_authority)
     try:
         async with _factory()() as session, session.begin():
             run = await persist_image_run_in_transaction(session, prepared, project_id=project_id, user_id=user_id,
@@ -352,6 +365,7 @@ async def _settle_image(run_id: str, *, owner: str) -> None:
                         user_id=run.user_id, project_id=run.project_id, model_name=run.model_name,
                         provider=run.capability_snapshot["provider_name"], prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                         usage_cost=usage_cost, breakdown=breakdown,
+                        execution_route=run.capability_snapshot,
                         margin_multiplier=Decimal(pricing["margin_multiplier"]),
                         credit_per_usd=Decimal(pricing["credit_per_usd"]), source=run.source,
                         api_key_id=run.api_key_id, run_id=run.id, usage_components=components)

@@ -125,7 +125,7 @@ def _mcp_config_fingerprint(server: dict) -> str:
 
 
 def _mcp_schema(server_id: int, tool: dict) -> dict:
-    """MCP 툴 → litellm function 스키마. 이름에 server_id 를 접두해 실행 시 라우팅."""
+    """MCP 툴 → provider function 스키마. 이름에 server_id 를 접두해 실행 시 라우팅."""
     return {
         "type": "function",
         "function": {

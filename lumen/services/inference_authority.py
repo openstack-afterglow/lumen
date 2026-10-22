@@ -67,13 +67,13 @@ def completion_scopes(request: dict, *, base: tuple[str, ...] = ("compat:complet
 
 
 async def authorize_new_io(*, user_id: str, project_id: str, api_key_id: int | None,
-                           required_scopes: tuple[str, ...]) -> None:
+                           required_scopes: tuple[str, ...], credential_authority: dict | None = None) -> None:
     factory = get_session_factory()
     if factory is None:
         raise ApiKeyAuthorityUnavailable("inference authority is unavailable")
     async with factory() as session, session.begin():
         await authorize_api_key_in_transaction(session, user_id=user_id, project_id=project_id,
-            api_key_id=api_key_id, required_scopes=required_scopes)
+            api_key_id=api_key_id, required_scopes=required_scopes, credential_authority=credential_authority)
 
 
 async def authorize_tool_dispatch(ctx) -> None:
@@ -84,6 +84,7 @@ async def authorize_tool_dispatch(ctx) -> None:
     if ctx.execution_hooks is not None:
         return
     api_key_id = None
+    credential_authority = None
     if ctx.run_id is not None:
         from lumen.models.chat_runs import ChatRun
         factory = get_session_factory()
@@ -94,8 +95,9 @@ async def authorize_tool_dispatch(ctx) -> None:
             if run is None or run.user_id != ctx.user_id or run.project_id != ctx.project_id:
                 raise ApiKeyForbidden("tool owner is unavailable")
             api_key_id = run.api_key_id
+            credential_authority = (run.capability_snapshot or {}).get("credential_authority")
     await authorize_new_io(user_id=ctx.user_id, project_id=ctx.project_id, api_key_id=api_key_id,
-                           required_scopes=("native:tools:execute",))
+                           required_scopes=("native:tools:execute",), credential_authority=credential_authority)
 
 
 async def authorize_run_generation(session, run, *, resolved: dict | None = None) -> None:
@@ -103,7 +105,8 @@ async def authorize_run_generation(session, run, *, resolved: dict | None = None
     generation = "compat:completions:write" if run.source == "api" and run.run_scope == "api" else "native:runs:write"
     history = "native:conversations:read" if getattr(run, "conversation_id", None) is not None else "native:runs:read"
     await authorize_api_key_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
-        api_key_id=run.api_key_id, required_scopes=(generation, history, *model_required_scopes(resolved)))
+        api_key_id=run.api_key_id, required_scopes=(generation, history, *model_required_scopes(resolved)),
+        credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
 
 
 async def authorize_run_generation_by_id(*, run_id: str, user_id: str, project_id: str, resolved: dict | None = None) -> None:

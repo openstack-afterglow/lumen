@@ -566,7 +566,7 @@ async def test_summary_compactor_fences_map_and_reduce_segments_and_records_usag
     monkeypatch.setattr(execution, "_cancel_requested", no_cancel)
     monkeypatch.setattr(execution.credit, "precheck", precheck)
     monkeypatch.setattr(execution.ps, "resolve_model_snapshot", resolve_snapshot)
-    monkeypatch.setattr(execution.litellm_client, "acompletion", complete_summary)
+    monkeypatch.setattr(execution.provider_client, "acompletion", complete_summary)
 
     hooks = execution._DurableExecutionHooks(run_id="run-1", owner="worker-1")
     monkeypatch.setattr(hooks, "_start", start)

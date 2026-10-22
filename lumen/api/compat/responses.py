@@ -55,7 +55,7 @@ async def responses(
 
     try:
         provider = core.select_api_provider(body.provider, x_lumen_provider)
-        resolved = await core.resolve_api(body.model, provider=provider)
+        resolved = await core.resolve_api(body.model, provider=provider, operation="responses")
         await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"))
         options = body.model_dump(
             exclude={

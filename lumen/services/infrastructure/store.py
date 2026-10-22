@@ -301,6 +301,47 @@ async def abort_unsubmitted_create(resource_id: str, generation: int, owner: str
         return True
 
 
+async def release_unsubmitted_operation(resource_id: str, generation: int, action: Literal["create", "delete"],
+                                        owner: str, fence: int) -> bool:
+    """Return a claimed operation to the one-shot pool when its SDK call was never entered.
+
+    Callers certify that a local gate (SQL fence, intent state or Redis assignment)
+    rejected the write before the provider was called. The claim is matched by its own
+    owner and fence rather than current pool ownership: a controller that lost its lease
+    can still prove its own claim was never used, and only it could have used it.
+    ``attempts`` is preserved as evidence of the claim; claiming keys off ``owner``.
+    """
+    if not owner or owner == _UNCLAIMED:
+        raise ValueError("invalid operation owner")
+    async def transaction() -> bool:
+        async with _factory()() as session, session.begin():
+            resource, _pool = await _locked_resource(session, resource_id, generation)
+            if not resource or resource.observed_state == "deleted":
+                return False
+            operation = (await session.execute(select(ChatResourceOperation).where(
+                ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.generation == generation,
+                ChatResourceOperation.action == action).with_for_update())).scalar_one_or_none()
+            if (not operation or operation.owner != owner or operation.fence != fence
+                    or operation.request_status != "claimed"):
+                return False
+            if action == "create":
+                if resource.provider_id is not None or resource.certificate_fingerprint is not None:
+                    return False
+                # The claim alone moved the intent to unknown; nothing was submitted.
+                if resource.observed_state == "unknown":
+                    resource.observed_state = "requested"
+                # A pre-create token existed only in this process and never reached a
+                # guest; drop its hash so the retry can issue a fresh one-shot token.
+                resource.bootstrap_token_hash = None
+                resource.bootstrap_expires_at = None
+            operation.owner = _UNCLAIMED
+            operation.fence = 0
+            operation.error_code = "not_submitted"
+            return True
+
+    return await retry_deadlocks(transaction)
+
+
 
 async def record_observation(resource_id: str, generation: int, owner: str, fence: int, observation: Observation) -> bool:
     """Persist a provider observation under the current lease; cloud ACTIVE is booting, not ready."""

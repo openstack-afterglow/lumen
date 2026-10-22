@@ -1,11 +1,15 @@
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from lumen_plugin_api.tools import ToolBinding, ToolDefinition, ToolExecutionResult
 
 from lumen.services import graph
+from lumen.services.durable_runs import execution, interactions
 
 
 def test_v2_approval_defaults_fail_closed_for_non_read_effects():
@@ -94,7 +98,7 @@ async def test_v2_graph_approves_dynamic_write_effect_before_dispatch(monkeypatc
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     events = [
@@ -158,7 +162,7 @@ async def test_v2_replayed_provider_turn_consumes_frozen_turn_budget(monkeypatch
         raise AssertionError("replayed turn exhausted the only model-turn budget")
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", unexpected_provider_call)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", unexpected_provider_call)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     events = [
@@ -226,7 +230,7 @@ async def test_v2_graph_stops_before_exceeding_frozen_model_turn_limit(monkeypat
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     events = [
@@ -321,7 +325,7 @@ async def test_v2_graph_runs_parallel_safe_reads_four_wide_in_call_order(monkeyp
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     events = [
@@ -346,7 +350,8 @@ async def test_v2_graph_runs_parallel_safe_reads_four_wide_in_call_order(monkeyp
     ]
 
 
-async def test_v2_graph_interrupts_before_external_mutation_dispatch(monkeypatch):
+@pytest.mark.parametrize("resolution", ["approve", "expired", "expired_forged_dispatch"])
+async def test_v2_graph_interrupts_before_external_mutation_dispatch(monkeypatch, resolution):
     tool_name = "custom__7__mutate_1"
     called = False
     completion_calls = 0
@@ -406,7 +411,7 @@ async def test_v2_graph_interrupts_before_external_mutation_dispatch(monkeypatch
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     events = [
@@ -443,6 +448,107 @@ async def test_v2_graph_interrupts_before_external_mutation_dispatch(monkeypatch
         }
     ]
     assert called is False
+    resume = {"kind": "tool_approval", "decisions": [{"call_id": "call-1", "decision": "approve"}]}
+    if resolution != "approve":
+        now = datetime.now(UTC)
+        run = SimpleNamespace(
+            id="run-v2-interrupt",
+            user_id="user",
+            project_id="project",
+            execution_protocol_version=2,
+            status="running",
+            lease_owner="worker-1",
+            lease_expires_at=now + timedelta(hours=1),
+            last_seq=0,
+        )
+        approvals = []
+        journal = []
+
+        def result(value):
+            return SimpleNamespace(
+                scalar_one=lambda: value,
+                scalar_one_or_none=lambda: value,
+                scalars=lambda: value,
+            )
+
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+        session.begin.return_value = session
+        session.execute = AsyncMock(side_effect=[result(run), result(None)])
+        session.add.side_effect = approvals.append
+
+        async def append_event(_session, current_run, event):
+            assert _session is session
+            journal.append(event.model_dump(mode="json"))
+            current_run.last_seq = event.seq
+
+        wake = AsyncMock()
+        monkeypatch.setattr(interactions, "_factory", lambda: lambda: session)
+        monkeypatch.setattr(interactions, "get_settings", lambda: SimpleNamespace(chat_execution_protocol_version=2))
+        monkeypatch.setattr(interactions, "_now", lambda: now)
+        monkeypatch.setattr(interactions, "append_event", append_event)
+        monkeypatch.setattr(interactions, "wake_run", wake)
+        await interactions._persist_v2_approval_interrupt(
+            run_id=run.id,
+            owner="worker-1",
+            calls=[{**events[0]["payload"]["calls"][0], "expected_state_revision": 7, "writer_fence": 11}],
+        )
+        approval, = approvals
+        assert run.status == "awaiting_input"
+        journal.clear()
+        now += timedelta(minutes=16)
+        session.execute.side_effect = [
+            result([run.id]), result([]), result(run), result(approvals), result([]),
+            result([]), result([]),
+        ]
+        if resolution == "expired_forged_dispatch":
+            # Keep the original signature: expiry must neither bless a substituted tool identity
+            # nor let it stop the sweep; the unverifiable run is skipped untouched.
+            approval.tool_name = "forged_mutation"
+            assert await interactions.expire_pending_inputs() == []
+            assert approval.status == "pending"
+            assert approval.decided_at is None
+            assert approval.decided_by_user_id is None
+            assert approval.decision_hmac is None
+            assert run.status == "awaiting_input"
+            assert journal == []
+            wake.assert_not_awaited()
+            assert called is False
+            assert completion_calls == 1
+            return
+
+        assert await interactions.expire_pending_inputs() == [run.id]
+        assert approval.status == "denied"
+        assert approval.decided_at == now
+        assert approval.decided_by_user_id is None
+        assert approval.decision_hmac
+        assert (approval.expected_state_revision, approval.writer_fence) == (7, 11)
+        assert run.status == "queued"
+        assert run.lease_owner is None and run.lease_expires_at is None
+        assert [event["type"] for event in journal] == ["tool.approval_resolved", "run.stage.changed"]
+        assert journal[0]["payload"] == {
+            "call_id": "call-1",
+            "decision": "deny",
+            "decided_by_user_id": None,
+            "decided_at": now.isoformat().replace("+00:00", "Z"),
+        }
+        assert journal[1]["seq"] == journal[0]["seq"] + 1
+        wake.assert_awaited_once_with(run.id)
+
+        # A new owner consumes the authenticated denial through the worker resume path.
+        run.status = "running"
+        run.lease_owner = "worker-2"
+        run.lease_expires_at = now + timedelta(minutes=1)
+        session.execute.side_effect = [result(run), result(approval)]
+        checkpointed = await graph.pending_interrupt(run.id)
+        fenced = {**checkpointed, "calls": [
+            {**checkpointed["calls"][0], "expected_state_revision": 7, "writer_fence": 11},
+        ]}
+        with monkeypatch.context() as patch:
+            patch.setattr(graph, "pending_interrupt", AsyncMock(return_value=fenced))
+            resume = await execution._v2_resume(run_id=run.id, owner="worker-2")
+        assert resume == {"kind": "tool_approval", "decisions": [{"call_id": "call-1", "decision": "deny"}]}
     resumed_events = [
         event
         async for event in graph.stream(
@@ -452,13 +558,21 @@ async def test_v2_graph_interrupts_before_external_mutation_dispatch(monkeypatch
             user_id="user",
             execution_protocol_version=2,
             approval_mode="required_for_mutations",
-            resume={"kind": "tool_approval", "decisions": [{"call_id": "call-1", "decision": "approve"}]},
+            resume=resume,
             run_id="run-v2-interrupt",
         )
     ]
-    assert called is True
+    assert called is (resolution == "approve")
     assert completion_calls == 2
     assert any(event.get("type") == "tool_result" for event in resumed_events)
+    if resolution == "expired":
+        assert any(
+            event.get("type") == "tool_result"
+            and event.get("tool_call_id") == "call-1"
+            and event.get("status") == "failed"
+            and event.get("error_code") == "tool_denied"
+            for event in resumed_events
+        )
 
 
 async def test_v2_graph_rejects_pre_interrupt_tool_id_reused_after_approval_resume(monkeypatch):
@@ -516,7 +630,7 @@ async def test_v2_graph_rejects_pre_interrupt_tool_id_reused_after_approval_resu
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     initial_events = [
@@ -626,7 +740,7 @@ async def test_v2_graph_rejects_changed_binding_before_resumed_dispatch(
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
     initial_events = [
         event
@@ -718,7 +832,7 @@ async def test_v2_graph_returns_policy_limit_result_without_dispatching_excess_c
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
     events = [
         event
@@ -803,7 +917,7 @@ async def test_v2_graph_rejects_duplicate_call_ids_before_any_binding_dispatch(m
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     with pytest.raises(RuntimeError, match="v2 tool call IDs must be unique"):
@@ -871,7 +985,7 @@ async def test_v2_graph_rejects_a_tool_call_id_reused_in_a_later_model_turn(monk
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     with pytest.raises(RuntimeError, match="v2 tool call IDs must be unique"):
@@ -934,7 +1048,7 @@ async def test_v2_role_effect_ceiling_denies_mutation_before_binding_io(monkeypa
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     events = [
@@ -990,7 +1104,7 @@ async def test_v2_graph_excludes_on_demand_extension_schemas_from_initial_reques
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     _ = [
@@ -1054,7 +1168,7 @@ async def test_v2_graph_exposes_no_bindings_or_dispatch_when_tools_disabled(monk
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_builtin_tool_bindings", lambda: {tool_name: binding})
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     with pytest.raises(RuntimeError, match="model requested an unavailable v2 tool"):
@@ -1118,7 +1232,7 @@ async def test_v2_mixed_read_and_mcp_approval_resume_returns_every_tool_result(m
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
     parameters = {"model": "test-model", "messages": [{"role": "user", "content": "read and click"}],
                   "project_id": "project", "user_id": "user", "execution_protocol_version": 2,
@@ -1162,7 +1276,7 @@ async def test_pending_interrupt_reads_the_checkpointed_approval_boundary(monkey
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
     _ = [event async for event in graph.stream(
         model="test-model", messages=[{"role": "user", "content": "click"}], project_id="project", user_id="user",
@@ -1232,7 +1346,7 @@ async def test_v2_on_demand_mcp_is_restored_before_approval_resume(monkeypatch, 
     monkeypatch.setattr(graph.bindings, "_load_mcp", selected_server)
     monkeypatch.setattr(graph.bindings.mcp_client, "list_tools", discovered_tools)
     monkeypatch.setattr(graph.bindings.mcp_client, "call_tool", call_tool)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
     parameters = {"model": "test-model", "messages": [{"role": "user", "content": "click"}],
                   "project_id": "project", "user_id": "user", "execution_protocol_version": 2,
@@ -1317,7 +1431,7 @@ async def test_v2_sandbox_tools_require_policy_and_compatible_assignment(
     monkeypatch.setattr(sandbox_binding, "kubernetes_mcp_binding", lambda *_args, **_kwargs: ToolBinding(
         definition=definition, execute=AsyncMock(return_value=ToolExecutionResult(status="completed")),
     ))
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
     events = [event async for event in graph.stream(

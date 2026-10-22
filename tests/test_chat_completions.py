@@ -19,6 +19,7 @@ from lumen.services import capabilities, chat_admission, context_store, credit
 from lumen.services import conversation_store as cs
 from lumen.services.durable_runs import admission, common, queries
 from lumen.services.durable_runs import errors as durable_errors
+from lumen.services.provider_client import ProviderObject
 from lumen.services.providers import repository
 from lumen.services.providers import routing as ps
 
@@ -1895,7 +1896,7 @@ class TestCompactionRoutes:
         self, client, monkeypatch, path, context_limit, tokens, reason
     ):
         from lumen.services import context_manager
-        from lumen.services.litellm_client import ContextTokenCount
+        from lumen.services.provider_metadata import ContextTokenCount
 
         monkeypatch.setattr(
             context_manager,
@@ -2067,15 +2068,13 @@ class TestStatelessModalityBilling:
             route["margin_multiplier"] = Decimal("99")
             if stream:
                 async def chunks():
-                    yield SimpleNamespace(usage=usage, choices=[])
+                    yield ProviderObject(usage=usage, choices=[])
                 return chunks()
-            return SimpleNamespace(
-                usage=usage, choices=[SimpleNamespace(
-                    message=SimpleNamespace(content="OK", tool_calls=None), finish_reason="stop",
-                )],
-            )
+            return ProviderObject(usage=usage, choices=[{
+                "message": {"content": "OK", "tool_calls": None}, "finish_reason": "stop",
+            }])
 
-        monkeypatch.setattr(core.litellm_client, "acompletion_stream" if stream else "acompletion", provider)
+        monkeypatch.setattr(core.provider_client, "acompletion_stream" if stream else "acompletion", provider)
         result = await self.invoke(core, route, self.media_messages(modality), stream=stream)
         assert calls == [("operator-selected-model", "https://private.example/v1", "saved-key")]
         assert len(recorded) == 1
@@ -2098,15 +2097,15 @@ class TestStatelessModalityBilling:
         async def provider(*args, **kwargs):
             calls.append(1)
             if protocol == "chat":
-                return SimpleNamespace(usage=None, choices=[SimpleNamespace(
-                    message=SimpleNamespace(content="OK", tool_calls=None), finish_reason="stop",
-                )])
+                return ProviderObject(usage=None, choices=[{
+                    "message": {"content": "OK", "tool_calls": None}, "finish_reason": "stop",
+                }])
             return {"output": [], "content": [{"type": "text", "text": "OK"}]}
 
-        monkeypatch.setattr(core.litellm_client, {
+        monkeypatch.setattr(core.provider_client, {
             "chat": "acompletion", "responses": "aresponses", "anthropic": "aanthropic_messages",
         }[protocol], provider)
-        monkeypatch.setattr(core.litellm_client, "count_tokens", lambda model, **kw: 50 if "text" in kw else 1000)
+        monkeypatch.setattr(core.provider_metadata, "count_tokens", lambda model, **kw: 50 if "text" in kw else 1000)
         await self.invoke(core, self.route(provider="anthropic"), [{"role": "user", "content": "text only"}], protocol)
         assert calls == [1]
         assert len(recorded) == 1
@@ -2122,7 +2121,7 @@ class TestStatelessModalityBilling:
         async def forbidden(*args, **kwargs):
             pytest.fail("unmeterable request reached provider")
 
-        monkeypatch.setattr(core.litellm_client, {
+        monkeypatch.setattr(core.provider_client, {
             "chat": "acompletion", "responses": "aresponses", "anthropic": "aanthropic_messages",
         }[protocol], forbidden)
         with pytest.raises(core.CompletionError, match="modality_usage_unavailable") as failure:
@@ -2157,17 +2156,17 @@ class TestStatelessModalityBilling:
             calls.append(1)
             if stream:
                 async def chunks():
-                    yield SimpleNamespace(usage=usage, choices=[SimpleNamespace(
-                        delta=SimpleNamespace(content="partial", reasoning_content=None, tool_calls=None),
-                        finish_reason="stop",
-                    )])
+                    yield ProviderObject(usage=usage, choices=[{
+                        "delta": {"content": "partial", "reasoning_content": None, "tool_calls": None},
+                        "finish_reason": "stop",
+                    }])
                 return chunks()
-            return SimpleNamespace(usage=usage, choices=[SimpleNamespace(
-                message=SimpleNamespace(content="OK", tool_calls=None), finish_reason="stop",
-            )])
+            return ProviderObject(usage=usage, choices=[{
+                "message": {"content": "OK", "tool_calls": None}, "finish_reason": "stop",
+            }])
 
-        monkeypatch.setattr(core.litellm_client, "count_tokens", no_estimate)
-        monkeypatch.setattr(core.litellm_client, "acompletion_stream" if stream else "acompletion", provider)
+        monkeypatch.setattr(core.provider_metadata, "count_tokens", no_estimate)
+        monkeypatch.setattr(core.provider_client, "acompletion_stream" if stream else "acompletion", provider)
         with pytest.raises(core.CompletionError, match="modality_usage_unavailable"):
             await self.invoke(core, self.route(), self.media_messages("audio"), stream=stream)
         assert calls == [1]
@@ -2193,7 +2192,7 @@ class TestStatelessModalityBilling:
                 return events()
             return payload
 
-        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
+        monkeypatch.setattr(core.provider_client, "aresponses", provider)
         result = await self.invoke(core, self.route(provider="openai"), [{"role": "user", "content": "text"}],
                                    "responses", stream=stream)
         assert calls == [1]
@@ -2227,8 +2226,8 @@ class TestStatelessModalityBilling:
         def no_estimate(*args, **kwargs):
             pytest.fail("malformed native usage retried as local text")
 
-        monkeypatch.setattr(core.litellm_client, "count_tokens", no_estimate)
-        monkeypatch.setattr(core.litellm_client, "aresponses" if protocol == "responses" else "aanthropic_messages", provider)
+        monkeypatch.setattr(core.provider_metadata, "count_tokens", no_estimate)
+        monkeypatch.setattr(core.provider_client, "aresponses" if protocol == "responses" else "aanthropic_messages", provider)
         with pytest.raises(core.CompletionError, match="modality_usage_unavailable"):
             await self.invoke(core, self.route(provider="openai"), [{"role": "user", "content": "text"}],
                               protocol, stream=True)
@@ -2247,7 +2246,7 @@ class TestStatelessModalityBilling:
         async def forbidden(*args, **kwargs):
             pytest.fail("chat-only modality metering used for a native adapter")
 
-        monkeypatch.setattr(core.litellm_client, "aresponses" if protocol == "responses" else "aanthropic_messages", forbidden)
+        monkeypatch.setattr(core.provider_client, "aresponses" if protocol == "responses" else "aanthropic_messages", forbidden)
         with pytest.raises(core.CompletionError, match="image_input.*modality_usage_unavailable"):
             await self.invoke(core, self.route("image", provider="gemini"), [{"role": "user", "content": [part]}], protocol)
         assert recorded == []
