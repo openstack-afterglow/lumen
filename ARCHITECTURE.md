@@ -534,8 +534,8 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 {
   "schema_version": 1,
   "source_sha256": "d4c969546f1fb4b779d10bb42e7a75f7b7a4af4b0c0746406bc049e9bca31387",
-  "reviewed_at": "2026-10-22T15:32:16Z",
-  "summary": "Integrated origin/dev 0.6.9 (Kubernetes sandboxes, direct-system authority repair, CLI catalog) into the Bifrost provider-account branch. Source-reviewed conflict resolutions in authority, execution, provider routing, docs and migrations; both immutable 027 ledger identities preserved with additive 028 reconciliation and credential-drift preflight. Fixed approval-expiry sweep isolation and pre-submit controller operation handling. Local contract 4633, SDK 143, MariaDB integration 415 and system 31 passed on this tree; no real provider, IAM, cluster, multi-arch image or production proof; integration worktree only, no rollout or migration approval."
+  "reviewed_at": "2026-10-22T15:33:27Z",
+  "summary": "Integrated origin/dev 0.6.9 into the Bifrost provider-account branch with additive 028 reconciliation, approval-expiry isolation and pre-submit controller claim release; operations findings updated to implemented/test-passed. Local contract 4633, SDK 143, MariaDB integration 415 and system 31 passed; no real provider, IAM, cluster, multi-arch image or production proof; integration branch only, no rollout or migration approval."
 }
 ```
 <!-- architecture-review:end -->
