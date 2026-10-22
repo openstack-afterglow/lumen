@@ -1,10 +1,91 @@
 # 테스트
 
+## Run-scoped Kubernetes tool cutover acceptance (pending)
+
+Current path: durable protocol v2 worker lease → pinned enabled-pool tool manifest → existing effect/approval dispatch → on-demand run sandbox → controller capability + identity-pinned mTLS → Pod stdio Playwright/filesystem MCP → typed execution result. Terminal/cancel/descendant resource reclamation uses durable sandbox release intents and controller lifecycle. Generic authenticated remote MCP/Afterglow remains a separate connector path with current owner/config/credential fences; it does not promise browser isolation.
+
+**No tests, lint, builds, formatters or smoke checks were run for this documentation cutover.** The parent runs integrated verification once after source freeze. The parent-reported earlier full gate had exactly one failure, `tests/test_ci_shape.py::test_dockerfile_has_no_recursive_chown_or_floating_uv`. That source-text implementation test is removed, not re-pinned or skipped; its removal is not a passing rerun. Behavioral package installation/import, ownership/privilege and security acceptance must remain separate from assertions about Dockerfile spelling or layer order.
+
+Required acceptance remains pending for the final exact source/plugin/config/image cohort:
+
+- Native API/worker/encrypted PostgreSQL checkpoint discovery→deny/approve→second tool call→automatic resume, including ordinary `chat` without an agent budget; assert HTTP, tool result, persisted run/event/usage state and no dispatch on denial.
+- Current owner/project/run isolation, frozen approval/config/activation and remote credential-epoch drift rejection; generic Afterglow scoped auth and approval behavior must survive the cutover without relying on remote browser isolation.
+- Actual Drover Kubernetes namespace/RBAC/RuntimeClass/CNI qualification, controller/worker NodePort+mTLS reachability, pinned stdio MCP schemas and real tool calls, enforced egress/resource limits, terminal/cancel/approval-waiting/descendant reclamation and restart/unknown-result behavior. Observe owned Pod/Service/Secret/NetworkPolicy absence and preserve unrelated resources; intent creation alone is not completed cleanup.
+- Current arm64 and amd64 builds/runtime and native isolation evidence, canonical service/plugin/sandbox/integration/system gates, exact-SHA CI/publication and separately authorized production rollout/monitoring. Readiness, import, standalone browser or historical diagnostic results do not satisfy these gates.
+
+
+## 0.6.9 candidate local evidence (2026-10-15)
+
+정본은 private proof root `/Users/pieroot/.local/share/afterglow-proofs/chat-mcp-20261015/`의 아래 JSON이다. **이 표는 이전 permanent gateway/named OCI 경로의 역사적 증거이며 현재 run-scoped Kubernetes 경로의 qualification이나 배포 절차가 아니다.** Source/image identity와 원래 실패를 그대로 보존하며 최종 cohort requalification·registry publication·production acceptance는 pending이다. 이 문서 변경에서는 실행을 추가하지 않았다. 긴 digest 표 대신 각 receipt의 image/source 항목을 사용하고 `token`, TLS private key는 공유하지 않는다.
+
+| Receipt | 실제 관측 | 경계 / 남은 gate |
+| --- | --- | --- |
+| `browser-linux/acceptance-report.json` | `LOCAL_LINUX_ACCEPTANCE_PASSED_WITH_REPORTED_LIMITS`. Ubuntu26.04 arm64/Docker29.1.3/AppArmor5.0.2의 canonical Compose healthy; official MCP0.0.83 reviewed22tools, public navigation/snapshot, fresh connection/session same-key continuity, distinct-key blank, auth/session/run denial, six sequential browser runs. Actual redirects/private/metadata/IPv6/site-hairpin/DNS·page fetch/WSS denials, live namespace/capability/filesystem/nft inspection, terminal cleanup, gateway SIGKILL 뒤16descendants 소멸을 관찰했다. | amd64 images는 build/binary probe만, Docker Desktop emulation 사용; native amd64 hardened navigation 미검증. Timeout **30.0037s** 뒤 browser discard; cancellation notification202는 prompt abort가 아니었다. 600s idle/1800s absolute TTL wall-clock 미대기. Local TLS localhost18443는 public443 native connector 수용이 아니다. Registry/Zun/production 증거 없음. |
+| `oci-linux/prepatch-failures.json` | Frozen runtime `2b38516f…`에서 root pytest **88 passed/0 skipped**; installer SIGHUP reload 성공, daemon PID/default `runc`/sentinel ID·PID·StartedAt·Config·HostConfig 불변. Token archive200 뒤 named create는 wrapper125/service PID0으로 실패했다. | Docker29 snapshotter same-ID rootfs, exact default private-net sysctls, empty blockIO, pathless private netns compatibility defect를 보존한다. Passed qualification receipt **없음**. |
+| `oci-linux/report.json` | `FROZEN_SOURCE_BLOCKED__DIAGNOSTIC_4PLUS1_PASSED__NO_QUALIFICATION_RECEIPT`. Ubuntu24.04 arm64 disposable VM. 위4fix + shim fd3 fix/VM diagnostic logging을 추가한 **unfrozen diagnostic**에서 named gateway/broker healthy, MCP22/navigation/run isolation/denials, live sandbox/nft/resource clamps/update, exec refusal, pause/resume·stop/start와 unchanged daemon/default/sentinel을 관찰했다. | Canonical frozen qualification은 실패 상태 그대로이며 종료 시 frozen source 재설치. Diagnostic은 current source 수용이 아니다. 256PID에서 two runs249tasks/thread exhaustion·cleanup 실패, systemd daemon-reload 뒤 swap.max=max, CPU0.125→0.13 roundup, broker stop20s 뒤 exit137을 기록한다. Current source의 CPU flooring·gateway tini·broker SIGTERM 및 compatibility 수정은 **재qualification 필요**. Docker inspect의 widened 요청값과 effective cgroup이 달라 kernel readback이 필요하다. Native amd64/Zun cloud/TTL wall-clock 미검증. |
+| `lumen-native/STATUS.json` | `PARTIAL - native v2 MCP approval/browser acceptance NOT exercised`. Real API/worker/MariaDB/Redis/PostgreSQL 및 encrypted saver(`msgpack+afterglow-aesgcm-v1`), synthetic IAM/provider. Ordinary no-budget v2 temporary/persistent 완료·checkpointer readiness는 **READ COMMITTED fix/plugin 재버전 전** images. Datastore **317 passed**는 해당 fix 포함, plugin 재버전/lock resync 전 source이며 source hashes 미기록. | Final arm64 root0.6.9/all6plugin versions/migrate-help probe는 했지만 deploy/smoke/host source-manifest 비교 안 함; current amd64 targets 미빌드. Budgeted fix의 native HTTP 성공 증거 없음(기존 MariaDB1020 실패만 있음). Canonical system **17 failed +14 errors**, externally stopped Desktop stack 뒤 DNS 장애: pass로 바꾸지 않는다. |
+
+위 native receipt는 v1 browser/unknown-tool block, v2 discovery→deny/approve→second call→automatic resume, owner/project/run/connector isolation, config/activation/OAuth epoch drift, provider/MCP failure propagation 및 terminal/approval-waiting/descendant 회수의 성공 증거를 포함하지 않는다. Descendant 시나리오는 당시 필요한 agent execution policy/delegable IDs의 public API 부재도 기록했다. 이전 quick tunnel은 닫혔으며 그 connector/session fixture를 현재 Kubernetes 배포 prerequisite로 재사용하지 않는다. Readiness나 standalone browser proof로 native 수용을 대신하지 않는다.
+
+**Current final gate:** 위 [run-scoped Kubernetes 수용 목록](#run-scoped-kubernetes-tool-cutover-acceptance-pending)을 final exact source/plugin/config/image cohort로 실행하고 실제 receipt를 남긴다. 과거 named-runtime/compute-only diagnostic을 현재 배포 권한으로 해석하지 않는다. Native Kubernetes tool/approval/lifecycle 또는 production 항목은 현재 완료로 표시하지 않는다.
+
+## 0.6.8 local qualification (2026-10-14)
+
+Release `0.6.8` integrates dev `bc2fefd8c95ee6a09973461ac95d1058b906192f` and every preserved public WIP scope. Fresh local qualification receipts cover the isolated integrated Lumen clone with source unchanged since integration. Native `uv lock --offline` generated the root0.6.8 lock; historical receipts below remain evidence for their original snapshots, not substitutes for these fresh results. Local evidence is recorded in `release-qualification-receipts.md`, with private proof root `release-all-20261014T073153Z-c2ba90` (private values are not reproduced). Publication and production evidence are recorded separately below.
+
+| Local gate | Actual result | Scope |
+| --- | --- | --- |
+| `env -u LUMEN_TEST_DATABASE_URL -u LUMEN_TEST_REDIS_URL uv run --no-sync lumen-test contract -q` | Service **3,179 passed / 344 deselected**; SDK **128 passed**; service and SDK Ruff passed | CPython 3.12.13; local, not CI |
+| `lumen-test integration -q` | **313 passed / 3,210 deselected** | Disposable Compose MariaDB+Redis project, torn down |
+| `lumen-test system -q` | **31 passed** | Disposable Compose; locally built native arm64 API/worker/batch-worker/migrate images, fake Keystone/provider, MinIO, ClamAV and Postgres |
+| Redacted gitleaks scan | **55 public-diff files, no findings** | Public diff only; not a whole-repository security audit |
+
+**Pre-rollout read-only baseline (2026-10-14, no mutation):** Before cutover, Lumen ran `bc2fefd` (`v0.6.7`); scripted full ledger comparison against integrated manifest paths and SHA-256 matched **26/26 (001–026)**, with no pending, unknown or drifted entries. **026 was already applied; 0.6.8 needed no production migration.** This baseline alone did not prove new-runtime acceptance or change production. Installations missing026 still require the documented stopped-writer migration procedure.
+
+### 0.6.8 production rollout (2026-10-14)
+
+- **Publication:** Commit `2417886bc6f320f3b0f0438ed0fe5b8ab12c2640` passed exact-SHA CI; tag `0.6.8` Package Release and Docker workflows succeeded. Published API/worker images cover amd64+arm64, OCI revision `2417886b`:
+
+  | Image | Pinned digest |
+  | --- | --- |
+  | `lumen-api` | `sha256:a5808052422162ae4423ed4c32954656309f273f5341febc4805dc01d4757de5` |
+  | `lumen-worker` | `sha256:3bad6b4c3963365335cd0cfd2647ea180bf8fed3531a8911030432ad0d36afad` |
+
+- **Coordinated cutover:** Canonical Kolla actions used `--skip-tags haproxy`. The terminal gate found `chat_runs`45 completed/22 failed, `chat_jobs`49/16 and segments49/22; batches and reservations were empty. APIs stopped before workers, with the gate repeated after API stop; the whole old cohort stopped before replacement. Five old writers exited0; the dms-controller3 worker exception is recorded below. Cold MariaDB restore in an isolated network-none tmpfs environment matched **63 tables / 5,540 rows** exactly; the cold checkpointer PostgreSQL dump covered **4 tables**. No migration: ledger unchanged at **26**. `llm_providers` remained **6 rows**, last updated2026-10-10; the **+3 rows** were the three new worker registrations.
+- **Runtime:** All **6 replicas** matched pinned digests/revision; APIs were healthy with **0 restarts**, `/v1/ready` returned **200 on all three listeners and publicly**, and **0 error log lines** were observed. Non-target containers remained unchanged. No paid inference or policy/IAM changes were performed.
+- **Residual drain defect:** The old0.6.7 dms-controller3 worker was **SIGKILLed (exit137) after the300s drain**. Its registration retained `auxiliary_active=1` while runs/jobs/memory-outbox/batch-queue live leases were all zero, so `acknowledge_drain` never succeeded. Five older registrations from2026-10-05/06 show the same unacknowledged drain: this pre-existing drain-acknowledgement defect was not caused by0.6.8 and needs follow-up.
+- **Residual Redis wiring:** Lumen's `REDIS_URL` still points at dms-controller1 Valkey, a **read-only replica**; the Sentinel master is on dms-controller3. No Lumen error was observed, but the same wiring breaks Waygate writes. Sentinel/master-routed Redis wiring needs a separate change.
+
+**Acceptance boundary:** This receipt settles CI, tag/package and API/worker image publication, amd64 production execution and the coordinated production rollout; it does not establish native IAM/Keystone, real-provider, controller/sandbox or published-arm64 runtime acceptance. Keep coordinated API/worker/controller cutover (no mixed old/new controller cohort) and complete guest drain before stopping the supervisor: unchanged `guest_api` sends SIGTERM, then SIGKILL after at most ten seconds regardless of outer Docker/systemd stop limits.
+
+### Release reproduction commands and prerequisites
+
+Authoritative commands come from `lumen/scripts/test_layers.py`, `.github/workflows/{ci,release,docker-build}.yml` and the native infrastructure recipes below. Run only on a disposable qualification environment, with Python3.12, uv, Docker Engine/Compose/Buildx, dependency/base-image access and adequate disk. Do not inherit operator `LUMEN_TEST_DATABASE_URL` or `LUMEN_TEST_REDIS_URL`: the integration runner accepts those overrides. Each Compose gate tears down its selected project's volumes; never choose a development/production project.
+
+```sh
+uv sync --python 3.12 --extra service --extra dev --frozen
+uv run --frozen --extra service --extra dev lumen-test contract -q
+LUMEN_TEST_COMPOSE_PROJECT=lumen-068-qualification-integration uv run --frozen --extra service --extra dev lumen-test integration -q
+LUMEN_TEST_COMPOSE_PROJECT=lumen-068-qualification-system uv run --frozen --extra service --extra dev lumen-test system -q
+uv run --frozen --extra service --extra dev pytest tests/test_kolla_assets.py -q
+uv build --wheel
+```
+
+`contract` includes service/SDK pytest and both Ruff scopes. In addition, CI builds/tests each default plugin with `uv build --wheel --out-dir dist <package>` and `uv run --project <package> --extra testing pytest -q <package>/tests`, for `plugins/{database-mariadb,memory-default,tools-default,skills-default,mcp-default}`. Build `packages/lumen-plugin-api` and `packages/lumen-sandbox` wheels with the same build command. Standalone sandbox test command is `uv run --project packages/lumen-sandbox --extra testing pytest -q packages/lumen-sandbox/tests`; full namespace/cgroup/tmpfs isolation needs native Linux, not macOS skips or a nonprivileged import. Root publication uses `python -m build --wheel --outdir dist` and verifies root tag/version lockstep plus installed Kolla shared assets. Parent must inspect packaged SQL/manifest and helpers after clean root-wheel `--no-deps` installation.
+
+For each target `lumen-api`, `lumen-worker`, `lumen-controller`, `lumen-sandbox`, reproduce `docker-build.yml` with `docker buildx build --platform linux/amd64,linux/arm64 --file docker/Dockerfile --target <target> --output type=oci,dest=<target>-0.6.8.oci .`. Then build/load each platform separately with `--platform linux/<arch> --load --tag <target>:0.6.8-<arch>` and execute it on a matching runner. API/worker/controller offline probe: `docker run --rm --network none --entrypoint python <image> -c 'import platform,lumen,lumen.main,lumen.worker,lumen.controller; print(platform.machine(),lumen.__version__)'`, followed by migration CLI `--help`. Sandbox must execute its independent distribution import, `node --version` and `python --version`; build/import alone is not Linux isolation or configured-cloud acceptance. Record immutable revision/digest/platform evidence separately from canonical Compose HTTP/provider/journal consumers and eventual publication/deployment.
+
+Architecture review uses `python3 scripts/check_architecture.py --stamp --summary "<current review scope and observed evidence>"` and the matching `--staged` commands when reviewing staged source. The parent owns the final freshness stamp/check; do not manually edit the marker digest/UTC/summary. No consent backfill, stopped-writer/drain/backup and mixed-version/rollback hazards remain documented in [operations](operations.md); schema-first applies where the ledger has missing migrations, not to the already-matched production026 ledger.
+
 Lumen의 테스트 시스템은 로컬 개발부터 외부 배포 검증까지 명확한 경계를 가진 4가지 계층(Contract, Integration, System, Deployment)으로 구성됩니다.
+
+## Bifrost + dev 0.6.9 integrated tree (2026-10-23, local-only)
+
+Isolated worktree `integrate/bifrost-current-dev` (merge of `origin/dev` `6ca10ee` into the Bifrost branch), fresh `uv venv` (Python 3.12.13; the cloned venv had shebangs pointing at the main checkout and was recreated, `import lumen` verified inside the worktree). Observed **test-passed** (synthetic/local) results on this exact tree: `ruff check lumen tests sdk` clean; contract `-m "not integration and not system"` **4,633 passed / 446 deselected / 0 failed** (with `BIFROST_EXECUTABLE` pointing at the host-built converter); SDK **143 passed**; Go `gofmt`/`go vet`/`go test` clean; `lumen-test integration` on disposable MariaDB/Redis **415 passed**, including real-MariaDB migration-history regressions (pre-027, Kubernetes-027-only, original-account-027, compatibility-repaired account-027 and credential drift rejected before any pending DDL) and pre-submit controller/approval-expiry regressions; `lumen-test system` **31 passed**. `test_v2_graph_interrupts_before_external_mutation_dispatch[expired]` also failed at `a26dec0` (resume returned `None`), so it predates this merge. Its mocked resume persisted the approval with fences `7/11` but replayed a checkpoint whose fences are `None` (custom HTTP tool); the interrupt payload construction in `graph.py`/`bindings.py` is identical at `a26dec0`, `origin/dev` and this tree, so no fence field is dropped. The test now resumes with the same fenced call it persisted, and the sweep mock follows the paged expiry query sequence; the real-MariaDB `test_approval_recovery.py` covers the unmocked path. Not exercised: real providers/OAuth, real IAM, Nova/Octavia/Kubernetes clusters, multi-arch image rebuild of this merged tree, Afterglow BFF/browser requalification against it, and production. Legacy migration 027 behavior is unchanged; see [operations](operations.md) for the coordinated cutover and the 028 reconciliation gate.
 
 ## Private Bifrost and account pools (2026-10-22, local-only)
 
-This cutover is unpublished local source. Execution moved from LiteLLM to owned Python transport/metadata/lifecycle plus a pinned converter-only Go companion, with endpoint-owned accounts/credentials. Historical receipts further below stay attached to their original source revision and do not qualify this runtime. The table records the **final observed** results on the frozen source; each is synthetic/local unless stated.
+These are historical receipts from the unpublished Bifrost source before integration with latest dev. Execution moved from LiteLLM to owned Python transport/metadata/lifecycle plus a pinned converter-only Go companion, with endpoint-owned accounts/credentials. Other receipts below likewise stay attached to their original source revision and do not qualify the merged runtime. The table records the **final observed** results on that frozen source; each is synthetic/local unless stated. The isolated integration worktree is not a production deployment and creates no new runtime proof; the combined Kubernetes/Bifrost cohort requires separate qualification.
 
 | Boundary | Observed result and limitation |
 | --- | --- |
@@ -316,6 +397,41 @@ LUMEN_TEST_COMPOSE_PROJECT=lumen-rolegrades-20261006 uv run --frozen --extra ser
 ```
 
 Both runners tear down their selected project's volumes. These local proofs do not establish production Keystone authorization, real provider output/billing, cloud workers or deployment. Docker multiarchitecture build/import checks are separate: importing `lumen.worker` is not worker execution evidence.
+
+### 0.6.7 direct-system authority source qualification
+
+The 0.6.7 source repair reads `role_assignments.list(user=user_id, system="all")` **without `effective=True`**, keeps only `scope.system.all is True` rows, and expands their role IDs through the current validated inference DAG to the exact unique global `admin` ID. Project membership still uses `role_assignments.list(user=user_id, project=project_id, effective=True)` for current group/inherited grants, with the existing verified-system-admin exception. Enabled owner/project checks, project/domain `admin|manager` denials, API-key stored-scope attenuation and foreign project/target rejection remain in force.
+
+`tests/system/fake_keystone.py::DirectoryState.assignments` models Keystone's omission of direct system grants when `effective=true`; it is an isolated directory HTTP fixture, not a production authentication fallback. `tests/test_native_keystone_authority.py::test_direct_system_grant_authorizes_http_without_promoting_project_admin` uses the installed Keystone SDK against that fixture and real auth dependencies through ASGI HTTP. Its `native-read` and `global-admin` cases admit the direct-system principal and reject a project-only `admin`/`member` principal with 403. This is not real deployed Keystone/API HTTP acceptance evidence.
+
+Final-tree qualification on isolated local `dev`: frozen `lumen-test contract -q` passed **3,069 service tests** (315 deselected), root Ruff, **128 SDK tests** and SDK Ruff. The disposable MariaDB/Redis integration gate passed **284**, and canonical Compose process-system gate passed **31** with actual API, online worker, batch worker, PostgreSQL, HTTPS MinIO, ClamAV and synthetic Keystone/provider HTTP. Strict X.509 guest-runtime smoke passed **1**; only ephemeral test certificates gained SAN/SKI/AKI/key-usage metadata, with production TLS policy unchanged. Existing dependency deprecation warnings remain disclosed rather than suppressed.
+
+Root `lumen-0.6.7-py3-none-any.whl` and all seven independent package wheels built. Independent plugin conformance passed **88**, with **1** optional-pgvector skip; Kolla asset tests passed **41**. Sandbox tests on macOS were **21 skipped** as Linux-only; a nonprivileged Linux arm64 process passed **12** and skipped **9**, not full namespace/cgroup workload qualification. These isolated fixtures and packaging results are not production RBAC, paid-provider, cloud sandbox/Nova/Octavia or rollout evidence. Local current-source Afterglow1.30.10/Lumen0.6.7, using the unchanged real Keystone owner session, returned200 for conversations and global provider administration; no role assignment or provider mutation was made.
+
+At the time of this 0.6.7 source receipt, production was **Lumen0.6.6 revision `2757a5df`, defective**; the later 0.6.8 publication/production receipt above supersedes that operating status. The 0.6.7 source migration tree/manifest were byte-identical to0.6.6; no new migration was introduced by that repair.
+
+Canonical reproducible commands (the exercised gates/builds above qualify this integrated source, not earlier user-reported20-test evidence):
+
+```sh
+uv sync --extra service --extra dev --frozen
+uv run --frozen lumen-test contract -q
+export LUMEN_TEST_COMPOSE_PROJECT=lumen-direct-system-067-qualification
+uv run --frozen lumen-test integration -q
+uv run --frozen lumen-test system -q
+uv run --frozen pytest tests/test_kolla_assets.py -q
+uv build --wheel
+uv build --wheel --out-dir dist packages/lumen-plugin-api
+uv build --wheel --out-dir dist plugins/database-mariadb
+uv build --wheel --out-dir dist plugins/memory-default
+uv build --wheel --out-dir dist plugins/tools-default
+uv build --wheel --out-dir dist plugins/skills-default
+uv build --wheel --out-dir dist plugins/mcp-default
+uv build --wheel --out-dir dist packages/lumen-sandbox
+```
+
+`contract` runs root pytest excluding integration/system, root Ruff, SDK pytest and SDK Ruff. The Compose project above is a disposable qualification project, not an operator development/production project: integration/system require Docker Engine/Compose and remove the selected project's volumes. They exercise isolated services with synthetic directory/provider HTTP, not paid providers or production Keystone. The root wheel command above is local packaging; `.github/workflows/release.yml` builds it with `python -m build --wheel --outdir dist`. Independent package wheels and the Kolla-assets test are separate from service contract evidence.
+
+Publication must separately qualify all four Dockerfile targets (`lumen-api`, `lumen-worker`, `lumen-controller`, `lumen-sandbox`) on **`linux/amd64` and `linux/arm64`**, verify immutable revision/digest and aliases, and execute the declared platforms. Final exact-scope architecture stamping and staged guard follow source/docs integration. Successful local gates, published tag/image digests, deployed version/revision and authenticated production acceptance remain separate evidence requirements.
 
 ### Execution credential isolation handoff (test-defined)
 

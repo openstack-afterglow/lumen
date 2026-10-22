@@ -94,9 +94,11 @@ async def _v2_resume(*, run_id: str, owner: str) -> dict[str, Any] | None:
         # consumed approval boundary. Legacy approval rows alone never fabricate a payload.
         return None
     if pending["kind"] == "tool_approval":
-        decisions = await _v2_approval_resume(run_id=run_id, owner=owner)
+        decisions = await _v2_approval_resume(run_id=run_id, owner=owner, calls=pending.get("calls"))
         if decisions is None:
-            raise DurableRunError("queued v2 run is waiting on approvals that were never recorded")
+            # Reconciliation committed awaiting_input and released this worker's lease.
+            # Stop before engine.stream can execute a graph node, tool, or provider call.
+            raise DurableRunLeaseLost(f"approval recovery released lease for {run_id}")
         return {"kind": "tool_approval", "decisions": decisions}
     wait_group_id = pending.get("wait_group_id")
     if not isinstance(wait_group_id, str):
@@ -107,6 +109,8 @@ async def _v2_resume(*, run_id: str, owner: str) -> dict[str, Any] | None:
 def _delegation_enabled(run: ChatRun, payload: dict[str, Any]) -> bool:
     """Advertise ``delegate_agent`` only when policy, budgets and a sandbox runtime all permit it."""
     if run.execution_protocol_version != 2 or run.credit_ceiling is None or run.sandbox_seconds_ceiling is None:
+        return False
+    if not _tools_enabled(payload.get("features")):
         return False
     try:
         policy = children._policy_from_snapshot(run.capability_snapshot or {})
@@ -309,7 +313,7 @@ async def _finish_transaction(
             await session.execute(select(ChatRun.id).where(ChatRun.parent_run_id == run_id).limit(1))
         ).scalar_one_or_none() is not None
         if (unlocked_run.parent_run_id is not None or has_children or unlocked_run.execution_mode == "code"
-                or unlocked_run.credit_ceiling is not None):
+                or unlocked_run.credit_ceiling is not None or unlocked_run.assigned_resource_id is not None):
             quota = await budgets.lock_project_quota(session, unlocked_run.project_id, order=order)
         order.take("conversation")
         if unlocked_run.conversation_id is not None:
@@ -535,7 +539,7 @@ async def _finish_transaction(
                 finalized = await children.cancel_descendants(
                     session, run, quota=quota, order=order, user_id=run.user_id, release_resources=False
                 )
-            if run.execution_mode == "code":
+            if run.execution_mode == "code" or run.assigned_resource_id is not None:
                 await budgets.settle_root_sandbox(session, quota=quota, root=run, order=order)
             if quota is not None:
                 await budgets.close_root_budget(session, quota=quota, root=run, order=order)
@@ -543,7 +547,7 @@ async def _finish_transaction(
 
             for child_id in finalized:
                 await infra_store.release_sandbox_intent(session, run_id=child_id, order=order)
-            if run.execution_mode == "code":
+            if run.execution_mode == "code" or getattr(run, "assigned_resource_id", None) is not None:
                 await infra_store.release_sandbox_intent(session, run_id=run.id, order=order)
     return True, wake_parent
 
@@ -1353,6 +1357,9 @@ class _DurableExecutionHooks:
 
     async def _credit_lineage(self, session):
         """Acquire quota and lineage before the segment ledger, including on completion."""
+        # Delta/heartbeat writers can commit after the identity read. A stale
+        # REPEATABLE READ view makes MariaDB reject the later locking read (1020).
+        await worker_routing.use_read_committed(session)
         identity = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id))).scalar_one()
         order = budgets.LockOrder()
         quota, root, _ancestors = await children._lock_lineage(session, identity, order)
@@ -2347,7 +2354,16 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         awaiting_model_response = True
         pending_tool_results: int | None = None
         execution_hooks = _DurableExecutionHooks(
-            run_id=run_id, owner=owner, credit_bounded=run.execution_protocol_version == 2,
+            run_id=run_id,
+            owner=owner,
+            # Approval-capable chat is not implicitly a managed agent allocation.
+            # Ordinary chat retains wallet precheck/settlement; explicit agent
+            # budgets and every child still enforce project/root call ceilings.
+            credit_bounded=run.execution_protocol_version == 2 and (
+                run.parent_run_id is not None
+                or run.execution_mode != "chat"
+                or run.credit_ceiling is not None
+            ),
             skill_snapshots=skill_snapshot, user_id=user_id, project_id=project_id,
         )
         feature_options = payload.get("features")
@@ -2361,7 +2377,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         resume = await _v2_resume(run_id=run_id, owner=owner) if run.execution_protocol_version == 2 else None
         delegation_enabled = _delegation_enabled(run, payload)
         sandbox_lease = None
-        if run.execution_protocol_version == 2 and run.assigned_resource_id is not None:
+        if run.execution_protocol_version == 2:
             try:
                 sandbox_lease = (owner, int(str(owner).rsplit("#", 1)[1]))
             except (IndexError, ValueError):

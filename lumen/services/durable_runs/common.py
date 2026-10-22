@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -34,7 +33,6 @@ from lumen.services.message_timestamps import message_timestamps
 
 from .errors import DurableRunError, DurableRunInputError
 
-logger = logging.getLogger(__name__)
 _LEASE_SECONDS = 45
 _V2_DEFAULT_MAX_MODEL_TURNS = 8
 _V2_DEFAULT_MAX_TOOL_CALLS = 24

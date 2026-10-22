@@ -33,10 +33,12 @@ from cryptography import x509
 from lumen.services.infrastructure.config import RuntimeConfig, SecretRef
 
 _MAX_REQUEST_BYTES = 256 * 1024
-_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+_MAX_RESPONSE_BYTES = 8 * 1024 * 1024 + 64 * 1024  # MCP frame plus execution status envelope.
 _UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 _PATHS = (
     ("POST", re.compile(r"/v1/executions\Z")),
+    ("POST", re.compile(r"/v1/mcp/executions\Z")),
+    ("GET", re.compile(r"/v1/workspace\Z")),
     ("GET", re.compile(rf"/v1/executions/{_UUID}\Z")),
     ("DELETE", re.compile(rf"/v1/executions/{_UUID}\Z")),
     ("GET", re.compile(rf"/v1/artifacts/{_UUID}\Z")),
@@ -45,6 +47,7 @@ _PATHS = (
     ("POST", re.compile(r"/v1/drain\Z")),
 )
 _POST_KEYS = {"run_id", "call_id", "fence", "language", "source", "timeout_seconds", "workspace_revision"}
+_MCP_POST_KEYS = {"run_id", "call_id", "fence", "profile", "tool", "arguments", "timeout_seconds", "workspace_revision"}
 _DRAIN_KEYS = {"resource_id", "generation", "fence"}
 
 
@@ -123,15 +126,23 @@ def sign_dispatch_capability(dispatch_key: bytes, *, resource_id: str, run_id: s
         "fence": fence, "exp": int(time.time()) + ttl_seconds,
     }
     if method == "POST":
-        if (not isinstance(body, dict) or set(body) != _POST_KEYS or body.get("run_id") != run_id
-                or body.get("fence") != fence or body.get("language") not in {"python", "javascript", "shell"}
-                or not isinstance(body.get("source"), str) or len(body["source"].encode("utf-8")) > 65_536
+        keys = _MCP_POST_KEYS if path == "/v1/mcp/executions" else _POST_KEYS
+        if (not isinstance(body, dict) or set(body) != keys or body.get("run_id") != run_id
+                or type(body.get("fence")) is not int or body["fence"] != fence
                 or type(body.get("timeout_seconds")) not in (int, float)
                 or not 0 < body["timeout_seconds"] <= 300
                 or type(body.get("workspace_revision")) is not int or body["workspace_revision"] < 0
                 or not isinstance(body.get("call_id"), str) or not 0 < len(body["call_id"]) <= 128
                 or body["call_id"] != call_id or body["workspace_revision"] != workspace_revision):
             raise InternalTransportError("invalid execution scope")
+        if path == "/v1/mcp/executions":
+            if (not isinstance(body["profile"], str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", body["profile"])
+                    or not isinstance(body["tool"], str) or not 0 < len(body["tool"]) <= 128
+                    or not isinstance(body["arguments"], dict) or len(_canonical(body)) > 65_536):
+                raise InternalTransportError("invalid MCP execution scope")
+        elif (body["language"] not in {"python", "javascript", "shell"}
+                or not isinstance(body["source"], str) or len(body["source"].encode("utf-8")) > 65_536):
+            raise InternalTransportError("invalid code execution scope")
         payload.update(call_id=call_id, workspace_revision=workspace_revision,
                        fingerprint=hashlib.sha256(_canonical(body)).hexdigest())
     elif body is not None or call_id is not None or workspace_revision is not None:
@@ -149,8 +160,9 @@ class InternalTransport:
     """
 
     def __init__(self, config: RuntimeConfig, *, managed_networks: tuple[str, ...] | None = None,
-                 max_request_bytes: int = _MAX_REQUEST_BYTES,
+                 worker_client: bool = False, max_request_bytes: int = _MAX_REQUEST_BYTES,
                  max_response_bytes: int = _MAX_RESPONSE_BYTES):
+        self._fixed_worker_config = config if worker_client else None
         guest_dir = os.environ.get("LUMEN_GUEST_IDENTITY_DIR")
         self._guest_directory = Path(guest_dir) if guest_dir else None
         if self._guest_directory is not None:
@@ -158,7 +170,10 @@ class InternalTransport:
             self._guest_resource_id = os.environ.get("LUMEN_RESOURCE_ID")
             self._guest_generation = int(os.environ["LUMEN_RESOURCE_GENERATION"])
             self._operator_files = None
-        elif config.tls is not None and config.tls.operator_client_cert_file:
+        elif worker_client and config.tls is not None and config.tls.worker_client_cert_file:
+            self._operator_files = (config.tls.ca_file, config.tls.worker_client_cert_file,
+                                    config.tls.worker_client_key_file)
+        elif not worker_client and config.tls is not None and config.tls.operator_client_cert_file:
             self._operator_files = (config.tls.ca_file, config.tls.operator_client_cert_file,
                                     config.tls.operator_client_key_file)
         else:
@@ -187,6 +202,14 @@ class InternalTransport:
             ca_file = str(directory / "ca.pem")
             cert_file, key_file = str(directory / "cert.pem"), str(directory / "key.pem")
         else:
+            if self._fixed_worker_config is not None:
+                from lumen.services.infrastructure.fixed_worker import FixedWorkerIdentityError, load_identity
+
+                try:
+                    if load_identity(self._fixed_worker_config) is None:
+                        raise FixedWorkerIdentityError("fixed worker identity unavailable")
+                except FixedWorkerIdentityError as exc:
+                    raise InternalTransportError("fixed worker identity unavailable") from exc
             ca_file, cert_file, key_file = self._operator_files
         try:
             context = ssl.create_default_context(cafile=ca_file)
@@ -255,8 +278,12 @@ class InternalTransport:
         remaining = (deadline - datetime.now(UTC)).total_seconds()
         if remaining <= 0:
             raise InternalTransportError("internal request deadline exceeded")
-        response_limit = min(self.max_response_bytes,
-                             _MAX_RESPONSE_BYTES if path.startswith("/v1/artifacts/") else 1024 * 1024)
+        response_bound = 1024 * 1024
+        if path.startswith("/v1/executions/"):
+            response_bound = _MAX_RESPONSE_BYTES
+        elif path.startswith("/v1/artifacts/"):
+            response_bound = 5 * 1024 * 1024
+        response_limit = min(self.max_response_bytes, response_bound)
         writer = None
         try:
             # Pin the peer on the *same* TLS connection before writing source or

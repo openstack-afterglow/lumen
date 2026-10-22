@@ -28,6 +28,27 @@
   tags: precheck
   when: enable_lumen | bool
 
+- name: Precheck | Verify Lumen chat execution protocol
+  ansible.builtin.assert:
+    that:
+      - lumen_chat_execution_protocol_version in [1, 2]
+    fail_msg: "lumen_chat_execution_protocol_version must be 1 or 2"
+  tags: precheck
+  when: enable_lumen | bool
+
+- name: Precheck | Require protocol v2 checkpointer configuration
+  ansible.builtin.assert:
+    that:
+      - lumen_enable_checkpointer | bool
+      - lumen_checkpointer_postgres_url is defined and lumen_checkpointer_postgres_url | length > 0
+      - lumen_checkpointer_postgres_url is match('^postgres(ql)?://\\S+$')
+    fail_msg: "Protocol v2 requires lumen_enable_checkpointer and a PostgreSQL checkpointer URL; qualify encrypted API/worker checkpoint readiness before opening admission"
+  tags: precheck
+  no_log: true
+  when:
+    - enable_lumen | bool
+    - lumen_chat_execution_protocol_version == 2
+
 - name: Precheck | Validate Lumen public route hostname
   ansible.builtin.assert:
     that:
@@ -101,12 +122,13 @@
 
     - name: Precheck | Run validator in canonical release image
       ansible.builtin.command:
-        argv: "{{ ['docker', 'run', '--rm', '-i', '--pull=never', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--volume', lumen_precheck_script.path ~ ':/precheck.py:ro'] + (['--volume', lumen_controller_secrets_dir ~ ':/etc/lumen/controller:ro'] if lumen_runtime_enabled | bool else []) + ['--entrypoint', 'python', lumen_api_image_ref, '/precheck.py', 'material'] }}"
+        argv: "{{ ['docker', 'run', '--rm', '-i', '--pull=never', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--volume', lumen_precheck_script.path ~ ':/precheck.py:ro'] + (['--volume', lumen_controller_secrets_dir ~ ':/etc/lumen/controller:ro'] if lumen_runtime_enabled | bool else []) + (['--volume', lumen_worker_secrets_dir ~ ':/etc/lumen/worker-precheck:ro'] if lumen_runtime_enabled | bool and enable_lumen_worker | bool else []) + ['--entrypoint', 'python', lumen_api_image_ref, '/precheck.py', 'material'] }}"
         stdin: "{{ lumen_precheck_input | to_json }}"
       vars:
         lumen_precheck_input:
           runtime_enabled: "{{ lumen_runtime_enabled | bool }}"
           runtime_config: "{{ lumen_runtime_config }}"
+          worker_enabled: "{{ enable_lumen_worker | bool }}"
           ca_expiry_margin_seconds: "{{ lumen_runtime_ca_expiry_margin_seconds }}"
           glance_image_evidence: "{{ lumen_runtime_glance_image_evidence }}"
           guest_artifact_evidence: "{{ lumen_runtime_guest_artifact_evidence }}"
@@ -185,27 +207,6 @@
     - lumen_runtime_enabled | bool
     - inventory_hostname in groups['lumen']
 
-- name: Precheck | Require runtime TLS and key references under controller mount
-  ansible.builtin.assert:
-    that:
-      - lumen_runtime_config.dispatch_key.file is defined
-      - lumen_runtime_config.dispatch_key.file == '/etc/lumen/controller/dispatch.key'
-      - lumen_runtime_config.tls.ca_file is match('^/etc/lumen/controller/[^/]+$')
-      - lumen_runtime_config.tls.ca_key_file is match('^/etc/lumen/controller/[^/]+$')
-      - lumen_runtime_config.tls.cert_file is match('^/etc/lumen/controller/[^/]+$')
-      - lumen_runtime_config.tls.key_file is match('^/etc/lumen/controller/[^/]+$')
-      - lumen_runtime_config.tls.operator_client_cert_file is match('^/etc/lumen/controller/[^/]+$')
-      - lumen_runtime_config.tls.operator_client_key_file is match('^/etc/lumen/controller/[^/]+$')
-      - ([lumen_runtime_config.tls.ca_file, lumen_runtime_config.tls.operator_client_cert_file, lumen_runtime_config.tls.operator_client_key_file] | unique | list | length) == 3
-      - lumen_runtime_config.tls.ca_key_file not in [lumen_runtime_config.tls.ca_file, lumen_runtime_config.tls.operator_client_cert_file, lumen_runtime_config.tls.operator_client_key_file]
-      - lumen_runtime_config.tls.key_file not in [lumen_runtime_config.tls.ca_file, lumen_runtime_config.tls.operator_client_cert_file, lumen_runtime_config.tls.operator_client_key_file]
-    fail_msg: "runtime_controller_mount: runtime TLS files must reside under /etc/lumen/controller with separate worker client material"
-  tags: precheck
-  when:
-    - enable_lumen | bool
-    - lumen_runtime_enabled | bool
-    - inventory_hostname in groups['lumen']
-
 - name: Precheck | Inspect worker-only TLS directory
   become: true
   ansible.builtin.stat:
@@ -215,12 +216,14 @@
   when:
     - enable_lumen | bool
     - lumen_runtime_enabled | bool
+    - enable_lumen_worker | bool
     - inventory_hostname in groups['lumen']
 
 - name: Precheck | Require a restricted worker-only TLS directory
   ansible.builtin.assert:
     that:
       - lumen_worker_secrets_stat.stat.isdir
+      - not lumen_worker_secrets_stat.stat.islnk
       - lumen_worker_secrets_stat.stat.uid == 0
       - lumen_worker_secrets_stat.stat.gid == 0
       - lumen_worker_secrets_stat.stat.mode == '0750'
@@ -229,34 +232,46 @@
   when:
     - enable_lumen | bool
     - lumen_runtime_enabled | bool
+    - enable_lumen_worker | bool
     - inventory_hostname in groups['lumen']
 
-- name: Precheck | Inventory worker-only TLS files
+- name: Precheck | Inventory worker identity and manifest copies
   become: true
   ansible.builtin.find:
     paths: "{{ lumen_worker_secrets_dir }}"
     file_type: any
     hidden: true
-    recurse: false
+    recurse: true
+    follow: false
   register: lumen_worker_secrets_inventory
   tags: precheck
   when:
     - enable_lumen | bool
     - lumen_runtime_enabled | bool
+    - enable_lumen_worker | bool
     - inventory_hostname in groups['lumen']
 
-- name: Precheck | Require only public CA and dedicated client material in worker mount
+- name: Precheck | Require only worker identity and enabled sandbox manifest copies
+  vars:
+    lumen_worker_expected_files: "{{ (lumen_runtime_precheck_result.stdout | from_json).worker_inventory.files | map('replace', '/etc/lumen/worker-precheck/', lumen_worker_secrets_dir ~ '/') | list }}"
+    lumen_worker_expected_directories: "{{ (lumen_runtime_precheck_result.stdout | from_json).worker_inventory.directories | map('replace', '/etc/lumen/worker-precheck/', lumen_worker_secrets_dir ~ '/') | list }}"
+    lumen_worker_expected_manifests: "{{ (lumen_runtime_precheck_result.stdout | from_json).worker_inventory.manifests | map('replace', '/etc/lumen/worker-precheck/', lumen_worker_secrets_dir ~ '/') | list }}"
   ansible.builtin.assert:
     that:
-      - (lumen_worker_secrets_inventory.files | map(attribute='path') | list | sort) == ([lumen_worker_secrets_dir ~ '/' ~ (lumen_runtime_config.tls.ca_file | basename), lumen_worker_secrets_dir ~ '/' ~ (lumen_runtime_config.tls.operator_client_cert_file | basename), lumen_worker_secrets_dir ~ '/' ~ (lumen_runtime_config.tls.operator_client_key_file | basename)] | sort)
+      - (lumen_worker_secrets_inventory.files | map(attribute='path') | list | sort) == ((lumen_worker_expected_files + lumen_worker_expected_directories) | sort)
       - (lumen_worker_secrets_inventory.files | map(attribute='uid') | unique | list) == [0]
       - (lumen_worker_secrets_inventory.files | map(attribute='gid') | unique | list) == [0]
-      - (lumen_worker_secrets_inventory.files | selectattr('isreg') | list | length) == 3
-      - (lumen_worker_secrets_inventory.files | selectattr('mode', 'in', ['0440', '0640', '0444', '0644']) | list | length) == 3
-      - (lumen_worker_secrets_inventory.files | selectattr('path', 'equalto', lumen_worker_secrets_dir ~ '/' ~ (lumen_runtime_config.tls.operator_client_key_file | basename)) | map(attribute='mode') | first) in ['0440', '0640']
-    fail_msg: "runtime_worker_mount_material: worker TLS mount must contain only regular, root:root public CA and client cert/key; client key must be group-readable without world access"
+      - (lumen_worker_secrets_inventory.files | selectattr('islnk') | list | length) == 0
+      - (lumen_worker_secrets_inventory.files | selectattr('isreg') | map(attribute='path') | list | sort) == (lumen_worker_expected_files | sort)
+      - (lumen_worker_secrets_inventory.files | selectattr('isdir') | map(attribute='path') | list | sort) == (lumen_worker_expected_directories | sort)
+      - (lumen_worker_secrets_inventory.files | selectattr('isdir') | rejectattr('mode', 'equalto', '0750') | list | length) == 0
+      - (lumen_worker_secrets_inventory.files | selectattr('isreg') | rejectattr('mode', 'in', ['0440', '0640', '0444', '0644']) | list | length) == 0
+      - (lumen_worker_secrets_inventory.files | selectattr('path', 'in', lumen_worker_expected_manifests) | rejectattr('mode', 'in', ['0444', '0644']) | list | length) == 0
+      - (lumen_worker_secrets_inventory.files | selectattr('path', 'equalto', lumen_worker_secrets_dir ~ '/' ~ (lumen_runtime_config.tls.worker_client_key_file | basename)) | map(attribute='mode') | first) in ['0440', '0640']
+    fail_msg: "runtime_worker_mount_material: require only root:root worker CA and fixed-worker cert/key, enabled Kubernetes manifest copies (0444/0644), and their exact ancestor directories (0750); no symlinks or controller private material"
   tags: precheck
   when:
     - enable_lumen | bool
     - lumen_runtime_enabled | bool
+    - enable_lumen_worker | bool
     - inventory_hostname in groups['lumen']

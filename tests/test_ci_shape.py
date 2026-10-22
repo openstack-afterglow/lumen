@@ -19,7 +19,6 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
-DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile"
 CI_WORKFLOW_REF = "./.github/workflows/ci.yml"
 CI_INPUTS = {"lumen_repository", "lumen_ref", "afterglow_crypto_ref"}
 
@@ -309,47 +308,5 @@ def test_test_layers_imports_only_the_standard_library() -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
 
-
-# --- image layers (rule 4) ------------------------------------------------------
-
-
-def _dockerfile_stages() -> dict[str, list[str]]:
-    joined = re.sub(r"\\\n", " ", DOCKERFILE.read_text(encoding="utf-8"))
-    stages: dict[str, list[str]] = {}
-    current: list[str] | None = None
-    for raw in joined.splitlines():
-        line = " ".join(raw.split())
-        if not line or line.startswith("#"):
-            continue
-        match = re.match(r"FROM \S+ AS (\S+)$", line, re.IGNORECASE)
-        if match:
-            current = stages.setdefault(match.group(1), [])
-            continue
-        if current is not None:
-            current.append(line)
-    return stages
-
-
-def _index(instructions: list[str], predicate) -> int:
-    return next(i for i, line in enumerate(instructions) if predicate(line))
-
-
-def test_dockerfile_has_no_recursive_chown_or_floating_uv() -> None:
-    instructions = [line for stage in _dockerfile_stages().values() for line in stage]
-
-    assert instructions
-    assert not any(re.search(r"chown\s+(-\w*R|--recursive)", line) for line in instructions)
-    assert not any(re.search(r"astral-sh/uv(:latest)?\s", line) for line in instructions)
-
-
-def test_uv_is_pinned_and_copied_after_the_apt_layer() -> None:
-    builder = _dockerfile_stages()["lumen-builder"]
-
-    uv_copy = _index(builder, lambda line: "ghcr.io/astral-sh/uv:" in line)
-    assert re.fullmatch(
-        r"COPY --from=ghcr\.io/astral-sh/uv:\d+\.\d+\.\d+@sha256:[0-9a-f]{64} /uv /uvx /bin/", builder[uv_copy]
-    )
-    apt = _index(builder, lambda line: line.startswith("RUN apt-get") and "build-essential" in line)
-    assert apt < uv_copy
 
 

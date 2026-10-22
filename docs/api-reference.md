@@ -6,6 +6,8 @@
 
 Keystone token/API key 모두 fresh enabled owner/project, exact global native assignments와 service-local oslo.policy action을 요구한다. `lumen_reader/user/editor/admin` 단독 grade는 registered defaults에서 허용하며 service edge와 member/reader co-role은 필요 없다. Native role list를 leaf로 합성하지 않는다. API key는 `X-API-Key: sk-afgl-...` 또는 Bearer로 전송하고 stored scope가 추가 ceiling이다. Compat text/model route는 API key 전용이다. Original token/scope, foreign target와 downstream credential 경계는 policy override와 독립적이다.
 
+Compat text/model routes (`/v1/models`, `/v1/cli/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`) reject Keystone tokens with 401. Multiple credentials are400 except identical API-key values in `X-API-Key` and Bearer. Key `X-Project-Id` must match its owner project. `X-Lumen-Provider` selects the configured `api_provider`; conflict with body `provider` is400, and transport prefixes are not selector aliases.
+
 Native project action은 registered policy가 current native roles를 평가한다. Verified human raw `system:all` global admin은 기본 alternative이지만 모든 admin route는 별도로 verified system authority와 `system:admin` policy를 요구한다. Project `admin` 및 `lumen_admin`은 system identity가 아니다. Caller original `X-Auth-Token`/Bearer와 connection scope의 `X-Project-Id`를 유지하며 다른 logical target은 verified human만 `X-Target-Project-Id`로 선택한다. Key는 foreign project/target/admin route를 사용할 수 없고 user/project ownership과 provider prerequisites는 유지한다.
 
 Original human source가 system/unscoped이고 home project가 없다면 `X-Project-Id`를 생략하고 explicit `X-Target-Project-Id`를 보낸다. Current raw direct/group/inferred system admin과 enabled native identities/domains를 검증한다. Projectless nonadmin 또는 explicit target 없는 요청은 거부한다. Empty original connection project와 actual system/unscoped source를 보존하며 logical target/ambient credentials로 보충하지 않는다.
@@ -25,7 +27,7 @@ Authenticated `GET /v1/policy/capabilities` has no service-entitlement prerequis
 
 | Surface | API-key scope | Keystone only |
 | --- | --- | --- |
-| `GET /v1/models`, `/v1/chat/models`, `/v1/capabilities` | `models:read` | 아니오 |
+| `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities` | `models:read` | 아니오 |
 | `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` | `compat:completions:write` | 아니오 |
 | conversations read/write | `native:conversations:read` / `native:conversations:write` | 아니오 |
 | native run read/write | `native:runs:read` / `native:runs:write` | 아니오 |
@@ -42,7 +44,7 @@ Authenticated `GET /v1/policy/capabilities` has no service-entitlement prerequis
 | `/v1/api-keys` / owner limits / revoke | internal route actions `native:keys:read|write|delete` (not issuable key scopes) | 예 |
 | `/v1/admin/*` | human verified raw direct/group/inferred system `admin`, not reduced token or tenant/domain admin | 예 |
 
-Scope는 current owner leaf와 교집합으로만 사용할 수 있다. 발급은 `lumen-keys_editor`와 requested scope 전체의 subset을 요구하며 default `models:read, compat:completions:write`도 자동 확대되지 않는다. Reader는 inventory/history, chat-user는 text generation, images-user는 image generation, audio-user는 finite/realtime audio, tools-user는 tool/skill/agent/provider search execution을 각각 허용한다. Config는 assets/agents/MCP/keys editor leaf, history/memory write/delete는 history-editor, resource/file/asset/extension/agent/key destruction은 resources-admin으로 분리된다. 실제 mapping은 `lumen/service_authority.py`의 단일 `SCOPE_CAPABILITIES`를 따른다. Nonreader action은 effective native `member`도 필요하며 `reader` baseline은 read-only다.
+Stored key scopes are an additional ceiling on current owner policy actions. Issuance requires `native:keys:write` and every requested action within the fresh owner/caller subset; default `models:read, compat:completions:write` is not an implicit expansion. Leaf/editor names below describe registered defaults and UI projections, not separate hardcoded prerequisites. The same action policy accepts configured native service grades, explicit leaves, project admin or verified system alternatives while preserving credential, ownership and system boundaries; native member/reader co-roles are not required.
 
 API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만 별도 media route는 해당 media action으로 실행한다. `memory=true`는 memory read만 요구하며 automatic extraction에 history-editor를 재요구하지 않는다. Client function schemas(`tool_choice="none"` 포함), managed/stored/plugin/skill/MCP/agent 및 intrinsic model search는 independent `native:tools:execute`를 요구한다. Agent selection은 `native:agents:use`를, generated output modalities는 matching image/audio scope를 추가한다. Missing action은 403, revoked/no-effective-scope key는 401, current directory unavailable은 503이다. 이미 시작한 provider I/O의 회수/checkpoint replay/정산은 보존한다.
 
@@ -53,7 +55,7 @@ API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만
 | 그룹 | Route |
 | --- | --- |
 | Discovery/health | `GET /`, `/v1/` (both advertise `rel=models` for `/v1/models`), `/v1/health`, `/v1/ready`, compat `GET /v1/compat` |
-| Compat | `GET /v1/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` |
+| Compat | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` |
 | Legacy Lumen device gateway | `/.well-known/oauth-authorization-server`, `/oauth/device/code`, `/oauth/token`, `/v1/managed-settings`, `/v1/models`, `/v1/messages`, `/v1/messages/count_tokens` under the configured `/v1/claude-gateway` base; not the current Claude Apps Gateway protocol |
 | Conversations | `POST/GET /v1/conversations`, `GET/DELETE /v1/conversations/{id}`, projected message pages/search/fork/workspace/active-leaf, completion/regenerate/retry/runs subroutes |
 | Native runs/children | `POST /v1/temp-completions`; `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/events`, `/v1/runs/{id}/children`, `/v1/temp-threads/{id}`; approval/interaction/cancel POST routes |
@@ -189,6 +191,18 @@ NVIDIA NIM provider를 `name="NVIDIA"`, `api_provider="nvidia"`로 바꿔도 `pr
 
 Provider→model ID 순서 잠금과 기존 provider 전체 active-run fence 아래 현재 목록을 대조한 뒤 한 transaction에서 바뀐 rank만 `0..N-1`로 정규화한다. 성공은 body 없는 `204`, `Cache-Control: no-store`다. 오래된 expected 순서·누락/추가/다른 provider ID 등 membership 충돌과 nonterminal run 사용은 `409`, provider 부재는 `404`, 입력 schema 위반은 `422`, 저장소 장애는 `503`이다. 충돌 시 부분 저장하지 않으며 클라이언트는 전체 관리자 목록을 다시 조회해야 한다. 가격·metadata·credential·활성/title/memory flag·timestamp 및 frozen route hash는 보존하고 기존 scalar sort_order PATCH는 유지한다.
 
+### Coding CLI catalog와 exact route ID
+
+`GET /v1/cli/models`는 coding CLI installer용 catalog다. API key만 허용하고(`models:read`, Keystone token 401, scope 누락 403) 다른 compat route처럼 `chat_api_hosts` 밖에서는 404다. 성공과 저장소 장애 응답 모두 `Cache-Control: no-store`다. 활성 provider의 활성 `model_kind="text"` 모델만 `(provider_sort_order, provider_id, sort_order, id)` 순으로 `{"models":[...]}`에 담는다. 저장소 장애는 빈 200이 아니라 503 OpenAI 오류다. 기존 `GET /v1/models` 응답은 바뀌지 않는다.
+
+각 행은 `id`(`lumen/<provider_id>/<model_id>` route token), `api_model_name`(공개 model ID), `display_name`, `provider`(`api_provider` 선택자), `provider_name`(표시 이름), `provider_type`(transport), `protocols`(`messages`/`responses`의 부분집합), `usable`, `disabled_reason`, `capabilities`, `input_price_per_million`·`output_price_per_million`(USD/1M token의 정확한 Decimal 문자열 또는 `null`)이다. `capabilities`는 effective capability에서 `context_limit`, `max_output_tokens`, `input_modalities`, `output_modalities`, `function_calling`, `tool_call`, `parallel_function_calling`, `reasoning`, `reasoning_options`, `vision`, `streaming` 중 서버가 가진 key만 그대로 복사하고 없는 값을 만들지 않는다. 카탈로그에 없는 모델의 `function_calling=false`는 LiteLLM probe 결과일 수 있으므로 선택 가능 여부는 `usable`과 `protocols`로 판단한다. API base, credential, 내부 route key는 응답에 없고 credential은 복호화하지 않는다.
+
+API-key route는 LiteLLM adapter로 `messages`/`responses`를 지원하되 custom OpenAI-compatible `api_base`는 native Responses endpoint가 확인되지 않으므로 catalog에서 `['messages']`만 광고한다. OpenAI 공식 direct base(없음 또는 `https://api.openai.com[/v1]`, trailing slash 허용)는 `['messages','responses']`다. 이 보수적 catalog 제한은 기존 `/v1/responses`나 Batch Responses transport를 변경하지 않으며 custom base의 native Responses 호출을 Chat Completions로 강제 변환하거나 retry/probe하지 않는다. Claude 구독(`anthropic_subscription`)은 `['messages']`만 광고하고 ChatGPT device 구독은 두 endpoint 모두 지원하지 않는다. 사용할 수 없는 행은 `usable=false`, `protocols=[]`이고 첫 번째 해당 사유를 `disabled_reason`에 넣는다: `subscription_protocol_unsupported`, `provider_credentials_missing`(API-key route에 key도 운영자 지정 API base도 없음, 구독은 저장 credential이 없거나 Claude 구독 만료 시각이 지남), `pricing_unavailable`(effective input/output 가격 중 하나 없음), `text_unavailable`(effective text gate가 비활성, `streaming=false`, 또는 비어 있지 않은 `input_modalities`/`output_modalities` 목록에 `text`가 없음), `tools_disabled`(저장된 override/models.dev `tool_call`/`function_calling=false`만 해당). Modality 목록이 없거나 `null`/빈 목록이면 unknown 그대로이며 이름으로 종류를 추론하거나 사용 불가로 바꾸지 않는다. Route token은 서버의 role preference가 아니며 migration도 추가하지 않는다.
+
+호환 resolver(`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, Batch 항목)는 canonical token(앞자리 0 없는 `1..9223372036854775807` 정수 두 개)을 받으면 해당 provider/model 한 쌍만 조회한다. Provider·model이 모두 활성이고 model이 그 provider에 속하며 요청 kind와 같아야 한다. 함께 보낸 `provider`/`X-Lumen-Provider`, provider id, transport 제한도 그대로 적용한다. 하나라도 맞지 않으면 404이며, 이름·rank나 같은 이름의 다른 route로 대체하지 않는다. 실행·과금·frozen fingerprint는 해석된 실제 `model_name`과 provider credential을 쓰고 credential은 서버에 남는다. Canonical 형식이 아닌 `lumen/...` 문자열은 일반 공개 ID로 해석하며 일반 공개 ID의 ambiguity 409 계약은 그대로다. 관리자가 canonical token 형식의 이름으로 등록한 모델은 공개 ID로 호출할 수 없다. Legacy gateway도 같은 resolver를 쓰지만 model은 서버의 `configured_route()` 설정이며 client가 임의 token을 선택하는 surface는 아니다.
+
+구독 transport가 지원하지 않는 protocol 요청(Claude 구독의 Responses, ChatGPT device의 Messages)은 provider 호출 전에 400 `invalid_request_error`로 거부한다. 이전에는 이 안전 오류 code(`subscription_protocol_unsupported`)가 등록되지 않아 502로 바뀌었다. `count_tokens`는 route token에서도 direct Anthropic API-key route만 Anthropic의 authoritative count endpoint를 호출한다. 다른 provider와 구독 route는 추정값 대신 501 `token_count_unavailable`이다.
+
 ## Provider credential 상태
 
 `GET /v1/chat/models`의 각 모델은 공개 `api_model_name`/`api_provider`, 운영용 내부 `model_name`, secret 없는 `provider_api_key_configured`, admission과 같은 규칙으로 계산한 `reasoning_none_supported`(명시 `reasoning_effort="none"` 허용 여부)를 반환한다. 클라이언트는 공개 필드만 SDK의 `model`/`provider`로 사용한다. `provider_api_key_configured=true`는 암호화 DB key 또는 `api_key_env`가 가리키는 비어 있지 않은 환경 변수 중 하나가 현재 API process에 있음을 뜻한다. `false`는 Lumen에 명시적 provider API key가 없다는 뜻이며 provider 도달 가능성이나 keyless provider의 실행 가능성까지 판정하지는 않는다.
@@ -245,7 +259,7 @@ Managed advisor cache 단가도 같은 manual→direct catalog→text write casc
 
 ## API 키와 월·주간 사용 한도
 
-API 키 발급·목록·이름·owner 한도 관리는 Keystone-only이며 current `lumen-keys_editor` 또는 verified system admin이 필요하다. Requested scope는 current owner action의 subset이어야 하며 기본값도 예외가 아니다. `DELETE /v1/api-keys/{key_id}`는 current `lumen-resources_admin` 또는 verified system admin과 ownership을 요구하고 row/ledger를 삭제하지 않고 revoke한다. API-key credential로 key management를 호출하면 401이다. `/v1/admin/api-keys*`는 verified effective system admin만 허용한다. Local seed는 실제 owner ID/directory credential을 필요로 하고 owned stale key rotation에도 delete action을 검사한다.
+API 키 발급·목록·이름·owner 한도 관리는 Keystone-only이며 current `lumen-keys_editor` 또는 verified system admin이 필요하다. Requested scope는 current owner action의 subset이어야 하며 기본값도 예외가 아니다. `DELETE /v1/api-keys/{key_id}`는 current `lumen-resources_admin` 또는 verified system admin과 ownership을 요구하고 row/ledger를 삭제하지 않고 revoke한다. API-key credential로 key management를 호출하면 401이다. `/v1/admin/api-keys*`는 raw direct/current-group system assignment(`effective=True` 미사용)를 현재 검증된 role-ID DAG로 확인한 human system admin만 허용한다. Local seed는 실제 owner ID/directory credential을 필요로 하고 owned stale key rotation에도 delete action을 검사한다.
 
 ### API 키 관리 route
 

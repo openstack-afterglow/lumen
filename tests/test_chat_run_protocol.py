@@ -1165,3 +1165,96 @@ async def test_durable_journal_debug_log_is_post_commit_and_metadata_only(monkey
     ]
     assert "private prompt and bind value" not in caplog.text
     assert "secret field" not in caplog.text
+
+
+
+@pytest.mark.parametrize(("path", "status", "assigned"), [
+    ("cancel", "awaiting_input", True),
+    ("cancel", "queued", True),
+    ("cancel", "waiting_resource", True),
+    ("fail", "queued", True),
+    ("fail", "waiting_resource", True),
+    ("cancel", "awaiting_input", False),
+])
+async def test_ordinary_chat_terminal_paths_settle_assigned_sandbox_before_release(
+    monkeypatch, path, status, assigned,
+):
+    from unittest.mock import AsyncMock
+
+    from lumen.services.durable_runs import budgets, lifecycle
+    from lumen.services.infrastructure import store as infra_store
+
+    run = ChatRun(
+        id="ordinary-mcp-chat", project_id="project", user_id="user", execution_mode="chat",
+        execution_protocol_version=2, run_kind="completion", parent_run_id=None,
+        assigned_resource_id="sandbox" if assigned else None, credit_ceiling=None,
+        status=status, cancel_requested_at=None, conversation_id=None, temp_thread_id=None,
+        capability_snapshot={}, last_seq=0,
+    )
+    quota = object()
+    calls = []
+    events = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def begin(self):
+            return self
+
+        async def execute(self, query):
+            identity = run if query.column_descriptions[0]["name"] == "ChatRun" else None
+            return SimpleNamespace(scalar_one_or_none=lambda: identity, scalars=lambda: [])
+
+    async def lock_quota(_session, project_id, *, order):
+        assert project_id == "project"
+        order.take("quota")
+        return quota
+
+    async def lock_run(_session, run_id, *, order, lock_class):
+        assert run_id == run.id
+        order.take(lock_class)
+        return run
+
+    async def settle(_session, *, quota: object, root, order):
+        assert quota is not None and root is run
+        calls.append("settle_sandbox")
+
+    async def close(_session, *, quota: object, root, order):
+        assert quota is not None and root.credit_ceiling is None
+        calls.append("close_budget")
+
+    async def release(_session, *, run_id, order):
+        assert run_id == run.id
+        order.take("resource")
+        calls.append("release_sandbox")
+
+    async def append(_session, _run, event):
+        events.append(event)
+        run.last_seq = event.seq
+
+    monkeypatch.setattr(lifecycle, "_factory", lambda: lambda: Session())
+    monkeypatch.setattr(lifecycle, "load_owned_run", AsyncMock(return_value=run))
+    monkeypatch.setattr(lifecycle, "append_event", append)
+    monkeypatch.setattr(budgets, "lock_project_quota", lock_quota)
+    monkeypatch.setattr(budgets, "lock_run", lock_run)
+    monkeypatch.setattr(budgets, "settle_root_sandbox", settle)
+    monkeypatch.setattr(budgets, "close_root_budget", close)
+    monkeypatch.setattr(infra_store, "release_sandbox_intent", release)
+    monkeypatch.setattr(execution, "_cancel_streaming_assistant_message", AsyncMock(return_value=None))
+
+    if path == "cancel":
+        response = await lifecycle.request_cancelled(run_id=run.id, project_id="project", user_id="user")
+        assert response.terminal and response.status == "canceled"
+        assert events[-1].type == "run.canceled"
+        await lifecycle.request_cancelled(run_id=run.id, project_id="project", user_id="user")
+    else:
+        assert await lifecycle.fail_waiting_run(run.id, error_code="sandbox_unavailable", safe_message="Unavailable")
+        assert events[-1].type == "run.failed"
+        assert not await lifecycle.fail_waiting_run(run.id, error_code="sandbox_unavailable", safe_message="Unavailable")
+
+    assert calls == (["settle_sandbox", "close_budget", "release_sandbox"] if assigned else [])
+    assert run.credit_ceiling is None

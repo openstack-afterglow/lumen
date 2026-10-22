@@ -23,7 +23,7 @@ from lumen.services import worker_routing
 from lumen.services.durable_runs import budgets, children, lifecycle
 from lumen.services.durable_runs.errors import DurableRunError
 from lumen.services.infrastructure import store
-from lumen.services.run_store import claim_queued_run, replay_events
+from lumen.services.run_store import append_event, claim_queued_run, replay_events
 
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
@@ -45,7 +45,18 @@ async def _claim_as_fixed_worker(factory, run_id: str, identity: str) -> str | N
 
 
 @pytest.fixture
-async def family():
+async def family(request):
+    if hasattr(request, "param"):
+        from sqlalchemy import event
+        from sqlalchemy.pool import Pool
+
+        def pin_isolation(connection, _record):
+            cursor = connection.cursor()
+            cursor.execute(f"SET SESSION innodb_snapshot_isolation={request.param}")
+            cursor.close()
+
+        event.listen(Pool, "connect", pin_isolation)
+        request.addfinalizer(lambda: event.remove(Pool, "connect", pin_isolation))
     init_db(os.environ["DATABASE_URL"], pool_size=3, max_overflow=1)
     factory = get_session_factory()
     assert factory is not None
@@ -276,6 +287,60 @@ async def test_child_credit_overrun_blocks_child_and_parent_without_recharging_r
         assert reservation.actual_credits == Decimal("1.2")
         assert (await session.get(ChatProjectAgentQuota, project)).credits_reserved == Decimal("3.2")
         assert (await session.get(ChatRun, root_id)).reserved_credits == Decimal("1.2")
+
+
+@pytest.mark.parametrize("family", ["ON", "OFF"], indirect=True)
+@pytest.mark.parametrize("target", ["root", "child"])
+async def test_bounded_call_settlement_survives_concurrent_delta(family, monkeypatch, target):
+    from lumen.models.chat_runs import ChatRunSegment
+    from lumen.services import provider_metadata
+    from lumen.services.durable_runs.execution import _DurableExecutionHooks, _event
+
+    factory, _project, _user, root_id, _group, child_ids, owner = family
+    run_id = root_id if target == "root" else child_ids[0]
+    async with factory() as session, session.begin():
+        run = await session.get(ChatRun, run_id)
+        run.pricing_snapshot = {
+            "input_price_per_token": "0.01", "output_price_per_token": "0",
+            "margin_multiplier": "1", "chat_credit_per_usd": "1", "component_prices": {},
+        }
+        run.capability_snapshot = {"capabilities": {"context_limit": 1}}
+        run.status = "running"
+        run.lease_owner = owner
+        run.lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+        (await session.get(ChatRun, root_id)).credit_ceiling = Decimal("3")
+    monkeypatch.setattr(provider_metadata, "count_context_tokens",
+                        lambda *_args: provider_metadata.ContextTokenCount(tokens=1, measurement="tokenizer"))
+    hooks = _DurableExecutionHooks(run_id=run_id, owner=owner, credit_bounded=True)
+    call = {"round_index": 0, "attempt": 1, "messages": [{"role": "user", "content": "hi"}],
+            "tool_schemas": [], "max_tokens": 1}
+    assert await hooks.provider_started(**call) is None
+    lock_run = budgets.lock_run
+    interleaved = []
+
+    async def commit_delta_then_lock(session, locked_id, **kwargs):
+        if locked_id == run_id and not interleaved:
+            async with factory() as rival, rival.begin():
+                row = await rival.get(ChatRun, run_id, with_for_update=True)
+                await append_event(rival, row, _event(row, "part.delta", {
+                    "message_id": f"temp:{run_id}:assistant:0", "part_index": 0,
+                    "part_type": "text", "delta": "concurrent text",
+                }))
+            interleaved.append(run_id)
+        return await lock_run(session, locked_id, **kwargs)
+
+    monkeypatch.setattr(budgets, "lock_run", commit_delta_then_lock)
+    result = {"text": "settled response", "usage": {"prompt_tokens": 2, "completion_tokens": 0}}
+    await hooks.provider_completed(round_index=0, attempt=1, usage=result["usage"], result_payload=result)
+    replay = await hooks.provider_started(**call)
+    assert replay["_durable_replay"] is True and replay["text"] == "settled response"
+    assert interleaved == [run_id]
+    async with factory() as session:
+        segment = await session.get(ChatRunSegment, (run_id, "provider:0:1"))
+        reservation = await session.get(ChatModelCallReservation, (run_id, "provider:0:1"))
+        assert segment.status == "completed"
+        assert (reservation.status, reservation.actual_credits) == ("settled", Decimal("0.02"))
+        assert (await session.get(ChatRun, run_id)).reserved_credits == Decimal("0.02")
 
 
 async def test_zero_price_provider_call_keeps_fence_without_credit_headroom(family, monkeypatch):

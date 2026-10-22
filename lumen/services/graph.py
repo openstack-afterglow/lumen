@@ -569,6 +569,27 @@ def _build_graph(params: dict, ctx: ToolContext):
                 return binding.definition.source, binding.definition.activity_category
         return await selection.context_tool_activity_metadata(tool_name, ctx)
 
+    async def restore_deferred_bindings() -> None:
+        # Approval and tool nodes can resume without another provider turn.
+        v2_bindings = params.get("v2_bindings")
+        if isinstance(ctx.binding_session, contracts.ToolBindingSession) and not ctx.binding_session.loaded_names:
+            restored = await boundary("loaded_tool_names")
+            if isinstance(restored, list) and all(isinstance(name, str) for name in restored):
+                if isinstance(v2_bindings, dict):
+                    await bindings.restore_v2_deferred_bindings(
+                        ctx,
+                        v2_bindings,
+                        restored,
+                        include_managed=True,
+                    )
+                else:
+                    await bindings.restore_v2_deferred_bindings(
+                        ctx,
+                        ctx.binding_session.legacy_bindings,
+                        restored,
+                        include_managed=False,
+                    )
+
     async def call_model(state: ChatState) -> dict:
         round_index = int(state.get("loop_count", 0))
         writer = turn_writer(round_index)
@@ -594,23 +615,7 @@ def _build_graph(params: dict, ctx: ToolContext):
 
         messages = list(state["messages"])
         v2_bindings = params.get("v2_bindings")
-        if isinstance(ctx.binding_session, contracts.ToolBindingSession) and not ctx.binding_session.loaded_names:
-            restored = await boundary("loaded_tool_names")
-            if isinstance(restored, list) and all(isinstance(name, str) for name in restored):
-                if isinstance(v2_bindings, dict):
-                    await bindings.restore_v2_deferred_bindings(
-                        ctx,
-                        v2_bindings,
-                        restored,
-                        include_managed=True,
-                    )
-                else:
-                    await bindings.restore_v2_deferred_bindings(
-                        ctx,
-                        ctx.binding_session.legacy_bindings,
-                        restored,
-                        include_managed=False,
-                    )
+        await restore_deferred_bindings()
         schemas = (
             _v2_tool_schemas(v2_bindings)
             if isinstance(v2_bindings, dict)
@@ -937,6 +942,7 @@ def _build_graph(params: dict, ctx: ToolContext):
         return {"classified_tool_calls": classified}
 
     async def await_input(state: ChatState) -> dict:
+        await restore_deferred_bindings()
         bindings = params.get("v2_bindings")
         if not isinstance(bindings, dict):
             return {}
@@ -1018,6 +1024,8 @@ def _build_graph(params: dict, ctx: ToolContext):
             if item.get("policy_limited") is True or item.get("effect_denied") is True:
                 continue
             if item.get("requires_approval") is not True:
+                # Reads in a gated batch still need their matching provider result.
+                approved.append(tool_call)
                 continue
             call_id = _v2_tool_call_id(tool_call)
             if decision_by_call.get(call_id) == "approve":
@@ -1047,6 +1055,7 @@ def _build_graph(params: dict, ctx: ToolContext):
         return "finalize"
 
     async def execute_tools(state: ChatState) -> dict:
+        await restore_deferred_bindings()
         round_index = int(state.get("loop_count", 0))
         writer = turn_writer(round_index)
         messages = list(state["messages"])
@@ -1054,7 +1063,7 @@ def _build_graph(params: dict, ctx: ToolContext):
         denied_tool_calls = state.get("denied_tool_calls", [])
         effect_denied_tool_calls = state.get("effect_denied_tool_calls", [])
         policy_limited_tool_calls = state.get("policy_limited_tool_calls", [])
-        delegation_enabled = bool(params.get("delegation_enabled"))
+        delegation_enabled = ctx.tools_enabled and bool(params.get("delegation_enabled"))
         delegation_calls = [
             tool_call
             for tool_call in approved_tool_calls
@@ -1458,6 +1467,8 @@ def _build_graph(params: dict, ctx: ToolContext):
         if calls:
             segment_id = f"delegation:{round_index}"
             try:
+                if not ctx.tools_enabled or not params.get("delegation_enabled"):
+                    raise child_runs.ChildFailure("tool_not_allowed", "agent delegation is disabled")
                 group = await boundary("delegations_prepared", segment_id=segment_id, calls=calls)
             except child_runs.ChildFailure as exc:
                 # The whole group is refused before any child exists; every call fails identically.
@@ -1611,9 +1622,9 @@ async def pending_interrupt(run_id: str) -> dict[str, Any] | None:
     """
     if not chat_checkpointer.available:
         return None
-    compiled = StateGraph(ChatState).add_node("noop", lambda state: state).set_entry_point("noop").compile(
-        checkpointer=chat_checkpointer.saver
-    )
+    # LangGraph derives pending tasks and interrupts from graph topology. Inspect
+    # with the executed graph; compilation and state reads never run its nodes.
+    compiled = _build_graph({}, None)
     snapshot = await compiled.aget_state({"configurable": {"thread_id": run_id}})
     checkpoint_id = (snapshot.config or {}).get("configurable", {}).get("checkpoint_id") if snapshot else None
     for task in getattr(snapshot, "tasks", ()) or ():
@@ -1685,7 +1696,7 @@ async def stream(
         "max_tool_calls": max_tool_calls,
         "allowed_direct_effects": frozenset(allowed_direct_effects) if allowed_direct_effects is not None else None,
         "native_web_search": native_web_search,
-        "delegation_enabled": delegation_enabled,
+        "delegation_enabled": tools_enabled and delegation_enabled,
     }
     ctx = ToolContext(
         project_id=project_id,
@@ -1717,16 +1728,38 @@ async def stream(
                 params["v2_bindings"],
                 include_managed=True,
             )
-        if delegation_enabled:
+        if tools_enabled and delegation_enabled:
             delegate = _delegate_binding()
             params["v2_bindings"][delegate.definition.name] = delegate
-        if sandbox_lease is not None and "process" in (params["allowed_direct_effects"] or frozenset()):
-            # Only runs with an assigned ready sandbox AND process authority expose run_code;
-            # read-only children keep their sandbox allocation but never this binding.
+        if tools_enabled and sandbox_lease is not None:
             from lumen.services import sandbox_binding
 
-            run_code = sandbox_binding.run_code_binding(ctx, lease_owner=sandbox_lease[0], fence=sandbox_lease[1])
-            params["v2_bindings"][run_code.definition.name] = run_code
+            if "process" in (params["allowed_direct_effects"] or frozenset()):
+                # A worker lease permits lazy MCP allocation, not code execution: only
+                # an assigned ready Nova resource implements the run_code endpoint.
+                target = await sandbox_binding.assigned_sandbox(run_id) if run_id else None
+                if target is not None and target.backend == "nova":
+                    run_code = sandbox_binding.run_code_binding(ctx, lease_owner=sandbox_lease[0], fence=sandbox_lease[1])
+                    params["v2_bindings"][run_code.definition.name] = run_code
+
+            from lumen.config import get_settings
+            from lumen.services.infrastructure.tool_manifest import ToolManifestError, load_tool_manifest
+
+            for pool in get_settings().runtime_config.pools:
+                if pool.enabled and pool.role == "sandbox" and pool.backend == "kubernetes":
+                    profiles = load_tool_manifest(pool.profile.tool_manifest_file, pool.profile.tool_manifest_sha256)
+                    for profile in profiles:
+                        for definition in profile.tools:
+                            if definition.name in params["v2_bindings"]:
+                                raise ToolManifestError()
+                            params["v2_bindings"][definition.name] = sandbox_binding.kubernetes_mcp_binding(
+                                ctx,
+                                lease_owner=sandbox_lease[0],
+                                fence=sandbox_lease[1],
+                                profile_id=profile.id,
+                                tool_def=definition,
+                                pool_name=pool.name,
+                            )
     graph = _build_graph(params, ctx)
     config = {"configurable": {"thread_id": run_id}} if run_id else None
     graph_input: dict[str, list[dict]] | Command = (

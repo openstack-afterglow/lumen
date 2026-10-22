@@ -325,7 +325,6 @@ def test_native_sdk_selector_free_exchange_preserves_original_scope(native_direc
     else:
         assert "system" not in document
 
-
 async def test_native_sdk_non_admin_cannot_select_foreign_target(native_directory):
     with pytest.raises(HTTPException) as exc:
         await auth.require_token(
@@ -1564,3 +1563,27 @@ async def test_native_personal_explicit_invalid_domain_kind_is_not_absence(nativ
     native_directory.state.domains["personal"]["afterglow_domain_kind"] = kind
     current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
     assert not current.get("personal_project_owner")
+
+
+@pytest.mark.parametrize("admin", [False, True], ids=["native-read", "global-admin"])
+async def test_direct_system_grant_authorizes_http_without_promoting_project_admin(native_directory, admin):
+    app = FastAPI()
+    dependency = auth.require_admin if admin else auth.require_scopes("native:conversations:read")
+
+    @app.get("/authority")
+    async def authority(principal=Depends(dependency)):
+        return {"system_admin": principal["is_system_admin"], "project_id": principal["project_id"]}
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+        allowed = await client.get("/authority", headers={"X-Auth-Token": DIRECTORY_TOKEN,
+            "X-Project-Id": DIRECTORY_PROJECT_ID})
+        assert allowed.status_code == 200, allowed.text
+        assert allowed.json() == {"system_admin": True, "project_id": DIRECTORY_PROJECT_ID}
+        native_directory.configure({"owner_roles": ["admin", "member"]})
+        project_response = await client.get("/authority", headers={"X-Auth-Token": OWNER_TOKEN,
+            "X-Project-Id": PROJECT_ID})
+        if admin:
+            assert project_response.status_code == 403
+        else:
+            assert project_response.status_code == 200, project_response.text
+            assert project_response.json() == {"system_admin": False, "project_id": PROJECT_ID}

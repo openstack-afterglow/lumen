@@ -98,6 +98,7 @@ jobs:
         run: |
           uv pip install --python .venv/bin/python --reinstall-package afterglow-crypto --no-deps "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@${AFTERGLOW_CRYPTO_REF}"
       - run: uv run ruff check lumen tests
+      # The Kubernetes stdio runtime has its own sandbox package job below.
       - run: uv run pytest -m "not integration and not system" tests
 
   plugins:

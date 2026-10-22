@@ -1060,3 +1060,401 @@ async def test_known_boot_timeout_reclaim_requires_full_owned_observation(pool):
         assert deletes == ["owned-server"] and await store.occupancy(pool.id) == 0
     finally:
         c.executor.shutdown(wait=True)
+
+
+class _Assignment:
+    """Redis assignment seam; SQL fences, claims and row state stay real MariaDB."""
+
+    def __init__(self, pool_name, owner):
+        self.pool_name, self.assignments = pool_name, {pool_name: owner}
+
+    async def current(self):
+        return SimpleNamespace(assignments=dict(self.assignments))
+
+
+def _owned_labels(pool, resource_id, fingerprint):
+    return dict(lumen_deployment=pool.deployment_id, lumen_pool=pool.name, lumen_resource=resource_id,
+                lumen_generation="1", lumen_fingerprint=fingerprint, lumen_policy=pool.profile_digest)
+
+
+async def _operation(resource_id, action):
+    async with get_session_factory()() as session:
+        return await session.scalar(select(ChatResourceOperation).where(
+            ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.action == action))
+
+
+@pytest.mark.parametrize("gate", ["redis-assignment", "sql-fence"])
+async def test_pre_submit_gate_failure_returns_create_claim_for_one_later_submission(pool, monkeypatch, gate):
+    from lumen.services.infrastructure import controller as controller_module
+    from lumen.services.infrastructure.controller import PoolLeaseLost
+    from lumen.services.infrastructure.providers import Observation
+
+    current, fence = await store.claim_pool_lease(pool.id, "controller-a", 30)
+    guest = await store.request_resource(current, role="worker", request_fingerprint="u" * 64,
+        image_ref=current.image_ref, policy_digest=current.profile_digest,
+        deadline=datetime.now(UTC) + timedelta(minutes=10), owner="controller-a", fence=fence)
+    factory = get_session_factory()
+    creates = []
+
+    class Nova:
+        requires_delivery = True
+        def create(self, intent):
+            creates.append(intent.resource_id)
+            return Observation("owned-server", "BUILD", None, None,
+                               _owned_labels(pool, intent.resource_id, "u" * 64))
+
+    real_claim = store.claim_operation
+    successor = {}
+
+    async def claim_then_lose_gate(resource_id, generation, action, owner, fence_value):
+        operation = await real_claim(resource_id, generation, action, owner, fence_value)
+        async with factory() as session, session.begin():
+            row = await session.get(ChatRuntimeResource, resource_id)
+            # Simulates a pre-create token held only in this controller's memory.
+            row.bootstrap_token_hash = "f" * 64
+            row.bootstrap_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+            if gate == "sql-fence":
+                (await session.get(ChatRuntimePool, pool.id)).reconcile_lease_expires_at = (
+                    datetime.now(UTC) - timedelta(seconds=1))
+        if gate == "sql-fence":
+            successor["claim"] = await store.claim_pool_lease(pool.id, "controller-b", 30)
+        else:
+            a._coordinator.assignments[pool.name] = "controller-b"
+        return operation
+
+    a = ResourceController(_controller_config(), {}, owner="controller-a")
+    b = ResourceController(_controller_config(), {}, owner="controller-b")
+    a._coordinator = _Assignment(pool.name, "controller-a")
+    target = controller_module._POOL.set(pool.name)
+    policy = SimpleNamespace(name=pool.name)
+    try:
+        monkeypatch.setattr(store, "claim_operation", claim_then_lose_gate)
+        [row] = await a._resources(pool.id)
+        with pytest.raises(PoolLeaseLost):
+            await a._reconcile_create(row, policy, fence, Nova())
+        monkeypatch.setattr(store, "claim_operation", real_claim)
+        assert creates == []
+        operation = await _operation(guest.id, "create")
+        assert operation.request_status == "claimed" and operation.owner == store._UNCLAIMED
+        assert operation.attempts == 1 and operation.error_code == "not_submitted"
+        [row] = await a._resources(pool.id)
+        assert row.observed_state == "requested" and row.provider_id is None
+        assert row.bootstrap_token_hash is None and row.bootstrap_expires_at is None
+
+        if gate == "sql-fence":
+            _, retry_fence = successor["claim"]
+            retry = b
+        else:
+            a._coordinator.assignments[pool.name] = "controller-a"
+            retry_fence, retry = fence, a
+        await retry._reconcile_create(row, policy, retry_fence, Nova())
+        assert creates == [guest.id]
+        operation = await _operation(guest.id, "create")
+        assert operation.request_status == "succeeded" and operation.owner == retry.owner
+        [row] = await retry._resources(pool.id)
+        assert row.provider_id == "owned-server" and row.observed_state == "creating"
+        # The submitted create is one-shot: a further pass never resubmits it.
+        await retry._reconcile_create(row, policy, retry_fence, Nova())
+        assert creates == [guest.id]
+    finally:
+        controller_module._POOL.reset(target)
+        a.executor.shutdown(wait=True)
+        b.executor.shutdown(wait=True)
+
+
+async def test_create_exception_after_sdk_entry_stays_unknown_and_is_never_resubmitted(pool):
+    from lumen.services.infrastructure import controller as controller_module
+
+    current, fence = await store.claim_pool_lease(pool.id, "controller-a", 30)
+    guest = await store.request_resource(current, role="worker", request_fingerprint="v" * 64,
+        image_ref=current.image_ref, policy_digest=current.profile_digest,
+        deadline=datetime.now(UTC) + timedelta(minutes=10), owner="controller-a", fence=fence)
+    creates = []
+
+    class Nova:
+        requires_delivery = True
+        def create(self, intent):
+            creates.append(intent.resource_id)
+            raise TimeoutError("create response lost after submission")
+
+    c = ResourceController(_controller_config(), {}, owner="controller-a")
+    c._coordinator = _Assignment(pool.name, "controller-a")
+    target = controller_module._POOL.set(pool.name)
+    policy = SimpleNamespace(name=pool.name)
+    try:
+        [row] = await c._resources(pool.id)
+        with pytest.raises(TimeoutError):
+            await c._reconcile_create(row, policy, fence, Nova())
+        operation = await _operation(guest.id, "create")
+        assert creates == [guest.id]
+        assert operation.request_status == "unknown" and operation.owner == "controller-a"
+        assert operation.error_code is None
+        [row] = await c._resources(pool.id)
+        assert row.observed_state == "unknown"
+        await c._reconcile_create(row, policy, fence, Nova())
+        assert creates == [guest.id]
+        assert await store.occupancy(pool.id) == 1
+    finally:
+        controller_module._POOL.reset(target)
+        c.executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("submitted", [False, True], ids=["assignment-lost-before-sdk", "sdk-raised"])
+async def test_delete_gate_failure_stays_retryable_but_submitted_delete_is_not_repeated(pool, monkeypatch, submitted):
+    from lumen.services.infrastructure import controller as controller_module
+    from lumen.services.infrastructure.controller import PoolLeaseLost
+    from lumen.services.infrastructure.providers import DeleteResult, Observation
+
+    current, fence = await store.claim_pool_lease(pool.id, "controller-a", 30)
+    guest = await store.request_resource(current, role="worker", request_fingerprint="w" * 64,
+        image_ref=current.image_ref, policy_digest=current.profile_digest, deadline=None,
+        owner="controller-a", fence=fence)
+    factory = get_session_factory()
+    async with factory() as session, session.begin():
+        row = await session.get(ChatRuntimeResource, guest.id)
+        row.provider_id, row.observed_state = "owned-server", "booting"
+        (await session.scalar(select(ChatResourceOperation).where(
+            ChatResourceOperation.resource_id == guest.id, ChatResourceOperation.action == "create",
+        ))).request_status = "succeeded"
+    assert await store.request_delete(guest.id, "controller-a", fence) is not None
+    deletes, fail = [], {"delete": submitted}
+
+    class Nova:
+        def observe(self, ref):
+            return Observation(ref.provider_id, "ACTIVE", None, None, {})
+        def delete(self, ref):
+            deletes.append(ref.provider_id)
+            if fail["delete"]:
+                raise TimeoutError("delete response lost after submission")
+            return DeleteResult(absent=True)
+
+    c = ResourceController(_controller_config(), {}, owner="controller-a")
+    c._coordinator = _Assignment(pool.name, "controller-a")
+    real_claim = store.claim_operation
+
+    async def claim_then_lose_assignment(*args):
+        operation = await real_claim(*args)
+        c._coordinator.assignments[pool.name] = "controller-b"
+        return operation
+
+    target = controller_module._POOL.set(pool.name)
+    policy = SimpleNamespace(name=pool.name)
+    try:
+        [row] = await c._resources(pool.id)
+        if submitted:
+            with pytest.raises(TimeoutError):
+                await c._reconcile_delete(row, policy, fence, Nova())
+            operation = await _operation(guest.id, "delete")
+            assert operation.request_status == "unknown" and operation.owner == "controller-a"
+            fail["delete"] = False
+            # Ambiguous acceptance is observed, never re-sent; ACTIVE is not absence.
+            await c._reconcile_delete(row, policy, fence, Nova())
+            assert deletes == ["owned-server"] and await store.occupancy(pool.id) == 1
+            return
+        monkeypatch.setattr(store, "claim_operation", claim_then_lose_assignment)
+        with pytest.raises(PoolLeaseLost):
+            await c._reconcile_delete(row, policy, fence, Nova())
+        monkeypatch.setattr(store, "claim_operation", real_claim)
+        assert deletes == []
+        operation = await _operation(guest.id, "delete")
+        assert operation.request_status == "claimed" and operation.owner == store._UNCLAIMED
+        assert operation.attempts == 1 and operation.error_code == "not_submitted"
+        c._coordinator.assignments[pool.name] = "controller-a"
+        await c._reconcile_delete(row, policy, fence, Nova())
+        assert deletes == ["owned-server"] and await store.occupancy(pool.id) == 0
+    finally:
+        controller_module._POOL.reset(target)
+        c.executor.shutdown(wait=True)
+
+
+@pytest.fixture
+async def lazy_chat_sandbox(pool, monkeypatch):
+    from lumen.models.chat_infrastructure import ChatAgentReservation, ChatProjectAgentQuota
+    from lumen.services import sandbox_binding
+    from lumen.services.infrastructure.config import PoolConfig, ProjectQuotaDefaults
+
+    factory = get_session_factory()
+    definition = PoolConfig.model_validate_json(json.dumps({
+        "name": pool.name, "role": "sandbox", "backend": "kubernetes", "enabled": True,
+        "image": "registry.example/sandbox@sha256:" + "a" * 64, "architecture": "x86_64",
+        "min_replicas": 0, "max_replicas": 4,
+        "sandbox": {"workspace_bytes": 128 * 1024**2, "memory_bytes": 1024**3,
+                    "cpu_millis": 1000, "pids_limit": 256},
+        "profile": {"backend": "kubernetes", "cluster_profile_id": "cluster",
+                    "tool_manifest_file": "/test/tools.json", "tool_manifest_sha256": "b" * 64,
+                    "controller_ingress_cidrs": ["192.0.2.11/32"], "bootstrap_egress_cidrs": ["192.0.2.11/32"]},
+    }))
+    runtime = SimpleNamespace(
+        enabled=True, deployment_id=pool.deployment_id, pools=(definition,), pool=lambda _name: definition,
+        project_quota_defaults=ProjectQuotaDefaults(max_active_sandboxes=1, max_sandbox_seconds=3600),
+    )
+    settings = SimpleNamespace(runtime_config=runtime)
+    monkeypatch.setattr(sandbox_binding, "get_settings", lambda: settings)
+    monkeypatch.setattr("lumen.config.get_settings", lambda: settings)
+    async with factory() as session, session.begin():
+        row = await session.get(ChatRuntimePool, pool.id)
+        row.role, row.backend = "sandbox", "kubernetes"
+        row.cloud_profile_id, row.project_id = None, None
+        row.cluster_profile_id, row.namespace = "cluster", "runs"
+        row.image_ref, row.profile_digest = definition.image, definition.digest()
+    project = "lazy-it-" + uuid.uuid4().hex
+    run_ids = []
+
+    async def create_run(**values):
+        run_id = str(uuid.uuid4())
+        run_ids.append(run_id)
+        run = ChatRun(
+            id=run_id, run_scope="temp", run_kind="completion", execution_mode="chat",
+            project_id=project, user_id=project, model_name="fixture-model", capability_snapshot={}, pricing_snapshot={},
+            client_request_id=str(uuid.uuid4()), request_fingerprint=uuid.uuid4().hex,
+            fingerprint_version=1, execution_protocol_version=2, status="running",
+            lease_owner="worker#1", lease_fence=1, lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        for key, value in values.items():
+            setattr(run, key, value)
+        async with factory() as session, session.begin():
+            session.add(run)
+        return run_id
+
+    try:
+        yield SimpleNamespace(factory=factory, create_run=create_run, project=project, pool=definition)
+    finally:
+        async with factory() as session, session.begin():
+            resource_ids = list((await session.scalars(select(ChatRuntimeResource.id).where(
+                ChatRuntimeResource.run_id.in_(run_ids)
+            ))).all())
+            await session.execute(delete(ChatResourceOperation).where(ChatResourceOperation.resource_id.in_(resource_ids)))
+            await session.execute(delete(ChatRuntimeResource).where(ChatRuntimeResource.id.in_(resource_ids)))
+            await session.execute(delete(ChatAgentReservation).where(ChatAgentReservation.run_id.in_(run_ids)))
+            await session.execute(delete(ChatRunEventRow).where(ChatRunEventRow.run_id.in_(run_ids)))
+            for run_id in reversed(run_ids):
+                await session.execute(delete(ChatRun).where(ChatRun.id == run_id))
+            await session.execute(delete(ChatProjectAgentQuota).where(ChatProjectAgentQuota.project_id == project))
+
+
+@pytest.mark.parametrize("condition", ["canceled", "terminal", "lease_expired", "takeover", "root_canceled", "deadline"])
+async def test_lazy_allocation_rejects_stale_authority_before_mutation(lazy_chat_sandbox, condition):
+    from lumen.services.sandbox_binding import SandboxDispatchError, ensure_sandbox_for_run
+
+    f = lazy_chat_sandbox
+    fields = {}
+    if condition == "canceled":
+        fields["cancel_requested_at"] = datetime.now(UTC)
+    elif condition == "terminal":
+        fields["status"] = "completed"
+    elif condition == "lease_expired":
+        fields["lease_expires_at"] = datetime.now(UTC) - timedelta(seconds=1)
+    elif condition == "takeover":
+        fields.update(lease_owner="worker#2", lease_fence=2)
+    elif condition == "root_canceled":
+        root_id = await f.create_run(cancel_requested_at=datetime.now(UTC))
+        fields.update(root_run_id=root_id, parent_run_id=root_id)
+    else:
+        fields["deadline_at"] = datetime.now(UTC) - timedelta(seconds=1)
+    run_id = await f.create_run(**fields)
+    with pytest.raises(SandboxDispatchError) as error:
+        await ensure_sandbox_for_run(run_id, lease_owner="worker#1", fence=1, pool_name=f.pool.name, wait_timeout=0)
+    assert error.value.code == "run_lease_invalid"
+    async with f.factory() as session:
+        run = await session.get(ChatRun, run_id)
+        assert run.assigned_resource_id is None and run.runtime_pool_id is None
+        assert await session.scalar(select(ChatRuntimeResource.id).where(ChatRuntimeResource.run_id == run_id)) is None
+
+
+@pytest.mark.parametrize("ceiling", [None, 30])
+async def test_lazy_chat_sandbox_quota_and_cancellation_reuse(lazy_chat_sandbox, ceiling):
+    from lumen.models.chat_infrastructure import ChatAgentReservation, ChatProjectAgentQuota
+    from lumen.services.durable_runs import lifecycle
+    from lumen.services.sandbox_binding import SandboxDispatchError, ensure_sandbox_for_run
+
+    f = lazy_chat_sandbox
+    first = await f.create_run(sandbox_seconds_ceiling=ceiling)
+    second = await f.create_run(sandbox_seconds_ceiling=ceiling)
+    with pytest.raises(SandboxDispatchError) as error:
+        await ensure_sandbox_for_run(first, lease_owner="worker#1", fence=1, pool_name=f.pool.name, wait_timeout=0)
+    assert error.value.code == "sandbox_timeout"
+    async with f.factory() as session:
+        run = await session.get(ChatRun, first)
+        quota = await session.get(ChatProjectAgentQuota, f.project)
+        assert run.credit_ceiling is None and run.sandbox_seconds_ceiling == ceiling
+        assert quota.active_sandboxes == 1
+        assert quota.sandbox_seconds_reserved == (ceiling or 1800)
+    with pytest.raises(SandboxDispatchError) as error:
+        await ensure_sandbox_for_run(second, lease_owner="worker#1", fence=1, pool_name=f.pool.name, wait_timeout=0)
+    assert error.value.code == "child_budget_exhausted"
+    async with f.factory() as session, session.begin():
+        run = await session.get(ChatRun, first)
+        run.status = "awaiting_input"
+        resource = await session.get(ChatRuntimeResource, run.assigned_resource_id)
+        resource.observed_state = "ready"
+        resource.ready_at = datetime.now(UTC) - timedelta(seconds=5)
+    response = await lifecycle.request_cancelled(run_id=first, project_id=f.project, user_id=f.project)
+    assert response.status == "canceled"
+    async with f.factory() as session:
+        quota = await session.get(ChatProjectAgentQuota, f.project)
+        run = await session.get(ChatRun, first)
+        resource = await session.get(ChatRuntimeResource, run.assigned_resource_id)
+        holds = (await session.scalars(select(ChatAgentReservation).where(ChatAgentReservation.run_id == first))).all()
+        assert quota.active_sandboxes == 0 and quota.sandbox_seconds_reserved == 0
+        assert resource.desired_state == "deleting"
+        assert {hold.kind: hold.status for hold in holds} == {"sandbox_slot": "released", "sandbox_seconds": "settled"}
+    with pytest.raises(SandboxDispatchError) as error:
+        await ensure_sandbox_for_run(second, lease_owner="worker#1", fence=1, pool_name=f.pool.name, wait_timeout=0)
+    assert error.value.code == "sandbox_timeout"
+    async with f.factory() as session:
+        assert (await session.get(ChatProjectAgentQuota, f.project)).active_sandboxes == 1
+        assert (await session.get(ChatRun, second)).assigned_resource_id is not None
+
+
+@pytest.mark.parametrize("forged_dispatch", [False, True])
+async def test_expired_approval_denial_resumes_only_authenticated_dispatch(lazy_chat_sandbox, monkeypatch, forged_dispatch):
+    from unittest.mock import AsyncMock
+
+    from lumen import crypto
+    from lumen.models.chat_runs import ChatToolApproval
+    from lumen.services.durable_runs import interactions
+
+    f = lazy_chat_sandbox
+    now = datetime.now(UTC)
+    monkeypatch.setattr(crypto, "_get_key", lambda: bytes.fromhex("ab" * 32))
+    monkeypatch.setattr(interactions, "get_settings", lambda: SimpleNamespace(chat_execution_protocol_version=2))
+    monkeypatch.setattr(interactions, "_now", lambda: now)
+    monkeypatch.setattr(interactions, "wake_run", AsyncMock())
+    run_id = await f.create_run()
+    calls = [{
+        "call_id": "expired-navigation", "name": "browser_navigate",
+        "arguments": json.dumps({"url": "https://example.com/approval-expiry"}),
+        "source": "mcp", "effect": "external_mutation", "tool_definition_hash": "a" * 64,
+        "config_fingerprint": "b" * 64, "expected_state_revision": 7, "writer_fence": 11,
+    }]
+    await interactions._reconcile_v2_approval_interrupt(run_id=run_id, owner="worker#1", calls=calls, resume=False)
+    async with f.factory() as session, session.begin():
+        approval = await session.scalar(select(ChatToolApproval).where(ChatToolApproval.run_id == run_id))
+        if forged_dispatch:
+            approval.tool_name = "browser_delete_everything"
+    now += timedelta(minutes=16)
+    if forged_dispatch:
+        assert run_id not in await interactions.expire_pending_inputs()
+        async with f.factory() as session:
+            run = await session.get(ChatRun, run_id)
+            approval = await session.scalar(select(ChatToolApproval).where(ChatToolApproval.run_id == run_id))
+            event_types = list((await session.scalars(select(ChatRunEventRow.event_type).where(
+                ChatRunEventRow.run_id == run_id
+            ).order_by(ChatRunEventRow.seq))).all())
+            assert run.status == "awaiting_input" and run.lease_owner is None
+            assert approval.status == "pending" and approval.decision_hmac is None
+            assert "tool.approval_resolved" not in event_types
+        return
+
+    assert await interactions.expire_pending_inputs() == [run_id]
+    async with f.factory() as session, session.begin():
+        run = await session.get(ChatRun, run_id)
+        approval = await session.scalar(select(ChatToolApproval).where(ChatToolApproval.run_id == run_id))
+        assert run.status == "queued" and run.lease_owner is None and run.lease_expires_at is None
+        assert approval.status == "denied" and approval.decided_by_user_id is None
+        assert approval.decision_hmac and approval.expected_state_revision == 7 and approval.writer_fence == 11
+        run.status, run.lease_owner, run.lease_fence = "running", "worker#2", 2
+        run.lease_expires_at = now + timedelta(minutes=1)
+    assert await interactions._reconcile_v2_approval_interrupt(
+        run_id=run_id, owner="worker#2", calls=calls, resume=True
+    ) == [{"call_id": "expired-navigation", "decision": "deny"}]

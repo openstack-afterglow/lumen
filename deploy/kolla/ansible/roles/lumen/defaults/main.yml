@@ -6,7 +6,7 @@ lumen_policy_directory: "/etc/kolla/lumen/policy"
 lumen_policy_file: "/etc/lumen/policy.yaml"
 lumen_policy_dirs: ["/etc/lumen/policy.d"]
 
-lumen_image_tag: "0.6.5"
+lumen_image_tag: "0.6.9"
 lumen_image_namespace: "ghcr.io/openstack-afterglow"
 lumen_api_image: "{{ lumen_image_namespace }}/lumen-api"
 lumen_worker_image: "{{ lumen_image_namespace }}/lumen-worker"
@@ -138,6 +138,8 @@ lumen_sandbox_api_key: ""
 lumen_chat_api_hosts: ""
 lumen_chat_default_model: ""
 lumen_chat_compat_run_timeout_seconds: 300
+# Protocol v2 requires a qualified API/worker cohort and encrypted PostgreSQL checkpointer.
+lumen_chat_execution_protocol_version: 1
 lumen_frontend_base_url: ""
 # Left empty on purpose. Deriving this from the public endpoint renders an http
 # URL wherever kolla_enable_tls_external is off, and a doubled slash wherever the
@@ -160,11 +162,11 @@ lumen_bifrost_executable: "/usr/local/bin/lumen-bifrost"
 lumen_bifrost_startup_seconds: 30
 lumen_bifrost_shutdown_seconds: 30
 
-# Agent runtime / autoscaling (plan Steps 2-4). Disabled by default on existing
-# installations. When enabled, the operator supplies the complete typed
-# RuntimeConfig JSON (cloud profiles with application-credential references,
-# pools, managed CIDRs, TLS/CA material paths) as `lumen_runtime_config`; the role
-# never guesses image/flavor/network IDs. Secrets stay file/env references.
+# Managed runtime is opt-in. Supply the complete typed RuntimeConfig, including
+# pools, managed CIDRs and TLS references; Nova additionally needs cloud profiles.
+# Kubernetes sandbox pools use an operator-created, qualified cluster, with
+# bearer_token.file, CA, qualification and tool manifest in the controller mount.
+# The role never creates clusters or guesses image/flavor/network IDs.
 lumen_runtime_enabled: false
 lumen_runtime_config: {}
 # Operator-supplied deployment evidence. Empty/false defaults deliberately fail
@@ -181,8 +183,16 @@ lumen_runtime_octavia_timeout_member_data: 0
 lumen_media_enabled: false
 lumen_controller_listen_address: "{{ 'api' | kolla_address(inventory_hostname) }}"
 lumen_controller_listen_port: 8013
-# Root-owned controller-only signing key and CA/TLS secrets; never mount this
-# directory into a worker. The worker gets only its client identity and public CA.
+# Controller-only signing/listener/probe keys, dispatch key and provider material.
+# Never mount this directory into a worker. The separate worker directory contains
+# public CA + tls.worker_client_cert_file/worker_client_key_file basenames, plus
+# a copy of every enabled Kubernetes sandbox pool's tool_manifest_file at the same
+# path relative to /etc/lumen/controller (never flatten nested manifest paths).
+# Worker root and exact manifest ancestor directories: root:root 0750, no links.
+# Identity files: root:root 0440/0640 (public CA/cert may also be 0444/0644).
+# Manifest copies: root:root 0444/0644, <=1 MiB, matching tool_manifest_sha256 and
+# controller bytes. No other files/directories, credentials or private material.
+# fixed_workers approves each host's dedicated URI identity and certificate pin.
 lumen_controller_secrets_dir: "/etc/kolla/lumen/controller"
 lumen_controller_dispatch_key_file: "{{ lumen_controller_secrets_dir }}/dispatch.key"
 lumen_worker_secrets_dir: "/etc/kolla/lumen/worker"
@@ -247,6 +257,7 @@ lumen_service_environments:
     LUMEN_ENCRYPTION_KEY: "{{ lumen_encryption_key }}"
     MCP_CONTROL_PLANE_URL: "{{ lumen_mcp_control_plane_url }}"
     LUMEN_MCP_SERVICE_TOKEN: "{{ lumen_mcp_service_token }}"
+    CHAT_EXECUTION_PROTOCOL_VERSION: "{{ lumen_chat_execution_protocol_version | string }}"
     CHAT_CHECKPOINTER_POSTGRES_URL: "{{ lumen_checkpointer_postgres_url }}"
     CHAT_MEMORY_PGVECTOR_URL: "{{ lumen_memory_pgvector_url }}"
     CHAT_ASSET_S3_ACCESS_KEY: "{{ lumen_s3_access_key }}"
@@ -270,6 +281,7 @@ lumen_service_environments:
     LUMEN_ENCRYPTION_KEY: "{{ lumen_encryption_key }}"
     MCP_CONTROL_PLANE_URL: "{{ lumen_mcp_control_plane_url }}"
     LUMEN_MCP_SERVICE_TOKEN: "{{ lumen_mcp_service_token }}"
+    CHAT_EXECUTION_PROTOCOL_VERSION: "{{ lumen_chat_execution_protocol_version | string }}"
     CHAT_CHECKPOINTER_POSTGRES_URL: "{{ lumen_checkpointer_postgres_url }}"
     CHAT_MEMORY_PGVECTOR_URL: "{{ lumen_memory_pgvector_url }}"
     CHAT_ASSET_S3_ACCESS_KEY: "{{ lumen_s3_access_key }}"

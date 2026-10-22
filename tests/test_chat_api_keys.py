@@ -574,6 +574,86 @@ class TestPrincipalDependency:
         chat_admission._require_native_admission_scopes(principal, features, **kwargs)
 
 class TestRouter:
+    async def test_create_returns_plaintext_once(self, client, monkeypatch):
+        async def fake_create(
+            user_id,
+            project_id,
+            name,
+            scopes,
+            monthly_credit_limit=None,
+            weekly_credit_limit=None,
+            *,
+            expires_at=None,
+            credential_authority=None,
+        ):
+            return {
+                "id": 1,
+                "name": name,
+                "key_prefix": "sk-afgl-AbCd",
+                "scopes": scopes,
+                "key": "sk-afgl-FULLSECRET",
+            }
+
+        monkeypatch.setattr(aks, "create_key", fake_create)
+        resp = await client.post(_USER_KEYS, json={"name": "my key"})
+        assert resp.status_code == 201
+        assert resp.json()["key"] == "sk-afgl-FULLSECRET"
+
+    async def test_create_forwarding_monthly_limit(self, client, monkeypatch):
+        captured = {}
+
+        async def fake_create(
+            user_id,
+            project_id,
+            name,
+            scopes,
+            monthly_credit_limit=None,
+            weekly_credit_limit=None,
+            *,
+            expires_at=None,
+            credential_authority=None,
+        ):
+            captured.update(
+                user_id=user_id,
+                project_id=project_id,
+                name=name,
+                scopes=scopes,
+                monthly_credit_limit=monthly_credit_limit,
+                weekly_credit_limit=weekly_credit_limit,
+                expires_at=expires_at,
+                credential_authority=credential_authority,
+            )
+            return {
+                "id": 1,
+                "name": name,
+                "key_prefix": "sk-afgl-AbCd",
+                "scopes": scopes,
+                "owner_monthly_credit_limit": "50.0",
+                "admin_monthly_credit_limit": None,
+                "system_monthly_credit_limit": "100.0",
+                "effective_monthly_credit_limit": "50.0",
+                "month_credited_cost": "0",
+                "key": "sk-afgl-FULLSECRET",
+            }
+
+        monkeypatch.setattr(aks, "create_key", fake_create)
+        resp = await client.post(
+            _USER_KEYS,
+            json={
+                "name": "my key",
+                "monthly_credit_limit": "50.0",
+                "weekly_credit_limit": "10.0",
+                "expires_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+            },
+        )
+        assert resp.status_code == 201
+        assert captured["monthly_credit_limit"] == Decimal("50.0")
+        assert captured["weekly_credit_limit"] == Decimal("10.0")
+        assert captured["expires_at"].tzinfo is UTC
+        assert captured["credential_authority"] is None
+        assert resp.json()["owner_monthly_credit_limit"] == "50.0"
+        assert resp.json()["effective_monthly_credit_limit"] == "50.0"
+
     async def test_patch_renames_owner_key_and_rejects_blank_name(self, client, monkeypatch):
         captured = {}
 

@@ -98,7 +98,7 @@ def _load_toml() -> dict[str, Any]:
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
+    model_config = SettingsConfigDict(extra="ignore", case_sensitive=False, hide_input_in_errors=True)
 
     oslo_policy_policy_file: str = "/etc/lumen/policy.yaml"
     oslo_policy_policy_dirs: list[str] = Field(default_factory=list)

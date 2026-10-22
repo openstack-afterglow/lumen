@@ -1,7 +1,8 @@
 # balanced-infrastructure-controller Specification
 
 ## Purpose
-TBD - created by archiving change balanced-infrastructure-controller. Update Purpose after archive.
+Define deployment-scoped Redis participation and deterministic compatible pool assignment while retaining SQL fencing, independent controller task progress, drain-before-release and existing durable worker/request ownership. Require scoped execution evidence without promoting local fixtures to live cloud or rollout acceptance.
+
 ## Requirements
 ### Requirement: Redis-time deployment participation
 

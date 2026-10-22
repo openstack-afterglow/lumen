@@ -90,8 +90,13 @@ class ResourceController:
             await self._check_assignment()
             return await self._settled(function, *args)
 
-    async def _fenced_cloud(self, resource, fence: int, function, *args, action: str | None = None):
-        """Order non-conditional cloud writes with takeover using the pool row lock."""
+    async def _fenced_cloud(self, resource, fence: int, function, *args, action: str | None = None,
+                            submission: list[bool] | None = None):
+        """Order non-conditional cloud writes with takeover using the pool row lock.
+
+        ``submission`` gains an entry immediately before SDK entry; while it stays
+        empty, any failure (limiter, lock, fence, drain or assignment gate) is unsent.
+        """
         factory = get_session_factory()
         async with self.limiter, factory() as session, session.begin():
             row, lease = await store._locked_resource(session, resource.id, resource.generation)
@@ -106,9 +111,9 @@ class ResourceController:
                         or row.observed_state in {"ready", "draining"}) and row.drain_ack_at is None
                         and row.failure_code != "resource_vanished"):
                     raise store.ResourceUnavailable("drain_pending")
-            return await self._renewed_effect(lease, function, *args)
+            return await self._renewed_effect(lease, function, *args, submission=submission)
 
-    async def _renewed_effect(self, lease, function, *args):
+    async def _renewed_effect(self, lease, function, *args, submission: list[bool] | None = None):
         await self._check_assignment()
         # The row lock orders takeover after this write. Renew the locked row while
         # SDK polling settles; the transaction publishes the final lease deadline.
@@ -122,6 +127,8 @@ class ResourceController:
                     pass
         renewal = asyncio.create_task(renew_locked())
         try:
+            if submission is not None:
+                submission.append(True)
             return await self._settled(function, *args)
         finally:
             done.set()
@@ -825,11 +832,17 @@ class ResourceController:
                     await lifecycle.fail_waiting_run(resource.run_id, error_code="resource_unavailable",
                                                      safe_message="Sandbox provisioning unavailable")
                 return
+        submission: list[bool] = []
         try:
             observation = await self._fenced_cloud(resource, fence, provider.create,
-                self._intent(resource, definition, bootstrap_token=token), action="create")
+                self._intent(resource, definition, bootstrap_token=token), action="create", submission=submission)
         except Exception:
-            await store.mark_unknown(resource.id, resource.generation, self.owner, fence)
+            if submission:
+                await store.mark_unknown(resource.id, resource.generation, self.owner, fence)
+            else:
+                # Proven unsent: return the claim so the rightful owner may submit it once.
+                await store.release_unsubmitted_operation(resource.id, resource.generation, "create",
+                                                          self.owner, fence)
             raise
         await store.record_observation(resource.id, resource.generation, self.owner, fence, observation)
 
@@ -929,10 +942,17 @@ class ResourceController:
             return
         operation = await store.claim_operation(resource.id, resource.generation, "delete", self.owner, fence)
         if operation is not None:
+            submission: list[bool] = []
             try:
-                result = await self._fenced_cloud(resource, fence, provider.delete, ref, action="delete")
+                result = await self._fenced_cloud(resource, fence, provider.delete, ref, action="delete",
+                                                  submission=submission)
             except Exception:
-                await store.mark_unknown(resource.id, resource.generation, self.owner, fence, action="delete")
+                if submission:
+                    await store.mark_unknown(resource.id, resource.generation, self.owner, fence, action="delete")
+                else:
+                    # Fence, assignment or drain gates fire before SDK entry; keep delete retryable.
+                    await store.release_unsubmitted_operation(resource.id, resource.generation, "delete",
+                                                              self.owner, fence)
                 raise
             if result.absent:
                 await self._prove_deleted(resource, definition, fence)

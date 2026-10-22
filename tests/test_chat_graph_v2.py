@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -9,7 +10,6 @@ from lumen_plugin_api.tools import ToolBinding, ToolDefinition, ToolExecutionRes
 
 from lumen.services import graph
 from lumen.services.durable_runs import execution, interactions
-from lumen.services.durable_runs.errors import DurableRunError
 
 
 def test_v2_approval_defaults_fail_closed_for_non_read_effects():
@@ -500,12 +500,13 @@ async def test_v2_graph_interrupts_before_external_mutation_dispatch(monkeypatch
         now += timedelta(minutes=16)
         session.execute.side_effect = [
             result([run.id]), result([]), result(run), result(approvals), result([]),
+            result([]), result([]),
         ]
         if resolution == "expired_forged_dispatch":
-            # Keep the original signature: expiry must not bless a substituted tool identity.
+            # Keep the original signature: expiry must neither bless a substituted tool identity
+            # nor let it stop the sweep; the unverifiable run is skipped untouched.
             approval.tool_name = "forged_mutation"
-            with pytest.raises(DurableRunError, match="v2 approval dispatch identity changed"):
-                await interactions.expire_pending_inputs()
+            assert await interactions.expire_pending_inputs() == []
             assert approval.status == "pending"
             assert approval.decided_at is None
             assert approval.decided_by_user_id is None
@@ -539,8 +540,14 @@ async def test_v2_graph_interrupts_before_external_mutation_dispatch(monkeypatch
         run.status = "running"
         run.lease_owner = "worker-2"
         run.lease_expires_at = now + timedelta(minutes=1)
-        session.execute.side_effect = [result(run), result(approvals)]
-        resume = await execution._v2_resume(run_id=run.id, owner="worker-2")
+        session.execute.side_effect = [result(run), result(approval)]
+        checkpointed = await graph.pending_interrupt(run.id)
+        fenced = {**checkpointed, "calls": [
+            {**checkpointed["calls"][0], "expected_state_revision": 7, "writer_fence": 11},
+        ]}
+        with monkeypatch.context() as patch:
+            patch.setattr(graph, "pending_interrupt", AsyncMock(return_value=fenced))
+            resume = await execution._v2_resume(run_id=run.id, owner="worker-2")
         assert resume == {"kind": "tool_approval", "decisions": [{"call_id": "call-1", "decision": "deny"}]}
     resumed_events = [
         event
@@ -1115,8 +1122,9 @@ async def test_v2_graph_excludes_on_demand_extension_schemas_from_initial_reques
     assert {schema["function"]["name"] for schema in captured} == {"custom_preloaded"}
 
 
-async def test_v2_graph_exposes_no_bindings_or_dispatch_when_tools_disabled(monkeypatch):
-    tool_name = "builtin_disabled_policy_probe"
+@pytest.mark.parametrize("delegation_enabled", [False, True])
+async def test_v2_graph_exposes_no_bindings_or_dispatch_when_tools_disabled(monkeypatch, delegation_enabled):
+    tool_name = "delegate_agent" if delegation_enabled else "builtin_disabled_policy_probe"
     dispatched = False
 
     async def execute(_arguments, _context):
@@ -1172,6 +1180,7 @@ async def test_v2_graph_exposes_no_bindings_or_dispatch_when_tools_disabled(monk
                 project_id="project",
                 user_id="user",
                 tools_enabled=False,
+                delegation_enabled=delegation_enabled,
                 execution_protocol_version=2,
                 max_model_turns=1,
                 run_id="run-v2-tools-disabled",
@@ -1180,3 +1189,262 @@ async def test_v2_graph_exposes_no_bindings_or_dispatch_when_tools_disabled(monk
 
     assert captured_schemas == [[]]
     assert dispatched is False
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+async def test_v2_mixed_read_and_mcp_approval_resume_returns_every_tool_result(monkeypatch, decision):
+    called = []
+    completion_calls = 0
+    provider_messages = []
+
+    async def read(_arguments, _context):
+        called.append("read")
+        return ToolExecutionResult(status="completed", model_content="read result")
+
+    async def click(_arguments, _context):
+        called.append("click")
+        return ToolExecutionResult(status="completed", model_content="click result")
+
+    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    resolved = {
+        "read_history": ToolBinding(definition=ToolDefinition(name="read_history", description="Read history", input_schema=schema, effect="read", source="builtin"), execute=read),
+        "mcp_23_browser_click": ToolBinding(definition=ToolDefinition(name="mcp_23_browser_click", description="Click browser", input_schema=schema, effect="external_mutation", source="mcp"), execute=click, config_fingerprint="a" * 64, destination_origin="https://playwright.example"),
+    }
+
+    async def bindings(_context):
+        return resolved
+
+    async def completion_stream(**kwargs):
+        nonlocal completion_calls
+        completion_calls += 1
+        provider_messages.append(kwargs["messages"])
+
+        async def chunks():
+            if completion_calls == 1:
+                yield {"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "read-call", "function": {"name": "read_history", "arguments": "{}"}},
+                    {"index": 1, "id": "browser-call", "function": {"name": "mcp_23_browser_click", "arguments": "{}"}},
+                ]}}]}
+            else:
+                yield {"choices": [{"delta": {"content": "done"}}]}
+            yield {"usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+
+        return chunks()
+
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
+    parameters = {"model": "test-model", "messages": [{"role": "user", "content": "read and click"}],
+                  "project_id": "project", "user_id": "user", "execution_protocol_version": 2,
+                  "approval_mode": "required_for_mutations", "run_id": f"mixed-{decision}"}
+    events = [event async for event in graph.stream(**parameters)]
+    interrupt = next(event for event in events if event.get("type") == "input.interrupted")
+    assert [call["call_id"] for call in interrupt["payload"]["calls"]] == ["browser-call"]
+    assert called == []
+    resumed = [event async for event in graph.stream(**parameters, resume={"kind": "tool_approval", "decisions": [{"call_id": "browser-call", "decision": decision}]})]
+    assert called == (["read", "click"] if decision == "approve" else ["read"])
+    assert completion_calls == 2
+    tool_messages = [message for message in provider_messages[-1] if message.get("role") == "tool"]
+    assert {message["tool_call_id"] for message in tool_messages} == {"read-call", "browser-call"}
+    assert len(tool_messages) == 2
+    assert len([event for event in resumed if event.get("type") == "tool_result"]) == 2
+    if decision == "deny":
+        assert any(event.get("error_code") == "tool_denied" for event in resumed if event.get("type") == "tool_result")
+
+
+async def test_pending_interrupt_reads_the_checkpointed_approval_boundary(monkeypatch):
+    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    async def click(_arguments, _context):
+        return ToolExecutionResult(status="completed", model_content="click result")
+
+    resolved = {"mcp_23_browser_click": ToolBinding(
+        definition=ToolDefinition(name="mcp_23_browser_click", description="Click browser", input_schema=schema,
+                                  effect="external_mutation", source="mcp"),
+        execute=click, config_fingerprint="a" * 64, destination_origin="https://playwright.example")}
+
+    async def bindings(_context):
+        return resolved
+
+    async def completion_stream(**kwargs):
+        async def chunks():
+            yield {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "browser-call", "function": {"name": "mcp_23_browser_click", "arguments": "{}"}},
+            ]}}]}
+            yield {"usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+
+        return chunks()
+
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
+    _ = [event async for event in graph.stream(
+        model="test-model", messages=[{"role": "user", "content": "click"}], project_id="project", user_id="user",
+        execution_protocol_version=2, approval_mode="required_for_mutations", run_id="awaiting-approval")]
+
+    pending = await graph.pending_interrupt("awaiting-approval")
+
+    assert pending is not None and pending["kind"] == "tool_approval"
+    assert [call["call_id"] for call in pending["calls"]] == ["browser-call"]
+    assert isinstance(pending["checkpoint_id"], str) and pending["checkpoint_id"]
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny", "changed_config"])
+async def test_v2_on_demand_mcp_is_restored_before_approval_resume(monkeypatch, decision):
+    server = {"id": 23, "name": "Browser", "url": "https://playwright.example/mcp",
+              "config_version": 1, "load_policy": "on_demand"}
+    method = {"name": "browser_click", "description": "Click browser element",
+              "input_schema": {"type": "object", "properties": {}, "additionalProperties": False}}
+    loaded_names = []
+    dispatched = []
+    provider_messages = []
+
+    async def no_bindings(_context):
+        return {}
+
+    async def no_extensions(_context):
+        return []
+
+    async def selected_server(_context):
+        return [dict(server)]
+
+    async def discovered_tools(_server, *, context):
+        return [method]
+
+    async def call_tool(_server, name, arguments, *, context, expected_credential_epoch):
+        dispatched.append((name, arguments, context.run_id))
+        return "clicked"
+
+    class Hooks:
+        async def loaded_tool_names(self):
+            return list(loaded_names)
+
+        async def tool_completed(self, *, tool_name, result_payload, **_kwargs):
+            if tool_name == "list_available_tools":
+                loaded_names[:] = json.loads(result_payload["content"])["loaded_tools"]
+
+    async def completion_stream(**kwargs):
+        provider_messages.append(kwargs["messages"])
+        turn = len(provider_messages)
+
+        async def chunks():
+            if turn <= 2:
+                name = "list_available_tools" if turn == 1 else loaded_names[0]
+                arguments = '{"query":"browser"}' if turn == 1 else "{}"
+                yield {"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": f"call-{turn}", "function": {"name": name, "arguments": arguments}},
+                ]}}]}
+            else:
+                yield {"choices": [{"delta": {"content": "done"}}]}
+            yield {"usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+
+        return chunks()
+
+    monkeypatch.setattr(graph.bindings, "v2_builtin_tool_bindings", no_bindings)
+    monkeypatch.setattr(graph.bindings, "_lumen_registry_bindings", no_extensions)
+    monkeypatch.setattr(graph.bindings, "_load_custom", no_extensions)
+    monkeypatch.setattr(graph.bindings, "_load_mcp", selected_server)
+    monkeypatch.setattr(graph.bindings.mcp_client, "list_tools", discovered_tools)
+    monkeypatch.setattr(graph.bindings.mcp_client, "call_tool", call_tool)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
+    parameters = {"model": "test-model", "messages": [{"role": "user", "content": "click"}],
+                  "project_id": "project", "user_id": "user", "execution_protocol_version": 2,
+                  "approval_mode": "required_for_mutations", "execution_hooks": Hooks(),
+                  "run_id": f"deferred-{decision}"}
+    events = [event async for event in graph.stream(**parameters)]
+    approval = next(event["payload"] for event in events if event.get("type") == "input.interrupted")
+    assert [call["call_id"] for call in approval["calls"]] == ["call-2"]
+    assert dispatched == []
+    resume = {"kind": "tool_approval", "decisions": [
+        {"call_id": "call-2", "decision": "deny" if decision == "deny" else "approve"},
+    ]}
+
+    if decision == "changed_config":
+        server["config_version"] = 2
+        with pytest.raises(RuntimeError):
+            _ = [event async for event in graph.stream(**parameters, resume=resume)]
+        assert dispatched == []
+        assert len(provider_messages) == 2
+        return
+
+    resumed = [event async for event in graph.stream(**parameters, resume=resume)]
+    results = [event for event in resumed if event.get("type") == "tool_result"]
+    assert [(event["tool_call_id"], event["status"], event.get("error_code")) for event in results] == [
+        ("call-2", "completed", None) if decision == "approve" else ("call-2", "failed", "tool_denied"),
+    ]
+    assert dispatched == ([("browser_click", {}, f"deferred-{decision}")] if decision == "approve" else [])
+    assert len(provider_messages) == 3
+    tool_messages = [message for message in provider_messages[-1] if message.get("role") == "tool"]
+    assert [message["tool_call_id"] for message in tool_messages] == ["call-1", "call-2"]
+    if decision == "approve":
+        assert tool_messages[-1]["content"] == "clicked"
+
+
+@pytest.mark.parametrize(("tools_enabled", "backend", "process_allowed", "lease", "expected"), [
+    (False, None, True, ("worker#1", 1), set()),
+    (False, "kubernetes", True, ("worker#1", 1), set()),
+    (False, "nova", True, ("worker#1", 1), set()),
+    (True, None, True, ("worker#1", 1), {"list_available_tools", "browser_click"}),
+    (True, "kubernetes", True, ("worker#1", 1), {"list_available_tools", "browser_click"}),
+    (True, "nova", True, ("worker#1", 1), {"list_available_tools", "browser_click", "run_code"}),
+    (True, "nova", False, ("worker#1", 1), {"list_available_tools", "browser_click"}),
+    (True, "nova", True, None, {"list_available_tools"}),
+])
+async def test_v2_sandbox_tools_require_policy_and_compatible_assignment(
+    monkeypatch, tools_enabled, backend, process_allowed, lease, expected,
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from lumen.services import sandbox_binding
+    from lumen.services.infrastructure import tool_manifest
+
+    definition = ToolDefinition(
+        name="browser_click", description="Click in the sandbox browser.",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        effect="external_mutation", source="mcp",
+    )
+    pool = SimpleNamespace(
+        enabled=True, role="sandbox", backend="kubernetes", name="browser",
+        profile=SimpleNamespace(tool_manifest_file="pinned.json", tool_manifest_sha256="a" * 64),
+    )
+    manifest = Mock(return_value=(SimpleNamespace(id="browser", tools=(definition,)),))
+    assigned = AsyncMock(return_value=SimpleNamespace(backend=backend) if backend is not None else None)
+    observed_tools = []
+
+    async def completion_stream(**kwargs):
+        observed_tools.append({item["function"]["name"] for item in kwargs.get("tools") or []})
+
+        async def chunks():
+            yield {"choices": [{"delta": {"content": "done"}}]}
+            yield {"usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+        return chunks()
+
+    monkeypatch.setattr(graph.bindings, "v2_builtin_tool_bindings", AsyncMock(return_value={}))
+    monkeypatch.setattr(graph.bindings, "_load_custom", AsyncMock(return_value=[]))
+    monkeypatch.setattr(graph.bindings, "_load_mcp", AsyncMock(return_value=[]))
+    monkeypatch.setattr("lumen.config.get_settings", lambda: SimpleNamespace(runtime_config=SimpleNamespace(pools=(pool,))))
+    monkeypatch.setattr(tool_manifest, "load_tool_manifest", manifest)
+    monkeypatch.setattr(sandbox_binding, "assigned_sandbox", assigned)
+    monkeypatch.setattr(sandbox_binding, "kubernetes_mcp_binding", lambda *_args, **_kwargs: ToolBinding(
+        definition=definition, execute=AsyncMock(return_value=ToolExecutionResult(status="completed")),
+    ))
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
+
+    events = [event async for event in graph.stream(
+        model="test-model", messages=[{"role": "user", "content": "hello"}],
+        project_id="project", user_id="user", run_id="sandbox-tool-policy",
+        execution_protocol_version=2, tools_enabled=tools_enabled, sandbox_lease=lease,
+        allowed_direct_effects=("process",) if process_allowed else ("read",),
+    )]
+
+    assert observed_tools == [expected]
+    assert any(event.get("type") == "token" for event in events)
+    if not tools_enabled or lease is None:
+        manifest.assert_not_called()
+        assigned.assert_not_awaited()
+    elif process_allowed:
+        assigned.assert_awaited_once_with("sandbox-tool-policy")

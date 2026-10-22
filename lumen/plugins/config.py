@@ -17,12 +17,12 @@ class PluginApproval(BaseModel):
 
 def default_allowlist() -> list[PluginApproval]:
     return [PluginApproval(distribution=distribution, name=name, kind=kind, version=version) for kind, name, distribution, version in (
-        ("database", "mariadb", "lumen-database-mariadb", "0.1.1"),
-        ("memory", "default-memory", "lumen-memory-default", "0.1.0"),
-        ("tools", "default-tools", "lumen-tools-default", "0.1.0"),
-        ("skills", "default-skills", "lumen-skills-default", "0.1.0"),
-        ("mcp", "remote-mcp", "lumen-mcp-default", "0.1.0"),
-        ("mcp", "afterglow-mcp", "lumen-mcp-default", "0.1.0"),
+        ("database", "mariadb", "lumen-database-mariadb", "0.1.2"),
+        ("memory", "default-memory", "lumen-memory-default", "0.1.1"),
+        ("tools", "default-tools", "lumen-tools-default", "0.1.1"),
+        ("skills", "default-skills", "lumen-skills-default", "0.1.1"),
+        ("mcp", "remote-mcp", "lumen-mcp-default", "0.1.1"),
+        ("mcp", "afterglow-mcp", "lumen-mcp-default", "0.1.1"),
     )]
 
 

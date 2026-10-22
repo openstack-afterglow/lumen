@@ -35,6 +35,7 @@ from lumen.services.durable_runs.execution import execute_queued_run, queued_run
 from lumen.services.durable_runs.interactions import expire_pending_inputs
 from lumen.services.durable_runs.lifecycle import purge_expired_temp_threads, recover_stale_runs
 from lumen.services.execution_protocol import SUPPORTED_EXECUTION_PROTOCOL_VERSIONS
+from lumen.services.infrastructure.tool_manifest import ToolManifestError, validate_worker_tool_manifests
 
 logger = logging.getLogger(__name__)
 _REGISTRATION_SCHEMA_VERSION = 1
@@ -181,6 +182,7 @@ class WorkerLoop:
 
         guest_dir = os.environ.get("LUMEN_GUEST_IDENTITY_DIR")
         resource_id = os.environ.get("LUMEN_RESOURCE_ID")
+        identity_kwargs = {}
         if guest_dir or resource_id or os.environ.get("LUMEN_BOOTSTRAP_FILE"):
             if not guest_dir or not resource_id:
                 raise RuntimeError("worker bootstrap identity missing")
@@ -190,6 +192,14 @@ class WorkerLoop:
 
             generation = int(os.environ["LUMEN_RESOURCE_GENERATION"])
             identity = load_identity(Path(guest_dir), role="worker", resource_id=resource_id, generation=generation)
+            identity_kwargs = {"resource_generation": generation,
+                               "certificate_fingerprint": identity["certificate_fingerprint"]}
+        else:
+            from lumen.services.infrastructure.fixed_worker import load_identity
+
+            fingerprint = load_identity(get_settings().runtime_config)
+            if fingerprint is not None:
+                identity_kwargs = {"certificate_fingerprint": fingerprint}
         self.registration_id = await store.register_worker(
             worker_identity=self.owner,
             boot_id=self.boot_id,
@@ -199,8 +209,7 @@ class WorkerLoop:
             schema_version=_REGISTRATION_SCHEMA_VERSION,
             workload_classes=list(self.workload_classes),
             resource_id=resource_id,
-            **({"resource_generation": generation,
-                "certificate_fingerprint": identity["certificate_fingerprint"]} if guest_dir else {}),
+            **identity_kwargs,
         )
         self.pool_id = await store.registration_pool_id(self.registration_id)
 
@@ -224,6 +233,17 @@ class WorkerLoop:
                 logger.error("worker certificate expired or identity changed; entering drain")
                 self.start_drain()
                 return
+        else:
+            from lumen.services.infrastructure.fixed_worker import FixedWorkerIdentityError, load_identity
+
+            try:
+                fingerprint = load_identity(get_settings().runtime_config)
+            except FixedWorkerIdentityError:
+                logger.error("fixed worker certificate expired or approval changed; entering drain")
+                self.start_drain()
+                return
+            if fingerprint is not None:
+                identity_kwargs = {"certificate_fingerprint": fingerprint}
         state = await store.heartbeat_worker(self.registration_id, accepting=not self.draining.is_set(),
                                              **identity_kwargs)
         if state is None:
@@ -262,6 +282,7 @@ async def serve() -> None:
 
 async def _serve() -> None:
     settings = get_settings()
+    validate_worker_tool_manifests(settings.runtime_config)
     if not settings.database_url:
         raise RuntimeError("chat worker requires database_url")
     registry = get_registry()
@@ -476,6 +497,9 @@ def main() -> None:
     logger.info("worker starting")
     try:
         asyncio.run(serve())
+    except ToolManifestError:
+        logger.error("runtime_kubernetes_manifest")
+        raise SystemExit("runtime_kubernetes_manifest") from None
     except Exception:
         logger.error("worker stopped with error")
         raise

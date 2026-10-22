@@ -20,7 +20,12 @@ def ca_material():
     cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
             .serial_number(x509.random_serial_number()).not_valid_before(datetime.now(UTC) - timedelta(minutes=1))
             .not_valid_after(datetime.now(UTC) + timedelta(days=1))
-            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True).sign(key, hashes.SHA256()))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
+            .add_extension(x509.KeyUsage(digital_signature=False, content_commitment=False,
+                key_encipherment=False, data_encipherment=False, key_agreement=False,
+                key_cert_sign=True, crl_sign=True, encipher_only=None, decipher_only=None), True)
+            .sign(key, hashes.SHA256()))
     return key, cert
 
 
@@ -36,8 +41,13 @@ def issue(ca_key, ca_cert, public_key, *, identity=None, seconds=3600, hostname=
             .serial_number(x509.random_serial_number()).not_valid_before(datetime.now(UTC) - timedelta(minutes=1))
             .not_valid_after(datetime.now(UTC) + timedelta(seconds=seconds))
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
-            .add_extension(x509.SubjectAlternativeName(names), False)
+            .add_extension(x509.SubjectAlternativeName(names), True)
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]), False)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(public_key), False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), False)
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
+                key_encipherment=False, data_encipherment=False, key_agreement=False,
+                key_cert_sign=False, crl_sign=False, encipher_only=None, decipher_only=None), True)
             .sign(ca_key, hashes.SHA256()))
     return cert
 

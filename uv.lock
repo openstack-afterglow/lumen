@@ -1089,7 +1089,7 @@ wheels = [
 
 [[package]]
 name = "lumen"
-version = "0.6.5"
+version = "0.6.9"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1195,7 +1195,7 @@ provides-extras = ["service", "dev"]
 
 [[package]]
 name = "lumen-database-mariadb"
-version = "0.1.1"
+version = "0.1.2"
 source = { editable = "plugins/database-mariadb" }
 dependencies = [
     { name = "aiomysql" },
@@ -1221,7 +1221,7 @@ provides-extras = ["testing"]
 
 [[package]]
 name = "lumen-mcp-default"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "plugins/mcp-default" }
 dependencies = [
     { name = "httpx" },
@@ -1247,7 +1247,7 @@ provides-extras = ["testing"]
 
 [[package]]
 name = "lumen-memory-default"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "plugins/memory-default" }
 dependencies = [
     { name = "lumen-plugin-api" },
@@ -1273,7 +1273,7 @@ provides-extras = ["testing"]
 
 [[package]]
 name = "lumen-plugin-api"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "packages/lumen-plugin-api" }
 dependencies = [
     { name = "jsonschema" },
@@ -1301,7 +1301,7 @@ provides-extras = ["database", "testing"]
 
 [[package]]
 name = "lumen-skills-default"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "plugins/skills-default" }
 dependencies = [
     { name = "lumen-plugin-api" },
@@ -1323,7 +1323,7 @@ provides-extras = ["testing"]
 
 [[package]]
 name = "lumen-tools-default"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "plugins/tools-default" }
 dependencies = [
     { name = "beautifulsoup4" },

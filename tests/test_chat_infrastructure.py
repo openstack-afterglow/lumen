@@ -45,7 +45,10 @@ def _controller():
     config = SimpleNamespace(max_parallel_cloud_operations=4, pools=(), tls=None)
     reconciler = controller_module.ResourceController(config, {}, owner="one")
     # Provider lifecycle tests isolate DB authorization; real-DB tests cover fences.
-    async def fenced(resource, fence, function, *args, **kwargs):
+    async def fenced(resource, fence, function, *args, action=None, submission=None):
+        if submission is not None:
+            # Mirror _renewed_effect: SDK entry is recorded before the provider call.
+            submission.append(True)
         return await reconciler._cloud(function, *args)
     reconciler._fenced_cloud = fenced
     return reconciler

@@ -220,7 +220,12 @@ async def lock_open_batch(session: AsyncSession, batch_id: str) -> bool:
 
 def _trusted_identity_valid(registration: ChatWorkerRegistration, resource: ChatRuntimeResource | None) -> bool:
     if registration.resource_id is None:
-        return registration.resource_generation is None and registration.certificate_fingerprint is None
+        from lumen.config import get_settings
+        from lumen.services.infrastructure.fixed_worker import approved_fingerprint
+
+        return (registration.resource_generation is None and registration.pool_id is None
+                and (registration.certificate_fingerprint is None
+                     or approved_fingerprint(get_settings().runtime_config, registration.certificate_fingerprint)))
     return bool(
         resource is not None
         and resource.role == "worker"
