@@ -1,0 +1,46 @@
+Lumen private Bifrost runtime
+
+Uses github.com/maximhq/bifrost/core
+Version: v1.13.2-0.20261021235121-668a660e5ac0
+Source: https://github.com/maximhq/bifrost
+Commit: 668a660e5ac0ab251433bd432a84dc758b76847a
+Copyright: Maxim AI, Inc. and Bifrost contributors
+License: Apache License, Version 2.0 (see LICENSE)
+The Lumen wrapper is independently authored; upstream source is not modified.
+
+EXECUTION/SECURITY AUDIT
+Lumen calls upstream Bifrost typed request/response and stream converters directly.
+It deliberately does not instantiate the Bifrost orchestration core or provider HTTP
+clients. The core contains key rotation, fallback, and encrypted-reasoning repair
+attempts. Provider utils.ConfigureDialer installs StaleConnectionRetryIfErr and
+BuildStreamingClient copies MaxIdemponentCallAttempts/RetryIfErr, so setting only
+max_retries=0 is insufficient. This runtime's HTTP/1 transport performs a single
+RoundTrip, using a fresh connection, no proxy, no redirects, no GetBody, no
+idempotency headers, verified TLS, and request context cancellation. No provider SDK
+HTTP retry policy, credential discovery chain, key selection, tools, database,
+response cache, model pricing, or upstream payload/error logger is installed.
+
+Native same-wire Responses, Anthropic Messages/count_tokens, and OpenAI-compatible
+embedding payloads/events use bounded raw transport to preserve fields not present
+in upstream typed schemas (including signed thinking and compaction). Cross-wire
+chat/Responses/Messages and Gemini/Bedrock embedding/event conversion use upstream
+Bifrost converters, not a nominal proxy. Provider cost estimates are not authority.
+
+CLOUD AUTHENTICATION BOUNDARIES
+Azure uses a request-local API key or explicit Authorization Bearer header and an
+administrator-owned API base. Vertex uses an explicit bearer token and full
+publisher/model base, or a request-local API key at a compatible custom endpoint;
+no ambient service-account discovery or refresh is claimed. Bedrock accepts a
+request-local bearer token plus explicit API base, or explicit JSON key material
+(region, access_key_id, secret_access_key, optional session_token), signed once with
+AWS SigV4. SDK default AWS/GCP chains are intentionally not available. ChatGPT/Codex
+subscription is owned by Lumen's strict-target Python transport, not this runtime.
+
+SOURCE-LEVEL RISKS / ACCEPTANCE LIMITS
+Upstream typed conversion is model-aware and can normalize unsupported fields at
+conversion time. Native same-wire raw paths avoid that loss; cross-wire protocols
+cannot promise round-trip equivalence for arbitrary future vendor extensions.
+Cloud service-account/STS refresh and provider account management belong outside
+this process. Synthetic tests do not prove live provider credentials, service terms,
+cloud SDK feature parity, invoice accuracy, or multi-architecture deployment.
+Third-party dependency licenses remain governed by their respective modules.

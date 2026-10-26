@@ -17,6 +17,7 @@ import httpx
 
 from lumen.services.usage_breakdown import UsageBreakdown
 
+from .credentials import api_key_route_configured, resolve_route_api_key
 from .errors import ProviderValidationError
 from .pricing import (
     exact_media_price,
@@ -85,7 +86,7 @@ def _image_usage(route: dict, result: dict, provider: str) -> UsageBreakdown | N
 
 def _model(route: dict) -> tuple[str, str]:
     """Accept only canonical direct endpoints, API-key authentication and known models."""
-    if route.get("model_kind") != "image" or route.get("provider_auth") is not None:
+    if not isinstance(route, dict) or route.get("model_kind") != "image" or not api_key_route_configured(route):
         raise ProviderValidationError("image route is not directly executable")
     provider = route.get("provider_type")
     model = route.get("api_model_name")
@@ -101,8 +102,6 @@ def _model(route: dict) -> tuple[str, str]:
     if configured_base is not None and (not isinstance(configured_base, str)
                                         or configured_base.rstrip("/") not in accepted_bases):
         raise ProviderValidationError("unsupported image provider endpoint")
-    if not isinstance(route.get("api_key"), str) or not route["api_key"].strip():
-        raise ProviderValidationError("image provider credential is unavailable")
     return provider, model
 
 
@@ -218,7 +217,7 @@ def _decode_image(encoded: object, mime: str | None = None) -> tuple[bytes, str]
 
 
 async def _post(url: str, *, headers: dict, count: int, json_body: dict | None = None,
-                form: dict | None = None, files: dict | None = None) -> dict:
+                form: dict | None = None, files: dict | None = None, relay_ref=None, relay_model=None) -> dict:
     # Streaming avoids buffering an unlimited upstream body in httpx before validation.
     max_bytes = count * _MAX_RESPONSE_BYTES_PER_IMAGE + 65536
     try:
@@ -227,6 +226,8 @@ async def _post(url: str, *, headers: dict, count: int, json_body: dict | None =
                               transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False)) as client,
             client.stream("POST", url, headers=headers, json=json_body, data=form, files=files) as response,
         ):
+            from .relay_history import record_dispatch
+            record_dispatch(relay_ref, endpoint=url, model=relay_model, operation="image", status_code=response.status_code)
             if response.status_code != 200:
                 raise ImageTransportError(f"image provider returned HTTP {response.status_code}",
                                           status_code=response.status_code)
@@ -262,14 +263,17 @@ async def generate_images(route: dict, *, prompt: str, size: str, quality: str, 
             raise ProviderValidationError("source image MIME is invalid")
     elif source_mime is not None:
         raise ProviderValidationError("source image MIME without data")
+    api_key = await resolve_route_api_key(route)
     if provider == "openai":
         body = {"model": model, "prompt": prompt, "size": size, "quality": quality, "n": n}
-        headers = {"Authorization": f"Bearer {route['api_key']}"}
+        headers = {"Authorization": f"Bearer {api_key}"}
         if source_image is None:
             result = await _post("https://api.openai.com/v1/images/generations", headers=headers,
+                                 relay_ref=route.get("provider_auth"), relay_model=model,
                                  count=n, json_body=body)
         else:
             result = await _post("https://api.openai.com/v1/images/edits", headers=headers,
+                                 relay_ref=route.get("provider_auth"), relay_model=model,
                                  count=n, form=body,
                                  files={"image": ("source.png", source_image, source_mime)})
         data = result.get("data")
@@ -290,7 +294,8 @@ async def generate_images(route: dict, *, prompt: str, size: str, quality: str, 
         response_format["image_size"] = quality.upper()
     result = await _post(
         "https://generativelanguage.googleapis.com/v1beta/interactions",
-        headers={"x-goog-api-key": route["api_key"]}, count=1,
+        relay_ref=route.get("provider_auth"), relay_model=model,
+        headers={"x-goog-api-key": api_key}, count=1,
         json_body={"model": model, "input": inputs, "response_format": response_format, "store": False},
     )
     if result.get("status") != "completed":

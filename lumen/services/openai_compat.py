@@ -25,7 +25,7 @@ from lumen.services.context_manager import ContextBudget
 from lumen.services.durable_runs import admission, lifecycle, queries
 from lumen.services.durable_runs.common import _require_supported_execution_protocol_version
 from lumen.services.durable_runs.errors import DurableRunError
-from lumen.services.litellm_client import count_context_tokens
+from lumen.services.provider_metadata import count_context_tokens
 from lumen.services.providers import repository
 
 logger = logging.getLogger(__name__)

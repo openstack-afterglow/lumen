@@ -200,6 +200,36 @@ async def test_native_create_returns_descriptor_links_and_keystone_authority(cli
     assert [item.operation for item in kwargs["request"].items] == list(_ITEMS_BY_OPERATION)
 
 
+async def test_native_create_passes_only_trusted_reduced_credential_snapshot(client, enabled, service):
+    authority = {"credential_restricted": True, "user_id": "test-user-123",
+                 "source_project_id": "test-project-123", "source_system_scope": "",
+                 "issued_role_ids": ["member-id", "chat-id"]}
+
+    async def principal():
+        return {**authority, "auth_type": "keystone", "project_id": "test-project-123",
+                "api_key_id": None, "scopes": (), "source": "web",
+                "roles": ["member", "lumen-chat_user"], "is_system_admin": False,
+                "token": "never-persist-this-bearer"}
+
+    app.dependency_overrides[get_principal] = principal
+    body = _create_body("chat.completions")
+    body["metadata"] = {"credential_authority": "forged", "issued_role_ids": "admin-id"}
+    body["items"][0]["body"] = {**_CHAT, "credential_authority": {"issued_role_ids": ["admin-id"]},
+                                "_credential_authority": {"issued_role_ids": ["admin-id"]}}
+    response = await client.post("/v1/chat/batches", json=body, headers={"Idempotency-Key": "reduced"})
+    assert response.status_code == 202
+    [(_, kwargs)] = service.calls
+    assert kwargs["credential_authority"] == authority
+    assert "never-persist-this-bearer" not in repr(kwargs)
+
+
+async def test_native_create_cannot_accept_top_level_credential_metadata(client, enabled, service):
+    body = {**_create_body("responses"), "credential_authority": {"issued_role_ids": ["admin-id"]}}
+    response = await client.post("/v1/chat/batches", json=body, headers={"Idempotency-Key": "forged"})
+    assert response.status_code == 422
+    assert service.calls == []
+
+
 async def test_native_idempotent_replay_returns_original_and_mismatch_is_409(client, enabled, service):
     service.set("create_native_batch", (_view(status="in_progress"), False))
     replay = await client.post("/v1/chat/batches", json=_create_body("responses"), headers={"Idempotency-Key": "k"})

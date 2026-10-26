@@ -91,11 +91,17 @@ def _load_toml() -> dict[str, Any]:
     for section in (keystone, database, cache, lumen, chat, mcp):
         for k, v in section.items():
             merged[k] = v
+    for key in ("policy_file", "policy_dirs"):
+        if key in data.get("oslo_policy", {}):
+            merged["oslo_policy_" + key] = data["oslo_policy"][key]
     return merged
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", case_sensitive=False, hide_input_in_errors=True)
+
+    oslo_policy_policy_file: str = "/etc/lumen/policy.yaml"
+    oslo_policy_policy_dirs: list[str] = Field(default_factory=list)
 
     plugin_config: PluginRuntimeConfig = Field(default_factory=PluginRuntimeConfig)
     runtime_config: RuntimeConfig = Field(default_factory=RuntimeConfig)
@@ -105,6 +111,9 @@ class Settings(BaseSettings):
     worker_concurrency: int = Field(default=4, ge=1, le=64)
     worker_heartbeat_seconds: int = Field(default=5, ge=1, le=30)
     worker_drain_seconds: int = Field(default=300, ge=0, le=3600)
+    bifrost_executable: str = Field(default="lumen-bifrost", min_length=1)
+    bifrost_startup_seconds: float = Field(default=30.0, gt=0, le=300)
+    bifrost_shutdown_seconds: float = Field(default=30.0, gt=0, le=600)
     api_max_active_requests: int = Field(default=256, ge=1, le=100000)
     api_max_sse_connections: int = Field(default=256, ge=1, le=100000)
     api_max_websocket_connections: int = Field(default=64, ge=1, le=100000)

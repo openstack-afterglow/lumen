@@ -18,6 +18,7 @@ import traceback
 import uuid
 from collections import Counter
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import test_infrastructure_store
@@ -31,7 +32,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_infrastructure import ChatResourceOperation, ChatRuntimePool, ChatRuntimeResource
 from lumen.services.infrastructure import _coordination, store
-from lumen.services.infrastructure._coordination import PoolCoordinator
+from lumen.services.infrastructure import controller as controller_module
+from lumen.services.infrastructure._coordination import PoolCoordinator, Snapshot
 from lumen.services.infrastructure.config import PoolConfig
 from lumen.services.infrastructure.controller import PoolLeaseLost, ResourceController
 from lumen.services.infrastructure.providers import Observation
@@ -360,6 +362,90 @@ async def test_sql_release_waits_for_in_flight_fenced_sdk_effect(pool):
     finally:
         release.set()
         await asyncio.gather(work, *([releasing] if releasing is not None else []), return_exceptions=True)
+        controller.executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("action", ["create", "delete"])
+@pytest.mark.parametrize("failure", ["unassigned", "redis-down", "sql-takeover", "in-flight"])
+async def test_claimed_sdk_boundary_preserves_native_journal_and_safe_recovery(pool, monkeypatch, action, failure):
+    _, fence = await store.claim_pool_lease(pool.id, "A", 30)
+    resource = await store.request_resource(
+        pool, role="worker", request_fingerprint="f" * 64,
+        image_ref=pool.image_ref, policy_digest=pool.profile_digest, deadline=None,
+    )
+    if action == "delete":
+        async with get_session_factory()() as session, session.begin():
+            row = await session.get(ChatRuntimeResource, resource.id)
+            row.provider_id, row.observed_state = "synthetic-server", "booting"
+        await store.request_delete(resource.id, "A", fence)
+
+    controller = ResourceController(_runtime_config(pool.deployment_id, (pool.name,)), {}, owner="A")
+    snapshot = Snapshot("A", {}, {pool.name: "A"})
+    controller._coordinator = SimpleNamespace(current=AsyncMock(return_value=snapshot))
+    monkeypatch.setattr(controller, "_intent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(controller, "_ref", lambda *_args: object())
+    monkeypatch.setattr(controller, "_withdraw_ingress", AsyncMock(return_value=True))
+    claim_operation = store.claim_operation
+    successor_fence = None
+
+    async def claim(*args):
+        nonlocal successor_fence
+        operation = await claim_operation(*args)
+        assert operation is not None
+        if failure == "unassigned":
+            controller._coordinator.current.return_value = Snapshot("B", {}, {pool.name: "B"})
+        elif failure == "redis-down":
+            controller._coordinator.current.side_effect = ConnectionError("synthetic Redis unavailable")
+        elif failure == "sql-takeover":
+            assert await store.release_pool_lease(pool.id, "A", fence)
+            _, successor_fence = await store.claim_pool_lease(pool.id, "B", 30)
+            # A successor cannot repeat the committed claim before non-submission is certified.
+            assert await claim_operation(resource.id, 1, action, "B", successor_fence) is None
+        return operation
+
+    monkeypatch.setattr(store, "claim_operation", claim)
+    calls = []
+
+    def effect(_request):
+        calls.append(action)
+        raise TimeoutError("synthetic SDK response lost")
+
+    provider = SimpleNamespace(requires_delivery=True, create=effect, delete=effect)
+    token = controller_module._POOL.set(pool.name)
+    try:
+        with pytest.raises(TimeoutError if failure == "in-flight" else PoolLeaseLost):
+            await getattr(controller, "_reconcile_" + action)(resource, SimpleNamespace(name=pool.name), fence, provider)
+        async with get_session_factory()() as session:
+            operation = await session.scalar(select(ChatResourceOperation).where(
+                ChatResourceOperation.resource_id == resource.id, ChatResourceOperation.action == action))
+            row = await session.get(ChatRuntimeResource, resource.id)
+            if failure == "in-flight":
+                assert calls == [action]
+                assert operation.request_status == "unknown" and operation.owner == "A" and operation.attempts == 1
+                if action == "create":
+                    assert row.observed_state == "unknown"
+            else:
+                assert calls == []
+                assert operation.request_status == "claimed" and operation.owner == store._UNCLAIMED
+                assert operation.fence == 0 and operation.attempts == 0
+                assert row.observed_state == ("requested" if action == "create" else "booting")
+
+        if successor_fence is None:
+            assert await store.release_pool_lease(pool.id, "A", fence)
+            _, successor_fence = await store.claim_pool_lease(pool.id, "B", 30)
+        assert not await store.defer_unsubmitted_operation(resource.id, 1, action, "B", fence)
+        if failure == "in-flight":
+            # Even the original claimant cannot reset a durably ambiguous request.
+            assert not await store.defer_unsubmitted_operation(resource.id, 1, action, "A", fence)
+            assert await claim_operation(resource.id, 1, action, "B", successor_fence) is None
+        else:
+            assert await claim_operation(resource.id, 1, action, "B", successor_fence) is not None
+            assert await claim_operation(resource.id, 1, action, "B", successor_fence) is None
+            # A stale claimant cannot release the successor's newly claimed work.
+            assert not await store.defer_unsubmitted_operation(resource.id, 1, action, "A", fence)
+        assert await store.occupancy(pool.id) == 1
+    finally:
+        controller_module._POOL.reset(token)
         controller.executor.shutdown(wait=True)
 
 

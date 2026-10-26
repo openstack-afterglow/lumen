@@ -8,7 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field
 
-from lumen.auth import Principal, require_scopes
+from lumen.auth import Principal, credential_authority_snapshot, require_scopes
 from lumen.config import get_settings
 from lumen.services import credit
 from lumen.services.durable_runs import errors as durable_errors
@@ -62,7 +62,8 @@ async def create_session(
     try:
         return await admit_realtime_session(payload.model_dump(), project_id=principal["project_id"],
             user_id=principal["user_id"], client_request_id=str(idempotency_key),
-            source=principal.get("source", "web"), api_key_id=principal.get("api_key_id"))
+            source=principal.get("source", "web"), api_key_id=principal.get("api_key_id"),
+            credential_authority=credential_authority_snapshot(principal))
     except (durable_errors.DurableRunError, credit.QuotaExceeded, ProviderValidationError) as exc:
         raise _error(exc) from exc
 

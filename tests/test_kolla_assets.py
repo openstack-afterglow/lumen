@@ -424,8 +424,11 @@ def test_runtime_enabled_kolla_config_loads_as_typed_settings(tmp_path, backend)
         runtime["tls"].update(worker_client_cert_file="/etc/lumen/controller/fixed-worker.pem",
                               worker_client_key_file="/etc/lumen/controller/fixed-worker-key.pem")
     values = dict.fromkeys(meta.find_undeclared_variables(environment.parse(source)), "")
+    role_defaults = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
+    values.update(_resolved_kolla_defaults(set(values) & set(role_defaults)))
     values.update(
         lumen_runtime_enabled=True, lumen_runtime_config=runtime,
+        lumen_policy_file="/etc/lumen/policy.yaml", lumen_policy_dirs=[],
         lumen_controller_listen_address="10.42.0.5", lumen_controller_listen_port=8013,
         lumen_worker_concurrency=4, lumen_worker_heartbeat_seconds=5,
         lumen_worker_drain_seconds=300, lumen_chat_compat_run_timeout_seconds=300,
@@ -474,7 +477,7 @@ def test_runtime_enabled_kolla_config_loads_as_typed_settings(tmp_path, backend)
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_runtime_worker_mount_excludes_controller_signing_keys(enabled):
-    values = _resolved_kolla_defaults(["lumen_worker_runtime_volumes"], {
+    values = _resolved_kolla_defaults(["lumen_worker_runtime_volumes", "lumen_policy_directory"], {
         "lumen_runtime_enabled": enabled, "enable_lumen_worker": True,
         "lumen_worker_secrets_dir": "/srv/worker-client",
         "lumen_controller_secrets_dir": "/srv/controller-only",
@@ -486,7 +489,8 @@ def test_runtime_worker_mount_excludes_controller_signing_keys(enabled):
         defaults["lumen_services"]["lumen-worker"]["volumes"],
     ).render(**values)
     assert mounts == [
-        "/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro", "kolla_logs:/var/log/kolla/", *expected,
+        "/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro",
+        "/etc/kolla/lumen/policy:/etc/lumen/policy.d:ro", "kolla_logs:/var/log/kolla/", *expected,
     ]
 
 

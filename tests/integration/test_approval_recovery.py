@@ -77,7 +77,7 @@ async def approval_recovery(monkeypatch):
         return chunks()
 
     monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-    monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
     monkeypatch.setattr(interactions, "get_settings", lambda: SimpleNamespace(chat_execution_protocol_version=2))
     try:

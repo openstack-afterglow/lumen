@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from copy import deepcopy
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Literal
@@ -19,6 +20,7 @@ from lumen.services.message_graph import append_active_message, reachable_messag
 from lumen.services.message_parts import serialize_parts
 from lumen.services.message_timestamps import message_timestamps
 from lumen.services.providers import routing as ps
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.run_store import NONTERMINAL, append_event
 
 from .common import (
@@ -94,6 +96,15 @@ async def _apply_root_budget(
     return True
 
 
+def _intent_with_credential_authority(
+    intent: dict[str, Any], credential_authority: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind trusted non-secret attenuation to UUID reuse, preserving legacy intents."""
+    if credential_authority is None:
+        return intent
+    return {**intent, "_credential_authority": deepcopy(credential_authority)}
+
+
 async def existing_run_for_intent(
     *,
     project_id: str,
@@ -136,6 +147,8 @@ def _add_run_providers(session, run: ChatRun, capability_snapshot: dict[str, Any
             provider_label=capability_snapshot["provider_name"],
             model_label=capability_snapshot["model_name"],
             config_version_hash=capability_snapshot["config_version_hash"],
+            **{key: value for key, value in execution_identity(capability_snapshot).items()
+               if key not in {"provider_auth", "provider_quota_group"}},
         )
     )
     summary = capability_snapshot.get("summary_route")
@@ -149,8 +162,20 @@ def _add_run_providers(session, run: ChatRun, capability_snapshot: dict[str, Any
                 provider_label=summary["provider_name"],
                 model_label=summary["model_name"],
                 config_version_hash=summary["config_version_hash"],
+                **{key: value for key, value in execution_identity(summary).items()
+                   if key not in {"provider_auth", "provider_quota_group"}},
             )
         )
+    for purpose, route in (capability_snapshot.get("feature_routes") or {}).items():
+        if purpose not in {"search", "advisor"} or not isinstance(route, dict):
+            continue
+        session.add(ChatRunProvider(
+            run_id=run.id, purpose=purpose, provider_id=route["provider_id"], model_id=route.get("model_id"),
+            provider_label=route["provider_name"], model_label=route.get("model_name") or purpose,
+            config_version_hash=route["config_version_hash"],
+            **{key: value for key, value in execution_identity(route).items()
+               if key not in {"provider_auth", "provider_quota_group"}},
+        ))
 
 
 async def _lock_run_configurations(
@@ -330,6 +355,7 @@ async def create_persistent_run(
         user_id=user_id,
         project_id=project_id,
     )
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
@@ -524,6 +550,7 @@ async def create_run(
         user_id=user_id,
         project_id=project_id,
     )
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
@@ -712,6 +739,7 @@ async def create_temp_run(
         user_id=user_id,
         project_id=project_id,
     )
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
@@ -873,6 +901,7 @@ async def create_compaction_run(
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
     request_payload["required_scopes"] = ["native:runs:write",
         "native:conversations:read" if conversation_id is not None else "native:runs:read"]
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():

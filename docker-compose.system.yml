@@ -8,7 +8,6 @@ x-test-trust: &test-trust
   SSL_CERT_FILE: /trust/ca-bundle.pem
   REQUESTS_CA_BUNDLE: /trust/ca-bundle.pem
   AWS_CA_BUNDLE: /trust/ca-bundle.pem
-  LITELLM_LOCAL_MODEL_COST_MAP: "True"
 
 # Media transports deliberately ignore environment proxy/CA overrides. Install the
 # mounted test CA into certifi's default bundle only in these disposable containers.
@@ -325,6 +324,7 @@ services:
     volumes:
       - system-seed:/seed
       - system-test-ca:/trust:ro
+      - ${LUMEN_POLICY_FILE:-./lumen/policy.yaml.sample}:/etc/lumen/policy.yaml:ro
 
   lumen-api:
     networks: [isolated]
@@ -361,6 +361,7 @@ services:
       retries: 50
     volumes:
       - system-test-ca:/trust:ro
+      - ${LUMEN_POLICY_FILE:-./lumen/policy.yaml.sample}:/etc/lumen/policy.yaml:ro
 
   lumen-worker:
     networks: [isolated]
@@ -388,6 +389,7 @@ services:
     healthcheck: *worker-health
     volumes:
       - system-test-ca:/trust:ro
+      - ${LUMEN_POLICY_FILE:-./lumen/policy.yaml.sample}:/etc/lumen/policy.yaml:ro
 
   lumen-batch-worker:
     networks: [isolated]
@@ -415,6 +417,7 @@ services:
     healthcheck: *worker-health
     volumes:
       - system-test-ca:/trust:ro
+      - ${LUMEN_POLICY_FILE:-./lumen/policy.yaml.sample}:/etc/lumen/policy.yaml:ro
 
   # Manual development-only controller profile, not part of lumen-test system.
   # Requires explicit runtime config, TLS and a built sandbox image on a disposable Docker host.

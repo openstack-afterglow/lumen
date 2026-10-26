@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import litellm
-
 from lumen.config import get_settings
+from lumen.services import provider_client
 from lumen.services.providers import routing as provider_store
 from lumen.services.providers.errors import AmbiguousModelRouteError
 
@@ -17,15 +16,16 @@ async def embed_with_route(*, route: dict, text: str, dimensions: int) -> list[f
     """Embed with a caller-owned immutable route; callers own pricing and snapshot policy."""
     if not text.strip() or dimensions <= 0:
         raise EmbeddingUnavailable("semantic memory embedding route is unavailable")
-    if route.get("provider_auth") is not None:
+    if (route.get("provider_auth") or {}).get("auth_mode", "api_key") != "api_key":
         raise EmbeddingUnavailable("subscription providers do not support embeddings")
     try:
-        response = await litellm.aembedding(
+        response = await provider_client.aembedding(
             model=route["model_name"],
             input=[text],
             api_key=route["api_key"],
             api_base=route["api_base"],
             custom_llm_provider=route["provider_type"],
+            provider_auth=route.get("provider_auth"),
         )
         data = response.data[0]
         vector = data["embedding"] if isinstance(data, dict) else data.embedding
@@ -43,7 +43,8 @@ async def embed_maintenance(text: str) -> list[float]:
     if not settings.chat_memory_embedding_model:
         raise EmbeddingUnavailable("semantic memory embedding route is unavailable")
     try:
-        route = await provider_store.resolve_model(settings.chat_memory_embedding_model)
+        route = await provider_store.resolve_model(settings.chat_memory_embedding_model,
+                                                   required_capabilities=("embeddings",))
     except AmbiguousModelRouteError as exc:
         raise EmbeddingUnavailable("semantic memory embedding route is ambiguous") from exc
     if route is None:

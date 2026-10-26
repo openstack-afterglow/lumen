@@ -12,13 +12,14 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from provider_fixtures import configured_provider
 from sqlalchemy import select
 
 from lumen.crypto import decrypt_chat_content
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_batches import ChatBatch, ChatBatchItem
-from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider
+from lumen.models.chat_db import ChatUsageLog, LlmModel
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment
 from lumen.services import assets, credit
 from lumen.services.durable_runs import audio, queries
@@ -60,14 +61,14 @@ async def test_audio_durable_scanned_assets_idempotency_and_unknown(monkeypatch)
     assert factory is not None
     raw = _wave()
     calls: list[str] = []
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
     async def no_wake(_run_id):
         return None
     monkeypatch.setattr(audio, "wake_run", no_wake)
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"audio-provider-{nonce}", provider_type="openai", is_active=True,
+            provider = configured_provider(name=f"audio-provider-{nonce}", provider_type="openai", is_active=True,
                                    margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()
@@ -251,7 +252,7 @@ async def test_audio_explicit_billing_checkpoint_ledger_and_unknown_hold(monkeyp
         if case == "characters" else {"billing_basis": "tokens", "reservation_usd": envelope,
             f"audio_{'output' if kind == 'tts' else 'input'}_per_second": "99",
             "token_rates": {"audio": {"input_per_million": "10", "cache_read_per_million": "1", "output_per_million": "20"}}})
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
     async def no_wake(_run_id):
         return None
@@ -259,7 +260,7 @@ async def test_audio_explicit_billing_checkpoint_ledger_and_unknown_hold(monkeyp
     calls = []
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"audio-bill-provider-{nonce}", provider_type=provider_type,
+            provider = configured_provider(name=f"audio-bill-provider-{nonce}", provider_type=provider_type,
                 is_active=True, margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()
@@ -384,7 +385,7 @@ async def test_timed_transcription_intent_checkpoint_projection_and_invalid_timi
     factory = get_session_factory()
     raw = _wave()
     calls: list[bytes] = []
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
     async def no_wake(_run_id):
         return None
@@ -426,7 +427,7 @@ async def test_timed_transcription_intent_checkpoint_projection_and_invalid_timi
 
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"audio-timed-provider-{nonce}", provider_type="openai", is_active=True,
+            provider = configured_provider(name=f"audio-timed-provider-{nonce}", provider_type="openai", is_active=True,
                                    margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()

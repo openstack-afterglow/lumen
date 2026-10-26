@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.6.9 — Unreleased candidate
+## 0.6.10 — Unreleased candidate
+
+- Replace embedded LiteLLM execution with owned Python transport/metadata/lifecycle and the pinned Bifrost converter companion. Native API, online/batch workers, controller and platform binary are one coordinated release set; no request retry, shadow, engine fallback or alternate-key replay.
+- Add endpoint-owned accounts/credentials, explicit/priority/weighted admission, exact generation/model/operation fences, bounded explicit credential probes and settled per-key relay receipts. Missing historical receipts remain unknown; no synthetic pool or legacy inline credential fallback.
+- Add strict forward028 reconciliation without changing published Kubernetes027 or any applied account027 receipt. Preserve credential ciphertext/environment references/generations, billing keys, original durable journals/holds and single-debit usage allocations. Unknown, partial or contradictory states fail before migration DDL; rollout requires independent review and stopped-writer MariaDB10.11.19 restore/rerun rehearsal.
+- Integrate service-local oslo.policy and original-credential attenuation required by native administration and pre-I/O execution, retaining published direct-system authority, Batch pre-lock authorization and Kubernetes/tool-manifest resume behavior.
+- Isolate overdue input expiry per run so corrupt frozen approvals cannot roll back independent valid expirations; authenticate automatic denials. Distinguish controller assignment/Redis failure before SDK submission from uncertain in-flight outcomes without releasing uncertain claims.
+- Fresh isolated qualification passed service/SDK/plugin/Go/Kolla gates, actual MariaDB10.11.19 forward028/operator-edited reruns, both-platform canonical system stacks, eight image executions and native account/encrypted-checkpoint fixtures. Exact counts and retained failures are in `docs/testing.md`; this is synthetic local evidence, not publication, protected real-backup rehearsal or production approval.
+
+## 0.6.9 — Published source
 
 - Remote MCP unknown effects now require the existing v2 mutation policy/approval path; legacy v1 remote discovery and both dispatch paths are explicit-read-only. Revalidate frozen owner/config/activation identity before dispatch.
 - Remove the superseded permanent HTTP browser connector settings, dedicated cleanup authority/plugin APIs, run-key routing and terminal DELETE hooks. Run-scoped Kubernetes sandbox release uses the existing durable resource lifecycle; generic execution context, frozen remote Afterglow authentication, credential-epoch fencing and approval behavior remain intact.

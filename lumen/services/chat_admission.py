@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 from lumen_plugin_api.contracts import PluginError
 
-from lumen.auth import Principal, ensure_scopes
+from lumen.auth import Principal, credential_authority_snapshot, ensure_scopes
 from lumen.config import get_settings
 from lumen.models.chat_contracts import (
     AgentBudget,
@@ -30,6 +30,7 @@ from lumen.services import workspace_store as ws
 from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.pricing import _has_component_prices, frozen_token_pricing
 from lumen.services.tool_runtime import contracts
 from lumen.services.usage_breakdown import required_modalities_for_request
@@ -217,8 +218,10 @@ def _feature_route_snapshot(route: dict[str, Any], *, purpose: str) -> dict[str,
     """Copy only immutable non-secret route identity into the plaintext run snapshot."""
     fields = ("provider_id", "provider_name", "config_version_hash")
     snapshot = {field: route[field] for field in fields}
+    snapshot.update(execution_identity(route))
     if purpose in {"advisor", "summary"}:
         snapshot.update({"model_id": route["model_id"], "model_name": route["model_name"]})
+        snapshot["output_budget_enforced"] = (route.get("capabilities") or {}).get("output_budget_enforced")
     if purpose == "advisor":
         capabilities = route.get("capabilities")
         snapshot["context_limit"] = route.get("context_limit") or (
@@ -330,12 +333,14 @@ def _run_snapshots(
                 component_prices[price_key] = str(advisor_route[route_key])
     capability_snapshot = {
         "effective_features": features,
+        **execution_identity(resolved),
         "provider_id": resolved["provider_id"],
         "model_id": resolved["model_id"],
         "provider_name": resolved["provider_name"],
         "model_name": resolved["model_name"],
         "config_version_hash": resolved["config_version_hash"],
         "capabilities": resolved.get("capabilities") or {},
+        "provider_request_defaults": dict(resolved.get("provider_request_defaults") or {}),
         "feature_routes": {
             purpose: _feature_route_snapshot(route, purpose=purpose)
             for purpose, route in (feature_routes or {}).items()
@@ -1200,6 +1205,13 @@ async def prepare_context_input(
         skill_instructions=skill_instructions,
     )
     effective_max_tokens = min(max_tokens or _MAX_TOKENS_CAP, _MAX_TOKENS_CAP)
+    if resolved.get("provider_type") == "chatgpt":
+        if max_tokens is not None or temperature is not None:
+            raise HTTPException(status_code=422, detail="subscription does not support explicit output or sampling limits")
+        if frozen_budget is not None:
+            raise HTTPException(status_code=422, detail="subscription_output_budget_unsupported")
+        # Preserve legacy online Codex defaults without discarding caller intent.
+        resolved = {**resolved, "provider_request_defaults": {"omit_output_budget": True, "omit_sampling": True}}
 
     summary_route = await resolve_summary_route(resolved)
     capability_snapshot, pricing_snapshot = _run_snapshots(
@@ -1210,6 +1222,9 @@ async def prepare_context_input(
         parts=parts,
     )
     capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
+    credential_authority = credential_authority_snapshot(token_info) if token_info is not None else None
+    if credential_authority is not None:
+        capability_snapshot["credential_authority"] = credential_authority
     from lumen.services.inference_authority import model_required_scopes, native_run_scopes
 
     capability_snapshot["required_scopes"] = list(native_run_scopes({

@@ -23,10 +23,11 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.config import get_settings
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
-from lumen.models.chat_db import ChatApiKey, ChatQuotaPolicy, ChatUsageLog, UserWallet
+from lumen.models.chat_db import ChatApiKey, ChatProviderUsage, ChatQuotaPolicy, ChatUsageLog, UserWallet
 from lumen.services import quota_policy
 from lumen.services.api_key_store import calculate_effective_limit
-from lumen.services.litellm_client import UsageCost
+from lumen.services.provider_metadata import UsageCost
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.quota_periods import month_start, week_start
 from lumen.services.usage_breakdown import UsageBreakdown, modality_token_charges
 
@@ -744,6 +745,55 @@ async def reset_user_quota(user_id: str) -> dict:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
+def _provider_usage_allocations(
+    route: dict, components: list[dict[str, Any]] | None, *, prompt_tokens: int,
+    completion_tokens: int, raw_cost: Decimal,
+) -> list[dict[str, Any]]:
+    """Allocate observed upstream components without charging the wallet twice."""
+    grouped: dict[tuple[int, int], dict[str, Any]] = {}
+
+    def allocation(identity: dict) -> dict[str, Any] | None:
+        fields = ("provider_id", "provider_account_id", "provider_credential_id", "provider_credential_generation")
+        if any(type(identity.get(key)) is not int for key in fields):
+            return None
+        if any(identity[key] <= 0 for key in fields[:3]) or identity[fields[3]] < 0:
+            raise ValueError("invalid provider usage identity")
+        key = (identity["provider_account_id"], identity["provider_credential_id"])
+        if key not in grouped:
+            grouped[key] = {**{name: identity[name] for name in fields},
+                "provider_backend": identity.get("provider_backend"),
+                "provider_backend_version": identity.get("provider_backend_version"),
+                "prompt_tokens": 0, "completion_tokens": 0, "raw_cost": Decimal("0")}
+        elif any(grouped[key][name] != identity[name] for name in fields):
+            raise ValueError("conflicting provider usage identity")
+        return grouped[key]
+
+    for component in components or ():
+        metadata = component.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise ValueError("invalid provider usage metadata")
+        item = allocation(metadata)
+        if item is None:
+            continue
+        cost = Decimal(str(component.get("cost_usd", "0")))
+        if not cost.is_finite() or cost < 0:
+            raise ValueError("invalid provider component cost")
+        item["raw_cost"] += cost
+        if component.get("unit") == "token":
+            quantity = Decimal(str(component["quantity"]))
+            if not quantity.is_finite() or quantity < 0 or quantity != quantity.to_integral_value():
+                raise ValueError("invalid provider component tokens")
+            direction = "completion_tokens" if "output" in str(component.get("kind")) else "prompt_tokens"
+            item[direction] += int(quantity)
+    if not grouped:
+        item = allocation(route)
+        if item is not None:
+            item.update(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, raw_cost=raw_cost)
+    if sum((item["raw_cost"] for item in grouped.values()), Decimal("0")) > raw_cost:
+        raise ValueError("provider allocations exceed the customer usage cost")
+    return list(grouped.values())
+
+
 
 async def apply_usage_in_transaction(
     session,
@@ -765,6 +815,7 @@ async def apply_usage_in_transaction(
     charge_wallet: bool = True,
     usage_components: list[dict[str, Any]] | None = None,
     breakdown: UsageBreakdown | None = None,
+    execution_route: dict[str, Any] | None = None,
 ) -> Decimal:
     """Append usage and wallet delta in the caller's transaction.
 
@@ -786,6 +837,9 @@ async def apply_usage_in_transaction(
         ),
         "credited_cost": format(credited, "f"),
     }
+    from lumen.services.providers.relay_history import current_receipts
+
+    pricing_snapshot["provider_relays"] = current_receipts(event_id)
     session.add(
         ChatUsageLog(
             event_id=event_id,
@@ -794,6 +848,14 @@ async def apply_usage_in_transaction(
             conversation_id=conversation_id,
             model_name=model_name,
             provider=provider,
+            provider_id=(execution_route or {}).get("provider_id"),
+            **{
+                key: value for key, value in execution_identity(execution_route or {}).items()
+                if key in {
+                    "provider_account_id", "provider_credential_id", "provider_credential_generation",
+                    "provider_backend", "provider_backend_version",
+                }
+            },
             prompt_tokens=int(prompt_tokens),
             completion_tokens=int(completion_tokens),
             **cache_columns,
@@ -807,6 +869,11 @@ async def apply_usage_in_transaction(
             usage_components=usage_components,
         )
     )
+    for allocation in _provider_usage_allocations(
+        execution_route or {}, usage_components, prompt_tokens=int(prompt_tokens),
+        completion_tokens=int(completion_tokens), raw_cost=usage_cost.raw_cost,
+    ):
+        session.add(ChatProviderUsage(event_id=event_id, **allocation))
     await session.flush()
     if charge_wallet:
         wallet = await _get_or_create_wallet(session, user_id, project_id)
@@ -837,6 +904,7 @@ async def apply_usage(
     run_id: str | None = None,
     charge_wallet: bool = True,
     breakdown: UsageBreakdown | None = None,
+    execution_route: dict[str, Any] | None = None,
 ) -> Decimal:
     factory = _require_db()
     try:
@@ -861,6 +929,7 @@ async def apply_usage(
                         charge_wallet=charge_wallet,
                         run_id=run_id,
                         breakdown=breakdown,
+                        execution_route=execution_route,
                     )
             except IntegrityError as exc:
                 await session.rollback()

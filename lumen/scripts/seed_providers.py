@@ -16,7 +16,7 @@ import json
 import os
 
 from lumen.db import close_db, init_db
-from lumen.services.litellm_client import direct_provider_route
+from lumen.services.provider_metadata import direct_provider_route
 from lumen.services.providers import repository
 from lumen.services.providers.audio_transport import validate_audio_request
 from lumen.services.providers.credentials import api_model_name, canonical_subscription_model_name

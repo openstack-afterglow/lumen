@@ -270,6 +270,17 @@ class WorkerLoop:
 
 
 async def serve() -> None:
+    from lumen.services.bifrost_runtime import close_bifrost_runtime
+
+    try:
+        await _serve()
+    finally:
+        # _serve drains durable runs and admitted auxiliary/provider work first.
+        # The child never owns journals, leases or run recovery.
+        await close_bifrost_runtime()
+
+
+async def _serve() -> None:
     settings = get_settings()
     validate_worker_tool_manifests(settings.runtime_config)
     if not settings.database_url:
@@ -285,6 +296,9 @@ async def serve() -> None:
         unhealthy_seconds=settings.database_unhealthy_seconds,
     )
     await registry.start(build_host())
+    from lumen.services.bifrost_runtime import start_bifrost_runtime
+
+    await start_bifrost_runtime()
 
     from lumen.services.checkpointer import chat_checkpointer
 

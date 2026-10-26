@@ -5,13 +5,13 @@ from __future__ import annotations
 from decimal import Decimal
 from types import SimpleNamespace
 
-import litellm
 import pytest
 from fastapi import HTTPException
 
 from lumen.api.models import ModelCreateRequest
-from lumen.services import credit, litellm_client
+from lumen.services import credit, provider_metadata
 from lumen.services.chat_admission import _run_snapshots
+from lumen.services.provider_client import ProviderObject
 from lumen.services.providers import pricing
 from lumen.services.providers.errors import ProviderValidationError
 from lumen.services.usage_breakdown import UsageBreakdown
@@ -174,13 +174,13 @@ def test_rounds_without_a_modality_report_make_the_sum_unknown():
     assert not (reported + UsageBreakdown.from_totals(10, 0)).reported("audio", "input")
 
 
-def test_live_litellm_usage_and_frozen_snapshot_price_modalities_identically():
-    usage = UsageBreakdown.from_runtime(litellm.Usage(
+def test_live_usage_and_frozen_snapshot_price_modalities_identically():
+    usage = UsageBreakdown.from_runtime(ProviderObject(
         prompt_tokens=1000, completion_tokens=100,
         prompt_tokens_details={"audio_tokens": 600, "cached_tokens": 0},
         completion_tokens_details={"audio_tokens": 80},
     ))
-    live = litellm_client.cost_from_usage(
+    live = provider_metadata.cost_from_usage(
         "gpt-audio", usage.input_tokens, usage.output_tokens,
         input_price_per_token=Decimal("0.000002"), output_price_per_token=Decimal("0.000004"),
         price_source="manual", breakdown=usage, allow_catalog_cache=False, allow_catalog_prices=False,

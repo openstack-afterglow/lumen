@@ -40,6 +40,7 @@ async def authorize_media_in_transaction(
     session: AsyncSession, *, user_id: str, project_id: str,
     api_key_id: int | None, required_scopes: tuple[str, ...],
     allowed_scopes: frozenset[str] | None = None,
+    credential_authority: dict | None = None,
 ) -> None:
     """Map the shared credential fence into finite media's safe input error contract.
 
@@ -52,7 +53,7 @@ async def authorize_media_in_transaction(
         return
     try:
         await authorize_api_key_in_transaction(session, user_id=user_id, project_id=project_id,
-            api_key_id=api_key_id, required_scopes=required_scopes)
+            api_key_id=api_key_id, required_scopes=required_scopes, credential_authority=credential_authority)
     except ApiKeyForbidden as exc:
         raise MediaAuthorizationRevoked("media credential is no longer authorized") from exc
     except ApiKeyAuthorityUnavailable as exc:
@@ -143,7 +144,8 @@ async def validate_batch_media_io_in_transaction(session: AsyncSession, run: Cha
     if not isinstance(scopes, list) or not scopes:
         raise DurableRunInputError("batch media scopes are unavailable")
     await authorize_media_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
-        api_key_id=run.api_key_id, required_scopes=tuple(scopes))
+        api_key_id=run.api_key_id, required_scopes=tuple(scopes),
+        credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
     source_id = payload.get("source_asset_id") if run.run_kind == "image" else payload.get("input_asset_id")
     if source_id is not None:
         await lock_media_source_in_transaction(session, asset_id=source_id, user_id=run.user_id,

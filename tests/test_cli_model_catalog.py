@@ -7,6 +7,7 @@ accounting are the only synthetic boundaries, so no paid inference runs.
 from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -18,12 +19,16 @@ from sqlalchemy.pool import StaticPool
 
 from lumen.auth import get_principal
 from lumen.main import app
-from lumen.models.chat_db import LlmModel, LlmProvider
+from lumen.models.chat_db import LlmModel, LlmProvider, LlmProviderAccount, LlmProviderCredential
 from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import completion_api as core
-from lumen.services import litellm_client
-from lumen.services.providers import routing
-from lumen.services.providers.errors import AmbiguousModelRouteError, ChatStorageUnavailable
+from lumen.services import provider_client
+from lumen.services.providers import accounts, routing
+from lumen.services.providers.errors import (
+    AmbiguousModelRouteError,
+    ChatStorageUnavailable,
+    ProviderConfigurationChangedError,
+)
 
 _H = {"Authorization": "Bearer sk-afgl-test"}
 _SECRETS = ("sealed-key-1", "sealed-key-2", "sealed-key-6", "sealed-subscription", "key-1", "key-2")
@@ -60,22 +65,20 @@ def catalog(monkeypatch):
     """Two connections expose the same public ID; inactive, unpriced and subscription routes surround them."""
     engine = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
     LlmProvider.__table__.create(engine)
+    LlmProviderAccount.__table__.create(engine)
+    LlmProviderCredential.__table__.create(engine)
     LlmModel.__table__.create(engine)
     sync_factory = sessionmaker(engine, expire_on_commit=False)
     providers = [
-        dict(id=1, name="OpenAI Direct", provider_type="openai", api_provider="openai", sort_order=1,
-             encrypted_api_key="sealed-key-1"),
+        dict(id=1, name="OpenAI Direct", provider_type="openai", api_provider="openai", sort_order=1),
         dict(id=2, name="NVIDIA Gateway", provider_type="openai", api_provider="nvidia", sort_order=0,
-             encrypted_api_key="sealed-key-2", api_base="https://gateway.invalid/v1"),
+             api_base="https://gateway.invalid/v1"),
         dict(id=3, name="Claude Plan", provider_type="anthropic", api_provider="claude-plan", sort_order=2,
-             auth_mode="anthropic_subscription", encrypted_subscription_tokens="sealed-subscription",
-             subscription_status="configured"),
+             auth_mode="anthropic_subscription"),
         dict(id=4, name="ChatGPT Plan", provider_type="chatgpt", api_provider="chatgpt", sort_order=3,
-             auth_mode="chatgpt_device", encrypted_subscription_tokens="sealed-subscription",
-             subscription_status="configured"),
+             auth_mode="chatgpt_device"),
         dict(id=5, name="Keyless", provider_type="openai", api_provider="keyless", sort_order=4),
-        dict(id=6, name="Retired", provider_type="openai", api_provider="retired", sort_order=5,
-             encrypted_api_key="sealed-key-6", is_active=False),
+        dict(id=6, name="Retired", provider_type="openai", api_provider="retired", sort_order=5, is_active=False),
     ]
     priced = {"input_price": _per_token("1.25"), "output_price": _per_token("10"), "price_source": "manual"}
     models = [
@@ -107,15 +110,21 @@ def catalog(monkeypatch):
         dict(id=61, provider_id=6, model_name="shared-coder", **priced),
     ]
     with sync_factory.begin() as session:
-        session.add_all([LlmProvider(margin_multiplier=Decimal("1"), **row) for row in providers])
+        for row in providers:
+            identifier = row["id"]
+            mode = row.get("auth_mode", "api_key")
+            credential = LlmProviderCredential(
+                id=identifier, name="catalog-key", auth_mode=mode, generation=0,
+                encrypted_api_key=f"sealed-key-{identifier}" if identifier in {1, 2, 6} else None,
+                encrypted_subscription_tokens="sealed-subscription" if identifier in {3, 4} else None,
+                subscription_status="configured" if identifier in {3, 4} else "disconnected",
+            )
+            account = LlmProviderAccount(id=identifier, name="catalog-account", credentials=[credential])
+            session.add(LlmProvider(margin_multiplier=Decimal("1"), accounts=[account], **row))
     with sync_factory.begin() as session:
         session.add_all([LlmModel(**row) for row in models])
 
     monkeypatch.setattr(routing, "_require_db", lambda: lambda: _Session(sync_factory()))
-    # Stored values are sentinels, not ciphertext: only execution may read a credential.
-    monkeypatch.setattr(
-        routing, "resolve_api_key", lambda provider: f"key-{provider.id}" if provider.auth_mode == "api_key" else None
-    )
     yield sync_factory
     engine.dispose()
 
@@ -166,8 +175,8 @@ def provider_calls(monkeypatch):
     async def precheck(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(litellm_client, "aanthropic_messages", messages)
-    monkeypatch.setattr(litellm_client, "aresponses", responses)
+    monkeypatch.setattr(provider_client, "aanthropic_messages", messages)
+    monkeypatch.setattr(provider_client, "aresponses", responses)
     monkeypatch.setattr(core, "_bill", bill)
     monkeypatch.setattr(core, "precheck", precheck)
     return calls
@@ -283,11 +292,193 @@ class TestCliCatalog:
             assert row["capabilities"]["function_calling"] is False
             assert row["usable"] is True
 
-    async def test_catalog_never_reads_credentials(self, client, catalog, api_key_principal, monkeypatch):
-        def forbidden(_provider):
-            raise AssertionError("catalog must not resolve provider credentials")
+    @pytest.mark.parametrize("change", [
+        "disabled-account", "disabled-credential", "account-model", "credential-model",
+        "account-capability", "credential-capability", "expired", "cooldown", "reauth",
+        "missing-key", "wrong-auth-mode", "invalid-generation", "explicit-missing", "explicit-foreign",
+        "invalid-policy", "no-accounts",
+    ])
+    async def test_catalog_requires_current_eligible_account_credential(
+        self, client, catalog, api_key_principal, change
+    ):
+        with catalog.begin() as session:
+            provider = session.get(LlmProvider, 1)
+            account = provider.accounts[0]
+            credential = account.credentials[0]
+            if change == "disabled-account":
+                account.is_active = False
+            elif change == "disabled-credential":
+                credential.is_active = False
+            elif change in {"account-model", "credential-model"}:
+                (account if change == "account-model" else credential).allowed_model_ids = [999]
+            elif change in {"account-capability", "credential-capability"}:
+                (account if change == "account-capability" else credential).allowed_capabilities = ["image"]
+            elif change == "expired":
+                credential.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            elif change == "cooldown":
+                credential.cooldown_until = datetime.now(UTC) + timedelta(hours=1)
+            elif change == "reauth":
+                credential.subscription_status = "reauth_required"
+            elif change == "missing-key":
+                credential.encrypted_api_key = None
+            elif change == "wrong-auth-mode":
+                credential.auth_mode = "anthropic_subscription"
+            elif change == "invalid-generation":
+                credential.generation = -1
+            elif change in {"explicit-missing", "explicit-foreign"}:
+                provider.selection_policy = "explicit"
+                provider.selected_credential_id = None if change == "explicit-missing" else 2
+            elif change == "invalid-policy":
+                provider.selection_policy = "unknown"
+            else:
+                provider.accounts.clear()
+        response = await client.get("/v1/cli/models", headers=_H)
+        assert response.status_code == 200, response.text
+        row = next(item for item in response.json()["models"] if item["id"] == "lumen/1/11")
+        assert (row["usable"], row["protocols"], row["disabled_reason"]) == (
+            False, [], "provider_credentials_missing",
+        )
 
-        monkeypatch.setattr(routing, "resolve_api_key", forbidden)
+    @pytest.mark.parametrize("policy,usable", [("explicit", False), ("priority", True), ("weighted", True)])
+    async def test_catalog_pool_is_availability_not_a_frozen_or_random_selection(
+        self, client, catalog, api_key_principal, monkeypatch, policy, usable
+    ):
+        with catalog.begin() as session:
+            provider = session.get(LlmProvider, 1)
+            provider.selection_policy = policy
+            provider.selected_credential_id = 1
+            account = provider.accounts[0]
+            account.credentials[0].is_active = False
+            account.credentials.append(LlmProviderCredential(
+                id=101, name="eligible-alternate", auth_mode="api_key", generation=9,
+                encrypted_api_key="sealed-alternate", allowed_model_ids=[11], allowed_capabilities=["messages", "responses"],
+            ))
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("catalog froze or randomly selected an account credential")
+        monkeypatch.setattr(routing, "selected_credential", forbidden)
+        monkeypatch.setattr("lumen.services.providers.accounts.secrets.randbelow", forbidden)
+        response = await client.get("/v1/cli/models", headers=_H)
+        assert response.status_code == 200, response.text
+        row = next(item for item in response.json()["models"] if item["id"] == "lumen/1/11")
+        assert row["usable"] is usable
+        assert row["protocols"] == (["messages", "responses"] if usable else [])
+        assert "provider_auth" not in row and "provider_credential_id" not in row
+        assert "sealed-alternate" not in response.text
+
+    @pytest.mark.parametrize("change", ["missing-tokens", "expired", "reauth", "disabled-account"])
+    async def test_catalog_subscription_checks_selected_account_material_and_expiry(
+        self, client, catalog, api_key_principal, change
+    ):
+        with catalog.begin() as session:
+            account = session.get(LlmProvider, 3).accounts[0]
+            credential = account.credentials[0]
+            if change == "missing-tokens":
+                credential.encrypted_subscription_tokens = None
+            elif change == "expired":
+                credential.subscription_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            elif change == "reauth":
+                credential.subscription_status = "reauth_required"
+            else:
+                account.is_active = False
+        response = await client.get("/v1/cli/models", headers=_H)
+        assert response.status_code == 200, response.text
+        row = next(item for item in response.json()["models"] if item["id"] == "lumen/3/31")
+        assert (row["usable"], row["protocols"], row["disabled_reason"]) == (
+            False, [], "provider_credentials_missing",
+        )
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    async def test_catalog_keyless_local_endpoint_still_requires_eligible_account(
+        self, client, catalog, api_key_principal, enabled
+    ):
+        with catalog.begin() as session:
+            provider = session.get(LlmProvider, 5)
+            provider.api_base = "http://local-provider.invalid/v1"
+            provider.accounts[0].is_active = enabled
+        response = await client.get("/v1/cli/models", headers=_H)
+        assert response.status_code == 200, response.text
+        row = next(item for item in response.json()["models"] if item["id"] == "lumen/5/51")
+        assert row["usable"] is enabled
+        assert row["protocols"] == (["messages"] if enabled else [])
+
+    @pytest.mark.parametrize("policy", ["priority", "weighted", "explicit"])
+    @pytest.mark.parametrize("invalid", ["expired", "missing-tokens"])
+    async def test_catalog_and_runtime_agree_on_mixed_subscription_pool(
+        self, client, catalog, api_key_principal, monkeypatch, policy, invalid
+    ):
+        with catalog.begin() as session:
+            provider = session.get(LlmProvider, 3)
+            provider.selection_policy = policy
+            provider.selected_credential_id = 3
+            account = provider.accounts[0]
+            rejected = account.credentials[0]
+            rejected.weight = 1000
+            if invalid == "expired":
+                rejected.subscription_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            else:
+                rejected.encrypted_subscription_tokens = None
+            account.credentials.append(LlmProviderCredential(
+                id=103, name="valid-subscription", auth_mode="anthropic_subscription", generation=4,
+                encrypted_subscription_tokens="sealed-valid-subscription", subscription_status="configured",
+                subscription_expires_at=datetime.now(UTC) + timedelta(days=1), priority=10, weight=7,
+            ))
+        draws = []
+        def draw(total):
+            draws.append(total)
+            assert total == 7, "unavailable subscription entered weighted selection"
+            return 0
+        monkeypatch.setattr(accounts.secrets, "randbelow", draw)
+        response = await client.get("/v1/cli/models", headers=_H)
+        assert response.status_code == 200, response.text
+        row = next(item for item in response.json()["models"] if item["id"] == "lumen/3/31")
+        assert row["usable"] is (policy != "explicit")
+        assert draws == [], "catalog selected a pool credential"
+        if policy == "explicit":
+            assert row["disabled_reason"] == "provider_credentials_missing"
+            assert await routing.resolve_api_model("lumen/3/31") is None
+        else:
+            resolved = await routing.resolve_api_model("lumen/3/31")
+            assert resolved["provider_auth"]["credential_id"] == 103
+            assert resolved["provider_auth"]["generation"] == 4
+            assert draws == ([7] if policy == "weighted" else [])
+            with catalog.begin() as session:
+                provider = session.get(LlmProvider, 3)
+                valid = next(credential for credential in provider.accounts[0].credentials if credential.id == 103)
+                valid.subscription_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                with pytest.raises(ProviderConfigurationChangedError):
+                    routing._resolved_model(session.get(LlmModel, 31), provider, ref=resolved["provider_auth"])
+
+    @pytest.mark.parametrize("subject", ["account", "credential"])
+    @pytest.mark.parametrize("operations,protocols", [
+        (["chat"], []), (["messages"], ["messages"]), (["responses"], ["responses"]),
+    ])
+    async def test_exact_cli_routes_and_catalog_enforce_operation_capability_restrictions(
+        self, client, catalog, api_key_principal, subject, operations, protocols
+    ):
+        with catalog.begin() as session:
+            account = session.get(LlmProvider, 1).accounts[0]
+            (account if subject == "account" else account.credentials[0]).allowed_capabilities = operations
+        response = await client.get("/v1/cli/models", headers=_H)
+        assert response.status_code == 200, response.text
+        row = next(item for item in response.json()["models"] if item["id"] == "lumen/1/11")
+        assert row["protocols"] == protocols
+        assert row["usable"] is bool(protocols)
+        for operation in ("chat", "messages", "responses"):
+            exact = await routing.resolve_api_model("lumen/1/11", required_capabilities=(operation,))
+            public = await routing.resolve_api_model("shared-coder", provider="openai", required_capabilities=(operation,))
+            if operation in operations:
+                assert exact["provider_auth"]["required_capabilities"] == [operation]
+                assert public["provider_auth"] == exact["provider_auth"]
+            else:
+                assert exact is None and public is None
+
+    async def test_catalog_never_reads_credentials(self, client, catalog, api_key_principal, monkeypatch):
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("catalog must not decrypt or select provider credentials")
+
+        monkeypatch.setattr("lumen.services.providers.credentials.decrypt_llm_provider_key", forbidden)
+        monkeypatch.setattr(routing, "selected_credential", forbidden)
+        monkeypatch.setattr("lumen.services.providers.accounts.secrets.randbelow", forbidden)
 
         assert (await client.get("/v1/cli/models", headers=_H)).status_code == 200
 
@@ -347,7 +538,11 @@ class TestExactRouteResolution:
         gateway = await routing.resolve_api_model("lumen/2/21")
 
         assert (gateway["provider_id"], gateway["model_id"]) == (2, 21)
-        assert gateway["model_name"] == "shared-coder" and gateway["api_key"] == "key-2"
+        assert gateway["model_name"] == "shared-coder" and gateway["api_key"] is None
+        assert gateway["provider_auth"] == {
+            "provider_id": 2, "account_id": 2, "credential_id": 2, "generation": 0,
+            "auth_mode": "api_key", "model_id": 21, "required_capabilities": ["chat"],
+        }
         assert gateway["api_base"] == "https://gateway.invalid/v1"
         assert (await routing.resolve_api_model("lumen/2/21", provider="nvidia", provider_type="openai"))[
             "model_id"
@@ -389,11 +584,13 @@ class TestCompatRouteTargets:
         assert responses.status_code == 200, responses.text
         sent_messages, sent_responses = provider_calls["messages"][0], provider_calls["responses"][0]
         assert (sent_messages["model"], sent_messages["api_key"], sent_messages["api_base"]) == (
-            "shared-coder", "key-2", "https://gateway.invalid/v1",
+            "shared-coder", None, "https://gateway.invalid/v1",
         )
         assert (sent_responses["model"], sent_responses["api_key"], sent_responses["api_base"]) == (
-            "shared-coder", "key-1", None,
+            "shared-coder", None, None,
         )
+        assert sent_messages["provider_auth"]["credential_id"] == 2
+        assert sent_responses["provider_auth"]["credential_id"] == 1
         billed = [(route["provider_id"], route["model_id"], route["model_name"]) for route in provider_calls["billed"]]
         assert billed == [(2, 21, "shared-coder"), (1, 11, "shared-coder")]
 

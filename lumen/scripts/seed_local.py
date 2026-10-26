@@ -130,12 +130,12 @@ async def seed() -> None:
     user_id = _required("LUMEN_LOCAL_OWNER_USER_ID")
     project_id = _required("LUMEN_LOCAL_OWNER_PROJECT_ID")
     try:
-        authority = await resolve_project_authority(user_id, project_id)
+        authority = {**await resolve_project_authority(user_id, project_id), "user_id": user_id, "project_id": project_id}
         ensure_scopes(authority, "native:keys:write", *_LOCAL_KEY_SCOPES)
     except HTTPException as exc:
         raise RuntimeError(
             f"Local API key owner {user_id!r} in project {project_id!r} must have current Keystone "
-            f"membership, keys-editor and all requested service capabilities: {exc.detail}"
+            f"membership and policy permission for key issuance and all requested service actions: {exc.detail}"
         ) from exc
     provider_name = os.environ.get("LUMEN_LOCAL_PROVIDER_NAME", "local-openai").strip()
     provider_type = os.environ.get("LUMEN_LOCAL_PROVIDER_TYPE", "openai").strip()

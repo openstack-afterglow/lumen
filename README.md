@@ -1,10 +1,10 @@
 # Lumen
 
-Lumen은 AI-chat 백엔드(LiteLLM, LangGraph/LangChain agent 실행, provider/model/conversation/tool/memory 런타임 및 secret)를 단독 소유하는 채팅 및 에이전트 서비스다. OpenAI·Anthropic 호환 completion, native durable run, server-managed tool/skill/memory, provider routing, usage ledger를 제공한다.
+Lumen은 AI-chat 백엔드(owned private Bifrost converter transport, LangGraph/LangChain agent 실행, provider/model/conversation/tool/memory 런타임 및 secret)를 단독 소유하는 채팅 및 에이전트 서비스다. OpenAI·Anthropic 호환 completion, native durable run, server-managed tool/skill/memory, endpoint-owned account/credential pools와 단일 customer usage ledger를 제공한다.
 
 ## 시작
 
-직접 실행 요구사항은 Python 3.12 이상, `uv`, MariaDB, Redis다. 독립형 Compose 실행은 Docker만 필요하다. 기본 `lumen` 패키지는 Kolla 역할 shared data만 제공하므로 서비스 CLI와 runtime import에는 `service` extra가 필요하다.
+직접 실행 요구사항은 Python 3.12 이상, `uv`, MariaDB, Redis와 현재 source에 맞는 native `lumen-bifrost` binary다. Binary source는 `runtime/bifrost/`이며 Go 1.27.3과 고정 module/`go.sum`을 사용한다. Python wheel은 binary를 포함하지 않으므로 `BIFROST_EXECUTABLE` 또는 PATH로 설치한다. Canonical Compose runtime image는 matching companion을 포함한다. 기본 `lumen` 패키지는 Kolla 역할 shared data만 제공하므로 서비스 CLI와 runtime import에는 `service` extra가 필요하다. 상세 binary 준비·forward migration028·drain/rollback은 [운영 가이드](docs/operations.md#private-provider-runtime-and-migration028-cutover)를 따른다.
 
 ```bash
 uv sync --extra service --frozen
@@ -14,6 +14,9 @@ uv run lumen-worker
 ```
 
 개발·테스트 도구까지 설치하려면 `uv sync --extra service --extra dev --frozen`을 사용한다. `lumen-migrate`는 API와 worker보다 먼저 실행한다. `docker/Dockerfile`은 migration을 자동 실행하지 않는다. 설정은 [`lumen.conf.example`](lumen.conf.example)을 복사해 secret manager/환경변수로 완성한다.
+
+현재 provider cutover는 unpublished local source이며 기존 published image/tag의 기능이라고 주장하지 않는다. Python이 선택·권한·가격·durable identity·정산을 소유하고 private Go process는 고정 Bifrost converters와 single-attempt HTTP만 소유한다. Stock gateway/key rotation/fallback/shadow/retry를 사용하지 않는다. Endpoint별 account/credential 정책은 새 admission에서 한 번 선택하고 frozen generation·operation을 I/O 직전 다시 검사한다. Offline historical LiteLLM 1.93.0 catalog와 tiktoken assets의 출처·MIT license는 `lumen/data/NOTICE`에 보존하며 runtime LiteLLM dependency나 live 가격 검증을 뜻하지 않는다. 현재 검증 범위는 [테스트](docs/testing.md#private-bifrost-and-account-pools-2026-10-22-local-only)를 참고한다.
+
 
 ### GHCR 컨테이너 이미지
 

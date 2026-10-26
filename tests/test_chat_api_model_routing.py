@@ -8,7 +8,14 @@ import pytest
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from lumen.models.chat_db import LlmModel, LlmProvider
+from lumen.models.chat_db import (
+    ChatProviderUsage,
+    ChatUsageLog,
+    LlmModel,
+    LlmProvider,
+    LlmProviderAccount,
+    LlmProviderCredential,
+)
 from lumen.services.providers import pricing, repository, routing
 from lumen.services.providers.errors import ProviderValidationError
 
@@ -55,6 +62,9 @@ class _AsyncSession(AbstractAsyncContextManager):
     def add(self, row):
         self.sync.add(row)
 
+    async def delete(self, row):
+        self.sync.delete(row)
+
     async def flush(self):
         for row in self.sync.new:
             if isinstance(row, LlmModel) and row.id is None:
@@ -63,6 +73,11 @@ class _AsyncSession(AbstractAsyncContextManager):
             if isinstance(row, LlmProvider) and row.id is None:
                 row.id = self.ids["provider"]
                 self.ids["provider"] += 1
+            for entity, counter in ((LlmProviderAccount, "account"), (LlmProviderCredential, "credential"),
+                                    (ChatUsageLog, "usage")):
+                if isinstance(row, entity) and row.id is None:
+                    row.id = self.ids[counter]
+                    self.ids[counter] += 1
         self.sync.flush()
 
 
@@ -71,19 +86,25 @@ def provider_db(monkeypatch):
     engine = create_engine("sqlite:///:memory:")
     LlmProvider.__table__.create(engine)
     LlmModel.__table__.create(engine)
+    LlmProviderAccount.__table__.create(engine)
+    LlmProviderCredential.__table__.create(engine)
+    ChatUsageLog.__table__.create(engine)
+    ChatProviderUsage.__table__.create(engine)
     # This routing fixture only needs the pending-run conflict query, not MySQL's MEDIUMTEXT run payload.
     with engine.begin() as connection:
         connection.exec_driver_sql("CREATE TABLE chat_runs (id TEXT PRIMARY KEY, status TEXT)")
         connection.exec_driver_sql("CREATE TABLE chat_run_providers (run_id TEXT, provider_id INTEGER, model_id INTEGER)")
     sync_factory = sessionmaker(engine, expire_on_commit=False)
-    ids = {"model": 100, "provider": 100}
+    ids = {"model": 100, "provider": 100, "account": 100, "credential": 100, "usage": 1000}
 
     def factory():
         return _AsyncSession(sync_factory(), ids)
 
     monkeypatch.setattr(repository, "_require_db", lambda: factory)
     monkeypatch.setattr(routing, "_require_db", lambda: factory)
-    monkeypatch.setattr(routing, "resolve_api_key", lambda provider: f"key-{provider.id}")
+    from lumen.services.providers import credentials
+
+    monkeypatch.setattr(credentials, "decrypt_llm_provider_key", lambda value: value.removeprefix("encrypted:"))
     monkeypatch.setattr(
         routing,
         "_resolved_base_prices",
@@ -127,6 +148,17 @@ def provider_db(monkeypatch):
                     auth_mode=auth_mode,
                     is_active=is_active,
                     margin_multiplier=Decimal("1"),
+                    selection_policy="priority",
+                    accounts=[LlmProviderAccount(
+                        id=provider_id, provider_id=provider_id, name="fixture-account", is_active=True,
+                        priority=0, weight=1,
+                        credentials=[LlmProviderCredential(
+                            id=provider_id, account_id=provider_id, name="fixture-credential", auth_mode=auth_mode,
+                            encrypted_api_key=f"encrypted:key-{provider_id}" if auth_mode == "api_key" else None,
+                            subscription_status="configured" if auth_mode != "api_key" else "disconnected",
+                            generation=0, is_active=True, priority=0, weight=1,
+                        )],
+                    )],
                 )
             )
 
@@ -225,18 +257,18 @@ async def test_admin_prices_save_independently_and_preserve_null_zero_and_other_
         assert reset.json()["price_source"] is None
 
 
-async def test_pre_0_4_text_run_snapshot_survives_media_migration(provider_db):
+async def test_legacy_secret_snapshot_requires_coordinated_readmission(provider_db):
     add_provider, add_model, _model_name = provider_db
     add_provider(provider_type="openai")
     add_model("legacy-text-contract")
-    # Published v0.3.1's HMAC for this exact route and the fixture's fixed key.
-    legacy_hash = "b1f4f048f540ce3bd822c4c35f66c5e2975962b725d5d3a172324727df62190c"
     current = await routing.resolve_model("legacy-text-contract")
-    assert current["config_version_hash"] == legacy_hash
+    assert current["api_key"] is None
+    assert current["provider_auth"]["credential_id"] == 1
     restored = await routing.resolve_model_snapshot(
-        {"provider_id": 1, "model_id": 10, "config_version_hash": legacy_hash}
+        {"provider_id": 1, "model_id": 10,
+         "config_version_hash": "b1f4f048f540ce3bd822c4c35f66c5e2975962b725d5d3a172324727df62190c"}
     )
-    assert restored is not None and restored["model_id"] == 10
+    assert restored is None
 
 
 async def test_perplexity_create_stores_transport_route_and_rejects_public_duplicate(provider_db):
@@ -291,7 +323,8 @@ async def test_api_route_selects_explicit_provider_and_rejects_ambiguity(provide
 
     assert selected["model_id"] == 12
     assert selected["provider_type"] == "perplexity"
-    assert selected["api_key"] == "key-2"
+    assert selected["api_key"] is None
+    assert selected["provider_auth"]["credential_id"] == 2
     assert selected["api_model_name"] == canonical
     with pytest.raises(routing.AmbiguousModelRouteError):
         await routing.resolve_api_model(canonical)
@@ -326,8 +359,7 @@ async def test_api_model_listing_keeps_internal_keys_private_and_does_not_decryp
     add_provider(provider_id=1, provider_type="perplexity")
     add_model("perplexity/perplexity/sonar", model_id=11)
     monkeypatch.setattr(
-        routing,
-        "resolve_api_key",
+        "lumen.services.providers.credentials.decrypt_llm_provider_key",
         lambda _provider: (_ for _ in ()).throw(AssertionError("listing must not decrypt credentials")),
     )
 
@@ -399,9 +431,9 @@ async def test_api_route_resolves_gemini_model_with_or_without_provider(provider
 
 
 def test_capabilities_detect_exact_native_search_support():
-    from lumen.services.capabilities import litellm_capabilities
+    from lumen.services.capabilities import provider_capabilities
 
-    caps_sonar = litellm_capabilities("sonar", "perplexity")
+    caps_sonar = provider_capabilities("sonar", "perplexity")
     assert caps_sonar["web_search"] is True
     assert caps_sonar["web_search_required"] is True
     assert caps_sonar["feature_gates"]["web_search"] == {
@@ -411,7 +443,7 @@ def test_capabilities_detect_exact_native_search_support():
         "pricing_available": True,
     }
 
-    caps_deepseek = litellm_capabilities("perplexity/perplexity/deepseek-v4-flash-0731", "perplexity")
+    caps_deepseek = provider_capabilities("perplexity/perplexity/deepseek-v4-flash-0731", "perplexity")
     assert caps_deepseek["web_search"] is False
     assert caps_deepseek["feature_gates"]["web_search"]["available"] is False
 
@@ -644,7 +676,8 @@ async def test_compatible_transports_resolve_independent_selectors_and_not_catal
         assert route["provider_id"] == expected
         assert route["api_provider"] == selector
         assert route["provider_type"] == "openai"
-        assert route["api_key"] == f"key-{expected}"
+        assert route["api_key"] is None
+        assert route["provider_auth"]["credential_id"] == expected
     assert [row["provider_id"] for row in await routing.list_api_models()] == [2, 1]
     with pytest.raises(routing.AmbiguousModelRouteError):
         await routing.resolve_api_model("shared-public-id")
@@ -718,9 +751,7 @@ async def test_catalog_ranks_and_selector_do_not_invalidate_frozen_execution(pro
     original = await routing.resolve_model_by_id(10)
     await repository.update_provider(1, {"api_provider": "nvidia", "sort_order": 2147483647})
     await repository.update_model(10, {"sort_order": 2147483647})
-    restored = await routing.resolve_model_snapshot({
-        "provider_id": 1, "model_id": 10, "config_version_hash": original["config_version_hash"],
-    })
+    restored = await routing.resolve_model_snapshot(original)
     assert restored["config_version_hash"] == original["config_version_hash"]
     assert restored["api_provider"] == "nvidia"
     assert restored["provider_type"] == "openai"
@@ -856,7 +887,7 @@ async def test_admin_reorder_canonicalizes_duplicate_ranks_and_preserves_frozen_
     async with repository._require_db()() as session, session.begin():
         provider = await session.get(LlmProvider, 1)
         provider.api_base = "https://example.invalid/v1"
-        provider.encrypted_api_key = "synthetic-encrypted-key"
+        provider.accounts[0].credentials[0].encrypted_api_key = "synthetic-encrypted-key"
         provider.encrypted_billing_admin_key = "synthetic-encrypted-billing-key"
         provider.margin_multiplier = Decimal("1.25")
         provider.models_dev_provider_id = "openai"
@@ -914,6 +945,7 @@ async def test_admin_reorder_canonicalizes_duplicate_ranks_and_preserves_frozen_
             "provider_id": route["provider_id"], "model_id": route["model_id"],
             "config_version_hash": route["config_version_hash"],
             "model_kind": route["model_kind"],
+            "provider_auth": route["provider_auth"],
         })
         assert restored is not None
         assert restored["config_version_hash"] == route["config_version_hash"]
@@ -1034,3 +1066,58 @@ async def test_admin_reorder_active_run_409_preserves_all_ranks(provider_db, adm
     assert "실행 중인" in response.json()["detail"]
     assert response.headers["cache-control"] == "no-store"
     assert await _persisted_provider_catalog() == before
+
+
+@pytest.mark.parametrize("kind", ["image", "tts", "stt", "realtime"])
+async def test_kind_correction_preserves_identity_and_moves_only_to_target_catalog(
+    provider_db, admin_client, monkeypatch, kind
+):
+    add_provider, _add_model, _model_name = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    token_rates = {"token_rates": {"image": {"input_per_million": "8", "output_per_million": "30"}}}
+    created = await admin_client.post("/v1/admin/models", json={
+        "provider_id": 1, "model_name": "misclassified-opaque-model", "model_kind": "text",
+        "input_price_per_million": "5", "output_price_per_million": "30",
+        "cache_write_price_per_million": "6", "cache_write_1h_price_per_million": "8",
+        "media_pricing": token_rates,
+    })
+    assert created.status_code == 201, created.text
+    model_id = created.json()["id"]
+    corrected = await admin_client.patch(f"/v1/admin/models/{model_id}", json={
+        "model_kind": kind, "is_active": False, "media_pricing": token_rates,
+        "cache_write_price_per_million": None, "cache_write_1h_price_per_million": None,
+    })
+    assert corrected.status_code == 200, corrected.text
+    saved = corrected.json()
+    assert (saved["id"], saved["model_kind"], saved["is_active"]) == (model_id, kind, False)
+    assert Decimal(saved["input_price_per_million"]) == Decimal("5")
+    assert Decimal(saved["output_price_per_million"]) == Decimal("30")
+    assert saved["media_pricing"] == token_rates
+    assert saved["cache_write_price_per_million"] is None
+    assert saved["cache_write_1h_price_per_million"] is None
+    assert await routing.list_api_models(model_kind="text") == []
+    assert await routing.list_api_models(model_kind=kind) == []
+    activated = await admin_client.patch(f"/v1/admin/models/{model_id}", json={"is_active": True})
+    assert activated.status_code == 200, activated.text
+    assert await routing.list_api_models(model_kind="text") == []
+    assert [row["api_model_name"] for row in await routing.list_api_models(model_kind=kind)] == [saved["api_model_name"]]
+    reloaded = await admin_client.get("/v1/admin/models")
+    assert [(row["id"], row["model_kind"]) for row in reloaded.json()] == [(model_id, kind)]
+
+
+@pytest.mark.parametrize("designation", ["is_title_model", "is_memory_model"])
+async def test_kind_correction_cannot_move_designated_text_model_to_media(
+    provider_db, admin_client, monkeypatch, designation
+):
+    add_provider, add_model, _model_name = provider_db
+    add_provider(provider_type="openai")
+    add_model("designated-model", model_id=11)
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    async with repository._require_db()() as session, session.begin():
+        row = await session.get(LlmModel, 11)
+        setattr(row, designation, True)
+    response = await admin_client.patch("/v1/admin/models/11", json={"model_kind": "image", "is_active": False})
+    assert response.status_code == 400, response.text
+    reloaded = await admin_client.get("/v1/admin/models")
+    assert [(row["id"], row["model_kind"], row[designation], row["is_active"]) for row in reloaded.json()] == [(11, "text", True, True)]

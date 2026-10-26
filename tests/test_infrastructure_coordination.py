@@ -12,7 +12,7 @@ import itertools
 import threading
 from collections import Counter
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -310,6 +310,68 @@ async def test_assignment_check_fails_closed_before_any_sdk_submission(controlle
         with pytest.raises(PoolLeaseLost):
             await controller._renewed_effect(SimpleNamespace(), lambda: calls.append("write"))
         assert calls == []
+    finally:
+        controller_module._POOL.reset(token)
+
+
+@pytest.mark.parametrize("action", ["create", "delete"])
+@pytest.mark.parametrize("failure", ["unassigned", "redis-down", "cancel-before", "in-flight", "cancel-in-flight"])
+async def test_claimed_operation_distinguishes_preflight_loss_from_started_sdk(
+    monkeypatch, controller_factory, action, failure,
+):
+    controller = controller_factory()
+    resource = SimpleNamespace(
+        id="resource-1", generation=1, desired_state="requested" if action == "create" else "deleting",
+        role="worker", ready_at=None, drain_requested_at=None, observed_state="unknown" if action == "create" else "booting",
+        run_id=None,
+    )
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    session.begin.return_value = session
+    monkeypatch.setattr(controller_module, "get_session_factory", lambda: lambda: session)
+    monkeypatch.setattr(controller_module.store, "_locked_resource", AsyncMock(return_value=(resource, SimpleNamespace())))
+    monkeypatch.setattr(controller_module.store, "_owns", lambda *_args: True)
+    deferred, unknown = AsyncMock(return_value=True), AsyncMock(return_value=True)
+    monkeypatch.setattr(controller_module.store, "defer_unsubmitted_operation", deferred)
+    monkeypatch.setattr(controller_module.store, "mark_unknown", unknown)
+    monkeypatch.setattr(controller, "_intent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(controller, "_ref", lambda *_args: object())
+    monkeypatch.setattr(controller, "_withdraw_ingress", AsyncMock(return_value=True))
+
+    async def claim(*_args):
+        if failure == "unassigned":
+            controller._coordinator.snapshot = Snapshot("B", _registry(), {"p0": "B"})
+        elif failure == "redis-down":
+            controller._coordinator.current.side_effect = ConnectionError("synthetic Redis unavailable")
+        elif failure == "cancel-before":
+            controller._coordinator.current.side_effect = asyncio.CancelledError()
+        return SimpleNamespace(id="operation-1")
+
+    monkeypatch.setattr(controller_module.store, "claim_operation", claim)
+    calls = []
+
+    def effect(_request):
+        calls.append(action)
+        if failure == "cancel-in-flight":
+            raise asyncio.CancelledError()
+        raise TimeoutError("synthetic SDK response lost")
+
+    provider = SimpleNamespace(requires_delivery=True, create=effect, delete=effect)
+    token = controller_module._POOL.set("p0")
+    try:
+        expected = asyncio.CancelledError if failure.startswith("cancel-") else (
+            TimeoutError if failure == "in-flight" else PoolLeaseLost)
+        with pytest.raises(expected):
+            await getattr(controller, "_reconcile_" + action)(resource, SimpleNamespace(name="p0"), 17, provider)
+        if failure in {"in-flight", "cancel-in-flight"}:
+            assert calls == [action]
+            unknown.assert_awaited_once_with(resource.id, 1, "A", 17, action=action)
+            deferred.assert_not_awaited()
+        else:
+            assert calls == []
+            deferred.assert_awaited_once_with(resource.id, 1, action, "A", 17)
+            unknown.assert_not_awaited()
     finally:
         controller_module._POOL.reset(token)
 

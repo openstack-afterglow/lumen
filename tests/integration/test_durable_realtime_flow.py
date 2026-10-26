@@ -10,6 +10,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from provider_fixtures import configured_provider
 from sqlalchemy import select, update
 
 from lumen.db import close_db, get_session_factory, init_db
@@ -37,10 +38,10 @@ async def test_realtime_durable_exact_pcm_usage_and_crash_unknown(monkeypatch, l
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"realtime-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"realtime-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()
@@ -153,14 +154,14 @@ async def test_realtime_token_usage_settles_once_or_keeps_checkpointed_unknown_h
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     usage = (_realtime_usage(text_in=200, audio_in=800, cached_text=100, cached_audio=300, text_out=100, audio_out=400)
              + _realtime_usage(text_in=100, audio_in=500, cached_text=0, cached_audio=0, text_out=50, audio_out=250))
     meter = AudioMeter(input_bytes=4800, output_bytes=4800, input_sample_rate_hz=24000,
                        output_sample_rate_hz=24000, usage=usage, usage_state="complete")
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"realtime-token-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"realtime-token-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("1"))
             session.add(provider)
             await session.flush()
@@ -244,7 +245,7 @@ async def test_session_deadline_closes_and_settles_connected_time_once(monkeypat
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
 
     class Upstream:
         def __init__(self):
@@ -290,7 +291,7 @@ async def test_session_deadline_closes_and_settles_connected_time_once(monkeypat
     monkeypatch.setattr(realtime_protocol.websockets, "connect", lambda *_args, **_kwargs: connection)
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"session-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"session-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("1"))
             session.add(provider)
             await session.flush()
@@ -341,7 +342,7 @@ async def test_compat_gateways_route_by_wire_transport_not_renamed_selector(monk
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(compat, "get_settings", lambda: SimpleNamespace(chat_api_hosts=""))
 
     async def verify_key(_key):
@@ -379,9 +380,9 @@ async def test_compat_gateways_route_by_wire_transport_not_renamed_selector(monk
     created: list[int] = []
     try:
         async with factory() as session, session.begin():
-            google = LlmProvider(name=f"realtime-google-{nonce}", provider_type="gemini", api_provider="google",
+            google = configured_provider(name=f"realtime-google-{nonce}", provider_type="gemini", api_provider="google",
                                  is_active=True, margin_multiplier=Decimal("1"))
-            openai = LlmProvider(name=f"realtime-openai-{nonce}", provider_type="openai",
+            openai = configured_provider(name=f"realtime-openai-{nonce}", provider_type="openai",
                                  is_active=True, margin_multiplier=Decimal("1"))
             session.add_all([google, openai])
             await session.flush()

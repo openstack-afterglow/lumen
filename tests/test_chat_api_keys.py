@@ -584,6 +584,7 @@ class TestRouter:
             weekly_credit_limit=None,
             *,
             expires_at=None,
+            credential_authority=None,
         ):
             return {
                 "id": 1,
@@ -610,6 +611,7 @@ class TestRouter:
             weekly_credit_limit=None,
             *,
             expires_at=None,
+            credential_authority=None,
         ):
             captured.update(
                 user_id=user_id,
@@ -619,6 +621,7 @@ class TestRouter:
                 monthly_credit_limit=monthly_credit_limit,
                 weekly_credit_limit=weekly_credit_limit,
                 expires_at=expires_at,
+                credential_authority=credential_authority,
             )
             return {
                 "id": 1,
@@ -647,6 +650,7 @@ class TestRouter:
         assert captured["monthly_credit_limit"] == Decimal("50.0")
         assert captured["weekly_credit_limit"] == Decimal("10.0")
         assert captured["expires_at"].tzinfo is UTC
+        assert captured["credential_authority"] is None
         assert resp.json()["owner_monthly_credit_limit"] == "50.0"
         assert resp.json()["effective_monthly_credit_limit"] == "50.0"
 

@@ -1208,7 +1208,6 @@ async def test_expired_approval_denial_resumes_only_authenticated_dispatch(lazy_
     from lumen import crypto
     from lumen.models.chat_runs import ChatToolApproval
     from lumen.services.durable_runs import interactions
-    from lumen.services.durable_runs.errors import DurableRunError
 
     f = lazy_chat_sandbox
     now = datetime.now(UTC)
@@ -1230,8 +1229,7 @@ async def test_expired_approval_denial_resumes_only_authenticated_dispatch(lazy_
             approval.tool_name = "browser_delete_everything"
     now += timedelta(minutes=16)
     if forged_dispatch:
-        with pytest.raises(DurableRunError):
-            await interactions.expire_pending_inputs()
+        assert await interactions.expire_pending_inputs() == []
         async with f.factory() as session:
             run = await session.get(ChatRun, run_id)
             approval = await session.scalar(select(ChatToolApproval).where(ChatToolApproval.run_id == run_id))

@@ -1,6 +1,10 @@
 # 환경변수는 이 TOML 값보다 우선한다. 실제 secret을 저장소에 넣지 않는다.
 # LUMEN_CONFIG_FILE로 다른 파일을 지정할 수 있다. 명시된 파일은 누락/빈 TOML 시 실패한다.
 
+[oslo_policy]
+policy_file = "/etc/lumen/policy.yaml"
+policy_dirs = []
+
 [keystone]
 keystone_auth_url = "https://keystone.example/v3"
 keystone_admin_username = "CHANGE_ME"
@@ -37,6 +41,11 @@ worker_concurrency = 4
 worker_workload_classes = ["online_text", "online_media"]
 worker_heartbeat_seconds = 5
 worker_drain_seconds = 300
+# Private, per-process provider runtime; no public listener or external daemon.
+# Wheel/dev installs must build this binary and put it on PATH, or set its absolute path.
+bifrost_executable = "lumen-bifrost"
+bifrost_startup_seconds = 30
+bifrost_shutdown_seconds = 30
 # Admission rejects new HTTP/SSE requests with 429 and WS handshakes with 503;
 # draining refuses new traffic without terminating established streams/sessions.
 api_max_active_requests = 256

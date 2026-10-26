@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lumen"
-version = "0.6.9"
+version = "0.6.10"
 description = "Afterglow Lumen durable chat, LLM, and agent service"
 requires-python = ">=3.11"
 dependencies = []
@@ -23,6 +23,8 @@ service = [
     "openstacksdk==3.3.0",
     "keystoneauth1>=5.12.0",
     "python-keystoneclient==5.4.0",
+    "oslo.policy>=4.5.0",
+    "oslo.config>=9.6.0",
     "jinja2==3.1.6",
     "pydantic==2.13.4",
     "pydantic-settings==2.14.2",
@@ -34,7 +36,8 @@ service = [
     "httpx>=0.28.1",
     "h11>=0.16.0,<1",
     "boto3>=1.35.0",
-    "litellm==1.93.0",
+    "tiktoken==0.13.0",
+    "openai==2.53.0",
     "mcp==1.28.1",
     "jsonschema==4.26.0",
     "beautifulsoup4==4.14.3",
@@ -60,6 +63,7 @@ dev = [
 
 [tool.hatch.build.targets.wheel.shared-data]
 "deploy/kolla/ansible/roles/lumen" = "share/kolla-ansible/ansible/roles/lumen"
+"lumen/policy.yaml.sample" = "share/lumen/policy.yaml.sample"
 
 [project.scripts]
 lumen-api = "lumen.main:run"
@@ -69,6 +73,12 @@ lumen-migrate = "lumen.scripts.migrate:main"
 lumen-seed-local = "lumen.scripts.seed_local:main"
 lumen-local-connection = "lumen.scripts.show_connection:main"
 lumen-test = "lumen.scripts.test_layers:main"
+
+[project.entry-points."oslo.policy.policies"]
+lumen = "lumen.policy:list_rules"
+
+[project.entry-points."oslo.policy.enforcer"]
+lumen = "lumen.policy:get_enforcer"
 
 [tool.hatch.metadata]
 allow-direct-references = true

@@ -12,6 +12,7 @@ from lumen.models.chat_runs import ChatRun
 from lumen.services import auxiliary
 from lumen.services import memory_store as ms
 from lumen.services.memory_extract import generate_memory_if_applicable
+from lumen.services.providers.relay_history import receipt_owner
 from lumen.services.worker_routing import use_read_committed
 
 _KIND = "memory_extract"
@@ -154,6 +155,7 @@ async def process_one(*, owner: str) -> bool:
         return await _process_claimed(claimed, owner=owner)
 
 
+@receipt_owner
 async def _process_claimed(claimed: tuple[str, str, str, str, str], *, owner: str) -> bool:
     job_id, run_id, conversation_id, project_id, user_id = claimed
     try:

@@ -31,12 +31,15 @@ from lumen.models.chat_db import (
     ChatMessage,
     ChatMessageGraph,
     ChatPluginBinding,
+    ChatProviderUsage,
     ChatQuotaPolicy,
     ChatSkill,
     ChatUsageLog,
     ChatWorkspace,
     LlmModel,
     LlmProvider,
+    LlmProviderAccount,
+    LlmProviderCredential,
     UserWallet,
 )
 from lumen.models.chat_infrastructure import (
@@ -63,6 +66,8 @@ from lumen.models.chat_runs import (
 
 __all__ = [
     "LlmProvider",
+    "LlmProviderAccount",
+    "LlmProviderCredential",
     "LlmModel",
     "ChatConversation",
     "ChatConversationActivePath",
@@ -70,6 +75,7 @@ __all__ = [
     "ChatMessage",
     "ChatMessageGraph",
     "ChatUsageLog",
+    "ChatProviderUsage",
     "ChatQuotaPolicy",
     "UserWallet",
     "ChatMcpServer",

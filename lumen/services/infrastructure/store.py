@@ -280,6 +280,40 @@ async def claim_operation(resource_id: str, generation: int, action: str, owner:
 
     return await retry_deadlocks(transaction)
 
+
+async def defer_unsubmitted_operation(resource_id: str, generation: int, action: str, owner: str, fence: int) -> bool:
+    """Release an exact claim only when its caller certifies the SDK callable never started.
+
+    Pool takeover does not invalidate this evidence: a successor cannot repeat the
+    claimed operation until its original owner durably records non-submission.
+    """
+    if action not in {"create", "delete"} or not owner or owner == _UNCLAIMED:
+        raise ValueError("invalid operation claimant")
+
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            resource, pool = await _locked_resource(session, resource_id, generation)
+            if resource is None or pool is None or resource.observed_state == "deleted":
+                return False
+            if action == "create" and resource.provider_id is not None:
+                return False
+            operation = await session.scalar(select(ChatResourceOperation).where(
+                ChatResourceOperation.resource_id == resource_id,
+                ChatResourceOperation.generation == generation,
+                ChatResourceOperation.action == action,
+            ).with_for_update().execution_options(populate_existing=True))
+            if (operation is None or operation.owner != owner or operation.fence != fence
+                    or operation.request_status != "claimed" or operation.provider_request_id is not None):
+                return False
+            operation.owner, operation.fence, operation.attempts = _UNCLAIMED, 0, 0
+            if action == "create":
+                resource.observed_state = "requested"
+            return True
+
+    return await retry_deadlocks(transaction)
+
+
 async def abort_unsubmitted_create(resource_id: str, generation: int, owner: str, fence: int,
                                    error_code: str) -> bool:
     """Release a claimed create only when the caller certifies no cloud call occurred."""

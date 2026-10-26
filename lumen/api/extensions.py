@@ -319,6 +319,8 @@ async def user_start_mcp_oauth(
 ):
     if token_info["auth_type"] == "api_key":
         raise HTTPException(status_code=403, detail="MCP OAuth 시작은 Keystone 세션이 필요합니다")
+    if token_info.get("credential_restricted"):
+        raise HTTPException(status_code=403, detail="MCP OAuth approval requires an unrestricted human session")
     uid, pid = _owner(token_info)
     initiator_nonce = secrets.token_urlsafe(32)
     try:

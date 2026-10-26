@@ -140,6 +140,9 @@ async def authorize_device(
     body: GatewayAuthorizeBody,
     token_info: dict = Depends(require_token),
 ):
+    if token_info.get("credential_restricted"):
+        raise HTTPException(status_code=403, detail="Device credential approval requires an unrestricted human session")
+    ensure_scopes(token_info, "native:keys:write", *(gateway.GATEWAY_SCOPES if body.action == "approve" else ()))
     try:
         await gateway.enforce_rate_limit(
             "device-approval", f"{token_info['project_id']}:{token_info['user_id']}", limit=10

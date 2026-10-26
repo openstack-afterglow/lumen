@@ -127,6 +127,24 @@ class ResourceController:
             done.set()
             await renewal
 
+    async def _claimed_effect(self, resource, fence: int, action: str, function, *args):
+        """Release only claims whose SDK callable never started; quarantine every started effect."""
+        submitted = False
+
+        def submit():
+            nonlocal submitted
+            submitted = True
+            return function(*args)
+
+        try:
+            return await self._fenced_cloud(resource, fence, submit, action=action)
+        except (Exception, asyncio.CancelledError):
+            if submitted:
+                await store.mark_unknown(resource.id, resource.generation, self.owner, fence, action=action)
+            else:
+                await store.defer_unsubmitted_operation(resource.id, resource.generation, action, self.owner, fence)
+            raise
+
     def _backoff(self, key: str) -> None:
         loop = asyncio.get_running_loop()
         attempt = self._retry.get(key, (0, 0))[1] + 1
@@ -825,12 +843,8 @@ class ResourceController:
                     await lifecycle.fail_waiting_run(resource.run_id, error_code="resource_unavailable",
                                                      safe_message="Sandbox provisioning unavailable")
                 return
-        try:
-            observation = await self._fenced_cloud(resource, fence, provider.create,
-                self._intent(resource, definition, bootstrap_token=token), action="create")
-        except Exception:
-            await store.mark_unknown(resource.id, resource.generation, self.owner, fence)
-            raise
+        observation = await self._claimed_effect(resource, fence, "create", provider.create,
+            self._intent(resource, definition, bootstrap_token=token))
         await store.record_observation(resource.id, resource.generation, self.owner, fence, observation)
 
     async def _reconcile_unknown(self, resource: ChatRuntimeResource, pool: ChatRuntimePool,
@@ -929,11 +943,7 @@ class ResourceController:
             return
         operation = await store.claim_operation(resource.id, resource.generation, "delete", self.owner, fence)
         if operation is not None:
-            try:
-                result = await self._fenced_cloud(resource, fence, provider.delete, ref, action="delete")
-            except Exception:
-                await store.mark_unknown(resource.id, resource.generation, self.owner, fence, action="delete")
-                raise
+            result = await self._claimed_effect(resource, fence, "delete", provider.delete, ref)
             if result.absent:
                 await self._prove_deleted(resource, definition, fence)
             return

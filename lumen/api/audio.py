@@ -8,7 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from lumen.auth import Principal, require_scopes
+from lumen.auth import Principal, credential_authority_snapshot, require_scopes
 from lumen.models.api_requests import SpeechRequest, TranscriptionRequest
 from lumen.services import assets, credit, openai_compat
 from lumen.services.conversation_store import ChatStorageUnavailable
@@ -53,6 +53,7 @@ async def admit(payload: SpeechRequest | TranscriptionRequest, *, kind: str, pri
             client_request_id=str(idempotency_key), source=principal.get("source", "web"),
             api_key_id=principal.get("api_key_id"),
             required_scopes=required_scopes,
+            credential_authority=credential_authority_snapshot(principal),
         )
     except (durable_errors.DurableRunError, assets.AssetError, assets.AssetUnavailable,
             ChatStorageUnavailable, credit.QuotaExceeded, ProviderValidationError) as exc:
