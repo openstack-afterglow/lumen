@@ -9,12 +9,17 @@ from collections.abc import Callable
 from typing import Any
 
 import redis.asyncio as aioredis
+from redis.asyncio.connection import SSLConnection, parse_url
+from redis.asyncio.retry import Retry
+from redis.asyncio.sentinel import Sentinel
+from redis.backoff import NoBackoff
 
 from lumen.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 _client: aioredis.Redis | None = None
+_sentinel: Sentinel | None = None
 
 ttl_fast = 60
 ttl_normal = 300
@@ -23,16 +28,43 @@ ttl_static = 86400
 
 
 def _get_client() -> aioredis.Redis:
-    global _client
+    global _client, _sentinel
     if _client is None:
-        _client = aioredis.from_url(
-            get_settings().redis_url,
-            encoding="utf-8",
-            decode_responses=False,
-            socket_connect_timeout=3,
-            socket_timeout=5,
-            health_check_interval=30,
-        )
+        settings = get_settings()
+        if settings.redis_sentinel_addresses:
+            options = dict(parse_url(settings.redis_url))
+            # Keep URL credentials/DB/options, never its seed or connection class.
+            options.pop("host", None)
+            options.pop("port", None)
+            if options.pop("connection_class", None) is SSLConnection:
+                options["ssl"] = True
+            options.setdefault("encoding", "utf-8")
+            options.setdefault("decode_responses", False)
+            options.setdefault("socket_connect_timeout", 3)
+            options.setdefault("socket_timeout", 5)
+            options.setdefault("health_check_interval", 30)
+            # A lost command response is uncertain, not permission to replay it.
+            options["retry"] = Retry(NoBackoff(), 0)
+            sentinel_options = {
+                name: value for name, value in options.items() if name.startswith(("socket_", "ssl"))
+            }
+            sentinel_options["retry"] = Retry(NoBackoff(), 0)
+            sentinel_options["username"] = settings.redis_sentinel_username or None
+            sentinel_options["password"] = settings.redis_sentinel_password.get_secret_value() or None
+            sentinel = Sentinel(settings.redis_sentinel_addresses, sentinel_kwargs=sentinel_options)
+            client = sentinel.master_for(settings.redis_sentinel_master, **options)
+            # Construction has no awaits or network I/O: sync consumers share the
+            # same atomic event-loop-local publication as async consumers.
+            _client, _sentinel = client, sentinel
+        else:
+            _client = aioredis.from_url(
+                settings.redis_url,
+                encoding="utf-8",
+                decode_responses=False,
+                socket_connect_timeout=3,
+                socket_timeout=5,
+                health_check_interval=30,
+            )
     return _client
 
 
@@ -108,7 +140,14 @@ async def invalidate(pattern: str) -> None:
 
 
 async def close_cache() -> None:
-    global _client
-    if _client is not None:
-        await _client.close()
-    _client = None
+    global _client, _sentinel
+    client, sentinel = _client, _sentinel
+    _client, _sentinel = None, None
+    owned = ([client] if client is not None else []) + (sentinel.sentinels if sentinel is not None else [])
+    # redis-py 5 has no Sentinel close method; own every discovery pool too.
+    results = await asyncio.gather(
+        *(item.close(close_connection_pool=True) for item in owned), return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result

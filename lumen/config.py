@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import math
 import os
+import re
 import tomllib
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, StrictInt, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from redis.asyncio.connection import SSLConnection, parse_url
 
 from lumen.plugins.config import PluginRuntimeConfig
 from lumen.services.infrastructure.config import RuntimeConfig, WorkloadClass
@@ -156,6 +160,10 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/8"
     redis_db_index: int = 8
+    redis_sentinel_addresses: tuple[tuple[str, StrictInt], ...] = ()
+    redis_sentinel_master: str = ""
+    redis_sentinel_username: str = ""
+    redis_sentinel_password: SecretStr = SecretStr("")
 
     lumen_encryption_key: str = ""
 
@@ -217,6 +225,54 @@ class Settings(BaseSettings):
 
     os_cacert: str = ""
     insecure: bool = False
+
+    @field_validator("redis_sentinel_addresses")
+    @classmethod
+    def bounded_sentinel_addresses(cls, value: tuple[tuple[str, int], ...]) -> tuple[tuple[str, int], ...]:
+        if len(value) > 16 or len(set(value)) != len(value):
+            raise ValueError("Valkey Sentinel requires at most 16 distinct addresses")
+        for host, port in value:
+            if (
+                not host or len(host) > 253
+                or any(character.isspace() or ord(character) < 32 for character in host)
+                or any(character in host for character in "/@?#[]")
+                or not 1 <= port <= 65535
+            ):
+                raise ValueError("Valkey Sentinel addresses require a hostname/IP and port 1..65535")
+            if ":" in host:
+                try:
+                    ipaddress.IPv6Address(host)
+                except ValueError:
+                    raise ValueError("Valkey Sentinel IPv6 addresses must be bare IP literals") from None
+        return value
+
+    @model_validator(mode="after")
+    def coherent_redis_sentinel(self) -> Settings:
+        if not (
+            self.redis_sentinel_addresses or self.redis_sentinel_master
+            or self.redis_sentinel_username or self.redis_sentinel_password.get_secret_value()
+        ):
+            return self
+        if not self.redis_sentinel_addresses or not re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", self.redis_sentinel_master):
+            raise ValueError("Valkey Sentinel requires addresses and a bounded ASCII master name")
+        if len(self.redis_sentinel_username) > 256 or any(
+            ord(character) < 33 or ord(character) == 127 for character in self.redis_sentinel_username
+        ):
+            raise ValueError("Valkey Sentinel username must be bounded and contain no whitespace/control characters")
+        try:
+            scheme = urlsplit(self.redis_url).scheme
+            options = parse_url(self.redis_url)
+        except (TypeError, ValueError):
+            raise ValueError("Valkey Sentinel requires a valid redis:// or rediss:// data URL") from None
+        if scheme not in {"redis", "rediss"}:
+            raise ValueError("Valkey Sentinel requires a redis:// or rediss:// data URL")
+        if options.get("connection_class") not in (None, SSLConnection):
+            raise ValueError("Valkey Sentinel cannot override its managed connection class")
+        for name, default in (("socket_connect_timeout", 3.0), ("socket_timeout", 5.0)):
+            timeout = options.get(name, default)
+            if not math.isfinite(timeout) or not 0 < timeout <= 30:
+                raise ValueError("Valkey Sentinel socket timeouts must be finite and in (0, 30] seconds")
+        return self
 
     @model_validator(mode="after")
     def coherent_execution_policy(self) -> Settings:

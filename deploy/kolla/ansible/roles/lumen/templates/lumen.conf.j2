@@ -21,6 +21,10 @@ database_max_overflow = 10
 
 [cache]
 redis_url = {{ lumen_redis_url | to_json }}
+redis_sentinel_addresses = {{ lumen_redis_sentinel_addresses | to_json }}
+redis_sentinel_master = {{ lumen_redis_sentinel_master | to_json }}
+redis_sentinel_username = {{ lumen_redis_sentinel_username | to_json }}
+redis_sentinel_password = {{ lumen_redis_sentinel_password | to_json }}
 
 [lumen]
 lumen_encryption_key = {{ lumen_encryption_key | to_json }}

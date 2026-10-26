@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.11 — Unreleased candidate
+
+- Add optional Valkey Sentinel primary discovery to the existing shared cache client. Preserve data URL authentication, database and TLS/socket options; separate Sentinel client authentication, never fall back to the URL seed, and never blindly replay an interrupted command in Sentinel mode. Direct URL mode retains its existing behavior.
+- Distribute discovery settings through protected Kolla configuration and all API/worker/controller/bootstrap environments, using the existing Valkey inventory and Sentinel port/master/password inputs. Close caller-owned data and discovery pools at process shutdown, including worker/controller lifecycles.
+- Bump only the service/runtime/root lock and packaged Kolla image default to0.6.11. SDK/plugins/sandbox, provider contracts, data, keys, policy and immutable migration027/028 SQL/manifest remain unchanged. Local qualification and native/deployment boundaries are recorded in `docs/testing.md`; this entry does not claim publication or production activation.
+
 ## 0.6.10 — Unreleased candidate
 
 - Replace embedded LiteLLM execution with owned Python transport/metadata/lifecycle and the pinned Bifrost converter companion. Native API, online/batch workers, controller and platform binary are one coordinated release set; no request retry, shadow, engine fallback or alternate-key replay.

@@ -6,10 +6,16 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: root candidate `lumen` `0.6.10` integrates published dev `6ca10ee` (`0.6.9`) with the provider-account/private-converter cutover. Fresh local qualification is recorded in `docs/testing.md`, not artifact publication or production change. Plugin API/default plugins remain `0.1.1`, database plugin `0.1.2`, independent SDK `0.2.1`, and discovery/API contract `1.0.0`; Kubernetes/tool-manifest and owner/credential fences remain. Published Kubernetes027 and any exact historical account027 receipt are immutable. Forward028 reconciles only supported inspected states without rewriting/replaying applied SQL/checksums. All writers must drain/stop and protected matching-engine restore/migration/rerun must pass before cutover.
+- 버전: root candidate `lumen` `0.6.11` extends published `0.6.10` dev `c27e540` with optional Valkey Sentinel routing and owned cache-pool cleanup. Fresh local qualification is recorded in `docs/testing.md`, not artifact publication or production change. Plugin API/default plugins remain `0.1.1`, database plugin `0.1.2`, independent SDK `0.2.1`, and discovery/API contract `1.0.0`; Kubernetes/tool-manifest and owner/credential fences remain. Published Kubernetes027 and any exact historical account027 receipt are immutable. Forward028 reconciles only supported inspected states without rewriting/replaying applied SQL/checksums. All writers must drain/stop and protected matching-engine restore/migration/rerun must pass before cutover.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
+
+### 0.6.11 Valkey Sentinel routing
+
+The cache singleton in `lumen/cache.py` remains synchronous to construct and async to use: existing `_get_client`, `_get_redis`, cache, queue, realtime ticket and controller callers keep one convention. Optional `redis_sentinel_addresses`/`redis_sentinel_master` select the current primary through Sentinel; URL hostname/port never bypass discovery. `redis_url` and the locked redis-py5.0.0 client retain their wire-compatible names; the actual server product is Valkey. URL data username/password/database/options remain data-node properties, with separate SecretStr `redis_sentinel_password` and optional ACL `redis_sentinel_username` for discovery. Rediss TLS and URI socket/TLS options reach both discovery and managed data pools. Bounded coherent settings reject invalid topology, connection-class overrides and nonfinite/unbounded socket timeouts before use.
+
+Sentinel mode alone sets zero command retries: lost replies and old-primary READONLY failures surface to the consumer, and only a later independent operation reconnects/discovers the new primary. No seed/replica/proxy fallback is added. Construction performs no network I/O/await; API, worker and controller own all discovery/data pools and clear the singleton before attempting every close, surfacing cleanup failures. Kolla renders Valkey inventory, `valkey_sentinel_port`/monitor name and the separate optional `valkey_sentinel_password` into the protected config and every service/bootstrap environment. Direct mode retains its existing URL precedence/timeouts/health checks. Root/runtime/image default is0.6.11; SDK/plugin/sandbox versions and all027/028 schema/manifest bytes remain unchanged. Local/native/publication/rollout evidence are separate in `docs/testing.md`.
 
 ### 0.6.9 candidate evidence boundary (2026-10-15)
 
@@ -531,9 +537,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "fd30e1f6ef8b5913d2f1df91d1a2e120c1b0cec65ce4d436b060c8889552ab81",
-  "reviewed_at": "2026-10-26T13:33:08Z",
-  "summary": "Release0.6.10 integrates complete provider-account/probe/receipt/Bifrost slice with published0.6.9 authority. Immutable both027 receipts and strict forward028 exact-state/malformed/unknown-ledger fencing independently reviewed. Full contract4737+SDK143, integration445 includingMariaDB10.11.19, botharch system31, nativeSQL76/PGv2164 and8image executions passed. Cold protected real snapshot rehearsal remains mandatory before live schema mutation."
+  "source_sha256": "2c0645522c92b6790220a48f57a943b41d80a119127c9f06d450d5d7357728a9",
+  "reviewed_at": "2026-10-26T18:19:06Z",
+  "summary": "Scoped 0.6.11 Valkey Sentinel routing review: shared sync cache factory, coherent optional topology/separate secret/TLS settings, owned data/discovery cleanup in worker/controller, Kolla distribution, focused socket/failure and owned Valkey acceptance; immutable migration027/028 and independent SDK/plugin contracts preserved."
 }
 ```
 <!-- architecture-review:end -->

@@ -22,7 +22,7 @@ import socket
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 
-from lumen.cache import _get_redis
+from lumen.cache import _get_redis, close_cache
 from lumen.config import get_settings
 from lumen.db import init_db
 from lumen.logging_config import configure_logging
@@ -488,7 +488,10 @@ async def _serve() -> None:
             await registry.close()
         except Exception:
             logger.error("plugin shutdown failed")
-        await close_db()
+        try:
+            await close_cache()
+        finally:
+            await close_db()
         logger.info("worker shutdown complete")
 
 

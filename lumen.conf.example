@@ -31,6 +31,15 @@ database_auto_create_tables = false
 [cache]
 redis_url = "redis://redis:6379/8"
 redis_db_index = 8
+# Optional Valkey Sentinel primary discovery. Empty fields retain direct URL mode.
+# URL username/password authenticate to DATA nodes; these credentials are separate.
+# For TLS use rediss:// and ssl_ca_certs=/path/to/ca.pem in the URL query; socket/TLS
+# options apply to discovery and data connections. Socket timeouts must be (0, 30].
+# redis_sentinel_addresses = [["valkey-1", 26379], ["valkey-2", 26379], ["valkey-3", 26379]]
+redis_sentinel_addresses = []
+redis_sentinel_master = ""
+redis_sentinel_username = ""
+redis_sentinel_password = ""
 
 [lumen]
 # 정확히 64개의 hex 문자. lumen_encryption_key가 필요하다.

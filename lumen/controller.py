@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from uvicorn import Config, Server
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
+from lumen.cache import close_cache
 from lumen.config import get_settings
 from lumen.db import close_db, init_db
 from lumen.logging_config import configure_logging
@@ -216,7 +217,10 @@ async def _serve() -> None:
         try:
             await registry.close()
         finally:
-            await close_db()
+            try:
+                await close_cache()
+            finally:
+                await close_db()
 
 
 def main() -> None:

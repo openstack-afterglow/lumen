@@ -62,6 +62,9 @@ def _kolla_inventory():
         "lumen_database_password": "test-only-database-password",
         "valkey_server_port": 6379,
         "valkey_master_password": "test-only-valkey-password",
+        "valkey_sentinel_port": 26379,
+        "valkey_sentinel_monitor_name": "kolla",
+        "valkey_sentinel_password": "test-only-discovery-password",
         "keystone_internal_url": "http://10.42.0.10:5000/v3",
         "lumen_keystone_password": "test-only-keystone-password",
         "default_project_domain_name": "Default",
@@ -276,6 +279,34 @@ def test_kolla_config_renders_effective_admission_batch_and_scanner_settings(cus
         assert type(config["lumen"][key]) is type(value)
     assert config["chat"]["chat_clamav_host"] == overrides.get("lumen_clamav_host", "")
     assert config["chat"]["chat_clamav_port"] == overrides.get("lumen_clamav_port", 3310)
+
+
+def test_kolla_sentinel_renders_discovery_and_separate_credentials_for_every_process():
+    from jinja2 import meta
+
+    from lumen.config import Settings
+
+    source = (ROLE_DIR / "templates" / "lumen.conf.j2").read_text()
+    environment = _kolla_environment(_kolla_inventory())
+    names = meta.find_undeclared_variables(environment.parse(source))
+    values = _resolved_kolla_defaults(names)
+    config = tomllib.loads(environment.from_string(source).render(**values))
+    settings = Settings(**config["cache"])
+    assert settings.redis_sentinel_addresses == (("10.42.0.11", 26379),)
+    assert settings.redis_sentinel_master == "kolla"
+    assert settings.redis_sentinel_password.get_secret_value() == "test-only-discovery-password"
+    assert "test-only-valkey-password" in settings.redis_url
+    environments = _resolved_kolla_defaults({"lumen_service_environments"})["lumen_service_environments"]
+    for process in ("lumen-api", "lumen-worker", "lumen-controller"):
+        effective = environments[process]
+        assert effective["REDIS_SENTINEL_ADDRESSES"] == [["10.42.0.11", 26379]]
+        assert effective["REDIS_SENTINEL_MASTER"] == settings.redis_sentinel_master
+        assert effective["REDIS_SENTINEL_PASSWORD"] == settings.redis_sentinel_password.get_secret_value()
+    bootstrap = yaml.safe_load((ROLE_DIR / "tasks" / "bootstrap_service.yml").read_text())
+    for task in bootstrap:
+        effective = task["community.docker.docker_container"]["env"]
+        for key in ("REDIS_SENTINEL_ADDRESSES", "REDIS_SENTINEL_MASTER", "REDIS_SENTINEL_USERNAME", "REDIS_SENTINEL_PASSWORD"):
+            assert key in effective
 
 
 def test_kolla_required_assets_exist():
