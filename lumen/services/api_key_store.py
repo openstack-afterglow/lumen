@@ -14,9 +14,11 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 
+from lumen import service_authority
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import ChatApiKey, ChatUsageLog
 from lumen.services import quota_policy
@@ -27,31 +29,9 @@ logger = logging.getLogger(__name__)
 _KEY_PREFIX = "sk-afgl-"  # 발급 키 접두(식별·표시용)
 
 DEFAULT_API_KEY_SCOPES = ("models:read", "compat:completions:write")
-API_KEY_SCOPES = frozenset(
-    {
-        "models:read",
-        "compat:completions:write",
-        "compat:images:write",
-        "compat:audio:write",
-        "compat:realtime:write",
-        "native:conversations:read",
-        "native:conversations:write",
-        "native:runs:read",
-        "native:runs:write",
-        "native:images:write",
-        "native:audio:write",
-        "native:realtime:write",
-        "native:assets:read",
-        "native:assets:write",
-        "native:extensions:read",
-        "native:extensions:write",
-        "native:tools:execute",
-        "native:memory:read",
-        "native:memory:write",
-        "native:agents:use",
-        "usage:read",
-    }
-)
+# Key management remains Keystone-only; its route action scopes are not issuable.
+API_KEY_SCOPES = frozenset(scope for scope in service_authority.SCOPE_CAPABILITIES
+                           if not scope.startswith("native:keys:"))
 
 
 def _valid_scopes(scopes: object) -> tuple[str, ...] | None:
@@ -68,6 +48,10 @@ class ApiKeyStorageUnavailable(RuntimeError):
     """chat DB 미구성/장애."""
 
 
+class ApiKeyAuthorityUnavailable(ApiKeyStorageUnavailable):
+    """Current Keystone owner authority could not be established."""
+
+
 class ApiKeyNotFound(LookupError):
     """대상 미존재 — 404."""
 
@@ -78,6 +62,10 @@ class ApiKeyForbidden(PermissionError):
 
 class ApiKeyLimitConflict(ValueError):
     """한도 설정 충돌 — 409."""
+
+
+class ApiKeyInvalidExpiry(ValueError):
+    """Expiry must be an aware future datetime — 422."""
 
 
 def _require_db():
@@ -102,6 +90,17 @@ def _is_expired(value: datetime | None, *, now: datetime | None = None) -> bool:
         return False
     normalized = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     return normalized <= (now or datetime.now(UTC))
+
+
+def validate_expires_at(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ApiKeyInvalidExpiry("expires_at must be a timezone-aware datetime")
+    value = value.astimezone(UTC)
+    if value <= datetime.now(UTC):
+        raise ApiKeyInvalidExpiry("expires_at must be in the future")
+    return value
 
 
 def _validate_credit_limit(
@@ -207,6 +206,9 @@ def _public(
         None,
         system_weekly_quota,
     )
+    expires_at = row.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
     return {
         "id": row.id,
         "name": row.name,
@@ -225,6 +227,7 @@ def _public(
         "last_used_at": _iso(row.last_used_at),
         "created_at": _iso(row.created_at),
         "revoked_at": _iso(row.revoked_at),
+        "expires_at": _iso(expires_at),
     }
 
 
@@ -259,7 +262,38 @@ def _owner_ceilings(
     return monthly_ceiling, weekly_ceiling
 
 
-def prepare_key_record(
+async def _current_owner_authority(
+    user_id: str, project_id: str, *, credential_authority: dict | None = None,
+) -> dict:
+    # Lazy import: auth also imports this store to verify key credentials.
+    from lumen.auth import resolve_project_authority
+
+    try:
+        if credential_authority is not None:
+            authority = await resolve_project_authority(user_id, project_id, credential_authority=credential_authority)
+        else:
+            authority = await resolve_project_authority(user_id, project_id)
+        return {**authority, "user_id": user_id, "project_id": project_id}
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise ApiKeyForbidden("현재 프로젝트 멤버십이 없습니다") from exc
+        raise ApiKeyAuthorityUnavailable("현재 Keystone 권한을 확인할 수 없습니다") from exc
+    except Exception as exc:
+        raise ApiKeyAuthorityUnavailable("현재 Keystone 권한을 확인할 수 없습니다") from exc
+
+
+async def current_issuance_scopes(
+    user_id: str, project_id: str, *, credential_authority: dict | None = None,
+) -> frozenset[str]:
+    """Issue only under current directory authority, shared by policy and creation."""
+    authority = await _current_owner_authority(user_id, project_id, credential_authority=credential_authority)
+    allowed = service_authority.allowed_scopes(authority)
+    if "native:keys:write" not in allowed:
+        raise ApiKeyForbidden("API key issuance denied by service policy")
+    return allowed & API_KEY_SCOPES
+
+
+async def prepare_key_record(
     user_id: str,
     project_id: str,
     name: str,
@@ -267,13 +301,18 @@ def prepare_key_record(
     *,
     expires_at: datetime | None = None,
     credential_kind: str = "api_key",
+    credential_authority: dict | None = None,
 ) -> tuple[ChatApiKey, str]:
-    """Build a one-time plaintext credential and its persistable hashed row."""
+    """Revalidate issue authority before generating a one-time hashed credential."""
     validated_scopes = _valid_scopes(list(scopes))
     if validated_scopes is None:
         raise ValueError("API 키 scope가 올바르지 않습니다")
     if credential_kind not in {"api_key", "claude_gateway"}:
         raise ValueError("API 키 credential kind가 올바르지 않습니다")
+    expires_at = validate_expires_at(expires_at)
+    permitted = await current_issuance_scopes(user_id, project_id, credential_authority=credential_authority)
+    if not set(validated_scopes).issubset(permitted):
+        raise ApiKeyForbidden("API 키 scope는 현재 소유자 권한을 초과할 수 없습니다")
     raw = _KEY_PREFIX + secrets.token_urlsafe(32)
     return (
         ChatApiKey(
@@ -298,11 +337,15 @@ async def create_key(
     scopes: list[str],
     monthly_credit_limit: Decimal | None = None,
     weekly_credit_limit: Decimal | None = None,
+    *,
+    expires_at: datetime | None = None,
+    credential_authority: dict | None = None,
 ) -> dict:
     """새 API 키 발급. 반환 dict 의 `key` 는 평문(1회만 노출) — 이후 조회 불가."""
     monthly = _validate_credit_limit(monthly_credit_limit, label="월")
     weekly = _validate_credit_limit(weekly_credit_limit, label="주간")
-    row, raw = prepare_key_record(user_id, project_id, name, scopes)
+    row, raw = await prepare_key_record(user_id, project_id, name, scopes, expires_at=expires_at,
+                                        credential_authority=credential_authority)
     row.owner_monthly_credit_limit = monthly
     row.owner_weekly_credit_limit = weekly
     factory = _require_db()
@@ -328,6 +371,22 @@ async def create_key(
         raise ApiKeyStorageUnavailable("chat DB 오류") from exc
     pub["key"] = raw  # 평문 — 1회만
     return pub
+
+
+async def owner_issuance_policy(user_id: str) -> dict:
+    """Current owner quota ceilings for a new key (no per-key admin limit)."""
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            system = await _get_system_quota(session, user_id)
+            monthly, weekly = _owner_ceilings(None, system)
+            return {
+                "monthly_credit_limit": _dec_str(monthly),
+                "weekly_credit_limit": _dec_str(weekly),
+            }
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ApiKeyStorageUnavailable("chat DB 오류") from exc
 
 
 async def list_keys(user_id: str, project_id: str) -> list[dict]:
@@ -554,10 +613,76 @@ async def revoke_key(key_id: int, user_id: str, project_id: str) -> None:
         raise ApiKeyStorageUnavailable("chat DB 오류") from exc
 
 
-async def verify_key(raw: str) -> dict | None:
-    """API 키 평문 → {user_id, project_id, api_key_id} | None.
+async def authorize_api_key_in_transaction(
+    session,
+    *,
+    api_key_id: int | None,
+    user_id: str,
+    project_id: str,
+    required_scopes: Iterable[str],
+    credential_authority: dict | None = None,
+) -> None:
+    """Revalidate current owner authority before new provider I/O, for keys AND web.
 
-    fail-closed: DB 미가용/오류/미존재/비활성/불일치는 모두 None(호출자가 401 처리).
+    Keys additionally require a refreshed active row and stored scope attenuation.
+    No retained keys-editor capability is required at use. The row is never locked:
+    revocation bounds the next I/O start without cancelling committed provider I/O.
+    """
+    required_scopes = tuple(required_scopes)
+    authority = await _current_owner_authority(user_id, project_id, credential_authority=credential_authority)
+    allowed = service_authority.allowed_scopes(authority)
+    if any(scope not in allowed for scope in required_scopes):
+        raise ApiKeyForbidden("현재 소유자 권한에 필요한 scope가 없습니다")
+    if api_key_id is None:
+        return
+    scopes = await _active_key_scopes(session, api_key_id=api_key_id, user_id=user_id, project_id=project_id)
+    if any(scope not in scopes for scope in required_scopes):
+        raise ApiKeyForbidden("API 키에 필요한 scope가 없습니다")
+
+
+async def current_api_key_scopes(
+    session, *, api_key_id: int | None, user_id: str, project_id: str,
+    credential_authority: dict | None = None,
+) -> frozenset[str]:
+    """Scopes the owner (attenuated by the key, if any) may use now, from one directory lookup.
+
+    For checking many requests of one owner together; each later provider I/O still
+    revalidates through ``authorize_api_key_in_transaction``.
+    """
+    authority = await _current_owner_authority(user_id, project_id, credential_authority=credential_authority)
+    allowed = service_authority.allowed_scopes(authority)
+    if api_key_id is None:
+        return allowed
+    return allowed & frozenset(
+        await _active_key_scopes(session, api_key_id=api_key_id, user_id=user_id, project_id=project_id))
+
+
+async def _active_key_scopes(session, *, api_key_id: int, user_id: str, project_id: str) -> tuple[str, ...]:
+    row = (
+        await session.execute(
+            select(ChatApiKey).where(ChatApiKey.id == api_key_id).execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        row is None
+        or row.owner_user_id != user_id
+        or row.owner_project_id != project_id
+        or not row.is_active
+        or row.revoked_at is not None
+        or _is_expired(row.expires_at)
+    ):
+        raise ApiKeyForbidden("API 키가 더 이상 유효하지 않습니다")
+    scopes = _valid_scopes(row.scopes)
+    if scopes is None:
+        raise ApiKeyForbidden("API 키에 필요한 scope가 없습니다")
+    return scopes
+
+
+async def verify_key(raw: str) -> dict | None:
+    """Verify a key and return its owner's current roles and attenuated scopes.
+
+    Invalid keys or absent membership fail closed as None; unavailable Keystone
+    remains an explicit 503, never indistinguishable from an invalid credential.
     """
     if not raw or not raw.startswith(_KEY_PREFIX):
         return None
@@ -572,7 +697,7 @@ async def verify_key(raw: str) -> dict | None:
             row = (
                 await session.execute(select(ChatApiKey).where(ChatApiKey.key_hash == computed))
             ).scalar_one_or_none()
-            if row is None or not row.is_active or _is_expired(row.expires_at):
+            if row is None or not row.is_active or row.revoked_at is not None or _is_expired(row.expires_at):
                 return None
             # 조회는 해시로 했지만 타이밍 안전 비교를 명시(CLAUDE.md §4).
             if not hmac.compare_digest(row.key_hash, computed):
@@ -580,6 +705,9 @@ async def verify_key(raw: str) -> dict | None:
             scopes = _valid_scopes(row.scopes)
             if scopes is None:
                 return None
+            authority = await _current_owner_authority(row.owner_user_id, row.owner_project_id)
+            allowed = service_authority.allowed_scopes(authority)
+            scopes = tuple(scope for scope in scopes if scope in allowed)
             info = {
                 "user_id": row.owner_user_id,
                 "project_id": row.owner_project_id,
@@ -587,6 +715,9 @@ async def verify_key(raw: str) -> dict | None:
                 "scopes": scopes,
                 "credential_kind": row.credential_kind,
                 "expires_at": row.expires_at,
+                "roles": authority["roles"],
+                "service_system_admin": authority["is_system_admin"],
+                "personal_project_owner": authority.get("personal_project_owner") is True,
             }
             # last_used_at 갱신(best-effort — 실패해도 인증은 성공).
             try:
@@ -595,6 +726,12 @@ async def verify_key(raw: str) -> dict | None:
             except Exception:
                 await session.rollback()
             return info
+    except ApiKeyAuthorityUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ApiKeyForbidden:
+        return None
+    except HTTPException:
+        raise
     except OperationalError:
         mark_db_unhealthy()
         return None

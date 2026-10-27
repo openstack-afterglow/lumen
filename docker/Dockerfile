@@ -1,5 +1,18 @@
 ARG AFTERGLOW_CRYPTO_REF=""
 
+# Compile on the builder architecture, targeting each image's own platform.
+# The Go module and sums pin the provider source independently of Python wheels.
+FROM --platform=$BUILDPLATFORM golang:1.27.3 AS lumen-bifrost-builder
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /src
+COPY runtime/bifrost/go.mod runtime/bifrost/go.sum ./
+RUN go mod download
+COPY runtime/bifrost/ ./
+RUN case "$TARGETOS/$TARGETARCH" in linux/amd64|linux/arm64) ;; *) exit 1 ;; esac \
+    && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+       go build -mod=readonly -trimpath -buildvcs=false -o /out/lumen-bifrost ./cmd/lumen-bifrost
+
 FROM python:3.12-slim AS lumen-builder
 ARG AFTERGLOW_CRYPTO_REF=""
 
@@ -50,7 +63,7 @@ WORKDIR /app
 # The user, directories and their ownership come before the source COPYs so
 # this layer stays cached across code changes. COPY --chown replaces a
 # recursive chown, which copied the whole venv into another layer.
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" appuser \
     && adduser appuser root \
@@ -58,6 +71,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && chown appuser:appuser /app /app/.venv /app/lumen /app/lumen_console /app/packages /app/packages/lumen-plugin-api /app/plugins /data /seed
 
 COPY --from=lumen-builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --from=lumen-bifrost-builder /out/lumen-bifrost /usr/local/bin/lumen-bifrost
+COPY --from=lumen-bifrost-builder /src/NOTICE /src/LICENSE /usr/share/doc/lumen-bifrost/
 COPY --chown=appuser:appuser pyproject.toml uv.lock LICENSE ./
 COPY --chown=appuser:appuser lumen/ ./lumen/
 COPY --chown=appuser:appuser lumen_console/ ./lumen_console/
@@ -74,6 +89,7 @@ RUN python -m compileall -q lumen
 # Import the actual migration entry point without opening a database connection.
 # This catches missing workspace distributions or editable sources before deployment.
 RUN python -m lumen.scripts.migrate --help
+RUN lumen-bifrost --version
 
 FROM lumen-runtime AS lumen-api
 CMD ["uvicorn", "lumen.main:app", "--host", "0.0.0.0", "--port", "8012"]
@@ -90,7 +106,7 @@ FROM python:3.12-slim AS lumen-test
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl openssl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" appuser \
     && adduser appuser root \
@@ -98,18 +114,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && chown appuser:appuser /app /app/.venv /app/lumen /app/lumen_console /app/packages /app/packages/lumen-plugin-api /app/plugins /app/tests /data /seed
 
 COPY --from=lumen-test-builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --from=lumen-bifrost-builder /out/lumen-bifrost /usr/local/bin/lumen-bifrost
+COPY --from=lumen-bifrost-builder /src/NOTICE /src/LICENSE /usr/share/doc/lumen-bifrost/
 COPY --chown=appuser:appuser pyproject.toml uv.lock LICENSE ./
 COPY --chown=appuser:appuser lumen/ ./lumen/
 COPY --chown=appuser:appuser lumen_console/ ./lumen_console/
 COPY --chown=appuser:appuser packages/lumen-plugin-api/ ./packages/lumen-plugin-api/
 COPY --chown=appuser:appuser plugins/ ./plugins/
 COPY --chown=appuser:appuser tests/ ./tests/
+# SDK HTTP clients need only imports; avoid an extra unpinned build-backend fetch.
+# OpenAI and Pillow already come from the frozen service dependency layer.
+COPY --chown=appuser:appuser sdk/lumen_sdk/ ./sdk/lumen_sdk/
 
 ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH="/app/sdk"
 
 USER appuser
 
 RUN python -m compileall -q lumen tests
+RUN lumen-bifrost --version
 
 CMD ["pytest", "-m", "system", "tests/system"]
 
@@ -129,6 +152,11 @@ ARG TARGETARCH
 ARG NODE_VERSION=24.21.0
 ARG NODE_SHA256_AMD64=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
 ARG NODE_SHA256_ARM64=6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2
+# Keep Chromium's sandbox enabled unless the operator explicitly qualifies an
+# alternative image on the target runtime (see IMAGE.md).
+ARG PLAYWRIGHT_CHROMIUM_SANDBOX=true
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bubblewrap \
@@ -157,6 +185,19 @@ RUN set -eu; \
     /usr/bin/node --version | grep -qx "v${NODE_VERSION}"; \
     /usr/bin/python3.12 --version
 
+COPY packages/lumen-sandbox/tools/ /opt/lumen-tools/
+RUN set -eu; \
+    case "$PLAYWRIGHT_CHROMIUM_SANDBOX" in true|false) ;; \
+      *) echo "PLAYWRIGHT_CHROMIUM_SANDBOX must be true or false" >&2; exit 1 ;; \
+    esac; \
+    cd /opt/lumen-tools; \
+    /opt/node/bin/npm ci --omit=dev --ignore-scripts --no-audit --no-fund; \
+    /usr/bin/node node_modules/playwright/cli.js install --with-deps --no-shell chromium; \
+    /usr/bin/node -e 'const fs = require("node:fs"); const { chromium } = require("playwright"); fs.symlinkSync(chromium.executablePath(), "/opt/ms-playwright/chromium");'; \
+    PLAYWRIGHT_CHROMIUM_SANDBOX="$PLAYWRIGHT_CHROMIUM_SANDBOX" /usr/bin/node -e 'const fs = require("node:fs"); const p = "/opt/lumen-tools/playwright.config.json"; const c = JSON.parse(fs.readFileSync(p, "utf8")); c.browser.launchOptions.chromiumSandbox = process.env.PLAYWRIGHT_CHROMIUM_SANDBOX === "true"; fs.writeFileSync(p, JSON.stringify(c, null, 2) + "\n");'; \
+    chmod -R a+rX,go-w /opt/lumen-tools /opt/ms-playwright; \
+    rm -rf /root/.npm /var/lib/apt/lists/*
+
 COPY --from=lumen-sandbox-builder /wheels /wheels
 RUN python -m pip install --no-cache-dir /wheels/lumen_sandbox-*.whl \
     && rm -rf /wheels \
@@ -176,6 +217,10 @@ ENV SANDBOX_STATE_DIR=/var/lib/lumen-sandbox \
     SANDBOX_BOOTSTRAP_FILE=/var/lib/lumen-sandbox/bootstrap/token \
     SANDBOX_PORT=8013
 
+# MCP relative artifact filenames must resolve inside the per-run mount.
+WORKDIR /work
+
 # The manager must run as root to create namespaces/cgroups; workloads never do.
 USER root
 CMD ["lumen-sandbox"]
+

@@ -76,11 +76,11 @@ def _validate_config(export, config: dict) -> None:
         raise ExtensionValidationError("plugin configuration is invalid") from exc
 
 
-def _public(row: ChatPluginBinding) -> dict[str, Any]:
-    return {"id": row.id, "kind": row.kind, "plugin_id": row.plugin_id, "export_key": row.export_key, "name": row.name, "scope": row.scope, "owner_user_id": row.owner_user_id, "owner_project_id": row.owner_project_id, "config": json.loads(decrypt_chat_content(row.encrypted_config)), "config_version": row.config_version, "is_active": row.is_active}
+def _public(row: ChatPluginBinding, *, include_private: bool = True) -> dict[str, Any]:
+    return {"id": row.id, "kind": row.kind, "plugin_id": row.plugin_id, "export_key": row.export_key, "name": row.name, "scope": row.scope, "owner_user_id": row.owner_user_id, "owner_project_id": row.owner_project_id, **({"config": json.loads(decrypt_chat_content(row.encrypted_config))} if include_private else {}), "config_version": row.config_version, "is_active": row.is_active}
 
 
-async def list_bindings(namespace: Namespace | None, *, admin: bool = False) -> list[dict]:
+async def list_bindings(namespace: Namespace | None, *, admin: bool = False, include_private: bool = True) -> list[dict]:
     async with _factory()() as session:
         query = select(ChatPluginBinding)
         if admin:
@@ -89,7 +89,7 @@ async def list_bindings(namespace: Namespace | None, *, admin: bool = False) -> 
             query = query.where(_visible(namespace), ChatPluginBinding.is_active.is_(True))
         else:
             raise ExtensionForbidden("plugin catalogue requires an owner")
-        return [_public(row) for row in (await session.execute(query.order_by(ChatPluginBinding.id))).scalars()]
+        return [_public(row, include_private=include_private) for row in (await session.execute(query.order_by(ChatPluginBinding.id))).scalars()]
 
 
 async def resolve_binding(identifier: str, *, kind: str, namespace: Namespace) -> dict:

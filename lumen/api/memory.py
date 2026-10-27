@@ -189,7 +189,7 @@ async def update_memory(
 
 
 @router.delete("/memories/{memory_id}", status_code=204)
-async def delete_memory(memory_id: int, token_info: dict = Depends(require_scopes("native:memory:write"))):
+async def delete_memory(memory_id: int, token_info: dict = Depends(require_scopes("native:memory:delete"))):
     try:
         namespace = _namespace(project_id=token_info["project_id"], workspace_id=None, token_info=token_info)
         provider = get_plugin("memory")

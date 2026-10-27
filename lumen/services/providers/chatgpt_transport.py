@@ -1,397 +1,282 @@
-"""Request-local ChatGPT subscription transport built on LiteLLM Responses transforms."""
+"""Pinned-target, request-local ChatGPT OAuth transport with a native Responses bridge.
+
+No environment auth, global SDK callbacks, redirects, retries, or on-disk token
+files are involved. A completed response event is required even for nonstreaming
+callers, because the Codex endpoint always returns SSE.
+"""
 
 from __future__ import annotations
 
-import inspect
-from collections.abc import AsyncIterator
+from collections import deque
+from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
 import httpx
-from litellm.completion_extras.litellm_responses_transformation.handler import (
-    ResponsesToCompletionBridgeHandler,
-)
-from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
-from litellm.llms.chatgpt.common_utils import (
-    CHATGPT_API_BASE,
-    get_chatgpt_default_headers,
-)
-from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
-from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
-from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
-from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
-from litellm.types.llms.openai import ResponsesAPIStreamEvents
-from litellm.types.router import GenericLiteLLMParams
-from litellm.types.utils import Choices, Message, ModelResponse
 
-from .credentials import canonical_subscription_model_name, litellm_model_name
+from lumen.services.provider_client import ProviderObject, ProviderStream, _mark_rejected, _subscription_error
+from lumen.services.provider_errors import APIConnectionError, ProviderError, Timeout, error_for_status
+
+from .credentials import ProviderAuthRef, canonical_subscription_model_name, transport_model_name
 from .errors import ProviderSubscriptionError
-from .subscription_logging import SubscriptionLogging
 
-_CHATGPT_RESPONSES_URL = f"{CHATGPT_API_BASE}/responses"
-
+_CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 _REQUEST_TIMEOUT = httpx.Timeout(90.0, connect=10.0, read=90.0, write=30.0, pool=10.0)
-_RESPONSE_KEYS = frozenset(
-    {
-        "instructions",
-        "stream",
-        "include",
-        "tools",
-        "tool_choice",
-        "reasoning",
-        "previous_response_id",
-        "truncation",
-    }
-)
-_FAILURE_EVENTS = frozenset(
-    {
-        ResponsesAPIStreamEvents.RESPONSE_FAILED,
-        ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE,
-        ResponsesAPIStreamEvents.ERROR,
-    }
-)
+_BLOCKED = frozenset({"api_base", "api_key", "base_url", "extra_body", "extra_headers", "headers",
+                      "model", "input", "messages", "provider_auth", "stream", "store", "stream_options"})
 
 
-class StoredChatGPTResponsesConfig(ChatGPTResponsesAPIConfig):
-    """ChatGPT Responses config backed only by a request-local credential."""
-
-    def __init__(self, *, access_token: str, account_id: str, session_id: str) -> None:
-        OpenAIResponsesAPIConfig.__init__(self)
-        self._access_token = access_token
-        self._account_id = account_id
-        self._session_id = session_id
-
-    def validate_environment(
-        self,
-        headers: dict,
-        model: str,
-        litellm_params: GenericLiteLLMParams | None,
-    ) -> dict:
-        del headers, model, litellm_params
-        return get_chatgpt_default_headers(
-            self._access_token,
-            self._account_id,
-            self._session_id,
-        )
-
-    def get_complete_url(self, api_base: str | None, litellm_params: dict) -> str:
-        del api_base, litellm_params
-        return _CHATGPT_RESPONSES_URL
-
-
-class _StrictAsyncHTTPHandler(AsyncHTTPHandler):
-    def create_client(
-        self,
-        timeout: float | httpx.Timeout | None,
-        event_hooks: Any,
-        ssl_verify: Any = None,
-        shared_session: Any = None,
-    ) -> httpx.AsyncClient:
-        client = super().create_client(
-            timeout=timeout,
-            event_hooks=event_hooks,
-            ssl_verify=True,
-            shared_session=shared_session,
-        )
-        client.follow_redirects = False
-        return client
+def _input_content(content: Any) -> Any:
+    if not isinstance(content, list):
+        return content
+    converted = []
+    for part in content:
+        if not isinstance(part, Mapping):
+            raise ValueError("invalid_chat_content")
+        kind = part.get("type")
+        if kind == "text":
+            converted.append({**part, "type": "input_text"})
+        elif kind == "image_url":
+            image = part.get("image_url")
+            if isinstance(image, str):
+                converted.append({"type": "input_image", "image_url": image})
+            elif isinstance(image, Mapping):
+                converted.append({"type": "input_image", **image, "image_url": image.get("url")})
+                converted[-1].pop("url", None)
+            else:
+                raise ValueError("invalid_chat_image")
+        elif kind in {"input_text", "input_image", "input_file", "input_audio"}:
+            converted.append(dict(part))
+        else:
+            raise ValueError("subscription_content_unsupported")
+    return converted
 
 
-async def _close(value: Any) -> None:
-    close = getattr(value, "aclose", None)
-    if close is None:
-        close = getattr(value, "close", None)
-    if close is None:
-        return
-    result = close()
-    if inspect.isawaitable(result):
-        await result
+def _request_body(model: str, messages: list[dict], options: dict) -> dict[str, Any]:
+    if _BLOCKED.intersection(options) - {"stream_options"}:
+        raise ValueError("subscription_transport_options_reserved")
+    body = {key: value for key, value in options.items() if key not in _BLOCKED}
+    if any(options.get(key) is not None for key in ("max_tokens", "max_completion_tokens", "max_output_tokens")):
+        raise ProviderSubscriptionError("subscription_output_budget_unsupported", 422)
+    if any(options.get(key) is not None for key in ("temperature", "top_p", "top_k")):
+        raise ProviderSubscriptionError("subscription_sampling_unsupported", 422)
+    if "reasoning_effort" in body:
+        body["reasoning"] = {**body.get("reasoning", {}), "effort": body.pop("reasoning_effort")}
+    if "response_format" in body:
+        response_format = body.pop("response_format")
+        if isinstance(response_format, Mapping) and response_format.get("type") == "json_schema":
+            schema = response_format.get("json_schema")
+            if not isinstance(schema, Mapping):
+                raise ValueError("invalid_response_format")
+            response_format = {**schema, "type": "json_schema"}
+        body["text"] = {**body.get("text", {}), "format": response_format}
+    tools = body.get("tools")
+    if tools is not None:
+        body["tools"] = [({"type": "function", **tool["function"]} if tool.get("type") == "function" and "function" in tool
+                          else dict(tool)) for tool in tools]
+    choice = body.get("tool_choice")
+    if isinstance(choice, Mapping) and choice.get("type") == "function" and "function" in choice:
+        body["tool_choice"] = {"type": "function", "name": choice["function"]["name"]}
+    if "web_search_options" in body:
+        body["tools"] = [*body.get("tools", []), {"type": "web_search", **body.pop("web_search_options")}]
+    items: list[dict] = []
+    instructions: list[str] = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if role in {"system", "developer"}:
+            if isinstance(content, str):
+                instructions.append(content)
+            elif isinstance(content, list) and all(part.get("type") == "text" for part in content):
+                instructions.extend(part["text"] for part in content)
+            else:
+                raise ValueError("subscription_instructions_unsupported")
+            continue
+        if role == "tool":
+            items.append({"type": "function_call_output", "call_id": message["tool_call_id"], "output": content})
+            continue
+        reasoning_items = message.get("reasoning_items") or []
+        items.extend(dict(item) for item in reasoning_items)
+        if content is not None:
+            if role == "assistant" and isinstance(content, list):
+                converted = [{**part, "type": "output_text"} if part.get("type") == "text" else dict(part) for part in content]
+            else:
+                converted = _input_content(content)
+            items.append({"role": role, "content": converted})
+        for call in message.get("tool_calls") or []:
+            function = call["function"]
+            items.append({"type": "function_call", "call_id": call["id"], "name": function["name"],
+                          "arguments": function.get("arguments", "")})
+    if body.get("instructions") is not None:
+        instructions.append(body["instructions"])
+    body.update(model=transport_model_name(canonical_subscription_model_name(model, "chatgpt_device")),
+                input=items, instructions="\n\n".join(instructions) or "You are a helpful assistant.",
+                store=False, stream=True)
+    body["include"] = list(dict.fromkeys([*body.get("include", []), "reasoning.encrypted_content"]))
+    return body
 
 
-def _subscription_error(error: BaseException) -> ProviderSubscriptionError:
-    status_code = getattr(error, "status_code", None)
-    if status_code is None:
-        response = getattr(error, "response", None)
-        status_code = getattr(response, "status_code", None)
-    if status_code in {401, 403}:
-        return ProviderSubscriptionError("subscription_auth_required", 502)
-    if status_code == 429:
-        return ProviderSubscriptionError("subscription_rate_limited", 429)
-    if isinstance(error, (httpx.TimeoutException, httpx.NetworkError)):
-        return ProviderSubscriptionError("subscription_upstream_unavailable", 503)
-    if isinstance(status_code, int) and status_code >= 500:
-        return ProviderSubscriptionError("subscription_upstream_unavailable", 503)
-    return ProviderSubscriptionError("subscription_auth_invalid_response", 502)
+def _usage(usage: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+    # Retain native details and explicit unknown-vs-zero; never manufacture cache
+    # or modality counters when the endpoint did not report them.
+    result = dict(usage)
+    if "input_tokens" in usage:
+        result["prompt_tokens"] = usage["input_tokens"]
+    if "output_tokens" in usage:
+        result["completion_tokens"] = usage["output_tokens"]
+    if "input_tokens_details" in usage:
+        result["prompt_tokens_details"] = usage["input_tokens_details"]
+    if "output_tokens_details" in usage:
+        result["completion_tokens_details"] = usage["output_tokens_details"]
+    return result
 
 
-class SuccessfulResponsesStream:
-    """Reject every stream that does not prove a completed Responses result."""
+def _completed_chat(response: Mapping[str, Any], model: str) -> ProviderObject:
+    content: list[str] = []
+    reasoning: list[str] = []
+    tools: list[dict] = []
+    reasoning_items: list[dict] = []
+    annotations: list[dict] = []
+    for item in response.get("output", []):
+        if item.get("type") == "message":
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    content.append(part.get("text", ""))
+                    annotations.extend(part.get("annotations", []))
+                elif part.get("type") == "refusal":
+                    content.append(part.get("refusal", ""))
+        elif item.get("type") == "function_call":
+            tools.append({"id": item.get("call_id", item.get("id")), "type": "function",
+                          "function": {"name": item.get("name"), "arguments": item.get("arguments", "")}})
+        elif item.get("type") == "reasoning":
+            reasoning_items.append(dict(item))
+            reasoning.extend(part.get("text", "") for part in item.get("summary", []))
+    message = {"role": "assistant", "content": "".join(content) or None,
+               "tool_calls": tools or None, "reasoning_content": "".join(reasoning) or None,
+               "reasoning_items": reasoning_items or None, "annotations": annotations or None}
+    return ProviderObject(id=response.get("id"), object="chat.completion", model=response.get("model", model),
+                          choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tools else "stop"}],
+                          usage=_usage(response.get("usage")))
 
-    def __init__(self, source: AsyncIterator[Any]) -> None:
+
+class ChatCompletionStream:
+    def __init__(self, source: ProviderStream, model: str) -> None:
         self._source = source
-        self._completed = False
-        self._closed = False
-
-    def __aiter__(self) -> SuccessfulResponsesStream:
-        return self
-
-    async def __anext__(self) -> Any:
-        try:
-            event = await self._source.__anext__()
-        except StopAsyncIteration:
-            await self.aclose()
-            if not self._completed:
-                raise ProviderSubscriptionError("subscription_auth_invalid_response", 502) from None
-            raise
-        except ProviderSubscriptionError:
-            await self.aclose()
-            raise
-        except BaseException as error:
-            await self.aclose()
-            raise _subscription_error(error) from None
-
-        event_type = getattr(event, "type", None)
-        if event_type in _FAILURE_EVENTS:
-            await self.aclose()
-            raise ProviderSubscriptionError("subscription_auth_invalid_response", 502)
-        if event_type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
-            response = getattr(event, "response", None)
-            if getattr(response, "status", None) != "completed":
-                await self.aclose()
-                raise ProviderSubscriptionError("subscription_auth_invalid_response", 502)
-            self._completed = True
-        return event
+        self._model = model
+        self._pending: deque[ProviderObject] = deque()
+        self._tools: dict[str, int] = {}
 
     @property
-    def completed_response(self) -> Any:
-        return getattr(self._source, "completed_response", None) if self._completed else None
+    def completed(self) -> bool:
+        return self._source.completed
 
-    @property
-    def _hidden_params(self) -> dict[str, Any]:
-        value = getattr(self._source, "_hidden_params", None)
-        return value if isinstance(value, dict) else {}
-
-    async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        response = getattr(self._source, "response", None)
-        await _close(response)
-        await _close(self._source)
-
-
-class _OwnedCompletionIterator:
-    def __init__(self, source: Any, guarded: SuccessfulResponsesStream, client: AsyncHTTPHandler) -> None:
-        self._source = source
-        self._guarded = guarded
-        self._client = client
-        self._closed = False
-        self._source.__aiter__()
-
-    def __aiter__(self) -> _OwnedCompletionIterator:
+    def __aiter__(self) -> ChatCompletionStream:
         return self
 
-    async def __anext__(self) -> Any:
+    def _chunk(self, delta: dict, finish: str | None = None, usage: Any = None) -> ProviderObject:
+        return ProviderObject(object="chat.completion.chunk", model=self._model,
+                              choices=[{"index": 0, "delta": delta, "finish_reason": finish}], usage=usage)
+
+    async def __anext__(self) -> ProviderObject:
         try:
-            return await self._source.__anext__()
-        except StopAsyncIteration:
+            while not self._pending:
+                event = await self._source.__anext__()
+                kind = event.get("type")
+                if kind == "response.output_text.delta":
+                    return self._chunk({"content": event.get("delta", "")})
+                if kind in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
+                    return self._chunk({"reasoning_content": event.get("delta", "")})
+                if kind == "response.output_text.annotation.added":
+                    return self._chunk({"annotations": [event["annotation"]]})
+                if kind == "response.output_item.added" and event.get("item", {}).get("type") == "function_call":
+                    item = event["item"]
+                    key = item["id"]
+                    self._tools[key] = len(self._tools)
+                    return self._chunk({"tool_calls": [{"index": self._tools[key], "id": item.get("call_id", key),
+                                                       "type": "function", "function": {"name": item["name"], "arguments": item.get("arguments", "")}}]})
+                if kind == "response.function_call_arguments.delta":
+                    key = event["item_id"]
+                    if key not in self._tools:
+                        raise APIConnectionError()
+                    return self._chunk({"tool_calls": [{"index": self._tools[key], "function": {"arguments": event.get("delta", "")}}]})
+                if kind == "response.output_item.done" and event.get("item", {}).get("type") == "reasoning":
+                    return self._chunk({"reasoning_items": [event["item"]]})
+                if kind == "response.completed":
+                    response = event["response"]
+                    self._pending.append(self._chunk({}, "tool_calls" if self._tools else "stop"))
+                    if response.get("usage") is not None:
+                        self._pending.append(ProviderObject(object="chat.completion.chunk", model=self._model,
+                                                            choices=[], usage=_usage(response["usage"])))
+                if kind == "response.incomplete":
+                    raise APIConnectionError()
+            return self._pending.popleft()
+        except ProviderError as exc:
             await self.aclose()
-            raise
+            raise _subscription_error(exc) from None
         except BaseException:
             await self.aclose()
             raise
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            await _close(self._source)
-        finally:
-            try:
-                await self._guarded.aclose()
-            finally:
-                await self._client.close()
-
-
-def _merge_response_choices(response: ModelResponse) -> ModelResponse:
-    choices = sorted(response.choices, key=lambda choice: choice.index)
-    if len(choices) <= 1:
-        return response
-
-    content: list[str] = []
-    reasoning: list[str] = []
-    tool_calls: list[Any] = []
-    reasoning_items: list[Any] = []
-    thinking_blocks: list[Any] = []
-    annotations: list[Any] = []
-    finish_reason = "stop"
-    for choice in choices:
-        message = choice.message
-        message_content = getattr(message, "content", None)
-        if isinstance(message_content, str):
-            content.append(message_content)
-        message_reasoning = getattr(message, "reasoning_content", None)
-        if isinstance(message_reasoning, str):
-            reasoning.append(message_reasoning)
-        choice_tool_calls = getattr(message, "tool_calls", None)
-        if choice_tool_calls:
-            tool_calls.extend(choice_tool_calls)
-        choice_reasoning_items = getattr(message, "reasoning_items", None)
-        if choice_reasoning_items:
-            reasoning_items.extend(choice_reasoning_items)
-        choice_thinking_blocks = getattr(message, "thinking_blocks", None)
-        if choice_thinking_blocks:
-            thinking_blocks.extend(choice_thinking_blocks)
-        choice_annotations = getattr(message, "annotations", None)
-        if choice_annotations:
-            annotations.extend(choice_annotations)
-        if choice.finish_reason and choice.finish_reason != "stop":
-            finish_reason = choice.finish_reason
-
-    if tool_calls:
-        finish_reason = "tool_calls"
-    response.choices = [
-        Choices(
-            index=0,
-            finish_reason=finish_reason,
-            message=Message(
-                role="assistant",
-                content="".join(content) or None,
-                reasoning_content="".join(reasoning) or None,
-                tool_calls=tool_calls or None,
-                reasoning_items=reasoning_items or None,
-                thinking_blocks=thinking_blocks or None,
-                annotations=annotations or None,
-            ),
-        )
-    ]
-    return response
-
-
-def _credential_value(credential: dict[str, Any], key: str) -> str:
-    value = credential.get(key)
-    if not isinstance(value, str) or not value:
-        raise ProviderSubscriptionError("subscription_auth_required", 502)
-    return value
+        await self._source.aclose()
 
 
 async def acompletion(
-    model: str,
-    messages: list[dict],
-    *,
-    credential: dict,
-    stream: bool,
-    optional_params: dict,
+    model: str, messages: list[dict], *, credential: dict | None, stream: bool,
+    optional_params: dict, single_attempt: bool = False, provider_auth: ProviderAuthRef | None = None,
 ) -> Any:
-    """Execute one ChatGPT subscription request without process-global auth state."""
-    canonical_model = litellm_model_name(canonical_subscription_model_name(model, "chatgpt_device"))
-    access_token = _credential_value(credential, "access_token")
-    account_id = _credential_value(credential, "account_id")
-    call_id = str(uuid4())
-    config = StoredChatGPTResponsesConfig(
-        access_token=access_token,
-        account_id=account_id,
-        session_id=call_id,
-    )
-    logging_obj = SubscriptionLogging(
-        model=canonical_model,
-        provider="chatgpt",
-        fixed_api_base=CHATGPT_API_BASE,
-        call_id=call_id,
-        stream=stream,
-    )
-    litellm_params = GenericLiteLLMParams(
-        api_base=CHATGPT_API_BASE,
-        custom_llm_provider="chatgpt",
-        no_log=True,
-        stream=True,
-    )
-    bridge = ResponsesToCompletionBridgeHandler()
-    sanitized_optional_params = {
-        key: value
-        for key, value in optional_params.items()
-        if key not in {"api_base", "api_key", "base_url", "extra_body", "extra_headers", "headers"}
-    }
-    sanitized_optional_params["stream"] = True
+    del single_attempt  # Every call is single-attempt, not just durable calls.
+    body = _request_body(model, messages, optional_params)
+    client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT, follow_redirects=False, trust_env=False,
+                               transport=httpx.AsyncHTTPTransport(retries=0))
+    response: httpx.Response | None = None
+    source: ProviderStream | None = None
+    fingerprint: str | None = None
     try:
-        request_data = bridge.transformation_handler.transform_request(
-            model=canonical_model,
-            messages=messages,
-            optional_params=sanitized_optional_params,
-            litellm_params=litellm_params.model_dump(exclude_none=True),
-            headers={},
-            litellm_logging_obj=logging_obj,
-        )
-    except ProviderSubscriptionError:
-        raise
-    except BaseException as error:
+        if provider_auth is not None:
+            from .credentials import resolve_inference_credential
+
+            credential = await resolve_inference_credential(provider_auth)
+        if not isinstance(credential, dict):
+            raise ProviderSubscriptionError("subscription_auth_required", 502)
+        access_token, account_id = credential.get("access_token"), credential.get("account_id")
+        fingerprint = credential.get("_fingerprint")
+        if not isinstance(access_token, str) or not access_token or not isinstance(account_id, str) or not account_id:
+            raise ProviderSubscriptionError("subscription_auth_required", 502)
+        headers = {"Authorization": f"Bearer {access_token}", "ChatGPT-Account-Id": account_id,
+                   "Content-Type": "application/json", "Accept": "text/event-stream",
+                   "originator": "codex_cli_rs", "User-Agent": "lumen-subscription/1", "session_id": str(uuid4())}
+        request = client.build_request("POST", _CHATGPT_RESPONSES_URL, json=body, headers=headers)
+        response = await client.send(request, stream=True)
+        from .relay_history import record_dispatch
+        record_dispatch(provider_auth, endpoint=_CHATGPT_RESPONSES_URL, model=body.get("model"), operation="responses", status_code=response.status_code)
+        if response.status_code >= 300:
+            if response.status_code in {401, 403}:
+                await _mark_rejected(provider_auth, fingerprint)
+            raise error_for_status(response.status_code)
+        if "text/event-stream" not in response.headers.get("content-type", ""):
+            raise APIConnectionError()
+        source = ProviderStream(response, client, "responses", provider_auth=provider_auth,
+                                fingerprint=fingerprint, subscription=True)
+        if stream:
+            return ChatCompletionStream(source, body["model"])
+        async for _ in source:
+            pass
+        if source.completed_response is None:
+            raise APIConnectionError()
+        return _completed_chat(source.completed_response["response"], body["model"])
+    except (ProviderError, httpx.HTTPError) as exc:
+        error = exc if isinstance(exc, ProviderError) else Timeout() if isinstance(exc, httpx.TimeoutException) else APIConnectionError()
         raise _subscription_error(error) from None
-
-    response_params = {key: value for key, value in request_data.items() if key in _RESPONSE_KEYS}
-    response_params["stream"] = True
-    input_items = request_data.get("input")
-    if not isinstance(input_items, (str, list)):
-        raise ProviderSubscriptionError("subscription_auth_invalid_response", 502)
-
-    http_client = _StrictAsyncHTTPHandler(timeout=_REQUEST_TIMEOUT, ssl_verify=True)
-    try:
-        raw_stream = await BaseLLMHTTPHandler().async_response_api_handler(
-            model=canonical_model,
-            input=input_items,
-            responses_api_provider_config=config,
-            response_api_optional_request_params=response_params,
-            custom_llm_provider="chatgpt",
-            litellm_params=litellm_params,
-            logging_obj=logging_obj,
-            timeout=_REQUEST_TIMEOUT,
-            client=http_client,
-        )
-    except BaseException as error:
-        await http_client.close()
-        if isinstance(error, ProviderSubscriptionError):
-            raise
-        raise _subscription_error(error) from None
-
-    if not hasattr(raw_stream, "__anext__"):
-        await http_client.close()
-        raise ProviderSubscriptionError("subscription_auth_invalid_response", 502)
-
-    guarded = SuccessfulResponsesStream(raw_stream)
-    if not stream:
-        try:
-            raw_response = await bridge._collect_response_from_stream_async(guarded)
-            model_response = bridge.transformation_handler.transform_response(
-                model=canonical_model,
-                raw_response=raw_response,
-                model_response=ModelResponse(),
-                logging_obj=logging_obj,
-                request_data=request_data,
-                messages=messages,
-                optional_params={**sanitized_optional_params, "stream": False},
-                litellm_params=litellm_params.model_dump(exclude_none=True),
-                encoding=None,
-                api_key=None,
-                json_mode=None,
-            )
-            return _merge_response_choices(model_response)
-        except ProviderSubscriptionError:
-            raise
-        except BaseException as error:
-            raise _subscription_error(error) from None
-        finally:
-            await guarded.aclose()
-            await http_client.close()
-
-    completion_stream = bridge.transformation_handler.get_model_response_iterator(
-        streaming_response=guarded,
-        sync_stream=False,
-        json_mode=None,
-    )
-    owned_stream = _OwnedCompletionIterator(completion_stream, guarded, http_client)
-    return CustomStreamWrapper(
-        completion_stream=owned_stream,
-        model=canonical_model,
-        custom_llm_provider="chatgpt",
-        logging_obj=logging_obj,
-    )
+    finally:
+        if source is None or not stream:
+            if source is not None:
+                await source.aclose()
+            else:
+                try:
+                    if response is not None:
+                        await response.aclose()
+                finally:
+                    await client.aclose()

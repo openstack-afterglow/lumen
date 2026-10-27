@@ -1,10 +1,10 @@
 """빌트인 AI 채팅 확장 API — MCP 서버 / 커스텀 HTTP 툴 / skill 관리.
 
 - 관리자 라우터(require_admin): scope='global' 확장 CRUD (전체 적용).
-- 사용자 라우터(get_principal): 본인 scope='user' 확장 CRUD (본인 적용) + 활성 global 열람.
+- 사용자 라우터(require_scopes): 본인 scope='user' 확장 CRUD (본인 적용) + 활성 global 열람.
 
 MCP와 커스텀 HTTP 툴은 durable worker의 ``tool_runtime``에서 frozen selection을 재검증한 뒤 실행한다.
-소유권/스코프 검증은 ``extensions_store``가 강제하고, API-key user route는 ``native:extensions`` scope를 요구한다.
+소유권은 ``extensions_store``가 강제하고 모든 사용자 경로는 서비스 역할 및 API-key scope를 검증한다.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from lumen.auth import get_principal, require_admin, require_scopes
+from lumen.auth import ensure_scopes, require_admin, require_scopes
 from lumen.services import extensions_store as es
 from lumen.services import mcp_bundles, mcp_oauth
 
@@ -37,6 +37,13 @@ class McpServerBody(BaseModel):
     transport: str | None = Field(default=None, max_length=20)
     url: str | None = Field(default=None, max_length=500)
     is_active: bool | None = None
+
+
+class McpActivationBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    is_active: bool = Field(strict=True)
+    config_version: int = Field(strict=True, ge=1)
 
 
 class AdminMcpServerBody(McpServerBody):
@@ -233,11 +240,13 @@ def _owner(token_info: dict) -> tuple[str, str]:
 
 
 @user_router.get("/mcp-servers")
-async def user_list_mcp(token_info: dict = Depends(require_scopes("native:extensions:read"))):
+async def user_list_mcp(
+    active_only: bool = False, token_info: dict = Depends(require_scopes("native:extensions:read"))
+):
     uid, pid = _owner(token_info)
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
-        return await es.list_for_user("mcp", user_id=uid, project_id=pid)
+        return await es.list_for_user("mcp", user_id=uid, project_id=pid, active_only=active_only)
     except es.ChatStorageUnavailable:
         return []
     except _EXC as exc:
@@ -245,7 +254,7 @@ async def user_list_mcp(token_info: dict = Depends(require_scopes("native:extens
 
 
 @user_router.post("/mcp-servers", status_code=201)
-async def user_create_mcp(body: McpServerBody, token_info: dict = Depends(require_scopes("native:extensions:write"))):
+async def user_create_mcp(body: McpServerBody, token_info: dict = Depends(require_scopes("native:mcp:write"))):
     uid, pid = _owner(token_info)
     try:
         source = await es.create(
@@ -256,9 +265,23 @@ async def user_create_mcp(body: McpServerBody, token_info: dict = Depends(requir
         raise _http(exc) from exc
 
 
+@user_router.patch("/mcp-servers/{item_id}/activation")
+async def user_activate_mcp(
+    item_id: int, body: McpActivationBody, token_info: dict = Depends(require_scopes("native:mcp:write"))
+):
+    uid, pid = _owner(token_info)
+    try:
+        return await es.set_mcp_activation(
+            item_id, user_id=uid, project_id=pid,
+            is_active=body.is_active, config_version=body.config_version,
+        )
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
 @user_router.patch("/mcp-servers/{item_id}")
 async def user_update_mcp(
-    item_id: int, body: McpServerBody, token_info: dict = Depends(require_scopes("native:extensions:write"))
+    item_id: int, body: McpServerBody, token_info: dict = Depends(require_scopes("native:mcp:write"))
 ):
     uid, pid = _owner(token_info)
     try:
@@ -273,7 +296,7 @@ async def user_update_mcp(
 
 
 @user_router.delete("/mcp-servers/{item_id}", status_code=204)
-async def user_delete_mcp(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:write"))):
+async def user_delete_mcp(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:delete"))):
     uid, pid = _owner(token_info)
     try:
         await es.delete("mcp", item_id, requester_user_id=uid, requester_project_id=pid)
@@ -292,10 +315,12 @@ async def user_get_mcp_oauth_status(item_id: int, token_info: dict = Depends(req
 
 @user_router.post("/mcp-servers/{item_id}/oauth/start")
 async def user_start_mcp_oauth(
-    item_id: int, request: Request, response: Response, token_info: dict = Depends(get_principal)
+    item_id: int, request: Request, response: Response, token_info: dict = Depends(require_scopes("native:mcp:write"))
 ):
     if token_info["auth_type"] == "api_key":
         raise HTTPException(status_code=403, detail="MCP OAuth 시작은 Keystone 세션이 필요합니다")
+    if token_info.get("credential_restricted"):
+        raise HTTPException(status_code=403, detail="MCP OAuth approval requires an unrestricted human session")
     uid, pid = _owner(token_info)
     initiator_nonce = secrets.token_urlsafe(32)
     try:
@@ -322,7 +347,7 @@ async def user_start_mcp_oauth(
 
 @user_router.delete("/mcp-servers/{item_id}/oauth", status_code=204)
 async def user_disconnect_mcp_oauth(
-    item_id: int, token_info: dict = Depends(require_scopes("native:extensions:write"))
+    item_id: int, token_info: dict = Depends(require_scopes("native:extensions:delete"))
 ):
     uid, pid = _owner(token_info)
     try:
@@ -369,7 +394,7 @@ async def user_update_tool(
 
 
 @user_router.delete("/custom-tools/{item_id}", status_code=204)
-async def user_delete_tool(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:write"))):
+async def user_delete_tool(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:delete"))):
     uid, pid = _owner(token_info)
     try:
         await es.delete("tool", item_id, requester_user_id=uid, requester_project_id=pid)
@@ -378,11 +403,13 @@ async def user_delete_tool(item_id: int, token_info: dict = Depends(require_scop
 
 
 @user_router.get("/skills")
-async def user_list_skills(token_info: dict = Depends(require_scopes("native:extensions:read"))):
+async def user_list_skills(include_private: bool = False, token_info: dict = Depends(require_scopes("native:extensions:read"))):
+    if include_private:
+        ensure_scopes(token_info, "native:extensions:write")
     uid, pid = _owner(token_info)
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
-        return await es.list_for_user("skill", user_id=uid, project_id=pid)
+        return await es.list_for_user("skill", user_id=uid, project_id=pid, include_private=include_private)
     except es.ChatStorageUnavailable:
         return []
     except _EXC as exc:
@@ -414,7 +441,7 @@ async def user_update_skill(
 
 
 @user_router.delete("/skills/{item_id}", status_code=204)
-async def user_delete_skill(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:write"))):
+async def user_delete_skill(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:delete"))):
     uid, pid = _owner(token_info)
     try:
         await es.delete("skill", item_id, requester_user_id=uid, requester_project_id=pid)

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from lumen_plugin_api.contracts import Namespace, PluginError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from lumen.auth import require_admin, require_scopes
+from lumen.auth import ensure_scopes, require_admin, require_scopes
 from lumen.plugins import bindings
 from lumen.plugins.registry import get_registry
 from lumen.services.extensions_store import (
@@ -107,9 +107,11 @@ async def admin_delete(identifier: UUID):
 
 
 @router.get("/plugin-bindings")
-async def catalogue(principal=Depends(require_scopes("native:extensions:read"))):
+async def catalogue(include_private: bool = False, principal=Depends(require_scopes("native:extensions:read"))):
+    if include_private:
+        ensure_scopes(principal, "native:extensions:write")
     try:
-        return await bindings.list_bindings(_namespace(principal))
+        return await bindings.list_bindings(_namespace(principal), include_private=include_private)
     except _ERRORS as exc:
         raise _http(exc) from exc
 
@@ -131,7 +133,7 @@ async def update(identifier: UUID, body: BindingPatch, principal=Depends(require
 
 
 @router.delete("/plugin-bindings/{identifier}", status_code=204)
-async def delete(identifier: UUID, principal=Depends(require_scopes("native:extensions:write"))):
+async def delete(identifier: UUID, principal=Depends(require_scopes("native:extensions:delete"))):
     try:
         await bindings.update_binding(str(identifier), patch={}, namespace=_namespace(principal), admin=False, delete=True)
         return Response(status_code=204)

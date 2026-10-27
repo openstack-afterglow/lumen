@@ -8,6 +8,7 @@ from lumen_plugin_api.contracts import PluginError
 from lumen_plugin_api.tools import validate_tool_arguments
 
 from lumen.services import mcp_client, tools
+from lumen.services.inference_authority import authorize_tool_dispatch
 from lumen.services.tools import ToolContext
 
 from . import bindings, contracts, managed, selection
@@ -15,8 +16,8 @@ from . import bindings, contracts, managed, selection
 logger = logging.getLogger(__name__)
 
 
-async def _execute_mcp_tool(name: str, args: dict, ctx: ToolContext) -> str:
-    """mcp__{server_id}__{tool} 을 파싱해 해당 MCP 서버에서 실행. 항상 안전한 문자열."""
+async def _execute_mcp_tool(name: str, args: dict, ctx: ToolContext) -> str | contracts.ToolExecutionResult:
+    """Route only explicitly read-only remote methods through the legacy boundary."""
     rest = name[len(selection._MCP_PREFIX) :]
     server_part, _, tool_name = rest.partition("__")
     if not tool_name:
@@ -25,11 +26,40 @@ async def _execute_mcp_tool(name: str, args: dict, ctx: ToolContext) -> str:
         server_id = int(server_part)
     except ValueError:
         return f"알 수 없는 MCP 툴입니다: {name}"
+    frozen_epoch = dict(ctx.expected_mcp_credential_versions or ()).get(server_id)
     servers = {s.get("id"): s for s in await selection._load_mcp(ctx)}
     server = servers.get(server_id)
     if server is None:
-        return "선택되지 않았거나 접근 불가한 MCP 서버입니다."
-    result = await mcp_client.call_tool(server, tool_name, args if isinstance(args, dict) else {})
+        return contracts.ToolExecutionResult(
+            "선택되지 않았거나 접근 불가한 MCP 서버입니다.",
+            warning_code="extension_unavailable", status="failed",
+        )
+    if contracts._v2_effect((server.get("effect_overrides") or {}).get(tool_name)) != "read":
+        return contracts.ToolExecutionResult(
+            "Remote MCP mutations and unknown effects require the v2 approval protocol.",
+            warning_code="tool_approval_required", status="failed",
+        )
+    expected_epoch = frozen_epoch if server.get("auth_mode") == "oauth" else None
+    if server.get("auth_mode") == "oauth" and (
+        type(expected_epoch) is not int or expected_epoch < 1
+    ):
+        return contracts.ToolExecutionResult(
+            "MCP 도구 실행 중 오류가 발생했습니다.",
+            warning_code="plugin_authority_revoked", status="failed",
+        )
+    try:
+        result = await mcp_client.call_tool(
+            server, tool_name, args if isinstance(args, dict) else {}, context=contracts.execution_context(ctx),
+            expected_credential_epoch=expected_epoch,
+        )
+    except PluginError as error:
+        return contracts.ToolExecutionResult(
+            "MCP 도구 실행 중 오류가 발생했습니다.", warning_code=error.code, status="failed",
+        )
+    except Exception:
+        return contracts.ToolExecutionResult(
+            "MCP 도구 실행 중 오류가 발생했습니다.", warning_code="plugin_unavailable", status="failed",
+        )
     return result.text if isinstance(result, mcp_client.McpToolOutput) else result
 
 
@@ -37,9 +67,18 @@ async def context_execute_result(name: str, args: dict, ctx: ToolContext) -> con
     """Execute a tool and preserve whether its result may become a user-visible part."""
     if not ctx.tools_enabled:
         return contracts.ToolExecutionResult("Tool execution is disabled by this run's policy.")
+    await authorize_tool_dispatch(ctx)
     if isinstance(ctx.binding_session, contracts.ToolBindingSession):
         binding = (await bindings._legacy_dynamic_bindings(ctx)).get(name)
         if binding is not None:
+            if (
+                (binding.definition.source == "mcp" or name.startswith(selection._MCP_PREFIX))
+                and binding.definition.effect != "read"
+            ):
+                return contracts.ToolExecutionResult(
+                    "Remote MCP mutations and unknown effects require the v2 approval protocol.",
+                    warning_code="tool_approval_required", status="failed",
+                )
             try:
                 safe_args = validate_tool_arguments(binding.definition.input_schema, args)
             except ValueError:
@@ -57,7 +96,11 @@ async def context_execute_result(name: str, args: dict, ctx: ToolContext) -> con
                 )
             components = result.usage_components.get("components", [])
             return contracts.ToolExecutionResult(
-                result.model_content,
+                "MCP 도구 실행 중 오류가 발생했습니다."
+                if binding.definition.source == "mcp" and result.status == "failed" and result.error_code in {
+                    "plugin_authority_revoked", "plugin_configuration_changed", "plugin_unavailable", "plugin_incompatible",
+                }
+                else result.model_content,
                 visible=bool(result.display or result.artifacts),
                 usage=tuple(components) if isinstance(components, list) else (),
                 warning_code=result.error_code,

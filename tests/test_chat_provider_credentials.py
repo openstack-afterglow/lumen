@@ -53,6 +53,8 @@ def test_public_provider_projection_reports_missing_and_environment_credentials(
         created_at=None,
         updated_at=None,
     )
+    provider.accounts = [SimpleNamespace(id=2, credentials=[SimpleNamespace(
+        id=3, account_id=2, auth_mode="api_key", encrypted_api_key=None, api_key_env="OPENAI_API_KEY")])]
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     missing = pricing._provider_public(provider)
@@ -121,10 +123,10 @@ def test_foreign_or_double_subscription_model_prefixes_are_rejected(auth_mode, m
 
 
 def test_litellm_model_name_strips_exactly_one_subscription_namespace():
-    assert credentials.litellm_model_name("chatgpt/gpt-5.2-codex") == "gpt-5.2-codex"
-    assert credentials.litellm_model_name("anthropic-subscription/claude-opus-4-1") == "claude-opus-4-1"
-    assert credentials.litellm_model_name("anthropic/claude-opus-4-1") == "anthropic/claude-opus-4-1"
-    assert credentials.litellm_model_name("chatgpt/chatgpt/gpt-5") == "chatgpt/chatgpt/gpt-5"
+    assert credentials.transport_model_name("chatgpt/gpt-5.2-codex") == "gpt-5.2-codex"
+    assert credentials.transport_model_name("anthropic-subscription/claude-opus-4-1") == "claude-opus-4-1"
+    assert credentials.transport_model_name("anthropic/claude-opus-4-1") == "anthropic/claude-opus-4-1"
+    assert credentials.transport_model_name("chatgpt/chatgpt/gpt-5") == "chatgpt/chatgpt/gpt-5"
 
 
 @pytest.mark.parametrize(
@@ -242,9 +244,15 @@ def test_subscription_public_projection_distinguishes_api_key_and_subscription_s
         "created_at": None,
         "updated_at": None,
     }
-    api_key = pricing._provider_public(SimpleNamespace(auth_mode="api_key", **base))
+    def projected(**values):
+        material = {key: values.pop(key) for key in (
+            "encrypted_api_key", "api_key_env", "encrypted_subscription_tokens", "subscription_status", "subscription_expires_at")}
+        values.pop("subscription_generation", None)
+        credential = SimpleNamespace(id=3, account_id=2, auth_mode=values.get("auth_mode", "api_key"), **material)
+        return SimpleNamespace(accounts=[SimpleNamespace(id=2, credentials=[credential])], **values)
+    api_key = pricing._provider_public(projected(auth_mode="api_key", **base))
     chatgpt = pricing._provider_public(
-        SimpleNamespace(
+        projected(
             **{
                 **base,
                 "provider_type": "chatgpt",
@@ -257,7 +265,7 @@ def test_subscription_public_projection_distinguishes_api_key_and_subscription_s
         )
     )
     claude_expired = pricing._provider_public(
-        SimpleNamespace(
+        projected(
             **{
                 **base,
                 "provider_type": "anthropic",

@@ -15,7 +15,8 @@ def test_realtime_websocket_requires_scoped_key_and_frozen_gemini_setup(monkeypa
     app = FastAPI()
     app.include_router(compat.router)
     verify = AsyncMock(return_value={"user_id": "owner", "project_id": "project", "api_key_id": 37,
-                                      "scopes": ["compat:realtime:write"]})
+                                      "scopes": ["compat:realtime:write"], "roles": ["member", "lumen-audio_user"],
+                                      "service_system_admin": False})
     monkeypatch.setattr(compat.api_key_store, "verify_key", verify)
     monkeypatch.setattr(compat, "get_settings", lambda: SimpleNamespace(chat_api_hosts="testserver"))
     monkeypatch.setattr(compat, "origin_allowed", lambda _websocket: True)

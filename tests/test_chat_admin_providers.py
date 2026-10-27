@@ -302,13 +302,6 @@ class TestModelPricingContract:
         assert "input_price" not in resp.json()
         assert "output_price" not in resp.json()
 
-    async def test_manual_price_requires_complete_pair(self, admin_client):
-        resp = await admin_client.post(
-            _MODELS_URL,
-            json={"provider_id": 1, "model_name": "gpt-4o", "input_price_per_million": "2"},
-        )
-        assert resp.status_code == 422
-
     async def test_update_rejects_legacy_price_alias(self, admin_client):
         resp = await admin_client.patch(f"{_MODELS_URL}/5", json={"input_price": "0.000002"})
         assert resp.status_code == 422
@@ -360,13 +353,6 @@ class TestModelPricingContract:
         assert pricing._per_token_price(Decimal("2"), "price") == Decimal("0.0000020000")
         with pytest.raises(errors.ProviderValidationError):
             pricing._per_token_price(Decimal("0.00004"), "price")
-
-    async def test_update_rejects_explicit_text_mixed_null_price_pair(self, admin_client):
-        response = await admin_client.patch(
-            f"{_MODELS_URL}/5",
-            json={"model_kind": "text", "input_price_per_million": None, "output_price_per_million": "8"},
-        )
-        assert response.status_code == 422
 
 
 @pytest.mark.parametrize(

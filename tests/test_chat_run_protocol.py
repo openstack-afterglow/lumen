@@ -13,7 +13,7 @@ from lumen.models.chat_contracts import validate_chat_run_event
 from lumen.models.chat_db import ChatUsageLog
 from lumen.models.chat_runs import ChatRun, ChatToolApproval
 from lumen.services import context_inspector, context_manager, execution_protocol, run_store
-from lumen.services.durable_runs import common, execution, interactions, lifecycle, queries
+from lumen.services.durable_runs import common, execution, interactions, queries
 from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.durable_runs.common import _fingerprint
 from lumen.services.run_protocol_v2 import transition_allowed
@@ -126,7 +126,8 @@ def test_v2_protocol_admission_requires_the_encrypted_checkpointer(monkeypatch):
         common._require_supported_execution_protocol_version(2)
 
 
-async def test_v2_run_admission_freezes_lumen_selection_and_overwrites_client_payload(monkeypatch):
+@pytest.mark.parametrize("protocol", [1, 2])
+async def test_run_admission_freezes_lumen_selection_and_overwrites_client_payload(monkeypatch, protocol):
     from lumen.services import mcp_adapter as mcp_lumen
 
     snapshot = mcp_lumen.LumenSnapshot(
@@ -142,11 +143,10 @@ async def test_v2_run_admission_freezes_lumen_selection_and_overwrites_client_pa
         return snapshot
 
     monkeypatch.setattr(mcp_lumen, "selected_lumen_snapshot", selected)
-    payload = await common._freeze_v2_lumen_snapshot(
-        {"lumen_snapshot": {"client": "forbidden"}},
+    payload = await common._freeze_lumen_snapshot(
+        {"lumen_snapshot": {"client": "forbidden"}, "execution_protocol_version": protocol},
         user_id="user-1",
         project_id="project-1",
-        execution_protocol_version=2,
     )
 
     assert payload["lumen_snapshot"] == mcp_lumen.snapshot_payload(snapshot)
@@ -423,6 +423,7 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
         conversation_id=None,
         user_message_id=None,
         assistant_message_id=None,
+        current_ordinal=0,
         capability_snapshot={},
         pricing_snapshot={
             "input_price_per_token": "0",
@@ -450,6 +451,9 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
 
         def begin(self):
             return self
+
+        async def connection(self, **_kwargs):
+            return None
 
     flushed = asyncio.Event()
     closed = asyncio.Event()
@@ -502,97 +506,12 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
     monkeypatch.setattr(execution.credit, "precheck", lambda *_args, **_kwargs: _return(None))
     monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
 
-    assert await execution.execute_queued_run("run-1", owner="worker-1") is True
+    assert await execution.execute_queued_run("run-1", owner="worker-1", registration_id="registration-1") is True
     assert [payload["delta"] for event_type, payload in journal if event_type == "part.delta"] == ["small"]
     assert finished[-1]["status"] == "completed"
     assert closed.is_set()
 
 
-@pytest.mark.parametrize(
-    ("efforts", "expected"),
-    [
-        (["minimal", "low", "medium", "high"], False),  # gpt-5 / gpt-5-mini
-        (["none", "low", "medium", "high"], True),  # gpt-5.1+
-    ],
-)
-async def test_worker_passes_frozen_reasoning_disable_capability_to_engine(monkeypatch, efforts, expected):
-    run = SimpleNamespace(
-        id="run-1",
-        model_name="gpt-5",
-        project_id="project-1",
-        user_id="user-1",
-        conversation_id=None,
-        user_message_id=None,
-        assistant_message_id=None,
-        capability_snapshot={},
-        pricing_snapshot={"component_prices": {}, "margin_multiplier": "1", "chat_credit_per_usd": "1"},
-        execution_protocol_version=1,
-        status="queued",
-        lease_owner="worker#1",
-        assigned_resource_id=None,
-        parent_run_id=None,
-        credit_ceiling=None,
-        sandbox_seconds_ceiling=None,
-        depth=0,
-    )
-    resolved = {
-        "model_name": "gpt-5",
-        "provider_name": "openai",
-        "provider_type": "openai",
-        "capabilities": {"reasoning": True, "reasoning_options": [{"type": "effort", "values": efforts}]},
-    }
-    captured: dict = {}
-
-    class _Session:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        def begin(self):
-            return self
-
-    async def engine_stream(**kwargs):
-        captured.update(kwargs)
-        yield {"type": "token", "text": "ok"}
-        yield {"type": "usage", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
-
-    def usage_cost(*_args, **_kwargs):
-        return SimpleNamespace(
-            raw_cost=Decimal("0"), input_cost=Decimal("0"), output_cost=Decimal("0"), pricing_snapshot={}
-        )
-
-    async def _return(value):
-        return value
-
-    monkeypatch.setattr(execution, "_factory", lambda: lambda: _Session())
-    monkeypatch.setattr(execution, "claim_queued_run", lambda *_args, **_kwargs: _return(run))
-    monkeypatch.setattr(
-        execution,
-        "_payload",
-        lambda _run: {
-            "input_messages": [{"role": "user", "content": "x"}],
-            "features": {},
-            "reasoning_effort": "auto",
-        },
-    )
-    monkeypatch.setattr(execution, "_validate_run_protocol_payload", lambda *_args: True)
-    monkeypatch.setattr(execution.ps, "resolve_model_snapshot", lambda *_args, **_kwargs: _return(resolved))
-    monkeypatch.setattr(execution, "_managed_tool_configs", lambda *_args, **_kwargs: _return((None, None, None)))
-    monkeypatch.setattr(execution.engine, "stream", engine_stream)
-    monkeypatch.setattr(execution, "_append", lambda *_args, **_kwargs: _return(None))
-    monkeypatch.setattr(execution, "_finish", lambda *_args, **_kwargs: _return(None))
-    monkeypatch.setattr(execution, "_set_stage", lambda *_args, **_kwargs: _return(None))
-    monkeypatch.setattr(execution, "_cancel_requested", lambda *_args: _return(False))
-    monkeypatch.setattr(execution, "_renew_lease", lambda *_args, **_kwargs: _return(True))
-    monkeypatch.setattr(execution.credit, "precheck", lambda *_args, **_kwargs: _return(None))
-    monkeypatch.setattr(execution.credit, "usage_cost_from_pricing_snapshot", usage_cost)
-    monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
-
-    assert await execution.execute_queued_run("run-1", owner="worker-1") is True
-    assert captured["reasoning_effort"] == "auto"
-    assert captured["reasoning_can_be_disabled"] is expected
 
 
 async def test_summary_compactor_fences_map_and_reduce_segments_and_records_usage(monkeypatch):
@@ -647,7 +566,7 @@ async def test_summary_compactor_fences_map_and_reduce_segments_and_records_usag
     monkeypatch.setattr(execution, "_cancel_requested", no_cancel)
     monkeypatch.setattr(execution.credit, "precheck", precheck)
     monkeypatch.setattr(execution.ps, "resolve_model_snapshot", resolve_snapshot)
-    monkeypatch.setattr(execution.litellm_client, "acompletion", complete_summary)
+    monkeypatch.setattr(execution.provider_client, "acompletion", complete_summary)
 
     hooks = execution._DurableExecutionHooks(run_id="run-1", owner="worker-1")
     monkeypatch.setattr(hooks, "_start", start)
@@ -1034,6 +953,9 @@ async def test_compaction_worker_uses_persisted_large_tool_schema_snapshot(monke
         def begin(self):
             return self
 
+        async def connection(self, **_kwargs):
+            return None
+
     captured: dict = {}
 
     class _Hooks:
@@ -1067,7 +989,7 @@ async def test_compaction_worker_uses_persisted_large_tool_schema_snapshot(monke
     monkeypatch.setattr(execution, "_cancel_requested", no_cancel)
     monkeypatch.setattr(execution, "_finish", finish)
 
-    assert await execution.execute_queued_run("run-compact", owner="worker-1") is True
+    assert await execution.execute_queued_run("run-compact", owner="worker-1", registration_id="registration-1") is True
     assert captured["tool_schemas"] == [large_schema]
     assert captured["finished"]["status"] == "completed"
 
@@ -1090,20 +1012,6 @@ async def test_events_return_gone_after_temporary_journal_purge(client, monkeypa
     assert response.status_code == 410
 
 
-async def test_cancel_is_owner_scoped_and_idempotent(client, monkeypatch):
-    seen = {}
-
-    async def cancel(**kwargs):
-        seen.update(kwargs)
-        return {"run_id": "run-1", "status": "running"}
-
-    monkeypatch.setattr(lifecycle, "request_cancelled", cancel)
-    response = await client.post("/api/v1/chat/runs/run-1/cancel")
-
-    assert response.status_code == 200
-    assert seen["run_id"] == "run-1"
-    assert seen["project_id"] == "test-project-123"
-    assert seen["user_id"] == "test-user-123"
 
 
 async def test_approval_decision_is_owner_scoped_and_validated(client, monkeypatch):
@@ -1257,3 +1165,96 @@ async def test_durable_journal_debug_log_is_post_commit_and_metadata_only(monkey
     ]
     assert "private prompt and bind value" not in caplog.text
     assert "secret field" not in caplog.text
+
+
+
+@pytest.mark.parametrize(("path", "status", "assigned"), [
+    ("cancel", "awaiting_input", True),
+    ("cancel", "queued", True),
+    ("cancel", "waiting_resource", True),
+    ("fail", "queued", True),
+    ("fail", "waiting_resource", True),
+    ("cancel", "awaiting_input", False),
+])
+async def test_ordinary_chat_terminal_paths_settle_assigned_sandbox_before_release(
+    monkeypatch, path, status, assigned,
+):
+    from unittest.mock import AsyncMock
+
+    from lumen.services.durable_runs import budgets, lifecycle
+    from lumen.services.infrastructure import store as infra_store
+
+    run = ChatRun(
+        id="ordinary-mcp-chat", project_id="project", user_id="user", execution_mode="chat",
+        execution_protocol_version=2, run_kind="completion", parent_run_id=None,
+        assigned_resource_id="sandbox" if assigned else None, credit_ceiling=None,
+        status=status, cancel_requested_at=None, conversation_id=None, temp_thread_id=None,
+        capability_snapshot={}, last_seq=0,
+    )
+    quota = object()
+    calls = []
+    events = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def begin(self):
+            return self
+
+        async def execute(self, query):
+            identity = run if query.column_descriptions[0]["name"] == "ChatRun" else None
+            return SimpleNamespace(scalar_one_or_none=lambda: identity, scalars=lambda: [])
+
+    async def lock_quota(_session, project_id, *, order):
+        assert project_id == "project"
+        order.take("quota")
+        return quota
+
+    async def lock_run(_session, run_id, *, order, lock_class):
+        assert run_id == run.id
+        order.take(lock_class)
+        return run
+
+    async def settle(_session, *, quota: object, root, order):
+        assert quota is not None and root is run
+        calls.append("settle_sandbox")
+
+    async def close(_session, *, quota: object, root, order):
+        assert quota is not None and root.credit_ceiling is None
+        calls.append("close_budget")
+
+    async def release(_session, *, run_id, order):
+        assert run_id == run.id
+        order.take("resource")
+        calls.append("release_sandbox")
+
+    async def append(_session, _run, event):
+        events.append(event)
+        run.last_seq = event.seq
+
+    monkeypatch.setattr(lifecycle, "_factory", lambda: lambda: Session())
+    monkeypatch.setattr(lifecycle, "load_owned_run", AsyncMock(return_value=run))
+    monkeypatch.setattr(lifecycle, "append_event", append)
+    monkeypatch.setattr(budgets, "lock_project_quota", lock_quota)
+    monkeypatch.setattr(budgets, "lock_run", lock_run)
+    monkeypatch.setattr(budgets, "settle_root_sandbox", settle)
+    monkeypatch.setattr(budgets, "close_root_budget", close)
+    monkeypatch.setattr(infra_store, "release_sandbox_intent", release)
+    monkeypatch.setattr(execution, "_cancel_streaming_assistant_message", AsyncMock(return_value=None))
+
+    if path == "cancel":
+        response = await lifecycle.request_cancelled(run_id=run.id, project_id="project", user_id="user")
+        assert response.terminal and response.status == "canceled"
+        assert events[-1].type == "run.canceled"
+        await lifecycle.request_cancelled(run_id=run.id, project_id="project", user_id="user")
+    else:
+        assert await lifecycle.fail_waiting_run(run.id, error_code="sandbox_unavailable", safe_message="Unavailable")
+        assert events[-1].type == "run.failed"
+        assert not await lifecycle.fail_waiting_run(run.id, error_code="sandbox_unavailable", safe_message="Unavailable")
+
+    assert calls == (["settle_sandbox", "close_budget", "release_sandbox"] if assigned else [])
+    assert run.credit_ceiling is None

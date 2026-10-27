@@ -55,6 +55,18 @@ class TestStorePureLogic:
         assert aks._is_expired(None, now=now) is False
         assert aks._is_expired((now - timedelta(seconds=1)).replace(tzinfo=None), now=now) is True
         assert aks._is_expired((now + timedelta(seconds=1)).replace(tzinfo=None), now=now) is False
+        assert aks._is_expired(now, now=now) is True
+
+    def test_expiry_serialization_includes_utc_for_mysql_datetime(self):
+        row = SimpleNamespace(
+            id=1, name="n", key_prefix="sk-afgl-AbCd", scopes=["models:read"], is_active=True,
+            owner_monthly_credit_limit=None, admin_monthly_credit_limit=None, owner_weekly_credit_limit=None,
+            created_at=None, last_used_at=None, revoked_at=None,
+            expires_at=datetime(2099, 1, 1),
+        )
+        assert aks._public(row)["expires_at"] == "2099-01-01T00:00:00+00:00"
+        row.expires_at = None
+        assert aks._public(row)["expires_at"] is None
 
     def test_public_never_leaks_hash(self):
         row = SimpleNamespace(
@@ -67,6 +79,7 @@ class TestStorePureLogic:
             created_at=None,
             scopes=["models:read"],
             revoked_at=None,
+            expires_at=None,
             owner_monthly_credit_limit=Decimal("50.5"),
             admin_monthly_credit_limit=Decimal("100.0"),
             owner_weekly_credit_limit=Decimal("40.0"),
@@ -101,6 +114,7 @@ class TestStorePureLogic:
             created_at=None,
             scopes=["models:read"],
             revoked_at=None,
+            expires_at=None,
             owner_user_id="u-admin-test",
             owner_project_id="p-admin-test",
             owner_monthly_credit_limit=None,
@@ -225,6 +239,7 @@ class TestStorePureLogic:
             created_at=None,
             last_used_at=None,
             revoked_at=None,
+            expires_at=None,
             owner_user_id="u-owner",
             owner_project_id="p-owner",
             owner_monthly_credit_limit=Decimal("500.0"),
@@ -305,6 +320,7 @@ class TestStorePureLogic:
             created_at=None,
             scopes=["models:read"],
             revoked_at=None,
+            expires_at=None,
             owner_user_id="u-owner",
             owner_project_id="p-owner",
             owner_monthly_credit_limit=None,
@@ -390,9 +406,9 @@ class TestStorePureLogic:
 
 class TestApiKeyAuthDependency:
     async def test_missing_key_401(self):
-        req = SimpleNamespace(state=SimpleNamespace())
+        req = _request()
         with pytest.raises(HTTPException) as ei:
-            await deps.get_api_key_info(req, bearer=None, x_api_key=None)
+            await deps.get_principal(req)
         assert ei.value.status_code == 401
 
     async def test_invalid_key_401(self, monkeypatch):
@@ -400,13 +416,9 @@ class TestApiKeyAuthDependency:
             return None
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
-        req = SimpleNamespace(state=SimpleNamespace())
+        req = _request(authorization="Bearer sk-afgl-bad")
         with pytest.raises(HTTPException) as ei:
-            await deps.get_api_key_info(
-                req,
-                bearer=deps.HTTPAuthorizationCredentials(scheme="Bearer", credentials="sk-afgl-bad"),
-                x_api_key=None,
-            )
+            await deps.get_principal(req)
         assert ei.value.status_code == 401
 
     async def test_valid_bearer_sets_token_info(self, monkeypatch):
@@ -417,15 +429,12 @@ class TestApiKeyAuthDependency:
                 "project_id": "p1",
                 "api_key_id": 7,
                 "scopes": ("models:read",),
+                "roles": ["reader", "lumen-inventory_reader", "lumen-history_reader"],
             }
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
-        req = SimpleNamespace(state=SimpleNamespace())
-        await deps.get_api_key_info(
-            req,
-            bearer=deps.HTTPAuthorizationCredentials(scheme="Bearer", credentials=" sk-afgl-good "),
-            x_api_key=None,
-        )
+        req = _request(authorization="Bearer sk-afgl-good")
+        await deps.get_principal(req)
         assert req.state.token_info["source"] == "api"
 
     async def test_valid_x_api_key_header(self, monkeypatch):
@@ -436,11 +445,12 @@ class TestApiKeyAuthDependency:
                 "project_id": "p1",
                 "api_key_id": 9,
                 "scopes": ("models:read",),
+                "roles": ["reader", "lumen-inventory_reader", "lumen-history_reader"],
             }
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
-        req = SimpleNamespace(state=SimpleNamespace())
-        info = await deps.get_api_key_info(req, bearer=None, x_api_key="sk-afgl-viakey")
+        req = _request(x_api_key="sk-afgl-viakey")
+        info = await deps.get_principal(req)
         assert info["api_key_id"] == 9
 
 
@@ -453,13 +463,14 @@ class TestPrincipalDependency:
                 "project_id": "p1",
                 "api_key_id": 7,
                 "scopes": ("models:read",),
+                "roles": ["reader", "lumen-inventory_reader", "lumen-history_reader"],
             }
 
         monkeypatch.setattr(aks, "verify_key", fake_verify)
         principal = await deps.get_principal(_request(authorization="Bearer sk-afgl-key"))
         assert principal["auth_type"] == "api_key"
         assert principal["project_id"] == "p1"
-        assert principal["roles"] == []
+        assert principal["roles"] == ["reader", "lumen-inventory_reader", "lumen-history_reader"]
         with pytest.raises(HTTPException, match="API 키 프로젝트와 X-Project-Id가 일치하지 않습니다") as exc_info:
             await deps.get_principal(_request(x_api_key="sk-afgl-key", x_project_id="other"))
         assert exc_info.value.status_code == 403
@@ -486,9 +497,9 @@ class TestPrincipalDependency:
             )
         assert exc_info.value.status_code == 403
 
-    def test_native_defaults_require_memory_and_tool_scopes(self):
+    def test_native_defaults_require_memory_read_and_tool_scopes(self):
         with pytest.raises(
-            HTTPException, match="native:memory:read, native:memory:write, native:tools:execute"
+            HTTPException, match="native:memory:read, native:tools:execute"
         ) as exc_info:
             chat_admission._require_native_admission_scopes(
                 {
@@ -537,42 +548,30 @@ class TestPrincipalDependency:
         assert exc_info.value.status_code == 403
 
 
-    def test_plugin_tool_selection_requires_execute_scope(self):
-        """A frozen plugin tool needs both extension read and tool execute; a plugin skill only read."""
+    @pytest.mark.parametrize("kind", ["tool", "skill"])
+    def test_plugin_selection_requires_independent_execute_scope(self, kind):
+        """A frozen tool or skill is execution, not mere extension inventory."""
         principal = {
             "auth_type": "api_key",
             "user_id": "u1",
             "project_id": "p1",
             "api_key_id": 7,
-            "scopes": ("native:memory:read", "native:memory:write", "native:extensions:read"),
+            "scopes": ("native:memory:read", "native:extensions:read"),
             "source": "api",
-            "roles": [],
+            "roles": ["member", "lumen-history_reader", "lumen-inventory_reader", "lumen-tools_user"],
             "is_system_admin": False,
         }
-        features = ChatFeatureOptions(tool_policy={"mode": "none"})
-        chat_admission._require_native_admission_scopes(
-            principal,
-            features,
-            parts=[TextPart(type="text", text="hello")],
-            execution_mode="chat",
-            skill_ids=[],
-            agent=None,
-            extension_selection={"tools": [], "mcp": []},
-            plugin_tool_snapshots=[],
-            plugin_skill_snapshots=[{"binding": {"id": "b"}}],
+        kwargs = dict(
+            parts=[TextPart(type="text", text="hello")], execution_mode="chat",
+            skill_ids=[], agent=None, extension_selection={"tools": [], "mcp": []},
+            plugin_tool_snapshots=[{"binding": {"id": "b"}}] if kind == "tool" else [],
+            plugin_skill_snapshots=[{"binding": {"id": "b"}}] if kind == "skill" else [],
         )
+        features = ChatFeatureOptions(tool_policy={"mode": "none"})
         with pytest.raises(HTTPException, match="native:tools:execute"):
-            chat_admission._require_native_admission_scopes(
-                principal,
-                features,
-                parts=[TextPart(type="text", text="hello")],
-                execution_mode="chat",
-                skill_ids=[],
-                agent=None,
-                extension_selection={"tools": [], "mcp": []},
-                plugin_tool_snapshots=[{"binding": {"id": "b"}}],
-                plugin_skill_snapshots=[],
-            )
+            chat_admission._require_native_admission_scopes(principal, features, **kwargs)
+        principal["scopes"] += ("native:tools:execute",)
+        chat_admission._require_native_admission_scopes(principal, features, **kwargs)
 
 class TestRouter:
     async def test_create_returns_plaintext_once(self, client, monkeypatch):
@@ -583,6 +582,9 @@ class TestRouter:
             scopes,
             monthly_credit_limit=None,
             weekly_credit_limit=None,
+            *,
+            expires_at=None,
+            credential_authority=None,
         ):
             return {
                 "id": 1,
@@ -607,6 +609,9 @@ class TestRouter:
             scopes,
             monthly_credit_limit=None,
             weekly_credit_limit=None,
+            *,
+            expires_at=None,
+            credential_authority=None,
         ):
             captured.update(
                 user_id=user_id,
@@ -615,6 +620,8 @@ class TestRouter:
                 scopes=scopes,
                 monthly_credit_limit=monthly_credit_limit,
                 weekly_credit_limit=weekly_credit_limit,
+                expires_at=expires_at,
+                credential_authority=credential_authority,
             )
             return {
                 "id": 1,
@@ -636,11 +643,14 @@ class TestRouter:
                 "name": "my key",
                 "monthly_credit_limit": "50.0",
                 "weekly_credit_limit": "10.0",
+                "expires_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
             },
         )
         assert resp.status_code == 201
         assert captured["monthly_credit_limit"] == Decimal("50.0")
         assert captured["weekly_credit_limit"] == Decimal("10.0")
+        assert captured["expires_at"].tzinfo is UTC
+        assert captured["credential_authority"] is None
         assert resp.json()["owner_monthly_credit_limit"] == "50.0"
         assert resp.json()["effective_monthly_credit_limit"] == "50.0"
 

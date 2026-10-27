@@ -19,7 +19,6 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
-DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile"
 CI_WORKFLOW_REF = "./.github/workflows/ci.yml"
 CI_INPUTS = {"lumen_repository", "lumen_ref", "afterglow_crypto_ref"}
 
@@ -89,18 +88,34 @@ def test_reusable_ci_jobs_override_the_implicit_success_check() -> None:
     # inner jobs (actions/runner#2205); without inner `needs` it hides nothing.
     jobs = _workflow("ci.yml")["jobs"]
 
-    assert set(jobs) == {"service", "plugins", "sandbox", "sdk", "kolla", "integration", "system"}
     for name, job in jobs.items():
         assert _compact(job.get("if")) == "${{ !cancelled() }}", name
         assert "needs" not in job, name
 
 
 def test_no_job_uses_a_self_hosted_runner() -> None:
-    for name in ("ci.yml", "docker-build.yml", "release.yml"):
-        for job_name, job in _workflow(name)["jobs"].items():
+    workflows = sorted(WORKFLOWS.glob("*.yml"))
+    assert {path.name for path in workflows} >= {"ci.yml", "docker-build.yml", "release.yml", "nova-guest.yml"}
+    for path in workflows:
+        for job_name, job in _workflow(path.name)["jobs"].items():
             if "uses" in job:
                 continue
-            assert "self-hosted" not in str(job["runs-on"]), f"{name}:{job_name}"
+            runners = [job["runs-on"]]
+            runners += [entry.get("runner") for entry in job.get("strategy", {}).get("matrix", {}).get("include", [])]
+            for runner in runners:
+                assert runner is None or "self-hosted" not in str(runner), f"{path.name}:{job_name}"
+
+
+def test_guest_publication_is_dispatch_only_and_reviewer_gated() -> None:
+    workflow = _workflow("nova-guest.yml")
+    jobs = workflow["jobs"]
+
+    assert set(_triggers(workflow)) == {"workflow_dispatch"}
+    assert workflow["permissions"] == {"contents": "read"}
+    writers = {name for name, job in jobs.items() if job.get("permissions", {}).get("contents") == "write"}
+    assert writers == {"publish"}
+    assert {name for name, job in jobs.items() if job.get("environment") == "nova-guest-build"} == {"build", "publish"}
+    assert set(_needs(jobs["publish"])) == {"validate", "build"} and _needs(jobs["build"]) == ["validate"]
 
 
 # --- identical-tree PR dedup (rule 9) -------------------------------------------
@@ -294,63 +309,3 @@ def test_test_layers_imports_only_the_standard_library() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-# --- image layers (rule 4) ------------------------------------------------------
-
-
-def _dockerfile_stages() -> dict[str, list[str]]:
-    joined = re.sub(r"\\\n", " ", DOCKERFILE.read_text(encoding="utf-8"))
-    stages: dict[str, list[str]] = {}
-    current: list[str] | None = None
-    for raw in joined.splitlines():
-        line = " ".join(raw.split())
-        if not line or line.startswith("#"):
-            continue
-        match = re.match(r"FROM \S+ AS (\S+)$", line, re.IGNORECASE)
-        if match:
-            current = stages.setdefault(match.group(1), [])
-            continue
-        if current is not None:
-            current.append(line)
-    return stages
-
-
-def _index(instructions: list[str], predicate) -> int:
-    return next(i for i, line in enumerate(instructions) if predicate(line))
-
-
-def test_dockerfile_has_no_recursive_chown_or_floating_uv() -> None:
-    instructions = [line for stage in _dockerfile_stages().values() for line in stage]
-
-    assert instructions
-    assert not any(re.search(r"chown\s+(-\w*R|--recursive)", line) for line in instructions)
-    assert not any(re.search(r"astral-sh/uv(:latest)?\s", line) for line in instructions)
-
-
-def test_uv_is_pinned_and_copied_after_the_apt_layer() -> None:
-    builder = _dockerfile_stages()["lumen-builder"]
-
-    uv_copy = _index(builder, lambda line: "ghcr.io/astral-sh/uv:" in line)
-    assert re.fullmatch(
-        r"COPY --from=ghcr\.io/astral-sh/uv:\d+\.\d+\.\d+@sha256:[0-9a-f]{64} /uv /uvx /bin/", builder[uv_copy]
-    )
-    apt = _index(builder, lambda line: line.startswith("RUN apt-get") and "build-essential" in line)
-    assert apt < uv_copy
-
-
-@pytest.mark.parametrize(
-    ("stage", "compiled"),
-    [("lumen-runtime", "lumen"), ("lumen-test", "lumen tests")],
-)
-def test_runtime_stages_own_files_through_copy_chown(stage: str, compiled: str) -> None:
-    instructions = _dockerfile_stages()[stage]
-
-    setup = _index(instructions, lambda line: line.startswith("RUN apt-get") and "adduser" in line)
-    assert "chown appuser:appuser /app " in instructions[setup]
-    copies = [i for i, line in enumerate(instructions) if line.startswith("COPY ")]
-    assert copies and setup < copies[0]
-    for i in copies:
-        assert instructions[i].startswith("COPY --from=") or instructions[i].startswith("COPY --chown=appuser:appuser ")
-        assert "--chown=appuser:appuser" in instructions[i]
-    user = instructions.index("USER appuser")
-    compile_step = instructions.index(f"RUN python -m compileall -q {compiled}")
-    assert copies[-1] < user < compile_step

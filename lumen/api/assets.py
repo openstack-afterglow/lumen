@@ -110,7 +110,7 @@ async def get_asset(asset_id: UUID, token_info: Principal = Depends(require_scop
 
 
 @router.delete("/assets/{asset_id}", status_code=202)
-async def delete_asset(asset_id: UUID, token_info: Principal = Depends(require_scopes("native:assets:write"))):
+async def delete_asset(asset_id: UUID, token_info: Principal = Depends(require_scopes("native:assets:delete"))):
     try:
         return await assets.delete_asset(
             asset_id=str(asset_id), user_id=token_info["user_id"], project_id=token_info["project_id"]

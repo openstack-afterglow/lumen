@@ -10,9 +10,10 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from lumen.crypto import encrypt_llm_provider_billing_admin_key, encrypt_llm_provider_key
 from lumen.db import mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
-from lumen.services.litellm_client import direct_provider_route
 from lumen.services.models_dev import ModelsDevCatalog
+from lumen.services.provider_metadata import direct_provider_route
 
+from .accounts import _provider, create_default, default_credential, validate_selection_policy
 from .billing import billing_admin_key_supported, billing_capability_for
 from .credentials import (
     api_key_source,
@@ -23,6 +24,7 @@ from .credentials import (
 )
 from .errors import (
     ChatStorageUnavailable,
+    ModelOrderConflictError,
     ModelsDevImportConflictError,
     ProviderNotFoundError,
     ProviderValidationError,
@@ -37,7 +39,6 @@ from .pricing import (
     _resolved_base_prices,
     _to_decimal,
     _validate_cache_prices,
-    _validate_price_pair,
     validate_media_pricing,
 )
 from .routing import _lock_mutable_route, _require_db
@@ -62,6 +63,16 @@ def validate_sort_order(value: int) -> int:
     return value
 
 
+def validate_model_order(value: list[int]) -> list[int]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 500:
+        raise ProviderValidationError("모델 ID 목록은 1개 이상 500개 이하여야 합니다")
+    if any(type(model_id) is not int or not 1 <= model_id <= 9223372036854775807 for model_id in value):
+        raise ProviderValidationError("모델 ID는 양의 정수여야 합니다")
+    if len(set(value)) != len(value):
+        raise ProviderValidationError("모델 ID 목록에는 중복이 없어야 합니다")
+    return value
+
+
 def validate_provider_name(value: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value.strip()) > 100:
         raise ProviderValidationError("name 은 100자 이하의 비어 있지 않은 문자열이어야 합니다")
@@ -82,15 +93,12 @@ def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: t
     return validate_media_pricing(kind, media_pricing)
 
 
-def _validate_text_prices(kind: str, input_price_per_million, output_price_per_million):
-    """Text keeps its paired input/output rule; media prices only its applicable directions."""
-    if kind == "text":
-        return _validate_price_pair(input_price_per_million, output_price_per_million)
+def _validate_text_prices(input_price_per_million, output_price_per_million):
+    """Store each text direction independently, including legacy text-kind media models."""
     return (
         _per_token_price(input_price_per_million, "input_price_per_million"),
         _per_token_price(output_price_per_million, "output_price_per_million"),
     )
-
 
 
 def validate_provider_auth_configuration(
@@ -175,8 +183,10 @@ async def create_provider(
     margin_multiplier=1.0,
     models_dev_provider_id: str | None = None,
     is_active: bool = True,
+    selection_policy: str = "priority",
 ) -> dict:
     factory = _require_db()
+    validate_selection_policy(selection_policy)
     name = validate_provider_name(name)
     sort_order = validate_sort_order(sort_order)
     normalized_provider_type = (provider_type or "openai").strip()
@@ -198,25 +208,25 @@ async def create_provider(
         api_provider=api_provider,
         sort_order=sort_order,
         api_base=(api_base or None) if normalized_auth_mode == "api_key" else None,
-        encrypted_api_key=(
-            encrypt_llm_provider_key(api_key) if api_key and normalized_auth_mode == "api_key" else None
-        ),
+        accounts=[],
         encrypted_billing_admin_key=(
             encrypt_llm_provider_billing_admin_key(billing_admin_key)
             if billing_admin_key
             and billing_admin_key_supported(normalized_provider_type, normalized_auth_mode, api_base)
             else None
         ),
-        api_key_env=normalize_api_key_env(api_key_env) if normalized_auth_mode == "api_key" else None,
         auth_mode=normalized_auth_mode,
         margin_multiplier=_to_decimal(margin_multiplier, "margin_multiplier"),
         models_dev_provider_id=(models_dev_provider_id or None),
+        selection_policy=selection_policy,
         is_active=is_active,
     )
     try:
         async with factory() as session, session.begin():
             session.add(row)
             await session.flush()
+            await create_default(session, row, api_key=api_key if normalized_auth_mode == "api_key" else None,
+                                 api_key_env=api_key_env if normalized_auth_mode == "api_key" else None)
             return _provider_public(row)
     except IntegrityError as exc:
         raise ProviderValidationError(f"이미 존재하는 프로바이더 이름입니다: {name}") from exc
@@ -249,7 +259,10 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
         patch["sort_order"] = validate_sort_order(patch["sort_order"])
     try:
         async with factory() as session, session.begin():
-            row, _ = await _lock_mutable_route(session, provider_id=provider_id)
+            if set(patch) <= {"api_key", "api_key_env", "selection_policy", "selected_credential_id"}:
+                row = await _provider(session, provider_id)
+            else:
+                row, _ = await _lock_mutable_route(session, provider_id=provider_id)
             if row is None:
                 raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
             current_auth_mode = getattr(row, "auth_mode", "api_key")
@@ -271,7 +284,7 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 auth_mode=target_auth_mode,
                 api_base=patch.get("api_base", row.api_base),
                 api_key=patch.get("api_key"),
-                api_key_env=patch.get("api_key_env", row.api_key_env),
+                api_key_env=patch.get("api_key_env", (default_credential(row).api_key_env if default_credential(row) else None)),
                 billing_admin_key=patch.get("billing_admin_key"),
             )
             current_billing_capability = billing_capability_for(row.provider_type, current_auth_mode, row.api_base)
@@ -292,10 +305,16 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 row.auth_mode = target_auth_mode
             if "api_base" in patch:
                 row.api_base = patch["api_base"] or None
-            if "api_key" in patch:
-                row.encrypted_api_key = encrypt_llm_provider_key(patch["api_key"]) if patch["api_key"] else None
-            if "api_key_env" in patch:
-                row.api_key_env = normalize_api_key_env(patch["api_key_env"])
+            credential = default_credential(row)
+            if {"api_key", "api_key_env"} & patch.keys():
+                if credential is None:
+                    _, credential = await create_default(session, row)
+                if "api_key" in patch:
+                    credential.encrypted_api_key = encrypt_llm_provider_key(patch["api_key"]) if patch["api_key"] else None
+                if "api_key_env" in patch:
+                    credential.api_key_env = normalize_api_key_env(patch["api_key_env"])
+                credential.generation += 1
+                credential.subscription_status = "disconnected"
             if "billing_admin_key" in patch:
                 row.encrypted_billing_admin_key = (
                     encrypt_llm_provider_billing_admin_key(patch["billing_admin_key"])
@@ -304,6 +323,14 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 )
             elif target_billing_capability != current_billing_capability:
                 row.encrypted_billing_admin_key = None
+            if {"selection_policy", "selected_credential_id"} & patch.keys():
+                policy = patch.get("selection_policy", row.selection_policy)
+                selected = patch.get("selected_credential_id", row.selected_credential_id)
+                validate_selection_policy(policy, selected)
+                if selected is not None and not any(c.id == selected for a in row.accounts for c in a.credentials):
+                    raise ProviderValidationError("selected credential does not belong to endpoint")
+                row.selection_policy = policy
+                row.selected_credential_id = selected
             if patch.get("margin_multiplier") is not None:
                 row.margin_multiplier = _to_decimal(patch["margin_multiplier"], "margin_multiplier")
             if "models_dev_provider_id" in patch:
@@ -359,8 +386,8 @@ async def create_model(
         input_price_per_million, output_price_per_million, cache_read_price_per_million,
         cache_write_price_per_million, cache_write_1h_price_per_million,
     ))
-    input_price, output_price = _validate_text_prices(model_kind, input_price_per_million, output_price_per_million)
-    # Cache rates are optional and independent of each other and of the input/output pair.
+    input_price, output_price = _validate_text_prices(input_price_per_million, output_price_per_million)
+    # Cache rates are optional and independent of each other and of input/output prices.
     cache_prices = _validate_cache_prices(
         {
             "cache_read_price_per_million": cache_read_price_per_million,
@@ -414,7 +441,9 @@ async def create_model(
                 price_source=(
                     ("manual" if media_pricing else None)
                     if model_kind != "text"
-                    else "manual" if input_price is not None else None
+                    else "manual"
+                    if input_price is not None or output_price is not None
+                    else None
                 ),
                 capabilities=(capabilities or None),
                 capability_source=("override" if capabilities else None),
@@ -432,7 +461,7 @@ async def create_model(
                 api_provider=provider.api_provider,
                 provider_sort_order=provider.sort_order,
                 auth_mode=auth_mode,
-                api_key_configured=api_key_source(provider) is not None,
+                api_key_configured=any(api_key_source(credential) is not None for account in provider.accounts for credential in account.credentials),
                 api_base=provider.api_base,
             )
     except IntegrityError as exc:
@@ -466,10 +495,42 @@ async def list_models(*, active_only: bool = False) -> list[dict]:
                     api_provider=provider.api_provider,
                     provider_sort_order=provider.sort_order,
                     auth_mode=getattr(provider, "auth_mode", "api_key"),
-                    api_key_configured=api_key_source(provider) is not None,
+                    api_key_configured=any(api_key_source(credential) is not None for account in provider.accounts for credential in account.credentials),
                     api_base=provider.api_base,
                 ))
             return public_models
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def reorder_models(
+    *, provider_id: int, expected_model_ids: list[int], model_ids: list[int],
+) -> None:
+    """Compare and replace a provider's complete display order in one transaction."""
+    if type(provider_id) is not int or not 1 <= provider_id <= 9223372036854775807:
+        raise ProviderValidationError("provider_id는 양의 정수여야 합니다")
+    validate_model_order(expected_model_ids)
+    validate_model_order(model_ids)
+    factory = _require_db()
+    try:
+        async with factory() as session, session.begin():
+            provider, models = await _lock_mutable_route(session, provider_id=provider_id)
+            if provider is None:
+                raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
+            current_ids = [model.id for model in sorted(models, key=lambda model: (model.sort_order, model.id))]
+            if expected_model_ids != current_ids or set(model_ids) != set(current_ids):
+                raise ModelOrderConflictError("모델 순서 또는 목록이 변경되었습니다. 전체 목록을 다시 조회하세요")
+            rows_by_id = {model.id: model for model in models}
+            for rank, model_id in enumerate(model_ids):
+                row = rows_by_id[model_id]
+                if row.sort_order != rank:
+                    # Rank is not a configuration/price version change, including legacy media rows.
+                    await session.execute(
+                        update(LlmModel)
+                        .where(LlmModel.id == model_id)
+                        .values(sort_order=rank, updated_at=row.updated_at)
+                    )
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
@@ -517,10 +578,6 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 )),
             )
             media_pricing = _validate_kind_prices(target_kind, media_pricing, token_prices)
-            if target_kind == "text" and (
-                has_input_price != has_output_price or (token_prices[0] is None) != (token_prices[1] is None)
-            ):
-                raise ProviderValidationError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
             if target_kind != getattr(row, "model_kind", "text"):
                 if row.is_title_model or row.is_memory_model:
                     raise ProviderValidationError("title/memory 모델은 text 종류만 허용합니다")
@@ -566,13 +623,13 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 else:
                     row.sort_order = patch["sort_order"]
             if has_input_price or has_output_price:
-                input_price, output_price = _validate_text_prices(target_kind, token_prices[0], token_prices[1])
+                input_price, output_price = _validate_text_prices(token_prices[0], token_prices[1])
                 if has_input_price:
                     row.input_price = input_price
                 if has_output_price:
                     row.output_price = output_price
                 if target_kind == "text":
-                    row.price_source = "manual" if input_price is not None else None
+                    row.price_source = "manual" if input_price is not None or output_price is not None else None
                     row.price_metadata = None
             for column, price in cache_prices.items():
                 setattr(row, column, price)
@@ -592,7 +649,7 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 api_provider=provider.api_provider,
                 provider_sort_order=provider.sort_order,
                 auth_mode=auth_mode,
-                api_key_configured=api_key_source(provider) is not None,
+                api_key_configured=any(api_key_source(credential) is not None for account in provider.accounts for credential in account.credentials),
                 api_base=provider.api_base,
             )
     except IntegrityError as exc:
@@ -703,7 +760,7 @@ async def import_models_dev_prices(
                     api_provider=provider.api_provider,
                     provider_sort_order=provider.sort_order,
                     auth_mode=getattr(provider, "auth_mode", "api_key"),
-                    api_key_configured=api_key_source(provider) is not None,
+                    api_key_configured=any(api_key_source(credential) is not None for account in provider.accounts for credential in account.credentials),
                     api_base=provider.api_base,
                 ))
             return public_models

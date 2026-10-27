@@ -193,6 +193,7 @@ async def reserve(
     kind: str,
     amount: Decimal | int,
     order: LockOrder,
+    allow_unbudgeted_chat: bool = False,
 ) -> ChatAgentReservation:
     """Reserve against the project cap and the root ceiling; one row per (run, kind)."""
     if kind not in _KIND_TO_CAP:
@@ -215,8 +216,10 @@ async def reserve(
         root.descendant_credits_reserved = Decimal(str(root.descendant_credits_reserved)) + value
     if kind == "sandbox_seconds":
         if root.sandbox_seconds_ceiling is None:
-            raise BudgetExceeded("child_budget_exhausted", "root run has no explicit sandbox ceiling")
-        if int(root.sandbox_seconds_reserved) + int(value) > int(root.sandbox_seconds_ceiling):
+            if not (allow_unbudgeted_chat and root.execution_mode == "chat"
+                    and root.parent_run_id is None and run_id == root.id):
+                raise BudgetExceeded("child_budget_exhausted", "root run has no explicit sandbox ceiling")
+        elif int(root.sandbox_seconds_reserved) + int(value) > int(root.sandbox_seconds_ceiling):
             raise BudgetExceeded("child_budget_exhausted", "root sandbox ceiling exceeded")
         root.sandbox_seconds_reserved = int(root.sandbox_seconds_reserved) + int(value)
     order.take("ledger")

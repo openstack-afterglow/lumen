@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -23,10 +23,11 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.config import get_settings
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
-from lumen.models.chat_db import ChatApiKey, ChatQuotaPolicy, ChatUsageLog, UserWallet
+from lumen.models.chat_db import ChatApiKey, ChatProviderUsage, ChatQuotaPolicy, ChatUsageLog, UserWallet
 from lumen.services import quota_policy
 from lumen.services.api_key_store import calculate_effective_limit
-from lumen.services.litellm_client import UsageCost
+from lumen.services.provider_metadata import UsageCost
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.quota_periods import month_start, week_start
 from lumen.services.usage_breakdown import UsageBreakdown, modality_token_charges
 
@@ -308,6 +309,26 @@ def worst_case_token_rates(pricing_snapshot: dict) -> tuple[Decimal, Decimal, De
     )
 
 
+def call_credit_bound(pricing_snapshot: dict, *, input_tokens: int, output_tokens: int) -> Decimal:
+    """Worst-case credits for one provider call under frozen prices, rounded upward.
+
+    ``pricing_snapshot`` carries the frozen token rates plus ``margin_multiplier``
+    and ``chat_credit_per_usd``; it is never a live catalog price. A free route
+    (every frozen rate zero) bounds to exactly zero. Raises ``ValueError``.
+    """
+    try:
+        input_rate, output_rate, cushion = worst_case_token_rates(pricing_snapshot)
+        multiplier = Decimal(str(pricing_snapshot["margin_multiplier"])) * Decimal(
+            str(pricing_snapshot["chat_credit_per_usd"])
+        )
+    except (KeyError, InvalidOperation, TypeError) as exc:
+        raise ValueError("durable pricing snapshot is invalid") from exc
+    if not multiplier.is_finite() or multiplier < 0:
+        raise ValueError("invalid credit conversion")
+    cost = input_rate * input_tokens + output_rate * output_tokens
+    return ((cost + (cushion if cost else 0)) * multiplier).quantize(_CREDIT_QUANTUM, rounding=ROUND_CEILING)
+
+
 def _first_of_month(d: date) -> date:
     return d.replace(day=1)
 
@@ -357,21 +378,23 @@ async def _ledger_credited_since(
     return Decimal(str((await session.execute(stmt)).scalar_one()))
 
 
-async def reserve_media_credit_in_transaction(session, *, user_id: str, project_id: str,
-                                              api_key_id: int | None, bound: Decimal) -> None:
-    """Serialize media starts on the wallet and count unsettled holds before provider I/O.
+async def reserve_call_credit_in_transaction(session, *, user_id: str, project_id: str,
+                                             api_key_id: int | None, bound: Decimal) -> None:
+    """Serialize provider-call starts on the wallet and count unsettled holds before I/O.
 
-    Call only from a READ COMMITTED transaction set before its first statement:
-    earlier run reads otherwise pin a stale REPEATABLE READ snapshot. Held and
-    ledger aggregates must stay nonlocking: their unindexed FOR UPDATE scans
-    can block another user's text reservation insert. Failed or uncertain calls
-    retain their bound until reconciliation; settled calls enter the ledger.
-    No remote I/O runs under this row lock.
+    Shared by durable text, media and realtime calls. Call only from a READ
+    COMMITTED transaction set before its first statement: earlier run reads
+    otherwise pin a stale REPEATABLE READ snapshot. Held and ledger aggregates
+    must stay nonlocking: their unindexed FOR UPDATE scans can block another
+    user's reservation insert. Failed or uncertain calls retain their bound until
+    reconciliation; settled calls enter the ledger. A zero bound is only valid
+    for a route whose frozen prices are explicitly free; it still passes every
+    wallet/key gate. No remote I/O runs under this row lock.
     """
     from lumen.models.chat_runs import ChatModelCallReservation, ChatRun
 
-    if not bound.is_finite() or bound <= 0:
-        raise QuotaExceeded("미디어 사용 한도가 올바르지 않습니다")
+    if not bound.is_finite() or bound < 0:
+        raise QuotaExceeded("호출 사용 한도가 올바르지 않습니다")
     # A plain session.get() before this lock pins a REPEATABLE READ snapshot and
     # can miss a competing reservation committed while waiting for the wallet.
     wallet = (await session.execute(select(UserWallet).where(UserWallet.user_id == user_id)
@@ -722,6 +745,55 @@ async def reset_user_quota(user_id: str) -> dict:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
+def _provider_usage_allocations(
+    route: dict, components: list[dict[str, Any]] | None, *, prompt_tokens: int,
+    completion_tokens: int, raw_cost: Decimal,
+) -> list[dict[str, Any]]:
+    """Allocate observed upstream components without charging the wallet twice."""
+    grouped: dict[tuple[int, int], dict[str, Any]] = {}
+
+    def allocation(identity: dict) -> dict[str, Any] | None:
+        fields = ("provider_id", "provider_account_id", "provider_credential_id", "provider_credential_generation")
+        if any(type(identity.get(key)) is not int for key in fields):
+            return None
+        if any(identity[key] <= 0 for key in fields[:3]) or identity[fields[3]] < 0:
+            raise ValueError("invalid provider usage identity")
+        key = (identity["provider_account_id"], identity["provider_credential_id"])
+        if key not in grouped:
+            grouped[key] = {**{name: identity[name] for name in fields},
+                "provider_backend": identity.get("provider_backend"),
+                "provider_backend_version": identity.get("provider_backend_version"),
+                "prompt_tokens": 0, "completion_tokens": 0, "raw_cost": Decimal("0")}
+        elif any(grouped[key][name] != identity[name] for name in fields):
+            raise ValueError("conflicting provider usage identity")
+        return grouped[key]
+
+    for component in components or ():
+        metadata = component.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise ValueError("invalid provider usage metadata")
+        item = allocation(metadata)
+        if item is None:
+            continue
+        cost = Decimal(str(component.get("cost_usd", "0")))
+        if not cost.is_finite() or cost < 0:
+            raise ValueError("invalid provider component cost")
+        item["raw_cost"] += cost
+        if component.get("unit") == "token":
+            quantity = Decimal(str(component["quantity"]))
+            if not quantity.is_finite() or quantity < 0 or quantity != quantity.to_integral_value():
+                raise ValueError("invalid provider component tokens")
+            direction = "completion_tokens" if "output" in str(component.get("kind")) else "prompt_tokens"
+            item[direction] += int(quantity)
+    if not grouped:
+        item = allocation(route)
+        if item is not None:
+            item.update(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, raw_cost=raw_cost)
+    if sum((item["raw_cost"] for item in grouped.values()), Decimal("0")) > raw_cost:
+        raise ValueError("provider allocations exceed the customer usage cost")
+    return list(grouped.values())
+
+
 
 async def apply_usage_in_transaction(
     session,
@@ -743,6 +815,7 @@ async def apply_usage_in_transaction(
     charge_wallet: bool = True,
     usage_components: list[dict[str, Any]] | None = None,
     breakdown: UsageBreakdown | None = None,
+    execution_route: dict[str, Any] | None = None,
 ) -> Decimal:
     """Append usage and wallet delta in the caller's transaction.
 
@@ -764,6 +837,9 @@ async def apply_usage_in_transaction(
         ),
         "credited_cost": format(credited, "f"),
     }
+    from lumen.services.providers.relay_history import current_receipts
+
+    pricing_snapshot["provider_relays"] = current_receipts(event_id)
     session.add(
         ChatUsageLog(
             event_id=event_id,
@@ -772,6 +848,14 @@ async def apply_usage_in_transaction(
             conversation_id=conversation_id,
             model_name=model_name,
             provider=provider,
+            provider_id=(execution_route or {}).get("provider_id"),
+            **{
+                key: value for key, value in execution_identity(execution_route or {}).items()
+                if key in {
+                    "provider_account_id", "provider_credential_id", "provider_credential_generation",
+                    "provider_backend", "provider_backend_version",
+                }
+            },
             prompt_tokens=int(prompt_tokens),
             completion_tokens=int(completion_tokens),
             **cache_columns,
@@ -785,6 +869,11 @@ async def apply_usage_in_transaction(
             usage_components=usage_components,
         )
     )
+    for allocation in _provider_usage_allocations(
+        execution_route or {}, usage_components, prompt_tokens=int(prompt_tokens),
+        completion_tokens=int(completion_tokens), raw_cost=usage_cost.raw_cost,
+    ):
+        session.add(ChatProviderUsage(event_id=event_id, **allocation))
     await session.flush()
     if charge_wallet:
         wallet = await _get_or_create_wallet(session, user_id, project_id)
@@ -815,6 +904,7 @@ async def apply_usage(
     run_id: str | None = None,
     charge_wallet: bool = True,
     breakdown: UsageBreakdown | None = None,
+    execution_route: dict[str, Any] | None = None,
 ) -> Decimal:
     factory = _require_db()
     try:
@@ -839,6 +929,7 @@ async def apply_usage(
                         charge_wallet=charge_wallet,
                         run_id=run_id,
                         breakdown=breakdown,
+                        execution_route=execution_route,
                     )
             except IntegrityError as exc:
                 await session.rollback()

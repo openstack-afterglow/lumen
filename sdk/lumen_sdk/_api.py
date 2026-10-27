@@ -170,6 +170,24 @@ class _LumenApiMixin:
         return self._json_request("POST", "/v1/chat/realtime/sessions", body=attrs,
                                   headers={"Idempotency-Key": idempotency_key})
 
+    # -- Native Batches -------------------------------------------------
+
+    def create_batch(self, *, idempotency_key: str, **attrs):
+        return self._json_request("POST", "/v1/chat/batches", body=attrs,
+                                  headers={"Idempotency-Key": idempotency_key})
+
+    def list_batches(self, **query):
+        return self._json_request("GET", "/v1/chat/batches", params=_query(**query))
+
+    def get_batch(self, batch_id):
+        return self._json_request("GET", f"/v1/chat/batches/{_segment(batch_id)}")
+
+    def list_batch_items(self, batch_id, **query):
+        return self._json_request("GET", f"/v1/chat/batches/{_segment(batch_id)}/items", params=_query(**query))
+
+    def cancel_batch(self, batch_id):
+        return self._json_request("POST", f"/v1/chat/batches/{_segment(batch_id)}/cancel")
+
     # -- Models & Capabilities ------------------------------------------
 
     def discovery(self):
@@ -457,6 +475,46 @@ class _LumenApiMixin:
 
     def admin_provider_available_models(self, provider_id):
         return self._json_request("GET", f"/v1/admin/providers/{_segment(provider_id)}/available-models")
+
+    def admin_provider_accounts(self, provider_id):
+        return self._json_request("GET", f"/v1/admin/providers/{_segment(provider_id)}/accounts")
+
+    def admin_create_provider_account(self, provider_id, **attrs):
+        return self._json_request("POST", f"/v1/admin/providers/{_segment(provider_id)}/accounts", body=attrs)
+
+    def admin_update_provider_account(self, provider_id, account_id, **attrs):
+        return self._json_request("PATCH", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}", body=attrs)
+
+    def admin_delete_provider_account(self, provider_id, account_id):
+        return self._json_request("DELETE", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}")
+
+    def admin_provider_account_usage(self, provider_id, account_id):
+        return self._json_request("GET", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}/usage")
+
+    def admin_create_provider_credential(self, provider_id, account_id, **attrs):
+        return self._json_request("POST", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}/credentials", body=attrs)
+
+    def admin_update_provider_credential(self, provider_id, account_id, credential_id, **attrs):
+        return self._json_request("PATCH", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}/credentials/{_segment(credential_id)}", body=attrs)
+
+    def admin_delete_provider_credential(self, provider_id, account_id, credential_id):
+        return self._json_request("DELETE", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}/credentials/{_segment(credential_id)}")
+
+    def admin_set_provider_credential_token(self, provider_id, account_id, credential_id, **attrs):
+        return self._json_request("PUT", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}/credentials/{_segment(credential_id)}/auth/token", body=attrs)
+
+    def admin_disconnect_provider_credential(self, provider_id, account_id, credential_id):
+        return self._json_request("DELETE", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}/credentials/{_segment(credential_id)}/auth")
+
+    def admin_begin_provider_credential_device_auth(self, provider_id, account_id, credential_id):
+        return self._json_request("POST", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}/credentials/{_segment(credential_id)}/auth/device")
+
+    def admin_poll_provider_credential_device_auth(self, provider_id, account_id, credential_id, attempt_id):
+        return self._json_request("POST", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}/credentials/{_segment(credential_id)}/auth/device/{_segment(attempt_id)}/poll")
+
+    def admin_cancel_provider_credential_device_auth(self, provider_id, account_id, credential_id, attempt_id):
+        return self._json_request("DELETE", f"/v1/admin/providers/{_segment(provider_id)}/accounts/{_segment(account_id)}/credentials/{_segment(credential_id)}/auth/device/{_segment(attempt_id)}")
+
 
     def admin_models(self, **query):
         return self._json_request("GET", "/v1/admin/models", params=_query(**query))

@@ -12,6 +12,7 @@ import hashlib
 import json
 import secrets
 import uuid
+from copy import deepcopy
 from decimal import Decimal
 
 from sqlalchemy import select, text
@@ -22,14 +23,17 @@ from lumen.config import get_settings
 from lumen.crypto import encrypt_chat_content
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import credit
-from lumen.services.litellm_client import UsageCost
+from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
+from lumen.services.provider_metadata import UsageCost
 from lumen.services.providers import pricing as provider_pricing
 from lumen.services.providers import realtime_transport, routing
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.errors import AmbiguousModelRouteError, ProviderValidationError
+from lumen.services.providers.relay_history import receipt_owner
 from lumen.services.run_store import (
     append_event,
     begin_segment_io,
-    claim_queued_run,
+    claim_realtime_run,
     complete_segment_io,
     load_segment_payload,
     prepare_segment,
@@ -253,11 +257,12 @@ async def consume_ticket(run_id: str, token: str) -> tuple[str, str]:
 async def admit_realtime_session(
     request: dict, *, project_id: str, user_id: str, client_request_id: str,
     source: str = "web", api_key_id: int | None = None, provider_type: str | None = None,
+    credential_authority: dict | None = None,
 ) -> dict:
     """``provider_type`` is the transport a vendor wire fixes, never the editable public selector."""
-    from .admission import _lock_run_configurations, existing_run_for_intent
+    from .admission import _intent_with_credential_authority, _lock_run_configurations, existing_run_for_intent
 
-    intent = _intent(request)
+    intent = _intent_with_credential_authority(_intent(request), credential_authority)
     previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
         client_request_id=client_request_id, intent=intent, conversation_id=None)
     if previous is not None:
@@ -285,7 +290,8 @@ async def admit_realtime_session(
     voice = intent["voice"] or voices["default_voice"]
     plan = realtime_transport.validate_realtime_request(route, voice=voice,
         instructions=intent["instructions"], max_duration_seconds=intent["max_duration_seconds"])
-    payload = {**intent, "voice": voice}
+    required_scopes = ("compat:realtime:write",) if source == "api" else ("native:realtime:write",)
+    payload = {**intent, "voice": voice, "required_scopes": list(required_scopes)}
     await credit.precheck(user_id, project_id, api_key_id)
     per_usd = Decimal(str(get_settings().chat_credit_per_usd))
     margin = Decimal(str(route["margin_multiplier"]))
@@ -294,7 +300,10 @@ async def admit_realtime_session(
     if bound <= 0 or bound >= Decimal("10000000000"):
         raise DurableRunInputError("realtime credit reservation is invalid")
     capability = {key: route[key] for key in ("provider_id", "model_id", "provider_name", "provider_type", "model_name", "model_kind", "config_version_hash")}
+    capability.update(execution_identity(route))
     capability["effective_features"] = {}
+    if credential_authority is not None:
+        capability["credential_authority"] = deepcopy(credential_authority)
     pricing = {**plan, "max_duration_seconds": intent["max_duration_seconds"],
                "reservation_usd": format(envelope, "f"), "bound_credits": format(bound, "f"),
                "margin_multiplier": format(margin, "f"), "credit_per_usd": format(per_usd, "f")}
@@ -310,7 +319,15 @@ async def admit_realtime_session(
                 run = existing
             else:
                 await _lock_run_configurations(session, capability, model_name=route["model_name"])
-                run = ChatRun(id=str(uuid.uuid4()), run_scope="realtime", run_kind="realtime",
+                try:
+                    await authorize_api_key_in_transaction(session, user_id=user_id, project_id=project_id,
+                        api_key_id=api_key_id, required_scopes=required_scopes,
+                        credential_authority=capability.get("credential_authority"))
+                except ApiKeyForbidden as exc:
+                    raise DurableRunInputError("inference_authority_revoked") from exc
+                except ApiKeyAuthorityUnavailable as exc:
+                    raise DurableRunError("inference_authority_unavailable") from exc
+                run = ChatRun(id=str(uuid.uuid4()), run_scope="realtime", run_kind="realtime", workload_class="realtime",
                     project_id=project_id, user_id=user_id, model_name=route["model_name"], source=source,
                     api_key_id=api_key_id, client_request_id=client_request_id, request_fingerprint=_fingerprint(intent),
                     fingerprint_version=1, execution_protocol_version=1, capability_snapshot=capability,
@@ -319,7 +336,9 @@ async def admit_realtime_session(
                 session.add(run)
                 session.add(ChatRunProvider(run_id=run.id, purpose="executor", provider_id=route["provider_id"],
                     model_id=route["model_id"], provider_label=route["provider_name"],
-                    model_label=route["model_name"], config_version_hash=route["config_version_hash"]))
+                    model_label=route["model_name"], config_version_hash=route["config_version_hash"],
+                    **{key: value for key, value in execution_identity(route).items()
+                       if key not in {"provider_auth", "provider_quota_group"}}))
                 await append_event(session, run, _event(run, "run.started", {"conversation_id": None,
                     "temp_thread_id": None, "model_name": run.model_name, "effective_features": {}, "run_kind": "realtime"}))
                 await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
@@ -345,7 +364,7 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
     async def transaction():
         async with _factory()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-            run = await claim_queued_run(session, run_id, owner=owner, lease_seconds=45)
+            run = await claim_realtime_run(session, run_id, owner=owner, lease_seconds=45)
             if run is None or run.user_id != user_id or run.project_id != project_id:
                 raise DurableRunNotFound("realtime session is unavailable")
             owner_fenced = run.lease_owner
@@ -353,7 +372,17 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
             await session.flush()
             if segment.status != "prepared":
                 raise DurableRunProviderResultUnknown("realtime session cannot be resumed")
-            await credit.reserve_media_credit_in_transaction(session, user_id=run.user_id,
+            scopes = _payload(run).get("required_scopes") or [
+                "compat:realtime:write" if run.source == "api" else "native:realtime:write"]
+            try:
+                await authorize_api_key_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
+                    api_key_id=run.api_key_id, required_scopes=tuple(scopes),
+                    credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
+            except ApiKeyForbidden as exc:
+                raise DurableRunInputError("inference_authority_revoked") from exc
+            except ApiKeyAuthorityUnavailable as exc:
+                raise DurableRunError("inference_authority_unavailable") from exc
+            await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id,
                 project_id=run.project_id, api_key_id=run.api_key_id,
                 bound=Decimal(run.pricing_snapshot["bound_credits"]))
             session.add(ChatModelCallReservation(run_id=run.id, segment_id=_SEGMENT,
@@ -421,6 +450,7 @@ async def _settle(run_id: str, *, owner: str, meter) -> dict[str, str]:
                 user_id=run.user_id, project_id=run.project_id, model_name=run.model_name,
                 provider=run.capability_snapshot["provider_name"], prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens, usage_cost=usage_cost,
+                execution_route=run.capability_snapshot,
                 margin_multiplier=Decimal(snapshot["margin_multiplier"]),
                 credit_per_usd=Decimal(snapshot["credit_per_usd"]), source=run.source,
                 api_key_id=run.api_key_id, run_id=run.id, usage_components=components, breakdown=breakdown)
@@ -438,6 +468,7 @@ async def _settle(run_id: str, *, owner: str, meter) -> dict[str, str]:
     return await budgets.retry_deadlocks(transaction)
 
 
+@receipt_owner
 async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str = "native") -> None:
     """Consume ticket, own the fenced run, relay, settle, and terminalize on disconnect."""
     from lumen.services.providers.realtime_protocol import relay_audio

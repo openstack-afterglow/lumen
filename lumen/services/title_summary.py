@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from lumen.services import litellm_client
+from lumen.services import provider_client, provider_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ def _resp_usage_breakdown(resp: Any, model: str, messages: list[dict[str, Any]],
     usage = getattr(resp, "usage", None)
     if usage is None and isinstance(resp, Mapping):
         usage = resp.get("usage")
-    return litellm_client.extract_usage_breakdown(model, messages, text, usage)
+    return provider_metadata.extract_usage_breakdown(model, messages, text, usage)
 
 
 def _route_capabilities(route: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -135,7 +135,7 @@ def _fit_text(model: str, role: str, text: str, token_budget: int) -> str:
     if token_budget <= 0:
         return ""
     original = text or ""
-    if litellm_client.count_tokens(model, messages=[{"role": role, "content": original}]) <= token_budget:
+    if provider_metadata.count_tokens(model, messages=[{"role": role, "content": original}]) <= token_budget:
         return original
 
     def candidate(keep: int) -> str:
@@ -149,27 +149,27 @@ def _fit_text(model: str, role: str, text: str, token_budget: int) -> str:
     lo, hi = 0, max(1, len(original))
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if litellm_client.count_tokens(model, messages=[{"role": role, "content": candidate(mid)}]) <= token_budget:
+        if provider_metadata.count_tokens(model, messages=[{"role": role, "content": candidate(mid)}]) <= token_budget:
             lo = mid
         else:
             hi = mid - 1
     fitted = candidate(lo)
     return (
         fitted
-        if litellm_client.count_tokens(model, messages=[{"role": role, "content": fitted}]) <= token_budget
+        if provider_metadata.count_tokens(model, messages=[{"role": role, "content": fitted}]) <= token_budget
         else ""
     )
 
 
 def _fit_messages_to_budget(*, model: str, messages: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
     """Fit both exchange roles after reserving system and role framing tokens."""
-    if litellm_client.count_tokens(model, messages=messages) <= budget:
+    if provider_metadata.count_tokens(model, messages=messages) <= budget:
         return messages
     system = messages[0]
     prompt = messages[-1] if len(messages) > 3 else None
     roles = messages[1:-1] if prompt is not None else messages[1:]
     fixed = [system, prompt] if prompt is not None else [system]
-    fixed_tokens = litellm_client.count_tokens(model, messages=fixed)
+    fixed_tokens = provider_metadata.count_tokens(model, messages=fixed)
     if fixed_tokens > budget:
         raise ValueError("title context budget exceeded")
     empty_roles = [system, *({"role": item["role"], "content": ""} for item in roles)]
@@ -177,7 +177,7 @@ def _fit_messages_to_budget(*, model: str, messages: list[dict[str, Any]], budge
         empty_roles.append(prompt)
     framing_tokens = max(
         0,
-        litellm_client.count_tokens(model, messages=empty_roles) - fixed_tokens,
+        provider_metadata.count_tokens(model, messages=empty_roles) - fixed_tokens,
     )
     available = max(0, budget - fixed_tokens - framing_tokens)
     # Allocate the remaining content budget equally before any role-specific trim.
@@ -196,7 +196,7 @@ def _fit_messages_to_budget(*, model: str, messages: list[dict[str, Any]], budge
             res.append(prompt)
         return res
     candidate = build(high)
-    if litellm_client.count_tokens(model, messages=candidate) <= budget:
+    if provider_metadata.count_tokens(model, messages=candidate) <= budget:
         return candidate
     # Tokenizer framing can differ from the estimate above.  Validate the actual
     # complete request and reduce both roles together, retaining the 50/50 split.
@@ -205,14 +205,14 @@ def _fit_messages_to_budget(*, model: str, messages: list[dict[str, Any]], budge
     while lo <= high:
         mid = (lo + high) // 2
         current = build(mid)
-        if litellm_client.count_tokens(model, messages=current) <= budget:
+        if provider_metadata.count_tokens(model, messages=current) <= budget:
             best = current
             lo = mid + 1
         else:
             high = mid - 1
     if best is None:
         best = build(0)
-        if litellm_client.count_tokens(model, messages=best) > budget:
+        if provider_metadata.count_tokens(model, messages=best) > budget:
             raise ValueError("title context budget exceeded")
     return best
 
@@ -258,26 +258,26 @@ async def generate_title(*, exchange: Sequence[Mapping[str, Any]], route: Mappin
     limit = _context_limit(route)
     if limit is not None:
         budget = max(1, limit - _TITLE_MAX_TOKENS - 2048)
-        if litellm_client.count_tokens(model, messages=messages) > budget:
+        if provider_metadata.count_tokens(model, messages=messages) > budget:
             raise ValueError("title context budget exceeded")
     params: dict[str, Any] = {
         "custom_llm_provider": route.get("provider_type"),
         "api_base": route.get("api_base"),
         "api_key": route.get("api_key"),
         "provider_auth": route.get("provider_auth"),
-        "max_tokens": _TITLE_MAX_TOKENS,
-        "temperature": 0.0,
+        "max_tokens": None if route.get("provider_type") == "chatgpt" else _TITLE_MAX_TOKENS,
+        "temperature": None if route.get("provider_type") == "chatgpt" else 0.0,
     }
     params = {key: value for key, value in params.items() if value is not None}
     # Send only an effort the frozen route advertises, through the wrapper's
     # extra options rather than an unsupported top-level keyword argument.
     effort = _title_reasoning_effort(route)
-    reasoning_params = getattr(litellm_client, "_reasoning_params", None)
+    reasoning_params = getattr(provider_client, "_reasoning_params", None)
     if effort is not None and callable(reasoning_params):
         reasoning = reasoning_params(model, effort, route.get("provider_type"))
         if reasoning:
             params["extra"] = reasoning
-    response = await litellm_client.acompletion(model, messages, **params)
+    response = await provider_client.acompletion(model, messages, **params)
     raw = _resp_text(response)
     title = _clean(raw)
     if not title:

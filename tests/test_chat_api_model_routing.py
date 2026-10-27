@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from lumen.models.chat_db import LlmModel, LlmProvider
+from lumen.models.chat_db import (
+    ChatProviderUsage,
+    ChatUsageLog,
+    LlmModel,
+    LlmProvider,
+    LlmProviderAccount,
+    LlmProviderCredential,
+)
 from lumen.services.providers import pricing, repository, routing
 from lumen.services.providers.errors import ProviderValidationError
 
@@ -54,6 +62,9 @@ class _AsyncSession(AbstractAsyncContextManager):
     def add(self, row):
         self.sync.add(row)
 
+    async def delete(self, row):
+        self.sync.delete(row)
+
     async def flush(self):
         for row in self.sync.new:
             if isinstance(row, LlmModel) and row.id is None:
@@ -62,6 +73,11 @@ class _AsyncSession(AbstractAsyncContextManager):
             if isinstance(row, LlmProvider) and row.id is None:
                 row.id = self.ids["provider"]
                 self.ids["provider"] += 1
+            for entity, counter in ((LlmProviderAccount, "account"), (LlmProviderCredential, "credential"),
+                                    (ChatUsageLog, "usage")):
+                if isinstance(row, entity) and row.id is None:
+                    row.id = self.ids[counter]
+                    self.ids[counter] += 1
         self.sync.flush()
 
 
@@ -70,19 +86,25 @@ def provider_db(monkeypatch):
     engine = create_engine("sqlite:///:memory:")
     LlmProvider.__table__.create(engine)
     LlmModel.__table__.create(engine)
+    LlmProviderAccount.__table__.create(engine)
+    LlmProviderCredential.__table__.create(engine)
+    ChatUsageLog.__table__.create(engine)
+    ChatProviderUsage.__table__.create(engine)
     # This routing fixture only needs the pending-run conflict query, not MySQL's MEDIUMTEXT run payload.
     with engine.begin() as connection:
         connection.exec_driver_sql("CREATE TABLE chat_runs (id TEXT PRIMARY KEY, status TEXT)")
         connection.exec_driver_sql("CREATE TABLE chat_run_providers (run_id TEXT, provider_id INTEGER, model_id INTEGER)")
     sync_factory = sessionmaker(engine, expire_on_commit=False)
-    ids = {"model": 100, "provider": 100}
+    ids = {"model": 100, "provider": 100, "account": 100, "credential": 100, "usage": 1000}
 
     def factory():
         return _AsyncSession(sync_factory(), ids)
 
     monkeypatch.setattr(repository, "_require_db", lambda: factory)
     monkeypatch.setattr(routing, "_require_db", lambda: factory)
-    monkeypatch.setattr(routing, "resolve_api_key", lambda provider: f"key-{provider.id}")
+    from lumen.services.providers import credentials
+
+    monkeypatch.setattr(credentials, "decrypt_llm_provider_key", lambda value: value.removeprefix("encrypted:"))
     monkeypatch.setattr(
         routing,
         "_resolved_base_prices",
@@ -126,6 +148,17 @@ def provider_db(monkeypatch):
                     auth_mode=auth_mode,
                     is_active=is_active,
                     margin_multiplier=Decimal("1"),
+                    selection_policy="priority",
+                    accounts=[LlmProviderAccount(
+                        id=provider_id, provider_id=provider_id, name="fixture-account", is_active=True,
+                        priority=0, weight=1,
+                        credentials=[LlmProviderCredential(
+                            id=provider_id, account_id=provider_id, name="fixture-credential", auth_mode=auth_mode,
+                            encrypted_api_key=f"encrypted:key-{provider_id}" if auth_mode == "api_key" else None,
+                            subscription_status="configured" if auth_mode != "api_key" else "disconnected",
+                            generation=0, is_active=True, priority=0, weight=1,
+                        )],
+                    )],
                 )
             )
 
@@ -159,18 +192,83 @@ def provider_db(monkeypatch):
     engine.dispose()
 
 
-async def test_pre_0_4_text_run_snapshot_survives_media_migration(provider_db):
+@pytest.mark.parametrize("kind", ["text", "image", "tts", "stt", "realtime"])
+@pytest.mark.parametrize("direction", ["input", "output"])
+async def test_admin_prices_save_independently_and_preserve_null_zero_and_other_rates(
+    provider_db, admin_client, monkeypatch, kind, direction
+):
+    add_provider, _add_model, _model_name = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr(pricing, "effective_prices_per_million", lambda *_args, **_kwargs: (None, None))
+    field = f"{direction}_price_per_million"
+    other = f"{'output' if direction == 'input' else 'input'}_price_per_million"
+    media = {"token_rates": {"image": {"input_per_million": "8", "output_per_million": "30"}}}
+    created = await admin_client.post(
+        "/v1/admin/models",
+        json={
+            "provider_id": 1,
+            "model_name": f"opaque-{kind}-{direction}",
+            "model_kind": kind,
+            field: "5.0001",
+            "media_pricing": media,
+        },
+    )
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert Decimal(body[field]) == Decimal("5.0001")
+    assert body[other] is None
+    assert body["media_pricing"] == media
+    if kind == "text":
+        assert body["price_source"] == "manual"
+        assert body["effective_price_source"] == "partial"
+        assert body["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is False
+    model_id = body["id"]
+    path = f"/v1/admin/models/{model_id}"
+
+    free = await admin_client.patch(path, json={other: "0"})
+    assert free.status_code == 200, free.text
+    assert Decimal(free.json()[field]) == Decimal("5.0001")
+    assert Decimal(free.json()[other]) == 0
+    cleared = await admin_client.patch(path, json={"model_kind": kind, field: None})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()[field] is None
+    assert Decimal(cleared.json()[other]) == 0
+
+    cached = await admin_client.patch(path, json={"cache_read_price_per_million": "1.25"})
+    assert cached.status_code == 200, cached.text
+    listed = await admin_client.get("/v1/admin/models")
+    assert listed.status_code == 200, listed.text
+    saved = next(row for row in listed.json() if row["id"] == model_id)
+    assert saved[field] is None
+    assert Decimal(saved[other]) == 0
+    assert Decimal(saved["cache_read_price_per_million"]) == Decimal("1.25")
+    assert saved["media_pricing"] == media
+    if kind == "text":
+        assert saved["price_source"] == "manual"
+        assert saved["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is False
+
+    reset = await admin_client.patch(path, json={other: None})
+    assert reset.status_code == 200, reset.text
+    assert reset.json()[field] is None and reset.json()[other] is None
+    assert Decimal(reset.json()["cache_read_price_per_million"]) == Decimal("1.25")
+    assert reset.json()["media_pricing"] == media
+    if kind == "text":
+        assert reset.json()["price_source"] is None
+
+
+async def test_legacy_secret_snapshot_requires_coordinated_readmission(provider_db):
     add_provider, add_model, _model_name = provider_db
     add_provider(provider_type="openai")
     add_model("legacy-text-contract")
-    # Published v0.3.1's HMAC for this exact route and the fixture's fixed key.
-    legacy_hash = "b1f4f048f540ce3bd822c4c35f66c5e2975962b725d5d3a172324727df62190c"
     current = await routing.resolve_model("legacy-text-contract")
-    assert current["config_version_hash"] == legacy_hash
+    assert current["api_key"] is None
+    assert current["provider_auth"]["credential_id"] == 1
     restored = await routing.resolve_model_snapshot(
-        {"provider_id": 1, "model_id": 10, "config_version_hash": legacy_hash}
+        {"provider_id": 1, "model_id": 10,
+         "config_version_hash": "b1f4f048f540ce3bd822c4c35f66c5e2975962b725d5d3a172324727df62190c"}
     )
-    assert restored is not None and restored["model_id"] == 10
+    assert restored is None
 
 
 async def test_perplexity_create_stores_transport_route_and_rejects_public_duplicate(provider_db):
@@ -225,7 +323,8 @@ async def test_api_route_selects_explicit_provider_and_rejects_ambiguity(provide
 
     assert selected["model_id"] == 12
     assert selected["provider_type"] == "perplexity"
-    assert selected["api_key"] == "key-2"
+    assert selected["api_key"] is None
+    assert selected["provider_auth"]["credential_id"] == 2
     assert selected["api_model_name"] == canonical
     with pytest.raises(routing.AmbiguousModelRouteError):
         await routing.resolve_api_model(canonical)
@@ -260,8 +359,7 @@ async def test_api_model_listing_keeps_internal_keys_private_and_does_not_decryp
     add_provider(provider_id=1, provider_type="perplexity")
     add_model("perplexity/perplexity/sonar", model_id=11)
     monkeypatch.setattr(
-        routing,
-        "resolve_api_key",
+        "lumen.services.providers.credentials.decrypt_llm_provider_key",
         lambda _provider: (_ for _ in ()).throw(AssertionError("listing must not decrypt credentials")),
     )
 
@@ -333,9 +431,9 @@ async def test_api_route_resolves_gemini_model_with_or_without_provider(provider
 
 
 def test_capabilities_detect_exact_native_search_support():
-    from lumen.services.capabilities import litellm_capabilities
+    from lumen.services.capabilities import provider_capabilities
 
-    caps_sonar = litellm_capabilities("sonar", "perplexity")
+    caps_sonar = provider_capabilities("sonar", "perplexity")
     assert caps_sonar["web_search"] is True
     assert caps_sonar["web_search_required"] is True
     assert caps_sonar["feature_gates"]["web_search"] == {
@@ -345,7 +443,7 @@ def test_capabilities_detect_exact_native_search_support():
         "pricing_available": True,
     }
 
-    caps_deepseek = litellm_capabilities("perplexity/perplexity/deepseek-v4-flash-0731", "perplexity")
+    caps_deepseek = provider_capabilities("perplexity/perplexity/deepseek-v4-flash-0731", "perplexity")
     assert caps_deepseek["web_search"] is False
     assert caps_deepseek["feature_gates"]["web_search"]["available"] is False
 
@@ -578,7 +676,8 @@ async def test_compatible_transports_resolve_independent_selectors_and_not_catal
         assert route["provider_id"] == expected
         assert route["api_provider"] == selector
         assert route["provider_type"] == "openai"
-        assert route["api_key"] == f"key-{expected}"
+        assert route["api_key"] is None
+        assert route["provider_auth"]["credential_id"] == expected
     assert [row["provider_id"] for row in await routing.list_api_models()] == [2, 1]
     with pytest.raises(routing.AmbiguousModelRouteError):
         await routing.resolve_api_model("shared-public-id")
@@ -652,9 +751,7 @@ async def test_catalog_ranks_and_selector_do_not_invalidate_frozen_execution(pro
     original = await routing.resolve_model_by_id(10)
     await repository.update_provider(1, {"api_provider": "nvidia", "sort_order": 2147483647})
     await repository.update_model(10, {"sort_order": 2147483647})
-    restored = await routing.resolve_model_snapshot({
-        "provider_id": 1, "model_id": 10, "config_version_hash": original["config_version_hash"],
-    })
+    restored = await routing.resolve_model_snapshot(original)
     assert restored["config_version_hash"] == original["config_version_hash"]
     assert restored["api_provider"] == "nvidia"
     assert restored["provider_type"] == "openai"
@@ -759,3 +856,268 @@ async def test_renamed_api_selector_is_independent_of_existing_gemini_model_pref
         completion_api.select_api_provider("gemini", "google")
     assert conflict.value.status_code == 400
     assert conflict.value.message == "provider_header_conflict"
+
+
+async def _persisted_provider_catalog():
+    async with repository._require_db()() as session:
+        providers = (await session.execute(select(LlmProvider.__table__).order_by(LlmProvider.id))).mappings().all()
+        models = (await session.execute(select(LlmModel.__table__).order_by(LlmModel.id))).mappings().all()
+        return [dict(row) for row in providers], [dict(row) for row in models]
+
+
+@pytest.mark.parametrize("kind", ["text", "image"])
+async def test_admin_reorder_canonicalizes_duplicate_ranks_and_preserves_frozen_config(
+    provider_db, admin_client, monkeypatch, kind,
+):
+    add_provider, add_model, _ = provider_db
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    # Exercise the actual legacy updated_at-based manual/media price version, not the fixture's fixed version.
+    monkeypatch.setattr(routing, "_resolved_base_prices", pricing._resolved_base_prices)
+    add_provider(provider_id=1, provider_type="openai", api_provider="nim", sort_order=8)
+    add_provider(provider_id=2, provider_type="openai", sort_order=2)
+    add_model("rank-first", model_id=11, sort_order=0)
+    add_model("rank-second", model_id=12, sort_order=0)
+    add_model("rank-inactive", model_id=13, sort_order=9, is_active=False)
+    add_model("other-provider", model_id=21, provider_id=2, sort_order=17)
+    clock = datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
+    media = {
+        "billing_basis": "tokens", "reservation_usd": "1",
+        "token_rates": {"image": {"input_per_million": "8", "output_per_million": "30"}},
+    }
+    async with repository._require_db()() as session, session.begin():
+        provider = await session.get(LlmProvider, 1)
+        provider.api_base = "https://example.invalid/v1"
+        provider.accounts[0].credentials[0].encrypted_api_key = "synthetic-encrypted-key"
+        provider.encrypted_billing_admin_key = "synthetic-encrypted-billing-key"
+        provider.margin_multiplier = Decimal("1.25")
+        provider.models_dev_provider_id = "openai"
+        provider.created_at = provider.updated_at = clock
+        for model_id in (11, 12, 13):
+            row = await session.get(LlmModel, model_id)
+            row.display_name = f"Card {model_id}"
+            row.input_price = Decimal("0.000005")
+            row.output_price = Decimal("0.000010")
+            row.cache_read_price = Decimal("0")
+            row.cache_write_price = Decimal("0.000006")
+            row.cache_write_1h_price = Decimal("0.000007")
+            row.capabilities = {"vision": True}
+            row.capability_source = "override"
+            row.created_at = row.updated_at = clock
+        first = await session.get(LlmModel, 11)
+        first.is_title_model = True
+        first.is_memory_model = True
+        # Preserve legacy text-kind media JSON as well as a correctly typed media route.
+        first.media_pricing = media
+        second = await session.get(LlmModel, 12)
+        second.model_kind = kind
+        second.media_pricing = media if kind == "image" else None
+        inactive = await session.get(LlmModel, 13)
+        inactive.price_source = "models.dev"
+        inactive.models_dev_model_id = "catalog-id"
+        inactive.price_metadata = {"fetched_at": "2020-01-02", "source_url": "https://example.invalid/prices"}
+
+    before_providers, before_models = await _persisted_provider_catalog()
+    frozen = [await routing.resolve_model_by_id(11), await routing.resolve_model_by_id(12, model_kind=kind)]
+    assert all(route is not None and bool(route["price_version"]) for route in frozen)
+    initial = await admin_client.get("/v1/admin/models")
+    assert initial.status_code == 200, initial.text
+    assert [row["id"] for row in initial.json() if row["provider_id"] == 1] == [11, 12, 13]
+
+    response = await admin_client.post("/v1/admin/models/reorder", json={
+        "provider_id": 1, "expected_model_ids": [11, 12, 13], "model_ids": [12, 11, 13],
+    })
+    assert response.status_code == 204, response.text
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
+    after_providers, after_models = await _persisted_provider_catalog()
+    assert after_providers == before_providers
+    ranks = {11: 1, 12: 0, 13: 2, 21: 17}
+    assert after_models == [{**row, "sort_order": ranks[row["id"]]} for row in before_models]
+    saved = await admin_client.get("/v1/admin/models")
+    assert saved.status_code == 200, saved.text
+    assert [row["id"] for row in saved.json()] == [21, 12, 11, 13]
+    assert [row["sort_order"] for row in saved.json()] == [17, 0, 1, 2]
+    public = await admin_client.get(f"/v1/chat/models?model_kind={kind}")
+    assert public.status_code == 200, public.text
+    assert [row["id"] for row in public.json()] == ([21, 12, 11] if kind == "text" else [12])
+    for route in frozen:
+        restored = await routing.resolve_model_snapshot({
+            "provider_id": route["provider_id"], "model_id": route["model_id"],
+            "config_version_hash": route["config_version_hash"],
+            "model_kind": route["model_kind"],
+            "provider_auth": route["provider_auth"],
+        })
+        assert restored is not None
+        assert restored["config_version_hash"] == route["config_version_hash"]
+        assert restored["price_version"] == route["price_version"]
+
+    # A second administrator cannot overwrite the saved permutation using the old expected order.
+    stale = await admin_client.post("/v1/admin/models/reorder", json={
+        "provider_id": 1, "expected_model_ids": [11, 12, 13], "model_ids": [13, 12, 11],
+    })
+    assert stale.status_code == 409, stale.text
+    assert await _persisted_provider_catalog() == (after_providers, after_models)
+    unchanged = await admin_client.post("/v1/admin/models/reorder", json={
+        "provider_id": 1, "expected_model_ids": [12, 11, 13], "model_ids": [12, 11, 13],
+    })
+    assert unchanged.status_code == 204, unchanged.text
+    assert await _persisted_provider_catalog() == (after_providers, after_models)
+
+
+@pytest.mark.parametrize("expected,desired", [
+    ([12, 11, 13], [13, 12, 11]),  # Stale order with correct membership.
+    ([11, 12], [12, 11]),  # Omitted provider member in both lists.
+    ([11, 12, 13], [12, 11]),  # Omitted destination member.
+    ([11, 12, 13], [12, 11, 999]),  # Missing model.
+    ([11, 12, 999], [12, 11, 999]),  # Missing expected member.
+    ([11, 12, 13], [12, 11, 21]),  # Model belonging to another provider.
+    ([11, 12, 21], [12, 11, 21]),  # Cross-provider expected membership.
+    ([11, 12, 13], [12, 11, 13, 21]),  # Extra member.
+])
+async def test_admin_reorder_conflicts_preserve_every_persisted_rank(
+    provider_db, admin_client, expected, desired,
+):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_id=1, provider_type="openai")
+    add_provider(provider_id=2, provider_type="openai")
+    for model_id, provider_id, rank in ((11, 1, 7), (12, 1, 7), (13, 1, 99), (21, 2, 3)):
+        add_model(f"card-{model_id}", model_id=model_id, provider_id=provider_id, sort_order=rank)
+    before = await _persisted_provider_catalog()
+    response = await admin_client.post("/v1/admin/models/reorder", json={
+        "provider_id": 1, "expected_model_ids": expected, "model_ids": desired,
+    })
+    assert response.status_code == 409, response.text
+    assert "모델 순서 또는 목록" in response.json()["detail"]
+    assert response.headers["cache-control"] == "no-store"
+    assert await _persisted_provider_catalog() == before
+
+
+@pytest.mark.parametrize("field", ["provider_id", "expected_model_ids", "model_ids"])
+@pytest.mark.parametrize("value", [True, "11", 11.0, 11.5, 0, -1, None, 9223372036854775808])
+async def test_admin_reorder_rejects_non_strict_positive_ids(provider_db, admin_client, field, value):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type="openai")
+    add_model("card", model_id=11, sort_order=9)
+    before = await _persisted_provider_catalog()
+    payload = {"provider_id": 1, "expected_model_ids": [11], "model_ids": [11]}
+    payload[field] = value if field == "provider_id" else [value]
+    response = await admin_client.post("/v1/admin/models/reorder", json=payload)
+    assert response.status_code == 422, response.text
+    assert await _persisted_provider_catalog() == before
+
+
+@pytest.mark.parametrize("field", ["expected_model_ids", "model_ids"])
+@pytest.mark.parametrize("value", [[11, 11], [], list(range(1, 502)), None, "11"])
+async def test_admin_reorder_requires_unique_bounded_lists(provider_db, admin_client, field, value):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type="openai")
+    add_model("card", model_id=11, sort_order=9)
+    before = await _persisted_provider_catalog()
+    payload = {"provider_id": 1, "expected_model_ids": [11], "model_ids": [11], field: value}
+    response = await admin_client.post("/v1/admin/models/reorder", json=payload)
+    assert response.status_code == 422, response.text
+    assert await _persisted_provider_catalog() == before
+
+
+@pytest.mark.parametrize("missing", ["provider_id", "expected_model_ids", "model_ids"])
+async def test_admin_reorder_requires_complete_request(provider_db, admin_client, missing):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type="openai")
+    add_model("card", model_id=11, sort_order=9)
+    before = await _persisted_provider_catalog()
+    payload = {"provider_id": 1, "expected_model_ids": [11], "model_ids": [11]}
+    del payload[missing]
+    response = await admin_client.post("/v1/admin/models/reorder", json=payload)
+    assert response.status_code == 422, response.text
+    assert await _persisted_provider_catalog() == before
+
+
+async def test_admin_reorder_missing_provider_is_404_without_mutation(provider_db, admin_client):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type="openai")
+    add_model("card", model_id=11, sort_order=9)
+    before = await _persisted_provider_catalog()
+    response = await admin_client.post("/v1/admin/models/reorder", json={
+        "provider_id": 999, "expected_model_ids": [11], "model_ids": [11],
+    })
+    assert response.status_code == 404, response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert await _persisted_provider_catalog() == before
+
+
+@pytest.mark.parametrize("run_model_id", [11, None])
+async def test_admin_reorder_active_run_409_preserves_all_ranks(provider_db, admin_client, run_model_id):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type="openai")
+    add_model("first", model_id=11, sort_order=7)
+    add_model("second", model_id=12, sort_order=7)
+    add_model("inactive", model_id=13, sort_order=99, is_active=False)
+    async with repository._require_db()() as session, session.begin():
+        await session.execute(text("INSERT INTO chat_runs VALUES ('active-reorder', 'queued')"))
+        session.sync.execute(
+            text("INSERT INTO chat_run_providers VALUES ('active-reorder', 1, :model_id)"),
+            {"model_id": run_model_id},
+        )
+    before = await _persisted_provider_catalog()
+    response = await admin_client.post("/v1/admin/models/reorder", json={
+        "provider_id": 1, "expected_model_ids": [11, 12, 13], "model_ids": [12, 13, 11],
+    })
+    assert response.status_code == 409, response.text
+    assert "실행 중인" in response.json()["detail"]
+    assert response.headers["cache-control"] == "no-store"
+    assert await _persisted_provider_catalog() == before
+
+
+@pytest.mark.parametrize("kind", ["image", "tts", "stt", "realtime"])
+async def test_kind_correction_preserves_identity_and_moves_only_to_target_catalog(
+    provider_db, admin_client, monkeypatch, kind
+):
+    add_provider, _add_model, _model_name = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    token_rates = {"token_rates": {"image": {"input_per_million": "8", "output_per_million": "30"}}}
+    created = await admin_client.post("/v1/admin/models", json={
+        "provider_id": 1, "model_name": "misclassified-opaque-model", "model_kind": "text",
+        "input_price_per_million": "5", "output_price_per_million": "30",
+        "cache_write_price_per_million": "6", "cache_write_1h_price_per_million": "8",
+        "media_pricing": token_rates,
+    })
+    assert created.status_code == 201, created.text
+    model_id = created.json()["id"]
+    corrected = await admin_client.patch(f"/v1/admin/models/{model_id}", json={
+        "model_kind": kind, "is_active": False, "media_pricing": token_rates,
+        "cache_write_price_per_million": None, "cache_write_1h_price_per_million": None,
+    })
+    assert corrected.status_code == 200, corrected.text
+    saved = corrected.json()
+    assert (saved["id"], saved["model_kind"], saved["is_active"]) == (model_id, kind, False)
+    assert Decimal(saved["input_price_per_million"]) == Decimal("5")
+    assert Decimal(saved["output_price_per_million"]) == Decimal("30")
+    assert saved["media_pricing"] == token_rates
+    assert saved["cache_write_price_per_million"] is None
+    assert saved["cache_write_1h_price_per_million"] is None
+    assert await routing.list_api_models(model_kind="text") == []
+    assert await routing.list_api_models(model_kind=kind) == []
+    activated = await admin_client.patch(f"/v1/admin/models/{model_id}", json={"is_active": True})
+    assert activated.status_code == 200, activated.text
+    assert await routing.list_api_models(model_kind="text") == []
+    assert [row["api_model_name"] for row in await routing.list_api_models(model_kind=kind)] == [saved["api_model_name"]]
+    reloaded = await admin_client.get("/v1/admin/models")
+    assert [(row["id"], row["model_kind"]) for row in reloaded.json()] == [(model_id, kind)]
+
+
+@pytest.mark.parametrize("designation", ["is_title_model", "is_memory_model"])
+async def test_kind_correction_cannot_move_designated_text_model_to_media(
+    provider_db, admin_client, monkeypatch, designation
+):
+    add_provider, add_model, _model_name = provider_db
+    add_provider(provider_type="openai")
+    add_model("designated-model", model_id=11)
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    async with repository._require_db()() as session, session.begin():
+        row = await session.get(LlmModel, 11)
+        setattr(row, designation, True)
+    response = await admin_client.patch("/v1/admin/models/11", json={"model_kind": "image", "is_active": False})
+    assert response.status_code == 400, response.text
+    reloaded = await admin_client.get("/v1/admin/models")
+    assert [(row["id"], row["model_kind"], row[designation], row["is_active"]) for row in reloaded.json()] == [(11, "text", True, True)]

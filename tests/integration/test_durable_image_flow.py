@@ -11,25 +11,35 @@ from contextlib import suppress
 from decimal import Decimal
 
 import pytest
+from provider_fixtures import configured_provider
 from sqlalchemy import delete, event, func, select, text
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
-from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider
+from lumen.models.chat_db import ChatUsageLog, LlmModel
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment
 from lumen.services import assets, credit
 from lumen.services.durable_runs import budgets, images, queries
 from lumen.services.durable_runs.errors import DurableRunConflict, DurableRunInputError
+from lumen.services.infrastructure.store import register_worker
 from lumen.services.providers import routing
 from lumen.services.run_store import claim_queued_run
 from lumen.services.usage_breakdown import ModalityTokens, UsageBreakdown
+from lumen.services.worker_routing import use_read_committed
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
 # Tiny valid PNG. The scanner/object-store boundary is replaced, not the owned asset ledger.
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL/nwAAAABJRU5ErkJggg=="
 )
+
+
+async def _media_worker(owner: str) -> str:
+    """A fresh fixed online_media registration; claims require a real worker identity."""
+    return await register_worker(worker_identity=owner, boot_id=str(uuid.uuid4()), capacity=4,
+                                 protocol_versions=[1, 2], plugin_digest="0" * 64, schema_version=1,
+                                 workload_classes=["online_media"])
 
 
 async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
@@ -38,14 +48,14 @@ async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
     async def no_wake(_run_id):
         return None
     monkeypatch.setattr(images, "wake_run", no_wake)
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"image-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"image-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()
@@ -81,6 +91,23 @@ async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
             return images.image_transport.ImageResult([(_PNG, "image/png")])
         monkeypatch.setattr(images.image_transport, "generate_images", provider_call)
         request = {"model_id": str(model_id), "prompt": "A cobalt cube", "size": "1024x1024", "quality": "high", "n": 1}
+        prepared = await images.prepare_image_run(request, project_id=project_id, user_id=user_id)
+        rolled_back_id = None
+        with pytest.raises(RuntimeError, match="caller rollback"):
+            async with factory() as session, session.begin():
+                staged = await images.persist_image_run_in_transaction(
+                    session, prepared, project_id=project_id, user_id=user_id,
+                    client_request_id=str(uuid.uuid4()))
+                rolled_back_id = staged.id
+                assert staged.workload_class == "online_media" and staged.worker_pool_id is None
+                assert Decimal(staged.pricing_snapshot["bound_credits"]) > 0
+                await session.flush()
+                assert await session.scalar(select(func.count()).select_from(ChatModelCallReservation).where(
+                    ChatModelCallReservation.run_id == staged.id)) == 0
+                raise RuntimeError("caller rollback")
+        async with factory() as session:
+            assert await session.get(ChatRun, rolled_back_id) is None
+        assert invoked == []
         key = str(uuid.uuid4())
         first = await images.admit_image_run(request, project_id=project_id, user_id=user_id, client_request_id=key)
         repeated = await images.admit_image_run({key: value for key, value in request.items() if key != "n"},
@@ -93,7 +120,9 @@ async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
             await images.admit_image_run({**request, "provider_id": provider_id + 1},
                         project_id=project_id, user_id=user_id, client_request_id=str(uuid.uuid4()))
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, first.run_id, owner="image-worker")
+            registration_id = await _media_worker("image-worker")
+            await use_read_committed(session)
+            claimed = await claim_queued_run(session, first.run_id, owner="image-worker", registration_id=registration_id)
             assert claimed is not None
             owner = claimed.lease_owner
             capability = dict(claimed.capability_snapshot)
@@ -126,7 +155,9 @@ async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
         second = await images.admit_image_run({**request, "prompt": "A teal tree"}, project_id=project_id,
                                              user_id=user_id, client_request_id=str(uuid.uuid4()))
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, second.run_id, owner="image-worker")
+            registration_id = await _media_worker("image-worker")
+            await use_read_committed(session)
+            claimed = await claim_queued_run(session, second.run_id, owner="image-worker", registration_id=registration_id)
             assert claimed is not None
             owner = claimed.lease_owner
             capability = dict(claimed.capability_snapshot)
@@ -200,7 +231,7 @@ async def test_concurrent_media_holds_observe_committed_reservations(monkeypatch
                 # The run was read before the competing reservation commits.
                 await session.execute(select(ChatRun.id).where(ChatRun.id == second_id))
                 snapshot_seen.set()
-                await credit.reserve_media_credit_in_transaction(
+                await credit.reserve_call_credit_in_transaction(
                     session, user_id=user_id, project_id=project_id, api_key_id=None, bound=bound,
                 )
                 session.add(ChatModelCallReservation(
@@ -220,7 +251,7 @@ async def test_concurrent_media_holds_observe_committed_reservations(monkeypatch
                 ))
         async with factory() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-            await credit.reserve_media_credit_in_transaction(
+            await credit.reserve_call_credit_in_transaction(
                 session, user_id=user_id, project_id=project_id, api_key_id=None, bound=bound,
             )
             session.add(ChatModelCallReservation(
@@ -299,7 +330,7 @@ async def test_media_start_does_not_block_another_users_text_start(monkeypatch, 
                 ))
         async with factory() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-            await credit.reserve_media_credit_in_transaction(
+            await credit.reserve_call_credit_in_transaction(
                 session, user_id=media_user, project_id=media_project,
                 api_key_id=None, bound=Decimal("1"),
             )
@@ -334,7 +365,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
     user_id, project_id = f"image-token-user-{nonce}", f"image-token-project-{nonce}"
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
 
     async def no_wake(_run_id):
@@ -343,7 +374,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
     monkeypatch.setattr(images, "wake_run", no_wake)
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"image-token-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"image-token-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()
@@ -388,7 +419,10 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
         admitted = await images.admit_image_run(request, project_id=project_id, user_id=user_id,
                                                client_request_id=str(uuid.uuid4()))
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, admitted.run_id, owner="image-token-worker")
+            registration_id = await _media_worker("image-token-worker")
+            await use_read_committed(session)
+            claimed = await claim_queued_run(session, admitted.run_id, owner="image-token-worker",
+                                             registration_id=registration_id)
             owner, capability, frozen = claimed.lease_owner, dict(claimed.capability_snapshot), dict(claimed.pricing_snapshot)
         # The transport revalidation sees a changed current rate; settlement must still use admission's prices.
         resolve = routing.resolve_model_snapshot

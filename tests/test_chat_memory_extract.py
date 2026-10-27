@@ -7,17 +7,15 @@ from decimal import Decimal
 import pytest
 
 from lumen.services import memory_extract as me
+from lumen.services.provider_client import ProviderObject
+
+pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
 
 
-class _Msg:
+class _Resp(ProviderObject):
     def __init__(self, content):
-        self.message = type("M", (), {"content": content})()
-
-
-class _Resp:
-    def __init__(self, content):
-        self.choices = [_Msg(content)]
-        self.usage = {"prompt_tokens": 10, "completion_tokens": 5}
+        super().__init__(choices=[{"message": {"content": content}}],
+                         usage={"prompt_tokens": 10, "completion_tokens": 5})
 
 
 class TestParseOps:
@@ -47,7 +45,7 @@ class TestGenerateMemory:
             return _Resp("[]")
 
         monkeypatch.setattr(me.ps, "resolve_memory_model", fake_resolve)
-        monkeypatch.setattr(me.litellm_client, "acompletion", fake_acompletion)
+        monkeypatch.setattr(me.provider_client, "acompletion", fake_acompletion)
         await me.generate_memory_if_applicable(conversation_id="c1", project_id="p1", run_id="r1", user_id="u1")
         assert called["acompletion"] is False  # 모델 미지정 → 호출 안 함
 
@@ -118,7 +116,7 @@ class TestGenerateMemory:
         monkeypatch.setattr(me.ps, "resolve_memory_model", fake_resolve)
         monkeypatch.setattr(me.ms, "list_memories", fake_list_memories)
         monkeypatch.setattr(me.cs, "list_messages_for_run", fake_list_messages_for_run)
-        monkeypatch.setattr(me.litellm_client, "acompletion", fake_acompletion)
+        monkeypatch.setattr(me.provider_client, "acompletion", fake_acompletion)
         monkeypatch.setattr(me.credit, "apply_usage", fake_credit)
 
         result = await me.generate_memory_if_applicable(
@@ -173,7 +171,7 @@ class TestGenerateMemory:
         monkeypatch.setattr(me.ps, "resolve_memory_model", fake_resolve)
         monkeypatch.setattr(me.cs, "list_messages_for_run", fake_list_messages_for_run)
         monkeypatch.setattr(me.ms, "list_memories", fake_list_memories)
-        monkeypatch.setattr(me.litellm_client, "acompletion", failing_completion)
+        monkeypatch.setattr(me.provider_client, "acompletion", failing_completion)
 
         with pytest.raises(me.MemoryExtractionRetryable):
             await me.generate_memory_if_applicable(conversation_id="c1", project_id="p1", run_id="r1", user_id="u1")

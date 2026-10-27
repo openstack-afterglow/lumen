@@ -14,6 +14,7 @@ from PIL import Image
 from lumen.api import images as native_images
 from lumen.api.compat import images as image_api
 from lumen.auth import get_principal
+from lumen.service_authority import SERVICE_CAPABILITIES
 
 
 def _png(rgb: tuple[int, int, int]) -> bytes:
@@ -89,6 +90,7 @@ def _principal():
         "api_key_id": 4,
         "scopes": ("compat:images:write", "native:assets:write"),
         "source": "api",
+        "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False,
     }
 
 

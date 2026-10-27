@@ -42,11 +42,11 @@ class _LedgerSession:
 
 
 def test_frozen_output_and_tool_bounds_fail_closed_without_capacity(monkeypatch):
-    from lumen.services import litellm_client
+    from lumen.services import provider_metadata
 
     monkeypatch.setattr(
-        litellm_client, "count_context_tokens",
-        lambda *_args: litellm_client.ContextTokenCount(tokens=None, measurement="unknown"),
+        provider_metadata, "count_context_tokens",
+        lambda *_args: provider_metadata.ContextTokenCount(tokens=None, measurement="unknown"),
     )
     run = SimpleNamespace(
         model_name="model", capability_snapshot={"capabilities": {"context_limit": 1}},
@@ -196,11 +196,11 @@ async def test_child_parent_overrun_and_unknown_replay_preserve_headroom():
 @pytest.mark.parametrize("direction", ["input", "cache_read", "output"])
 @pytest.mark.asyncio
 async def test_modality_prices_bound_actual_child_usage_and_reject_underfunding(monkeypatch, modality, direction):
-    from lumen.services import litellm_client
+    from lumen.services import provider_metadata
     from lumen.services.usage_breakdown import UsageBreakdown
 
-    monkeypatch.setattr(litellm_client, "count_context_tokens", lambda *_args:
-                        litellm_client.ContextTokenCount(tokens=1, measurement="known"))
+    monkeypatch.setattr(provider_metadata, "count_context_tokens", lambda *_args:
+                        provider_metadata.ContextTokenCount(tokens=1, measurement="estimated"))
     root = SimpleNamespace(id="root", project_id="project", parent_run_id=None, root_run_id=None,
                            credit_ceiling=Decimal("100"), reserved_credits=Decimal("0"),
                            descendant_credits_reserved=Decimal("0.5"))
@@ -251,9 +251,9 @@ def test_actual_call_requirements_allow_text_after_media_but_never_missing_split
 
 
 def test_modality_only_prices_still_require_provider_capacity(monkeypatch):
-    from lumen.services import litellm_client
-    monkeypatch.setattr(litellm_client, "count_context_tokens", lambda *_args:
-                        litellm_client.ContextTokenCount(tokens=None, measurement="unknown"))
+    from lumen.services import provider_metadata
+    monkeypatch.setattr(provider_metadata, "count_context_tokens", lambda *_args:
+                        provider_metadata.ContextTokenCount(tokens=None, measurement="unknown"))
     run = SimpleNamespace(model_name="model", capability_snapshot={"capabilities": {}}, pricing_snapshot={
         "input_price_per_token": "0", "output_price_per_token": "0", "margin_multiplier": "1", "chat_credit_per_usd": "1",
         "token_rates": {"audio": {"input_per_million": "100000"}},
@@ -268,7 +268,7 @@ def test_modality_only_prices_still_require_provider_capacity(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_frozen_main_summary_modality_rates_survive_edits_and_reach_ledger(monkeypatch):
-    from lumen.services import chat_admission, litellm_client
+    from lumen.services import chat_admission, provider_metadata
     from lumen.services.durable_runs import execution
 
     route = {"model_name": "main", "provider_id": 1, "model_id": 2, "provider_name": "gemini",
@@ -291,8 +291,8 @@ async def test_frozen_main_summary_modality_rates_survive_edits_and_reach_ledger
     # Optional summary rates do not require an absent audio split.
     assert hooks._actual_credit(run, "context_compaction", {
         "prompt_tokens": 10, "completion_tokens": 1, "required_token_modalities": []}, None) == Decimal("0.012")
-    monkeypatch.setattr(litellm_client, "count_context_tokens", lambda *_args:
-                        litellm_client.ContextTokenCount(tokens=10, measurement="known"))
+    monkeypatch.setattr(provider_metadata, "count_context_tokens", lambda *_args:
+                        provider_metadata.ContextTokenCount(tokens=10, measurement="estimated"))
     assert _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=1) == Decimal("1.00200001")
     assert _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=1, summary=True) == Decimal("2.00200001")
 
@@ -326,9 +326,9 @@ async def test_frozen_main_summary_modality_rates_survive_edits_and_reach_ledger
 
 
 def test_credit_hold_covers_rounding_of_all_text_and_modality_categories(monkeypatch):
-    from lumen.services import litellm_client
-    monkeypatch.setattr(litellm_client, "count_context_tokens", lambda *_args:
-                        litellm_client.ContextTokenCount(tokens=8, measurement="known"))
+    from lumen.services import provider_metadata
+    monkeypatch.setattr(provider_metadata, "count_context_tokens", lambda *_args:
+                        provider_metadata.ContextTokenCount(tokens=8, measurement="estimated"))
     pricing = {key: "0.0000000000501" for key in (
         "input_price_per_token", "output_price_per_token", "cache_read_price_per_token",
         "cache_write_price_per_token", "cache_write_1h_price_per_token")}

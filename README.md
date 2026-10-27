@@ -1,10 +1,10 @@
 # Lumen
 
-Lumen은 AI-chat 백엔드(LiteLLM, LangGraph/LangChain agent 실행, provider/model/conversation/tool/memory 런타임 및 secret)를 단독 소유하는 채팅 및 에이전트 서비스다. OpenAI·Anthropic 호환 completion, native durable run, server-managed tool/skill/memory, provider routing, usage ledger를 제공한다.
+Lumen은 AI-chat 백엔드(owned private Bifrost converter transport, LangGraph/LangChain agent 실행, provider/model/conversation/tool/memory 런타임 및 secret)를 단독 소유하는 채팅 및 에이전트 서비스다. OpenAI·Anthropic 호환 completion, native durable run, server-managed tool/skill/memory, endpoint-owned account/credential pools와 단일 customer usage ledger를 제공한다.
 
 ## 시작
 
-직접 실행 요구사항은 Python 3.12 이상, `uv`, MariaDB, Redis다. 독립형 Compose 실행은 Docker만 필요하다. 기본 `lumen` 패키지는 Kolla 역할 shared data만 제공하므로 서비스 CLI와 runtime import에는 `service` extra가 필요하다.
+직접 실행 요구사항은 Python 3.12 이상, `uv`, MariaDB, Redis와 현재 source에 맞는 native `lumen-bifrost` binary다. Binary source는 `runtime/bifrost/`이며 Go 1.27.3과 고정 module/`go.sum`을 사용한다. Python wheel은 binary를 포함하지 않으므로 `BIFROST_EXECUTABLE` 또는 PATH로 설치한다. Canonical Compose runtime image는 matching companion을 포함한다. 기본 `lumen` 패키지는 Kolla 역할 shared data만 제공하므로 서비스 CLI와 runtime import에는 `service` extra가 필요하다. 상세 binary 준비·forward migration028·drain/rollback은 [운영 가이드](docs/operations.md#private-provider-runtime-and-migration028-cutover)를 따른다.
 
 ```bash
 uv sync --extra service --frozen
@@ -14,6 +14,9 @@ uv run lumen-worker
 ```
 
 개발·테스트 도구까지 설치하려면 `uv sync --extra service --extra dev --frozen`을 사용한다. `lumen-migrate`는 API와 worker보다 먼저 실행한다. `docker/Dockerfile`은 migration을 자동 실행하지 않는다. 설정은 [`lumen.conf.example`](lumen.conf.example)을 복사해 secret manager/환경변수로 완성한다.
+
+현재 provider cutover는 unpublished local source이며 기존 published image/tag의 기능이라고 주장하지 않는다. Python이 선택·권한·가격·durable identity·정산을 소유하고 private Go process는 고정 Bifrost converters와 single-attempt HTTP만 소유한다. Stock gateway/key rotation/fallback/shadow/retry를 사용하지 않는다. Endpoint별 account/credential 정책은 새 admission에서 한 번 선택하고 frozen generation·operation을 I/O 직전 다시 검사한다. Offline historical LiteLLM 1.93.0 catalog와 tiktoken assets의 출처·MIT license는 `lumen/data/NOTICE`에 보존하며 runtime LiteLLM dependency나 live 가격 검증을 뜻하지 않는다. 현재 검증 범위는 [테스트](docs/testing.md#private-bifrost-and-account-pools-2026-10-22-local-only)를 참고한다.
+
 
 ### GHCR 컨테이너 이미지
 
@@ -35,10 +38,13 @@ docker pull ghcr.io/openstack-afterglow/lumen-worker:latest
 
 - **휠 빌드**: `uv build --wheel`로 `lumen-<version>-py3-none-any.whl`을 생성한다.
 - **역할 설치 경로**: `pip install --no-deps lumen-<version>-py3-none-any.whl`은 Kolla 환경의 `share/kolla-ansible/ansible/roles/lumen`에 역할 자산을 설치한다.
-- **릴리스 이미지 기본값**: 0.6.2 root wheel의 `lumen_image_tag` 기본값은 `0.6.2`이다. 두 아키텍처 이미지 게시를 확인한 뒤 배포하고, 게시 전에는 운영자가 검증된 tag/digest를 명시한다. Source-build commit pin과 SDK/플러그인 버전은 독립적이다.
+- **릴리스 이미지 기본값**: Published `0.6.8` root release의 `lumen_image_tag` 기본값은 `0.6.8`이다. Commit `2417886bc6f320f3b0f0438ed0fe5b8ab12c2640`의 exact-SHA CI와 tag `0.6.8` Package Release/Docker가 성공했고 API/worker 이미지는 `linux/amd64`·`linux/arm64`로 게시됐다. DMS Lab production의6replicas는 pinned digest/revision `2417886b`와 일치하며 API healthy, restart0, `/v1/ready`200×3+public이다([production receipt](docs/testing.md#068-production-rollout-2026-10-14)). Local qualification은 [testing](docs/testing.md#068-local-qualification-2026-10-14)에 별도 기록한다. Native IAM/provider·controller/sandbox 및 published-arm64 runtime acceptance는 이번 rollout receipt가 보장하지 않는다. Source-build commit pin과 SDK/플러그인 버전은 독립적이다.
 - **첫 배포 및 운영자 동기화**: `kolla-ansible -i <inventory> deploy --tags lumen`으로 최초 기동하며, root wheel 재설치로 패키지 역할을 동기화한다.
 - **PostgreSQL 전제**: 기본 `lumen_postgres_mode="external"`은 운영자가 `lumen_external_postgres_url`을 secret 설정에 제공해야 한다. 자체 PostgreSQL을 만들려면 `bundled`와 강한 `lumen_postgres_password`를 명시한다.
 - **업그레이드 및 Reconfigure 검증**: `kolla-ansible -i <inventory> reconfigure --tags lumen`은 이미지 pull (`pull.yml`) → 설정 렌더링 (`config.yml`) → DB 마이그레이션과 provider bootstrap (`bootstrap_service.yml`) → 서비스 기동 (`start.yml`) 순서다. Bootstrap CLI가 포함된 새 이미지 또는 source-build pin을 먼저 준비해야 한다.
+- **Claude Code auto mode**: 0.6.5 rollout 후 safeguards 호환성 수정은 서버에 적용되므로 installer에 환경 변수를 수동 추가할 필요가 없다. 기존 endpoint/API key 설정은 유지한다.
+- **0.6.7 system authority repair**: 직접 system `admin` assignment는 `system="all"`로 읽되 `effective=True`를 사용하지 않고 현재 검증된 role-ID DAG로 확장한다. Project membership은 계속 `effective=True`로 확인하며 project/domain admin과 API key는 global admin이 아니다. Final local service contract3,069/SDK128/Ruff/integration284/process-system31과 실제 local Keystone owner의 native/global-admin reads200을 검증했다. 이는 불변 artifact publication과 canonical multinode 운영 rollout/acceptance의 별도 receipt를 대신하지 않는다. 운영0.6.6(`2757a5df`) 결함 보고와 owner 승인 경계는 유지한다.
+- **0.6.8 coordinated cutover**:2026-10-14 terminal gate·API/worker 전체 old cohort 정지 뒤 cold MariaDB restore63tables/5,540rows exact와 checkpointer PostgreSQL dump4tables를 확보하고 배포했다. Migration은 없었으며 ledger26, provider6rows는 유지되고 새 worker registration3rows만 추가됐다. Old0.6.7 dms-controller3 worker는 `auxiliary_active=1`/live leases0으로300s drain 뒤 SIGKILL됐다. 더 오래된 registration5개도 같은 기존 drain-acknowledgement defect를 보인다. Lumen `REDIS_URL`은 read-only dms-controller1 Valkey replica를 가리키고 Sentinel master는 dms-controller3이다. Lumen error는 없었지만 같은 wiring이 Waygate writes를 깨뜨리므로 두 위험은 별도 follow-up이 필요하다. Migration026의 consent backfill은 없으며 missing migrations가 있는 installation만 stopped-writer schema-first 절차를 따른다. Mixed-version/controller cohort 혼합과 guest drain·backup·recovery 경계는 유지한다([operations](docs/operations.md)).
 
 ### 독립형 컨테이너 API + 로컬 Console (개발자/운영자 툴링)
 

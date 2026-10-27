@@ -37,6 +37,8 @@ class ResourceIntent:
     logical_project_id: str | None = None
     logical_user_id: str | None = None
     bootstrap_token: str | None = None
+    guest_profile_id: str | None = None
+    guest_profile_digest: str | None = None
 
 
 @dataclass(frozen=True)
