@@ -6,10 +6,16 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: root candidate `lumen` `0.6.11` extends published `0.6.10` dev `c27e540` with optional Valkey Sentinel routing and owned cache-pool cleanup. Fresh local qualification is recorded in `docs/testing.md`, not artifact publication or production change. Plugin API/default plugins remain `0.1.1`, database plugin `0.1.2`, independent SDK `0.2.1`, and discovery/API contract `1.0.0`; Kubernetes/tool-manifest and owner/credential fences remain. Published Kubernetes027 and any exact historical account027 receipt are immutable. Forward028 reconciles only supported inspected states without rewriting/replaying applied SQL/checksums. All writers must drain/stop and protected matching-engine restore/migration/rerun must pass before cutover.
+- 버전: root candidate `lumen` `0.6.12` extends immutable published `0.6.11` dev `7e27902` with explicit title scheduling-stop ownership during worker cleanup. Valkey Sentinel discovery and caller-owned pool cleanup remain unchanged. Local evidence is recorded in `docs/testing.md`, separately from exact-SHA publication and production acceptance. Plugin API/default plugins remain `0.1.1`, database plugin `0.1.2`, SDK `0.2.1`, and discovery/API contract `1.0.0`. Published027 and forward028 SQL/manifest remain immutable; coordinated stopped-writer recovery/migration requirements remain.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
+
+### 0.6.12 cooperative title scheduling stop
+
+`_title_processor_loop` owns an explicit `asyncio.Event` supplied by the worker. `stop_auxiliary` sets it before any cleanup await or cancellation, including error-finally paths that never entered `WorkerLoop.draining`. The loop checks it before each new claim and before idle sleep; cancellation still interrupts idle waits, while existing `auxiliary.finish_inflight` preserves an admitted operation and lease renewal through completion. A dependency consuming cancellation cannot resume scheduling or keep shutdown gathering forever. This does not clear historical auxiliary counters, manufacture a drain acknowledgment, interrupt/replay provider I/O, or repair an already-loaded old process. Source-bound diagnostics prove the observed old title-loop shutdown blocker, not its earlier initiating application failure.
+
+`durable_runs/api_completion._settle` selects the existing `worker_routing.use_read_committed` before its first statement. This pure DB checkpoint settlement must combine concurrent wallet deltas rather than write from a stale REPEATABLE READ snapshot when MariaDB snapshot isolation is enabled. Existing bounded rollback-safe transaction retry and exactly-once event/hold settlement remain; no provider or native I/O is retried. The independently reproduced sustained-rival case fails on immutable0.6.11 with1020 and passes under both ON/OFF modes after this change. A separate system scanner refusal and client timeout are retained as historical failures; they are not retrospectively attributed to this transaction fix.
 
 ### 0.6.11 Valkey Sentinel routing
 
@@ -537,9 +543,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "2c0645522c92b6790220a48f57a943b41d80a119127c9f06d450d5d7357728a9",
-  "reviewed_at": "2026-10-26T18:19:06Z",
-  "summary": "Scoped 0.6.11 Valkey Sentinel routing review: shared sync cache factory, coherent optional topology/separate secret/TLS settings, owned data/discovery cleanup in worker/controller, Kolla distribution, focused socket/failure and owned Valkey acceptance; immutable migration027/028 and independent SDK/plugin contracts preserved."
+  "source_sha256": "0ff2ef19d2feaf1e20900df47e5f745e3b16e1b112ec78f54cb731c3940526ce",
+  "reviewed_at": "2026-10-27T06:05:33Z",
+  "summary": "Explicit title scheduling stop owns drain/error cleanup without cancelling admitted work; API-completion checkpoint settlement selects existing READ COMMITTED before reads to preserve concurrent wallet deltas. No provider/native replay, counter reset or027/028/schema/dependency changes; prior failed systems and separate exceptional process disposition remain evidence-bound."
 }
 ```
 <!-- architecture-review:end -->

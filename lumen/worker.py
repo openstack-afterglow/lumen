@@ -68,9 +68,9 @@ async def _next_run_ids(limit: int, *, registration_id: str, hint_keys: Sequence
     return list(dict.fromkeys([*hinted, *polled]))
 
 
-async def _title_processor_loop(processor, *, owner: str) -> None:
-    """Continuously drain title jobs independently of long-running completions."""
-    while True:
+async def _title_processor_loop(processor, *, owner: str, stop: asyncio.Event) -> None:
+    """Drain title jobs until scheduling stops, even if a dependency consumes cancellation."""
+    while not stop.is_set():
         try:
             worked = await processor(owner=owner)
         except asyncio.CancelledError:
@@ -78,7 +78,7 @@ async def _title_processor_loop(processor, *, owner: str) -> None:
         except Exception:
             logger.warning("durable title generation job failed")
             worked = False
-        if not worked:
+        if not worked and not stop.is_set():
             await asyncio.sleep(0.5)
 
 
@@ -385,6 +385,7 @@ async def _serve() -> None:
     # Auxiliary maintenance belongs to the always-on online_text pool only.
     auxiliary_jobs: list[_Maintenance] = []
     title_job_task: asyncio.Task[None] | None = None
+    title_stop = asyncio.Event()
     if loop.serves_online_text:
         auxiliary_jobs = [
             _Maintenance("temp_purge", purge_temp, interval=3_600),
@@ -396,11 +397,15 @@ async def _serve() -> None:
             auxiliary_jobs.append(_Maintenance("memory_outbox", outbox, interval=0.5))
         if settings.batch_enabled:
             auxiliary_jobs.append(_Maintenance("batch_coordinator", coordinate_batches, interval=1.0))
-        title_job_task = asyncio.create_task(_title_processor_loop(process_title_generation, owner=registration_id))
+        title_job_task = asyncio.create_task(
+            _title_processor_loop(process_title_generation, owner=registration_id, stop=title_stop),
+        )
 
     async def stop_auxiliary() -> None:
         # Cancellation reaches only the scheduling loops; admitted steps finish in flight.
         nonlocal title_job_task
+        # Cleanup can start on an error without WorkerLoop entering drain.
+        title_stop.set()
         for job in auxiliary_jobs:
             await job.stop()
         if title_job_task is not None:

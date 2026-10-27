@@ -496,6 +496,9 @@ async def _settle(run_id: str, *, owner: str) -> Literal["completed", "rejected"
     """Settle the checkpoint exactly once; unpriceable usage keeps the hold for reconciliation."""
     async def transaction() -> Literal["completed", "rejected"]:
         async with _factory()() as session, session.begin():
+            # Other runs can settle this user's wallet after our identity reads.
+            # Select isolation before any statement so that delta is not a stale snapshot write.
+            await worker_routing.use_read_committed(session)
             run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
                    .with_for_update().execution_options(populate_existing=True))).scalar_one()
             _require_owned_running_lease(run, owner)

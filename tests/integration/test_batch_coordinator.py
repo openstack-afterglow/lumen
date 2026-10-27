@@ -840,3 +840,66 @@ async def test_coordinator_lease_is_registration_owned_and_drain_waits_for_relea
         assert row.lease_owner is None and queue.lease_owner is None
         assert registration.auxiliary_active == 0
     assert await store.acknowledge_drain(db.owner)
+
+
+async def test_api_completion_settlement_observes_concurrent_wallet_delta(batch_db, monkeypatch):
+    from lumen.models.chat_db import ChatProviderUsage, ChatUsageLog, UserWallet
+    from lumen.services import credit
+    from lumen.services.usage_breakdown import UsageBreakdown
+
+    db = batch_db
+    run_id, owner = str(uuid4()), "checkpoint-settler"
+    now = datetime.now(UTC)
+    async with db.factory() as session, session.begin():
+        session.add(UserWallet(user_id=db.user_id, project_id=db.project_id,
+            quota_period_start=now.date().replace(day=1), used_quota_this_month=Decimal("1")))
+        session.add(ChatRun(id=run_id, run_scope="api", run_kind="api_completion",
+            workload_class="batch", project_id=db.project_id, user_id=db.user_id,
+            model_name="checkpoint-text", source="api", client_request_id=str(uuid4()),
+            request_fingerprint="f" * 64, fingerprint_version=1, status="running",
+            lease_owner=owner, lease_expires_at=now + timedelta(minutes=5),
+            capability_snapshot={"provider_name": "checkpoint-provider"}, pricing_snapshot={
+                "input_price_per_token": "0.01", "output_price_per_token": "0",
+                "margin_multiplier": "1", "chat_credit_per_usd": "1"}))
+        await session.flush()
+        segment = ChatRunSegment(run_id=run_id, segment_id="api_completion:1", ordinal=1,
+            endpoint="chat_completions", status="provider_started")
+        complete_segment_io(segment, result_payload={"operation": "chat.completions", "envelope": {
+            "status_code": 200, "request_id": run_id, "body": {"choices": []}}},
+            usage_payload={"token_usage": UsageBreakdown.from_totals(2, 0).as_usage_dict()})
+        session.add(segment)
+        session.add(ChatModelCallReservation(run_id=run_id, segment_id="api_completion:1",
+            bound_credits=Decimal("0.1"), status="reserved"))
+
+    get_wallet = credit._get_or_create_wallet
+    interleaved = []
+
+    async def commit_rival_delta_after_wallet_read(session, user_id, project_id):
+        wallet = await get_wallet(session, user_id, project_id)
+        if user_id == db.user_id:
+            # Commit a real rival delta on every snapshot attempt. The old
+            # bounded DB retry can mask one conflict, but not sustained writes;
+            # READ COMMITTED must settle without resending provider work.
+            async with db.factory() as rival, rival.begin():
+                await rival.execute(text("UPDATE user_wallets SET used_quota_this_month = "
+                    "used_quota_this_month + 3 WHERE user_id = :user_id"), {"user_id": user_id})
+            interleaved.append(user_id)
+        return wallet
+
+    monkeypatch.setattr(credit, "_get_or_create_wallet", commit_rival_delta_after_wallet_read)
+    try:
+        assert await api_completion._settle(run_id, owner=owner) == "completed"
+        assert await api_completion._settle(run_id, owner=owner) == "completed"
+        async with db.factory() as session:
+            wallet = await session.get(UserWallet, db.user_id)
+            assert wallet.used_quota_this_month == Decimal("1.02") + Decimal("3") * len(interleaved)
+            reservation = await session.get(ChatModelCallReservation, (run_id, "api_completion:1"))
+            assert (reservation.status, reservation.actual_credits) == ("settled", Decimal("0.02"))
+            usage = (await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))).scalars().all()
+            assert len(usage) == 1 and usage[0].credited_cost == Decimal("0.02")
+            assert (await session.get(ChatRun, run_id)).usage_reconciled_at is not None
+    finally:
+        async with db.factory() as session, session.begin():
+            await session.execute(delete(ChatProviderUsage).where(ChatProviderUsage.event_id == f"run:{run_id}"))
+            await session.execute(delete(ChatUsageLog).where(ChatUsageLog.run_id == run_id))
+            await session.execute(delete(UserWallet).where(UserWallet.user_id == db.user_id))

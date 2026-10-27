@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.12 — Unreleased candidate
+
+- Stop the title scheduling loop explicitly before awaiting worker drain or error cleanup. A dependency that consumes cancellation can no longer restart claims or idle sleeps and indefinitely block shutdown; already admitted work retains its existing finish-inflight and lease behavior. No provider/native-operation retry or durable counter reset is added.
+- Preserve the published0.6.11 Valkey Sentinel fix, all SDK/plugin/sandbox identities and immutable027/028 migration bytes. This source repair does not patch an already-running old worker or classify retained failed-generation accounting as clean drain.
+- Select the existing READ COMMITTED transaction mode before Batch/API-completion checkpoint settlement reads. A sustained rival wallet commit can no longer exhaust bounded rollback-safe DB retries with MariaDB1020; checkpointed provider work is not sent again. Snapshot ON/OFF regressions preserve every rival delta, one usage charge and duplicate-settlement no-op.
+
 ## 0.6.11 — Unreleased candidate
 
 - Add optional Valkey Sentinel primary discovery to the existing shared cache client. Preserve data URL authentication, database and TLS/socket options; separate Sentinel client authentication, never fall back to the URL seed, and never blindly replay an interrupted command in Sentinel mode. Direct URL mode retains its existing behavior.
