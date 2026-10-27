@@ -4,7 +4,7 @@
 
 A source-bound actual old0.6.9 worker remained in shutdown for more than1800seconds. Non-injecting, non-pausing exact-ABI diagnostics observed its parent gathering a still-running title loop after cancellation had been consumed; the child was again sleeping/polling. Frozen published0.6.11 source reproduces the consumer-visible failure in both normal drain and error cleanup. This proves the observed shutdown blocker, not the earlier initiating application failure.
 
-## Change
+## What Changes
 
 Use a worker-owned explicit scheduling-stop Event, set before any cleanup await/cancel. Stop new title claims and idle sleeps after the flag while retaining single cancellation for idle interruption and existing finish-inflight behavior for admitted work. No retry, provider call, counter reset, migration, new logging/instrumentation or runtime injection is added.
 

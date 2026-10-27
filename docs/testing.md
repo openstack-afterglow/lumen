@@ -18,6 +18,8 @@ All **8/8 final canonical product images** built and executed on arm64/amd64 wit
 
 Final receipts: parent `lumen-cooperative-title-stop-20261027/python-final-5b4d58b813b0/` and `oci-final-0ff2ef19d2fe/`. Historical failed system/harness attempts remain preserved and are not relabelled success or attributed by inference. Exact-SHA publication and native cold/deployment acceptance remain separate gates.
 
+Immutable `v0.6.12` is formally published from `9d94d0b51f2dcee9d47fdb05004de4c7558fa661` after exact CI40460489921. Formal package40462122964 and dualarchitecture images40462122895 succeeded; all8 immutable published image binaries were executed, source hashes/revision/platform and version/latest digest parity verified. Published root wheel SHA-256 is `07fac5f125567ea43092c4a02e94484b598a49945854a17f825f937dd3eeb038`. The archived rapid code-change receipt records publication; native runtime/cold/migration acceptance remains a separate parent task, not implied by this publication.
+
 ## 0.6.11 Valkey Sentinel patch qualification
 
 Source boundary: fetched `origin/dev` and isolated integration base both `c27e5401746901cc359730d4df486e95c6e74838`; root/runtime/Kolla image default0.6.11, generated lock root only. No SDK/plugin/sandbox or027/028 SQL/manifest changes. `tests/test_cache.py` covers installed-client options, separate discovery authentication, strict coherent topology, cleanup failures, native TCP lost-response/READONLY no-replay and discovery failure without seed fallback. `tests/test_kolla_assets.py` checks rendered config and every API/worker/controller/bootstrap environment.

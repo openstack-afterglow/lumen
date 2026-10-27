@@ -7,8 +7,8 @@
 
 ## Final qualification
 - [x] Run final exact-source contract/integration/system/package/image gates and independent review.
-- [ ] Freeze architecture, archive this code change and commit/push dev without altering prior immutable tags.
-- [ ] Verify exact-SHA CI, immutable0.6.12 publication, revision/digests/latest and actual published binaries.
+- [x] Freeze architecture and commit/push qualified dev source without altering prior immutable tags.
+- [x] Verify exact-SHA CI, immutable0.6.12 publication, revision/digests/latest and actual published binaries.
 
 ## Boundary
-- [ ] Record actual runtime cutover separately; this source change does not clear historical counters, certify old work, or authorize a forced process exit.
+Actual runtime cutover remains tracked separately in Afterglow's `release-current-changes-20261026`; it is not claimed by this completed source change. This source repair does not clear historical counters, certify old work, or authorize a forced process exit.

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.12 — Unreleased candidate
+## 0.6.12 — 2026-10-27
 
 - Stop the title scheduling loop explicitly before awaiting worker drain or error cleanup. A dependency that consumes cancellation can no longer restart claims or idle sleeps and indefinitely block shutdown; already admitted work retains its existing finish-inflight and lease behavior. No provider/native-operation retry or durable counter reset is added.
 - Preserve the published0.6.11 Valkey Sentinel fix, all SDK/plugin/sandbox identities and immutable027/028 migration bytes. This source repair does not patch an already-running old worker or classify retained failed-generation accounting as clean drain.
