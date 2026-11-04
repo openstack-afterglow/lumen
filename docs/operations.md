@@ -11,6 +11,14 @@ source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra ser
 
 `docker/Dockerfile`은 migration을 자동 실행하지 않는다. migration 누락 상태로 새 API/worker를 기동하지 않는다.
 
+## 0.6.13 standard-role release boundary
+
+Candidate0.6.13 is scoped from current remote dev c4527de / published0.6.12, not the separate dirty release/lumen-0.6.5 checkout. It changes native role defaults and actual OpenID classification only. It does not include Pi, CHAT3/durable4, historical account027 rewrites, dependency changes or new SQL. Published Kubernetes027 and forward028, existing Bifrost binary, protocol1/2 and SDK/plugin/sandbox versions remain byte-compatible.
+
+Relative to a fully migrated0.6.12 cohort there is no new migration. Older installations still require all existing schema/028 and credential-provenance prerequisites below. Preserve original SQL/Redis/PostgreSQL endpoints, encryption keys, provider credentials and pending/unknown journals; normal drain and matching API/online-worker/batch-worker/controller/bootstrap replacement remain mandatory. Inventory operator policy files/directories on every host and guest: absent YAML uses new defaults; existing grade-only overrides must be deliberately replaced/narrowed, never silently rewritten. No native IAM grants are added or removed, and existing key scope lists never expand.
+
+The canonical package/image workflows now accept numeric `X.Y.Z` and historical `vX.Y.Z` tags, enforce package/tag lockstep before publication and attach wheels for both. The intended new Git tag and package/OCI version are`0.6.13`. The independent operator-owned `lumen_source_version` commit pin remains unchanged; source-build operators must select the exact reviewed release commit explicitly. Local source qualification, tag publication, multiarch image qualification and operational acceptance are distinct receipts.
+
 ## Valkey Sentinel primary routing (0.6.11)
 
 `[cache] redis_url` remains the Valkey data credential/database/TLS URL. Optional `redis_sentinel_addresses = [["controller-1", 26379], ["controller-2", 26379], ["controller-3", 26379]]` plus `redis_sentinel_master = "kolla"` enable primary discovery; both empty retain standalone/direct URL behavior. `redis_sentinel_username` (optional ACL user) and SecretStr `redis_sentinel_password` authenticate discovery separately from the URL's data-node credentials. Never reuse the data-server password unless the operator actually configured the same client AUTH on Sentinel. Kolla takes addresses from the existing `valkey` group and `valkey_sentinel_port`, master from `valkey_sentinel_monitor_name`, and optional discovery password from `valkey_sentinel_password`; service-specific overrides stay in the existing protected rendering path, never plaintext globals/example secrets.
@@ -80,7 +88,7 @@ Cache 종료는 pinned Redis 5.0.0의 async `close()`로 client 소유 connectio
 
 ## Service-local oslo.policy (locally exercised, not deployed)
 
-Use one operator policy across every API, online/batch worker and key/bootstrap process. Service grades (`lumen_reader`, `lumen_user`, `lumen_editor`, `lumen_admin`) need no Keystone service-role implication edges or member/reader co-role. Do not bulk-expand grade grants or reconstruct leaf roles in tokens/user-data. Fresh native enabled identity and global assignments remain mandatory; raw human system authorization retains its independent native graph verification.
+Use one operator policy across every API, online/batch worker and key/bootstrap process. Standard native project admin/manager/member manage owned resources and reader reads nonsecret resources; dedicated Lumen service roles and special personal-project provenance are no longer required. Native effective custom/group/domain/inherited and retained legacy implications remain authoritative when they reach those exact standard roles. Never bulk-edit native grants or reconstruct synthetic role aliases. Fresh enabled identity, exact source/issued-ID/key ceilings and raw human system verification remain mandatory.
 
 ```toml
 [oslo_policy]
@@ -91,11 +99,11 @@ policy_dirs = []
 Environment overrides are `OSLO_POLICY_POLICY_FILE` and JSON `OSLO_POLICY_POLICY_DIRS`. Missing files use code-registered defaults. Start with selected rules from installed `share/lumen/policy.yaml.sample` (also `lumen/policy.yaml.sample` in source), not an expanded role graph. Standard generator: `uv run --extra service oslopolicy-sample-generator --namespace lumen --output-file /tmp/lumen-policy.yaml.sample`. Effective-policy tooling uses `oslo.policy.enforcer` namespace `lumen`. The installed standard generator and all 40 registered defaults/sample parity were exercised locally; see `docs/testing.md` for the exact evidence boundary.
 
 ```yaml
-"compat:completions:write": "role:lumen_user or role:custom_chat_operator"
+"compat:completions:write": "role:member or role:manager"
 "native:tools:execute": "!"
 ```
 
-Action names are the existing exact native/compat scope names plus `system:admin`. Rules use ordinary oslo.policy syntax (`role:`, `rule:`, `@`, `!`); custom roles must be exact trusted global native grants. Current project `admin` is allowed for project actions by default but never becomes system administrator. `system:admin` remains a verified human-only boundary even when set to `@`. Stored key scopes, original issued-ID/source ceilings, user/project/resource ownership, consent, provider prerequisites and new-I/O revalidation cannot be overridden by YAML.
+Action names are the existing exact native/compat scope names plus `system:admin`. Rules use ordinary oslo.policy syntax (`role:`, `rule:`, `@`, `!`); custom roles must be exact trusted global native grants and satisfy the independent standard native-role floor. Policy can narrow but not give reader mutations or legacy-only service entitlement. Project admin/manager/member never become system administrators. `system:admin` remains verified-human-only even with `@`. Stored key scopes, original issued-ID/source ceilings, ownership, consent, provider prerequisites and new-I/O revalidation cannot be overridden.
 
 oslo.policy checks file/directory modification times during authorization, so updates apply on the next request/new-I/O gate. Change the file timestamp; do not retain an old timestamp while replacing contents. Malformed YAML/nonstring rules, malformed expressions and undefined/cyclic rule references deny rather than silently using prior allows. Use a directory bind mount for atomic rename updates; a single-file bind can retain the old inode, so update its contents in place or recreate the container after a safe preservation preflight. Confirm the mounted bytes on **all** API/workers, then compare authenticated `GET /v1/policy/capabilities` and the affected real action; the capability endpoint alone is not provider-execution proof. Reverting to reviewed previous YAML follows the same reload procedure, not role graph edits.
 

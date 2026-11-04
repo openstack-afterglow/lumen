@@ -66,6 +66,43 @@ def test_docker_build_is_the_single_push_and_pr_test_entry() -> None:
     assert callers == ["test"]
 
 
+@pytest.mark.parametrize("workflow_name", ["docker-build.yml", "release.yml"])
+def test_release_triggers_accept_numeric_and_historical_v_tags(workflow_name: str) -> None:
+    assert _triggers(_workflow(workflow_name))["push"]["tags"] == ["[0-9]*.[0-9]*.[0-9]*", "v*"]
+
+
+@pytest.mark.parametrize("workflow_name,job", [
+    ("release.yml", "release-package"), ("docker-build.yml", "build-and-push"),
+])
+@pytest.mark.parametrize("prefix", ["", "v"])
+@pytest.mark.parametrize("matches", [True, False])
+def test_package_tag_lockstep_accepts_only_matching_release_versions(
+    prefix: str, matches: bool, workflow_name: str, job: str,
+) -> None:
+    from lumen import __version__
+
+    steps = _workflow(workflow_name)["jobs"][job]["steps"]
+    step = next(step for step in steps if step.get("name") == "Verify Tag/Version Lockstep")
+    version = __version__ if matches else "999.999.999"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=REPO_ROOT,
+        env={"PATH": os.path.dirname(sys.executable) + os.pathsep + os.defpath,
+             "GITHUB_REF": f"refs/tags/{prefix}{version}"},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == (0 if matches else 1), result.stdout + result.stderr
+
+
+def test_numeric_release_attaches_wheels_and_uses_semver_oci_tags() -> None:
+    steps = _workflow("release.yml")["jobs"]["release-package"]["steps"]
+    attach = next(step for step in steps if step.get("name") == "Attach Wheel to GitHub Release")
+    assert attach["if"] == "startsWith(github.ref, 'refs/tags/')"
+    image_steps = _docker_jobs()["build-and-push"]["steps"]
+    metadata = next(step for step in image_steps if step.get("id") == "meta")
+    assert "type=semver,pattern={{version}}" in metadata["with"]["tags"].splitlines()
+
+
 def test_tests_run_unless_dedup_reports_a_duplicate() -> None:
     test = _docker_jobs()["test"]
 

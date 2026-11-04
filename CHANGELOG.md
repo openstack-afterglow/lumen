@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.13 — 2026-11-04 candidate (UTC; publication/deployment pending)
+
+- **한국어 — 변경/수정:** Dedicated Lumen service role 및 special personal-project marker 대신 native project admin/manager/member는 소유 리소스를 관리하고 reader는 nonsecret 조회만 허용한다. Native custom/group/domain/inherited/retained legacy implications, original issued-role-ID/API-key scope ceilings, fresh revocation/outage, owner/private/credential 및 global human admin 경계는 유지한다. Keystone 실제 `openid`와 token-reissued OpenID human session을 올바르게 분류한다.
+- **한국어 — 폐기/제거:** Dedicated service-grade/leaf default requirements와 `personal_project_owner` 특례를 제거한다. Native IAM role/grant, SDK/plugin, SQL 또는 사용자 데이터 삭제 없음. 배포일: 미배포; 릴리스 게시일: 미게시.
+- **English — Changes/fixes:** Standard native project admin/manager/member manage owned resources; reader reads nonsecret resources. Preserve effective custom/group/domain/inherited/retained legacy implications, original issued-role-ID and API-key ceilings, fresh revocation/outage, owner/private/credential and human global-admin boundaries. Recognize actual Keystone `openid` and token-reissued OpenID human methods.
+- **English — Deprecated/removed:** Dedicated service-grade/leaf default requirements and the `personal_project_owner` special case. No native IAM role/grant, SDK/plugin, migration or user-data removal. Deployment date: not deployed; publication date: not published.
+- Scoped from remote dev c4527de / published0.6.12; root package/runtime/lock and packaged Kolla default become0.6.13. No Pi/CHAT3/durable4 or primary-checkout historical027 cutover. Immutable published027/028, Bifrost, protocol1/2 and all independently versioned SDK/plugins/sandbox remain unchanged. Source, local qualification, tag publication and operational acceptance are distinct.
+
 ## 0.6.12 — 2026-10-27
 
 - Stop the title scheduling loop explicitly before awaiting worker drain or error cleanup. A dependency that consumes cancellation can no longer restart claims or idle sleeps and indefinitely block shutdown; already admitted work retains its existing finish-inflight and lease behavior. No provider/native-operation retry or durable counter reset is added.
