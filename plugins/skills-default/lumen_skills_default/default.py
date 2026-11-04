@@ -91,7 +91,7 @@ class DefaultSkills:
     manifest = PluginManifest(
         id="default-skills",
         kind="skills",
-        version="0.1.0",
+        version="0.1.1",
         required_capabilities=(),
         exports=(
             PluginExport(

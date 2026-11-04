@@ -68,7 +68,7 @@ async def test_context_state_thresholds_and_recommendations():
 
 
 async def test_context_token_counter_honesty():
-    from lumen.services.litellm_client import count_context_tokens
+    from lumen.services.provider_metadata import count_context_tokens
 
     uncountable = [{"role": "user", "content": [{"type": "audio", "data": "abc"}]}]
     res = count_context_tokens("gpt-4o", uncountable)
@@ -244,7 +244,7 @@ async def test_compaction_reduces_again_when_safe_result_misses_target():
 
 async def test_context_state_distinguishes_unknown_limit_counting_and_invalid_budget(monkeypatch):
     import lumen.services.context_manager as context_manager
-    from lumen.services.litellm_client import ContextTokenCount
+    from lumen.services.provider_metadata import ContextTokenCount
 
     messages = [{"role": "user", "content": "hello"}]
     monkeypatch.setattr(
@@ -296,14 +296,13 @@ async def test_context_state_distinguishes_unknown_limit_counting_and_invalid_bu
 
 
 async def test_context_counter_failure_keeps_a_text_estimate(monkeypatch):
-    import litellm
+    from lumen.services import provider_metadata
+    from lumen.services.provider_metadata import count_context_tokens
 
-    from lumen.services.litellm_client import count_context_tokens
+    def unavailable_counter(_model):
+        raise OSError("tokenizer unavailable")
 
-    def unavailable_counter(**_kwargs):
-        raise RuntimeError("tokenizer unavailable")
-
-    monkeypatch.setattr(litellm, "token_counter", unavailable_counter)
+    monkeypatch.setattr(provider_metadata, "_text_encoding", unavailable_counter)
 
     count = count_context_tokens("perplexity/perplexity/sonar", [{"role": "user", "content": "count me"}])
 
@@ -313,7 +312,7 @@ async def test_context_counter_failure_keeps_a_text_estimate(monkeypatch):
 
 
 async def test_prepare_context_reports_distinct_unavailable_reason_codes():
-    from lumen.services.litellm_client import ContextTokenCount
+    from lumen.services.provider_metadata import ContextTokenCount
 
     with pytest.raises(ContextLimitExceeded) as invalid_budget:
         await prepare_model_messages([], [], 2_000, 100, {}, token_counter=_count)

@@ -1,0 +1,15 @@
+{# Source: https://raw.githubusercontent.com/openstack/kolla-ansible/570f2b77142d7145e55f39126e3987002afe7494/ansible/roles/loadbalancer/templates/haproxy/haproxy_external_frontend.cfg.j2
+   Commit: 570f2b77142d7145e55f39126e3987002afe7494
+   Upstream body below is unmodified. #}
+{%- set external_tls_bind_info = 'ssl crt /etc/haproxy/certificates/haproxy.pem' if kolla_enable_tls_external|bool else '' %}
+
+frontend external_frontend
+    mode http
+    http-request del-header X-Forwarded-Proto
+{% for http_option in haproxy_external_single_frontend_options %}
+    {{ http_option }}
+{% endfor %}
+    http-request set-header X-Forwarded-Proto https if { ssl_fc }
+    bind {{ kolla_external_vip_address }}:{{ haproxy_single_external_frontend_public_port }} {{ external_tls_bind_info }}
+    use_backend %[req.hdr(host),lower,map_dom(/etc/haproxy/external-frontend-map,{{ haproxy_external_single_frontend_default_backend }})]
+    http-request deny if { path -i -m beg /server-status }

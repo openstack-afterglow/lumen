@@ -15,10 +15,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from lumen.api.assets import _map_error as asset_error
 from lumen.api.assets import _spool_upload
-from lumen.api.audio import SpeechRequest, TranscriptionRequest, admit, completed_audio, speech_stream
+from lumen.api.audio import admit, completed_audio, speech_stream
 from lumen.api.compat.openai import openai_error_response
 from lumen.auth import Principal, require_api_key_scopes
 from lumen.db import get_session_factory
+from lumen.models.api_requests import SpeechRequest, TranscriptionRequest
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_runs import ChatRun
 from lumen.services import assets
@@ -99,7 +100,8 @@ async def speech(
         payload = SpeechRequest(model_id=body.get("model"), input=body.get("input"), voice=body.get("voice"),
                                 response_format=body.get("response_format", "mp3"), provider_id=body.get("provider_id"))
         run_id = await admit(payload, kind="tts", principal=principal,
-                             idempotency_key=idempotency_key or uuid.uuid4(), api_provider=body.get("provider"))
+                             idempotency_key=idempotency_key or uuid.uuid4(), api_provider=body.get("provider"),
+                             required_scopes=("compat:audio:write",))
         result = await completed_audio(run_id, principal=principal, request=request)
         return await speech_stream(result, principal=principal)
     except ValidationError as exc:
@@ -120,7 +122,7 @@ async def transcriptions(
     response_format: str = Form("json"),
     temperature: float = Form(0),
     idempotency_key: uuid.UUID | None = Header(default=None, alias="Idempotency-Key"),
-    principal: Principal = Depends(require_api_key_scopes("compat:audio:write", "native:assets:write")),
+    principal: Principal = Depends(require_api_key_scopes("compat:audio:write")),
 ):
     try:
         unknown = set((await request.form()).keys()) - _TRANSCRIPTION_FIELDS
@@ -158,7 +160,8 @@ async def transcriptions(
         payload.input_asset_id = uuid.UUID(source_id)
         try:
             run_id = await admit(payload, kind="stt", principal=principal,
-                                 idempotency_key=idempotency_key or uuid.uuid4(), api_provider=provider)
+                                 idempotency_key=idempotency_key or uuid.uuid4(), api_provider=provider,
+                                 required_scopes=("compat:audio:write",))
             result = await completed_audio(run_id, principal=principal, request=request)
             if result.get("kind") != "stt":
                 raise HTTPException(status_code=503, detail="transcript is unavailable")

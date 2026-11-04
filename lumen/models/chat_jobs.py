@@ -38,7 +38,10 @@ class ChatJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
-    __table_args__ = (Index("idx_chat_jobs_claim", "status", "next_at"),)
+    __table_args__ = (
+        Index("idx_chat_jobs_claim", "status", "next_at"),
+        Index("idx_chat_jobs_owner_lease", "lease_owner", "status", "lease_expires_at"),
+    )
 
 
 class ChatInputDerivation(Base):
@@ -111,4 +114,7 @@ class ChatMemoryOutbox(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
-    __table_args__ = (Index("idx_chat_memory_outbox_claim", "status", "change_seq"),)
+    __table_args__ = (
+        Index("idx_chat_memory_outbox_claim", "status", "change_seq"),
+        Index("idx_chat_memory_outbox_owner_lease", "lease_owner", "status", "lease_expires_at"),
+    )

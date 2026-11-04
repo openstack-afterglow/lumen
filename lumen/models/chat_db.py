@@ -42,24 +42,17 @@ class LlmProvider(Base):
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
-    # litellm custom_llm_provider (openai|anthropic|gemini|vertex_ai|azure|bedrock|ollama|...)
+    # Provider adapter family, independent of public API identity.
     provider_type: Mapped[str] = mapped_column(VARCHAR(40), nullable=False, default="openai")
     # Public API selector is independent of the execution transport.
     api_provider: Mapped[str] = mapped_column(VARCHAR(40), nullable=False, default=_default_api_provider)
     sort_order: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
     api_base: Mapped[str | None] = mapped_column(VARCHAR(255))
-    # AES-256-GCM(lumen_encryption_key, 도메인 llm_provider_key) 암호화 상태로 저장
-    encrypted_api_key: Mapped[str | None] = mapped_column(TEXT)
+    selection_policy: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="priority", server_default="priority")
+    selected_credential_id: Mapped[int | None] = mapped_column(BIGINT)
     # Organization billing credentials use a separate HKDF domain and never enter inference execution.
     encrypted_billing_admin_key: Mapped[str | None] = mapped_column(TEXT)
-    # Optional environment variable name used only when no database key exists.
-    api_key_env: Mapped[str | None] = mapped_column(VARCHAR(128))
-    # Subscription credentials are encrypted separately from API keys so execution cannot fall back across auth modes.
     auth_mode: Mapped[str] = mapped_column(VARCHAR(32), nullable=False, default="api_key")
-    encrypted_subscription_tokens: Mapped[str | None] = mapped_column(TEXT)
-    subscription_status: Mapped[str] = mapped_column(VARCHAR(24), nullable=False, default="disconnected")
-    subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    subscription_generation: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     margin_multiplier: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False, default=Decimal("1.0"))
     # models.dev provider key. Display names are never used for catalog matching.
@@ -69,11 +62,8 @@ class LlmProvider(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
     models: Mapped[list["LlmModel"]] = relationship("LlmModel", back_populates="provider", cascade="all, delete-orphan")
-    auth_attempt: Mapped["LlmProviderAuthAttempt | None"] = relationship(
-        "LlmProviderAuthAttempt",
-        back_populates="provider",
-        cascade="all, delete-orphan",
-        uselist=False,
+    accounts: Mapped[list["LlmProviderAccount"]] = relationship(
+        "LlmProviderAccount", back_populates="provider", cascade="all, delete-orphan", lazy="selectin"
     )
 
     __table_args__ = (
@@ -82,16 +72,60 @@ class LlmProvider(Base):
     )
 
 
+class LlmProviderAccount(Base):
+    __tablename__ = "llm_provider_accounts"
+
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    provider_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_providers.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
+    is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
+    priority: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    weight: Mapped[int] = mapped_column(INT, nullable=False, default=1)
+    allowed_model_ids: Mapped[list | None] = mapped_column(JSON)
+    allowed_capabilities: Mapped[list | None] = mapped_column(JSON)
+    quota_group: Mapped[str | None] = mapped_column(VARCHAR(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    provider: Mapped["LlmProvider"] = relationship("LlmProvider", back_populates="accounts")
+    credentials: Mapped[list["LlmProviderCredential"]] = relationship(
+        "LlmProviderCredential", back_populates="account", cascade="all, delete-orphan", lazy="selectin"
+    )
+    __table_args__ = (UniqueConstraint("provider_id", "name", name="uq_provider_account_name"),)
+
+
+class LlmProviderCredential(Base):
+    __tablename__ = "llm_provider_credentials"
+
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_provider_accounts.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
+    auth_mode: Mapped[str] = mapped_column(VARCHAR(32), nullable=False)
+    encrypted_api_key: Mapped[str | None] = mapped_column(TEXT)
+    api_key_env: Mapped[str | None] = mapped_column(VARCHAR(128))
+    encrypted_subscription_tokens: Mapped[str | None] = mapped_column(TEXT)
+    subscription_status: Mapped[str] = mapped_column(VARCHAR(24), nullable=False, default="disconnected")
+    subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    generation: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
+    is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
+    priority: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    weight: Mapped[int] = mapped_column(INT, nullable=False, default=1)
+    allowed_model_ids: Mapped[list | None] = mapped_column(JSON)
+    allowed_capabilities: Mapped[list | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    account: Mapped["LlmProviderAccount"] = relationship("LlmProviderAccount", back_populates="credentials")
+    __table_args__ = (UniqueConstraint("account_id", "name", name="uq_provider_credential_name"),)
+
+
 class LlmProviderAuthAttempt(Base):
-    """Single durable device-auth attempt for one provider."""
+    """Single durable, caller-bound device-auth attempt for one selected credential."""
 
     __tablename__ = "llm_provider_auth_attempts"
 
-    provider_id: Mapped[int] = mapped_column(
-        BIGINT,
-        ForeignKey("llm_providers.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
+    credential_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_provider_credentials.id", ondelete="CASCADE"), primary_key=True)
+    provider_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_providers.id", ondelete="CASCADE"), nullable=False)
     id: Mapped[str] = mapped_column(CHAR(36), nullable=False, unique=True)
     initiated_by_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     initiated_by_project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
@@ -101,8 +135,6 @@ class LlmProviderAuthAttempt(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     next_poll_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
-
-    provider: Mapped["LlmProvider"] = relationship("LlmProvider", back_populates="auth_attempt")
 
 
 class LlmModel(Base):
@@ -317,6 +349,12 @@ class ChatUsageLog(Base):
     credited_cost: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     source: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="web")  # web | api
     api_key_id: Mapped[int | None] = mapped_column(BIGINT)
+    provider_id: Mapped[int | None] = mapped_column(BIGINT)
+    provider_account_id: Mapped[int | None] = mapped_column(BIGINT)
+    provider_credential_id: Mapped[int | None] = mapped_column(BIGINT)
+    provider_credential_generation: Mapped[int | None] = mapped_column(BIGINT)
+    provider_backend: Mapped[str | None] = mapped_column(VARCHAR(40))
+    provider_backend_version: Mapped[str | None] = mapped_column(VARCHAR(100))
     event_id: Mapped[str | None] = mapped_column(VARCHAR(64), unique=True)
     pricing_status: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="legacy")
     pricing_snapshot: Mapped[dict | None] = mapped_column(JSON)
@@ -331,7 +369,28 @@ class ChatUsageLog(Base):
         Index("idx_chat_usage_user_created", "user_id", "created_at"),
         Index("idx_chat_usage_api_key_created", "api_key_id", "created_at"),
         Index("idx_chat_usage_run_id", "run_id"),
+        Index("idx_chat_usage_provider_account", "provider_account_id", "created_at"),
     )
+
+class ChatProviderUsage(Base):
+    """Upstream attribution allocated inside the existing idempotent credit transaction."""
+
+    __tablename__ = "chat_provider_usage"
+
+    event_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    provider_account_id: Mapped[int] = mapped_column(BIGINT, primary_key=True)
+    provider_credential_id: Mapped[int] = mapped_column(BIGINT, primary_key=True)
+    provider_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    provider_credential_generation: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    provider_backend: Mapped[str | None] = mapped_column(VARCHAR(40))
+    provider_backend_version: Mapped[str | None] = mapped_column(VARCHAR(100))
+    prompt_tokens: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
+    raw_cost: Mapped[Decimal] = mapped_column(Numeric(20, 10), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+    __table_args__ = (Index("idx_provider_usage_account", "provider_account_id", "created_at"),)
+
 
 
 class ChatQuotaPolicy(Base):
@@ -414,6 +473,25 @@ class ChatMcpServer(Base):
         Index("idx_chat_mcp_owner", "owner_user_id"),
         Index("idx_chat_mcp_servers_project", "project_id"),
     )
+
+
+class ChatMcpActivation(Base):
+    """Owner/project approval for one exact administrator-published MCP revision."""
+
+    __tablename__ = "chat_mcp_activations"
+
+    mcp_server_id: Mapped[int] = mapped_column(
+        BIGINT, ForeignKey("chat_mcp_servers.id", ondelete="CASCADE"), primary_key=True
+    )
+    owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    owner_project_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
+    config_version: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    generation: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+    __table_args__ = (Index("idx_chat_mcp_activation_owner", "owner_user_id", "owner_project_id"),)
 
 
 class ChatMcpOAuthConnection(Base):

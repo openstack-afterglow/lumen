@@ -28,7 +28,7 @@ def _route(provider, model, variants):
 def _mock_provider(monkeypatch, handler):
     client_type = httpx.AsyncClient
     monkeypatch.setattr(image_transport.httpx, "AsyncClient", lambda **kwargs: client_type(
-        transport=httpx.MockTransport(handler), **kwargs,
+        **{**kwargs, "transport": httpx.MockTransport(handler)},
     ))
 
 

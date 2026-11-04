@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from lumen.api import audio as native
 from lumen.api.compat import audio as compat
 from lumen.auth import get_principal
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services.providers.errors import ProviderValidationError
 
 
@@ -21,6 +22,7 @@ def _principal():
         "auth_type": "api_key", "user_id": "user-1", "project_id": "project-1", "api_key_id": 4,
         "source": "api", "scopes": ("native:audio:write", "native:assets:read", "native:assets:write",
                               "compat:audio:write"),
+        "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False,
     }
 
 

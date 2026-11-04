@@ -10,7 +10,7 @@ from lumen_plugin_api.testing import check_lifecycle, check_manifest, check_tool
 from lumen_plugin_api.tools import ToolSpec, ToolTextPart
 from lumen_tools_default import create_plugin
 
-IDENTITY = PluginIdentity(plugin_id="default-tools", version="0.1.0", config_fingerprint="0" * 64)
+IDENTITY = PluginIdentity(plugin_id="default-tools", version=create_plugin().manifest.version, config_fingerprint="0" * 64)
 OWNER = ExecutionContext(user_id="owner", project_id="p", run_id="r")
 CUSTOM_ROW = {
     "id": 7, "name": "lookup", "description": "Look up a public URL", "url": "https://api.example/x",

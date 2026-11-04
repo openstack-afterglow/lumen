@@ -29,7 +29,7 @@ from lumen.models.chat_contracts import (
     ContextBreakdown,
     ContextComponent,
 )
-from lumen.services.litellm_client import ContextTokenCount, count_context_tokens
+from lumen.services.provider_metadata import ContextTokenCount, count_context_tokens
 
 # The compaction projection marks its summary turn with this exact sentinel in
 # both ``context_store`` (durable checkpoint projection) and ``context_manager``

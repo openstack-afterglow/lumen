@@ -13,6 +13,7 @@ from decimal import Decimal
 from urllib.parse import quote
 
 from .audio_transport import _GEMINI_VOICES, _OPENAI_VOICES
+from .credentials import api_key_route_configured
 from .errors import ProviderValidationError
 from .pricing import exact_duration_price, frozen_token_pricing, media_billing_basis, media_reservation_usd
 
@@ -47,7 +48,7 @@ class RealtimeTransportError(RuntimeError):
 
 
 def _model(route: dict) -> tuple[str, str]:
-    if not isinstance(route, dict) or route.get("model_kind") != "realtime" or route.get("provider_auth") is not None:
+    if not isinstance(route, dict) or route.get("model_kind") != "realtime" or not api_key_route_configured(route):
         raise ProviderValidationError("realtime route is not directly executable")
     provider, model = route.get("provider_type"), route.get("api_model_name")
     if not isinstance(model, str):
@@ -61,8 +62,6 @@ def _model(route: dict) -> tuple[str, str]:
     base = route.get("api_base")
     if base is not None and (not isinstance(base, str) or base.rstrip("/") not in bases):
         raise ProviderValidationError("unsupported realtime provider endpoint")
-    if not isinstance(route.get("api_key"), str) or not route["api_key"].strip():
-        raise ProviderValidationError("realtime provider credential is unavailable")
     return provider, model
 
 

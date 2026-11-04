@@ -4,13 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lumen-sandbox"
-version = "0.1.0"
+version = "0.1.1"
 description = "Isolated, fenced Lumen sandbox execution daemon"
 requires-python = ">=3.12"
-dependencies = ["starlette>=0.46,<1", "uvicorn>=0.34,<1", "cryptography>=44,<48"]
+dependencies = ["starlette>=0.46,<1", "uvicorn>=0.34,<1", "cryptography>=44,<48", "jsonschema>=4.23,<5"]
 
 [project.scripts]
 lumen-sandbox = "lumen_sandbox.server:main"
+lumen-sandbox-kubernetes = "lumen_sandbox.kubernetes_server:main"
 
 [project.optional-dependencies]
 testing = ["pytest>=8", "httpx>=0.27"]

@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from urllib.parse import urlsplit
 
 import pytest
+from keystoneauth1 import session, token_endpoint
+from openstack.connection import Connection
 
 from lumen_sdk import register
 from lumen_sdk.proxy import Proxy
@@ -250,6 +257,19 @@ JSON_METHOD_TABLE = [
     ("admin_update_provider", (1,), {"name": "p2"}, "PATCH", "/v1/admin/providers/1", {"name": "p2"}, None),
     ("admin_delete_provider", (1,), {}, "DELETE", "/v1/admin/providers/1", None, None),
     ("admin_provider_available_models", (1,), {}, "GET", "/v1/admin/providers/1/available-models", None, None),
+    ("admin_provider_accounts", (1,), {}, "GET", "/v1/admin/providers/1/accounts", None, None),
+    ("admin_create_provider_account", (1,), {"name": "a"}, "POST", "/v1/admin/providers/1/accounts", {"name": "a"}, None),
+    ("admin_update_provider_account", (1, 2), {"weight": 3}, "PATCH", "/v1/admin/providers/1/accounts/2", {"weight": 3}, None),
+    ("admin_delete_provider_account", (1, 2), {}, "DELETE", "/v1/admin/providers/1/accounts/2", None, None),
+    ("admin_provider_account_usage", (1, 2), {}, "GET", "/v1/admin/providers/1/accounts/2/usage", None, None),
+    ("admin_create_provider_credential", (1, 2), {"name": "c"}, "POST", "/v1/admin/providers/1/accounts/2/credentials", {"name": "c"}, None),
+    ("admin_update_provider_credential", (1, 2, 3), {"priority": 1}, "PATCH", "/v1/admin/providers/1/accounts/2/credentials/3", {"priority": 1}, None),
+    ("admin_delete_provider_credential", (1, 2, 3), {}, "DELETE", "/v1/admin/providers/1/accounts/2/credentials/3", None, None),
+    ("admin_set_provider_credential_token", (1, 2, 3), {"token": "t"}, "PUT", "/v1/admin/providers/1/accounts/2/credentials/3/auth/token", {"token": "t"}, None),
+    ("admin_disconnect_provider_credential", (1, 2, 3), {}, "DELETE", "/v1/admin/providers/1/accounts/2/credentials/3/auth", None, None),
+    ("admin_begin_provider_credential_device_auth", (1, 2, 3), {}, "POST", "/v1/admin/providers/1/accounts/2/credentials/3/auth/device", None, None),
+    ("admin_poll_provider_credential_device_auth", (1, 2, 3, "att"), {}, "POST", "/v1/admin/providers/1/accounts/2/credentials/3/auth/device/att/poll", None, None),
+    ("admin_cancel_provider_credential_device_auth", (1, 2, 3, "att"), {}, "DELETE", "/v1/admin/providers/1/accounts/2/credentials/3/auth/device/att", None, None),
     ("admin_models", (), {"active_only": True}, "GET", "/v1/admin/models", None, {"active_only": True}),
     ("admin_create_model", (), {"name": "m1"}, "POST", "/v1/admin/models", {"name": "m1"}, None),
     ("admin_update_model", (1,), {"name": "m2"}, "PATCH", "/v1/admin/models/1", {"name": "m2"}, None),
@@ -486,3 +506,119 @@ def test_register_enables_non_official_service_before_attaching_proxy():
 
     assert isinstance(proxy, Proxy)
     assert connection.config.has_service("lumen")
+
+
+# -- Real OpenStack adapter discovery: the facade /v1 must not be duplicated --
+
+@pytest.fixture
+def native_accounts():
+    state = {"account": None, "credential": None, "key_digest": None}
+
+    class NativeBoundary(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def respond(self, status, payload=None):
+            raw = json.dumps(payload).encode() if payload is not None else b""
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            self.dispatch()
+
+        def do_POST(self):
+            self.dispatch()
+
+        def do_PATCH(self):
+            self.dispatch()
+
+        def do_DELETE(self):
+            self.dispatch()
+
+        def dispatch(self):
+            path = urlsplit(self.path).path.rstrip("/")
+            version = {"id": "v1.0", "status": "CURRENT", "links": [{"rel": "self", "href": base + "/v1/"}]}
+            if self.command == "GET" and path in ("", "/v1"):
+                self.respond(200, {"versions": [version]} if path == "" else {"version": version})
+                return
+            if self.headers.get("X-Auth-Token") != "sdk-fixture-token":
+                self.respond(401, {"error": "authentication required"})
+                return
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+            accounts = "/v1/admin/providers/7/accounts"
+            credential = accounts + "/41/credentials/51"
+            if path == accounts and self.command == "POST":
+                if not isinstance(body.get("name"), str):
+                    self.respond(422, {"error": "name required"})
+                    return
+                state["account"] = {"id": 41, "provider_id": 7, "name": body["name"]}
+                self.respond(201, {**state["account"], "credentials": []})
+            elif path == accounts and self.command == "GET":
+                self.respond(200, [{**state["account"], "credentials": [state["credential"]] if state["credential"] else []}]
+                             if state["account"] else [])
+            elif path == accounts + "/41/credentials" and self.command == "POST":
+                if not isinstance(body.get("api_key"), str) or not body.get("name"):
+                    self.respond(422, {"error": "credential required"})
+                    return
+                state["key_digest"] = hashlib.sha256(body["api_key"].encode()).hexdigest()
+                state["credential"] = {"id": 51, "account_id": 41, "name": body["name"],
+                                       "generation": 0, "api_key_configured": True, "api_key_source": "database"}
+                self.respond(201, state["credential"])
+            elif path == credential and self.command == "PATCH":
+                if not isinstance(body.get("api_key"), str):
+                    self.respond(422, {"error": "rotation key required"})
+                    return
+                state["key_digest"] = hashlib.sha256(body["api_key"].encode()).hexdigest()
+                state["credential"]["generation"] += 1
+                self.respond(200, state["credential"])
+            elif path == credential and self.command == "DELETE":
+                state["credential"] = None
+                self.respond(204)
+            elif path == accounts + "/41/usage" and self.command == "GET":
+                self.respond(200, {"account_id": 41, "raw_cost": "0.1250000000", "events": 3})
+            elif path == accounts + "/41" and self.command == "DELETE":
+                state["account"] = None
+                self.respond(204)
+            else:
+                self.respond(404, {"error": "unknown native resource"})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), NativeBoundary)
+    base = f"http://127.0.0.1:{server.server_port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield base, state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+@pytest.mark.parametrize("endpoint_suffix", ["", "/v1"])
+def test_discovered_proxy_preserves_account_lifecycle_without_duplicating_version(native_accounts, endpoint_suffix):
+    base, state = native_accounts
+    auth = token_endpoint.Token(base, "sdk-fixture-token")
+    conn = Connection(session=session.Session(auth=auth), lumen_endpoint_override=base + endpoint_suffix,
+                      lumen_api_version="1")
+    try:
+        api = register(conn)
+        account = api.admin_create_provider_account(7, name="SDK account")
+        credential = api.admin_create_provider_credential(7, account["id"], name="primary", api_key="first-synthetic-key")
+        assert credential["api_key_configured"] and credential["generation"] == 0
+        rotated = api.admin_update_provider_credential(7, account["id"], credential["id"], api_key="rotated-synthetic-key")
+        assert rotated["generation"] == 1
+        assert state["key_digest"] == hashlib.sha256(b"rotated-synthetic-key").hexdigest()
+        saved = api.admin_provider_accounts(7)
+        assert saved[0]["credentials"][0]["generation"] == 1
+        assert "synthetic-key" not in json.dumps(saved)
+        assert api.admin_provider_account_usage(7, account["id"])["raw_cost"] == "0.1250000000"
+        assert api.admin_delete_provider_credential(7, account["id"], credential["id"]) is None
+        assert api.admin_provider_accounts(7)[0]["credentials"] == []
+        assert api.admin_delete_provider_account(7, account["id"]) is None
+        assert api.admin_provider_accounts(7) == []
+    finally:
+        conn.close()

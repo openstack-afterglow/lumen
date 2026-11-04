@@ -24,7 +24,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-`model="lumen"`은 서버의 `chat_default_model`을 사용해 Lumen durable worker에서 실행한다. 특정 공개 provider model ID를 사용하면 stateless provider-direct 경로가 유지된다. `provider`는 공개 ID가 충돌할 때만 필요하며 내부 `model_name`/LiteLLM route를 SDK에 보내지 않는다. Anthropic client도 deployment의 `/v1/messages` stateless surface와 동일한 `extra_body` 선택자를 사용한다.
+`model="lumen"`은 서버의 `chat_default_model`을 사용해 Lumen durable worker에서 실행한다. 특정 공개 provider model ID는 stateless provider-direct 경로를 사용한다. `provider`는 공개 ID 충돌 때만 필요하며 내부 `model_name`/transport route나 account/credential ID를 SDK inference 요청에 보내지 않는다. Anthropic client도 deployment의 `/v1/messages` stateless surface와 같은 공개 선택자를 사용한다. Account policy 선택과 frozen credential/current-authority 검사는 Lumen이 소유하며 client 재시도로 unknown 실행을 반복하지 않는다.
 
 ## Direct API-key client
 
@@ -47,6 +47,28 @@ with Client("https://lumen.example", "sk-afgl-...") as client:
 ```
 
 위 예제 key는 `native:runs:write`, `native:runs:read`와 `models:read`가 필요하다. memory를 켜면 `native:memory:read`와 `native:memory:write`, tools를 켜면 `native:tools:execute`, skill/custom/MCP selection이면 `native:extensions:read`를 추가한다. `usage_records()`에는 `usage:read`가 필요하다.
+
+`AsyncClient(base_url, api_key, *, timeout=30.0, verify=True, transport=None)`는 같은 mixin method set을 awaitable로 제공한다. `speech()`와 `download_asset()`은 bytes를 반환하고 `run_events()`는 async iterator다. `async with` 또는 `aclose()`로 연결을 닫는다.
+
+### Batch
+
+Sync `Client`, `AsyncClient`, Keystone proxy는 `create_batch(*, idempotency_key, **attrs)`, `list_batches(**query)`, `get_batch(batch_id)`, `list_batch_items(batch_id, **query)`, `cancel_batch(batch_id)`를 제공한다. 서버의 `batch_enabled`가 꺼져 있으면 503 `batch_unavailable`이다. 조회에는 `native:batches:read`, 생성/취소에는 `native:batches:write`와 각 항목 operation scope가 필요하다. 결과는 batch가 terminal 상태가 된 뒤 item page로 읽는다. 순서는 `ordinal`과 `custom_id`로 확인한다.
+
+```python
+from uuid import uuid4
+from lumen_sdk import AsyncClient
+
+async with AsyncClient("https://lumen.example", "sk-afgl-...") as client:
+    batch = await client.create_batch(
+        idempotency_key=str(uuid4()),
+        items=[{"custom_id": "q1", "operation": "chat.completions",
+                "body": {"model": "provider-model", "messages": [{"role": "user", "content": "hello"}]}}],
+        metadata={"job": "nightly"},
+    )
+    page = await client.list_batch_items(batch["id"], limit=100)
+```
+
+OpenAI Python SDK로 Files/Batch를 사용할 때는 `compat:files:write|read`, `compat:batches:write|read`와 endpoint scope가 필요하다. `client.files.create(file=..., purpose="batch")` 후 `client.batches.create(input_file_id=..., endpoint="/v1/chat/completions", completion_window="24h")`를 호출한다. 지원 endpoint는 chat completions, Responses와 image generation 세 개다. Upstream OpenAI Batch 할인이나 provider batch quota는 적용되지 않는다.
 
 ## Plugin binding과 native agent/child
 
@@ -95,6 +117,29 @@ run = conn.lumen.temp_completion(
 ```
 
 `Client.close()`를 호출하거나 context manager를 사용한다. `run_events()`는 generator이므로 stream 소비를 중단하면 generator도 닫는다. API-key `Client`는 `/v1/api-keys`, admin, code workspace/Git credential 관리처럼 Keystone-only surface를 사용할 수 없다. Asset 업로드/조회에는 해당 `native:assets:write|read` scope와 owner project가 필요하다.
+
+### Keystone administrator account/credential methods
+
+The shared `Client`/`AsyncClient`/Keystone proxy API mixin declares these methods, but `/v1/admin/*` is **Keystone verified human system-admin only**; an API-key `Client` cannot acquire that authority. Use the authenticated Keystone proxy (`conn.lumen`), not provider secrets or a wider Lumen API key. All paths are beneath `/v1/admin/providers/{provider_id}`:
+
+| Method | Native path / purpose |
+| --- | --- |
+| `admin_provider_accounts(provider_id)` | GET `/accounts`, nested secret-free credential metadata. |
+| `admin_create_provider_account(provider_id, **attrs)` | POST `/accounts`. |
+| `admin_update_provider_account(provider_id, account_id, **attrs)` | PATCH `/accounts/{account_id}`. |
+| `admin_delete_provider_account(provider_id, account_id)` | DELETE `/accounts/{account_id}`. |
+| `admin_provider_account_usage(provider_id, account_id)` | GET `/accounts/{account_id}/usage`; local allocation totals, not another customer charge/invoice. |
+| `admin_create_provider_credential(provider_id, account_id, **attrs)` | POST `/accounts/{account_id}/credentials`. |
+| `admin_update_provider_credential(provider_id, account_id, credential_id, **attrs)` | PATCH `/accounts/{account_id}/credentials/{credential_id}`. |
+| `admin_delete_provider_credential(provider_id, account_id, credential_id)` | DELETE that credential. |
+| `admin_set_provider_credential_token(provider_id, account_id, credential_id, **attrs)` | PUT credential `/auth/token`, `token` and optional `expires_at`. |
+| `admin_disconnect_provider_credential(provider_id, account_id, credential_id)` | DELETE credential `/auth`. |
+| `admin_begin_provider_credential_device_auth(provider_id, account_id, credential_id)` | POST credential `/auth/device`. |
+| `admin_poll_provider_credential_device_auth(provider_id, account_id, credential_id, attempt_id)` | POST credential `/auth/device/{attempt_id}/poll`. |
+| `admin_cancel_provider_credential_device_auth(provider_id, account_id, credential_id, attempt_id)` | DELETE credential `/auth/device/{attempt_id}`. |
+
+Existing `admin_update_provider(provider_id, **attrs)` sets endpoint `selection_policy="explicit"|"priority"|"weighted"` and `selected_credential_id`. Account/credential `allowed_model_ids` and `allowed_capabilities` preserve `None` (unrestricted) versus `[]` (deny all); operations are `chat,responses,messages,count_tokens,embeddings,search,image,tts,stt,realtime`, not model features. Only endpoint-owned model/credential IDs are valid. Expiry/cooldown and secret/restriction edits can invalidate frozen generations; they do not rotate in-flight requests. See [API reference](api-reference.md#provider-account-and-credential-administration) for fields and status semantics. Never log submitted secrets/device codes, and treat subscription authentication as separate from vendor permission for public multi-user pooling.
+
 
 ## 이미지·유한 오디오·실시간 음성 SDK
 

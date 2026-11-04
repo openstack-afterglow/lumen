@@ -34,7 +34,7 @@ def _route(provider="openai", model="whisper-1", kind="stt", pricing=None):
 def _mock(monkeypatch, handler):
     client = httpx.AsyncClient
     monkeypatch.setattr(audio_transport.httpx, "AsyncClient", lambda **kwargs: client(
-        transport=httpx.MockTransport(handler), **kwargs,
+        **{**kwargs, "transport": httpx.MockTransport(handler)},
     ))
 
 

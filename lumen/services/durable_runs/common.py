@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from lumen_plugin_api.tools import AgentExecutionPolicy
+from sqlalchemy import select
 
 from lumen.crypto import decrypt_chat_content
 from lumen.db import get_session_factory, is_db_available
@@ -33,7 +33,6 @@ from lumen.services.message_timestamps import message_timestamps
 
 from .errors import DurableRunError, DurableRunInputError
 
-logger = logging.getLogger(__name__)
 _LEASE_SECONDS = 45
 _V2_DEFAULT_MAX_MODEL_TURNS = 8
 _V2_DEFAULT_MAX_TOOL_CALLS = 24
@@ -84,16 +83,13 @@ def _require_supported_execution_protocol_version(version: int) -> None:
         raise DurableRunInputError("execution protocol version 2 requires an encrypted PostgreSQL checkpointer")
 
 
-async def _freeze_v2_lumen_snapshot(
+async def _freeze_lumen_snapshot(
     request_payload: dict[str, Any],
     *,
     user_id: str,
     project_id: str,
-    execution_protocol_version: int,
 ) -> dict[str, Any]:
     """Freeze the selected Lumen grant at run admission, never at worker execution."""
-    if execution_protocol_version != 2:
-        return request_payload
     from lumen.services import mcp_adapter as mcp_lumen
 
     try:
@@ -333,12 +329,23 @@ def _temporary_history_messages(history_ciphertext: str) -> list[dict[str, str]]
 
 
 async def wake_run(run_id: str) -> None:
-    """Best-effort post-commit wakeup; MySQL scanning remains authoritative."""
+    """Best-effort post-commit wakeup on the run's class/pool hint queue.
+
+    MySQL scanning remains authoritative; a hint never reaches a worker of another
+    class or pool, and API-owned realtime runs are never hinted to workers.
+    """
     try:
         from lumen.cache import _get_redis
+        from lumen.services import worker_routing
 
+        async with _factory()() as session:
+            route = (await session.execute(
+                select(ChatRun.workload_class, ChatRun.worker_pool_id).where(ChatRun.id == run_id)
+            )).one_or_none()
+        if route is None or route.workload_class not in worker_routing.WORKER_WORKLOAD_CLASSES:
+            return
         redis = await _get_redis()
-        await redis.lpush("afterglow:chat:runs", run_id)
+        await redis.lpush(worker_routing.run_hint_key(route.workload_class, route.worker_pool_id), run_id)
     except Exception:
         # A missed wakeup only adds up to the worker's bounded DB-poll delay.
         return

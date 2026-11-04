@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urlencode
 
+from lumen.services.provider_metadata import catalog_model_metadata, catalog_models
 from lumen.services.providers import errors
 from lumen.services.providers import routing as provider_store
 from lumen.services.providers.credentials import (
@@ -347,13 +348,7 @@ def _gemini_parse_page(payload: Any) -> _PageResult:
 
 def _catalog_kind(provider_type: str, model_id: str) -> Literal["text", "image", "tts", "stt", "realtime"] | None:
     """Exact catalog operation hint, never an execution or price guarantee."""
-    import litellm
-
-    for key in (f"{provider_type}/{model_id}", model_id):
-        entry = litellm.model_cost.get(key)
-        if isinstance(entry, dict) and entry.get("litellm_provider") == provider_type:
-            return _MODEL_MODES.get(entry.get("mode"))
-    return None
+    return _MODEL_MODES.get(catalog_model_metadata(model_id, provider_type).get("mode"))
 
 
 def _catalog_candidate(provider_type: str, model_id: str) -> DiscoveredCandidate:
@@ -468,21 +463,14 @@ async def _fetch_openai_compatible_models(
 
 
 # ---------------------------------------------------------------------------
-# 정적(litellm) 참고 목록 — 목록 API가 미지원인 경우에만 사용
+# 정적 catalog 참고 목록 — 목록 API가 미지원인 경우에만 사용
 # ---------------------------------------------------------------------------
-def _litellm_static(provider_type: str) -> list[str]:
-    try:
-        import litellm
-
-        mbp = getattr(litellm, "models_by_provider", None) or {}
-        return sorted({str(m) for m in mbp.get(provider_type, [])})
-    except Exception:
-        logger.warning("litellm 정적 모델 목록 실패 ptype=%s", provider_type, exc_info=True)
-        return []
+def _catalog_static(provider_type: str) -> list[str]:
+    return list(catalog_models(provider_type))
 
 
 def _static_candidates(provider_type: str) -> tuple[DiscoveredCandidate, ...]:
-    static = _litellm_static(provider_type)
+    static = _catalog_static(provider_type)
     if provider_type == "perplexity":
         static = [api_model_name(model, "perplexity") for model in static if not model.startswith("preset/")]
     ids = sorted({m for m in static if m and len(m) <= _MAX_MODEL_ID_LEN})
@@ -500,7 +488,7 @@ def _wrap_ids(ids: list[str]) -> tuple[DiscoveredCandidate, ...]:
 def _response(
     provider_id: int,
     fetched_at: str,
-    source: Literal["api", "litellm", "none"],
+    source: Literal["api", "catalog", "none"],
     live_status: Literal["success", "empty", "unsupported", "error"],
     complete: bool,
     error: dict[str, Any] | None,
@@ -521,19 +509,19 @@ def _response(
 def _subscription_response(provider_id: int, fetched_at: str, auth_mode: str) -> dict[str, Any]:
     catalog_provider = "chatgpt" if auth_mode == "chatgpt_device" else "anthropic"
     canonical_models: list[str] = []
-    for candidate in _litellm_static(catalog_provider):
+    for candidate in _catalog_static(catalog_provider):
         try:
             canonical_models.append(canonical_subscription_model_name(candidate, auth_mode))
         except errors.ProviderValidationError:
             continue
     candidates = _wrap_ids(canonical_models)
-    source: Literal["api", "litellm", "none"] = "litellm" if candidates else "none"
+    source: Literal["api", "catalog", "none"] = "catalog" if candidates else "none"
     return _response(provider_id, fetched_at, source, "unsupported", False, None, candidates)
 
 
 def _unsupported_response(provider_id: int, fetched_at: str, provider_type: str) -> dict[str, Any]:
     candidates = _static_candidates(provider_type)
-    source: Literal["api", "litellm", "none"] = "litellm" if candidates else "none"
+    source: Literal["api", "catalog", "none"] = "catalog" if candidates else "none"
     return _response(provider_id, fetched_at, source, "unsupported", False, None, candidates)
 
 
@@ -558,7 +546,12 @@ async def discover_models(provider_id: int) -> dict[str, Any]:
 
     provider_type = prov["provider_type"]
     api_base = prov["api_base"]
-    api_key = prov["api_key"]
+    api_key = None
+    if provider_type in {"anthropic", "gemini", *_OPENAI_COMPATIBLE} and prov.get("provider_auth") is not None:
+        from lumen.services.providers.credentials import resolve_inference_credential
+
+        material = await resolve_inference_credential(prov["provider_auth"])
+        api_key = material.get("api_key")
 
     if provider_type == "anthropic":
         outcome = await _fetch_anthropic_models(api_base, api_key)

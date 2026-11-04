@@ -46,3 +46,8 @@ def configure_logging(process: Literal["api", "worker", "controller"]) -> None:
         uvicorn_logger.setLevel(logging.NOTSET)
         uvicorn_logger.propagate = True
     logging.getLogger("uvicorn.access").disabled = True
+
+    # HTTP clients log absolute URLs (including secret query parameters) at INFO.
+    # Keep transport detail private even when service diagnostics use DEBUG.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)

@@ -63,6 +63,32 @@ def _ca(config: RuntimeConfig):
     return certificate, key
 
 
+def sign_resource_certificate(csr, resource, ca_certificate, ca_key, now, expires):
+    """Assign identity and extensions on the controller, never from the CSR."""
+    identity = resource_identity(resource.role, resource.id, resource.generation)
+    usages = [ExtendedKeyUsageOID.SERVER_AUTH]
+    if resource.role in {"api", "worker"}:
+        usages.append(ExtendedKeyUsageOID.CLIENT_AUTH)
+    try:
+        ski = ca_certificate.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
+        aki = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ski)
+    except x509.ExtensionNotFound:
+        aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_certificate.public_key())
+    return (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, identity)]))
+            .issuer_name(ca_certificate.subject).public_key(csr.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(expires)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
+                           key_encipherment=False, data_encipherment=False, key_agreement=False,
+                           key_cert_sign=False, crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
+            .add_extension(aki, critical=False)
+            .add_extension(x509.ExtendedKeyUsage(usages), critical=False)
+            .add_extension(x509.SubjectAlternativeName([x509.UniformResourceIdentifier(identity)]), critical=False)
+            .sign(ca_key, None if isinstance(ca_key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)) else hashes.SHA256()))
+
+
 async def issue_bootstrap_token(resource_id: str, generation: int, config: RuntimeConfig) -> str:
     """Issue once for a pending generation; never reissue a consumed token.
 
@@ -76,7 +102,7 @@ async def issue_bootstrap_token(resource_id: str, generation: int, config: Runti
     async with _factory()() as session, session.begin():
         resource = (await session.execute(select(ChatRuntimeResource).where(
             ChatRuntimeResource.id == resource_id, ChatRuntimeResource.generation == generation,
-        ).with_for_update())).scalar_one_or_none()
+        ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
         if (resource is None or resource.desired_state != "requested"
                 or resource.observed_state not in {"requested", "creating", "booting", "unknown"}
                 or resource.certificate_fingerprint or resource.bootstrap_token_hash):
@@ -111,7 +137,7 @@ async def exchange_bootstrap_token(token: str, csr_pem: str, config: RuntimeConf
     async with _factory()() as session, session.begin():
         resource = (await session.execute(select(ChatRuntimeResource).where(
             ChatRuntimeResource.bootstrap_token_hash == digest,
-        ).with_for_update())).scalar_one_or_none()
+        ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
         if (resource is None or not hmac.compare_digest(resource.bootstrap_token_hash, digest)
                 or resource.bootstrap_expires_at is None or _utc(resource.bootstrap_expires_at) <= now
                 or resource.desired_state == "deleting" or resource.observed_state in {"deleted", "failed"}
@@ -128,34 +154,7 @@ async def exchange_bootstrap_token(token: str, csr_pem: str, config: RuntimeConf
         expires = min(required_until, now + timedelta(hours=25), _utc(ca_certificate.not_valid_after_utc))
         if expires < required_until:
             raise BootstrapRejected("bootstrap unavailable")
-        identity = resource_identity(resource.role, resource.id, resource.generation)
-        names: list[x509.GeneralName] = [x509.UniformResourceIdentifier(identity)]
-        usages = [ExtendedKeyUsageOID.SERVER_AUTH]
-        if resource.role in {"api", "worker"}:
-            usages.append(ExtendedKeyUsageOID.CLIENT_AUTH)
-        try:
-            issuer_ski = ca_certificate.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
-        except x509.ExtensionNotFound:
-            authority_key_identifier = x509.AuthorityKeyIdentifier.from_issuer_public_key(
-                ca_certificate.public_key())
-        else:
-            authority_key_identifier = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(issuer_ski)
-        cert = (x509.CertificateBuilder()
-                .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, identity)]))
-                .issuer_name(ca_certificate.subject)
-                .public_key(csr.public_key())
-                .serial_number(x509.random_serial_number())
-                .not_valid_before(now - timedelta(minutes=1))
-                .not_valid_after(expires)
-                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-                .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
-                                             key_encipherment=False, data_encipherment=False,
-                                             key_agreement=False, key_cert_sign=False, crl_sign=False,
-                                             encipher_only=False, decipher_only=False), critical=True)
-                .add_extension(authority_key_identifier, critical=False)
-                .add_extension(x509.ExtendedKeyUsage(usages), critical=False)
-                .add_extension(x509.SubjectAlternativeName(names), critical=False)
-                .sign(ca_key, None if isinstance(ca_key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)) else hashes.SHA256()))
+        cert = sign_resource_certificate(csr, resource, ca_certificate, ca_key, now, expires)
         fingerprint = cert.fingerprint(hashes.SHA256()).hex()
         response: dict[str, str | int | None] = {
             "resource_id": resource.id, "run_id": resource.run_id,
@@ -174,6 +173,7 @@ async def exchange_bootstrap_token(token: str, csr_pem: str, config: RuntimeConf
         resource.bootstrap_token_hash = None
         resource.bootstrap_expires_at = None
         resource.certificate_fingerprint = fingerprint
+        resource.certificate_not_after = expires
         return response
 
 

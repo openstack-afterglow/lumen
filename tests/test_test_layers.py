@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from lumen.scripts.test_layers import run_contract, run_integration, run_system
+from lumen.scripts.test_layers import _compose_env, run_contract, run_integration, run_system
 
 
 @patch("subprocess.run")
@@ -117,9 +117,10 @@ def test_run_system_success(mock_run: MagicMock) -> None:
         "-d",
         "--wait",
         "--wait-timeout",
-        "180",
+        "600",
         "lumen-api",
         "lumen-worker",
+        "lumen-batch-worker",
     ]
     assert calls[2][0][0] == [*compose, "run", "--rm", "--no-deps", "system-tests"]
     assert calls[3][0][0] == [*compose, "down", "-v", "--remove-orphans", "--timeout", "1"]
@@ -154,3 +155,12 @@ def test_run_system_logs_and_cleanup_on_failure(mock_run: MagicMock) -> None:
         "--timeout",
         "1",
     ]
+
+
+def test_layers_never_inherit_manual_cloud_runtime_profile(monkeypatch):
+    monkeypatch.setenv("COMPOSE_PROFILES", "agent-runtime")
+    monkeypatch.setenv("RUNTIME_CONFIG", '{"enabled":true}')
+    for layer in ("integration", "system"):
+        environment = _compose_env(layer)
+        assert environment["COMPOSE_PROFILES"] == ""
+        assert environment["RUNTIME_CONFIG"] == '{"enabled":false}'

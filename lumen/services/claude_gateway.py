@@ -225,7 +225,7 @@ async def exchange_device_code(*, device_code: str, grant_type: str, client_id: 
                 raise GatewayError("invalid_grant")
             else:
                 expires_at = now + timedelta(hours=24)
-                api_key, raw_key = api_key_store.prepare_key_record(
+                api_key, raw_key = await api_key_store.prepare_key_record(
                     row.owner_user_id,
                     row.owner_project_id,
                     "Claude Code gateway",
@@ -238,6 +238,10 @@ async def exchange_device_code(*, device_code: str, grant_type: str, client_id: 
                 row.issued_api_key_id = api_key.id
                 row.status = "consumed"
                 row.consumed_at = now
+    except api_key_store.ApiKeyForbidden as exc:
+        raise GatewayError("access_denied", status_code=403, description=str(exc)) from exc
+    except api_key_store.ApiKeyAuthorityUnavailable as exc:
+        raise GatewayError("temporarily_unavailable", status_code=503) from exc
     except OperationalError as exc:
         mark_db_unhealthy()
         raise GatewayError("temporarily_unavailable", status_code=503) from exc

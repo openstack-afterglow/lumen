@@ -1,0 +1,155 @@
+{
+  "change": "provider-key-relay-history",
+  "date": "2026-10-26",
+  "scope": "unpublished native source; not released/deployed",
+  "taskCheckout": "/Users/pieroot/code/lumen-admin-fixes dev",
+  "nativeVersionMetadata": "0.6.5; existing account/converter cutover predates released0.6.9",
+  "focused": {
+    "passed": 233,
+    "files": 9
+  },
+  "consumers": {
+    "passed": 322,
+    "files": 7
+  },
+  "sdk": {
+    "passed": 143,
+    "ruffPassed": true
+  },
+  "go": {
+    "passed": true,
+    "command": "docker run --rm --network none lumen-qa/provider-relay-builder-20261026:arm64 go test ./..."
+  },
+  "images": {
+    "api": {
+      "arm64": "sha256:c6cfa6b688060b43ddc883d7edc19144818cc454000c1fdc4089d6649d28894e",
+      "amd64": "sha256:2cf4988e806964e7c29ed51dd402ef1ac00a217b800ffceabd671f3f63862222"
+    },
+    "worker": {
+      "arm64": "sha256:e5ed12d87f7d72a828528cb37c146f88070d7817f33758e5eac841ef897b66e3",
+      "amd64": "sha256:39003730428c961ef92c54b4bcba499ef3a50202e085f899fef9ac056fa30546"
+    },
+    "test": {
+      "arm64": "sha256:f91e49566ce1b1805f06b2d9f047bb2cc224448095efec690e980900ae50191c",
+      "amd64": "sha256:e98921c1c40e8802fc45a2294f944c433ee4ed903e59499f6f727bf4d7b39f21"
+    }
+  },
+  "actualNative": {
+    "arm64": {
+      "boundary": "disposable SQLite/native TCP/real new Go converter; synthetic admin/upstream; settled history only",
+      "sends": 2,
+      "history": [
+        {
+          "credential_id": 100,
+          "status": 200,
+          "dispatch": {
+            "attempt_id": "9f068d35-967f-4346-90d4-473fbc33971d",
+            "endpoint": "http://127.0.0.1:46401/v1/chat/completions",
+            "model": "account-model",
+            "operation": "chat",
+            "status": "response_received",
+            "status_code": 200,
+            "recorded_at": "2026-10-26T07:44:20.743896Z"
+          }
+        },
+        {
+          "credential_id": 101,
+          "status": 200,
+          "dispatch": {
+            "attempt_id": "dc42f6aa-4ebb-4a82-a16f-aa53e684645d",
+            "endpoint": "http://127.0.0.1:46401/v1/chat/completions",
+            "model": "account-model",
+            "operation": "chat",
+            "status": "response_received",
+            "status_code": 200,
+            "recorded_at": "2026-10-26T07:44:20.839397Z"
+          }
+        }
+      ],
+      "old_missing_receipt": null,
+      "ownership_member": 403,
+      "ownership_mismatch": 404,
+      "stale_generation": 409
+    },
+    "amd64": {
+      "boundary": "disposable SQLite/native TCP/real new Go converter; synthetic admin/upstream; settled history only",
+      "sends": 2,
+      "history": [
+        {
+          "credential_id": 100,
+          "status": 200,
+          "dispatch": {
+            "attempt_id": "da097af7-4e34-4832-a85c-6e2168f0f70e",
+            "endpoint": "http://127.0.0.1:34533/v1/chat/completions",
+            "model": "account-model",
+            "operation": "chat",
+            "status": "response_received",
+            "status_code": 200,
+            "recorded_at": "2026-10-26T07:44:24.413179Z"
+          }
+        },
+        {
+          "credential_id": 101,
+          "status": 200,
+          "dispatch": {
+            "attempt_id": "df05cab1-686b-440c-ad6e-4d5139d946e7",
+            "endpoint": "http://127.0.0.1:34533/v1/chat/completions",
+            "model": "account-model",
+            "operation": "chat",
+            "status": "response_received",
+            "status_code": 200,
+            "recorded_at": "2026-10-26T07:44:24.518606Z"
+          }
+        }
+      ],
+      "old_missing_receipt": null,
+      "ownership_member": 403,
+      "ownership_mismatch": 404,
+      "stale_generation": 409
+    }
+  },
+  "fullContract": {
+    "passed": false,
+    "actualCanonicalRunner": true,
+    "boundary": "Container contract run; root suite stopped before SDK/lint",
+    "passedCases": 4024,
+    "failedCases": 4,
+    "errors": 12,
+    "deselected": 384,
+    "artifact": "artifact://685",
+    "failures": [
+      "test_chat_graph_v2.py::test_v2_graph_interrupts_before_external_mutation_dispatch[expired] (preexisting failing boundary)",
+      "container lacks git/uv/lumen.conf.example required by root repository tooling tests; no native history/transport regression failed"
+    ],
+    "note": "Not a green full-service gate. Task-focused233+consumer322 and actual newGo API receipts passed.",
+    "exactFailedSelectors": [
+      "tests/test_architecture_guard.py::test_digest_is_independent_of_commit_metadata_and_checkout_location",
+      "tests/test_chat_graph_v2.py::test_v2_graph_interrupts_before_external_mutation_dispatch[expired]",
+      "tests/test_config_deployment.py::test_shipped_toml_example_preserves_disabled_runtime_and_settings_sections",
+      "tests/test_kolla_assets.py::test_root_wheel_contains_kolla_shared_data"
+    ],
+    "errorsScope": "12 tests/test_architecture_guard.py errors; missing container Git"
+  },
+  "preservation": {
+    "indexStaged": 0,
+    "privateConfigDbSchemaMigrationsKeysWrites": 0,
+    "originalCheckoutUntouched": "/Users/pieroot/code/lumen",
+    "commitPushReleaseDeploy": false,
+    "finalStatus": {
+      "branch": "dev",
+      "staged": 0,
+      "unstaged": 21,
+      "untracked": 9
+    }
+  },
+  "limits": [
+    "Settled usage history, not all failed/unsettled sends or live connection monitoring",
+    "Historical missing receipts remain null; no current-config attribution",
+    "Current installed local Lumen0.6.9 has no account/probe routes; coordinated reconciled native release+schema+API/worker/converter cutover still required",
+    "Native account027 clashes with published Kubernetes027; no appliedSQL/checksum changes or migration replay",
+    "Actual paid provider/OAuth/human-cloud and fullworker lifecycle not exercised",
+    "Arbitrary operatorconfigured endpoint path must not contain secrets; userinfo/query/fragment stripped",
+    "PowerShell runtime absent; code index unavailable"
+  ],
+  "archive": "openspec/changes/archive/2026-10-26-provider-key-relay-history"
+}

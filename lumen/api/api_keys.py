@@ -4,41 +4,22 @@
 소유권은 api_key_store 가 강제하고, 예외를 HTTP 상태로 매핑한다.
 """
 
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from lumen.auth import get_token_info, require_admin
+from lumen import service_authority
+from lumen.auth import credential_authority_snapshot, ensure_scopes, get_token_info, require_admin
 from lumen.services import api_key_store as aks
 
 router = APIRouter()
 
 
-ApiKeyScope = Literal[
-    "models:read",
-    "compat:completions:write",
-    "compat:images:write",
-    "compat:audio:write",
-    "compat:realtime:write",
-    "native:conversations:read",
-    "native:conversations:write",
-    "native:runs:read",
-    "native:runs:write",
-    "native:images:write",
-    "native:audio:write",
-    "native:realtime:write",
-    "native:assets:read",
-    "native:assets:write",
-    "native:extensions:read",
-    "native:extensions:write",
-    "native:tools:execute",
-    "native:memory:read",
-    "native:memory:write",
-    "native:agents:use",
-    "usage:read",
-]
+# Keep the public validation/schema vocabulary identical to the service contract.
+ApiKeyScope = Literal[tuple(sorted(aks.API_KEY_SCOPES))]
 
 
 class ApiKeyCreateBody(BaseModel):
@@ -60,6 +41,12 @@ class ApiKeyCreateBody(BaseModel):
         max_digits=18,
         decimal_places=8,
     )
+    expires_at: datetime | None = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def expiry_must_be_aware_and_future(cls, value: datetime | None) -> datetime | None:
+        return aks.validate_expires_at(value)
 
     @field_validator("scopes")
     @classmethod
@@ -111,6 +98,8 @@ class ApiKeyUpdateBody(BaseModel):
 
 
 def _http(exc: Exception) -> HTTPException:
+    if isinstance(exc, aks.ApiKeyInvalidExpiry):
+        return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, aks.ApiKeyLimitConflict):
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, aks.ApiKeyNotFound):
@@ -120,11 +109,12 @@ def _http(exc: Exception) -> HTTPException:
     return HTTPException(status_code=503, detail=str(exc))
 
 
-_EXC = (aks.ApiKeyLimitConflict, aks.ApiKeyNotFound, aks.ApiKeyForbidden, aks.ApiKeyStorageUnavailable)
+_EXC = (aks.ApiKeyInvalidExpiry, aks.ApiKeyLimitConflict, aks.ApiKeyNotFound, aks.ApiKeyForbidden, aks.ApiKeyStorageUnavailable)
 
 
 @router.get("/api-keys")
 async def list_api_keys(token_info: dict = Depends(get_token_info)):
+    ensure_scopes(token_info, "native:keys:read")
     # 선택적 목록 — 저장소 미가용 시 빈 목록으로 degrade(핵심 채팅과 동일 정책).
     try:
         return await aks.list_keys(token_info["user_id"], token_info["project_id"])
@@ -135,6 +125,7 @@ async def list_api_keys(token_info: dict = Depends(get_token_info)):
 @router.post("/api-keys", status_code=201)
 async def create_api_key(body: ApiKeyCreateBody, token_info: dict = Depends(get_token_info)):
     """새 API 키 발급 — 응답의 `key` 는 평문(1회만 노출, 이후 조회 불가)."""
+    ensure_scopes(token_info, "native:keys:write", *body.scopes)
     try:
         return await aks.create_key(
             token_info["user_id"],
@@ -143,9 +134,35 @@ async def create_api_key(body: ApiKeyCreateBody, token_info: dict = Depends(get_
             list(body.scopes),
             body.monthly_credit_limit,
             body.weekly_credit_limit,
+            expires_at=body.expires_at,
+            credential_authority=credential_authority_snapshot(token_info),
         )
     except _EXC as exc:
         raise _http(exc) from exc
+
+
+@router.get("/api-keys/issuance-policy")
+async def get_api_key_issuance_policy(token_info: dict = Depends(get_token_info)):
+    ensure_scopes(token_info, "native:keys:write")
+    try:
+        permitted = await aks.current_issuance_scopes(
+            token_info["user_id"], token_info["project_id"],
+            credential_authority=credential_authority_snapshot(token_info),
+        )
+        permitted &= service_authority.allowed_scopes(token_info)
+        if token_info.get("auth_type") == "api_key":
+            permitted &= set(token_info.get("scopes", ()))
+        allowed = sorted(permitted)
+        policy = await aks.owner_issuance_policy(token_info["user_id"])
+    except _EXC as exc:
+        raise _http(exc) from exc
+    return {
+        **policy,
+        "allowed_scopes": allowed,
+        "scope_capabilities": {scope: sorted(service_authority.SCOPE_CAPABILITIES[scope]) for scope in allowed},
+    }
+
+
 
 
 @router.patch("/api-keys/{key_id}")
@@ -154,6 +171,7 @@ async def update_api_key(
     body: ApiKeyUpdateBody,
     token_info: dict = Depends(get_token_info),
 ):
+    ensure_scopes(token_info, "native:keys:write")
     try:
         return await aks.rename_key(
             key_id,
@@ -167,6 +185,7 @@ async def update_api_key(
 
 @router.delete("/api-keys/{key_id}", status_code=204)
 async def revoke_api_key(key_id: int, token_info: dict = Depends(get_token_info)):
+    ensure_scopes(token_info, "native:keys:delete")
     try:
         await aks.revoke_key(key_id, token_info["user_id"], token_info["project_id"])
     except _EXC as exc:
@@ -179,6 +198,7 @@ async def update_owner_api_key_limits(
     body: ApiKeyOwnerLimitUpdateBody,
     token_info: dict = Depends(get_token_info),
 ):
+    ensure_scopes(token_info, "native:keys:write")
     try:
         return await aks.update_owner_limits(
             key_id,

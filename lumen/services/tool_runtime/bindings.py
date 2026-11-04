@@ -27,7 +27,7 @@ from .contracts import (
     execution_context,
     v2_builtin_tool_bindings,
 )
-from .selection import _load_custom, _load_mcp
+from .selection import _load_custom, _load_mcp, _mcp_config_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,19 @@ def _v2_mcp_result(value: str | mcp_client.McpToolOutput) -> V2ToolExecutionResu
             GeneratedToolFile(data=file.data, name=file.name, media_type=file.media_type) for file in value.files
         ],
     )
+
+def _v2_mcp_failure(error: PluginError) -> V2ToolExecutionResult:
+    """Expose only fixed text and a typed code, never provider exception details."""
+    content = {
+        "plugin_authority_revoked": "The selected MCP authority is no longer available.",
+        "plugin_configuration_changed": "The selected MCP configuration has changed.",
+        "plugin_incompatible": "The selected MCP provider is incompatible.",
+    }.get(error.code, "MCP tool execution is unavailable.")
+    return V2ToolExecutionResult(
+        status="failed", model_content=content,
+        display=[ToolTextPart(text=content)], error_code=error.code,
+    )
+
 
 
 async def _lumen_registry_bindings(ctx: ToolContext) -> tuple[ToolBinding, ...]:
@@ -277,6 +290,24 @@ def _closed_mcp_input_schema(raw_schema: object) -> dict:
 
 
 _CATALOG_TERM_RE = re.compile(r"[a-z0-9_]{2,}|[가-힣]{2,}", re.IGNORECASE)
+_CATALOG_CAPABILITY_ALIASES = (
+    ("클라우드", ("cloud", "nova", "cinder", "neutron")),
+    ("컴퓨트", ("compute", "nova", "vm", "server", "servers", "instance", "instances")),
+    ("컴퓨팅", ("compute", "nova", "vm", "server", "servers", "instance", "instances")),
+    ("가상머신", ("vm", "nova", "server", "servers", "instance", "instances")),
+    ("스토리지", ("storage", "cinder", "volume", "volumes", "swift", "manila")),
+    ("볼륨", ("volume", "volumes", "cinder")),
+    ("네트워크", ("network", "networks", "neutron", "subnet", "subnets")),
+)
+
+
+def _catalog_terms(value: str) -> set[str]:
+    # Split provider names too; Korean capability stems tolerate grammatical particles.
+    terms = set(_CATALOG_TERM_RE.findall(value.replace("_", " ")))
+    for stem, aliases in _CATALOG_CAPABILITY_ALIASES:
+        if stem in value:
+            terms.update(aliases)
+    return terms
 
 
 def _catalog_matches(binding: ToolBinding, query: str) -> bool:
@@ -291,8 +322,8 @@ def _catalog_matches(binding: ToolBinding, query: str) -> bool:
     query = query.casefold()
     if query in searchable:
         return True
-    query_terms = set(_CATALOG_TERM_RE.findall(query))
-    searchable_terms = set(_CATALOG_TERM_RE.findall(searchable))
+    query_terms = _catalog_terms(query)
+    searchable_terms = _catalog_terms(searchable)
     return bool(query_terms & searchable_terms)
 
 
@@ -342,7 +373,8 @@ async def _search_and_load_bindings(
     selected = [
         binding
         for binding in deferred.values()
-        if _catalog_matches(binding, query)
+        if (include_managed or binding.definition.source != "mcp" or binding.definition.effect == "read")
+        and _catalog_matches(binding, query)
         and (
             category_needle is None
             or category_needle in binding.definition.activity_category.casefold()
@@ -420,6 +452,7 @@ async def v2_tool_bindings(
     """Resolve tenant-scoped bindings, optionally restricted to one extension load policy."""
     if not ctx.tools_enabled:
         return {}
+    frozen_credential_epochs = dict(ctx.expected_mcp_credential_versions or ())
     bindings = await v2_builtin_tool_bindings(ctx) if include_platform else {}
 
     def add(binding: ToolBinding) -> None:
@@ -427,9 +460,12 @@ async def v2_tool_bindings(
             raise ValueError(f"duplicate v2 tool name: {binding.definition.name}")
         bindings[binding.definition.name] = binding
 
-    if include_managed:
+    if include_managed or extension_load_policy == "on_demand":
         for binding in await _lumen_registry_bindings(ctx):
-            add(binding)
+            # Legacy chat has no managed mutation approval boundary. Delegated
+            # reads are safe to discover lazily, but mutations remain v2-only.
+            if include_managed or binding.definition.effect == "read":
+                add(binding)
 
     for custom in await _load_custom(ctx):
         if extension_load_policy is not None and custom.get("load_policy") != extension_load_policy:
@@ -473,15 +509,21 @@ async def v2_tool_bindings(
         identifier = server.get("id")
         if not isinstance(identifier, int):
             continue
+        frozen_oauth = server.get("auth_mode") == "oauth"
+        frozen_epoch = frozen_credential_epochs.get(identifier) if frozen_oauth else None
+        if frozen_oauth and (type(frozen_epoch) is not int or frozen_epoch < 1):
+            continue
         destination_origin = _v2_destination_origin(server.get("url"))
         if destination_origin is None:
             logger.warning("MCP server without a canonical destination excluded from v2 bindings server=%s", identifier)
             continue
         try:
-            discovered = await mcp_client.list_tools(server)
+            discovered = await mcp_client.list_tools(server, context=execution_context(ctx))
         except Exception:
             logger.warning("MCP discovery failed for v2 bindings server=%s", identifier, exc_info=True)
             continue
+        frozen_config = _mcp_config_fingerprint(server)
+        frozen_owner = (ctx.user_id, ctx.project_id, ctx.run_id)
         for method in discovered:
             if not isinstance(method, dict) or not isinstance(method.get("name"), str):
                 continue
@@ -509,6 +551,10 @@ async def v2_tool_bindings(
                 *,
                 server_id=identifier,
                 method_name=method["name"],
+                expected_config=frozen_config,
+                expected_owner=frozen_owner,
+                expected_oauth=frozen_oauth,
+                expected_credential_epoch=frozen_epoch,
             ) -> V2ToolExecutionResult:
                 if not isinstance(context, ToolContext):
                     return V2ToolExecutionResult(
@@ -516,27 +562,36 @@ async def v2_tool_bindings(
                         model_content="Tool execution context is invalid.",
                         error_code="invalid_tool_context",
                     )
+                if expected_oauth and (
+                    type(expected_credential_epoch) is not int or expected_credential_epoch < 1
+                ):
+                    return _v2_mcp_failure(PluginError("plugin_authority_revoked"))
                 current = next((item for item in await _load_mcp(context) if item.get("id") == server_id), None)
-                if current is None:
+                if (
+                    (context.user_id, context.project_id, context.run_id) != expected_owner
+                    or current is None
+                    or _mcp_config_fingerprint(current) != expected_config
+                ):
                     return V2ToolExecutionResult(
                         status="failed",
                         model_content="The selected MCP server is no longer available.",
                         error_code="extension_unavailable",
                     )
-                return _v2_mcp_result(await mcp_client.call_tool(current, method_name, arguments))
+                try:
+                    return _v2_mcp_result(await mcp_client.call_tool(
+                        current, method_name, arguments, context=execution_context(context),
+                        expected_credential_epoch=expected_credential_epoch,
+                    ))
+                except PluginError as error:
+                    return _v2_mcp_failure(error)
+                except Exception:
+                    return _v2_mcp_failure(PluginError("plugin_unavailable"))
 
             add(
                 ToolBinding(
                     definition=definition,
                     execute=execute,
-                    config_fingerprint=_v2_config_fingerprint(
-                        {
-                            "id": identifier,
-                            "url": server.get("url"),
-                            "effect_overrides": server.get("effect_overrides"),
-                            "config_version": server.get("config_version"),
-                        }
-                    ),
+                    config_fingerprint=frozen_config,
                     destination_origin=destination_origin,
                     load_policy=server.get("load_policy")
                     if server.get("load_policy") in {"preloaded", "on_demand"}
@@ -566,12 +621,14 @@ async def _legacy_dynamic_bindings(ctx: ToolContext) -> dict[str, ToolBinding]:
     if not isinstance(session, ToolBindingSession):
         return {}
     if not session.legacy_preloaded:
+        preloaded = await v2_tool_bindings(
+            ctx,
+            extension_load_policy="preloaded",
+            include_platform=False,
+        )
         session.legacy_bindings.update(
-            await v2_tool_bindings(
-                ctx,
-                extension_load_policy="preloaded",
-                include_platform=False,
-            )
+            (name, binding) for name, binding in preloaded.items()
+            if binding.definition.source != "mcp" or binding.definition.effect == "read"
         )
         session.legacy_preloaded = True
     bindings = dict(session.legacy_bindings)
@@ -595,6 +652,11 @@ async def restore_v2_deferred_bindings(
         include_platform=False,
         include_managed=include_managed,
     )
+    if not include_managed:
+        deferred = {
+            name: binding for name, binding in deferred.items()
+            if binding.definition.source != "mcp" or binding.definition.effect == "read"
+        }
     ctx.binding_session.deferred_bindings = deferred
     unavailable = [name for name in names if name not in deferred]
     if unavailable:

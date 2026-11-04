@@ -1,6 +1,6 @@
 """빌트인 AI 채팅 에이전트 API (사용자·프로젝트 소유 리소스 + 공개 허브).
 
-전 엔드포인트 get_token_info 인증. CRUD는 호출자 user/project에 한정하고,
+전 엔드포인트 서비스 scope 인증. CRUD는 호출자 user/project에 한정하고,
 공개 허브는 복제 가능한 템플릿만 검색한다(IDOR 방어).
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
-from lumen.auth import get_token_info
+from lumen.auth import ensure_scopes, require_scopes
 from lumen.models.chat_contracts import validate_plugin_binding_ids
 from lumen.services import agent_store as ags
 
@@ -87,7 +87,7 @@ def _map_error(exc: Exception) -> HTTPException:
 
 
 @router.post("/agents", status_code=201)
-async def create_agent(payload: AgentCreate, token_info: dict = Depends(get_token_info)):
+async def create_agent(payload: AgentCreate, token_info: dict = Depends(require_scopes("native:agents:write"))):
     try:
         return await ags.create_agent(
             owner_user_id=token_info["user_id"],
@@ -99,10 +99,14 @@ async def create_agent(payload: AgentCreate, token_info: dict = Depends(get_toke
 
 
 @router.get("/agents")
-async def list_agents(token_info: dict = Depends(get_token_info)):
+async def list_agents(include_private: bool = False, token_info: dict = Depends(require_scopes("native:agents:read"))):
+    if include_private:
+        ensure_scopes(token_info, "native:agents:write")
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
-        return await ags.list_agents(user_id=token_info["user_id"], project_id=token_info["project_id"])
+        return await ags.list_agents(
+            user_id=token_info["user_id"], project_id=token_info["project_id"], include_private=include_private
+        )
     except ags.ChatStorageUnavailable:
         return []
 
@@ -112,7 +116,7 @@ async def agent_hub(
     query: str = Query(default=""),
     limit: int = Query(default=30, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(require_scopes("native:agents:read")),
 ):
     """공개 에이전트 검색(허브). 이름·설명 부분일치, 인기(clone_count) 순."""
     try:
@@ -128,7 +132,7 @@ async def agent_hub(
 
 
 @router.get("/agents/{agent_id}")
-async def get_agent(agent_id: int, token_info: dict = Depends(get_token_info)):
+async def get_agent(agent_id: int, token_info: dict = Depends(require_scopes("native:agents:write"))):
     try:
         return await ags.get_agent(
             agent_id,
@@ -140,7 +144,7 @@ async def get_agent(agent_id: int, token_info: dict = Depends(get_token_info)):
 
 
 @router.patch("/agents/{agent_id}")
-async def update_agent(agent_id: int, payload: AgentUpdate, token_info: dict = Depends(get_token_info)):
+async def update_agent(agent_id: int, payload: AgentUpdate, token_info: dict = Depends(require_scopes("native:agents:write"))):
     try:
         return await ags.update_agent(
             agent_id,
@@ -153,7 +157,7 @@ async def update_agent(agent_id: int, payload: AgentUpdate, token_info: dict = D
 
 
 @router.delete("/agents/{agent_id}", status_code=204)
-async def delete_agent(agent_id: int, token_info: dict = Depends(get_token_info)):
+async def delete_agent(agent_id: int, token_info: dict = Depends(require_scopes("native:agents:delete"))):
     try:
         await ags.delete_agent(
             agent_id,
@@ -165,7 +169,7 @@ async def delete_agent(agent_id: int, token_info: dict = Depends(get_token_info)
 
 
 @router.post("/agents/{agent_id}/clone", status_code=201)
-async def clone_agent(agent_id: int, token_info: dict = Depends(get_token_info)):
+async def clone_agent(agent_id: int, token_info: dict = Depends(require_scopes("native:agents:write"))):
     """허브의 공개(또는 본인) 에이전트를 내 계정으로 복제(private 사본)."""
     try:
         return await ags.clone_agent(

@@ -13,6 +13,10 @@ class ModelsDevImportConflictError(RuntimeError):
     """models.dev provider mapping would orphan imported local prices."""
 
 
+class ModelOrderConflictError(RuntimeError):
+    """Provider model membership or display order changed before a reorder."""
+
+
 class ProviderValidationError(ValueError):
     """입력 검증 실패/제약 위반 — 400."""
 
@@ -38,6 +42,10 @@ _SUBSCRIPTION_MESSAGES = {
     "subscription_upstream_unavailable": "구독 인증 공급자에 연결할 수 없습니다",
     "subscription_rate_limited": "구독 인증 요청이 제한되었습니다",
     "subscription_auth_invalid_response": "구독 인증 공급자의 응답을 확인할 수 없습니다",
+    "subscription_output_budget_unsupported": "이 구독 연결은 명시적 출력 토큰 한도를 지원하지 않습니다",
+    "subscription_sampling_unsupported": "이 구독 연결은 명시적 sampling 설정을 지원하지 않습니다",
+    "subscription_protocol_unsupported": "이 구독 연결은 요청한 프로토콜을 지원하지 않습니다",
+    "subscription_native_web_search_unsupported": "이 구독 연결은 native 웹 검색을 지원하지 않습니다",
 }
 
 

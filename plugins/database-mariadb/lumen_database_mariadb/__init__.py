@@ -76,7 +76,7 @@ class MariaDbDatabase:
     manifest = PluginManifest(
         id="mariadb",
         kind="database",
-        version="0.1.1",
+        version="0.1.2",
         required_capabilities=(),
     )
 
