@@ -9,4 +9,4 @@
 
 - [x] 2.1 Run final canonical contract and relevant native authority/HTTP checks and record exact evidence.
 - [x] 2.2 Build/execute affected canonical images and exercise isolated native HTTP runtime; distinguish local evidence from publication/deployment.
-- [ ] 2.3 Stamp/check scoped architecture and validate OpenSpec; return immutable manifest and remaining parent-owned publication/operational gates.
+- [x] 2.3 Stamp/check scoped architecture and validate OpenSpec; return immutable manifest and remaining parent-owned publication/operational gates.

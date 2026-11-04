@@ -1,11 +1,11 @@
 # Changelog
 
-## 0.6.13 — 2026-11-04 candidate (UTC; publication/deployment pending)
+## 0.6.13 — 2026-11-04 (KST; published, not deployed)
 
 - **한국어 — 변경/수정:** Dedicated Lumen service role 및 special personal-project marker 대신 native project admin/manager/member는 소유 리소스를 관리하고 reader는 nonsecret 조회만 허용한다. Native custom/group/domain/inherited/retained legacy implications, original issued-role-ID/API-key scope ceilings, fresh revocation/outage, owner/private/credential 및 global human admin 경계는 유지한다. Keystone 실제 `openid`와 token-reissued OpenID human session을 올바르게 분류한다.
-- **한국어 — 폐기/제거:** Dedicated service-grade/leaf default requirements와 `personal_project_owner` 특례를 제거한다. Native IAM role/grant, SDK/plugin, SQL 또는 사용자 데이터 삭제 없음. 배포일: 미배포; 릴리스 게시일: 미게시.
+- **한국어 — 폐기/제거:** Dedicated service-grade/leaf default requirements와 `personal_project_owner` 특례를 제거한다. `lumen_reader/user/editor/admin` 또는 `lumen-*` leaf만 있고 표준 admin/manager/member/reader로 가는 effective native 경로가 없는 principal은 이제 모든 action에서 403이며, 그 role을 지정한 operator YAML도 native 하한을 넓힐 수 없다. 운영 반영 전 그런 principal과 policy override를 점검한다. Native IAM role/grant, SDK/plugin, SQL 또는 사용자 데이터 삭제 없음. 릴리스 게시일: 2026-11-04 (KST); 배포일: 미배포.
 - **English — Changes/fixes:** Standard native project admin/manager/member manage owned resources; reader reads nonsecret resources. Preserve effective custom/group/domain/inherited/retained legacy implications, original issued-role-ID and API-key ceilings, fresh revocation/outage, owner/private/credential and human global-admin boundaries. Recognize actual Keystone `openid` and token-reissued OpenID human methods.
-- **English — Deprecated/removed:** Dedicated service-grade/leaf default requirements and the `personal_project_owner` special case. No native IAM role/grant, SDK/plugin, migration or user-data removal. Deployment date: not deployed; publication date: not published.
+- **English — Deprecated/removed:** Dedicated service-grade/leaf default requirements and the `personal_project_owner` special case. A principal holding only `lumen_reader/user/editor/admin` or `lumen-*` leaves, with no effective native path to a standard admin/manager/member/reader role, now receives 403 on every action, and operator YAML naming those roles cannot widen past the native floor. Audit such principals and policy overrides before rollout. No native IAM role/grant, SDK/plugin, migration or user-data removal. Publication date: 2026-11-04 (KST); deployment date: not deployed.
 - Scoped from remote dev c4527de / published0.6.12; root package/runtime/lock and packaged Kolla default become0.6.13. No Pi/CHAT3/durable4 or primary-checkout historical027 cutover. Immutable published027/028, Bifrost, protocol1/2 and all independently versioned SDK/plugins/sandbox remain unchanged. Source, local qualification, tag publication and operational acceptance are distinct.
 
 ## 0.6.12 — 2026-10-27
