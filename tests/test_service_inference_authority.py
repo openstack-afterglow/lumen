@@ -14,28 +14,32 @@ from lumen.api import audio, images
 from lumen.api.compat import anthropic, openai, responses
 from lumen.auth import ensure_scopes, get_principal
 from lumen.models.chat_contracts import ChatFeatureOptions, ChatRunDescriptor, ToolPolicy
+from lumen.models.chat_db import ChatApiKey
 from lumen.services import api_key_store, chat_admission, completion_api, inference_authority
 from lumen.services.durable_runs import execution
 from lumen.services.durable_runs.errors import DurableRunInputError
 
 
-def principal(*roles, key=False):
-    return {"user_id": "owner", "project_id": "project", "roles": ["member", *roles],
+def principal(role="member", *, key=False, scopes=("compat:completions:write", "native:runs:write")):
+    return {"user_id": "owner", "project_id": "project", "roles": [role],
             "auth_type": "api_key" if key else "keystone", "api_key_id": 7 if key else None,
-            "source": "api" if key else "web", "is_system_admin": False,
-            "scopes": ("compat:completions:write", "native:tools:execute", "compat:images:write",
-                       "compat:audio:write", "native:images:write", "native:audio:write")}
+            "source": "api" if key else "web", "is_system_admin": False, "scopes": scopes}
+
+
+def active_key(*scopes):
+    return SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True,
+                           revoked_at=None, expires_at=None, scopes=list(scopes))
 
 
 @pytest.mark.parametrize(("path", "body"), [
     ("/chat/images/generations", {"model_id": "image", "prompt": "dot"}),
     ("/chat/audio/speech", {"model_id": "voice", "input": "hi", "voice": "alloy"}),
 ])
-def test_chat_only_denies_direct_native_media(monkeypatch, path, body):
+def test_reader_denied_direct_native_media(monkeypatch, path, body):
     app = FastAPI()
     app.include_router(images.router)
     app.include_router(audio.router)
-    app.dependency_overrides[get_principal] = lambda: principal("lumen-chat_user")
+    app.dependency_overrides[get_principal] = lambda: principal("reader")
     image_admit = AsyncMock(side_effect=AssertionError("denied request reached media admission"))
     audio_admit = AsyncMock(side_effect=AssertionError("denied request reached media admission"))
     monkeypatch.setattr(images, "admit", image_admit)
@@ -47,10 +51,10 @@ def test_chat_only_denies_direct_native_media(monkeypatch, path, body):
     audio_admit.assert_not_awaited()
 
 
-def test_independent_images_leaf_admits_without_chat_or_editor(monkeypatch):
+def test_member_admits_native_images_without_service_role(monkeypatch):
     app = FastAPI()
     app.include_router(images.router)
-    app.dependency_overrides[get_principal] = lambda: principal("lumen-images_user")
+    app.dependency_overrides[get_principal] = principal
     admitted = AsyncMock(return_value=ChatRunDescriptor(
         run_id=str(uuid4()), status="queued", events_url="/runs/image/events", cancel_url="/runs/image/cancel"))
     monkeypatch.setattr(images, "admit", admitted)
@@ -68,10 +72,10 @@ def test_independent_images_leaf_admits_without_chat_or_editor(monkeypatch):
     (anthropic.router, "/messages", {"model": "model", "max_tokens": 20,
         "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "web_search_20250305", "name": "web_search"}]}),
 ])
-def test_chat_only_denies_compat_tools_before_resolution(monkeypatch, router, path, body):
+def test_completion_key_denies_compat_tools_before_resolution(monkeypatch, router, path, body):
     app = FastAPI()
     app.include_router(router)
-    app.dependency_overrides[get_principal] = lambda: principal("lumen-chat_user", key=True)
+    app.dependency_overrides[get_principal] = lambda: principal(key=True)
     resolve = AsyncMock(side_effect=AssertionError("tool-denied request resolved provider"))
     monkeypatch.setattr(completion_api, "resolve_api", resolve)
     with TestClient(app) as client:
@@ -81,7 +85,7 @@ def test_chat_only_denies_compat_tools_before_resolution(monkeypatch, router, pa
 
 
 @pytest.mark.parametrize("selection", ["provider_search", "builtin", "stored_tool", "stored_mcp", "plugin", "skill", "agent"])
-def test_all_native_selected_tools_require_independent_tools_leaf(selection):
+def test_all_native_selected_tools_require_independent_key_scope(selection):
     features = ChatFeatureOptions(memory=False, tool_policy=ToolPolicy(mode="none"))
     extensions = {"tools": [], "mcp": []}
     kwargs = dict(parts=[], execution_mode="chat", skill_ids=[], plugin_tool_snapshots=[],
@@ -101,7 +105,7 @@ def test_all_native_selected_tools_require_independent_tools_leaf(selection):
     else:
         kwargs["agent"] = {"id": 1}
     with pytest.raises(HTTPException) as error:
-        chat_admission._require_native_admission_scopes(principal("lumen-chat_user", "lumen-inventory_reader"), features, **kwargs)
+        chat_admission._require_native_admission_scopes(principal(key=True), features, **kwargs)
     assert error.value.status_code == 403
     assert "native:tools:execute" in error.value.detail
 
@@ -114,9 +118,10 @@ def test_intrinsic_provider_search_requires_tools_without_explicit_options():
     kwargs = dict(parts=[], execution_mode="chat", skill_ids=[], plugin_tool_snapshots=[],
                   plugin_skill_snapshots=[], agent=None, extension_selection={"tools": [], "mcp": []}, resolved=resolved)
     with pytest.raises(HTTPException) as error:
-        chat_admission._require_native_admission_scopes(principal("lumen-chat_user"), features, **kwargs)
+        chat_admission._require_native_admission_scopes(principal(key=True), features, **kwargs)
     assert error.value.status_code == 403
-    chat_admission._require_native_admission_scopes(principal("lumen-chat_user", "lumen-tools_user"), features, **kwargs)
+    chat_admission._require_native_admission_scopes(
+        principal(key=True, scopes=("native:runs:write", "native:tools:execute")), features, **kwargs)
     assert inference_authority.completion_scopes({}, resolved={"capabilities": {"web_search": True}}) == ("compat:completions:write",)
 
 
@@ -127,9 +132,9 @@ async def test_direct_intrinsic_search_fence_passes_independent_tools_scope(monk
     assert "native:tools:execute" in authorize.await_args.kwargs["required_scopes"]
 
 
-def test_plain_text_and_automatic_memory_do_not_require_history_editor():
+def test_member_plain_text_and_automatic_memory_need_no_service_roles():
     features = ChatFeatureOptions(memory=True, tool_policy=ToolPolicy(mode="none"))
-    chat_admission._require_native_admission_scopes(principal("lumen-chat_user", "lumen-history_reader"), features, parts=[], execution_mode="chat",
+    chat_admission._require_native_admission_scopes(principal(), features, parts=[], execution_mode="chat",
         skill_ids=[], plugin_tool_snapshots=[], plugin_skill_snapshots=[], agent=None,
         extension_selection={"tools": [], "mcp": []})
     scopes = inference_authority.native_run_scopes({"features": features.model_dump()})
@@ -142,24 +147,28 @@ def test_compat_generated_modalities_are_independent(modalities, scope):
     scopes = inference_authority.completion_scopes({"modalities": modalities})
     assert scope in scopes
     with pytest.raises(HTTPException):
-        ensure_scopes(principal("lumen-chat_user", key=True), *scopes)
+        ensure_scopes(principal(key=True), *scopes)
 
 
 class Session:
-    def __init__(self, value):
+    def __init__(self, value, *, key=None):
         self.value = value
+        self.key = key
     async def __aenter__(self):
         return self
     async def __aexit__(self, *args):
         return False
     def begin(self):
         return self
-    async def execute(self, *args, **kwargs):
-        return SimpleNamespace(scalar_one=lambda: self.value, scalar_one_or_none=lambda: self.value)
+    async def execute(self, statement, *args, **kwargs):
+        value = self.key if self.key is not None and any(
+            item.get("entity") is ChatApiKey for item in getattr(statement, "column_descriptions", ())
+        ) else self.value
+        return SimpleNamespace(scalar_one=lambda: value, scalar_one_or_none=lambda: value)
 
 
 @pytest.mark.parametrize("api_key_id", [None, 7])
-@pytest.mark.parametrize("roles", [["member", "lumen-chat_user"], []])
+@pytest.mark.parametrize("roles", [["reader"], []])
 async def test_downgraded_owner_denied_before_new_io(monkeypatch, api_key_id, roles):
     authority = AsyncMock(return_value={"roles": roles, "is_system_admin": False})
     monkeypatch.setattr(auth, "resolve_project_authority", authority)
@@ -170,7 +179,7 @@ async def test_downgraded_owner_denied_before_new_io(monkeypatch, api_key_id, ro
 
 async def test_revoked_key_denied_before_new_io(monkeypatch):
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
-        "roles": ["member", "lumen-tools_user"], "is_system_admin": False}))
+        "roles": ["member"], "is_system_admin": False}))
     key = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=False,
                           revoked_at=None, expires_at=None)
     with pytest.raises(api_key_store.ApiKeyForbidden):
@@ -208,7 +217,7 @@ async def test_stateless_provider_denied_before_new_call(monkeypatch):
     monkeypatch.setattr(completion_api, "billing_route", lambda route, *args, **kwargs: route)
     monkeypatch.setattr(inference_authority, "get_session_factory", lambda: lambda: Session(None))
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
-        "roles": ["member", "lumen-chat_user"], "is_system_admin": False}))
+        "roles": ["reader"], "is_system_admin": False}))
     provider = AsyncMock(side_effect=AssertionError("provider invoked after downgrade"))
     monkeypatch.setattr(completion_api, "invoke_chat_once", provider)
     with pytest.raises(completion_api.CompletionError) as error:
@@ -218,11 +227,11 @@ async def test_stateless_provider_denied_before_new_call(monkeypatch):
     provider.assert_not_awaited()
 
 
-def test_independent_audio_leaf_admits_without_chat_or_editor(monkeypatch):
+def test_member_admits_native_audio_without_service_role(monkeypatch):
     from fastapi.responses import Response
     app = FastAPI()
     app.include_router(audio.router)
-    app.dependency_overrides[get_principal] = lambda: principal("lumen-audio_user")
+    app.dependency_overrides[get_principal] = principal
     admitted = AsyncMock(return_value="run")
     monkeypatch.setattr(audio, "admit", admitted)
     monkeypatch.setattr(audio, "completed_audio", AsyncMock(return_value={"kind": "tts"}))
@@ -234,12 +243,12 @@ def test_independent_audio_leaf_admits_without_chat_or_editor(monkeypatch):
     admitted.assert_awaited_once()
 
 
-async def test_non_durable_tool_dispatch_revalidates_current_tools_cap(monkeypatch):
+async def test_non_durable_tool_dispatch_revalidates_current_project_membership(monkeypatch):
     from lumen.services.tool_runtime import dispatch
     from lumen.services.tools import ToolContext
     monkeypatch.setattr(inference_authority, "get_session_factory", lambda: lambda: Session(None))
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
-        "roles": ["member", "lumen-chat_user"], "is_system_admin": False}))
+        "roles": ["reader"], "is_system_admin": False}))
     provider = AsyncMock(side_effect=AssertionError("MCP I/O started after downgrade"))
     monkeypatch.setattr(dispatch.mcp_client, "call_tool", provider)
     with pytest.raises(api_key_store.ApiKeyForbidden):
@@ -270,33 +279,34 @@ def test_batch_and_legacy_virtual_run_freeze_actual_tools_and_media_only():
     ("images", "/images/generations", {"model": "image", "prompt": "dot"}),
     ("audio", "/audio/speech", {"model": "voice", "input": "hi", "voice": "alloy"}),
 ])
-def test_chat_only_denies_compat_media_with_broad_key_scopes(family, path, body):
+def test_reader_denies_compat_media_even_with_explicit_key_scope(family, path, body):
     from lumen.api.compat import audio as compat_audio
     from lumen.api.compat import images as compat_images
     app = FastAPI()
     app.include_router(compat_images.router if family == "images" else compat_audio.router)
-    app.dependency_overrides[get_principal] = lambda: principal("lumen-chat_user", key=True)
+    app.dependency_overrides[get_principal] = lambda: principal(
+        "reader", key=True, scopes=(f"compat:{family}:write",))
     with TestClient(app) as client:
         response = client.post(path, json=body)
     assert response.status_code == 403
 
 
-async def test_compat_realtime_checks_owner_audio_not_only_key_scope(monkeypatch):
+async def test_compat_realtime_checks_current_project_writer_not_only_key_scope(monkeypatch):
     from lumen.api.compat import realtime
     monkeypatch.setattr(realtime, "get_settings", lambda: SimpleNamespace(chat_api_hosts=""))
     monkeypatch.setattr(realtime, "origin_allowed", lambda _: True)
     monkeypatch.setattr(realtime.api_key_store, "verify_key", AsyncMock(return_value={
-        **principal("lumen-chat_user", key=True), "scopes": ["compat:realtime:write"]}))
+        **principal("reader", key=True), "scopes": ["compat:realtime:write"]}))
     websocket = SimpleNamespace(headers={"authorization": "Bearer sk-afgl-synthetic"})
     assert await realtime._principal(websocket) is None
 
 
-def test_history_continuation_requires_read_but_fresh_chat_does_not():
+def test_history_continuation_requires_key_read_scope_but_fresh_chat_does_not():
     request = {"features": {"memory": False, "tool_policy": {"mode": "none"}}}
-    ensure_scopes(principal("lumen-chat_user"), *inference_authority.native_run_scopes(request))
+    ensure_scopes(principal(key=True), *inference_authority.native_run_scopes(request))
     request["context_source"] = {"messages": [{"role": "user", "content": "stored private history"}]}
     with pytest.raises(HTTPException):
-        ensure_scopes(principal("lumen-chat_user"), *inference_authority.native_run_scopes(request))
+        ensure_scopes(principal(key=True), *inference_authority.native_run_scopes(request))
 
 
 @pytest.mark.parametrize("cause", ["downgraded", "revoked"])
@@ -313,7 +323,7 @@ async def test_automatic_title_fence_checks_root_owner_and_key_before_new_io(mon
                                         revoked_at=None, expires_at=None))
     monkeypatch.setattr("lumen.db.get_session_factory", lambda: lambda: session)
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
-        "roles": ["member", "lumen-history_reader"] if cause == "downgraded" else ["member", "lumen-chat_user", "lumen-history_reader"],
+        "roles": ["reader"] if cause == "downgraded" else ["member"],
         "is_system_admin": False}))
     with pytest.raises(api_key_store.ApiKeyForbidden):
         await title_jobs._mark_provider_started.__wrapped__("job", owner="worker", expected_revision=1)
@@ -346,7 +356,7 @@ async def test_automatic_memory_generation_denies_current_downgraded_owner(monke
                           revoked_at=None, expires_at=None)
     monkeypatch.setattr(inference_authority, "get_session_factory", lambda: lambda: RunSession(key))
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
-        "roles": ["member", "lumen-history_reader"] if cause == "downgraded" else ["member", "lumen-chat_user", "lumen-history_reader"],
+        "roles": ["reader"] if cause == "downgraded" else ["member"],
         "is_system_admin": False}))
     monkeypatch.setattr(memory_extract.ps, "resolve_memory_model", AsyncMock(return_value={"model_name": "small"}))
     monkeypatch.setattr(memory_extract.ms, "list_memories", AsyncMock(return_value=[]))
@@ -359,7 +369,7 @@ async def test_automatic_memory_generation_denies_current_downgraded_owner(monke
 
 async def test_auxiliary_generation_does_not_require_old_selected_tools(monkeypatch):
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
-        "roles": ["member", "lumen-chat_user", "lumen-history_reader"], "is_system_admin": False}))
+        "roles": ["member"], "is_system_admin": False}))
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=None, source="web",
         run_scope="persistent", conversation_id="conv",
         capability_snapshot={"required_scopes": ["native:tools:execute"]})
@@ -367,23 +377,24 @@ async def test_auxiliary_generation_does_not_require_old_selected_tools(monkeypa
 
 
 @pytest.mark.parametrize("required", [False, True])
-@pytest.mark.parametrize("tools", [False, True])
-async def test_auxiliary_model_uses_its_own_intrinsic_capability(monkeypatch, required, tools):
-    roles = ["member", "lumen-chat_user", "lumen-history_reader", *(["lumen-tools_user"] if tools else [])]
-    monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={"roles": roles, "is_system_admin": False}))
-    run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=None, source="web",
+@pytest.mark.parametrize("tools_scope", [False, True])
+async def test_auxiliary_model_uses_its_own_intrinsic_key_scope(monkeypatch, required, tools_scope):
+    monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={"roles": ["member"], "is_system_admin": False}))
+    run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7, source="api",
                           run_scope="persistent", conversation_id="conv", capability_snapshot={})
+    session = Session(active_key("native:runs:write", "native:conversations:read",
+                                 *(("native:tools:execute",) if tools_scope else ())))
     resolved = {"capabilities": {"web_search_required": required}}
-    if required and not tools:
+    if required and not tools_scope:
         with pytest.raises(api_key_store.ApiKeyForbidden):
-            await inference_authority.authorize_run_generation(Session(None), run, resolved=resolved)
+            await inference_authority.authorize_run_generation(session, run, resolved=resolved)
     else:
-        await inference_authority.authorize_run_generation(Session(None), run, resolved=resolved)
+        await inference_authority.authorize_run_generation(session, run, resolved=resolved)
 
 
 async def test_auxiliary_intrinsic_search_preserves_key_scope_attenuation(monkeypatch):
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
-        "roles": ["member", "lumen-chat_user", "lumen-history_reader", "lumen-tools_user"], "is_system_admin": False}))
+        "roles": ["member"], "is_system_admin": False}))
     key = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True, revoked_at=None,
                           expires_at=None, scopes=["native:runs:write", "native:conversations:read"])
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7, source="api",
@@ -404,15 +415,16 @@ async def test_denied_intrinsic_title_terminalizes_only_title_not_completed_chat
     job = SimpleNamespace(status="running", lease_owner="worker", run_id="run", conversation_id="conv",
                           progress={}, payload="synthetic encrypted payload")
     conversation = SimpleNamespace(title_revision=1, title_status="pending", title=None)
-    run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=None, source="web",
+    run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7, source="api",
                           run_scope="persistent", conversation_id="conv", status="completed", capability_snapshot={})
     class JobSession(Session):
         async def get(self, model, key, **kwargs):
             return job if model is ChatJob else conversation if model is ChatConversation else run
-    monkeypatch.setattr("lumen.db.get_session_factory", lambda: lambda: JobSession(None))
+    monkeypatch.setattr("lumen.db.get_session_factory", lambda: lambda: JobSession(
+        active_key("native:runs:write", "native:conversations:read")))
     monkeypatch.setattr(title_jobs, "_json_load", lambda _: payload)
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
-        "roles": ["member", "lumen-chat_user", "lumen-history_reader"], "is_system_admin": False}))
+        "roles": ["member"], "is_system_admin": False}))
     monkeypatch.setattr(title_jobs.credit, "precheck", AsyncMock())
     provider = AsyncMock(side_effect=AssertionError("intrinsic title provider started without tools authority"))
     monkeypatch.setattr(title_jobs.title_summary, "generate_title", provider)
@@ -428,18 +440,18 @@ async def test_denied_intrinsic_memory_completes_optional_job_without_mutating_c
     from lumen.models.chat_jobs import ChatJob
     from lumen.services import memory_extract, memory_jobs
 
-    run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=None, source="web",
+    run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7, source="api",
                           run_scope="persistent", conversation_id="conv", status="completed", capability_snapshot={})
     job = SimpleNamespace(status="running", lease_owner="worker")
     class MemorySession(Session):
         async def get(self, model, key, **kwargs):
             return job if model is ChatJob else run
     def factory():
-        return MemorySession(None)
+        return MemorySession(active_key("native:runs:write", "native:conversations:read"))
     monkeypatch.setattr(inference_authority, "get_session_factory", lambda: factory)
     monkeypatch.setattr("lumen.db.get_session_factory", lambda: factory)
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
-        "roles": ["member", "lumen-chat_user", "lumen-history_reader"], "is_system_admin": False}))
+        "roles": ["member"], "is_system_admin": False}))
     monkeypatch.setattr(memory_extract.ps, "resolve_memory_model", AsyncMock(return_value={
         "model_name": "administrator-selected-model", "capabilities": {"web_search_required": True}}))
     monkeypatch.setattr(memory_extract.ms, "list_memories", AsyncMock(return_value=[]))
@@ -466,16 +478,17 @@ async def test_intrinsic_compaction_fences_only_new_intent_including_old_snapsho
     summary = {"model_name": "administrator-selected-model", "provider_id": 1, "model_id": 2}
     if not legacy:
         summary["capabilities"] = {"web_search_required": True}
-    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, agent_id=None,
-                          source="web", run_scope="persistent", conversation_id="conv", capability_snapshot={"summary_route": summary})
+    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=7, agent_id=None,
+                          source="api", run_scope="persistent", conversation_id="conv", capability_snapshot={"summary_route": summary})
     segment = SimpleNamespace(status=segment_state, result_payload="{}", usage_payload="{}")
-    monkeypatch.setattr(execution, "_factory", lambda: lambda: Session(run))
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: Session(
+        run, key=active_key("native:runs:write", "native:conversations:read")))
     monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *_args: None)
     monkeypatch.setattr(execution, "prepare_segment", AsyncMock(return_value=segment))
     monkeypatch.setattr(execution, "_payload", lambda _: {"features": {"tool_policy": {"mode": "none"}}})
     monkeypatch.setattr(execution, "load_segment_payload", lambda _: {})
     monkeypatch.setattr(execution, "fail_unresolved_segment", lambda *args, **kwargs: None)
-    authority = AsyncMock(return_value={"roles": ["member", "lumen-chat_user", "lumen-history_reader"], "is_system_admin": False})
+    authority = AsyncMock(return_value={"roles": ["member"], "is_system_admin": False})
     resolver = AsyncMock(return_value={"capabilities": {"web_search_required": True}})
     monkeypatch.setattr(auth, "resolve_project_authority", authority)
     monkeypatch.setattr(execution.ps, "resolve_model_snapshot", resolver)
@@ -494,8 +507,8 @@ async def test_intrinsic_compaction_fences_only_new_intent_including_old_snapsho
 async def test_denied_automatic_intrinsic_compaction_preserves_safe_plain_chat_input(monkeypatch):
     summary = {"model_name": "administrator-selected-model", "context_limit": 4000,
                "capabilities": {"web_search_required": True}}
-    run = SimpleNamespace(id="run", status="running", user_id="owner", project_id="project", api_key_id=None,
-        agent_id=None, source="web", run_scope="persistent", conversation_id="conv", temp_thread_id=None,
+    run = SimpleNamespace(id="run", status="running", user_id="owner", project_id="project", api_key_id=7,
+        agent_id=None, source="api", run_scope="persistent", conversation_id="conv", temp_thread_id=None,
         model_name="ordinary-chat", capability_snapshot={"capabilities": {"context_limit": 1000}, "summary_route": summary},
         pricing_snapshot={"summary_route": {"token_rates": {}}})
     segment = SimpleNamespace(status="prepared")
@@ -506,7 +519,8 @@ async def test_denied_automatic_intrinsic_compaction_preserves_safe_plain_chat_i
         events.append((event_type, payload))
     async def prepare(*args, compactor, **kwargs):
         return await compactor(["stored older history"], {"round": 0})
-    monkeypatch.setattr(execution, "_factory", lambda: lambda: Session(run))
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: Session(
+        run, key=active_key("native:runs:write", "native:conversations:read")))
     monkeypatch.setattr(execution, "_payload", lambda _: {"max_tokens": 10, "features": {"memory": False, "tool_policy": {"mode": "none"}}})
     monkeypatch.setattr(execution, "_append", append)
     monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *_args: None)
@@ -515,7 +529,7 @@ async def test_denied_automatic_intrinsic_compaction_preserves_safe_plain_chat_i
     monkeypatch.setattr(execution.context_manager, "context_state", lambda *args, **kwargs: state)
     monkeypatch.setattr(execution.context_manager, "prepare_model_messages", prepare)
     monkeypatch.setattr(execution.credit, "precheck", AsyncMock())
-    authority = AsyncMock(return_value={"roles": ["member", "lumen-chat_user", "lumen-history_reader"], "is_system_admin": False})
+    authority = AsyncMock(return_value={"roles": ["member"], "is_system_admin": False})
     monkeypatch.setattr(auth, "resolve_project_authority", authority)
     provider = AsyncMock(side_effect=AssertionError("intrinsic summary provider started without tools authority"))
     monkeypatch.setattr(execution.provider_client, "acompletion", provider)
@@ -524,14 +538,14 @@ async def test_denied_automatic_intrinsic_compaction_preserves_safe_plain_chat_i
         messages=messages, tool_schemas=[], round_index=0)
     assert result is messages and run.status == "running" and segment.status == "prepared"
     assert events[-1][1]["phase"] == "failed" and events[-1][1]["after_tokens"] == 80
-    ensure_scopes(principal("lumen-chat_user"), *inference_authority.native_run_scopes({"features": {"memory": False, "tool_policy": {"mode": "none"}}}))
+    ensure_scopes(principal(key=True), *inference_authority.native_run_scopes({"features": {"memory": False, "tool_policy": {"mode": "none"}}}))
     provider.assert_not_awaited()
     authority.assert_awaited_once_with("owner", "project")
 
 
 
 async def test_queued_key_expiration_rejects_new_tool_intent_before_provider_start(monkeypatch):
-    roles = ["member", "lumen-chat_user", "lumen-tools_user"]
+    roles = ["member"]
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
         "roles": roles, "is_system_admin": False}))
     key = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True,
@@ -564,10 +578,10 @@ async def test_queued_key_expiration_rejects_new_tool_intent_before_provider_sta
 
 def reduced_authority():
     return {"credential_restricted": True, "user_id": "owner", "source_project_id": "project",
-            "source_system_scope": "", "issued_role_ids": ["member-id", "chat-id", "tools-id", "audio-id", "images-id", "history-id"]}
+            "source_system_scope": "", "issued_role_ids": ["member-id"]}
 
 
-def retained_admin_with_reduced_leaf(monkeypatch, metadata):
+def retained_admin_with_reduced_membership(monkeypatch, metadata):
     """Missing metadata deliberately gives the still-current owner's full admin authority."""
     state = SimpleNamespace(revoked=False)
 
@@ -576,9 +590,7 @@ def retained_admin_with_reduced_leaf(monkeypatch, metadata):
         if credential_authority is None:
             return {"roles": [], "is_system_admin": True}
         assert credential_authority == metadata
-        return {"roles": ["member"] if state.revoked else ["member", "lumen-chat_user",
-            "lumen-tools_user", "lumen-audio_user", "lumen-images_user", "lumen-history_reader"],
-            "is_system_admin": False}
+        return {"roles": [] if state.revoked else ["member"], "is_system_admin": False}
 
     lookup = AsyncMock(side_effect=current)
     monkeypatch.setattr(auth, "resolve_project_authority", lookup)
@@ -588,7 +600,7 @@ def retained_admin_with_reduced_leaf(monkeypatch, metadata):
 @pytest.mark.parametrize("by_id", [False, True])
 async def test_auxiliary_generation_retains_original_ceiling_at_shared_fresh_gate(monkeypatch, by_id):
     metadata = reduced_authority()
-    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    state, lookup = retained_admin_with_reduced_membership(monkeypatch, metadata)
     run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None,
         source="web", run_scope="persistent", conversation_id="conv",
         capability_snapshot={"credential_authority": metadata})
@@ -621,7 +633,7 @@ async def test_non_durable_tool_dispatch_preserves_ceiling_before_provider(monke
     from lumen.services.tools import ToolContext
 
     metadata = reduced_authority()
-    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    state, lookup = retained_admin_with_reduced_membership(monkeypatch, metadata)
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=None,
         capability_snapshot={"credential_authority": metadata})
     session = Session(None)
@@ -631,7 +643,7 @@ async def test_non_durable_tool_dispatch_preserves_ceiling_before_provider(monke
     ctx = ToolContext(user_id="owner", project_id="project", run_id="run")
     await inference_authority.authorize_tool_dispatch(ctx)
     state.revoked = True
-    provider = AsyncMock(side_effect=AssertionError("MCP started after issued leaf revocation"))
+    provider = AsyncMock(side_effect=AssertionError("MCP started after issued membership revocation"))
     monkeypatch.setattr(dispatch.mcp_client, "call_tool", provider)
     with pytest.raises(api_key_store.ApiKeyForbidden):
         await dispatch.context_execute_result("mcp__1__search", {}, ctx)
@@ -647,7 +659,7 @@ async def test_finite_media_fresh_gate_keeps_original_ceiling_before_source_or_h
     from lumen.services.durable_runs import media
 
     metadata = reduced_authority()
-    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    state, lookup = retained_admin_with_reduced_membership(monkeypatch, metadata)
     run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None,
         run_kind=kind, model_name="synthetic", capability_snapshot={"credential_authority": metadata}, pricing_snapshot={})
     monkeypatch.setattr("lumen.services.durable_runs.admission._lock_run_configurations", AsyncMock())
@@ -673,7 +685,7 @@ async def test_realtime_fresh_gate_retains_original_ceiling_before_hold_and_prov
     from lumen.services.durable_runs import realtime
 
     metadata = reduced_authority()
-    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    state, lookup = retained_admin_with_reduced_membership(monkeypatch, metadata)
     run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, source="web",
         lease_owner="worker", last_seq=0, capability_snapshot={"credential_authority": metadata},
         pricing_snapshot={"bound_credits": "1"}, provider_started_at=None)
@@ -717,7 +729,7 @@ async def test_finite_media_ceiling_fences_hold_but_not_committed_checkpoint(mon
 
     module = durable_images if kind == "image" else durable_audio
     metadata = reduced_authority()
-    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    state, lookup = retained_admin_with_reduced_membership(monkeypatch, metadata)
     scope = "native:images:write" if kind == "image" else "native:audio:write"
     run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, source="web",
         run_kind=kind, model_name="synthetic", last_seq=0,
@@ -770,7 +782,7 @@ async def test_api_generation_segment_keeps_ceiling_before_hold_without_reauthor
     from lumen.services.durable_runs import api_completion
 
     metadata = reduced_authority()
-    state, lookup = retained_admin_with_reduced_leaf(monkeypatch, metadata)
+    state, lookup = retained_admin_with_reduced_membership(monkeypatch, metadata)
     run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, batch_id="batch",
         model_name="synthetic", last_seq=0, cancel_requested_at=None, provider_started_at=None,
         capability_snapshot={"credential_authority": metadata})

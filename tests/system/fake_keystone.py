@@ -33,10 +33,6 @@ OWNER_UNSCOPED_TOKEN = "synthetic-owner-unscoped-token"
 CONTROL_TOKEN = "synthetic-directory-control"
 SYSTEM_GROUP_ID = "synthetic-system-admins"
 SYSTEM_PARENT = "synthetic-system-admin"
-READER_LEAVES = {"lumen-inventory_reader", "lumen-history_reader"}
-USER_LEAVES = {"lumen-chat_user", "lumen-images_user", "lumen-audio_user", "lumen-tools_user"}
-EDITOR_LEAVES = {"lumen-assets_editor", "lumen-agents_editor", "lumen-mcp_editor", "lumen-keys_editor", "lumen-history_editor"}
-ADMIN_LEAVES = {"lumen-resources_admin"}
 _TOKEN_SCOPES = {
     DIRECTORY_TOKEN: (DIRECTORY_ID, "project"),
     PROJECTLESS_SYSTEM_TOKEN: (PROJECTLESS_ADMIN_ID, "system"),
@@ -57,23 +53,20 @@ class DirectoryState:
 
     def reset(self):
         with self.lock:
-            names = (READER_LEAVES | USER_LEAVES | EDITOR_LEAVES | ADMIN_LEAVES
-                     | {"admin", "manager", "member", "reader", "project_admin", "project_member", "project_reader",
-                        "lumen_admin", "lumen_editor", "lumen_user", "lumen_reader", SYSTEM_PARENT})
+            names = {"admin", "manager", "member", "reader", "project_admin", "project_member", "project_reader",
+                     "lumen_admin", "lumen_editor", "lumen_user", "lumen_reader", "lumen-chat_user", SYSTEM_PARENT}
             self.roles = {role_id(name): {"id": role_id(name), "name": name, "domain_id": None}
                           for name in sorted(names)}
             implications = {
+                "project_admin": {"admin"},
                 "project_member": {"member", "project_reader"}, "project_reader": {"reader"},
-                "lumen_admin": {"lumen_editor", *ADMIN_LEAVES},
-                "lumen_editor": {"lumen_user", *EDITOR_LEAVES},
-                "lumen_user": {"lumen_reader", *USER_LEAVES}, "lumen_reader": READER_LEAVES,
-                **{leaf: {"lumen_reader"} for leaf in USER_LEAVES | EDITOR_LEAVES | ADMIN_LEAVES},
+                "member": {"reader"},
                 SYSTEM_PARENT: {"admin"},
             }
             self.graph = {rid: set() for rid in self.roles}
             for prior, children in implications.items():
                 self.graph[role_id(prior)] = {role_id(child) for child in children}
-            self.owner_roles = {role_id("project_member"), role_id("lumen_admin")}
+            self.owner_roles = {role_id("project_member")}
             self.directory_target_roles = set()
             self.directory_system_admin = True
             self.revoke_system_admin_after_checks = None

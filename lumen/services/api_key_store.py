@@ -717,7 +717,6 @@ async def verify_key(raw: str) -> dict | None:
                 "expires_at": row.expires_at,
                 "roles": authority["roles"],
                 "service_system_admin": authority["is_system_admin"],
-                "personal_project_owner": authority.get("personal_project_owner") is True,
             }
             # last_used_at 갱신(best-effort — 실패해도 인증은 성공).
             try:

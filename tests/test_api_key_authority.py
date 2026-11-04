@@ -89,8 +89,8 @@ def test_issuable_scope_vocabulary_matches_shared_service_contract():
 
 
 @pytest.mark.parametrize("roles", [
-    ["member"], ["member", "lumen-chat_user"], ["lumen_user"], ["lumen_reader"],
-    ["member", "project_owner", "project_admin"], ["drover_admin"],
+    [], ["reader"], ["lumen_user"], ["lumen_reader"], ["lumen_editor"], ["lumen_admin"],
+    ["project_owner", "project_admin"], ["lumen-keys_editor", "lumen-chat_user"], ["drover_admin"],
 ])
 async def test_every_issuer_requires_current_issuance_action(monkeypatch, roles):
     lookup = current_roles(monkeypatch, roles)
@@ -103,14 +103,15 @@ async def test_every_issuer_requires_current_issuance_action(monkeypatch, roles)
     lookup.assert_called_with("u", "p")
 
 
-async def test_issuance_scopes_must_be_subset_of_current_owner_caps(monkeypatch):
-    current_roles(monkeypatch, ["member", "lumen-keys_editor", "lumen-chat_user"])
-    row, raw = await aks.prepare_key_record("u", "p", "chat only", [_CHAT])
-    assert row.scopes == [_CHAT] and row.key_hash == aks._hash_key(raw)
-    assert row.key_hash != raw
-    for denied_scope in ("models:read", "compat:images:write", "native:assets:delete", "native:tools:execute"):
-        with pytest.raises(aks.ApiKeyForbidden):
-            await aks.prepare_key_record("u", "p", "overbroad", [_CHAT, denied_scope])
+@pytest.mark.parametrize("role", ["member", "manager", "admin"])
+@pytest.mark.parametrize("kind", ["api_key", "claude_gateway"])
+async def test_standard_project_writer_can_issue_every_storable_scope_without_service_roles(monkeypatch, role, kind):
+    current_roles(monkeypatch, [role])
+    row, raw = await aks.prepare_key_record("u", "p", "all project actions", sorted(aks.API_KEY_SCOPES),
+                                          credential_kind=kind)
+    assert set(row.scopes) == aks.API_KEY_SCOPES
+    assert row.key_hash == aks._hash_key(raw) and row.key_hash != raw
+    assert not any(scope.startswith("native:keys:") for scope in row.scopes)
 
 
 @pytest.mark.parametrize("roles", [["admin"], []], ids=["target-admin-role", "zero-target-roles"])
@@ -121,23 +122,24 @@ async def test_verified_system_owner_can_issue_service_scopes(monkeypatch, roles
     assert not any(scope.startswith("native:keys:") for scope in row.scopes)
 
 
-async def test_verify_returns_current_roles_and_attenuates_downgraded_owner(monkeypatch):
+@pytest.mark.parametrize("role", ["member", "manager", "admin"])
+async def test_verify_intersects_stored_scopes_with_fresh_standard_owner_role(monkeypatch, role):
     session = stored_key(monkeypatch)
-    roles = ["member", "lumen-inventory_reader", "lumen-chat_user", "lumen-images_user"]
-    lookup = current_roles(monkeypatch, roles)
+    lookup = current_roles(monkeypatch, [role])
     first = await aks.verify_key(_RAW)
-    assert first["roles"] == roles
+    assert first["roles"] == [role]
     assert set(first["scopes"]) == set(session.row.scopes)
-    lookup.return_value = {"roles": ["member", "lumen-chat_user"], "is_system_admin": False}
+    lookup.return_value = {"roles": ["reader"], "is_system_admin": False}
     downgraded = await aks.verify_key(_RAW)
-    assert downgraded["roles"] == ["member", "lumen-chat_user"]
-    assert downgraded["scopes"] == (_CHAT,)
+    assert downgraded["roles"] == ["reader"]
+    assert downgraded["scopes"] == ("models:read",)
     assert session.row.scopes == ["models:read", _CHAT, "compat:images:write"]
-    auth.ensure_scopes({"auth_type": "api_key", **downgraded}, _CHAT)
-    with pytest.raises(HTTPException) as error:
-        auth.ensure_scopes({"auth_type": "api_key", **downgraded}, "compat:images:write")
-    assert error.value.status_code == 403
-    lookup.return_value = {"roles": ["member"], "is_system_admin": False}
+    auth.ensure_scopes({"auth_type": "api_key", **downgraded}, "models:read")
+    for denied in (_CHAT, "compat:images:write"):
+        with pytest.raises(HTTPException) as error:
+            auth.ensure_scopes({"auth_type": "api_key", **downgraded}, denied)
+        assert error.value.status_code == 403
+    lookup.return_value = {"roles": ["lumen_admin", "lumen-chat_user"], "is_system_admin": False}
     assert (await aks.verify_key(_RAW))["scopes"] == ()
 
 
@@ -147,7 +149,7 @@ async def test_verify_returns_current_roles_and_attenuates_downgraded_owner(monk
 ])
 async def test_revoked_or_expired_key_never_authorizes(monkeypatch, changes):
     stored_key(monkeypatch, **changes)
-    lookup = current_roles(monkeypatch, ["member", "lumen-chat_user"])
+    lookup = current_roles(monkeypatch, ["member"])
     assert await aks.verify_key(_RAW) is None
     lookup.assert_not_awaited()
 
@@ -170,7 +172,7 @@ async def test_missing_membership_differs_from_unavailable_keystone(monkeypatch,
 
 async def test_current_group_effective_roles_are_used_without_direct_member_fallback(monkeypatch):
     stored_key(monkeypatch)
-    names = ["member", "lumen-chat_user", "lumen-keys_editor"]
+    names = ["member", "reader"]
     roles = [{"id": str(i), "name": name, "domain_id": None} for i, name in enumerate(names)]
     # Effective group grants resolve to the requested user, not a raw group principal.
     assignments = [{"role": {"id": role["id"]}, "scope": {"project": {"id": "p"}},
@@ -195,10 +197,10 @@ async def test_current_group_effective_roles_are_used_without_direct_member_fall
                          domains=SimpleNamespace(get=lambda _id: SimpleNamespace(id=_id, enabled=True)))
     monkeypatch.setattr(auth, "_get_admin_ks_client", lambda: ks)
     info = await aks.verify_key(_RAW)
-    assert set(info["roles"]) == set(names) and info["scopes"] == (_CHAT,)
+    assert set(info["roles"]) == set(names) and set(info["scopes"]) == {"models:read", _CHAT, "compat:images:write"}
     await aks.prepare_key_record("u", "p", "group issue", [_CHAT])
-    assignments[:] = assignments[:1]  # Current group service grants revoked, member remains.
-    assert (await aks.verify_key(_RAW))["scopes"] == ()
+    assignments[:] = assignments[1:]  # Current group member grant revoked, reader remains.
+    assert (await aks.verify_key(_RAW))["scopes"] == ("models:read",)
     assignments.clear()
     with pytest.raises(aks.ApiKeyForbidden):
         await aks.prepare_key_record("u", "p", "removed", [_CHAT])
@@ -206,15 +208,15 @@ async def test_current_group_effective_roles_are_used_without_direct_member_fall
 
 
 @pytest.mark.parametrize("api_key_id", [None, 7])
-async def test_before_new_io_key_and_web_revalidate_current_caps_without_keys_editor(monkeypatch, api_key_id):
+async def test_before_new_io_key_and_web_revalidate_standard_roles_without_service_grants(monkeypatch, api_key_id):
     session = KeySession(key_row())
-    lookup = current_roles(monkeypatch, ["member", "lumen-chat_user"])
+    lookup = current_roles(monkeypatch, ["member"])
     await aks.authorize_api_key_in_transaction(
         session, api_key_id=api_key_id, user_id="u", project_id="p", required_scopes=iter([_CHAT]))
     assert len(session.statements) == (1 if api_key_id else 0)
     if api_key_id:
         assert session.statements[0].get_execution_options()["populate_existing"] is True
-    lookup.return_value = {"roles": ["reader", "lumen-inventory_reader", "lumen-history_reader"], "is_system_admin": False}
+    lookup.return_value = {"roles": ["reader"], "is_system_admin": False}
     with pytest.raises(aks.ApiKeyForbidden):
         await aks.authorize_api_key_in_transaction(
             session, api_key_id=api_key_id, user_id="u", project_id="p", required_scopes=(_CHAT,))
@@ -229,7 +231,7 @@ async def test_before_new_io_key_and_web_revalidate_current_caps_without_keys_ed
 
 
 async def test_key_refresh_still_enforces_revocation_scope_and_owner(monkeypatch):
-    current_roles(monkeypatch, ["member", "lumen-chat_user"])
+    current_roles(monkeypatch, ["member"])
     session = KeySession(key_row())
     for changes in ({"scopes": ["models:read"]}, {"revoked_at": datetime.now(UTC)},
                     {"owner_user_id": "someone-else"}, {"owner_project_id": "other"}):
@@ -261,14 +263,14 @@ async def test_system_owner_key_has_service_authority_not_platform_admin(monkeyp
 
 
 @pytest.mark.parametrize("roles,expected", [
-    (["member"], [403, 403, 403, 403, 403]),
-    (["member", "lumen-chat_user", "lumen-images_user", "lumen-tools_user"], [403, 403, 403, 403, 403]),
-    (["member", "lumen-keys_editor"], [200, 403, 200, 200, 403]),
-    (["member", "lumen-keys_editor", "lumen-resources_admin"], [200, 403, 200, 200, 204]),
-    (["member", "lumen-keys_editor", "lumen-chat_user"], [200, 201, 200, 200, 403]),
-    (["member", "lumen-keys_editor", "lumen-chat_user", "lumen-resources_admin"], [200, 201, 200, 200, 204]),
+    (["member"], [200, 201, 200, 200, 204]),
+    (["manager"], [200, 201, 200, 200, 204]),
+    (["admin"], [200, 201, 200, 200, 204]),
+    (["reader"], [200, 403, 403, 403, 403]),
+    (["lumen_admin"], [403, 403, 403, 403, 403]),
+    (["lumen-keys_editor", "lumen-chat_user", "lumen-resources_admin"], [403, 403, 403, 403, 403]),
 ])
-async def test_keys_editor_manages_resources_admin_revokes_preserving_owner_context(monkeypatch, roles, expected):
+async def test_standard_roles_manage_keys_with_owner_context_and_reader_is_read_only(monkeypatch, roles, expected):
     test_app = FastAPI()
     test_app.include_router(api_keys.router)
     async def principal():
@@ -291,10 +293,12 @@ async def test_keys_editor_manages_resources_admin_revokes_preserving_owner_cont
     assert [response.status_code for response in responses] == expected
     if expected[0] == 200:
         listing.assert_awaited_once_with("u", "p")
-        rename.assert_awaited_once_with(7, "u", "p", "renamed")
     else:
         listing.assert_not_awaited()
-        create.assert_not_awaited()
+    if expected[2] == 200:
+        rename.assert_awaited_once_with(7, "u", "p", "renamed")
+        limits.assert_awaited_once_with(7, "u", "p", {"weekly_credit_limit": None})
+    else:
         rename.assert_not_awaited()
         limits.assert_not_awaited()
     if expected[1] == 201:
@@ -307,11 +311,11 @@ async def test_keys_editor_manages_resources_admin_revokes_preserving_owner_cont
         revoke.assert_not_awaited()
 
 
-async def test_resources_admin_cannot_revoke_another_owner_or_project(monkeypatch):
+async def test_member_cannot_revoke_another_owner_or_project(monkeypatch):
     session = stored_key(monkeypatch)
     test_app = FastAPI()
     test_app.include_router(api_keys.router)
-    caller = {"user_id": "other", "project_id": "p", "roles": ["member", "lumen-resources_admin"],
+    caller = {"user_id": "other", "project_id": "p", "roles": ["member"],
               "is_system_admin": False}
 
     async def principal():
@@ -331,8 +335,8 @@ async def test_resources_admin_cannot_revoke_another_owner_or_project(monkeypatc
 
 
 @pytest.mark.parametrize("authority,status,code", [
-    ({"roles": ["member", "lumen-inventory_reader", "lumen-chat_user"], "is_system_admin": False}, 403, "access_denied"),
-    ({"roles": ["member", "lumen-keys_editor", "lumen-chat_user"], "is_system_admin": False}, 403, "access_denied"),
+    ({"roles": ["reader"], "is_system_admin": False}, 403, "access_denied"),
+    ({"roles": ["lumen-keys_editor", "lumen-chat_user"], "is_system_admin": False}, 403, "access_denied"),
     (HTTPException(status_code=403, detail="membership removed"), 403, "access_denied"),
     (HTTPException(status_code=503, detail="unavailable"), 503, "temporarily_unavailable"),
 ])
@@ -391,7 +395,7 @@ def issuance_store(monkeypatch, *, monthly="100", weekly="20"):
 ])
 async def test_service_rejects_naive_or_past_expiry_before_issuance(monkeypatch, expires_at):
     session = issuance_store(monkeypatch)
-    lookup = current_roles(monkeypatch, ["member", "lumen-keys_editor", "lumen-chat_user"])
+    lookup = current_roles(monkeypatch, ["member"])
     with pytest.raises(aks.ApiKeyInvalidExpiry):
         await aks.create_key("u", "p", "invalid", [_CHAT], expires_at=expires_at)
     lookup.assert_not_awaited()
@@ -401,7 +405,7 @@ async def test_service_rejects_naive_or_past_expiry_before_issuance(monkeypatch,
 @pytest.mark.parametrize("expires_at", [None, datetime.now(UTC) + timedelta(days=1)])
 async def test_creation_commits_expiry_and_both_limits_atomically(monkeypatch, expires_at):
     session = issuance_store(monkeypatch)
-    current_roles(monkeypatch, ["member", "lumen-keys_editor", "lumen-chat_user"])
+    current_roles(monkeypatch, ["member"])
     issued = await aks.create_key(
         "u", "p", "atomic", [_CHAT], Decimal("100"), Decimal("20"), expires_at=expires_at)
     assert session.commits == 1 and session.rollbacks == 0 and session.quota_reads == 1
@@ -419,18 +423,18 @@ async def test_creation_commits_expiry_and_both_limits_atomically(monkeypatch, e
 @pytest.mark.parametrize("monthly,weekly", [("100.00000001", "20"), ("100", "20.00000001")])
 async def test_expiry_never_relaxes_owner_limit_ceilings(monkeypatch, monthly, weekly):
     session = issuance_store(monkeypatch)
-    current_roles(monkeypatch, ["member", "lumen-keys_editor", "lumen-chat_user"])
+    current_roles(monkeypatch, ["member"])
     with pytest.raises(aks.ApiKeyLimitConflict):
         await aks.create_key("u", "p", "over quota", [_CHAT], Decimal(monthly), Decimal(weekly),
                              expires_at=datetime.now(UTC) + timedelta(days=1))
     assert session.commits == 0 and session.added == [] and session.rollbacks == 1
 
 
-async def test_expiry_never_relaxes_scope_ceiling(monkeypatch):
+async def test_expiry_never_relaxes_reader_issuance_denial(monkeypatch):
     session = issuance_store(monkeypatch)
-    current_roles(monkeypatch, ["member", "lumen-keys_editor", "lumen-chat_user"])
+    current_roles(monkeypatch, ["reader"])
     with pytest.raises(aks.ApiKeyForbidden):
-        await aks.create_key("u", "p", "over scope", [_CHAT, "native:tools:execute"],
+        await aks.create_key("u", "p", "reader cannot issue", ["models:read"],
                              expires_at=datetime.now(UTC) + timedelta(days=1))
     assert session.commits == 0 and session.added == [] and session.quota_reads == 0
 
@@ -438,7 +442,7 @@ async def test_expiry_never_relaxes_scope_ceiling(monkeypatch):
 @pytest.mark.parametrize("expiry_kind,status", [("naive", 422), ("past", 422), ("future", 201), ("null", 201)])
 async def test_creation_http_validates_expiry_and_returns_atomic_limits(monkeypatch, expiry_kind, status):
     session = issuance_store(monkeypatch)
-    roles = ["member", "lumen-keys_editor", "lumen-chat_user"]
+    roles = ["member"]
     current_roles(monkeypatch, roles)
     test_app = FastAPI()
     test_app.include_router(api_keys.router)
@@ -463,7 +467,7 @@ async def test_creation_http_validates_expiry_and_returns_atomic_limits(monkeypa
 
 async def test_api_key_expiry_http_failure_is_unauthorized_not_scope_denial(monkeypatch):
     stored_key(monkeypatch, expires_at=datetime.now(UTC) - timedelta(seconds=1))
-    current_roles(monkeypatch, ["member", "lumen-chat_user"])
+    current_roles(monkeypatch, ["member"])
     request = Request({"type": "http", "method": "GET", "path": "/",
                        "headers": [(b"x-api-key", _RAW.encode())]})
     with pytest.raises(HTTPException) as error:
@@ -473,7 +477,7 @@ async def test_api_key_expiry_http_failure_is_unauthorized_not_scope_denial(monk
 
 async def test_null_expiry_credentials_continue_to_authenticate(monkeypatch):
     stored_key(monkeypatch, expires_at=None)
-    current_roles(monkeypatch, ["member", "lumen-chat_user"])
+    current_roles(monkeypatch, ["member"])
     request = Request({"type": "http", "method": "GET", "path": "/",
                        "headers": [(b"x-api-key", _RAW.encode())]})
     principal = await auth.get_principal(request)
@@ -483,7 +487,7 @@ async def test_null_expiry_credentials_continue_to_authenticate(monkeypatch):
 
 async def test_key_expiring_after_lookup_is_denied_at_execution_revalidation(monkeypatch):
     session = stored_key(monkeypatch, expires_at=datetime.now(UTC) + timedelta(days=1))
-    current_roles(monkeypatch, ["member", "lumen-chat_user"])
+    current_roles(monkeypatch, ["member"])
     principal = await aks.verify_key(_RAW)
     assert principal is not None
     session.row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -507,13 +511,15 @@ async def test_owner_issuance_policy_uses_existing_quota_ceilings_without_admin_
 
 
 @pytest.mark.parametrize("roles,admin,status", [
-    (["member", "lumen-keys_editor"], False, 200),
-    (["member", "lumen-keys_editor", "lumen-chat_user", "lumen-tools_user"], False, 200),
-    (["lumen_editor"], False, 200),
-    (["member", "lumen-inventory_reader"], False, 403),
-    (["admin"], True, 200),
+    (["member"], False, 200),
+    (["manager"], False, 200),
+    (["admin"], False, 200),
+    (["reader"], False, 403),
+    (["lumen_editor"], False, 403),
+    (["lumen-keys_editor"], False, 403),
+    ([], True, 200),
 ])
-async def test_issuance_policy_needs_keys_editor_not_inventory_and_exposes_exact_scope_contract(monkeypatch, roles, admin, status):
+async def test_issuance_policy_uses_standard_roles_and_exposes_unchanged_scope_contract(monkeypatch, roles, admin, status):
     current_roles(monkeypatch, roles, system_admin=admin)
     test_app = FastAPI()
     test_app.include_router(api_keys.router)
@@ -558,17 +564,17 @@ def test_api_and_service_expiry_normalize_offsets_to_utc():
 
 
 async def test_issuance_policy_rechecks_current_owner_without_authority_cache(monkeypatch):
-    request_roles = ["member", "lumen-keys_editor", "lumen-chat_user", "lumen-tools_user"]
+    request_roles = ["admin"]
     lookup = current_roles(monkeypatch, request_roles)
     policy = AsyncMock(return_value={"monthly_credit_limit": None, "weekly_credit_limit": None})
     monkeypatch.setattr(aks, "owner_issuance_policy", policy)
     token_info = {"user_id": "u", "project_id": "p", "roles": request_roles, "is_system_admin": False}
     first = await api_keys.get_api_key_issuance_policy(token_info)
     assert "native:tools:execute" in first["allowed_scopes"]
-    lookup.return_value = {"roles": ["member", "lumen-keys_editor", "lumen-chat_user"], "is_system_admin": False}
+    lookup.return_value = {"roles": ["member"], "is_system_admin": False}
     second = await api_keys.get_api_key_issuance_policy(token_info)
-    assert "native:tools:execute" not in second["allowed_scopes"]
-    lookup.return_value = {"roles": ["member", "lumen-chat_user"], "is_system_admin": False}
+    assert second["allowed_scopes"] == first["allowed_scopes"]
+    lookup.return_value = {"roles": ["reader"], "is_system_admin": False}
     with pytest.raises(HTTPException) as error:
         await api_keys.get_api_key_issuance_policy(token_info)
     assert error.value.status_code == 403
@@ -576,12 +582,12 @@ async def test_issuance_policy_rechecks_current_owner_without_authority_cache(mo
 
 
 async def test_issuance_policy_owner_authority_outage_is_503_without_quota_fallback(monkeypatch):
-    current_roles(monkeypatch, ["member", "lumen-keys_editor"]).side_effect = HTTPException(status_code=503)
+    current_roles(monkeypatch, ["member"]).side_effect = HTTPException(status_code=503)
     policy = AsyncMock()
     monkeypatch.setattr(aks, "owner_issuance_policy", policy)
     with pytest.raises(HTTPException) as error:
         await api_keys.get_api_key_issuance_policy({
-            "user_id": "u", "project_id": "p", "roles": ["member", "lumen-keys_editor"], "is_system_admin": False})
+            "user_id": "u", "project_id": "p", "roles": ["member"], "is_system_admin": False})
     assert error.value.status_code == 503
     policy.assert_not_awaited()
 
@@ -655,31 +661,28 @@ async def test_zero_role_system_owner_key_native_routes_remain_scoped_and_tenant
 
 
 @pytest.mark.parametrize("caller_admin", [False, True])
-async def test_issuance_policy_never_widens_caller_ceiling_to_larger_owner_grants(monkeypatch, caller_admin):
-    owner_roles = ["member", "lumen-keys_editor", "lumen-chat_user", "lumen-tools_user"]
-    current_roles(monkeypatch, owner_roles, system_admin=True)
+async def test_reduced_member_issuance_keeps_full_project_actions_without_system_authority(monkeypatch, caller_admin):
+    current_roles(monkeypatch, ["admin"], system_admin=True)
     policy = AsyncMock(return_value={"monthly_credit_limit": None, "weekly_credit_limit": None})
     monkeypatch.setattr(aks, "owner_issuance_policy", policy)
-    caller_roles = ["member", "lumen-keys_editor", "lumen-chat_user"]
-    token_info = {"user_id": "u", "project_id": "p", "roles": caller_roles,
+    token_info = {"user_id": "u", "project_id": "p", "roles": ["member"],
                   "is_system_admin": caller_admin, "credential_restricted": not caller_admin,
                   "source_project_id": "p", "source_system_scope": "",
-                  "issued_role_ids": ["member", "keys", "chat"]}
+                  "issued_role_ids": ["member-id"]}
     response = await api_keys.get_api_key_issuance_policy(token_info)
-    expected = sorted(service_authority.allowed_scopes(token_info) & aks.API_KEY_SCOPES)
-    assert response["allowed_scopes"] == expected
-    assert ("native:tools:execute" in response["allowed_scopes"]) is caller_admin
+    assert response["allowed_scopes"] == sorted(aks.API_KEY_SCOPES)
+    assert "native:tools:execute" in response["allowed_scopes"]
     policy.assert_awaited_once_with("u")
 
 
 async def test_reduced_caller_cannot_mint_scope_from_unrestricted_owner_authority(monkeypatch):
-    lookup = current_roles(monkeypatch, ["member", "lumen-keys_editor", "lumen-chat_user", "lumen-tools_user"])
+    lookup = current_roles(monkeypatch, ["admin"], system_admin=True)
     create = AsyncMock()
     monkeypatch.setattr(aks, "create_key", create)
-    caller = {"user_id": "u", "project_id": "p", "roles": ["member", "lumen-keys_editor", "lumen-chat_user"],
+    caller = {"user_id": "u", "project_id": "p", "roles": ["reader"],
               "is_system_admin": False, "credential_restricted": True,
               "source_project_id": "p", "source_system_scope": "",
-              "issued_role_ids": ["member", "keys", "chat"]}
+              "issued_role_ids": ["reader-id"]}
     with pytest.raises(HTTPException) as error:
         await api_keys.create_api_key(api_keys.ApiKeyCreateBody(scopes=[_CHAT, "native:tools:execute"]), caller)
     assert error.value.status_code == 403
@@ -799,10 +802,10 @@ async def test_incomplete_original_credential_metadata_never_becomes_unrestricte
 async def test_device_approval_requires_human_before_rate_limit_or_store(monkeypatch, action, restricted):
     from lumen.api import claude_gateway as routes
 
-    caller = {"user_id": "u", "project_id": "p", "roles": ["member", "lumen-keys_editor", "lumen-chat_user", "lumen-inventory_reader"],
+    caller = {"user_id": "u", "project_id": "p", "roles": ["member"],
               "credential_restricted": restricted, "is_system_admin": False,
               "source_project_id": "p", "source_system_scope": "",
-              "issued_role_ids": ["member-id", "chat-id", "keys-id", "inventory-id"]}
+              "issued_role_ids": ["member-id"]}
     limiter = AsyncMock()
     authorize = AsyncMock(return_value={"status": "approved" if action == "approve" else "denied"})
     monkeypatch.setattr(gateway, "enforce_rate_limit", limiter)
@@ -823,14 +826,14 @@ async def test_device_approval_requires_human_before_rate_limit_or_store(monkeyp
 
 def test_credential_snapshot_copies_only_nonsecret_original_binding():
     info = {"credential_restricted": True, "user_id": "u", "project_id": "p", "source_project_id": "p",
-            "source_system_scope": "", "issued_role_ids": ["member-id", "chat-id"],
-            "token": "synthetic-original-bearer", "roles": ["member", "lumen-chat_user"],
+            "source_system_scope": "", "issued_role_ids": ["member-id", "reader-id"],
+            "token": "synthetic-original-bearer", "roles": ["member", "reader"],
             "is_system_admin": False, "application_credential": {"id": "synthetic-appcred"}}
     snapshot = auth.credential_authority_snapshot(info)
     assert snapshot == {"credential_restricted": True, "user_id": "u", "source_project_id": "p",
-                        "source_system_scope": "", "issued_role_ids": ["member-id", "chat-id"]}
+                        "source_system_scope": "", "issued_role_ids": ["member-id", "reader-id"]}
     info["issued_role_ids"].append("must-not-expand-frozen-ceiling")
-    assert snapshot["issued_role_ids"] == ["member-id", "chat-id"]
+    assert snapshot["issued_role_ids"] == ["member-id", "reader-id"]
     assert auth.credential_authority_snapshot({**info, "credential_restricted": False,
         "roles": [], "is_system_admin": True}) is None
 
@@ -845,3 +848,67 @@ async def test_malformed_original_credential_container_never_loads_owner_or_key(
             required_scopes=(_CHAT,), credential_authority=metadata)
     directory.assert_not_awaited()
     assert session.statements == []
+
+
+@pytest.mark.parametrize("issued_role_ids,expected", [
+    (["reader-id"], frozenset({"models:read"})),
+    (["member-id"], frozenset({"models:read", _CHAT})),
+    (["legacy-id"], frozenset()),
+])
+async def test_key_stored_scopes_intersect_fresh_native_roles_and_original_issued_ids(
+    monkeypatch, issued_role_ids, expected,
+):
+    session = KeySession(key_row(scopes=["models:read", _CHAT]))
+    catalog = [{"id": role_id, "name": name, "domain_id": None} for role_id, name in (
+        ("reader-id", "reader"), ("member-id", "member"), ("manager-id", "manager"),
+        ("legacy-id", "lumen_admin"),
+    )]
+    assignments = [{"role": {"id": role["id"]}, "user": {"id": "u"},
+                    "scope": {"project": {"id": "p"}}} for role in catalog]
+    calls = []
+
+    def get(path):
+        calls.append(path)
+        if path == "/roles":
+            key, rows = "roles", catalog
+        elif path == "/role_inferences":
+            key, rows = "role_inferences", []
+        else:
+            assert path == "/role_assignments?user.id=u&scope.project.id=p&effective=True"
+            key, rows = "role_assignments", assignments
+        return None, {key: rows, "links": {}, "truncated": False}
+
+    monkeypatch.setattr(auth, "_get_admin_ks_client", lambda: SimpleNamespace(
+        get=get,
+        users=SimpleNamespace(get=lambda identity: SimpleNamespace(id="u", domain_id="ud", enabled=True)),
+        projects=SimpleNamespace(get=lambda identity: SimpleNamespace(id="p", domain_id="pd", enabled=True)),
+        domains=SimpleNamespace(get=lambda identity: SimpleNamespace(id=identity, enabled=True)),
+    ))
+    metadata = {"credential_restricted": True, "user_id": "u", "source_project_id": "p",
+                "source_system_scope": "", "issued_role_ids": issued_role_ids}
+    assert await aks.current_api_key_scopes(
+        session, api_key_id=7, user_id="u", project_id="p", credential_authority=metadata) == expected
+    for scope in ("models:read", _CHAT):
+        if scope in expected:
+            await aks.authorize_api_key_in_transaction(
+                session, api_key_id=7, user_id="u", project_id="p",
+                required_scopes=(scope,), credential_authority=metadata)
+        else:
+            with pytest.raises(aks.ApiKeyForbidden):
+                await aks.authorize_api_key_in_transaction(
+                    session, api_key_id=7, user_id="u", project_id="p",
+                    required_scopes=(scope,), credential_authority=metadata)
+    if _CHAT in expected:
+        row, _raw = await aks.prepare_key_record("u", "p", "reduced member", [_CHAT],
+                                               credential_authority=metadata)
+        assert row.scopes == [_CHAT]
+    else:
+        with pytest.raises(aks.ApiKeyForbidden):
+            await aks.prepare_key_record("u", "p", "not a writer", ["models:read"],
+                                         credential_authority=metadata)
+    assignments[:] = [row for row in assignments if row["role"]["id"] not in issued_role_ids]
+    assert await aks.current_api_key_scopes(
+        session, api_key_id=7, user_id="u", project_id="p", credential_authority=metadata) == frozenset()
+    assert session.row.scopes == ["models:read", _CHAT]
+    assert all(path in {"/roles", "/role_inferences",
+                       "/role_assignments?user.id=u&scope.project.id=p&effective=True"} for path in calls)

@@ -169,15 +169,14 @@ async def batch_db(request, monkeypatch):
 
 @pytest.fixture
 def reduced_batch_directory(batch_db, monkeypatch):
-    """Keep raw owner system-admin while revoking a reduced credential's leaf.
+    """Keep raw owner system-admin while downgrading a reduced credential to reader.
 
     Exercise the production ID resolver rather than granting a mocked list of
     scopes; all user/project/domain, role graph and raw system facts are synthetic.
     """
     db = batch_db
-    catalog = {"member-id": "member", "admin-id": "admin", "chat-id": "lumen-chat_user",
-               "images-id": "lumen-images_user", "audio-id": "lumen-audio_user"}
-    granted = {"member-id", "chat-id", "images-id", "audio-id"}
+    catalog = {"member-id": "member", "reader-id": "reader", "admin-id": "admin"}
+    granted = {"member-id", "reader-id"}
 
     class Directory:
         users = projects = domains = SimpleNamespace(get=lambda identifier: SimpleNamespace(
@@ -213,13 +212,10 @@ def reduced_batch_directory(batch_db, monkeypatch):
     return SimpleNamespace(authority=authority, granted=granted, lookup=lookup)
 
 
-@pytest.mark.parametrize("operation,leaf", [
-    ("chat.completions", "chat-id"), ("responses", "chat-id"),
-    ("images.generations", "images-id"), ("audio.speech", "audio-id"),
-])
+@pytest.mark.parametrize("operation", ["chat.completions", "responses", "images.generations", "audio.speech"])
 @pytest.mark.parametrize("revoke_at", ["validation", "materialization", "provider_start"])
-async def test_reduced_batch_ceiling_survives_owner_system_admin_and_leaf_revocation(
-        batch_db, reduced_batch_directory, monkeypatch, operation, leaf, revoke_at):
+async def test_reduced_batch_ceiling_survives_owner_system_admin_and_membership_downgrade(
+        batch_db, reduced_batch_directory, monkeypatch, operation, revoke_at):
     db, directory = batch_db, reduced_batch_directory
     authority = directory.authority
     if operation in {"chat.completions", "responses", "audio.speech"}:
@@ -251,7 +247,8 @@ async def test_reduced_batch_ceiling_survives_owner_system_admin_and_leaf_revoca
         scopes=None, source="web", idempotency_key=str(uuid4()), request=request, credential_authority=authority)
     assert all(item.capability_snapshot == {"credential_authority": authority} for item in await db.items(view.id))
     if revoke_at == "validation":
-        directory.granted.remove(leaf)
+        directory.granted.clear()
+        directory.granted.add("reader-id")
     before = directory.lookup.await_count
     await db.tick()
     assert directory.lookup.await_count - before == 1
@@ -266,7 +263,8 @@ async def test_reduced_batch_ceiling_survives_owner_system_admin_and_leaf_revoca
         frozen = await db.items(view.id)
         assert all(item.capability_snapshot["credential_authority"] == authority for item in frozen)
         if revoke_at == "materialization":
-            directory.granted.remove(leaf)
+            directory.granted.clear()
+            directory.granted.add("reader-id")
         before = directory.lookup.await_count
         await db.tick()
         assert directory.lookup.await_count - before == 1
@@ -286,7 +284,8 @@ async def test_reduced_batch_ceiling_survives_owner_system_admin_and_leaf_revoca
             item = items[0]
             claimed = await db.claim(item.run_id)
             assert claimed is not None
-            directory.granted.remove(leaf)
+            directory.granted.clear()
+            directory.granted.add("reader-id")
             before = directory.lookup.await_count
             with pytest.raises(ApiKeyForbidden if operation in {"chat.completions", "responses"}
                                else MediaAuthorizationRevoked):
@@ -307,13 +306,12 @@ async def test_reduced_batch_ceiling_survives_owner_system_admin_and_leaf_revoca
                     ChatModelCallReservation.run_id == item.run_id)) == 0
                 assert await session.scalar(select(func.count()).select_from(ChatRunSegment).where(
                     ChatRunSegment.run_id == item.run_id, ChatRunSegment.status == "provider_started")) == 0
-    # The owner still has raw system-admin. Only the reduced credential lost the
-    # operation leaf; falling back to the owner would incorrectly authorize I/O.
+    # Raw owner system-admin cannot replace the reduced credential's revoked
+    # standard membership, even when the original issued IDs still include it.
     assert (await resolve_project_authority(db.user_id, db.project_id))["is_system_admin"] is True
     reduced = await resolve_project_authority(db.user_id, db.project_id, credential_authority=authority)
     assert reduced["is_system_admin"] is False
-    revoked_role = {"chat-id": "lumen-chat_user", "images-id": "lumen-images_user", "audio-id": "lumen-audio_user"}[leaf]
-    assert revoked_role not in reduced["roles"]
+    assert reduced["roles"] == ["reader"]
 
 
 async def test_native_idempotency_cannot_erase_or_replace_reduced_provenance(batch_db, reduced_batch_directory):
@@ -324,7 +322,7 @@ async def test_native_idempotency_cannot_erase_or_replace_reduced_provenance(bat
     assert created
     replay, created = await batches.create_native_batch(**kwargs, credential_authority=directory.authority)
     assert replay.id == view.id and not created
-    for replacement in (None, {**directory.authority, "issued_role_ids": ["member-id", "images-id"]}):
+    for replacement in (None, {**directory.authority, "issued_role_ids": ["reader-id"]}):
         with pytest.raises(batches.BatchConflict, match="idempotency key reused"):
             await batches.create_native_batch(**kwargs, credential_authority=replacement)
     assert (await db.items(view.id))[0].capability_snapshot == {"credential_authority": directory.authority}
@@ -469,7 +467,7 @@ async def test_validation_resolves_owner_authority_once_per_chunk(batch_db, curr
     db = batch_db
     monkeypatch.setattr(get_settings(), "batch_validation_chunk_rows", 100)
     if not authorized:
-        current_project_authority.return_value = {"roles": ["member"], "is_system_admin": False}
+        current_project_authority.return_value = {"roles": ["reader"], "is_system_admin": False}
     view, _ = await db.create(5)
     before = current_project_authority.await_count
     await db.tick()

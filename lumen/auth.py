@@ -13,7 +13,6 @@ from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBea
 from starlette.concurrency import run_in_threadpool
 
 from lumen.config import get_settings
-from lumen.service_authority import SERVICE_CAPABILITIES
 
 keystone_token_scheme = APIKeyHeader(name="X-Auth-Token", auto_error=False, scheme_name="KeystoneToken")
 keystone_bearer_scheme = HTTPBearer(auto_error=False, scheme_name="KeystoneBearer")
@@ -40,7 +39,6 @@ class Principal(TypedDict):
     roles: list[str]
     is_system_admin: bool
     service_system_admin: NotRequired[bool]
-    personal_project_owner: NotRequired[bool]
     credential_kind: NotRequired[str]
     expires_at: NotRequired[object]
     token: NotRequired[str]
@@ -102,10 +100,7 @@ def _load_role_graph(ks) -> tuple[dict[str, set[str]], dict[str, str]]:
     catalog = {}
     global_ids = {}
     folded_global_names = set()
-    builtin_names = SERVICE_CAPABILITIES | {
-        "admin", "manager", "member", "reader",
-        "lumen_reader", "lumen_user", "lumen_editor", "lumen_admin",
-    }
+    builtin_names = {"admin", "manager", "member", "reader"}
     seen_builtin_names = set()
     for role in _identity_collection(ks, "/roles", "roles"):
         rid, name, domain = role.get("id"), role.get("name"), role.get("domain_id")
@@ -214,37 +209,6 @@ def _is_system_admin(user_id: str) -> bool:
         raise HTTPException(status_code=503, detail="Current Keystone authority unavailable") from exc
 
 
-def _personal_project_owner(ks, user_id, project_id, project, domains, graph, global_ids, assignments):
-    """Native personal provenance only; never infer ownership from member alone."""
-    if getattr(project, "afterglow_personal_user_id", None) != user_id:
-        return False
-    domain = domains[project.domain_id]
-    if (getattr(domain, "name", None) != "Personal"
-            or getattr(domain, "afterglow_domain_kind", "personal") != "personal"):
-        return False
-    member = global_ids.get("member")
-    reader = global_ids.get("reader")
-    if member is None or not _expand_role_ids({member}, graph) <= {member, reader}:
-        return False
-    raw = _identity_collection(ks, "/role_assignments?" + urlencode({"scope.project.id": project_id}), "role_assignments")
-
-    def direct(row, permitted):
-        scope = row.get("scope")
-        links = row.get("links", {})
-        return (isinstance(scope, dict) and set(scope) == {"project"}
-                and scope["project"].get("id") == project_id
-                and row.get("user", {}).get("id") == user_id and "group" not in row
-                and row.get("role", {}).get("id") in permitted
-                and isinstance(links, dict) and "membership" not in links
-                and "OS-INHERIT:inherited_to" not in row
-                and (not links.get("assignment") or links["assignment"].rstrip("/").endswith(
-                    f"/projects/{project_id}/users/{user_id}/roles/{member}")))
-
-    return bool(raw) and all(direct(row, {member}) for row in raw) and bool(assignments) and all(
-        direct(row, {member, reader}) for row in assignments
-    ) and any(row.get("role", {}).get("id") == member for row in assignments)
-
-
 def _resolve_project_authority(
     user_id: str, project_id: str, *, issued_role_ids: tuple[str, ...] | None = None,
 ) -> dict:
@@ -301,18 +265,13 @@ def _resolve_project_authority(
         is_system_admin = issued_role_ids is None and _system_admin_from_graph(ks, user_id, graph, global_ids)
         if not role_ids and not is_system_admin:
             raise HTTPException(status_code=403, detail="Current project membership required")
-        # Effective native assignments are the authority. Do not fabricate service
-        # leaves by walking the Keystone graph: grade permission is local policy.
+        # Exact current effective assignments bind project authority; reduced
+        # credentials remain limited to their original issued role IDs.
         if not role_ids.issubset(graph):
             raise ValueError("Assigned Keystone role ID absent from current catalog")
         reached = role_ids if issued_role_ids is None else role_ids.intersection(issued_role_ids)
         roles = sorted(name for name, rid in global_ids.items() if rid in reached)
-        result = {"roles": roles, "is_system_admin": is_system_admin}
-        if issued_role_ids is None and _personal_project_owner(
-            ks, user_id, project_id, project, domains, graph, global_ids, assignments,
-        ):
-            result["personal_project_owner"] = True
-        return result
+        return {"roles": roles, "is_system_admin": is_system_admin}
     except HTTPException:
         raise
     except Exception as exc:
@@ -392,7 +351,7 @@ def validate_token(token: str, project_id: str = "", target_project_id: str = ""
             raise HTTPException(status_code=403, detail="Bound and access-rule credentials are not supported")
         restricted = (
             not methods
-            or bool(set(methods) - {"password", "token", "totp", "mapped", "external", "oidc", "saml2"})
+            or bool(set(methods) - {"password", "token", "totp", "mapped", "external", "openid", "oidc", "saml2"})
             or original.trust_scoped
             or any(key in data for key in (
                 "OS-TRUST:trust", "application_credential", "OS-OAUTH1", "OS-OAUTH1:access_token",
@@ -501,11 +460,6 @@ async def _refresh_token_authority(info: dict) -> None:
     connection_project_id = info.get("connection_project_id", info["project_id"])
     if info["project_id"] != connection_project_id and not authority["is_system_admin"]:
         raise HTTPException(status_code=403, detail="Target project override requires system admin privileges")
-    # A logical admin target or a rescope is not the original personal credential.
-    if (info.get("source_project_id", connection_project_id) != info["project_id"]
-            or info.get("source_system_scope") or info.get("credential_restricted")):
-        authority.pop("personal_project_owner", None)
-    info.pop("personal_project_owner", None)
     info.update(authority)
 
 
@@ -580,7 +534,6 @@ async def get_principal(
             "expires_at": info.get("expires_at"),
             "is_system_admin": False,
             "service_system_admin": bool(info.get("service_system_admin", False)),
-            "personal_project_owner": info.get("personal_project_owner") is True,
         }
     else:
         assert keystone_token is not None

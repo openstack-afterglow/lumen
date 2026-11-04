@@ -2,14 +2,40 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from threading import RLock, get_ident
 
 import yaml
 from fastapi import HTTPException
 from oslo_config import cfg
-from oslo_policy import _parser, policy
+from oslo_policy import _checks, _parser, policy
 
 _LOCK = RLock()
+
+
+def _validate_native_rule_graph(enforcer: policy.Enforcer) -> None:
+    """Validate parsed references, including oslo.policy's singular NotCheck child."""
+    complete: set[str] = set()
+
+    def visit_rule(name: str, active: frozenset[str]) -> None:
+        if name not in enforcer.rules or name in active:
+            raise ValueError("Undefined or cyclic native policy reference")
+        if name in complete:
+            return
+        visit_check(enforcer.rules[name], active | {name})
+        complete.add(name)
+
+    def visit_check(check, active: frozenset[str]) -> None:
+        if isinstance(check, _checks.RuleCheck):
+            visit_rule(check.match, active)
+        elif isinstance(check, _checks.NotCheck):
+            visit_check(check.rule, active)
+        else:
+            for child in getattr(check, "rules", ()):
+                visit_check(child, active)
+
+    for name in enforcer.rules:
+        visit_rule(name, frozenset())
 
 
 class _ParserLog:
@@ -35,6 +61,38 @@ class _ParserLog:
 
 
 class _Enforcer(policy.Enforcer):
+    _reload_failed = False
+
+    def load_rules(self, force_reload: bool = False) -> None:
+        # Enforcer.enforce reloads again internally. Every reload must validate
+        # the exact parsed graph before evaluation, not only its caller's preflight.
+        # Native parsing can report an error and return FalseCheck; `not` would
+        # otherwise invert that failed parse into allow. Observe diagnostics,
+        # not grammar. Missing configured policy directories fail closed;
+        # an absent main file selects registered defaults per Lumen contract.
+        with _LOCK:
+            original = _parser.LOG
+            monitor = _ParserLog(original)
+            _parser.LOG = monitor
+            try:
+                for directory in self.conf.oslo_policy.policy_dirs:
+                    if not Path(directory).is_dir():
+                        raise FileNotFoundError("Configured policy directory is unavailable")
+                super().load_rules(force_reload=force_reload or self._reload_failed)
+                if monitor.failed:
+                    raise ValueError("Native oslo.policy parser rejected an expression")
+                self.check_rules(raise_on_violation=True)
+                _validate_native_rule_graph(self)
+                self._reload_failed = False
+            except Exception:
+                self._reload_failed = True
+                self.clear()
+                self.use_conf = True
+                self.register_defaults(list_rules())
+                raise
+            finally:
+                _parser.LOG = original
+
     def _load_policy_file(self, path: str, force_reload: bool, overwrite: bool = True) -> bool:
         # The real parser can substitute FalseCheck for an invalid clause;
         # `not` would turn that into allow. Observe its reports, not its grammar.
@@ -65,18 +123,14 @@ class _Enforcer(policy.Enforcer):
 
 
 def list_rules() -> list[policy.RuleDefault]:
-    from lumen.service_authority import READER_CAPABILITIES, SCOPE_CAPABILITIES
+    from lumen.service_authority import PROJECT_WRITE_ROLES, SCOPE_CAPABILITIES
 
     rules = []
-    for action, leaves in SCOPE_CAPABILITIES.items():
-        grades = ["lumen_admin"]
-        if "lumen-resources_admin" not in leaves:
-            grades.append("lumen_editor")
-        if any(leaf.endswith("_user") for leaf in leaves):
-            grades.append("lumen_user")
-        if set(leaves).intersection(READER_CAPABILITIES):
-            grades.extend(["lumen_user", "lumen_reader"])
-        check = " or ".join(["is_system_admin:True", "personal_project_owner:True", "role:admin"] + [f"role:{role}" for role in grades] + [f"role:{leaf}" for leaf in leaves])
+    for action in SCOPE_CAPABILITIES:
+        roles = sorted(PROJECT_WRITE_ROLES)
+        if action.endswith(":read"):
+            roles.append("reader")
+        check = " or ".join(["is_system_admin:True", *(f"role:{role}" for role in roles)])
         rules.append(policy.RuleDefault(action, check, description=f"Lumen {action}; project/user ownership and credential ceilings are enforced separately."))
     rules.append(policy.RuleDefault("system:admin", "is_system_admin:True", description="Verified human system administrator only; independent hard boundary also enforced."))
     return rules
@@ -112,11 +166,22 @@ def authorize(action: str, principal: dict) -> bool:
         return False
     if principal.get("auth_type") == "api_key" and action not in principal.get("scopes", ()):
         return False
+    if action != "system:admin":
+        from lumen.service_authority import PROJECT_WRITE_ROLES, SCOPE_CAPABILITIES
+
+        if action not in SCOPE_CAPABILITIES:
+            return False
+        roles = set(principal.get("roles", ()))
+        if not (
+            principal.get("is_system_admin") or principal.get("service_system_admin")
+            or roles.intersection(PROJECT_WRITE_ROLES)
+            or (action.endswith(":read") and "reader" in roles)
+        ):
+            return False
     credentials = {
         "roles": list(principal.get("roles", ())),
         "user_id": principal["user_id"], "project_id": principal["project_id"],
         "is_system_admin": bool(principal.get("is_system_admin") or principal.get("service_system_admin")),
-        "personal_project_owner": principal.get("personal_project_owner") is True and not principal.get("credential_restricted"),
     }
     target = {"user_id": principal["user_id"], "project_id": principal["project_id"]}
     with _LOCK:
@@ -127,7 +192,6 @@ def authorize(action: str, principal: dict) -> bool:
         # undefined/cyclic references must not fall back to registered allows.
         try:
             enforcer.load_rules()
-            enforcer.check_rules(raise_on_violation=True)
             return bool(enforcer.authorize(action, target, credentials, do_raise=False))
         except Exception as exc:
             enforcer.clear()

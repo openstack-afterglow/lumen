@@ -1,4 +1,6 @@
-"""Lumen UI labels and action projection, evaluated by operator oslo.policy."""
+"""Internal Lumen action labels projected from standard native project roles."""
+
+PROJECT_WRITE_ROLES = frozenset({"admin", "manager", "member"})
 
 READER_CAPABILITIES = frozenset({"lumen-inventory_reader", "lumen-history_reader"})
 SERVICE_CAPABILITIES = READER_CAPABILITIES | {
@@ -7,7 +9,7 @@ SERVICE_CAPABILITIES = READER_CAPABILITIES | {
     "lumen-keys_editor", "lumen-history_editor", "lumen-resources_admin",
 }
 
-# A tuple is an OR of permissible capabilities; multiple requested scopes are AND.
+# Internal UI labels, not Keystone role requirements. Requested scopes are AND.
 SCOPE_CAPABILITIES: dict[str, tuple[str, ...]] = {
     "models:read": ("lumen-inventory_reader",),
     "usage:read": ("lumen-inventory_reader",),
@@ -54,7 +56,11 @@ SCOPE_CAPABILITIES: dict[str, tuple[str, ...]] = {
 def capabilities(principal: dict) -> frozenset[str]:
     """UI labels only, never synthetic Keystone roles or a second action gate."""
     scopes = allowed_scopes(principal)
-    return frozenset(leaves[0] for scope, leaves in SCOPE_CAPABILITIES.items() if len(leaves) == 1 and scope in scopes)
+    return frozenset(
+        leaves[0] for scope, leaves in SCOPE_CAPABILITIES.items()
+        if len(leaves) == 1 and scope in scopes
+        and (not scope.endswith(":read") or leaves[0] in READER_CAPABILITIES)
+    )
 
 
 def allowed_scopes(principal: dict) -> frozenset[str]:

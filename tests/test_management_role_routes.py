@@ -22,12 +22,6 @@ from lumen.services import agent_store, conversation_store, extensions_store, mc
 
 _IDENTIFIER = "00000000-0000-0000-0000-000000000001"
 
-# Native directory results contain only actual assigned roles, with no implied
-# service leaves or prerequisite native member edge.
-
-
-def _effective_roles(grade: str, baseline: str | None = "member") -> list[str]:
-    return ([baseline] if baseline else []) + [grade]
 
 
 @pytest.fixture
@@ -40,7 +34,7 @@ def management_app():
     app.include_router(files.router, prefix="/compat")
     principal = {
         "auth_type": "keystone", "user_id": "owner", "project_id": "project",
-        "roles": _effective_roles("lumen_user"), "is_system_admin": False, "scopes": (),
+        "roles": ["member"], "is_system_admin": False, "scopes": (),
     }
     app.dependency_overrides[auth.get_principal] = lambda: principal
     app.dependency_overrides[auth.require_token] = lambda: principal
@@ -70,9 +64,8 @@ _CONFIG_WRITES = [
 
 
 @pytest.mark.parametrize("method,path,payload", _CONFIG_WRITES)
-@pytest.mark.parametrize("roles", [["member"], _effective_roles("lumen_user", "reader"),
-                                   _effective_roles("lumen_reader"), _effective_roles("lumen_user")])
-async def test_ordinary_users_cannot_manage_configuration(management_app, method, path, payload, roles):
+@pytest.mark.parametrize("roles", [["reader"], []])
+async def test_readers_and_nonmembers_cannot_manage_configuration(management_app, method, path, payload, roles):
     app, principal = management_app
     principal["roles"] = roles
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
@@ -88,21 +81,20 @@ _CONFIG_DELETES = [
 
 
 @pytest.mark.parametrize("path", _CONFIG_DELETES)
-@pytest.mark.parametrize("role", ["lumen_user", "lumen_editor"])
-async def test_editor_cannot_delete_revoke_or_disconnect_configuration(management_app, path, role):
+@pytest.mark.parametrize("roles", [["reader"], []])
+async def test_readers_and_nonmembers_cannot_delete_configuration(management_app, path, roles):
     app, principal = management_app
-    principal["roles"] = _effective_roles(role)
+    principal["roles"] = roles
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         response = await client.delete(path)
     assert response.status_code == 403
 
 
-@pytest.mark.parametrize("role", ["lumen_editor", "lumen_admin"])
-@pytest.mark.parametrize("family,leaf", [("custom-tools", "lumen-assets_editor"), ("skills", "lumen-assets_editor"),
-                                         ("mcp-servers", "lumen-mcp_editor")])
-async def test_editors_and_admin_manage_only_their_own_extensions(management_app, monkeypatch, role, family, leaf):
+@pytest.mark.parametrize("role", ["member", "manager", "admin"])
+@pytest.mark.parametrize("family", ["custom-tools", "skills", "mcp-servers"])
+async def test_project_writers_manage_only_their_own_extensions(management_app, monkeypatch, role, family):
     app, principal = management_app
-    principal["roles"] = _effective_roles(role)
+    principal["roles"] = [role]
     create = AsyncMock(return_value={"id": 1, "name": "owned"})
     update = AsyncMock(return_value={"id": 1, "name": "updated"})
     delete = AsyncMock()
@@ -116,21 +108,16 @@ async def test_editors_and_admin_manage_only_their_own_extensions(management_app
         response = await client.delete(f"/v1/{family}/1")
     assert create.call_args.kwargs == {"scope": "user", "owner_user_id": "owner", "owner_project_id": "project"}
     assert update.call_args.kwargs == {"requester_user_id": "owner", "requester_project_id": "project"}
-    if role == "lumen_admin":
-        assert response.status_code == 204
-        assert delete.call_args.kwargs == {"requester_user_id": "owner", "requester_project_id": "project"}
-    else:
-        assert response.status_code == 403
-        delete.assert_not_called()
-    # A distinct editor leaf cannot manage the other config family.
-    principal["roles"] = ["member", "lumen-agents_editor" if leaf != "lumen-agents_editor" else "lumen-assets_editor"]
+    assert response.status_code == 204
+    assert delete.call_args.kwargs == {"requester_user_id": "owner", "requester_project_id": "project"}
+    principal["roles"] = ["reader"]
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         assert (await client.post(f"/v1/{family}", json={"name": "blocked"})).status_code == 403
 
 
-async def test_agent_editor_create_clone_update_admin_delete(management_app, monkeypatch):
+async def test_member_creates_clones_updates_and_deletes_owned_agent(management_app, monkeypatch):
     app, principal = management_app
-    principal["roles"] = ["member", "lumen-agents_editor"]
+    principal["roles"] = ["member"]
     create = AsyncMock(return_value={"id": 1})
     update = AsyncMock(return_value={"id": 1})
     clone = AsyncMock(return_value={"id": 2})
@@ -141,8 +128,9 @@ async def test_agent_editor_create_clone_update_admin_delete(management_app, mon
         assert (await client.post("/v1/agents", json={"name": "agent"})).status_code == 201
         assert (await client.patch("/v1/agents/1", json={"name": "updated"})).status_code == 200
         assert (await client.post("/v1/agents/1/clone")).status_code == 201
+        principal["roles"] = ["reader"]
         assert (await client.delete("/v1/agents/1")).status_code == 403
-        principal["roles"] = _effective_roles("lumen_admin")
+        principal["roles"] = ["member"]
         assert (await client.delete("/v1/agents/1")).status_code == 204
     assert create.call_args.kwargs["owner_user_id"] == "owner"
     assert create.call_args.kwargs["project_id"] == "project"
@@ -157,7 +145,7 @@ def _conversation():
             "model_name": None, "created_at": None, "updated_at": None}
 
 
-async def test_history_reader_chat_user_and_history_editor_are_independent(management_app, monkeypatch):
+async def test_reader_reads_history_and_member_creates_forks_and_deletes(management_app, monkeypatch):
     app, principal = management_app
     create = AsyncMock(return_value=_conversation())
     fork = AsyncMock(return_value=_conversation())
@@ -167,16 +155,17 @@ async def test_history_reader_chat_user_and_history_editor_are_independent(manag
                             ("delete_conversation", delete), ("get_conversation", get)):
         monkeypatch.setattr(conversation_store, name, operation)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
-        principal["roles"] = ["reader", "lumen-history_reader"]
+        principal["roles"] = ["reader"]
         assert (await client.get("/v1/conversations/conversation")).status_code == 200
         assert (await client.post("/v1/conversations", json={})).status_code == 403
-        principal["roles"] = ["member", "lumen-chat_user"]
+        principal["roles"] = ["member"]
         assert (await client.post("/v1/conversations", json={})).status_code == 201
         assert (await client.post("/v1/conversations/conversation/fork", json={"message_id": 1})).status_code == 201
-        assert (await client.get("/v1/conversations/conversation")).status_code == 403
+        assert (await client.get("/v1/conversations/conversation")).status_code == 200
+        principal["roles"] = ["reader"]
         assert (await client.delete("/v1/conversations/conversation")).status_code == 403
         delete.assert_not_called()
-        principal["roles"] = ["member", "lumen-history_editor"]
+        principal["roles"] = ["member"]
         assert (await client.delete("/v1/conversations/conversation")).status_code == 204
     assert fork.call_args.kwargs["user_id"] == delete.call_args.kwargs["user_id"] == "owner"
     assert fork.call_args.kwargs["project_id"] == delete.call_args.kwargs["project_id"] == "project"
@@ -185,7 +174,7 @@ async def test_history_reader_chat_user_and_history_editor_are_independent(manag
 @pytest.mark.parametrize("user_id,project_id", [("other", "project"), ("owner", "other-project")])
 async def test_admin_does_not_bypass_real_conversation_ownership(management_app, monkeypatch, user_id, project_id):
     app, principal = management_app
-    principal.update(roles=_effective_roles("lumen_admin"), user_id=user_id, project_id=project_id)
+    principal.update(roles=["admin"], user_id=user_id, project_id=project_id)
     row = SimpleNamespace(user_id="owner", project_id="project")
 
     class Session:
@@ -206,26 +195,26 @@ async def test_admin_does_not_bypass_real_conversation_ownership(management_app,
 
 @pytest.mark.parametrize("path", ["/v1/admin/mcp-servers", "/v1/admin/custom-tools", "/v1/admin/skills",
                                   "/v1/admin/mcp-bundles", "/v1/admin/plugins", "/v1/admin/plugin-bindings"])
-async def test_service_admin_is_not_global_system_admin(management_app, path):
+async def test_project_admin_is_not_global_system_admin(management_app, path):
     app, principal = management_app
-    principal["roles"] = _effective_roles("lumen_admin")
+    principal["roles"] = ["admin"]
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         assert (await client.get(path)).status_code == 403
 
 
-@pytest.mark.parametrize("role,scopes", [("lumen_user", ("compat:files:write", "compat:files:delete")),
-                                       ("lumen_editor", ("compat:files:delete",)),
-                                       ("lumen_admin", ("compat:files:write",))])
-async def test_compat_file_delete_requires_role_and_explicit_delete_scope(management_app, role, scopes):
+@pytest.mark.parametrize("role,scopes", [("reader", ("compat:files:write", "compat:files:delete")),
+                                       ("member", ("compat:files:write",)),
+                                       ("admin", ("compat:files:write",))])
+async def test_compat_file_delete_requires_project_writer_and_explicit_delete_scope(management_app, role, scopes):
     app, principal = management_app
-    principal.update(auth_type="api_key", roles=_effective_roles(role), scopes=scopes)
+    principal.update(auth_type="api_key", roles=[role], scopes=scopes)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         assert (await client.delete("/compat/files/file-" + "0" * 32)).status_code == 403
 
 
-async def test_api_key_scope_attenuates_configuration_editor(management_app, monkeypatch):
+async def test_api_key_scope_attenuates_project_member(management_app, monkeypatch):
     app, principal = management_app
-    principal.update(auth_type="api_key", roles=_effective_roles("lumen_editor"), scopes=("native:extensions:read",))
+    principal.update(auth_type="api_key", roles=["member"], scopes=("native:extensions:read",))
     create = AsyncMock(return_value={"id": 1})
     monkeypatch.setattr(extensions_store, "create", create)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
@@ -235,7 +224,7 @@ async def test_api_key_scope_attenuates_configuration_editor(management_app, mon
     assert create.await_count == 1
 
 
-@pytest.mark.parametrize("roles", [_effective_roles("lumen_user"), _effective_roles("lumen_reader", "reader"), ["member"]])
+@pytest.mark.parametrize("roles", [["reader"], []])
 async def test_oauth_callback_rechecks_persisted_owner_before_exchange(monkeypatch, roles):
     row = SimpleNamespace(status="pending", expires_at=datetime.now(UTC) + timedelta(minutes=5),
                           owner_user_id="owner", owner_project_id="project", encrypted_payload="encrypted")
@@ -259,7 +248,7 @@ async def test_oauth_callback_rechecks_persisted_owner_before_exchange(monkeypat
 @pytest.mark.parametrize("family", ["agents", "skills", "plugin-bindings"])
 async def test_inventory_and_private_config_have_distinct_authority(management_app, monkeypatch, family):
     app, principal = management_app
-    principal["roles"] = ["reader", "lumen-inventory_reader"]
+    principal["roles"] = ["reader"]
     private = "private instructions or credentials"
 
     async def listed(*args, include_private=True, **kwargs):
@@ -279,7 +268,7 @@ async def test_inventory_and_private_config_have_distinct_authority(management_a
         assert inventory.status_code == 200
         assert inventory.json() == [{"id": 1, "name": "metadata"}]
         assert (await client.get(f"/v1/{family}?include_private=true")).status_code == 403
-        principal["roles"] = _effective_roles("lumen_editor")
+        principal["roles"] = ["member"]
         details = await client.get(f"/v1/{family}?include_private=true")
         assert details.status_code == 200
         assert private in details.text
@@ -287,14 +276,15 @@ async def test_inventory_and_private_config_have_distinct_authority(management_a
         assert (await client.get(f"/v1/{family}?include_private=true")).status_code == 403
 
 
-async def test_private_agent_detail_requires_agent_editor(management_app, monkeypatch):
+async def test_private_agent_detail_requires_project_writer(management_app, monkeypatch):
     app, principal = management_app
+    principal["roles"] = ["reader"]
     get = AsyncMock(return_value={"id": 1, "instructions": "private"})
     monkeypatch.setattr(agent_store, "get_agent", get)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         assert (await client.get("/v1/agents/1")).status_code == 403
         get.assert_not_called()
-        principal["roles"] = ["member", "lumen-agents_editor"]
+        principal["roles"] = ["member"]
         assert (await client.get("/v1/agents/1")).status_code == 200
     get.assert_awaited_once_with(1, user_id="owner", project_id="project")
 
@@ -306,9 +296,9 @@ async def test_private_agent_detail_requires_agent_editor(management_app, monkey
     ("/v1/git-credentials/1", code_workspaces, "revoke_git_credential", 204),
     (f"/v1/code-workspaces/{_IDENTIFIER}", code_workspaces, "request_delete_workspace", 202),
 ])
-async def test_service_admin_can_destroy_owned_config_without_owner_bypass(management_app, monkeypatch, path, module, name, status):
+async def test_member_can_destroy_owned_config_without_owner_bypass(management_app, monkeypatch, path, module, name, status):
     app, principal = management_app
-    principal["roles"] = _effective_roles("lumen_admin")
+    principal["roles"] = ["member"]
     operation = AsyncMock(return_value={"id": _IDENTIFIER, "status": "deleting"})
     monkeypatch.setattr(module, name, operation)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
@@ -322,21 +312,21 @@ async def test_service_admin_can_destroy_owned_config_without_owner_bypass(manag
         assert kwargs["user_id"] == "owner" and kwargs["project_id"] == "project"
 
 
-async def test_memory_cleanup_is_history_editor_not_resources_admin(management_app, monkeypatch):
+async def test_memory_cleanup_requires_project_writer(management_app, monkeypatch):
     app, principal = management_app
     provider = SimpleNamespace(delete=AsyncMock())
     monkeypatch.setattr(memory, "get_plugin", lambda _: provider)
     monkeypatch.setattr(memory.memory_host, "access_for", lambda namespace: namespace)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
-        principal["roles"] = ["member", "lumen-resources_admin"]
+        principal["roles"] = ["reader"]
         assert (await client.delete("/v1/memories/1")).status_code == 403
-        principal["roles"] = ["member", "lumen-history_editor"]
+        principal["roles"] = ["member"]
         assert (await client.delete("/v1/memories/1")).status_code == 204
     args = provider.delete.call_args.args
     assert args[0] == 1 and args[1].user_id == "owner" and args[1].project_id == "project"
 
 
-async def test_grouping_workspace_is_ordinary_chat_use_and_history_cleanup(management_app, monkeypatch):
+async def test_member_manages_owned_grouping_workspace(management_app, monkeypatch):
     app, principal = management_app
     create = AsyncMock(return_value={"id": 1})
     update = AsyncMock(return_value={"id": 1})
@@ -345,11 +335,12 @@ async def test_grouping_workspace_is_ordinary_chat_use_and_history_cleanup(manag
     monkeypatch.setattr(workspaces.ws, "update_workspace", update)
     monkeypatch.setattr(workspaces.ws, "delete_workspace", delete)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
-        principal["roles"] = ["member", "lumen-chat_user"]
+        principal["roles"] = ["member"]
         assert (await client.post("/v1/workspaces", json={"name": "group"})).status_code == 201
         assert (await client.patch("/v1/workspaces/1", json={"name": "updated"})).status_code == 200
+        principal["roles"] = ["reader"]
         assert (await client.delete("/v1/workspaces/1")).status_code == 403
-        principal["roles"] = ["member", "lumen-history_editor"]
+        principal["roles"] = ["member"]
         assert (await client.delete("/v1/workspaces/1")).status_code == 204
     assert create.call_args.kwargs["owner_user_id"] == "owner"
     assert update.call_args.kwargs["user_id"] == delete.call_args.kwargs["user_id"] == "owner"
@@ -375,7 +366,7 @@ def test_metadata_serializers_do_not_decrypt_private_configuration(monkeypatch):
     assert "config" not in plugins.bindings._public(binding, include_private=False)
 
 
-async def test_oauth_callback_accepts_current_mcp_editor_owner(monkeypatch):
+async def test_oauth_callback_accepts_current_project_member_owner(monkeypatch):
     row = SimpleNamespace(status="pending", expires_at=datetime.now(UTC) + timedelta(minutes=5),
                           owner_user_id="owner", owner_project_id="project", encrypted_payload="encrypted")
     result = SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: row))
@@ -385,7 +376,7 @@ async def test_oauth_callback_accepts_current_mcp_editor_owner(monkeypatch):
     async def connection():
         yield session
 
-    authority = AsyncMock(return_value={"roles": ["member", "lumen-mcp_editor"], "is_system_admin": False})
+    authority = AsyncMock(return_value={"roles": ["member"], "is_system_admin": False})
     monkeypatch.setattr(mcp_oauth, "_session", connection)
     monkeypatch.setattr(mcp_oauth, "resolve_project_authority", authority)
     monkeypatch.setattr(mcp_oauth, "_decrypt", lambda _: {"namespace": {"user_id": "owner", "project_id": "project"}})
@@ -398,9 +389,10 @@ async def test_oauth_callback_accepts_current_mcp_editor_owner(monkeypatch):
 @pytest.mark.parametrize("path", ["/v1/conversations", "/v1/conversations/search", "/v1/conversations/conversation",
                                   "/v1/conversations/conversation/messages", "/v1/workspaces", "/v1/workspaces/1",
                                   "/v1/memories", "/v1/memories/document"])
-async def test_inventory_leaf_does_not_disclose_history(management_app, path):
+async def test_inventory_key_scope_does_not_disclose_history(management_app, path):
     app, principal = management_app
-    principal["roles"] = ["reader", "lumen-inventory_reader"]
+    principal.update(auth_type="api_key", roles=["reader"],
+                     scopes=("models:read", "native:agents:read", "native:extensions:read"))
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         assert (await client.get(path)).status_code == 403
 
@@ -408,16 +400,16 @@ async def test_inventory_leaf_does_not_disclose_history(management_app, path):
 @pytest.mark.parametrize("path", ["/v1/agents", "/v1/agents/hub", "/v1/mcp-servers", "/v1/mcp-servers/1/oauth",
                                   "/v1/custom-tools", "/v1/skills", "/v1/plugin-bindings", "/v1/code-workspaces",
                                   f"/v1/assets/{_IDENTIFIER}", f"/v1/assets/{_IDENTIFIER}/download"])
-async def test_history_leaf_does_not_grant_config_inventory(management_app, path):
+async def test_history_key_scope_does_not_grant_config_inventory(management_app, path):
     app, principal = management_app
-    principal["roles"] = ["reader", "lumen-history_reader"]
+    principal.update(auth_type="api_key", roles=["reader"],
+                     scopes=("native:conversations:read", "native:memory:read"))
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         assert (await client.get(path)).status_code == 403
 
 
-@pytest.mark.parametrize("roles", [_effective_roles("lumen_admin", None), _effective_roles("lumen_admin", "reader"),
-                                   ["admin", *_effective_roles("lumen_admin")], ["manager", *_effective_roles("lumen_admin")]])
-async def test_grade_only_management_is_independent_of_native_membership(management_app, monkeypatch, roles):
+@pytest.mark.parametrize("roles", [["member"], ["manager"], ["admin"]])
+async def test_standard_project_writers_manage_configuration_without_service_roles(management_app, monkeypatch, roles):
     app, principal = management_app
     principal["roles"] = roles
     create = AsyncMock(return_value={"id": 1})
@@ -429,9 +421,9 @@ async def test_grade_only_management_is_independent_of_native_membership(managem
     assert principal["is_system_admin"] is False
 
 
-async def test_mcp_editor_oauth_start_keystone_only_admin_disconnect(management_app, monkeypatch):
+async def test_member_oauth_start_remains_keystone_only_and_disconnect_requires_writer(management_app, monkeypatch):
     app, principal = management_app
-    principal["roles"] = ["member", "lumen-mcp_editor"]
+    principal["roles"] = ["member"]
     begin = AsyncMock(return_value={"authorization_url": "https://example.test/authorize"})
     disconnect = AsyncMock()
     monkeypatch.setattr(mcp_oauth, "begin", begin)
@@ -439,10 +431,11 @@ async def test_mcp_editor_oauth_start_keystone_only_admin_disconnect(management_
     monkeypatch.setattr(mcp_oauth, "callback_cookie_secure", lambda: True)
     async with AsyncClient(transport=ASGITransport(app), base_url="https://test") as client:
         assert (await client.post("/v1/mcp-servers/1/oauth/start")).status_code == 200
+        principal["roles"] = ["reader"]
         assert (await client.delete("/v1/mcp-servers/1/oauth")).status_code == 403
-        principal.update(auth_type="api_key", scopes=("native:mcp:write",))
+        principal.update(auth_type="api_key", roles=["member"], scopes=("native:mcp:write",))
         assert (await client.post("/v1/mcp-servers/1/oauth/start")).status_code == 403
-        principal.update(auth_type="keystone", roles=_effective_roles("lumen_admin"))
+        principal.update(auth_type="keystone", roles=["member"])
         assert (await client.delete("/v1/mcp-servers/1/oauth")).status_code == 204
     assert begin.await_count == 1
     assert begin.call_args.kwargs["user_id"] == "owner"
@@ -450,7 +443,7 @@ async def test_mcp_editor_oauth_start_keystone_only_admin_disconnect(management_
     disconnect.assert_awaited_once_with(1, user_id="owner", project_id="project")
 
 
-async def test_code_workspace_provisioning_is_agent_editor_and_assignment_tools_user(management_app, monkeypatch):
+async def test_member_provisions_code_workspace_and_key_assignment_requires_agent_scope(management_app, monkeypatch):
     app, principal = management_app
     create = AsyncMock(return_value={"id": _IDENTIFIER})
     assign = AsyncMock(return_value={"id": "conversation"})
@@ -458,19 +451,19 @@ async def test_code_workspace_provisioning_is_agent_editor_and_assignment_tools_
     monkeypatch.setattr(code_workspaces, "create_workspace", create)
     monkeypatch.setattr(code_workspaces, "assign_conversation_workspace", assign)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
-        principal["roles"] = ["member", "lumen-agents_editor"]
+        principal["roles"] = ["member"]
         assert (await client.post("/v1/code-workspaces", json={"name": "workspace", "source_kind": "empty"})).status_code == 202
-        principal["roles"] = ["member", "lumen-chat_user"]
+        principal.update(auth_type="api_key", scopes=("native:conversations:write",))
         assert (await client.put("/v1/conversations/conversation/code-workspace", json={})).status_code == 403
-        principal["roles"].append("lumen-tools_user")
+        principal["scopes"] = ("native:conversations:write", "native:agents:use")
         assert (await client.put("/v1/conversations/conversation/code-workspace", json={"code_workspace_id": _IDENTIFIER})).status_code == 200
     assert create.call_args.kwargs["user_id"] == "owner" and create.call_args.kwargs["project_id"] == "project"
     assign.assert_awaited_once_with("conversation", workspace_id=_IDENTIFIER, user_id="owner", project_id="project")
 
 
-async def test_plugin_editor_create_and_update_preserve_namespace(management_app, monkeypatch):
+async def test_member_plugin_create_and_update_preserve_namespace(management_app, monkeypatch):
     app, principal = management_app
-    principal["roles"] = ["member", "lumen-assets_editor"]
+    principal["roles"] = ["member"]
     create = AsyncMock(return_value={"id": _IDENTIFIER})
     update = AsyncMock(return_value={"id": _IDENTIFIER})
     monkeypatch.setattr(plugins.bindings, "create_binding", create)
@@ -484,7 +477,7 @@ async def test_plugin_editor_create_and_update_preserve_namespace(management_app
         assert operation.call_args.kwargs["admin"] is False
 
 
-async def test_assets_editor_upload_user_denied_admin_delete(management_app, monkeypatch):
+async def test_member_uploads_and_deletes_assets_but_reader_cannot(management_app, monkeypatch):
     app, principal = management_app
     upload = AsyncMock(return_value={"id": _IDENTIFIER, "name": "file.txt", "mime_type": "text/plain",
                                     "size_bytes": 5, "sha256": "a" * 64, "status": "ready"})
@@ -492,12 +485,12 @@ async def test_assets_editor_upload_user_denied_admin_delete(management_app, mon
     monkeypatch.setattr(assets.assets, "create_uploaded_asset", upload)
     monkeypatch.setattr(assets.assets, "delete_asset", delete)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
-        principal["roles"] = ["member", "lumen-assets_editor"]
+        principal["roles"] = ["member"]
         assert (await client.post("/v1/assets", files={"file": ("file.txt", b"hello", "text/plain")})).status_code == 201
+        principal["roles"] = ["reader"]
         assert (await client.delete(f"/v1/assets/{_IDENTIFIER}")).status_code == 403
-        principal["roles"] = _effective_roles("lumen_user")
         assert (await client.post("/v1/assets", files={"file": ("file.txt", b"hello", "text/plain")})).status_code == 403
-        principal["roles"] = _effective_roles("lumen_admin")
+        principal["roles"] = ["member"]
         assert (await client.delete(f"/v1/assets/{_IDENTIFIER}")).status_code == 202
     assert upload.await_count == 1
     assert upload.call_args.kwargs["user_id"] == "owner" and upload.call_args.kwargs["project_id"] == "project"
@@ -517,9 +510,9 @@ async def test_verified_system_admin_can_manage_global_extensions(management_app
 
 
 @pytest.mark.parametrize("method,payload", [("GET", None), ("PATCH", {"name": "updated"}), ("DELETE", None)])
-async def test_service_admin_agent_routes_keep_real_user_project_sql_predicates(management_app, monkeypatch, method, payload):
+async def test_project_admin_agent_routes_keep_real_user_project_sql_predicates(management_app, monkeypatch, method, payload):
     app, principal = management_app
-    principal.update(roles=_effective_roles("lumen_admin"), user_id="other-user", project_id="other-project")
+    principal.update(roles=["admin"], user_id="other-user", project_id="other-project")
     statements = []
 
     class Session:
@@ -553,16 +546,16 @@ async def test_service_admin_agent_routes_keep_real_user_project_sql_predicates(
     ("DELETE", "/v1/conversations/conversation", None, "native:conversations:delete"),
     ("GET", "/v1/skills?include_private=true", None, "native:extensions:write"),
 ])
-async def test_operator_action_deny_overrides_retained_native_grade(management_app, operator_policy, method, path, payload, action):
+async def test_operator_action_deny_overrides_retained_project_member(management_app, operator_policy, method, path, payload, action):
     app, principal = management_app
-    principal["roles"] = ["lumen_admin"]
+    principal["roles"] = ["member"]
     replace, _ = operator_policy
     replace(f'"{action}": "!"')
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         assert (await client.request(method, path, json=payload)).status_code == 403
 
 
-async def test_retained_grade_cannot_restore_operator_denied_callback_authority(monkeypatch, operator_policy):
+async def test_retained_member_cannot_restore_operator_denied_callback_authority(monkeypatch, operator_policy):
     row = SimpleNamespace(status="pending", expires_at=datetime.now(UTC) + timedelta(minutes=5),
                           owner_user_id="owner", owner_project_id="project", encrypted_payload="encrypted")
     result = SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: row))
@@ -574,7 +567,7 @@ async def test_retained_grade_cannot_restore_operator_denied_callback_authority(
 
     replace, _ = operator_policy
     replace('"native:mcp:write": "!"')
-    authority = AsyncMock(return_value={"roles": ["lumen_editor"], "is_system_admin": False})
+    authority = AsyncMock(return_value={"roles": ["member"], "is_system_admin": False})
     monkeypatch.setattr(mcp_oauth, "_session", connection)
     monkeypatch.setattr(mcp_oauth, "resolve_project_authority", authority)
     monkeypatch.setattr(mcp_oauth, "_decrypt", lambda _: pytest.fail("operator-denied owner state disclosed to OAuth exchange"))

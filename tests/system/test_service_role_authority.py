@@ -12,15 +12,11 @@ from uuid import uuid4
 import httpx
 import pytest
 from system.fake_keystone import (
-    ADMIN_LEAVES,
     CONTROL_TOKEN,
     DIRECTORY_PROJECT_ID,
     DIRECTORY_TOKEN,
-    EDITOR_LEAVES,
     OWNER_TOKEN,
     PROJECT_ID,
-    READER_LEAVES,
-    USER_LEAVES,
 )
 from system.test_process_stack import _poll_run_until_terminal
 
@@ -80,6 +76,7 @@ def test_current_assignment_downgrade_at_native_and_compat_http_boundaries():
     control_headers = {"X-Test-Control-Token": CONTROL_TOKEN}
     scopes = ["models:read", "compat:completions:write", "native:runs:write", "native:runs:read"]
     created_id = None
+    member_key_id = None
     with httpx.Client(base_url=api_url, timeout=60, trust_env=False) as api, \
             httpx.Client(base_url=directory_url, timeout=10, trust_env=False) as directory, \
             httpx.Client(base_url=provider_url, timeout=10, trust_env=False) as provider:
@@ -96,18 +93,26 @@ def test_current_assignment_downgrade_at_native_and_compat_http_boundaries():
             assert response.status_code == 200, response.text
             assert response.json()["choices"][0]["message"]["content"] == "Hello from fake provider!"
             change = directory.post("/_control/configure", headers=control_headers,
-                json={"owner_roles": ["lumen_user"]})
+                json={"owner_roles": ["member"]})
             assert change.status_code == 200, change.text
-            denied_issue = api.post("/v1/api-keys", headers=owner_headers, json={"name": "must deny", "scopes": scopes})
-            assert denied_issue.status_code == 403, denied_issue.text
-            # Existing key use does not require retained issuer keys-editor.
+            member_issue = api.post("/v1/api-keys", headers=owner_headers, json={"name": "member issuance", "scopes": scopes})
+            assert member_issue.status_code == 201, member_issue.text
+            member_key_id = member_issue.json()["id"]
+            deleted_member_key = api.delete(f"/v1/api-keys/{member_key_id}", headers=owner_headers)
+            assert deleted_member_key.status_code in {200, 204}, deleted_member_key.text
+            member_key_id = None
+            # Ordinary membership retains all actions and key management.
             allowed = api.post("/v1/chat/completions", headers=key_headers,
                 json={"model": model, "messages": [{"role": "user", "content": "existing key remains usable"}]})
             assert allowed.status_code == 200, allowed.text
             change = directory.post("/_control/configure", headers=control_headers,
-                json={"owner_roles": ["lumen_reader"]})
+                json={"owner_roles": ["reader"]})
             assert change.status_code == 200, change.text
             assert api.get("/v1/models", headers=key_headers).status_code == 200
+            denied_issue = api.post("/v1/api-keys", headers=owner_headers, json={"name": "reader cannot issue", "scopes": scopes})
+            assert denied_issue.status_code == 403, denied_issue.text
+            denied_delete = api.delete(f"/v1/api-keys/{created_id}", headers=owner_headers)
+            assert denied_delete.status_code == 403, denied_delete.text
             before = _provider_stats(provider)
             denied_marker = "SENTINEL_ROLE_DENIED_" + uuid4().hex
             compat = api.post("/v1/chat/completions", headers=key_headers,
@@ -124,13 +129,15 @@ def test_current_assignment_downgrade_at_native_and_compat_http_boundaries():
         finally:
             restored = directory.post("/_control/reset", headers=control_headers, json={})
             assert restored.status_code == 200, restored.text
-            if created_id is not None:
-                cleanup = api.delete(f"/v1/api-keys/{created_id}", headers=owner_headers)
-                assert cleanup.status_code in {200, 204}, cleanup.text
+            for key_id in (created_id, member_key_id):
+                if key_id is not None:
+                    cleanup = api.delete(f"/v1/api-keys/{key_id}", headers=owner_headers)
+                    assert cleanup.status_code in {200, 204}, cleanup.text
 
 
-def test_media_only_cancel_is_owner_bound_and_idempotent_in_persistent_store():
-    """A queued image in an offline pool remains cancelable without chat authority."""
+@pytest.mark.parametrize("text_protocol", [1, 2], ids=["chat1", "durable2"])
+def test_member_cancel_is_owner_bound_and_idempotent_in_persistent_store(text_protocol):
+    """Role cutover preserves the published protocol-specific cancellation contract."""
     from urllib.parse import unquote, urlsplit
 
     import pymysql
@@ -152,24 +159,40 @@ def test_media_only_cancel_is_owner_bound_and_idempotent_in_persistent_store():
         try:
             assert directory.post("/_control/reset", headers=control, json={}).status_code == 200
             with db.cursor() as cursor:
-                for identifier, kind in ((run_id, "image"), (text_id, "completion")):
+                for identifier, kind, protocol in (
+                    (run_id, "image", 1),
+                    (text_id, "completion", text_protocol),
+                ):
                     cursor.execute("""INSERT INTO chat_runs
                         (id, run_scope, run_kind, workload_class, worker_pool_id, project_id, user_id,
                          model_name, source, capability_snapshot, pricing_snapshot, client_request_id,
-                         request_fingerprint, fingerprint_version, status, execution_protocol_version,
+                         request_fingerprint, fingerprint_version, status, execution_protocol_version, lease_fence,
                          execution_mode, depth, last_seq, current_ordinal, reserved_credits,
                          descendant_credits_reserved, sandbox_seconds_reserved, created_at, updated_at)
                         VALUES (%s,'temporary',%s,%s,%s,%s,%s,'synthetic-model','web','{}','{}',%s,%s,1,'queued',
-                                1,'chat',0,0,0,0,0,0,UTC_TIMESTAMP(),UTC_TIMESTAMP())""",
+                                %s,0,'chat',0,0,0,0,0,0,UTC_TIMESTAMP(),UTC_TIMESTAMP())""",
                         (identifier, kind, "online_media" if kind == "image" else "online_text",
-                         pool_id, PROJECT_ID, OWNER_ID, str(uuid4()), identifier))
+                         pool_id, PROJECT_ID, OWNER_ID, str(uuid4()), identifier, protocol))
+            readonly = directory.post("/_control/configure", headers=control,
+                json={"owner_roles": ["reader"]})
+            assert readonly.status_code == 200, readonly.text
+            for identifier in (run_id, text_id):
+                denied_cancel = api.post(f"/v1/runs/{identifier}/cancel", headers=headers)
+                assert denied_cancel.status_code == 403, denied_cancel.text
             downgrade = directory.post("/_control/configure", headers=control,
-                json={"owner_roles": ["project_member", "lumen-images_user"]})
+                json={"owner_roles": ["member"]})
             assert downgrade.status_code == 200, downgrade.text
-            foreign_cancel = api.post(f"/v1/runs/{run_id}/cancel", headers=foreign)
-            assert foreign_cancel.status_code == 404, foreign_cancel.text
-            denied_text = api.post(f"/v1/runs/{text_id}/cancel", headers=headers)
-            assert denied_text.status_code == 403, denied_text.text
+            for identifier in (run_id, text_id):
+                foreign_cancel = api.post(f"/v1/runs/{identifier}/cancel", headers=foreign)
+                assert foreign_cancel.status_code == 404, foreign_cancel.text
+            canceled_text = api.post(f"/v1/runs/{text_id}/cancel", headers=headers)
+            assert canceled_text.status_code == 200, canceled_text.text
+            repeated_text = api.post(f"/v1/runs/{text_id}/cancel", headers=headers)
+            assert repeated_text.status_code == 200, repeated_text.text
+            assert repeated_text.json() == canceled_text.json()
+            expected_text_status = "canceled" if text_protocol == 2 else "queued"
+            assert canceled_text.json()["status"] == expected_text_status
+            assert canceled_text.json()["terminal"] is (text_protocol == 2)
             first = api.post(f"/v1/runs/{run_id}/cancel", headers=headers)
             second = api.post(f"/v1/runs/{run_id}/cancel", headers=headers)
             assert first.status_code == second.status_code == 200, (first.text, second.text)
@@ -180,8 +203,10 @@ def test_media_only_cancel_is_owner_bound_and_idempotent_in_persistent_store():
                 stored = cursor.fetchone()
                 assert stored[0] == "canceled" and stored[1] is not None
                 assert stored[2] == first.json()["last_seq"]
-                cursor.execute("SELECT status,cancel_requested_at FROM chat_runs WHERE id=%s", (text_id,))
-                assert cursor.fetchone() == ("queued", None)
+                cursor.execute("SELECT status,cancel_requested_at,last_seq FROM chat_runs WHERE id=%s", (text_id,))
+                stored_text = cursor.fetchone()
+                assert stored_text[0] == expected_text_status and stored_text[1] is not None
+                assert stored_text[2] == canceled_text.json()["last_seq"]
         finally:
             assert directory.post("/_control/reset", headers=control, json={}).status_code == 200
             with db.cursor() as cursor:
@@ -323,18 +348,18 @@ def _assert_positive_response(api, headers, action, boundary, response):
 
 
 @pytest.mark.parametrize("requested_scope", [scope for scopes in _ACTION_SCOPES.values() for scope in scopes])
-def test_key_issuance_requires_requested_scope_subset_of_current_owner_leaves(authority_http, requested_scope):
+def test_member_can_issue_every_action_scope_but_reader_cannot(authority_http, requested_scope):
     api, directory, provider, created_ids = authority_http
-    # The owner still has issuer authority and inventory/history, but none of
-    # the independently named generation/tools leaves. Issuer is not an alias.
-    _directory_change(directory, {"owner_roles": ["project_member", "lumen-keys_editor"]})
-    _issue_owned_key(api, created_ids, ["models:read"])
+    _directory_change(directory, {"owner_roles": ["member"]})
+    _issue_owned_key(api, created_ids, ["models:read", requested_scope])
     listed = api.get("/v1/api-keys", headers=_OWNER_HEADERS)
     assert listed.status_code == 200, listed.text
+    _directory_change(directory, {"owner_roles": ["reader"]})
     before = _provider_stats(provider)
     denied = api.post("/v1/api-keys", headers=_OWNER_HEADERS,
-                      json={"name": "denied requested subset", "scopes": ["models:read", requested_scope]})
+                      json={"name": "reader cannot issue", "scopes": ["models:read", requested_scope]})
     assert denied.status_code == 403, denied.text
+    _directory_change(directory, {"owner_roles": ["member"]})
     after = api.get("/v1/api-keys", headers=_OWNER_HEADERS)
     assert after.status_code == 200, after.text
     assert after.json() == listed.json(), (listed.text, after.text)
@@ -342,11 +367,11 @@ def test_key_issuance_requires_requested_scope_subset_of_current_owner_leaves(au
 
 
 @pytest.mark.parametrize("removed_action", ["chat", "images", "audio", "tools"])
-def test_current_owner_leaves_are_independent_at_native_and_compat_http(authority_http, removed_action):
+def test_member_api_key_action_scopes_at_native_and_compat_http(authority_http, removed_action):
     api, directory, provider, created_ids = authority_http
-    _, headers = _issue_owned_key(api, created_ids, _BROAD_SCOPES)
-    retained = (ADMIN_LEAVES | EDITOR_LEAVES | READER_LEAVES | USER_LEAVES) - {f"lumen-{removed_action}_user"}
-    _directory_change(directory, {"owner_roles": sorted(retained)})
+    _directory_change(directory, {"owner_roles": ["member"]})
+    retained = set(_BROAD_SCOPES) - set(_ACTION_SCOPES[removed_action])
+    _, headers = _issue_owned_key(api, created_ids, sorted(retained))
     assert api.get("/v1/models", headers=headers).status_code == 200
     before = _provider_stats(provider)
     denied_markers = []
@@ -357,8 +382,8 @@ def test_current_owner_leaves_are_independent_at_native_and_compat_http(authorit
         assert denied.status_code == 403, (removed_action, boundary, denied.text)
     _assert_no_provider_io(provider, before, denied_markers)
 
-    # Losing one leaf must not revoke any other modality. Tool-bearing chat
-    # is deliberately conjunctive: it cannot bypass the missing chat leaf.
+    # Current membership allows every modality; only this key's scopes attenuate
+    # the request. Tool-bearing chat still needs chat and tool scopes together.
     for action in _ACTION_SCOPES:
         if action == removed_action:
             continue
@@ -386,6 +411,26 @@ def test_current_owner_leaves_are_independent_at_native_and_compat_http(authorit
                 assert call["operation"] == operation and call["status"] == 200, call
                 assert call["host"] == "api.openai.com" and call["tls"] is True, call
     _assert_no_provider_io(provider, _provider_stats(provider), denied_markers)
+
+
+@pytest.mark.parametrize("roles", [["reader"], ["lumen_admin"], []],
+                         ids=["reader", "legacy-grade-only", "no-membership"])
+@pytest.mark.parametrize("credential", ["web", "key"])
+def test_reader_legacy_and_absent_membership_fence_every_provider_boundary(authority_http, roles, credential):
+    api, directory, provider, created_ids = authority_http
+    _, key_headers = _issue_owned_key(api, created_ids, _BROAD_SCOPES)
+    headers = _OWNER_HEADERS if credential == "web" else key_headers
+    _directory_change(directory, {"owner_roles": roles})
+    before = _provider_stats(provider)
+    markers = []
+    for action in _ACTION_SCOPES:
+        for boundary in ("native", "compat"):
+            marker = "SENTINEL_READER_OR_NO_MEMBERSHIP_DENIED_" + uuid4().hex
+            markers.append(marker)
+            denied = _authority_post(api, headers, action, boundary, marker)
+            expected = 401 if not roles and credential == "key" else 403
+            assert denied.status_code == expected, (roles, credential, action, boundary, denied.text)
+    _assert_no_provider_io(provider, before, markers)
 
 
 def test_revoked_key_is_denied_before_provider_at_all_native_and_compat_boundaries(authority_http):
@@ -449,8 +494,7 @@ def test_queued_media_worker_revalidates_current_authority_before_new_io(authori
         queued = api.get(f"/v1/runs/{queued_id}", headers=_OWNER_HEADERS)
         assert queued.status_code == 200 and queued.json()["status"] == "queued", queued.text
         if loss == "assignment":
-            retained = (ADMIN_LEAVES | EDITOR_LEAVES | READER_LEAVES | USER_LEAVES) - {"lumen-images_user"}
-            _directory_change(directory, {"owner_roles": sorted(retained)})
+            _directory_change(directory, {"owner_roles": ["reader"]})
         else:
             revoked = api.delete(f"/v1/api-keys/{key_id}", headers=_OWNER_HEADERS)
             assert revoked.status_code in {200, 204}, revoked.text

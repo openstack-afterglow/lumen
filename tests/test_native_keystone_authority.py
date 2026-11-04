@@ -34,6 +34,7 @@ from lumen.services import api_key_store
 _TOOL_BODY = {"name": "synthetic-tool", "url": "https://tool.example/invoke"}
 _ADMIN_REQUESTS = [
     ("GET", "/v1/admin/providers", None, "provider_list", 200),
+    ("GET", "/v1/admin/stats", None, "stats_overview", 200),
     ("POST", "/v1/admin/providers", {"name": "synthetic-provider"}, "provider_create", 201),
     ("PATCH", "/v1/admin/providers/1", {"name": "renamed-provider"}, "provider_update", 200),
     ("DELETE", "/v1/admin/providers/1", None, "provider_delete", 204),
@@ -107,10 +108,11 @@ def native_admin_source(request):
 @pytest.fixture
 async def native_routes(native_directory, monkeypatch):
     """Production routers and auth dependencies; only SQL persistence is mocked."""
-    from lumen.api import api_keys, completions, extensions, models
+    from lumen.api import api_keys, completions, extensions, models, stats
 
     application = FastAPI()
     application.include_router(models.router, prefix="/v1")
+    application.include_router(stats.router, prefix="/v1")
     application.include_router(extensions.admin_router, prefix="/v1")
     application.include_router(extensions.user_router, prefix="/v1")
     application.include_router(api_keys.router, prefix="/v1")
@@ -141,6 +143,11 @@ async def native_routes(native_directory, monkeypatch):
         "extension_update": AsyncMock(return_value=tool),
         "extension_delete": AsyncMock(return_value=None),
     }
+    for name, result in (("overview", {}), ("by_model", []), ("monthly", []),
+                         ("timeseries", []), ("by_user", []), ("by_api_key", []),
+                         ("projects_with_usage", [])):
+        storage["stats_" + name] = AsyncMock(return_value=result)
+        monkeypatch.setattr(stats.stats_service, name, storage["stats_" + name])
     for name, attribute in (("provider_list", "list_providers"), ("provider_create", "create_provider"),
                             ("provider_update", "update_provider"), ("provider_delete", "delete_provider")):
         monkeypatch.setattr(models.repository, attribute, storage[name])
@@ -151,13 +158,12 @@ async def native_routes(native_directory, monkeypatch):
         yield SimpleNamespace(client=client, storage=storage)
 
 
-async def test_native_sdk_grade_alone_survives_zero_service_edges_without_fabricated_roles(native_directory):
-    native_directory.configure({"owner_roles": ["lumen_admin"], "remove_edges": [
-        {"prior": "lumen_admin", "implied": "lumen_editor"},
-        {"prior": "lumen_admin", "implied": "lumen-resources_admin"},
+async def test_native_sdk_member_alone_grants_all_project_actions_without_service_roles(native_directory):
+    native_directory.configure({"owner_roles": ["member"], "remove_edges": [
+        {"prior": "member", "implied": "reader"},
     ]})
     current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
-    assert current == {"roles": ["lumen_admin"], "is_system_admin": False}
+    assert current == {"roles": ["member"], "is_system_admin": False}
     assert capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, **current}) == SERVICE_CAPABILITIES
     assert auth._is_system_admin(OWNER_ID) is False
     assert auth._is_system_admin(DIRECTORY_ID) is True
@@ -185,14 +191,11 @@ async def test_native_sdk_directory_failure_stays_unavailable(native_directory):
     assert exc.value.status_code == 503
 
 
-@pytest.mark.parametrize(("leaf", "scope"), [
-    ("lumen-chat_user", "compat:completions:write"),
-    ("lumen-images_user", "native:images:write"),
-    ("lumen-audio_user", "native:audio:write"),
-    ("lumen-tools_user", "native:tools:execute"),
+@pytest.mark.parametrize("scope", [
+    "compat:completions:write", "native:images:write", "native:audio:write", "native:tools:execute",
 ])
 @pytest.mark.parametrize("key", [False, True])
-async def test_native_sdk_live_owner_fences_new_io_for_web_and_existing_key(native_directory, key, leaf, scope):
+async def test_native_sdk_live_owner_fences_new_io_for_web_and_existing_key(native_directory, key, scope):
     row, _raw = await api_key_store.prepare_key_record(OWNER_ID, PROJECT_ID, "HTTP owner", [scope])
     row.id = 7
     class Session:
@@ -201,16 +204,36 @@ async def test_native_sdk_live_owner_fences_new_io_for_web_and_existing_key(nati
     kwargs = dict(api_key_id=7 if key else None, user_id=OWNER_ID, project_id=PROJECT_ID,
                   required_scopes=(scope,))
     await api_key_store.authorize_api_key_in_transaction(Session(), **kwargs)
-    # Issuer key-management authority need not be retained by an existing key.
-    native_directory.configure({"owner_roles": ["member", leaf]})
-    await api_key_store.authorize_api_key_in_transaction(Session(), **kwargs)
-    with pytest.raises(api_key_store.ApiKeyForbidden):
-        await api_key_store.prepare_key_record(OWNER_ID, PROJECT_ID, "cannot reissue", [scope])
     native_directory.configure({"owner_roles": ["member"]})
+    await api_key_store.authorize_api_key_in_transaction(Session(), **kwargs)
+    await api_key_store.prepare_key_record(OWNER_ID, PROJECT_ID, "member reissue", [scope])
+    native_directory.configure({"owner_roles": ["reader"]})
+    with pytest.raises(api_key_store.ApiKeyForbidden):
+        await api_key_store.prepare_key_record(OWNER_ID, PROJECT_ID, "reader cannot reissue", [scope])
     # The directory service remains privileged; it cannot replace owner authority.
     assert auth._is_system_admin(DIRECTORY_ID) is True
     with pytest.raises(api_key_store.ApiKeyForbidden):
         await api_key_store.authorize_api_key_in_transaction(Session(), **kwargs)
+
+
+@pytest.mark.parametrize("scope", [
+    "compat:completions:write", "native:images:write", "native:audio:write", "native:tools:execute",
+])
+async def test_native_sdk_member_key_scopes_attenuate_current_all_action_authority(native_directory, scope):
+    native_directory.configure({"owner_roles": ["member"]})
+    row, _raw = await api_key_store.prepare_key_record(OWNER_ID, PROJECT_ID, "read-only key", ["models:read"])
+    row.id = 8
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: row)))
+    # Web execution uses all current member actions, while the persisted key's
+    # independent scopes cannot inherit that broader authority.
+    await api_key_store.authorize_api_key_in_transaction(session, api_key_id=None,
+        user_id=OWNER_ID, project_id=PROJECT_ID, required_scopes=(scope,))
+    session.execute.assert_not_awaited()
+    await api_key_store.authorize_api_key_in_transaction(session, api_key_id=row.id,
+        user_id=OWNER_ID, project_id=PROJECT_ID, required_scopes=("models:read",))
+    with pytest.raises(api_key_store.ApiKeyForbidden):
+        await api_key_store.authorize_api_key_in_transaction(session, api_key_id=row.id,
+            user_id=OWNER_ID, project_id=PROJECT_ID, required_scopes=(scope,))
 
 
 def test_native_sdk_token_auth_preserves_fixed_project_and_rejects_role_headers(native_directory):
@@ -335,30 +358,6 @@ async def test_native_sdk_non_admin_cannot_select_foreign_target(native_director
     assert exc.value.status_code == 403
 
 
-@pytest.mark.parametrize("admin", [False, True], ids=["native-read", "global-admin"])
-async def test_direct_system_grant_authorizes_http_without_promoting_project_admin(native_directory, admin):
-    app = FastAPI()
-    dependency = auth.require_admin if admin else auth.require_scopes("native:conversations:read")
-
-    @app.get("/authority")
-    async def authority(principal=Depends(dependency)):
-        return {"system_admin": principal["is_system_admin"], "project_id": principal["project_id"]}
-
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
-        allowed = await client.get("/authority", headers={"X-Auth-Token": DIRECTORY_TOKEN,
-            "X-Project-Id": DIRECTORY_PROJECT_ID})
-        assert allowed.status_code == 200, allowed.text
-        assert allowed.json() == {"system_admin": True, "project_id": DIRECTORY_PROJECT_ID}
-        native_directory.configure({"owner_roles": ["admin", "member"]})
-        project_admin = await client.get("/authority", headers={"X-Auth-Token": OWNER_TOKEN,
-            "X-Project-Id": PROJECT_ID})
-        if admin:
-            assert project_admin.status_code == 403
-        else:
-            assert project_admin.status_code == 200, project_admin.text
-            assert project_admin.json() == {"system_admin": False, "project_id": PROJECT_ID}
-
-
 @pytest.mark.parametrize("logical_project_id", [DIRECTORY_PROJECT_ID, PROJECT_ID], ids=["home", "target"])
 async def test_native_http_system_admin_without_target_roles_crud(native_directory, native_routes, logical_project_id):
     authority = await auth.resolve_project_authority(DIRECTORY_ID, PROJECT_ID)
@@ -426,7 +425,7 @@ async def test_native_http_admin_source_scope_matrix_denied(
         # The password directory reader retains native home-project admin;
         # revoking requester authority must not also revoke metadata access.
         directory_home = await auth.resolve_project_authority(DIRECTORY_ID, DIRECTORY_PROJECT_ID)
-        assert directory_home == {"roles": ["admin", "member"], "is_system_admin": False}
+        assert directory_home == {"roles": ["admin", "member", "reader"], "is_system_admin": False}
         assert native_directory.client.get("/v3/roles", headers={"X-Auth-Token": DIRECTORY_TOKEN}).status_code == 200
     # Valid issued snapshots cannot stand in for current directory authority.
     snapshot = native_directory.client.get(
@@ -467,23 +466,50 @@ async def test_native_http_projectless_nonadmin_denied(native_directory, native_
         mock.assert_not_awaited()
 
 
-@pytest.mark.parametrize("roles", [["project_member", "manager"], ["project_member", "project_admin"]],
-                         ids=["native-project-manager", "project-admin"])
-async def test_native_http_unentitled_project_roles_denied(native_directory, native_routes, roles):
+@pytest.mark.parametrize("roles", [
+    ["lumen_admin"], ["lumen-chat_user"], ["reader"], [],
+], ids=["legacy-grade-only", "legacy-leaf-only", "reader", "no-membership"])
+async def test_native_http_legacy_roles_reader_and_no_membership_cannot_mutate(native_directory, native_routes, roles):
     native_directory.configure({"owner_roles": roles})
-    current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
-    assert current["is_system_admin"] is False
-    assert capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, "roles": current["roles"]}) == frozenset()
-    headers = {**_headers(OWNER_TOKEN, PROJECT_ID), "X-Roles": "lumen_admin", "X-Is-System-Admin": "true"}
+    headers = {**_headers(OWNER_TOKEN, PROJECT_ID), "X-Roles": "admin", "X-Is-System-Admin": "true"}
     for method, path, payload, _store, _status in _AUTH_REQUESTS:
         response = await native_routes.client.request(method, path, json=payload, headers=headers)
-        assert response.status_code == 403, (method, path, response.text)
-    for mock in native_routes.storage.values():
-        mock.assert_not_awaited()
+        expected = 200 if roles == ["reader"] and method == "GET" and path == "/v1/custom-tools" else 403
+        assert response.status_code == expected, (method, path, response.text)
+    for name, mock in native_routes.storage.items():
+        if roles == ["reader"] and name == "extension_list_user":
+            mock.assert_awaited_once_with("tool", user_id=OWNER_ID, project_id=PROJECT_ID)
+        else:
+            mock.assert_not_awaited()
 
 
-async def test_native_http_entitled_user_scoped_crud_still_works(native_directory, native_routes):
-    # Ordinary project membership plus current leaves, not a native admin label.
+@pytest.mark.parametrize("legacy", ["lumen_admin", "lumen-chat_user"])
+async def test_native_http_effective_standard_member_from_existing_inference_is_authoritative(
+    native_directory, native_routes, legacy,
+):
+    native_directory.configure({"owner_roles": [legacy]})
+    native_directory.state.graph[role_id(legacy)].add(role_id("member"))
+    headers = _headers(OWNER_TOKEN, PROJECT_ID)
+    # Native effective canonical membership remains authoritative regardless of
+    # the historical root label; retiring inference edges is a separate IAM edit.
+    current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
+    assert "member" in current["roles"] and current["is_system_admin"] is False
+    assert capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, **current}) == SERVICE_CAPABILITIES
+    for method, path, payload, store, status in _SCOPED_REQUESTS:
+        before = native_routes.storage[store].await_count
+        response = await native_routes.client.request(method, path, json=payload, headers=headers)
+        assert response.status_code == status, (legacy, method, path, response.text)
+        assert native_routes.storage[store].await_count == before + 1
+    for method, path, payload, store, _status in _ADMIN_REQUESTS:
+        before = native_routes.storage[store].await_count
+        response = await native_routes.client.request(method, path, json=payload, headers=headers)
+        assert response.status_code == 403, (legacy, method, path, response.text)
+        assert native_routes.storage[store].await_count == before
+
+
+@pytest.mark.parametrize("roles", [["member"], ["manager"], ["admin"], ["project_admin"]])
+async def test_native_http_standard_project_member_or_higher_scoped_crud(native_directory, native_routes, roles):
+    native_directory.configure({"owner_roles": roles})
     current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
     assert current["is_system_admin"] is False
     assert capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, "roles": current["roles"]}) == SERVICE_CAPABILITIES
@@ -506,7 +532,7 @@ async def test_native_http_entitled_user_scoped_crud_still_works(native_director
         assert storage[store].await_count == before
 
 
-@pytest.mark.parametrize("target_roles", [[], ["project_member", "lumen_admin"]], ids=["no-target-roles", "retained-target-roles"])
+@pytest.mark.parametrize("target_roles", [[], ["project_member"]], ids=["no-target-roles", "retained-target-roles"])
 async def test_native_http_revoked_system_assignment_rejects_foreign_target(native_directory, native_routes, target_roles):
     native_directory.configure({"directory_target_roles": target_roles})
     headers = _headers(target_project_id=PROJECT_ID)
@@ -521,7 +547,7 @@ async def test_native_http_revoked_system_assignment_rejects_foreign_target(nati
     assert snapshot["is_system_admin"] is False
     assert snapshot["connection_project_id"] == DIRECTORY_PROJECT_ID
     home = await auth.resolve_project_authority(DIRECTORY_ID, DIRECTORY_PROJECT_ID)
-    assert home == {"roles": ["admin", "member"], "is_system_admin": False}
+    assert home == {"roles": ["admin", "member", "reader"], "is_system_admin": False}
     assert native_directory.client.get("/v3/roles", headers={"X-Auth-Token": DIRECTORY_TOKEN}).status_code == 200
     for method, path, payload, _store, _status in _AUTH_REQUESTS:
         response = await native_routes.client.request(method, path, json=payload, headers=headers)
@@ -543,11 +569,11 @@ async def test_native_http_final_authority_rejects_mid_request_system_revocation
     native_directory, native_routes, native_admin_source, path,
 ):
     native_directory.configure({
-        "directory_target_roles": ["project_member", "lumen_admin"],
+        "directory_target_roles": ["project_member"],
         "revoke_system_admin_after_checks": 1,
     })
     # The first system check observes admin, then Keystone revokes it before
-    # the final project-authority read. PROJECT retains target leaves; the
+    # the final project-authority read. PROJECT retains target membership; the
     # projectless requester has none. Neither may retain foreign target access.
     response = await native_routes.client.get(path, headers=native_admin_source.headers)
     assert response.status_code == 403, response.text
@@ -563,7 +589,7 @@ async def test_native_http_final_authority_rejects_mid_request_system_revocation
             await auth.resolve_project_authority(native_admin_source.user_id, PROJECT_ID)
         assert exc.value.status_code == 403
     directory_home = await auth.resolve_project_authority(DIRECTORY_ID, DIRECTORY_PROJECT_ID)
-    assert directory_home == {"roles": ["admin", "member"], "is_system_admin": False}
+    assert directory_home == {"roles": ["admin", "member", "reader"], "is_system_admin": False}
     for mock in native_routes.storage.values():
         mock.assert_not_awaited()
 
@@ -739,7 +765,7 @@ def native_key_storage(monkeypatch):
 
 
 @pytest.mark.parametrize(("mode", "revocation"), _SYSTEM_REVOCATIONS)
-@pytest.mark.parametrize("path", ["/v1/admin/providers", "/v1/custom-tools", "/v1/api-keys/issuance-policy"])
+@pytest.mark.parametrize("path", ["/v1/admin/providers", "/v1/admin/stats", "/v1/custom-tools", "/v1/api-keys/issuance-policy"])
 async def test_native_http_final_raw_system_revocation_zero_target_membership(
     native_directory, native_routes, native_key_storage, mode, revocation, path,
 ):
@@ -815,7 +841,7 @@ _NATIVE_DEPENDENCIES = ["/native/require-token", "/native/principal"]
 async def test_native_http_original_restricted_ids_never_inherit_owner_system_or_parents(
     native_directory, native_routes, metadata, path,
 ):
-    names = ("member", "lumen-inventory_reader", "lumen-assets_editor", "lumen_user")
+    names = ("reader",)
     native_directory.configure({
         "system_admin_mode": "group",
         "system_group_members": [DIRECTORY_ID, PROJECTLESS_ADMIN_ID, OWNER_ID],
@@ -830,7 +856,7 @@ async def test_native_http_original_restricted_ids_never_inherit_owner_system_or
         assert info["credential_restricted"] is True
         assert info["is_system_admin"] is False
         assert info["roles"] == sorted(names)
-        assert "lumen-chat_user" not in info["roles"]
+        assert "member" not in info["roles"] and "project_member" not in info["roles"]
         assert info["issued_role_ids"] == sorted(role_id(name) for name in names)
         assert info["token"] == OWNER_TOKEN
         assert info["connection_project_id"] == info["source_project_id"] == PROJECT_ID
@@ -849,15 +875,14 @@ async def test_native_http_original_restricted_ids_never_inherit_owner_system_or
 async def test_native_http_restricted_original_crud_and_key_scope_boundaries(
     native_directory, native_routes, native_key_storage, metadata,
 ):
-    names = ("member", "lumen-inventory_reader", "lumen-assets_editor", "lumen-keys_editor")
+    names = ("member",)
     native_directory.configure({"token_overrides": {OWNER_TOKEN: {**metadata, "roles": _issued_roles(*names)}}})
     headers = _headers(OWNER_TOKEN, PROJECT_ID)
     for method, path, payload, store, status in _SCOPED_REQUESTS:
         before = native_routes.storage[store].await_count
         response = await native_routes.client.request(method, path, json=payload, headers=headers)
-        expected = 403 if method == "DELETE" else status
-        assert response.status_code == expected, (method, path, response.text)
-        assert native_routes.storage[store].await_count == before + (expected != 403)
+        assert response.status_code == status, (method, path, response.text)
+        assert native_routes.storage[store].await_count == before + 1
     for method, path, payload, store, _status in _ADMIN_REQUESTS:
         before = native_routes.storage[store].await_count
         response = await native_routes.client.request(method, path, json=payload, headers=headers)
@@ -867,16 +892,16 @@ async def test_native_http_restricted_original_crud_and_key_scope_boundaries(
     assert policy.status_code == 200, policy.text
     from lumen.service_authority import allowed_scopes
     assert set(policy.json()["allowed_scopes"]) == allowed_scopes({"user_id": OWNER_ID, "project_id": PROJECT_ID, "roles": names}) & api_key_store.API_KEY_SCOPES
-    # Narrow issued leaves cannot borrow the owner's unrestricted grade.
+    # The exact original member ID permits every local action, not global APIs.
     response = await native_routes.client.post("/v1/api-keys", headers=headers,
-        json={"name": "cannot-launder-chat", "scopes": ["compat:completions:write"]})
-    assert response.status_code == 403, response.text
-    assert native_key_storage.rows == []
+        json={"name": "member-chat", "scopes": ["compat:completions:write"]})
+    assert response.status_code == 201, response.text
+    assert response.json()["scopes"] == ["compat:completions:write"]
     response = await native_routes.client.post("/v1/api-keys", headers=headers,
         json={"name": "inventory-only", "scopes": ["models:read"]})
     assert response.status_code == 201, response.text
     assert response.json()["scopes"] == ["models:read"]
-    assert len(native_key_storage.rows) == 1
+    assert len(native_key_storage.rows) == 2
     assert _caller_exchanges(native_directory) == []
 
 
@@ -908,7 +933,7 @@ async def test_native_http_original_bind_and_access_rules_rejected_before_storag
     assert _caller_exchanges(native_directory) == []
 
 
-@pytest.mark.parametrize("method", ["password", "token", "totp", "mapped", "external", "oidc", "saml2"])
+@pytest.mark.parametrize("method", ["password", "token", "totp", "mapped", "external", "openid", "oidc", "saml2"])
 @pytest.mark.parametrize("path", _NATIVE_DEPENDENCIES)
 async def test_native_http_human_original_methods_keep_live_authority(native_directory, native_routes, method, path):
     native_directory.configure({"token_overrides": {DIRECTORY_TOKEN: {"methods": [method]}}})
@@ -917,6 +942,86 @@ async def test_native_http_human_original_methods_keep_live_authority(native_dir
     assert response.json()["credential_restricted"] is False
     assert response.json()["is_system_admin"] is True
     assert response.json()["roles"] == []
+    assert _caller_exchanges(native_directory) == []
+
+
+@pytest.mark.parametrize("methods", [["openid"], ["openid", "token"], ["token", "openid"]])
+@pytest.mark.parametrize("mode", _SYSTEM_MODES)
+@pytest.mark.parametrize(("path", "store"), [
+    ("/v1/admin/providers", "provider_list"),
+    ("/v1/admin/stats", "stats_overview"),
+])
+async def test_native_http_openid_human_admin_settings_and_global_stats(
+    native_directory, native_routes, native_admin_source, methods, mode, path, store,
+):
+    source = native_admin_source
+    native_directory.configure({
+        "system_admin_mode": mode,
+        "token_overrides": {source.token: {"methods": methods}},
+    })
+    response = await native_routes.client.get(path, headers=source.headers)
+    assert response.status_code == 200, (path, methods, response.text)
+    native_routes.storage[store].assert_awaited_once()
+    if path == "/v1/admin/stats":
+        assert response.json()["project_id"] is None
+        native_routes.storage[store].assert_awaited_once_with("all", None)
+    assert _caller_exchanges(native_directory) == []
+
+
+@pytest.mark.parametrize("metadata", [
+    pytest.param({"OS-TRUST:trust": {"id": "synthetic-trust", "trustor_user_id": DIRECTORY_ID,
+                                   "trustee_user_id": OWNER_ID, "impersonation": True}}, id="trust"),
+    pytest.param({"application_credential": {"id": "synthetic-appcred"}}, id="appcred"),
+    pytest.param({"OS-OAUTH1:access_token": {"id": "synthetic-oauth"}}, id="oauth1"),
+    pytest.param({"OS-OAUTH2:access_token": {"id": "synthetic-oauth"}}, id="oauth2"),
+    pytest.param({"methods": ["application_credential"]}, id="appcred-method"),
+    pytest.param({"methods": ["unrecognized-auth-method"]}, id="unknown-method"),
+])
+@pytest.mark.parametrize("path", ["/v1/admin/providers", "/v1/admin/stats"])
+async def test_native_http_openid_reduced_admin_stays_denied(
+    native_directory, native_routes, metadata, path,
+):
+    native_directory.configure({"token_overrides": {DIRECTORY_TOKEN: {
+        **metadata, "methods": ["openid", "token", *metadata.get("methods", [])],
+    }}})
+    response = await native_routes.client.get(path, headers=_headers())
+    assert response.status_code == 403, response.text
+    for store in native_routes.storage.values():
+        store.assert_not_awaited()
+    assert _caller_exchanges(native_directory) == []
+
+
+@pytest.mark.parametrize("path", ["/v1/admin/providers", "/v1/admin/stats"])
+@pytest.mark.parametrize(("patch", "status"), [
+    ({"directory_system_admin": False}, 403),
+    ({"authority_unavailable": True}, 503),
+])
+async def test_native_http_openid_admin_revocation_and_outage_remain_distinct(
+    native_directory, native_routes, path, patch, status,
+):
+    native_directory.configure({"token_overrides": {DIRECTORY_TOKEN: {"methods": ["openid", "token"]}}})
+    response = await native_routes.client.get(path, headers=_headers())
+    assert response.status_code == 200, response.text
+    for store in native_routes.storage.values():
+        store.reset_mock()
+    native_directory.configure(patch)
+    response = await native_routes.client.get(path, headers=_headers())
+    assert response.status_code == status, response.text
+    for store in native_routes.storage.values():
+        store.assert_not_awaited()
+    assert _caller_exchanges(native_directory) == []
+
+
+@pytest.mark.parametrize("path", ["/v1/admin/providers", "/v1/admin/stats"])
+async def test_native_http_openid_nonadmin_cannot_borrow_directory_admin(
+    native_directory, native_routes, path,
+):
+    native_directory.configure({"token_overrides": {OWNER_TOKEN: {"methods": ["openid", "token"]}}})
+    response = await native_routes.client.get(path, headers=_headers(OWNER_TOKEN, PROJECT_ID))
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "관리자 권한이 필요합니다"
+    for store in native_routes.storage.values():
+        store.assert_not_awaited()
     assert _caller_exchanges(native_directory) == []
 
 
@@ -933,11 +1038,11 @@ async def test_native_http_human_explicit_rescope_keeps_original_metadata(native
 
 def test_native_sdk_original_token_metadata_survives_directory_mutations(native_directory):
     metadata = {"methods": ["application_credential"], "application_credential": {"id": "synthetic-appcred"},
-                "roles": _issued_roles("member", "lumen-inventory_reader"), "audit_ids": ["original-audit"]}
+                "roles": _issued_roles("reader"), "audit_ids": ["original-audit"]}
     native_directory.configure({"token_overrides": {OWNER_TOKEN: metadata}})
     ks = auth._get_admin_ks_client()
     before = ks.tokens.get_token_data(OWNER_TOKEN, include_catalog=False)
-    native_directory.configure({"owner_roles": [], "remove_edges": [{"prior": "lumen_reader", "implied": "lumen-inventory_reader"}]})
+    native_directory.configure({"owner_roles": [], "remove_edges": [{"prior": "member", "implied": "reader"}]})
     after = ks.tokens.get_token_data(OWNER_TOKEN, include_catalog=False)
     assert before == after
     assert "catalog" not in after["token"]
@@ -995,7 +1100,7 @@ async def test_native_sdk_distinct_user_and_project_domains_both_required(native
     pytest.param(OWNER_TOKEN, {"token_overrides": {OWNER_TOKEN: {"methods": "token"}}}, 503, id="malformed-methods"),
     pytest.param(OWNER_TOKEN, {"token_overrides": {OWNER_TOKEN: {"methods": [None]}}}, 503, id="malformed-method-entry"),
     pytest.param(OWNER_TOKEN, {"token_overrides": {OWNER_TOKEN: {"application_credential": "not-an-object"}}}, 503, id="malformed-appcred"),
-    pytest.param(OWNER_TOKEN, {"token_overrides": {OWNER_TOKEN: {"roles": [{"name": "lumen_admin"}]}}}, 503, id="missing-original-role-id"),
+    pytest.param(OWNER_TOKEN, {"token_overrides": {OWNER_TOKEN: {"roles": [{"name": "member"}]}}}, 503, id="missing-original-role-id"),
     pytest.param(OWNER_TOKEN, {"token_overrides": {OWNER_TOKEN: {"roles": None}}}, 503, id="malformed-original-roles"),
     pytest.param(OWNER_TOKEN, {"token_overrides": {OWNER_TOKEN: {"user": {"id": ""}}}}, 503, id="missing-original-user-id"),
     pytest.param(OWNER_TOKEN, {"token_overrides": {OWNER_TOKEN: {"system": {"all": True}}}}, 503, id="conflicting-original-scopes"),
@@ -1017,15 +1122,15 @@ async def test_native_http_invalid_unavailable_and_malformed_originals_fail_clos
     pytest.param({"owner_roles": []}, id="membership-revoked"),
     pytest.param({"owner_enabled": False}, id="owner-disabled"),
     pytest.param({"project_enabled": False}, id="project-disabled"),
-    pytest.param({"remove_edges": [{"prior": "lumen_editor", "implied": "lumen-assets_editor"}]}, id="issued-leaf-edge-revoked"),
+    pytest.param({"remove_edges": [{"prior": "project_member", "implied": "member"}]}, id="issued-member-edge-revoked"),
 ])
-async def test_native_http_restricted_original_requires_fresh_membership_and_issued_leaf(
+async def test_native_http_restricted_original_requires_fresh_membership_and_exact_issued_member(
     native_directory, native_routes, patch,
 ):
     native_directory.configure({"system_admin_mode": "group",
         "system_group_members": [DIRECTORY_ID, PROJECTLESS_ADMIN_ID, OWNER_ID],
         "token_overrides": {OWNER_TOKEN: {"application_credential": {"id": "synthetic-appcred"},
-            "roles": _issued_roles("member", "lumen-assets_editor")}}})
+            "roles": _issued_roles("member")}}})
     headers = _headers(OWNER_TOKEN, PROJECT_ID)
     before = await native_routes.client.post("/v1/custom-tools", headers=headers, json=_TOOL_BODY)
     assert before.status_code == 201, before.text
@@ -1062,12 +1167,11 @@ async def test_native_http_key_issue_pre_storage_raw_authority_revocation(
 
 
 @pytest.mark.parametrize(("roles", "scopes"), [
-    pytest.param(("member", "lumen-inventory_reader"), ["models:read"], id="no-keys-editor"),
-    pytest.param(("member", "lumen-keys_editor"), ["models:read"], id="no-requested-leaf"),
-    pytest.param(("member", "lumen-keys_editor", "lumen-inventory_reader"),
-                 ["models:read", "compat:completions:write"], id="every-requested-scope-required"),
+    pytest.param(("reader",), ["models:read"], id="reader-cannot-issue-read-key"),
+    pytest.param(("reader",), ["models:read", "compat:completions:write"], id="reader-cannot-issue-write-key"),
+    pytest.param(("lumen_admin",), ["models:read"], id="legacy-grade-cannot-borrow-member"),
 ])
-async def test_native_http_key_issue_requires_original_keys_editor_and_all_requested_leaves(
+async def test_native_http_key_issue_requires_original_standard_member_id(
     native_directory, native_routes, native_key_storage, roles, scopes,
 ):
     native_directory.configure({"token_overrides": {OWNER_TOKEN: {
@@ -1076,9 +1180,8 @@ async def test_native_http_key_issue_requires_original_keys_editor_and_all_reque
     response = await native_routes.client.post("/v1/api-keys", headers=headers,
         json={"name": "cannot-increase-original-authority", "scopes": scopes})
     assert response.status_code == 403, response.text
-    if "lumen-keys_editor" not in capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, "roles": roles}):
-        policy = await native_routes.client.get("/v1/api-keys/issuance-policy", headers=headers)
-        assert policy.status_code == 403, policy.text
+    policy = await native_routes.client.get("/v1/api-keys/issuance-policy", headers=headers)
+    assert policy.status_code == 403, policy.text
     assert native_key_storage.rows == []
     native_key_storage.quota.assert_not_awaited()
     assert _caller_exchanges(native_directory) == []
@@ -1172,7 +1275,7 @@ async def test_native_http_incomplete_or_malformed_identity_collection_is_503(
         envelope["links"] = {"next": 17, "previous": None}
     native_directory.configure({"collection_overrides": [{"path": endpoint, "query": query, "payload": envelope}]})
     headers = _headers(PROJECTLESS_SYSTEM_TOKEN, None, target_project_id=PROJECT_ID)
-    for path in _NATIVE_DEPENDENCIES + ["/v1/admin/providers", "/v1/custom-tools", "/v1/api-keys/issuance-policy"]:
+    for path in _NATIVE_DEPENDENCIES + ["/v1/admin/providers", "/v1/admin/stats", "/v1/custom-tools", "/v1/api-keys/issuance-policy"]:
         response = await native_routes.client.get(path, headers=headers)
         assert response.status_code == 503, (collection, fault, path, response.text)
     response = await native_routes.client.post("/v1/api-keys", headers=headers,
@@ -1195,7 +1298,7 @@ async def test_native_sdk_exchange_can_erase_original_restrictions_but_native_au
     from keystoneauth1 import session as ks_session
     from keystoneauth1.identity import v3
 
-    names = ("member", "lumen-inventory_reader")
+    names = ("reader",)
     native_directory.configure({"token_overrides": {OWNER_TOKEN: {
         **metadata, "roles": _issued_roles(*names)}}})
     directory = auth._get_admin_ks_client()
@@ -1253,6 +1356,8 @@ async def _admit_native_ceiling_run(native_routes, monkeypatch):
         def __init__(self):
             self.added = []
             self.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None))
+            # This isolated fresh thread has no earlier retained root admission.
+            self.scalar = AsyncMock(return_value=0)
 
         async def __aenter__(self):
             return self
@@ -1302,23 +1407,19 @@ async def _admit_native_ceiling_run(native_routes, monkeypatch):
 
 
 @pytest.mark.parametrize("metadata", [_RESTRICTED_ORIGINALS[index] for index in (0, 1, 3, 5)])
-@pytest.mark.parametrize(("surface", "leaf"), [
-    ("generation", "lumen-chat_user"), ("tool", "lumen-tools_user"),
-    ("auxiliary", "lumen-chat_user"),
-])
+@pytest.mark.parametrize("surface", ["generation", "tool", "auxiliary"])
 @pytest.mark.parametrize("revocation", ["grant", "inference"])
 async def test_native_http_reduced_admin_ceiling_persists_and_fences_fresh_io(
-    native_directory, native_routes, monkeypatch, metadata, surface, leaf, revocation,
+    native_directory, native_routes, monkeypatch, metadata, surface, revocation,
 ):
     from lumen.services import inference_authority
     from lumen.services.durable_runs import execution
     from lumen.services.durable_runs.errors import DurableRunInputError
 
-    names = ("member", "lumen-chat_user", *({"tool": ("lumen-tools_user",),
-        "auxiliary": ("lumen-history_reader",)}.get(surface, ())))
+    names = ("member",)
     native_directory.configure({"system_admin_mode": "group",
         "system_group_members": [DIRECTORY_ID, PROJECTLESS_ADMIN_ID, OWNER_ID],
-        "owner_roles": ["member", "lumen_user", "lumen_reader"],
+        "owner_roles": ["project_member"],
         "token_overrides": {OWNER_TOKEN: {**metadata, "roles": _issued_roles(*names)}}})
     assert auth._is_system_admin(OWNER_ID) is True
     run, session = await _admit_native_ceiling_run(native_routes, monkeypatch)
@@ -1330,10 +1431,9 @@ async def test_native_http_reduced_admin_ceiling_persists_and_fences_fresh_io(
         "issued_role_ids": sorted(role_id(name) for name in names)}
     assert OWNER_TOKEN not in json.dumps(run.capability_snapshot)
     assert "token" not in ceiling and "roles" not in ceiling and "is_system_admin" not in ceiling
-    with pytest.raises(api_key_store.ApiKeyForbidden):
-        await api_key_store.authorize_api_key_in_transaction(session, api_key_id=None,
-            user_id=OWNER_ID, project_id=PROJECT_ID, required_scopes=("native:images:write",),
-            credential_authority=ceiling)
+    await api_key_store.authorize_api_key_in_transaction(session, api_key_id=None,
+        user_id=OWNER_ID, project_id=PROJECT_ID, required_scopes=("native:images:write",),
+        credential_authority=ceiling)
     session.execute = AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: run))
     monkeypatch.setattr(execution, "_factory", lambda: lambda: session)
     monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *_args: None)
@@ -1359,8 +1459,8 @@ async def test_native_http_reduced_admin_ceiling_persists_and_fences_fresh_io(
     provider.reset_mock()
     started.clear()
     session.execute.reset_mock()
-    native_directory.configure({"owner_roles": ["member"]} if revocation == "grant" else {
-        "remove_edges": [{"prior": "lumen_user", "implied": leaf}]})
+    native_directory.configure({"owner_roles": ["reader"]} if revocation == "grant" else {
+        "remove_edges": [{"prior": "project_member", "implied": "member"}]})
     # Unrestricted owner re-resolution still succeeds: only the original ceiling
     # plus fresh project grants can deny this credential while admin is retained.
     assert auth._is_system_admin(OWNER_ID) is True
@@ -1386,7 +1486,7 @@ async def test_native_http_restricted_mcp_oauth_start_cannot_create_owner_only_c
     native_directory.configure({"system_admin_mode": "group",
         "system_group_members": [DIRECTORY_ID, PROJECTLESS_ADMIN_ID, OWNER_ID],
         "token_overrides": {OWNER_TOKEN: {**metadata,
-            "roles": _issued_roles("member", "lumen-mcp_editor")}}})
+            "roles": _issued_roles("member")}}})
     assert auth._is_system_admin(OWNER_ID) is True
     begin = AsyncMock(return_value={"authorization_url": "https://synthetic.example/authorize?state=human-state"})
     monkeypatch.setattr(mcp_oauth, "begin", begin)
@@ -1398,7 +1498,7 @@ async def test_native_http_restricted_mcp_oauth_start_cannot_create_owner_only_c
     assert "set-cookie" not in response.headers
     begin.assert_not_awaited()
 
-    native_directory.configure({"remove_edges": [{"prior": "lumen_editor", "implied": "lumen-mcp_editor"}]})
+    native_directory.configure({"owner_roles": ["reader"]})
     assert auth._is_system_admin(OWNER_ID) is True
     assert (await auth.resolve_project_authority(OWNER_ID, PROJECT_ID))["is_system_admin"] is True
     response = await native_routes.client.post("/v1/mcp-servers/7/oauth/start", headers=headers)
@@ -1423,8 +1523,8 @@ async def test_native_http_restricted_mcp_oauth_start_cannot_create_owner_only_c
     directory.assert_not_awaited()
     begin.assert_not_awaited()
 
-    # Unrestricted humans retain interactive OAuth approval without target roles,
-    # even when the selected project's mcp-editor implication was removed.
+    # Unrestricted human system admins retain interactive OAuth approval without
+    # target membership, even after the project owner becomes a reader.
     response = await native_routes.client.post("/v1/mcp-servers/7/oauth/start",
         headers=_headers(DIRECTORY_TOKEN, None, target_project_id=PROJECT_ID))
     assert response.status_code == 200, response.text
@@ -1434,22 +1534,18 @@ async def test_native_http_restricted_mcp_oauth_start_cannot_create_owner_only_c
     assert begin.await_args.kwargs["project_id"] == PROJECT_ID
 
 
-async def test_native_http_reduced_grade_alone_can_issue_its_local_actions_without_baseline(
+async def test_native_http_reduced_member_id_can_issue_all_local_actions_without_parent_id(
     native_directory, native_routes, native_key_storage,
 ):
-    native_directory.configure({"owner_roles": ["lumen_editor"], "remove_edges": [
-        {"prior": "lumen_editor", "implied": "lumen_user"},
-        *({"prior": "lumen_editor", "implied": name} for name in (
-            "lumen-assets_editor", "lumen-agents_editor", "lumen-mcp_editor", "lumen-keys_editor", "lumen-history_editor")),
-    ], "token_overrides": {OWNER_TOKEN: {
-        "application_credential": {"id": "synthetic-appcred"}, "roles": _issued_roles("lumen_editor"),
+    native_directory.configure({"token_overrides": {OWNER_TOKEN: {
+        "application_credential": {"id": "synthetic-appcred"}, "roles": _issued_roles("member"),
     }}})
-    authority = auth._resolve_project_authority(OWNER_ID, PROJECT_ID, issued_role_ids=(role_id("lumen_editor"),))
-    assert authority == {"roles": ["lumen_editor"], "is_system_admin": False}
+    authority = auth._resolve_project_authority(OWNER_ID, PROJECT_ID, issued_role_ids=(role_id("member"),))
+    assert authority == {"roles": ["member"], "is_system_admin": False}
     response = await native_routes.client.post("/v1/api-keys", headers=_headers(OWNER_TOKEN, PROJECT_ID),
-        json={"name": "grade-only-issued-ceiling", "scopes": ["compat:completions:write"]})
+        json={"name": "member-only-issued-ceiling", "scopes": sorted(api_key_store.API_KEY_SCOPES)})
     assert response.status_code == 201, response.text
-    assert response.json()["scopes"] == ["compat:completions:write"]
+    assert set(response.json()["scopes"]) == api_key_store.API_KEY_SCOPES
     assert len(native_key_storage.rows) == 1
     assert _caller_exchanges(native_directory) == []
 
@@ -1467,23 +1563,23 @@ async def test_native_personal_member_has_all_project_actions_without_native_ser
 
     native_directory.configure({"owner_roles": ["member"]})
     ordinary = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
-    assert not capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, **ordinary})
+    assert capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, **ordinary}) == SERVICE_CAPABILITIES
     _configure_personal_directory(native_directory)
     current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
-    assert current["personal_project_owner"] is True
+    assert "personal_project_owner" not in current
     assert set(current["roles"]) <= {"member", "reader"}
     principal = {"user_id": OWNER_ID, "project_id": PROJECT_ID, **current}
     assert capabilities(principal) == SERVICE_CAPABILITIES
     assert all(authorize(action, principal) for action in SCOPE_CAPABILITIES)
     assert not authorize("system:admin", principal)
     response = await native_routes.client.get("/native/principal", headers=_headers(OWNER_TOKEN, PROJECT_ID))
-    assert response.status_code == 200 and response.json()["personal_project_owner"] is True
+    assert response.status_code == 200 and "personal_project_owner" not in response.json()
     assert (await native_routes.client.get("/v1/admin/providers", headers=_headers(OWNER_TOKEN, PROJECT_ID))).status_code == 403
 
 
 @pytest.mark.parametrize("change", ["missing_marker", "foreign_marker", "malformed_marker", "wrong_domain", "conflicting_kind",
-    "disabled_home", "disabled_domain", "disabled_user", "disabled_project", "member_removed", "foreign_raw", "group_raw", "inherited_raw", "group_effective"])
-async def test_native_personal_provenance_never_borrows_member_or_foreign_authority(native_directory, change):
+    "disabled_home", "disabled_domain", "disabled_user", "disabled_project", "member_removed"])
+async def test_native_personal_metadata_does_not_change_standard_membership(native_directory, change):
     _configure_personal_directory(native_directory)
     patch = {}
     if change in {"missing_marker", "foreign_marker", "malformed_marker"}:
@@ -1498,59 +1594,70 @@ async def test_native_personal_provenance_never_borrows_member_or_foreign_author
         patch["owner_enabled" if change == "disabled_user" else "project_enabled"] = False
     elif change == "member_removed":
         patch["owner_roles"] = []
-    else:
-        row = {"user": {"id": OWNER_ID}, "role": {"id": role_id("member")}, "scope": {"project": {"id": PROJECT_ID}}}
-        if change == "foreign_raw":
-            row["user"]["id"] = DIRECTORY_ID
-        elif change in {"group_raw", "group_effective"}:
-            row["links"] = {"membership": "https://identity/groups/foreign/users/owner"}
-        else:
-            row["scope"]["OS-INHERIT:inherited_to"] = "projects"
-        query = {"effective": "True"} if change == "group_effective" else {"scope.project.id": PROJECT_ID}
-        patch["collection_overrides"] = [{"path": "/v3/role_assignments", "query": query,
-            "payload": {"role_assignments": [row], "links": {"next": None}}}]
     native_directory.configure(patch)
-    try:
-        current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
-    except HTTPException as error:
-        assert error.status_code == 403
+    if change in {"disabled_home", "disabled_domain", "disabled_user", "disabled_project", "member_removed"}:
+        with pytest.raises(HTTPException) as exc:
+            await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
+        assert exc.value.status_code == 403
     else:
-        assert not current.get("personal_project_owner")
-        assert not capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, **current})
+        current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
+        assert "personal_project_owner" not in current
+        assert capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, **current}) == SERVICE_CAPABILITIES
 
 
-async def test_native_personal_key_and_worker_recheck_owner_marker_and_reduced_ceiling(native_directory):
+async def test_native_personal_key_and_worker_use_membership_not_owner_marker_and_keep_reduced_ceiling(native_directory):
     _configure_personal_directory(native_directory)
     scope = "native:images:write"
     row, _ = await api_key_store.prepare_key_record(OWNER_ID, PROJECT_ID, "personal bounded", [scope])
     assert row.scopes == [scope]
     reduced = {"credential_restricted": True, "user_id": OWNER_ID, "source_project_id": PROJECT_ID,
         "source_system_scope": "", "issued_role_ids": [role_id("member")]}
-    with pytest.raises(api_key_store.ApiKeyForbidden):
-        await api_key_store.prepare_key_record(OWNER_ID, PROJECT_ID, "reduced", [scope], credential_authority=reduced)
+    await api_key_store.prepare_key_record(OWNER_ID, PROJECT_ID, "reduced member", [scope], credential_authority=reduced)
     await api_key_store.authorize_api_key_in_transaction(None, api_key_id=None, user_id=OWNER_ID,
         project_id=PROJECT_ID, required_scopes=(scope,))
     native_directory.configure({"project_overrides": {"afterglow_personal_user_id": DIRECTORY_ID}})
+    await api_key_store.authorize_api_key_in_transaction(None, api_key_id=None, user_id=OWNER_ID,
+        project_id=PROJECT_ID, required_scopes=(scope,))
+    native_directory.configure({"owner_roles": ["reader"]})
     with pytest.raises(api_key_store.ApiKeyForbidden):
         await api_key_store.authorize_api_key_in_transaction(None, api_key_id=None, user_id=OWNER_ID,
-            project_id=PROJECT_ID, required_scopes=(scope,))
+            project_id=PROJECT_ID, required_scopes=(scope,), credential_authority=reduced)
 
 
-async def test_native_personal_fresh_refresh_does_not_retain_owner_flag_or_use_logical_target(native_directory):
+@pytest.mark.parametrize("raw_fault", ["truncated", "malformed"])
+async def test_native_member_authority_does_not_read_obsolete_raw_personal_provenance(
+    native_directory, native_routes, native_key_storage, raw_fault,
+):
     _configure_personal_directory(native_directory)
-    principal = auth._keystone_principal(auth.validate_token(OWNER_TOKEN), OWNER_TOKEN)
-    await auth._refresh_token_authority(principal)
-    assert principal["personal_project_owner"] is True
-    principal["source_project_id"] = "another-original-project"
-    await auth._refresh_token_authority(principal)
-    assert not principal.get("personal_project_owner")
-    principal["source_project_id"] = PROJECT_ID
-    native_directory.configure({"project_overrides": {}})
-    await auth._refresh_token_authority(principal)
-    assert not principal.get("personal_project_owner")
+    effective_query = {"user.id": OWNER_ID, "scope.project.id": PROJECT_ID, "effective": "True"}
+    effective = native_directory.client.get(
+        "/v3/role_assignments", params=effective_query, headers={"X-Auth-Token": DIRECTORY_TOKEN},
+    )
+    assert effective.status_code == 200, effective.text
+    raw_payload = {"role_assignments": [], "links": {"next": "/unread-page"}, "truncated": True}
+    if raw_fault == "malformed":
+        raw_payload = {"role_assignments": "not-a-list"}
+    native_directory.configure({"collection_overrides": [
+        {"path": "/v3/role_assignments", "query": effective_query, "payload": effective.json()},
+        {"path": "/v3/role_assignments", "query": {"scope.project.id": PROJECT_ID}, "payload": raw_payload},
+    ]})
+    response = await native_routes.client.get("/native/principal", headers=_headers(OWNER_TOKEN, PROJECT_ID))
+    assert response.status_code == 200, response.text
+    assert "personal_project_owner" not in response.json()
+    response = await native_routes.client.post("/v1/api-keys", headers=_headers(OWNER_TOKEN, PROJECT_ID),
+        json={"name": "member without raw provenance", "scopes": ["native:images:write"]})
+    assert response.status_code == 201, response.text
+    assert len(native_key_storage.rows) == 1
+    await api_key_store.authorize_api_key_in_transaction(
+        None, api_key_id=None, user_id=OWNER_ID, project_id=PROJECT_ID,
+        required_scopes=("native:images:write",),
+    )
+    raw_project_query = {"scope.project.id": [PROJECT_ID]}
+    assert not any(method == "GET" and path == "/v3/role_assignments" and query == raw_project_query
+                   for method, path, query in native_directory.state.requests)
 
 
-async def test_native_personal_http_issuance_needs_fresh_unrestricted_owner(native_directory, native_routes, native_key_storage):
+async def test_native_personal_http_issuance_uses_fresh_member_and_reduced_original_id(native_directory, native_routes, native_key_storage):
     _configure_personal_directory(native_directory)
     response = await native_routes.client.post("/v1/api-keys", headers=_headers(OWNER_TOKEN, PROJECT_ID),
         json={"name": "personal native", "scopes": ["native:images:write"]})
@@ -1561,30 +1668,31 @@ async def test_native_personal_http_issuance_needs_fresh_unrestricted_owner(nati
         "application_credential": {"id": "reduced"}, "roles": _issued_roles("member"),
     }}})
     response = await native_routes.client.post("/v1/api-keys", headers=_headers(OWNER_TOKEN, PROJECT_ID),
-        json={"name": "cannot borrow personal", "scopes": ["native:images:write"]})
-    assert response.status_code == 403 and len(native_key_storage.rows) == 1
+        json={"name": "reduced member", "scopes": ["native:images:write"]})
+    assert response.status_code == 201 and len(native_key_storage.rows) == 2
+    native_directory.configure({"token_overrides": {OWNER_TOKEN: {
+        "application_credential": {"id": "reduced reader"}, "roles": _issued_roles("reader"),
+    }}})
+    response = await native_routes.client.post("/v1/api-keys", headers=_headers(OWNER_TOKEN, PROJECT_ID),
+        json={"name": "reader cannot borrow personal", "scopes": ["native:images:write"]})
+    assert response.status_code == 403 and len(native_key_storage.rows) == 2
 
 
-@pytest.mark.parametrize("change", ["malformed_home", "missing_home", "escalating_member"])
-async def test_native_personal_incomplete_home_or_escalating_member_never_establishes_owner(native_directory, change):
+@pytest.mark.parametrize("change", ["malformed_home", "missing_home"])
+async def test_native_member_authority_still_rejects_incomplete_home(native_directory, change):
     _configure_personal_directory(native_directory)
     if change == "malformed_home":
         native_directory.configure({"user_overrides": {"domain_id": []}})
-    elif change == "missing_home":
+    else:
         native_directory.configure({"user_domain_id": "missing-home"})
-    else:
-        native_directory.state.graph[role_id("member")].add(role_id("admin"))
-    try:
-        current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
-    except HTTPException as error:
-        assert error.status_code in {403, 503}
-    else:
-        assert not current.get("personal_project_owner")
+    with pytest.raises(HTTPException) as error:
+        await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
+    assert error.value.status_code in {403, 503}
 
 
 @pytest.mark.parametrize("kind", [None, False, "organization", ["personal"]])
-async def test_native_personal_explicit_invalid_domain_kind_is_not_absence(native_directory, kind):
+async def test_native_member_authority_ignores_irrelevant_personal_domain_kind(native_directory, kind):
     _configure_personal_directory(native_directory)
     native_directory.state.domains["personal"]["afterglow_domain_kind"] = kind
     current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
-    assert not current.get("personal_project_owner")
+    assert capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, **current}) == SERVICE_CAPABILITIES

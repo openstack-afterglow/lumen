@@ -56,7 +56,7 @@ async def test_removing_batch_write_after_admission_blocks_frozen_authority(cont
     from lumen.services import api_key_store
 
     async def current_authority(user_id, project_id):
-        return {"roles": ["member", "lumen-chat_user"], "is_system_admin": False}
+        return {"roles": ["member"], "is_system_admin": False}
 
     monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
 
@@ -139,7 +139,7 @@ async def test_native_create_rejects_missing_item_scope_immediately(monkeypatch)
 def test_prepared_payload_round_trip_uses_frozen_snapshots_not_reresolution(operation, prepared_type, persist):
     batch = SimpleNamespace(project_id="p", user_id="u")
     authority = {"credential_restricted": True, "user_id": "u", "source_project_id": "p",
-                 "source_system_scope": "", "issued_role_ids": ["member-id", "batch-leaf-id"]}
+                 "source_system_scope": "", "issued_role_ids": ["member-id"]}
     snapshot = {"version": "frozen", "credential_authority": authority}
     item = ChatBatchItem(operation=operation,
         request_ciphertext=batches._seal({"operation": operation, "model": "fixture"}),
@@ -194,7 +194,7 @@ async def test_current_key_authorization_never_falls_back_to_keystone(monkeypatc
 async def test_text_preparation_retains_trusted_ceiling_not_body_metadata(monkeypatch, operation):
     batch = SimpleNamespace(project_id="p", user_id="u", api_key_id=None, contract="native")
     authority = {"credential_restricted": True, "user_id": "u", "source_project_id": "p",
-                 "source_system_scope": "", "issued_role_ids": ["member-id", "chat-id"]}
+                 "source_system_scope": "", "issued_role_ids": ["member-id"]}
     body = {"model": "fixture", **({"input": "hi"} if operation == "responses" else {
         "messages": [{"role": "user", "content": "hi"}],
         "credential_authority": {"issued_role_ids": ["admin-id"]},
@@ -209,8 +209,8 @@ async def test_text_preparation_retains_trusted_ceiling_not_body_metadata(monkey
     assert prepared.payload["_credential_authority"] == authority
     assert "credential_authority" not in original.capability_snapshot
     authority["issued_role_ids"].append("later-id")
-    assert prepared.capability_snapshot["credential_authority"]["issued_role_ids"] == ["member-id", "chat-id"]
-    assert prepared.payload["_credential_authority"]["issued_role_ids"] == ["member-id", "chat-id"]
+    assert prepared.capability_snapshot["credential_authority"]["issued_role_ids"] == ["member-id"]
+    assert prepared.payload["_credential_authority"]["issued_role_ids"] == ["member-id"]
 
 
 async def test_native_chunk_authority_forwards_original_ceiling(monkeypatch):
@@ -222,7 +222,7 @@ async def test_native_chunk_authority_forwards_original_ceiling(monkeypatch):
 
     monkeypatch.setattr(batches, "_factory", lambda: Session)
     authority = {"credential_restricted": True, "user_id": "u", "source_project_id": "p",
-                 "source_system_scope": "", "issued_role_ids": ["member-id", "images-id"]}
+                 "source_system_scope": "", "issued_role_ids": ["member-id"]}
     check = AsyncMock(return_value=frozenset({"native:images:write", "native:batches:write"}))
     monkeypatch.setattr(batches, "current_api_key_scopes", check)
     batch = SimpleNamespace(project_id="p", user_id="u", api_key_id=None, contract="native")

@@ -1,4 +1,4 @@
-"""Owned media cancellation never grants text-generation authority."""
+"""Owned media cancellation preserves operation-specific API-key attenuation."""
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 from uuid import uuid4
@@ -15,21 +15,21 @@ from lumen.services.durable_runs import lifecycle, queries
 from lumen.services.durable_runs.errors import DurableRunNotFound
 
 
-def actor(leaf, *, key=False, scopes=()):
+def actor(*, key=False, scopes=()):
     return {"auth_type": "api_key" if key else "keystone", "user_id": "owner", "project_id": "project",
-            "api_key_id": 7 if key else None, "roles": ["member", leaf], "scopes": tuple(scopes),
+            "api_key_id": 7 if key else None, "roles": ["member"], "scopes": tuple(scopes),
             "source": "api" if key else "web", "is_system_admin": False}
 
 
-@pytest.mark.parametrize(("kind", "scope", "leaf"), [
-    ("image", "native:images:write", "lumen-images_user"),
-    ("image", "compat:images:write", "lumen-images_user"),
-    ("tts", "native:audio:write", "lumen-audio_user"),
-    ("stt", "compat:audio:write", "lumen-audio_user"),
-    ("realtime", "native:realtime:write", "lumen-audio_user"),
+@pytest.mark.parametrize(("kind", "scope"), [
+    ("image", "native:images:write"),
+    ("image", "compat:images:write"),
+    ("tts", "native:audio:write"),
+    ("stt", "compat:audio:write"),
+    ("realtime", "native:realtime:write"),
 ])
 @pytest.mark.parametrize("key", [False, True])
-def test_media_only_cancels_owned_matching_operation_without_chat(monkeypatch, kind, scope, leaf, key):
+def test_member_cancels_owned_media_with_key_limited_to_matching_operation(monkeypatch, kind, scope, key):
     run = SimpleNamespace(run_kind=kind, run_scope="image" if kind == "image" else "audio")
     required = inference_authority.cancel_run_scopes(run, {"required_scopes": [scope, "native:assets:read"]})
     assert required == (scope,)
@@ -39,14 +39,17 @@ def test_media_only_cancels_owned_matching_operation_without_chat(monkeypatch, k
     monkeypatch.setattr(lifecycle, "request_cancelled", cancel)
     app = FastAPI()
     app.include_router(completions.router, prefix="/v1")
-    principal = actor(leaf, key=key, scopes=(scope,))
+    principal = actor(key=key, scopes=(scope,))
     app.dependency_overrides[auth.get_principal] = lambda: principal
     with TestClient(app) as client:
         response = client.post("/v1/runs/owned-media/cancel")
     assert response.status_code == 200
     lookup.assert_awaited_once_with(run_id="owned-media", project_id="project", user_id="owner")
     cancel.assert_awaited_once_with(run_id="owned-media", project_id="project", user_id="owner")
-    with pytest.raises(HTTPException):
+    if key:
+        with pytest.raises(HTTPException):
+            auth.ensure_scopes(principal, "native:runs:write")
+    else:
         auth.ensure_scopes(principal, "native:runs:write")
 
 
@@ -61,7 +64,7 @@ def test_cancel_preserves_scope_attenuation_and_owner_failure(monkeypatch, scope
     monkeypatch.setattr(lifecycle, "request_cancelled", cancel)
     app = FastAPI()
     app.include_router(completions.router, prefix="/v1")
-    app.dependency_overrides[auth.get_principal] = lambda: actor("lumen-images_user", key=True, scopes=scopes)
+    app.dependency_overrides[auth.get_principal] = lambda: actor(key=True, scopes=scopes)
     with TestClient(app) as client:
         response = client.post("/v1/runs/media/cancel")
     assert response.status_code == expected
@@ -99,7 +102,7 @@ async def test_image_only_batch_cancel_checks_item_action_before_mutation(monkey
     monkeypatch.setattr(batches, "owned_cancel_scopes", lookup)
     monkeypatch.setattr(batches, "cancel_batch", cancel)
     monkeypatch.setattr(batch_routes, "native_descriptor", lambda view: view)
-    principal = actor("lumen-images_user", key=True, scopes=("native:batches:write", "native:images:write"))
+    principal = actor(key=True, scopes=("native:batches:write", "native:images:write"))
     if operation_scope == "native:images:write":
         result = await batch_routes.cancel_batch(str(uuid4()), principal)
         assert result.status == "cancelling" and cancel.await_count == 1

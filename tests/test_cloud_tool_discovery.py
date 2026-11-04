@@ -222,7 +222,7 @@ async def test_current_tool_permission_loss_blocks_loaded_cloud_invocation(
     if authority == "key":
         synthetic_inference_store.key.scopes.remove("native:tools:execute")
     else:
-        synthetic_inference_store.authority.return_value["roles"].remove("lumen-tools_user")
+        synthetic_inference_store.authority.return_value["roles"] = ["reader"]
     request_count = len(bridge.requests)
     with pytest.raises(ApiKeyForbidden):
         await dispatch.context_execute_result("afterglow_vm_list", {}, ctx)

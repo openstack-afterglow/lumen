@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from threading import Event
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import Depends, FastAPI, HTTPException
@@ -569,7 +569,7 @@ async def test_foreign_target_requires_admin_at_final_authority_lookup(monkeypat
         if lookup_status is not None:
             raise HTTPException(status_code=lookup_status, detail="Current authority denied/unavailable")
         # Even retained, entitled target membership cannot authorize the admin-only header.
-        return {"roles": ["member", "lumen-chat_user"], "is_system_admin": False}
+        return {"roles": ["member"], "is_system_admin": False}
 
     monkeypatch.setattr(deps, "resolve_project_authority", current)
     with pytest.raises(HTTPException) as exc:
@@ -595,7 +595,17 @@ def test_system_admin_lookup_outage_is_not_a_negative_assignment(monkeypatch):
 
 
 class TestStartupFailurePropagation:
-    async def test_checkpointer_failure_returns_false_propagates_on_startup(self, monkeypatch):
+    @pytest.fixture
+    def initialized_provider_runtime(self, monkeypatch):
+        """Isolate failures after the unrelated provider dependency has started."""
+        runtime = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
+        monkeypatch.setattr("lumen.services.bifrost_runtime.start_bifrost_runtime", runtime.start)
+        monkeypatch.setattr("lumen.services.bifrost_runtime.close_bifrost_runtime", runtime.close)
+        return runtime
+
+    async def test_checkpointer_failure_returns_false_propagates_on_startup(
+        self, monkeypatch, initialized_provider_runtime,
+    ):
         monkeypatch.setattr(
             "lumen.main.get_settings",
             lambda: Settings(database_url="", chat_checkpointer_postgres_url="postgresql://invalid:5432/db"),
@@ -609,8 +619,12 @@ class TestStartupFailurePropagation:
         with pytest.raises(RuntimeError, match="configured chat checkpointer failed to initialize"):
             async with lifespan(app):
                 pass
+        initialized_provider_runtime.start.assert_awaited_once()
+        initialized_provider_runtime.close.assert_awaited_once()
 
-    async def test_semantic_memory_failure_propagates_on_startup(self, monkeypatch):
+    async def test_semantic_memory_failure_propagates_on_startup(
+        self, monkeypatch, initialized_provider_runtime,
+    ):
         monkeypatch.setattr(
             "lumen.main.get_settings",
             lambda: Settings(
@@ -628,6 +642,8 @@ class TestStartupFailurePropagation:
         with pytest.raises(RuntimeError, match="pgvector extension unavailable"):
             async with lifespan(app):
                 pass
+        initialized_provider_runtime.start.assert_awaited_once()
+        initialized_provider_runtime.close.assert_awaited_once()
 
 
 class TestDurableRunsDescriptorContract:
@@ -651,6 +667,8 @@ def test_original_project_inspection_does_not_exchange_token(monkeypatch, projec
 
 @pytest.mark.parametrize("methods,metadata", [
     ([], {}), (["unknown"], {}), (["password", "unknown"], {}),
+    (["openid", "unknown"], {}),
+    (["openid", "token", "application_credential"], {"application_credential": {"id": "app-1"}}),
     (["application_credential"], {"application_credential": {"id": "app-1"}}),
     (["token"], {"application_credential": {}}),
     (["token"], {"OS-TRUST:trust": {"id": "trust-1"}}),
@@ -671,7 +689,7 @@ def test_original_delegation_or_unknown_method_cannot_become_human_authority(mon
     admin.assert_not_called()
 
 
-@pytest.mark.parametrize("method", ["password", "token", "totp", "mapped", "external", "oidc", "saml2"])
+@pytest.mark.parametrize("method", ["password", "token", "totp", "mapped", "external", "openid", "oidc", "saml2"])
 def test_supported_original_human_methods_remain_human(monkeypatch, method):
     original_token(monkeypatch, methods=[method])
     admin = Mock(return_value=True)
@@ -732,17 +750,18 @@ def test_explicit_human_rescope_rejects_foreign_identity_and_closes_session(monk
 
 
 @pytest.mark.parametrize("dependency", [deps.get_principal, deps.require_token])
-async def test_both_dependencies_keep_original_restriction_ceiling_against_larger_owner(monkeypatch, dependency):
+@pytest.mark.parametrize("issued_role", ["reader", "member"])
+async def test_both_dependencies_keep_original_restriction_ceiling_against_larger_owner(monkeypatch, dependency, issued_role):
     from starlette.requests import Request
 
-    _, inspect = original_token(monkeypatch, role_names=["member", "lumen-chat_user"],
+    _, inspect = original_token(monkeypatch, role_names=[issued_role],
                                 methods=["token"], metadata={"application_credential": {"id": "app-1"}})
     rows = [{"user": {"id": "u1"}, "scope": {"project": {"id": "p1"}}, "role": {"id": rid}}
-            for rid in ("member", "lumen-chat_user", "lumen-tools_user")]
+            for rid in ("reader", "member", "manager")]
     def get(path):
         if path == "/roles":
             key, values = "roles", [{"id": rid, "name": rid, "domain_id": None}
-                                     for rid in ("member", "lumen-chat_user", "lumen-tools_user", "admin")]
+                                     for rid in ("reader", "member", "manager", "admin")]
         elif path == "/role_inferences":
             key, values = "role_inferences", []
         else:
@@ -764,11 +783,18 @@ async def test_both_dependencies_keep_original_restriction_ceiling_against_large
         info = await dependency(x_auth_token="original-token", bearer=None, x_project_id=None)
     assert info["credential_restricted"] is True and info["is_system_admin"] is False
     assert info["source_project_id"] == info["connection_project_id"] == info["project_id"] == "p1"
-    assert info["issued_role_ids"] == ("lumen-chat_user", "member")
-    assert set(info["roles"]) == {"member", "lumen-chat_user"}
+    assert info["issued_role_ids"] == (issued_role,)
+    assert info["roles"] == [issued_role]
     assert info["token"] == "original-token"
-    deps.ensure_scopes(info, "compat:completions:write")
+    deps.ensure_scopes(info, "models:read", "native:conversations:read")
+    for scope in ("compat:completions:write", "native:tools:execute", "native:agents:delete"):
+        if issued_role == "member":
+            deps.ensure_scopes(info, scope)
+        else:
+            with pytest.raises(HTTPException) as error:
+                deps.ensure_scopes(info, scope)
+            assert error.value.status_code == 403
     with pytest.raises(HTTPException) as error:
-        deps.ensure_scopes(info, "native:tools:execute")
+        deps.require_admin(info)
     assert error.value.status_code == 403
     inspect.assert_called_once_with("original-token", include_catalog=False)

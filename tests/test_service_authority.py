@@ -1,4 +1,4 @@
-"""Service role/credential authority contract, with isolated FastAPI auth smoke.
+"""Standard project role/credential authority contract, with isolated FastAPI auth smoke.
 
 These tests use synthetic Keystone responses; they never contact a paid provider.
 """
@@ -27,26 +27,36 @@ def principal(roles, *, key=False, scopes=(), system=False):
             "scopes": tuple(scopes), "is_system_admin": system}
 
 
-@pytest.mark.parametrize("roles", [[], ["member"], ["reader"], ["manager"], ["project_admin"],
-                                   ["project_owner"], ["waygate_admin"], ["member", "lumen_custom"]])
-def test_unentitled_native_roles_fail_closed(roles):
+@pytest.mark.parametrize("roles", [[], ["project_admin"], ["project_owner"], ["waygate_admin"],
+                                   ["lumen_reader"], ["lumen_user"], ["lumen_editor"], ["lumen_admin"],
+                                   *[[label] for label in sorted(SERVICE_CAPABILITIES)]])
+@pytest.mark.parametrize("scope", sorted(SCOPE_CAPABILITIES))
+def test_legacy_only_and_nonstandard_native_roles_fail_closed(roles, scope):
     assert capabilities(principal(roles)) == frozenset()
     with pytest.raises(HTTPException) as exc:
-        auth.ensure_scopes(principal(roles), "compat:completions:write")
+        auth.ensure_scopes(principal(roles), scope)
     assert exc.value.status_code == 403
 
 
-@pytest.mark.parametrize("grade", ["reader", "user", "editor", "admin"])
-def test_grade_alone_has_local_policy_authority_without_edges_or_corole(grade):
-    actor = principal([f"lumen_{grade}"])
-    assert "models:read" in allowed_scopes(actor)
-    if grade == "reader":
-        assert capabilities(actor) == READER_CAPABILITIES
-        with pytest.raises(HTTPException):
-            auth.ensure_scopes(actor, "compat:completions:write")
+@pytest.mark.parametrize("role", ["member", "manager", "admin"])
+@pytest.mark.parametrize("scope", sorted(SCOPE_CAPABILITIES))
+def test_standard_project_writer_needs_no_service_roles(role, scope):
+    actor = principal([role])
+    assert capabilities(actor) == SERVICE_CAPABILITIES
+    assert auth.ensure_scopes(actor, scope) is actor
+    assert actor["roles"] == [role]
+
+
+@pytest.mark.parametrize("scope", sorted(SCOPE_CAPABILITIES))
+def test_standard_reader_reads_only(scope):
+    actor = principal(["reader"])
+    assert capabilities(actor) == READER_CAPABILITIES
+    if scope.endswith(":read"):
+        assert auth.ensure_scopes(actor, scope) is actor
     else:
-        auth.ensure_scopes(actor, "compat:completions:write")
-    assert actor["roles"] == [f"lumen_{grade}"]
+        with pytest.raises(HTTPException) as error:
+            auth.ensure_scopes(actor, scope)
+        assert error.value.status_code == 403
 
 
 def test_project_admin_is_local_not_system_authority():
@@ -57,21 +67,25 @@ def test_project_admin_is_local_not_system_authority():
 
 
 @pytest.mark.parametrize("scope,leaf", [(scope, leaf) for scope, leaves in SCOPE_CAPABILITIES.items() for leaf in leaves])
-def test_exact_leaf_is_narrow_and_scope_mapping_is_authoritative(scope, leaf):
-    roles = ["member", leaf]
-    assert capabilities(principal(roles)) == frozenset({leaf})
-    assert auth.ensure_scopes(principal(roles), scope)
+def test_internal_capability_label_is_not_an_iam_role_requirement(scope, leaf):
+    assert auth.ensure_scopes(principal(["member"]), scope)
+    with pytest.raises(HTTPException) as error:
+        auth.ensure_scopes(principal([leaf]), scope)
+    assert error.value.status_code == 403
 
 
 def test_key_scopes_only_attenuate_current_role_authority():
-    p = principal(["member", "lumen-chat_user"], key=True,
-                  scopes=["compat:completions:write", "compat:images:write", "native:tools:execute"])
-    auth.ensure_scopes(p, "compat:completions:write")
+    p = principal(["member"], key=True, scopes=["compat:completions:write", "models:read"])
+    auth.ensure_scopes(p, "compat:completions:write", "models:read")
     for scope in ["compat:images:write", "native:tools:execute"]:
         with pytest.raises(HTTPException):
             auth.ensure_scopes(p, scope)
+    p["roles"] = ["reader"]
+    auth.ensure_scopes(p, "models:read")
     with pytest.raises(HTTPException):
-        auth.ensure_scopes(principal(["member", *SERVICE_CAPABILITIES], key=True), "compat:completions:write")
+        auth.ensure_scopes(p, "compat:completions:write")
+    with pytest.raises(HTTPException):
+        auth.ensure_scopes(principal(["member"], key=True), "compat:completions:write")
 
 
 def test_service_system_authority_does_not_assert_global_key_authority():
@@ -154,12 +168,12 @@ async def test_deleted_identity_is_permanent_denial_but_missing_catalog_is_unava
 
 async def test_current_effective_lookup_uses_group_inherited_project_grants(monkeypatch):
     # Effective group/inherited grants are resolved by Keystone to the exact user.
-    rows = [_assignment("member"), _assignment("chat")]
+    rows = [_assignment("member")]
     queries = _keystone(monkeypatch, assignments=rows,
-                        role_rows=[SimpleNamespace(id="member", name="member", domain_id=None),
-                                   SimpleNamespace(id="chat", name="lumen-chat_user", domain_id=None)])
+                        role_rows=[SimpleNamespace(id="member", name="member", domain_id=None)])
     current = await auth.resolve_project_authority("user", "project")
-    assert set(current["roles"]) == {"member", "lumen-chat_user"}
+    assert current["roles"] == ["member"]
+    assert allowed_scopes(principal(current["roles"])) == frozenset(SCOPE_CAPABILITIES)
     assert queries == [{"user": "user", "project": "project", "effective": True}]
 
 
@@ -203,22 +217,22 @@ async def test_actual_fastapi_auth_revalidates_current_roles_and_ignores_role_he
     async def generate(p=Depends(auth.require_scopes("compat:completions:write"))):
         return {"user_id": p["user_id"]}
     monkeypatch.setattr(auth, "validate_token", lambda *args, **kwargs: {
-        "user_id": "user", "project_id": "project", "roles": ["member", "lumen_admin"],
+        "user_id": "user", "project_id": "project", "roles": ["admin"],
         "is_system_admin": False, "auth_token": "synthetic"})
-    current_roles = ["member", "lumen-chat_user"]
+    current_roles = ["member"]
     async def current(user_id, project_id):
         return {"roles": list(current_roles), "is_system_admin": False}
     monkeypatch.setattr(auth, "resolve_project_authority", current)
     async with AsyncClient(transport=ASGITransport(application), base_url="http://synthetic") as client:
-        headers = {"X-Auth-Token": "synthetic", "X-Roles": "lumen_admin", "X-Is-System-Admin": "true"}
+        headers = {"X-Auth-Token": "synthetic", "X-Roles": "admin", "X-Is-System-Admin": "true"}
         assert (await client.post("/generate", headers=headers)).status_code == 200
-        current_roles[:] = ["reader", "lumen-history_reader"]
+        current_roles[:] = ["reader"]
         assert (await client.post("/generate", headers=headers)).status_code == 403
         current_roles[:] = []
         assert (await client.post("/generate", headers=headers)).status_code == 403
 
 
-@pytest.mark.parametrize("roles", [[], ["member", *sorted(SERVICE_CAPABILITIES)], ["admin"], ["manager"]])
+@pytest.mark.parametrize("roles", [[], ["member"], ["reader"], ["admin"], ["manager"], ["lumen_admin"]])
 async def test_actual_global_provider_routes_reject_tenant_and_domain_admin(monkeypatch, roles):
 
     from lumen.api import models
@@ -236,43 +250,43 @@ async def test_actual_global_provider_routes_reject_tenant_and_domain_admin(monk
         repository.assert_awaited_once()
 
 
-async def test_current_grade_authorizes_without_graph_expansion_and_revokes_with_assignment(monkeypatch):
-    assignments = [_assignment("user")]
+async def test_current_member_authorizes_without_service_graph_and_revokes_with_assignment(monkeypatch):
+    assignments = [_assignment("member")]
     _keystone(monkeypatch, assignments=assignments, rules=[],
-              role_rows=[SimpleNamespace(id="user", name="lumen_user", domain_id=None)])
+              role_rows=[SimpleNamespace(id="member", name="member", domain_id=None)])
     current = await auth.resolve_project_authority("user", "project")
-    assert current == {"roles": ["lumen_user"], "is_system_admin": False}
-    auth.ensure_scopes(principal(current["roles"]), "compat:images:write", "compat:completions:write")
+    assert current == {"roles": ["member"], "is_system_admin": False}
+    assert allowed_scopes(principal(current["roles"])) == frozenset(SCOPE_CAPABILITIES)
     assignments.clear()
     with pytest.raises(HTTPException) as error:
         await auth.resolve_project_authority("user", "project")
     assert error.value.status_code == 403
 
 
-async def test_same_named_domain_leaf_cannot_assert_global_builtin_authority(monkeypatch):
+async def test_same_named_domain_member_cannot_assert_standard_project_authority(monkeypatch):
     _keystone(monkeypatch,
-              assignments=[_assignment(rid) for rid in ("member", "domain-chat")],
-              role_rows=[SimpleNamespace(id="member", name="member", domain_id=None),
-                         SimpleNamespace(id="domain-chat", name="lumen-chat_user", domain_id="domain")])
+              assignments=[_assignment(rid) for rid in ("reader", "domain-member")],
+              role_rows=[SimpleNamespace(id="reader", name="reader", domain_id=None),
+                         SimpleNamespace(id="domain-member", name="member", domain_id="domain")])
     current = await auth.resolve_project_authority("user", "project")
-    assert current["roles"] == ["member"]
+    assert current["roles"] == ["reader"]
     with pytest.raises(HTTPException):
         auth.ensure_scopes(principal(current["roles"]), "compat:completions:write")
 
 
 @pytest.mark.parametrize("problem", ["missing", "unknown", "cycle", "duplicate-global", "domain-collision"])
 async def test_missing_or_ambiguous_current_role_graph_never_falls_back(monkeypatch, problem):
-    catalog = [SimpleNamespace(id="member", name="member", domain_id=None),
-               SimpleNamespace(id="chat", name="lumen-chat_user", domain_id=None)]
+    catalog = [SimpleNamespace(id="reader", name="reader", domain_id=None),
+               SimpleNamespace(id="member", name="member", domain_id=None)]
     rules = []
     if problem == "unknown":
-        rules = [SimpleNamespace(prior_role={"id": "chat"}, implies=[{"id": "absent"}])]
+        rules = [SimpleNamespace(prior_role={"id": "member"}, implies=[{"id": "absent"}])]
     elif problem == "cycle":
-        rules = [SimpleNamespace(prior_role={"id": "chat"}, implies=[{"id": "chat"}])]
+        rules = [SimpleNamespace(prior_role={"id": "member"}, implies=[{"id": "member"}])]
     elif problem == "duplicate-global":
-        catalog.append(SimpleNamespace(id="other-chat", name="lumen-chat_user", domain_id=None))
+        catalog.append(SimpleNamespace(id="other-member", name="member", domain_id=None))
     elif problem == "domain-collision":
-        catalog.append(SimpleNamespace(id="domain-chat", name="lumen-chat_user", domain_id="domain"))
+        catalog.append(SimpleNamespace(id="domain-member", name="member", domain_id="domain"))
     _keystone(monkeypatch, assignments=[_assignment("member")],
               role_rows=catalog, rules=rules)
     if problem == "missing":
@@ -302,17 +316,17 @@ def test_system_administrator_uses_current_global_ids_and_graph(monkeypatch):
 @pytest.mark.parametrize("label", ["admin", "manager"])
 async def test_domain_privileged_label_does_not_add_global_or_service_authority(monkeypatch, label):
     _keystone(monkeypatch,
-              assignments=[_assignment(rid) for rid in ("member", "domain-privileged")],
-              role_rows=[SimpleNamespace(id="member", name="member", domain_id=None),
+              assignments=[_assignment(rid) for rid in ("reader", "domain-privileged")],
+              role_rows=[SimpleNamespace(id="reader", name="reader", domain_id=None),
                          SimpleNamespace(id="domain-privileged", name=label, domain_id="domain")])
     current = await auth.resolve_project_authority("user", "project")
-    assert current == {"roles": ["member"], "is_system_admin": False}
+    assert current == {"roles": ["reader"], "is_system_admin": False}
     with pytest.raises(HTTPException):
         auth.ensure_scopes(principal(current["roles"]), "compat:completions:write")
 
 
 @pytest.mark.parametrize("scope", sorted(SCOPE_CAPABILITIES))
-def test_zero_target_roles_system_admin_is_alternative_to_every_service_leaf(scope):
+def test_zero_target_roles_system_admin_is_alternative_for_every_project_action(scope):
     actor = principal([], system=True)
     assert capabilities(actor) == SERVICE_CAPABILITIES
     assert auth.ensure_scopes(actor, scope) is actor
@@ -514,17 +528,17 @@ def test_raw_system_or_group_metadata_failure_is_unavailable(monkeypatch, proble
 
 async def test_reduced_issued_ids_are_a_ceiling_not_an_inference_root(monkeypatch):
     catalog = [SimpleNamespace(id=rid, name=name, domain_id=None) for rid, name in
-               [("member", "member"), ("parent", "lumen_user"), ("chat", "lumen-chat_user"), ("admin", "admin")]]
-    rules = [SimpleNamespace(prior_role={"id": "parent"}, implies=[{"id": "chat"}])]
-    queries = _keystone(monkeypatch, assignments=[_assignment("member"), _assignment("parent")],
+               [("reader", "reader"), ("member", "member"), ("manager", "manager"), ("admin", "admin")]]
+    rules = [SimpleNamespace(prior_role={"id": "manager"}, implies=[{"id": "member"}])]
+    queries = _keystone(monkeypatch, assignments=[_assignment("reader"), _assignment("manager")],
                         role_rows=catalog, rules=rules,
                         system_assignments=[_assignment("admin", scope={"system": {"all": True}})])
-    current = auth._resolve_project_authority("user", "project", issued_role_ids=("member", "parent"))
-    assert current == {"roles": ["lumen_user", "member"], "is_system_admin": False}
+    current = auth._resolve_project_authority("user", "project", issued_role_ids=("reader", "manager"))
+    assert current == {"roles": ["manager", "reader"], "is_system_admin": False}
     assert queries == [{"user": "user", "project": "project", "effective": True}]
     auth.ensure_scopes(principal(current["roles"]), "compat:completions:write")
-    current = auth._resolve_project_authority("user", "project", issued_role_ids=("member", "chat"))
-    assert current == {"roles": ["member"], "is_system_admin": False}
+    current = auth._resolve_project_authority("user", "project", issued_role_ids=("reader", "member"))
+    assert current == {"roles": ["reader"], "is_system_admin": False}
     with pytest.raises(HTTPException):
         auth.ensure_scopes(principal(current["roles"]), "compat:completions:write")
 
