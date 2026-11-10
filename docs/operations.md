@@ -11,6 +11,10 @@ source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra ser
 
 `docker/Dockerfile`은 migration을 자동 실행하지 않는다. migration 누락 상태로 새 API/worker를 기동하지 않는다.
 
+## 0.6.14 release boundary
+
+0.6.14 (annotated tag `0.6.14` on dev merge `77c4b127b44c285f373525c86155c6d8ce99ab76`, published 2026-11-10, not deployed) adds OpenAI media/realtime model coverage, the admission/wallet/refusal fixes, bootstrap schema repair and dev's MCP registry work. Production is at 0.6.13 with the ledger at 028, so a rollout applies migrations 029, 030 and 031 in order before the API starts; 030 aborts with 1062 on duplicate `chat_runs` idempotency keys (0 found on 2026-11-10) and the schema repair is default deny. Image and wheel digests are in CHANGELOG 0.6.14.
+
 ## 0.6.13 standard-role release boundary
 
 Candidate0.6.13 is scoped from current remote dev c4527de / published0.6.12, not the separate dirty release/lumen-0.6.5 checkout. It changes native role defaults and actual OpenID classification only. It does not include Pi, CHAT3/durable4, historical account027 rewrites, dependency changes or new SQL. Published Kubernetes027 and forward028, existing Bifrost binary, protocol1/2 and SDK/plugin/sandbox versions remain byte-compatible.
