@@ -344,7 +344,7 @@ class TestCatalog:
 
         monkeypatch.setattr(mcp_connections.mcp_client, "discover_tools", fail)
         result = await mcp_connections.refresh_catalog(5, user_id=None, project_id=None)
-        assert result == {"status": "failed", "error": "MCP 도구 검색 실패: TimeoutError", "diff": None}
+        assert result == {"status": "failed", "error": "MCP 도구 검색 실패: unexpected error", "diff": None}
         server_id, tools, error = store.catalog_writes[0]
         assert tools is None
         assert "secret" not in error and "token" not in error
@@ -419,3 +419,40 @@ class TestRoutes:
 
         monkeypatch.setattr(es, "get_global_mcp_revealed", missing)
         assert (await admin_client.post(f"{ADMIN_CONNECTIONS}/999/catalog/refresh")).status_code == 404
+
+
+def test_remote_tool_error_text_reaches_the_model_and_generic_failures_stay_generic():
+    from lumen_plugin_api.contracts import PluginError
+
+    from lumen.services.tool_runtime import bindings as tool_runtime
+
+    remote = tool_runtime._v2_mcp_failure(
+        PluginError("mcp_tool_error", "원격 MCP 도구가 오류를 반환했습니다 [x]: bad (재시도 불가)")
+    )
+    assert remote.model_content == "원격 MCP 도구가 오류를 반환했습니다 [x]: bad (재시도 불가)"
+    assert remote.error_code == "mcp_tool_error"
+    unavailable = tool_runtime._v2_mcp_failure(PluginError("plugin_unavailable"))
+    assert unavailable.model_content.startswith("The MCP server could not complete the request")
+    assert unavailable.error_code == "plugin_unavailable"
+
+
+async def test_refresh_failure_reports_only_the_consumer_safe_plugin_text(monkeypatch, store):
+    from lumen_plugin_api.contracts import PluginError
+
+    store.rows.append({"id": 5, "tools": []})
+    monkeypatch.setattr(es, "get_global_mcp_revealed", _reveal({"id": 5, "is_active": True, "auth_mode": "none"}))
+
+    async def timed_out(server):
+        raise PluginError("mcp_server_error", "The MCP server did not respond within 15 seconds. Try again later.")
+
+    monkeypatch.setattr(mcp_connections.mcp_client, "discover_tools", timed_out)
+    result = await mcp_connections.refresh_catalog(5, user_id=None, project_id=None)
+    assert result["error"] == "MCP 도구 검색 실패: The MCP server did not respond within 15 seconds. Try again later."
+
+    async def internal(server):
+        raise PluginError("plugin_unavailable", "Public HTTP capability is required")
+
+    monkeypatch.setattr(mcp_connections.mcp_client, "discover_tools", internal)
+    result = await mcp_connections.refresh_catalog(5, user_id=None, project_id=None)
+    assert result["error"] == f"MCP 도구 검색 실패: {mcp_connections.mcp_client.CONNECTION_FAILURE_TEXT}"
+    assert "capability" not in result["error"]

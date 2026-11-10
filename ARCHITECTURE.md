@@ -547,9 +547,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b78dcc01c0fd13113f5a1be0e2b07e61c4868f0d6f3448f7dd312558565c2b97",
-  "reviewed_at": "2026-11-10T09:51:12Z",
-  "summary": "API docs: scripts/gen_api_docs.py generates reference.md and schemas.md from live OpenAPI; docs/api group READMEs corrected against SCOPE_CAPABILITIES; MCP catalog refresh fix (discover_tools context optional) with regression"
+  "source_sha256": "bb2398ef67746297ad8c1bad772475f8c7bef03501bcc1bdd76e1a694ca90b07",
+  "reviewed_at": "2026-11-10T10:46:07Z",
+  "summary": "Remote MCP failure classification: ToolException isinstance and adapter block text; server-level mcp_server_error for timeout, rejected credentials, HTTP status and unreachable with fixed texts; one shared consumer message across v2, legacy and catalog refresh; formatting noise removed from the earlier commit"
 }
 ```
 <!-- architecture-review:end -->

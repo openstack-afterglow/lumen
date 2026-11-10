@@ -158,8 +158,9 @@ async def refresh_catalog(server_id: int, *, user_id: str | None, project_id: st
     try:
         tools = await mcp_client.discover_tools(server)
     except Exception as exc:
-        # Only the exception type is reported: messages can echo URLs or headers.
-        error = f"MCP 도구 검색 실패: {type(exc).__name__}"
+        # Only the plugin's consumer-safe text is reported; anything else stays generic (no type names, URLs or headers).
+        detail = mcp_client.consumer_message(exc) or "unexpected error"
+        error = f"MCP 도구 검색 실패: {detail}"
         await es.record_catalog(server_id, tools=None, error=error)
         return {"status": "failed", "error": error, "diff": None}
     current = catalog_from_tools(tools)

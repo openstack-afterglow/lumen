@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from langchain_core.tools import ToolException
 from lumen_plugin_api.contracts import (
     ExecutionContext,
     Namespace,
@@ -174,6 +175,81 @@ class RemoteTransport:
 def _fingerprint(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
+_TOOL_TEXT_LIMIT = 500
+_UNREACHABLE_TEXT = "The MCP server could not be reached. Check its URL and availability, then try again."
+_REJECTED_TEXT = "The MCP server rejected the connection's credentials. Reconnect it (re-authorize for OAuth), then try again."
+
+
+def _single_line(value: object, limit: int = _TOOL_TEXT_LIMIT) -> str:
+    """One bounded line; control characters are removed so server text cannot forge log lines."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value))
+    return re.sub(r" {2,}", " ", text).strip()[:limit]
+
+
+def _tool_error_text(exc: ToolException) -> str:
+    """Text the remote server reported for a failed tool call.
+
+    The adapter raises with the converted content blocks as its first argument; a multi-block error is
+    joined block by block (never the Python repr of the list). A JSON {"error": {...}} body is rendered
+    from its code, field, message and retryable flag only.
+    """
+    blocks = exc.args[0] if exc.args else None
+    if isinstance(blocks, str):
+        raw = blocks
+    elif isinstance(blocks, list):
+        raw = "\n".join(str(block.get("text", "")) for block in blocks if isinstance(block, dict) and block.get("type") == "text")
+    else:
+        raw = ""
+    raw = raw or str(exc)
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        code = _single_line(error.get("code") or "unknown", 80)
+        field = _single_line(error.get("field") or "", 80)
+        message = _single_line(error.get("message") or "")
+        retry = "가능" if error.get("retryable") is True else "불가"
+        where = f" ({field})" if field else ""
+        return f"원격 MCP 도구가 오류를 반환했습니다 [{code}]{where}: {message} (재시도 {retry})"
+    text = _single_line(raw)
+    return f"원격 MCP 도구가 오류를 반환했습니다: {text}" if text else "원격 MCP 도구가 오류를 반환했습니다."
+
+
+def _leaves(exc: BaseException):
+    if isinstance(exc, BaseExceptionGroup):
+        for child in exc.exceptions:
+            yield from _leaves(child)
+    else:
+        yield exc
+
+
+def remote_failure(exc: BaseException) -> PluginError | None:
+    """Consumer-safe error for a failure of the remote MCP server, or None to keep the failure generic.
+
+    Exposed: the server's own tool error fields, the timeout length, the HTTP status class, and fixed texts.
+    Never exposed: URLs, headers, credentials, exception type names, or stack traces. Plugin errors that the
+    host raised itself pass through unchanged so their existing codes stay in force.
+    """
+    if isinstance(exc, PluginError):
+        return None
+    for leaf in _leaves(exc):
+        if isinstance(leaf, ToolException):
+            return PluginError("mcp_tool_error", _tool_error_text(leaf))
+        if isinstance(leaf, TimeoutError):
+            return PluginError("mcp_server_error", f"The MCP server did not respond within {_TIMEOUT} seconds. Try again later.")
+        if isinstance(leaf, httpx.HTTPStatusError):
+            status = leaf.response.status_code
+            if status in (401, 403):
+                return PluginError("mcp_server_error", _REJECTED_TEXT)
+            return PluginError("mcp_server_error", f"The MCP server returned HTTP {status}. Try again later.")
+        if isinstance(leaf, httpx.HTTPError):
+            return PluginError("mcp_server_error", _UNREACHABLE_TEXT)
+    return None
+
+
+
 
 class RemoteMcp:
     manifest = PluginManifest(id="remote-mcp", kind="mcp", version="0.1.1", required_capabilities=("extensions", "public_http", "mcp_connections"))
@@ -207,7 +283,13 @@ class RemoteMcp:
 
     async def list_tools(self, server: dict[str, Any], *, context: ExecutionContext | None = None) -> list[dict[str, Any]]:
         transport, _ = self._ready()
-        return await transport.list_tools(server, context=context)
+        try:
+            return await transport.list_tools(server, context=context)
+        except Exception as exc:
+            mapped = remote_failure(exc)
+            if mapped is None:
+                raise
+            raise mapped from None
 
     async def call_tool(self, server: dict[str, Any], name: str, arguments: dict[str, Any], *, context: ExecutionContext, expected_credential_epoch: int | None) -> McpToolOutput:
         transport, _ = self._ready()
@@ -218,7 +300,13 @@ class RemoteMcp:
             raise PluginError("plugin_authority_revoked")
         if _fingerprint({k: v for k, v in current.items() if k != "headers"}) != expected_configuration:
             raise PluginError("plugin_configuration_changed")
-        return await transport.call_tool(current, name, arguments, context=context)
+        try:
+            return await transport.call_tool(current, name, arguments, context=context)
+        except Exception as exc:
+            mapped = remote_failure(exc)
+            if mapped is None:
+                raise
+            raise mapped from None
 
     async def detect(self, server_id: int, namespace: Namespace) -> dict[str, Any]:
         return await self._ready()[1].detect(server_id, namespace)

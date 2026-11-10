@@ -46,8 +46,8 @@ def _v2_mcp_result(value: str | mcp_client.McpToolOutput) -> V2ToolExecutionResu
 
 
 def _v2_mcp_failure(error: PluginError) -> V2ToolExecutionResult:
-    """Expose only fixed text and a typed code, never provider exception details."""
-    content = {
+    """Consumer-safe text: the plugin's own message for remote-server codes, fixed text for everything else."""
+    content = mcp_client.consumer_message(error) or {
         "plugin_authority_revoked": "The selected MCP authority is no longer available.",
         "plugin_configuration_changed": "The selected MCP configuration has changed.",
         "plugin_incompatible": "The selected MCP provider is incompatible.",

@@ -8,14 +8,32 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from lumen_plugin_api.contracts import ExecutionContext
+from lumen_plugin_api.contracts import ExecutionContext, PluginError
 from lumen_plugin_api.mcp import McpGeneratedFile, McpRemoteProvider, McpToolOutput
 
 from lumen.plugins.registry import get_plugin
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["McpGeneratedFile", "McpToolOutput", "list_tools", "call_tool"]
+__all__ = ["McpGeneratedFile", "McpToolOutput", "consumer_message", "list_tools", "call_tool"]
+
+# Codes whose message the plugin wrote for consumers, plus the one connection-level text every path shares.
+_CONSUMER_CODES = frozenset({"mcp_tool_error", "mcp_server_error"})
+CONNECTION_FAILURE_TEXT = "The MCP server could not complete the request. Check the connection status and try again."
+
+
+def consumer_message(exc: BaseException) -> str | None:
+    """Safe consumer-facing text for a remote MCP failure, or None when the failure must stay generic.
+
+    A host-side plugin_unavailable carries internal wording, so only the fixed connection text is returned for it.
+    """
+    if not isinstance(exc, PluginError):
+        return None
+    if exc.code in _CONSUMER_CODES:
+        return str(exc)
+    if exc.code == "plugin_unavailable":
+        return CONNECTION_FAILURE_TEXT
+    return None
 
 
 def _provider() -> McpRemoteProvider:

@@ -53,12 +53,11 @@ async def _execute_mcp_tool(name: str, args: dict, ctx: ToolContext) -> str | co
             expected_credential_epoch=expected_epoch,
         )
     except PluginError as error:
-        return contracts.ToolExecutionResult(
-            "MCP 도구 실행 중 오류가 발생했습니다.", warning_code=error.code, status="failed",
-        )
+        text = mcp_client.consumer_message(error) or "MCP 도구 실행 중 오류가 발생했습니다."
+        return contracts.ToolExecutionResult(text, warning_code=error.code, status="failed")
     except Exception:
         return contracts.ToolExecutionResult(
-            "MCP 도구 실행 중 오류가 발생했습니다.", warning_code="plugin_unavailable", status="failed",
+            mcp_client.CONNECTION_FAILURE_TEXT, warning_code="plugin_unavailable", status="failed",
         )
     return result.text if isinstance(result, mcp_client.McpToolOutput) else result
 
@@ -98,7 +97,7 @@ async def context_execute_result(name: str, args: dict, ctx: ToolContext) -> con
             return contracts.ToolExecutionResult(
                 "MCP 도구 실행 중 오류가 발생했습니다."
                 if binding.definition.source == "mcp" and result.status == "failed" and result.error_code in {
-                    "plugin_authority_revoked", "plugin_configuration_changed", "plugin_unavailable", "plugin_incompatible",
+                    "plugin_authority_revoked", "plugin_configuration_changed", "plugin_incompatible",
                 }
                 else result.model_content,
                 visible=bool(result.display or result.artifacts),

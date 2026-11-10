@@ -33,7 +33,7 @@ uv run --project ../../.. python openai_chat.py
   - `mcp_catalog_refresh.py`: 공개 MCP 서버 `CertScore.ai MCP Light`에 실제 `tools/list` 호출, `status: ok`, 도구 4개.
   - 같은 `template_key`로 연결 2개(`label` a, b)를 만들고 각각 새로고침, 소유자 활성화 후 v2 run에서 `list_available_tools`가 후보 8개(연결당 4개)를 돌려줬다.
   - `native_run_mcp.py`(자동 승인 꺼짐): 승인 요청 `mcp__2__certscore_get_scan_status_*`(effect `external_mutation`)에서 멈추고 종료 코드 3.
-  - `native_run_mcp.py`(자동 승인 켜짐): 승인 후 원격 MCP 서버에 도달했다. 서버는 `invalid_scan_id`로 응답했다. 검증에 쓴 scanId가 임의 값이었기 때문이다. 채팅 결과는 `plugin_unavailable`로 보고되었고, 이는 원격 도구 오류가 일반 실패로 매핑되는 결함이다. 종료 코드 1.
+  - `native_run_mcp.py`(자동 승인 켜짐): 승인 후 원격 MCP 서버에 도달했다. 서버는 `invalid_scan_id`로 응답했다. 검증에 쓴 scanId가 임의 값이었기 때문이다. 수정 전 채팅 결과는 `plugin_unavailable`로 보고되었다. 수정 후 직접 호출 확인에서 같은 원격 오류가 `mcp_tool_error`(코드 `invalid_scan_id`, 필드 `scanId`, 재시도 불가)로 전달됨을 확인했다. 종료 코드 1.
 - 검증하지 않은 것: 유효한 scanId를 얻는 스캔 시작(외부 서비스에 작업을 만든다), 도구 성공 응답, 실제 Keystone 인증과 운영 클러스터, Afterglow 연동.
 - 로컬 Compose의 `seed-local`은 실제 Keystone 권한을 요구해 전체 스택 시드에 실패했다. 이 검증은 합성 Keystone으로 수행했다.
 

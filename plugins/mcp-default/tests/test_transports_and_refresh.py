@@ -127,3 +127,87 @@ async def test_unrefreshable_token_fails_closed():
     plugin, _, _ = _plugin(_credential(10), fail=True)
     with pytest.raises(PluginError):
         await plugin._server(9, SimpleNamespace(user_id="u", project_id="p"))
+
+
+def _adapter_tool_error(*texts: str):
+    """Raise through the adapter's real isError=True conversion, not a hand-built exception."""
+    from langchain_mcp_adapters.tools import _convert_call_tool_result
+    from mcp.types import CallToolResult, TextContent
+
+    result = CallToolResult(content=[TextContent(type="text", text=text) for text in texts], isError=True)
+    try:
+        _convert_call_tool_result(result)
+    except Exception as exc:  # the adapter's ToolException subclass
+        return exc
+    raise AssertionError("isError=True must be converted into a tool exception")
+
+
+def test_adapter_tool_error_exposes_code_field_message_and_retry_only():
+    from lumen_mcp_default.remote import remote_failure
+
+    exc = _adapter_tool_error(
+        '{"error":{"code":"invalid_scan_id","field":"scanId","message":"Use the UUID.","retryable":false}}'
+    )
+    mapped = remote_failure(exc)
+    assert mapped.code == "mcp_tool_error"
+    assert str(mapped) == "원격 MCP 도구가 오류를 반환했습니다 [invalid_scan_id] (scanId): Use the UUID. (재시도 불가)"
+
+
+def test_multi_block_adapter_error_is_joined_text_not_a_python_repr():
+    from lumen_mcp_default.remote import remote_failure
+
+    mapped = remote_failure(_adapter_tool_error("first line", "second block"))
+    assert mapped.code == "mcp_tool_error"
+    assert str(mapped) == "원격 MCP 도구가 오류를 반환했습니다: first line second block"
+
+
+def test_tool_error_text_is_single_line_and_bounded():
+    from lumen_mcp_default.remote import remote_failure
+
+    mapped = remote_failure(_adapter_tool_error("line1\nline2" + "a" * 2000))
+    assert "\n" not in str(mapped) and len(str(mapped)) < 700
+
+
+def test_timeout_is_a_fixed_retryable_server_message():
+    from lumen_mcp_default.remote import _TIMEOUT, remote_failure
+
+    mapped = remote_failure(TimeoutError())
+    assert mapped.code == "mcp_server_error"
+    assert str(mapped) == f"The MCP server did not respond within {_TIMEOUT} seconds. Try again later."
+
+
+def test_timeout_is_found_inside_an_exception_group():
+    from lumen_mcp_default.remote import remote_failure
+
+    assert remote_failure(ExceptionGroup("wrapped", [TimeoutError()])).code == "mcp_server_error"
+
+
+def test_http_status_maps_to_rejection_or_status_text_without_the_url():
+    import httpx
+    from lumen_mcp_default.remote import remote_failure
+
+    def status(code: int):
+        request = httpx.Request("POST", "https://internal.example/mcp?token=secret")
+        return httpx.HTTPStatusError("boom", request=request, response=httpx.Response(code, request=request))
+
+    rejected = remote_failure(status(401))
+    assert rejected.code == "mcp_server_error" and "rejected the connection's credentials" in str(rejected)
+    server_error = remote_failure(status(500))
+    assert str(server_error) == "The MCP server returned HTTP 500. Try again later."
+    assert "internal.example" not in str(rejected) + str(server_error)
+
+
+def test_unreachable_server_is_fixed_text_without_the_url():
+    import httpx
+    from lumen_mcp_default.remote import remote_failure
+
+    mapped = remote_failure(httpx.ConnectError("refused https://internal.example/mcp"))
+    assert mapped.code == "mcp_server_error" and "could not be reached" in str(mapped)
+    assert "internal.example" not in str(mapped)
+
+
+def test_unknown_failures_and_host_plugin_errors_are_not_reclassified():
+    from lumen_mcp_default.remote import remote_failure
+
+    assert remote_failure(ConnectionError("https://internal.example/secret")) is None
+    assert remote_failure(PluginError("plugin_unavailable", "Public HTTP capability is required")) is None

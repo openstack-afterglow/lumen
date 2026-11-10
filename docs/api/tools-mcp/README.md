@@ -54,7 +54,7 @@ curl -sS "http://127.0.0.1:8012/v1/mcp-servers?active_only=true" \
 
 도구 이름은 `mcp__<연결 ID>__<도구 이름>_<해시>`다. 같은 원격 서버를 가리키는 연결 두 개를 고르면 도구가 두 번 나타나며, 이름의 연결 ID로 구분된다.
 
-검증된 예제는 [examples/native_run_mcp.py](../examples/native_run_mcp.py)다. 원격 도구 오류가 `plugin_unavailable`로 보고되는 매핑 결함이 알려져 있다. 원인은 서버 응답으로 따로 확인해야 한다.
+검증된 예제는 [examples/native_run_mcp.py](../examples/native_run_mcp.py)다. 원격 도구 오류는 서버가 보고한 코드·필드·메시지·재시도 여부를 담은 `mcp_tool_error`로 전달된다. 원격 서버 자체의 실패(시간 초과, 인증 거부, HTTP 오류, 연결 불가)는 `mcp_server_error`와 고정 문구로 전달된다. 원격 오류 메시지는 서버가 쓴 문장이므로 그대로 신뢰하지 않는다.
 
 ## 제약
 

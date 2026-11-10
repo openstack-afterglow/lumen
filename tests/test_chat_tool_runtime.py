@@ -655,11 +655,12 @@ class TestRemoteMcpSafety:
         session = contracts.ToolBindingSession(legacy_preloaded=True, legacy_bindings={binding.definition.name: binding})
         dynamic = await tool_runtime.context_execute_result(binding.definition.name, {}, replace(ctx, binding_session=session))
         direct = await tool_runtime.context_execute_result("mcp__7__search", {}, ctx)
+        expected = bindings.mcp_client.CONNECTION_FAILURE_TEXT if code in (None, "plugin_unavailable") else "MCP 도구 실행 중 오류가 발생했습니다."
         for result in (dynamic, direct):
             assert result.status == "failed"
             assert result.warning_code == (code or "plugin_unavailable")
             assert result.visible is True
-            assert result.content == "MCP 도구 실행 중 오류가 발생했습니다."
+            assert result.content == expected
         assert await tool_runtime.context_execute("mcp__7__search", {}, ctx) == direct.content
 
 

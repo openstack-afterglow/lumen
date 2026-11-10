@@ -47,7 +47,9 @@
 
 - run이 생성되어 `awaiting_input`이 되었고, 승인 요청 `mcp__2__certscore_get_scan_status_*`(effect `external_mutation`)가 나왔다.
 - 승인 후 호출이 원격 MCP 서버에 도달했다. 서버는 `invalid_scan_id`로 응답했다. 검증 입력의 scanId가 임의 값이었기 때문이다. 유효한 scanId는 `certscore_scan_site`로 실제 스캔을 시작해야 얻는다. 이 검증은 외부 스캔을 시작하지 않았다.
-- 이 실패는 채팅 결과에서 `plugin_unavailable`로 보고된다. 원격 도구 오류가 일반 실패로 매핑되는 결함이다(`lumen/services/tool_runtime/bindings.py`의 `except Exception`). 수정 전까지 원인은 서버 로그와 직접 호출로만 확인된다.
+- 원격 도구가 오류를 반환하면 채팅 결과에 그 내용이 나온다: `원격 MCP 도구가 오류를 반환했습니다 [코드] (필드): 서버 메시지 (재시도 가능|불가)`. 이벤트의 `error_code`는 `mcp_tool_error`다. 서버의 코드·필드·메시지·재시도 여부만 전달하고, 연결 주소와 내부 예외는 전달하지 않는다. 메시지는 한 줄, 최대 500자로 잘린다.
+- 원격 서버 자체의 실패는 `mcp_server_error`다. 종류별 고정 문구를 쓴다. 시간 초과(`The MCP server did not respond within 15 seconds. Try again later.`), 인증 거부(`... rejected the connection's credentials. Reconnect it (re-authorize for OAuth), then try again.`), HTTP 오류 상태(`The MCP server returned HTTP <상태>. Try again later.`), 연결 불가(`The MCP server could not be reached. ...`). URL과 헤더는 포함하지 않는다.
+- 그 밖의 실패(호스트 내부 실패 등)는 `plugin_unavailable`이며, 메시지는 "The MCP server could not complete the request. Check the connection status and try again."다. 호스트 내부 문구는 노출하지 않는다.
 
 ## 대화 관리
 
