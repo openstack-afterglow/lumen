@@ -30,6 +30,11 @@ async def list_tools(server: dict[str, Any], *, context: ExecutionContext | None
         return []
 
 
+async def discover_tools(server: dict[str, Any], *, context: ExecutionContext) -> list[dict[str, Any]]:
+    """Strict discovery for catalog refresh: a failure propagates instead of becoming an empty catalog."""
+    return await _provider().list_tools(server, context=context)
+
+
 async def call_tool(server: dict[str, Any], tool_name: str, args: dict[str, Any], *, context: ExecutionContext, expected_credential_epoch: int | None) -> str | McpToolOutput:
     output = await _provider().call_tool(server, tool_name, args, context=context, expected_credential_epoch=expected_credential_epoch)
     return output if output.files else output.text

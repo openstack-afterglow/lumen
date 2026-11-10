@@ -27,6 +27,7 @@ from lumen_plugin_api.tools import GeneratedToolFile, ToolBinding, ToolDefinitio
 from .oauth import RemoteOAuth
 
 _TIMEOUT = 15
+_SSE_READ_TIMEOUT = 60
 _MAX_RESPONSE = 1024 * 1024
 _MAX_TEXT = 6000
 _MAX_FILES = 20
@@ -82,8 +83,8 @@ def result_to_output(result: Any, *, tool_name: str) -> McpToolOutput:
 
 def connection(server: dict[str, Any], http_factory) -> dict[str, Any]:
     transport = (server.get("transport") or "http").lower()
-    if transport not in {"http", "streamable_http", "streamable-http"}:
-        raise ValueError("streamable HTTP MCP transport is required")
+    if transport not in {"http", "streamable_http", "streamable-http", "sse"}:
+        raise ValueError("MCP transport must be streamable HTTP or SSE")
     url = server.get("url") or ""
     parsed = urlsplit(url)
     if parsed.scheme.lower() != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.fragment:
@@ -91,6 +92,8 @@ def connection(server: dict[str, Any], http_factory) -> dict[str, Any]:
     headers = server.get("headers") or {}
     if not isinstance(headers, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items()):
         raise ValueError("MCP headers must be string pairs")
+    if transport == "sse":
+        return {"transport": "sse", "url": url, "headers": headers, "timeout": _TIMEOUT, "sse_read_timeout": _SSE_READ_TIMEOUT, "httpx_client_factory": http_factory}
     return {"transport": "streamable_http", "url": url, "headers": headers, "timeout": _TIMEOUT, "httpx_client_factory": http_factory}
 
 
@@ -239,7 +242,7 @@ class RemoteMcp:
         return await self._ready()[1].headers_for_user(namespace)
 
     async def _server(self, server_id: int, namespace: Namespace) -> tuple[dict[str, Any], int | None]:
-        transport, _ = self._ready()
+        transport, oauth = self._ready()
         server = await self._extensions.resolve("mcp", server_id, namespace)
         if not server.get("is_active") or server.get("id") != server_id:
             raise PluginError("plugin_authority_revoked")
@@ -257,7 +260,12 @@ class RemoteMcp:
                 if expiry.tzinfo is None:
                     expiry = expiry.replace(tzinfo=UTC)
                 if expiry <= datetime.now(UTC) + timedelta(seconds=60):
-                    raise PluginError("plugin_authority_revoked", "OAuth connection requires refresh")
+                    # Refresh at use time. The row is re-read afterwards so the returned epoch matches the stored one.
+                    if await oauth.refresh(credential.id) is None:
+                        raise PluginError("plugin_authority_revoked", "OAuth connection requires reconnection")
+                    credential = await self._connections.connection(server_id, namespace)
+                    if credential is None or credential.status != "active":
+                        raise PluginError("plugin_authority_revoked")
             token = credential.token.get("access_token")
             if not isinstance(token, str) or not token:
                 raise PluginError("plugin_authority_revoked")

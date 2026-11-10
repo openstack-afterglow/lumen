@@ -23,6 +23,13 @@ def _selected(items: list[dict], selected_ids: tuple[int, ...] | None) -> list[d
     return [it for it in items if it.get("id") in allow]
 
 
+def _runtime_selected(items: list[dict], selected_ids: tuple[int, ...] | None) -> list[dict]:
+    """Exact frozen selection. A legacy run with no snapshot (``None``) gets only implicitly selectable sources."""
+    if selected_ids is None:
+        return [it for it in items if it.get("implicit_selection", True)]
+    return _selected(items, selected_ids)
+
+
 def _frozen_selection(items: list[dict], ctx: ToolContext, kind: str) -> list[dict]:
     expected = dict(
         ((entry_kind, identifier), fingerprint)
@@ -110,7 +117,7 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
             logger.info("MCP 서버 %s: 실행 중 인증 값이 변경되었거나 폐기됨 — 노출 스킵", server_id)
             continue
         usable.append(server)
-    return _frozen_selection(_selected(usable, ctx.selected_mcp_ids), ctx, "mcp")
+    return _frozen_selection(_runtime_selected(usable, ctx.selected_mcp_ids), ctx, "mcp")
 
 
 def _mcp_config_fingerprint(server: dict) -> str:

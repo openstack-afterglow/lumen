@@ -14,7 +14,7 @@ import hashlib
 import json
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.crypto import (
@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 
 _MODELS = {"mcp": ChatMcpServer, "tool": ChatCustomTool, "skill": ChatSkill}
 
-# MCP supports only HTTPS streamable HTTP. Local process and legacy SSE transports are rejected.
-_MCP_TRANSPORTS = ("http",)
+# MCP supports hosted streamable HTTP and SSE only. Local process (stdio) transports are rejected.
+_MCP_TRANSPORTS = ("http", "sse")
 
 _AUTH_MODES = ("none", "oauth", "admin")
 _LOAD_POLICIES = ("preloaded", "on_demand")
@@ -115,6 +115,11 @@ def _load_policy(row: ChatMcpServer | ChatCustomTool) -> str:
     return policy if policy in _LOAD_POLICIES else "on_demand"
 
 
+def _stored_tools(raw) -> list[dict]:
+    tools = raw.get("tools") if isinstance(raw, dict) else None
+    return [tool for tool in tools if isinstance(tool, dict)] if isinstance(tools, list) else []
+
+
 def _public_mcp(row: ChatMcpServer) -> dict:
     # Header values remain write-only and are exposed only as administrator configuration state.
     return {
@@ -130,8 +135,15 @@ def _public_mcp(row: ChatMcpServer) -> dict:
         "has_oauth_client_secret": bool(getattr(row, "encrypted_oauth_client_secret", None)),
         "is_active": row.is_active,
         "load_policy": _load_policy(row),
+        "implicit_selection": bool(row.implicit_selection),
         "effect_overrides": row.tool_effect_overrides,
         "config_version": row.config_version,
+        "template_key": row.template_key,
+        "connection_label": row.connection_label,
+        "tools": [{"name": tool.get("name"), "description": tool.get("description")} for tool in _stored_tools(row.tool_catalog)],
+        "tool_count": len(_stored_tools(row.tool_catalog)),
+        "catalog_refreshed_at": _iso(row.catalog_refreshed_at),
+        "catalog_error": row.catalog_error,
         "created_at": _iso(row.created_at),
     }
 
@@ -153,6 +165,7 @@ def _reveal_mcp(row: ChatMcpServer) -> dict:
         "effect_overrides": row.tool_effect_overrides,
         "config_version": row.config_version,
         "load_policy": _load_policy(row),
+        "implicit_selection": bool(row.implicit_selection),
     }
 
 
@@ -350,7 +363,7 @@ def _apply_fields(kind: str, row, fields: dict) -> None:
             row.name = str(fields["name"]).strip()
         if "transport" in fields and fields["transport"]:
             if fields["transport"] not in _MCP_TRANSPORTS:
-                raise ExtensionValidationError("transport 는 http(streamable HTTP)만 지원합니다")
+                raise ExtensionValidationError("transport 는 http(streamable HTTP) 또는 sse 만 지원합니다")
             row.transport = fields["transport"]
         if "url" in fields:
             url = (fields["url"] or "").strip()
@@ -478,6 +491,10 @@ def _apply_fields(kind: str, row, fields: dict) -> None:
         row.load_policy = policy
     if "is_active" in fields and fields["is_active"] is not None:
         row.is_active = bool(fields["is_active"])
+    if "implicit_selection" in fields and fields["implicit_selection"] is not None:
+        if getattr(row, "scope", None) != "global":
+            raise ExtensionValidationError("암묵 선택 정책은 관리자 전역 확장에만 설정할 수 있습니다")
+        row.implicit_selection = bool(fields["implicit_selection"])
 
 
 async def list_global(kind: str) -> list[dict]:
@@ -673,6 +690,9 @@ async def create(
         **_required_defaults.get(kind, {}),
     )
     _apply_fields(kind, row, fields)
+    if kind == "mcp":
+        row.template_key = fields.get("template_key")
+        row.connection_label = fields.get("connection_label")
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
@@ -681,6 +701,45 @@ async def create(
             return _PUBLIC[kind](row)
     except IntegrityError as exc:
         raise ExtensionValidationError("제약 위반(중복 등)") from exc
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def get_global_mcp_revealed(item_id: int) -> dict:
+    """Administrator execution view of one global MCP connection, with decrypted admin headers."""
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            row = await session.get(ChatMcpServer, item_id)
+            if row is None or row.scope != "global":
+                raise ExtensionNotFound(f"{item_id} 를 찾을 수 없습니다")
+            return _reveal_mcp(row)
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def record_catalog(item_id: int, *, tools: list[dict] | None, error: str | None) -> list[dict]:
+    """Store discovery metadata only. It never bumps config_version, so OAuth connections stay valid.
+
+    Returns the previously stored tools so the caller can report what changed. A failure keeps the last good catalog.
+    """
+    factory = _require_db()
+    try:
+        async with factory() as session, session.begin():
+            row = await session.get(ChatMcpServer, item_id)
+            if row is None or row.scope != "global":
+                raise ExtensionNotFound(f"{item_id} 를 찾을 수 없습니다")
+            previous = _stored_tools(row.tool_catalog)
+            if tools is not None:
+                row.tool_catalog = {"tools": tools}
+                row.catalog_refreshed_at = func.utc_timestamp()
+                row.catalog_error = None
+            else:
+                row.catalog_error = (error or "")[:300] or None
+            await session.flush()
+            return previous
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc

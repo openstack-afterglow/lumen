@@ -429,11 +429,16 @@ async def _resolve_extension_selection(
         # A selection nobody spelled out is "whatever is visible", which now
         # includes administrator-installed connector bundles. An unconnected
         # OAuth connector must not be frozen into such a selection.
+        # Registry-installed sources opt out of implicit selection; naming one still selects it.
         implicit_selection = selected_ids is None
         try:
             visible = await es.list_for_user(kind, user_id=user_id, project_id=project_id, active_only=True)
             if selected_ids is None:
-                selected_ids = [item["id"] for item in visible if isinstance(item.get("id"), int)]
+                selected_ids = [
+                    item["id"]
+                    for item in visible
+                    if isinstance(item.get("id"), int) and (kind != "mcp" or item.get("implicit_selection", True))
+                ]
             credential_versions = (
                 await es.mcp_credential_versions(selected_ids, user_id=user_id, project_id=project_id)
                 if kind == "mcp"

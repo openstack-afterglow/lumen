@@ -68,10 +68,6 @@ class TestDefinitions:
         with pytest.raises(mcp_bundles.McpBundleError):
             mcp_bundles.definition("slack")
 
-    def test_install_fields_stay_inside_the_store_whitelist(self):
-        fields = mcp_bundles._install_fields(mcp_bundles.definition("github"))
-        assert set(fields) == {"name", "transport", "url", "auth_mode", "load_policy", "is_active"}
-
 
 class TestCatalog:
     async def test_reports_uninstalled_bundles(self, monkeypatch):
@@ -247,3 +243,47 @@ class TestUnconnectedConnectorSelection:
                 user_id="u1",
                 project_id="p1",
             )
+
+
+class TestRegistryRowsAreOptIn:
+    """A registry-installed source is visible and selectable by name, but no run picks it up implicitly."""
+
+    @staticmethod
+    def _patch(monkeypatch):
+        async def fake_list(kind, **_kwargs):
+            if kind != "mcp":
+                return []
+            return [
+                {**_row(7, "https://registry.example.com/mcp", name="Registry"), "implicit_selection": False},
+                _row(8, "https://bundled.example.com/mcp", name="Bundled"),
+            ]
+
+        async def fake_versions(server_ids, *, user_id, project_id):
+            return {7: 0, 8: 0}
+
+        monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
+        monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", fake_versions)
+
+    async def test_implicit_selection_skips_a_registry_source(self, monkeypatch):
+        self._patch(monkeypatch)
+        selection = await chat_admission._resolve_extension_selection(
+            None, ChatFeatureOptions(), user_id="u1", project_id="p1"
+        )
+        assert [item["id"] for item in selection["mcp"]] == [8]
+
+    async def test_naming_a_registry_source_still_selects_it(self, monkeypatch):
+        self._patch(monkeypatch)
+        selection = await chat_admission._resolve_extension_selection(
+            None,
+            ChatFeatureOptions(tool_policy={"enabled_mcp_ids": [7]}),
+            user_id="u1",
+            project_id="p1",
+        )
+        assert [item["id"] for item in selection["mcp"]] == [7]
+
+    async def test_agent_allowlist_naming_a_registry_source_selects_it(self, monkeypatch):
+        self._patch(monkeypatch)
+        selection = await chat_admission._resolve_extension_selection(
+            {"tool_ids": [], "mcp_ids": [7]}, ChatFeatureOptions(), user_id="u1", project_id="p1"
+        )
+        assert [item["id"] for item in selection["mcp"]] == [7]

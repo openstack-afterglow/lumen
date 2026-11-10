@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from lumen.auth import ensure_scopes, require_admin, require_scopes
 from lumen.services import extensions_store as es
-from lumen.services import mcp_bundles, mcp_oauth
+from lumen.services import mcp_bundles, mcp_connections, mcp_oauth, mcp_registry_catalog, mcp_registry_model
 
 admin_router = APIRouter(dependencies=[Depends(require_admin)])
 user_router = APIRouter()
@@ -55,6 +55,39 @@ class AdminMcpServerBody(McpServerBody):
     oauth_client_id: str | None = Field(default=None, max_length=512)
     oauth_client_secret: str | None = Field(default=None, max_length=4096)
     load_policy: Literal["preloaded", "on_demand"] | None = None
+
+
+class AdminMcpRegistryInstallBody(BaseModel):
+    """Administrator install of one GitHub MCP Registry entry. Supply only the values that entry needs."""
+
+    variables: dict[str, str] | None = None
+    auth_mode: Literal["none", "oauth", "admin"] | None = None
+    headers: dict[str, str] | None = None
+    label: str | None = Field(default=None, max_length=100)
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+
+class AdminMcpConnectionBody(BaseModel):
+    """A global connection: one authorized view of a service, with its own label, credentials and permissions."""
+
+    name: str = Field(min_length=1, max_length=100)
+    url: str = Field(min_length=1, max_length=500)
+    transport: Literal["http", "sse"] = "http"
+    auth_mode: Literal["none", "oauth", "admin"] = "none"
+    template_key: str | None = Field(default=None, max_length=100)
+    label: str | None = Field(default=None, max_length=100)
+    headers: dict[str, str] | None = None
+    implicit_selection: bool = False
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+
+class AdminMcpConnectionPatchBody(BaseModel):
+    """Credential or availability change. Each one bumps config_version, as any authority change does."""
+
+    headers: dict[str, str] | None = None
+    is_active: bool | None = None
+    implicit_selection: bool | None = None
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
 
 class CustomToolBody(BaseModel):
@@ -121,7 +154,7 @@ async def admin_list_mcp_bundles():
 
 
 @admin_router.post("/admin/mcp-bundles/{slug}/install")
-async def admin_install_mcp_bundle(slug: str):
+async def admin_install_mcp_bundle(slug: str, label: str | None = None):
     """Materialize one built-in bundle as a global MCP source.
 
     Idempotent by destination: a second call returns the existing row untouched
@@ -129,11 +162,110 @@ async def admin_install_mcp_bundle(slug: str):
     revokes every user's OAuth connection to that server.
     """
     try:
-        return await mcp_bundles.install(slug)
+        return await mcp_bundles.install(slug, label=label)
     except mcp_bundles.McpBundleError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except _EXC as exc:
         raise _http(exc) from exc
+
+
+@admin_router.get("/admin/mcp-registry")
+async def admin_list_mcp_registry():
+    """List every GitHub MCP Registry entry with its access state and install state."""
+    try:
+        return {"entries": await mcp_registry_catalog.catalog()}
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@admin_router.post("/admin/mcp-registry/install-all")
+async def admin_install_mcp_registry_all():
+    """Install every entry that needs no administrator-supplied value.
+
+    Idempotent by destination: rows that already exist are reported and left unchanged.
+    """
+    try:
+        return await mcp_registry_catalog.install_all()
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@admin_router.post("/admin/mcp-registry/{entry_id}/install")
+async def admin_install_mcp_registry_entry(entry_id: str, body: AdminMcpRegistryInstallBody):
+    """Install one registry entry as a global MCP source.
+
+    Idempotent by destination: a second call returns the existing row untouched rather than rewriting it.
+    """
+    try:
+        return await mcp_registry_catalog.install(
+            entry_id, variables=body.variables, auth_mode=body.auth_mode, label=body.label, headers=body.headers
+        )
+    except mcp_registry_model.McpRegistryNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except mcp_registry_model.McpRegistryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@admin_router.get("/admin/mcp-connections")
+async def admin_list_mcp_connections():
+    """Every global connection with its transport, auth mode, label, tool catalog and refresh state."""
+    try:
+        return {"connections": await mcp_connections.list_connections()}
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@admin_router.post("/admin/mcp-connections", status_code=201)
+async def admin_create_mcp_connection(body: AdminMcpConnectionBody):
+    """Create a connection, or return the one that already has this template and label, unchanged."""
+    try:
+        return await mcp_connections.create_connection(
+            name=body.name,
+            url=body.url,
+            transport=body.transport,
+            auth_mode=body.auth_mode,
+            headers=body.headers,
+            template_key=body.template_key,
+            label=body.label,
+            implicit_selection=body.implicit_selection,
+        )
+    except mcp_registry_model.McpRegistryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@admin_router.patch("/admin/mcp-connections/{item_id}")
+async def admin_update_mcp_connection(item_id: int, body: AdminMcpConnectionPatchBody):
+    """Change credentials or availability. The patch is a full authority change, so config_version advances."""
+    try:
+        return await es.update("mcp", item_id, body.model_dump(exclude_unset=True), admin=True)
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@admin_router.post("/admin/mcp-connections/{item_id}/catalog/refresh")
+async def admin_refresh_mcp_connection_catalog(item_id: int, token_info: dict = Depends(require_admin)):
+    """Re-discover one connection's tools. An OAuth connection is discovered with the caller's own token."""
+    try:
+        return await mcp_connections.refresh_catalog(
+            item_id, user_id=token_info.get("user_id"), project_id=token_info.get("project_id")
+        )
+    except mcp_registry_model.McpRegistryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@admin_router.delete("/admin/mcp-connections/{item_id}", status_code=204)
+async def admin_delete_mcp_connection(item_id: int):
+    try:
+        await es.delete("mcp", item_id, admin=True)
+    except _EXC as exc:
+        raise _http(exc) from exc
+    return Response(status_code=204)
 
 
 @admin_router.get("/admin/mcp-servers")
