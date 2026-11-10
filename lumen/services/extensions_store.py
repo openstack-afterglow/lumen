@@ -135,7 +135,6 @@ def _public_mcp(row: ChatMcpServer) -> dict:
         "has_oauth_client_secret": bool(getattr(row, "encrypted_oauth_client_secret", None)),
         "is_active": row.is_active,
         "load_policy": _load_policy(row),
-        "implicit_selection": bool(row.implicit_selection),
         "effect_overrides": row.tool_effect_overrides,
         "config_version": row.config_version,
         "template_key": row.template_key,
@@ -165,7 +164,6 @@ def _reveal_mcp(row: ChatMcpServer) -> dict:
         "effect_overrides": row.tool_effect_overrides,
         "config_version": row.config_version,
         "load_policy": _load_policy(row),
-        "implicit_selection": bool(row.implicit_selection),
     }
 
 
@@ -491,10 +489,6 @@ def _apply_fields(kind: str, row, fields: dict) -> None:
         row.load_policy = policy
     if "is_active" in fields and fields["is_active"] is not None:
         row.is_active = bool(fields["is_active"])
-    if "implicit_selection" in fields and fields["implicit_selection"] is not None:
-        if getattr(row, "scope", None) != "global":
-            raise ExtensionValidationError("암묵 선택 정책은 관리자 전역 확장에만 설정할 수 있습니다")
-        row.implicit_selection = bool(fields["implicit_selection"])
 
 
 async def list_global(kind: str) -> list[dict]:

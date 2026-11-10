@@ -464,8 +464,6 @@ class ChatMcpServer(Base):
     load_policy: Mapped[str] = mapped_column(
         VARCHAR(16), nullable=False, default="on_demand", server_default="on_demand"
     )
-    # False: an administrator-registered source the user must name; never frozen into implicit runs.
-    implicit_selection: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True, server_default="1")
     # Template identity: several global connections may share a template and differ by label.
     template_key: Mapped[str | None] = mapped_column(VARCHAR(100))
     connection_label: Mapped[str | None] = mapped_column(VARCHAR(100))

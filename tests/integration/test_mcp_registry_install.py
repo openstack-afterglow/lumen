@@ -1,8 +1,8 @@
-"""Real MariaDB: a registry-installed MCP source is opt-in in actual chat admission.
+"""Real MariaDB: a registry-installed source is published globally but runs only after owner activation.
 
-Uses the real ``extensions_store.create`` path and the real ``chat_admission`` selection. The DNS policy is
-replaced because the hosts are deliberately non-resolving; unit tests cover URL validation.
-``install_all`` is not called here, because it would write the whole shipped catalog into the shared database.
+Uses the real ``mcp_registry_catalog.install`` path, the real ``extensions_store`` rows and migrated schema, and
+the real ``chat_admission`` selection. The DNS policy is replaced because the hosts are deliberately non-resolving.
+``install_all`` is not called, because it would write the whole shipped catalog into the shared database.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import os
 import uuid
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import delete
 
 from lumen.db import close_db, get_session_factory, init_db
@@ -35,16 +36,14 @@ async def database(monkeypatch):
     await close_db()
 
 
-async def test_registry_source_is_opt_in_against_real_admission(database, monkeypatch):
+async def test_registry_source_runs_only_after_owner_activation(database, monkeypatch):
     token = uuid.uuid4().hex[:10]
-    registry_url = f"https://registry-{token}.invalid/mcp"
-    bundle_url = f"https://bundle-{token}.invalid/mcp"
     entry = {
         "id": f"reg-{token}",
         "registry_name": f"org/reg-{token}",
         "name": f"Registry {token}",
         "description": "",
-        "url": registry_url,
+        "url": f"https://registry-{token}.invalid/mcp",
         "transport": "http",
         "variables": [],
         "header_hints": [],
@@ -55,41 +54,29 @@ async def test_registry_source_is_opt_in_against_real_admission(database, monkey
 
     installed = await catalog.install(entry["id"])
     assert installed["created"] is True
-    registry_id = installed["server"]["id"]
-    database.append(registry_id)
-    assert installed["server"]["implicit_selection"] is False
-
+    server = installed["server"]
+    database.append(server["id"])
     again = await catalog.install(entry["id"])
-    assert again["created"] is False
-    assert again["server"]["id"] == registry_id
-
-    bundle = await es.create(
-        "mcp",
-        {
-            "name": f"Bundle {token}",
-            "transport": "http",
-            "url": bundle_url,
-            "auth_mode": "none",
-            "load_policy": "on_demand",
-            "is_active": True,
-        },
-        scope="global",
-    )
-    database.append(bundle["id"])
-    assert bundle["implicit_selection"] is True
+    assert again["created"] is False and again["server"]["id"] == server["id"]
 
     user, project = f"u-{token}", f"p-{token}"
-    implicit = await chat_admission._resolve_extension_selection(
+    before = await chat_admission._resolve_extension_selection(
         None, ChatFeatureOptions(), user_id=user, project_id=project
     )
-    implicit_ids = {item["id"] for item in implicit["mcp"]}
-    assert bundle["id"] in implicit_ids
-    assert registry_id not in implicit_ids
+    assert server["id"] not in {item["id"] for item in before["mcp"]}, "publication is not owner consent"
 
-    named = await chat_admission._resolve_extension_selection(
-        None,
-        ChatFeatureOptions(tool_policy={"enabled_mcp_ids": [registry_id]}),
-        user_id=user,
-        project_id=project,
+    with pytest.raises(HTTPException):
+        await chat_admission._resolve_extension_selection(
+            None,
+            ChatFeatureOptions(tool_policy={"enabled_mcp_ids": [server["id"]]}),
+            user_id=user,
+            project_id=project,
+        )
+
+    await es.set_mcp_activation(
+        server["id"], user_id=user, project_id=project, is_active=True, config_version=server["config_version"]
     )
-    assert [item["id"] for item in named["mcp"]] == [registry_id]
+    after = await chat_admission._resolve_extension_selection(
+        None, ChatFeatureOptions(), user_id=user, project_id=project
+    )
+    assert server["id"] in {item["id"] for item in after["mcp"]}

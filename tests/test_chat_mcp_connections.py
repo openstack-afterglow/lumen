@@ -242,7 +242,6 @@ class TestRegistryInstall:
         assert created["template_key"] == "tmpl"
         assert created["connection_label"] == "team-a"
         assert created["transport"] == "http"
-        assert created["implicit_selection"] is False
 
     async def test_registry_install_passes_the_transport_of_the_entry(self, monkeypatch, store):
         monkeypatch.setattr(registry, "_load", lambda: (_entry(transport="sse", url="https://s.example.com/sse"),))

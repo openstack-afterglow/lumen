@@ -77,7 +77,6 @@ class AdminMcpConnectionBody(BaseModel):
     template_key: str | None = Field(default=None, max_length=100)
     label: str | None = Field(default=None, max_length=100)
     headers: dict[str, str] | None = None
-    implicit_selection: bool = False
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
 
@@ -86,7 +85,6 @@ class AdminMcpConnectionPatchBody(BaseModel):
 
     headers: dict[str, str] | None = None
     is_active: bool | None = None
-    implicit_selection: bool | None = None
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
 
@@ -229,7 +227,6 @@ async def admin_create_mcp_connection(body: AdminMcpConnectionBody):
             headers=body.headers,
             template_key=body.template_key,
             label=body.label,
-            implicit_selection=body.implicit_selection,
         )
     except mcp_registry_model.McpRegistryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

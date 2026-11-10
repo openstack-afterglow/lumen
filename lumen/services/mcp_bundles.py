@@ -115,7 +115,6 @@ async def install(slug: str, *, label: str | None = None) -> dict[str, Any]:
         template_key=slug,
         default_label=bundle["name"],
         label=label,
-        implicit_selection=True,
         load_policy=bundle["load_policy"],
     )
     return {"slug": slug, "created": result["created"], "server": result["server"]}

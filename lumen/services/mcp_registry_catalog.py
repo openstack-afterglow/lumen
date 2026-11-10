@@ -126,7 +126,6 @@ async def install(
         template_key=entry_id,
         default_label=candidate["name"],
         label=label,
-        implicit_selection=False,
     )
 
 

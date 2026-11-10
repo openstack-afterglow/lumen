@@ -66,6 +66,11 @@ class _Connection:
         return await self.connection.execute(statement, parameters or {})
 
 
+def _pending_from_account() -> list[str]:
+    """Every manifest migration from the account migration onward; later migrations are pending too."""
+    return [migration.logical_id for migration in runner.load_manifest() if migration.logical_id >= account.ACCOUNT_ID]
+
+
 class _Database:
     def __init__(self, engine):
         self.raw_engine = engine
@@ -248,7 +253,7 @@ async def test_exact_historical_receipt_is_preserved_without_replaying027(databa
         await database.sql("UPDATE llm_provider_credentials SET encrypted_api_key='synthetic-rotated-envelope',generation=23 WHERE account_id=(SELECT id FROM llm_provider_accounts WHERE provider_id=71)")
         await database.sql("INSERT INTO chat_provider_usage (event_id,provider_account_id,provider_credential_id,provider_id,provider_credential_generation,raw_cost) VALUES ('historical-deleted-identity',9991,9992,9993,7,0.123)")
     before = await database.snapshot()
-    assert await database.run(monkeypatch) == ([account.ACCOUNT_ID], 0)
+    assert await database.run(monkeypatch) == (_pending_from_account(), 0)
     migration_statements = tuple(database.statements)
     after = await database.snapshot()
     assert (await database.sql("SELECT COUNT(*) FROM llm_providers WHERE encrypted_api_key IS NOT NULL OR api_key_env IS NOT NULL OR encrypted_subscription_tokens IS NOT NULL OR subscription_status <> 'disconnected' OR subscription_expires_at IS NOT NULL OR subscription_generation <> 0")).scalar_one() == 0
@@ -276,7 +281,7 @@ async def test_exact_historical_receipt_is_preserved_without_replaying027(databa
 @pytest.mark.parametrize("apply", [False, True])
 async def test_receipted028_missing_published027_rejects_without_ddl(database, monkeypatch, apply):
     await database.prepare()
-    assert await database.run(monkeypatch) == ([account.ACCOUNT_ID], 0)
+    assert await database.run(monkeypatch) == (_pending_from_account(), 0)
     await database.sql("DELETE FROM schema_migrations WHERE logical_id='027-kubernetes-sandboxes'")
     before = await database.snapshot()
     with pytest.raises(runner.MigrationLedgerError, match="incomplete_published027_prefix"):
@@ -326,7 +331,7 @@ async def test_repaired_dry_run_is_read_only(database, monkeypatch):
     await database.prepare()
     await database.repair()
     before = await database.snapshot()
-    assert await database.run(monkeypatch, apply=False) == ([account.ACCOUNT_ID], 0)
+    assert await database.run(monkeypatch, apply=False) == (_pending_from_account(), 0)
     assert all(sql.lstrip().startswith(('SELECT','SHOW')) for sql in database.statements)
     assert await database.snapshot() == before
 

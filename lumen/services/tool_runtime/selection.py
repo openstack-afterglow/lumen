@@ -23,13 +23,6 @@ def _selected(items: list[dict], selected_ids: tuple[int, ...] | None) -> list[d
     return [it for it in items if it.get("id") in allow]
 
 
-def _runtime_selected(items: list[dict], selected_ids: tuple[int, ...] | None) -> list[dict]:
-    """Exact frozen selection. A legacy run with no snapshot (``None``) gets only implicitly selectable sources."""
-    if selected_ids is None:
-        return [it for it in items if it.get("implicit_selection", True)]
-    return _selected(items, selected_ids)
-
-
 def _frozen_selection(items: list[dict], ctx: ToolContext, kind: str) -> list[dict]:
     expected = dict(
         ((entry_kind, identifier), fingerprint)
@@ -71,8 +64,10 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
         )
         # An OAuth execution needs admission's exact epoch before refresh/discovery.
         items = [
-            server for server in items
-            if server.get("auth_mode") != "oauth" or (
+            server
+            for server in items
+            if server.get("auth_mode") != "oauth"
+            or (
                 type(expected_credential_versions.get(server.get("id"))) is int
                 and expected_credential_versions[server["id"]] > 0
             )
@@ -99,7 +94,9 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
         return []
     usable: list[dict] = []
     for server in items:
-        if server.get("transport") != "http" or not str(server.get("url") or "").lower().startswith("https://"):
+        if server.get("transport") not in {"http", "sse"} or not str(server.get("url") or "").lower().startswith(
+            "https://"
+        ):
             logger.warning("MCP server %s uses an unsupported transport or URL", server.get("id"))
             continue
         server_id = server.get("id")
@@ -117,18 +114,20 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
             logger.info("MCP 서버 %s: 실행 중 인증 값이 변경되었거나 폐기됨 — 노출 스킵", server_id)
             continue
         usable.append(server)
-    return _frozen_selection(_runtime_selected(usable, ctx.selected_mcp_ids), ctx, "mcp")
+    return _frozen_selection(_selected(usable, ctx.selected_mcp_ids), ctx, "mcp")
 
 
 def _mcp_config_fingerprint(server: dict) -> str:
     """Freeze execution configuration and consent, excluding secrets and run headers."""
     from lumen.services import extensions_store as es
 
-    return contracts._v2_config_fingerprint({
-        "selection": es.selection_fingerprint(server),
-        "effect_overrides": server.get("effect_overrides"),
-        "oauth_scopes": server.get("oauth_scopes"),
-    })
+    return contracts._v2_config_fingerprint(
+        {
+            "selection": es.selection_fingerprint(server),
+            "effect_overrides": server.get("effect_overrides"),
+            "oauth_scopes": server.get("oauth_scopes"),
+        }
+    )
 
 
 def _mcp_schema(server_id: int, tool: dict) -> dict:
@@ -183,8 +182,11 @@ async def context_tool_schemas(ctx: ToolContext) -> list[dict]:
         dynamic_bindings = await bindings._legacy_dynamic_bindings(ctx)
         return [
             *await tools.tool_schemas(),
-            *(bindings._binding_schema(binding) for binding in dynamic_bindings.values()
-              if binding.definition.source != "mcp" or binding.definition.effect == "read"),
+            *(
+                bindings._binding_schema(binding)
+                for binding in dynamic_bindings.values()
+                if binding.definition.source != "mcp" or binding.definition.effect == "read"
+            ),
         ]
     schemas = await tools.tool_schemas()
     for name, enabled in (

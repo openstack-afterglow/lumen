@@ -97,7 +97,6 @@ async def create_connection(
     template_key: str | None = None,
     default_label: str | None = None,
     label: str | None = None,
-    implicit_selection: bool = False,
     load_policy: str = "on_demand",
 ) -> dict[str, Any]:
     """Create one global connection, or return the matching existing one unchanged."""
@@ -124,7 +123,6 @@ async def create_connection(
         "url": url,
         "auth_mode": auth_mode,
         "load_policy": load_policy,
-        "implicit_selection": implicit_selection,
         "is_active": True,
         "template_key": template_key,
         "connection_label": resolved_label,

@@ -787,11 +787,11 @@ class TestMcpTools:
         out = await tool_runtime.context_execute("mcp__99__x", {}, _CTX)
         assert "MCP" in out  # 안전한 거부
 
-    async def test_legacy_mcp_transport_is_not_exposed(self, monkeypatch):
+    async def test_local_process_mcp_transport_is_not_exposed(self, monkeypatch):
         import lumen.services.extensions_store as es
 
         async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False):
-            return [{"id": 7, "name": "legacy", "transport": "sse", "url": "https://mcp.example/sse"}]
+            return [{"id": 7, "name": "local", "transport": "stdio", "url": "https://mcp.example/stdio"}]
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
         assert await selection._load_mcp(_CTX) == []
