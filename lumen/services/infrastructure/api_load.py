@@ -24,6 +24,9 @@ from starlette.responses import JSONResponse, StreamingResponse
 logger = logging.getLogger(__name__)
 
 _SESSION_WEBSOCKET = re.compile(r"/v1/chat/realtime/sessions/[^/]+/ws")
+# Every API-owned realtime WebSocket path; the compat wires and the native session socket all hold a "ws" slot.
+_ADMITTED_WEBSOCKET_PATHS = frozenset(
+    {"/v1/realtime", "/v1/realtime/translations", "/v1/live/sessions", "/v1beta/realtime"})
 _EXCLUDED_PATHS = frozenset({"/v1/health", "/v1/ready", "/v1/internal/drain"})
 
 
@@ -204,7 +207,7 @@ class ApiAdmissionMiddleware:
         scope["lumen.api_admission"] = self.admission
         path = scope.get("path", "")
         if scope["type"] == "websocket" and (
-            path in {"/v1/realtime", "/v1beta/realtime"} or _SESSION_WEBSOCKET.fullmatch(path)
+            path in _ADMITTED_WEBSOCKET_PATHS or _SESSION_WEBSOCKET.fullmatch(path)
         ):
             try:
                 reservation = self.admission.reserve("ws")
@@ -355,7 +358,7 @@ class ApiLoadMiddleware:
     async def __call__(self, scope, receive, send):
         path = scope.get("path", "")
         if scope["type"] == "websocket" and (
-            path in {"/v1/realtime", "/v1beta/realtime"} or _SESSION_WEBSOCKET.fullmatch(path)
+            path in _ADMITTED_WEBSOCKET_PATHS or _SESSION_WEBSOCKET.fullmatch(path)
         ):
             self.meter.active_ws += 1
             try:

@@ -49,6 +49,7 @@ from .errors import (
     DurableRunInputError,
     DurableRunNotFound,
     DurableRunProviderResultUnknown,
+    RealtimeKindMismatch,
 )
 from .lifecycle import _renew_lease
 
@@ -129,29 +130,41 @@ def _checkpoint(meter, basis: str) -> dict:
     return usage
 
 
+# Duration family -> (ledger component kind, summary key, checkpoint byte and sample-rate keys).
+_DURATION_COMPONENTS = {
+    "realtime_input": ("audio_input_seconds", "input_audio_seconds", "input_bytes", "input_sample_rate_hz"),
+    "realtime_output": ("audio_output_seconds", "output_audio_seconds", "output_bytes", "output_sample_rate_hz"),
+}
+
+
 def _duration_bill(run: ChatRun, snapshot: dict, usage: dict):
+    """Price each frozen duration family; input-only plans (transcription, translation) bill input PCM only."""
     duration = snapshot["max_duration_seconds"]
+    frozen_rates = snapshot.get("duration_rates")
+    if (not isinstance(frozen_rates, dict) or "realtime_input" not in frozen_rates
+            or set(frozen_rates) - set(_DURATION_COMPONENTS)):
+        raise DurableRunProviderResultUnknown("frozen realtime duration price is unavailable")
     components = []
-    costs = []
+    costs: dict[str, Decimal] = {}
     summary = {}
-    for family, kind, summary_key, size, rate in (
-        ("realtime_input", "audio_input_seconds", "input_audio_seconds",
-         usage.get("input_bytes"), usage.get("input_sample_rate_hz")),
-        ("realtime_output", "audio_output_seconds", "output_audio_seconds",
-         usage.get("output_bytes"), usage.get("output_sample_rate_hz")),
-    ):
+    for family, (kind, summary_key, size_key, rate_key) in _DURATION_COMPONENTS.items():
+        if family not in frozen_rates:
+            continue
+        size, rate = usage.get(size_key), usage.get(rate_key)
         if type(size) is not int or type(rate) is not int or rate not in {16000, 24000} or size < 0 or size > 2 * rate * duration:
             raise DurableRunProviderResultUnknown("realtime duration exceeds frozen reservation")
         seconds = Decimal(size) / Decimal(2 * rate)
         cost = _duration_seconds_cost(snapshot, family, seconds)
-        frozen = snapshot["duration_rates"][family]
-        costs.append(cost)
+        frozen = frozen_rates[family]
+        costs[family] = cost
         summary[summary_key] = format(seconds, "f")
         components.append({"segment_id": _SEGMENT, "kind": kind, "quantity": format(seconds, "f"), "unit": "second",
             "unit_price_usd": format(Decimal(frozen["rate"]) / frozen["unit_seconds"], "f"),
             "cost_usd": format(cost, "f"), "source": "media", "model_name": run.model_name,
             "metadata": {"billing_basis": "duration", "rate_unit_seconds": frozen["unit_seconds"]}})
-    usage_cost = UsageCost(raw_cost=costs[0] + costs[1], input_cost=costs[0], output_cost=costs[1],
+    input_cost, output_cost = costs["realtime_input"], costs.get("realtime_output")
+    usage_cost = UsageCost(raw_cost=input_cost if output_cost is None else input_cost + output_cost,
+                           input_cost=input_cost, output_cost=Decimal(0) if output_cost is None else output_cost,
                            pricing_status="priced", pricing_snapshot=snapshot)
     return usage_cost, components, None, summary
 
@@ -212,10 +225,16 @@ def _token_bill(run: ChatRun, snapshot: dict, usage: dict):
 _BILLS = {"duration": _duration_bill, "session": _session_bill, "tokens": _token_bill}
 
 
-def _intent(request: dict) -> dict:
-    return {"model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
-            "voice": request.get("voice"), "instructions": request.get("instructions"),
-            "max_duration_seconds": request.get("max_duration_seconds", 300)}
+def _intent(request: dict, kind: str = "conversation") -> dict:
+    intent = {"model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
+              "voice": request.get("voice"), "instructions": request.get("instructions"),
+              "max_duration_seconds": request.get("max_duration_seconds", 300)}
+    # Conversation intents keep their historical fingerprint; other kinds add only what they carry.
+    if kind != "conversation":
+        intent["realtime_kind"] = kind
+    if request.get("transcription") is not None:
+        intent["transcription"] = request["transcription"]
+    return intent
 
 
 def _ticket_key(run_id: str) -> str:
@@ -257,12 +276,19 @@ async def consume_ticket(run_id: str, token: str) -> tuple[str, str]:
 async def admit_realtime_session(
     request: dict, *, project_id: str, user_id: str, client_request_id: str,
     source: str = "web", api_key_id: int | None = None, provider_type: str | None = None,
-    credential_authority: dict | None = None,
+    credential_authority: dict | None = None, kind: str = "conversation",
 ) -> dict:
-    """``provider_type`` is the transport a vendor wire fixes, never the editable public selector."""
+    """``provider_type`` is the transport a vendor wire fixes, never the editable public selector.
+
+    ``kind`` is the realtime kind the calling endpoint speaks. The native session endpoint
+    and plain compatible wires only speak ``conversation``; a model of another kind is
+    admitted only through its own compatible endpoint.
+    """
     from .admission import _intent_with_credential_authority, _lock_run_configurations, existing_run_for_intent
 
-    intent = _intent_with_credential_authority(_intent(request), credential_authority)
+    if kind not in realtime_transport.REALTIME_KINDS:
+        raise DurableRunInputError("unsupported realtime session kind")
+    intent = _intent_with_credential_authority(_intent(request, kind), credential_authority)
     previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
         client_request_id=client_request_id, intent=intent, conversation_id=None)
     if previous is not None:
@@ -286,6 +312,19 @@ async def admit_realtime_session(
         api_provider is not None and route["api_provider"] != api_provider
     ) or (provider_type is not None and route["provider_type"] != provider_type):
         raise DurableRunInputError("realtime provider or model is unavailable")
+    route_kind = realtime_transport.realtime_kind(route)
+    if route_kind != kind:
+        raise RealtimeKindMismatch(f"realtime {route_kind} models are not available on this endpoint")
+    if "transcription" in intent:
+        from lumen.services.providers.realtime_protocol import transcription_session, transcription_update
+
+        options = intent["transcription"]
+        try:
+            if kind != "transcription" or not isinstance(options, dict) or transcription_session(
+                    transcription_update(route["api_model_name"], options)["session"])[1] != options:
+                raise DurableRunInputError("realtime transcription options are invalid")
+        except realtime_transport.RealtimeTransportError as exc:
+            raise DurableRunInputError("realtime transcription options are invalid") from exc
     voices = realtime_transport.available_realtime_options(route)
     voice = intent["voice"] or voices["default_voice"]
     plan = realtime_transport.validate_realtime_request(route, voice=voice,
@@ -309,6 +348,9 @@ async def admit_realtime_session(
                "margin_multiplier": format(margin, "f"), "credit_per_usd": format(per_usd, "f")}
     try:
         async with _factory()() as session, session.begin():
+            # No gap locks: the unique idempotency index (migration 030) decides same-key races, and the
+            # IntegrityError replay below returns the winner. Gap locks deadlocked concurrent admissions.
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             existing = (await session.execute(select(ChatRun).where(ChatRun.project_id == project_id,
                 ChatRun.user_id == user_id, ChatRun.client_request_id == client_request_id).with_for_update())).scalar_one_or_none()
             if existing is not None:
@@ -492,6 +534,11 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
         await _finish(run_id, status="failed", message_id=None, owner=owner,
                       error_code="provider_result_unknown", safe_message="realtime price changed before connection")
         raise DurableRunProviderResultUnknown("realtime price changed before connection")
+    if pricing.get("realtime_kind", "conversation") != "conversation" and wire != "openai":
+        # The native event schema models conversations only; other kinds own their compatible wire.
+        await _finish(run_id, status="failed", message_id=None, owner=owner,
+                      error_code="provider_result_unknown", safe_message="realtime model requires its compatible wire")
+        raise DurableRunInputError("realtime model requires its compatible wire")
     stop = asyncio.Event()
 
     async def heartbeat():
@@ -515,7 +562,8 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
         meter = await relay_audio(websocket, route, session_id=run_id, voice=payload["voice"],
             instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"],
             wire=wire, is_canceled=is_canceled, token_usage=pricing.get("billing_basis", "duration") == "tokens",
-            session_time=pricing.get("billing_basis", "duration") == "session")
+            session_time=pricing.get("billing_basis", "duration") == "session",
+            transcription=payload.get("transcription"))
         summary = await _settle(run_id, owner=owner, meter=meter)
         await _finish(run_id, status="canceled" if await is_canceled() else "completed", message_id=None, owner=owner)
         if wire == "native":

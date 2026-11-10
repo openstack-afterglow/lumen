@@ -103,8 +103,8 @@ def run_integration(extra_args: list[str] | None = None) -> int:
         if up_code != 0:
             return up_code
 
-        # Apply migrations
-        mig_code = _run_cmd(["lumen-migrate", "--apply"], env=env)
+        # Ledger migrations only: the bootstrap schema repair would hide a migration that forgot an ORM index.
+        mig_code = _run_cmd(["lumen-migrate", "--apply", "--no-schema-repair"], env=env)
         if mig_code != 0:
             return mig_code
 

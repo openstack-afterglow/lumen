@@ -8,6 +8,7 @@ batch→run lock order before any source read or provider request.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 from sqlalchemy import select, text
@@ -177,3 +178,27 @@ def confirmed_media_rejection(exc: BaseException) -> int | None:
             and type(status) is int and status in _REJECTION_STATUSES):
         return status
     return None
+
+
+_REJECTION_SUFFIX = re.compile(r"\(HTTP (\d{3})\)$")
+
+
+def rejection_message(status: int) -> str:
+    """Terminal safe message of a confirmed refusal; carries only the numeric upstream status."""
+    return f"upstream provider rejected the request (HTTP {status})"
+
+
+def rejection_http_response(safe_message: str | None) -> tuple[int, str, str]:
+    """``(status, error type, message)`` a caller receives for a ``provider_rejected`` media run.
+
+    Refusals of the caller's request (400/413/415/422) are 400; an upstream rate limit stays 429; credential
+    or model-configuration refusals (401/403/404) are the operator's problem and surface as 502.
+    """
+    match = _REJECTION_SUFFIX.search(safe_message or "")
+    upstream = int(match.group(1)) if match else None
+    message = safe_message or "upstream provider rejected the request"
+    if upstream in {400, 413, 415, 422}:
+        return 400, "invalid_request_error", message
+    if upstream == 429:
+        return 429, "rate_limit_error", message
+    return 502, "api_error", message

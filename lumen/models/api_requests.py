@@ -95,6 +95,8 @@ class ImageGenerationRequest(BaseModel):
     prompt: str = Field(min_length=1)
     size: str = "auto"
     quality: str = "auto"
+    # GPT Image 2.6 only; the transport rejects it for every other model before provider I/O.
+    complexity: Literal["low", "medium", "high"] | None = None
     n: int = Field(default=1, ge=1)
 
 
@@ -112,6 +114,7 @@ class OpenAIImageGenerationRequest(BaseModel):
     n: int = Field(default=1, ge=1)
     size: str = "auto"
     quality: str = "auto"
+    complexity: Literal["low", "medium", "high"] | None = None
     response_format: str = "b64_json"
 
 

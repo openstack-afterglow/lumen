@@ -137,7 +137,10 @@ async def get_chat_capabilities(
         )
     if model_kind == "realtime":
         gates = (resolved.get("capabilities") or {}).get("feature_gates") or {}
-        if all((gates.get(name) or {}).get("available") is True for name in ("audio_input", "audio_output")):
+        # Transcription/translation/GPT-Live models speak only their compatible WebSocket
+        # wires; the native voice session cannot execute them, so it advertises no options.
+        if (all((gates.get(name) or {}).get("available") is True for name in ("audio_input", "audio_output"))
+                and realtime_transport.realtime_kind(resolved) == "conversation"):
             result.update(realtime_transport.available_realtime_options(resolved))
         else:
             result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,

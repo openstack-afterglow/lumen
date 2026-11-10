@@ -34,6 +34,8 @@ _SESSION_ID = "00000000-0000-0000-0000-000000000001"
 _PATHS = (
     f"/v1/chat/realtime/sessions/{_SESSION_ID}/ws",
     "/v1/realtime?model=gpt-realtime",
+    "/v1/realtime/translations?model=gpt-realtime-translate",
+    "/v1/live/sessions",
     "/v1beta/realtime",
 )
 _HEADERS = {"x-realtime-token": "one-use-ticket", "authorization": "Bearer scoped-key"}
@@ -108,6 +110,9 @@ async def _socket_call(app, path, *, incoming=None, sent=None):
     incoming.put_nowait({"type": "websocket.connect"})
     if path == "/v1beta/realtime":
         incoming.put_nowait({"type": "websocket.receive", "text": json.dumps(_SETUP)})
+    if path == "/v1/live/sessions":
+        incoming.put_nowait({"type": "websocket.receive",
+                             "text": json.dumps({"type": "session.start", "session": {"model": "gpt-live-1"}})})
     sent = sent if sent is not None else []
 
     async def send(message):

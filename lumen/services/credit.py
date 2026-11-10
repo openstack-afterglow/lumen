@@ -19,6 +19,7 @@ from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.config import get_settings
@@ -345,16 +346,14 @@ def _maybe_reset_month(wallet: UserWallet) -> None:
 async def _get_or_create_wallet(session, user_id: str, project_id: str | None) -> UserWallet:
     wallet = await session.get(UserWallet, user_id)
     if wallet is None:
-        wallet = UserWallet(
-            user_id=user_id,
-            project_id=project_id,
-            max_quota_monthly=None,
-            max_quota_weekly=None,
-            used_quota_this_month=Decimal("0"),
-            quota_period_start=_first_of_month(datetime.now(UTC).date()),
-        )
-        session.add(wallet)
-        await session.flush()
+        # A no-op upsert, not an ORM insert: concurrent first requests take the duplicate-key check's exclusive
+        # lock in turn instead of failing with 1062 or deadlocking while holding shared locks.
+        await session.execute(mysql_insert(UserWallet).values(
+            user_id=user_id, project_id=project_id, quota_period_start=_first_of_month(datetime.now(UTC).date()),
+        ).on_duplicate_key_update(user_id=UserWallet.user_id))
+        # The row may have been committed after this transaction's snapshot: only a locking read sees it.
+        wallet = (await session.execute(select(UserWallet).where(UserWallet.user_id == user_id)
+                  .with_for_update().execution_options(populate_existing=True))).scalar_one()
     return wallet
 
 
@@ -441,7 +440,20 @@ async def precheck(user_id: str, project_id: str | None = None, api_key_id: int 
 
     A zero weekly quota means no separate weekly cap. The effective monthly quota
     is still checked first, so weekly usage can never escape its monthly ceiling.
+    The check is pure DB work, so a lock conflict is retried: a new user's racing first requests create the
+    wallet row concurrently, and under snapshot isolation the loser conflicts once before the row is visible.
     """
+    from lumen.services.durable_runs.budgets import retry_deadlocks
+
+    try:
+        await retry_deadlocks(lambda: _precheck_once(user_id, project_id, api_key_id))
+    except OperationalError as exc:  # only a lock conflict that outlived the retries reaches here
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def _precheck_once(user_id: str, project_id: str | None, api_key_id: int | None) -> None:
+    from lumen.services.durable_runs.budgets import is_lock_conflict
+
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
@@ -528,6 +540,8 @@ async def precheck(user_id: str, project_id: str | None = None, api_key_id: int 
     except (QuotaExceeded, ChatStorageUnavailable):
         raise
     except OperationalError as exc:
+        if is_lock_conflict(exc):
+            raise
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
     except Exception as exc:

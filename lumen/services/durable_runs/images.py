@@ -54,6 +54,7 @@ from .media import (
     lock_media_run_for_io,
     lock_media_source_in_transaction,
     media_io_allowed,
+    rejection_message,
     validate_batch_media_io_in_transaction,
 )
 
@@ -62,9 +63,13 @@ _MAX_SOURCE_BYTES = 5 * 1024 * 1024
 
 
 def _intent(request: dict) -> dict:
-    return {"kind": "image", "model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
-            "prompt": request.get("prompt"), "size": request.get("size", "auto"), "quality": request.get("quality", "auto"),
-            "n": request.get("n", 1), "source_asset_id": request.get("source_asset_id", request.get("input_asset_id"))}
+    intent = {"kind": "image", "model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
+              "prompt": request.get("prompt"), "size": request.get("size", "auto"), "quality": request.get("quality", "auto"),
+              "n": request.get("n", 1), "source_asset_id": request.get("source_asset_id", request.get("input_asset_id"))}
+    # Added only when requested so every pre-existing request keeps its idempotency fingerprint.
+    if request.get("complexity") is not None:
+        intent["complexity"] = request["complexity"]
+    return intent
 
 
 @dataclass(frozen=True)
@@ -121,7 +126,9 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
     size = request.get("size", "auto")
     quality = request.get("quality", "auto")
     n = request.get("n", 1)
-    unit_price = image_transport.validate_image_request(route, size=size, quality=quality, n=n, edit=source_asset_id is not None)
+    unit_price = image_transport.validate_image_request(route, size=size, quality=quality, n=n,
+                                                        edit=source_asset_id is not None,
+                                                        complexity=intent.get("complexity"))
     basis = image_transport.image_billing_basis(route)
     if not assets.asset_pipeline_available():
         raise DurableRunInputError("image asset storage or scanner is unavailable")
@@ -223,6 +230,9 @@ async def admit_image_run(request: dict, *, project_id: str, user_id: str, clien
                                        credential_authority=credential_authority)
     try:
         async with _factory()() as session, session.begin():
+            # No gap locks: the unique idempotency index (migration 030) decides same-key races, and the
+            # IntegrityError replay below returns the winner. Gap locks deadlocked concurrent admissions.
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             run = await persist_image_run_in_transaction(session, prepared, project_id=project_id, user_id=user_id,
                 client_request_id=client_request_id, source=source, api_key_id=api_key_id)
             created = descriptor(run)
@@ -460,7 +470,8 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
                      **{key: pricing_snapshot.get(key) for key in (
                          "input_price_per_token", "output_price_per_token", "cache_read_price_per_token")}}
         price = image_transport.validate_image_request(route, size=pricing_snapshot["size"],
-                    quality=pricing_snapshot["quality"], n=pricing_snapshot["count"], edit=bool(source_id))
+                    quality=pricing_snapshot["quality"], n=pricing_snapshot["count"], edit=bool(source_id),
+                    complexity=payload.get("complexity"))
         expected_price = Decimal(pricing_snapshot["reservation_usd"] if token_mode else pricing_snapshot["image_per_unit"])
         if price != expected_price:
             raise DurableRunInputError("image price changed after admission")
@@ -477,15 +488,18 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
             raise DurableRunProviderResultUnknown("image provider result cannot be replayed")
         if state == "started":
             try:
+                # ``complexity`` is forwarded only when requested, keeping every other call shape unchanged.
+                extra = {"complexity": payload["complexity"]} if payload.get("complexity") is not None else {}
                 generated = await image_transport.generate_images(route, prompt=payload["prompt"],
                              size=pricing_snapshot["size"], quality=pricing_snapshot["quality"],
-                             n=pricing_snapshot["count"], source_image=source_data, source_mime=source_mime)
+                             n=pricing_snapshot["count"], source_image=source_data, source_mime=source_mime, **extra)
             except image_transport.ImageTransportError as exc:
-                # Batch only: a confirmed refusal settles at zero; anything else stays unknown.
-                if not is_batch or confirmed_media_rejection(exc) is None:
+                # A refusal proven to precede inference settles at zero; anything else stays unknown.
+                rejected = confirmed_media_rejection(exc)
+                if rejected is None:
                     raise
                 await _finish(run_id, status="failed", message_id=None, owner=owner, error_code="provider_rejected",
-                              safe_message="upstream provider rejected the request")
+                              safe_message=rejection_message(rejected))
                 return True
             outputs = generated.images
             if len(outputs) != pricing_snapshot["count"]:

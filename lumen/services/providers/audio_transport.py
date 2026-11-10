@@ -42,7 +42,10 @@ _MAX_SEGMENT_TEXT_CHARS = 65536
 _MAX_SEGMENT_SECONDS = 30 * 60
 _MAX_INLINE_JSON_BYTES = (_MAX_OUTPUT_BYTES * 4 // 3) + 65536
 _TIMEOUT = httpx.Timeout(120.0, connect=10.0, read=120.0, write=30.0, pool=10.0)
-_OPENAI_STT_MODELS = frozenset({"whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"})
+_OPENAI_STT_MODELS = frozenset({"whisper-1", "gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"})
+# These file-transcription models report ``usage: {"type": "duration"}`` only, never tokens (live-verified
+# 2026-11-10), so a token billing basis can never be settled for them.
+_OPENAI_DURATION_ONLY_STT_MODELS = frozenset({"whisper-1", "gpt-transcribe"})
 # Only whisper-1 offers verbose_json with timestamp_granularities on the
 # direct OpenAI transcription endpoint; no other route advertises timing.
 _OPENAI_TIMED_STT_MODELS = frozenset({"whisper-1"})
@@ -158,7 +161,7 @@ def validate_audio_request(route: dict, *, kind: str, format: str | None = None,
     pricing = route.get("media_pricing")
     basis = media_billing_basis(kind, pricing)
     if basis == "tokens":
-        if provider == "openai" and (kind == "tts" or model == "whisper-1"):
+        if provider == "openai" and (kind == "tts" or model in _OPENAI_DURATION_ONLY_STT_MODELS):
             raise ProviderValidationError("audio provider cannot report token usage for this model")
         envelope = media_reservation_usd(pricing)
         if envelope is None or not envelope.is_finite() or envelope <= 0:

@@ -13,6 +13,10 @@ class DurableRunInputError(DurableRunError):
     pass
 
 
+class RealtimeKindMismatch(DurableRunInputError):
+    """A realtime model was requested on an endpoint that serves a different realtime kind."""
+
+
 class DurableRunLeaseLost(DurableRunError):
     """The worker must stop before a stale lease holder writes another event."""
 

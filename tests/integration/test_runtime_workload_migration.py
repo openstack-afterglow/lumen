@@ -330,7 +330,13 @@ async def test_runtime_backfill_and_batch_ledger_survive_repeat_migration(snapsh
         async with engine.begin() as connection:
             await connection.exec_driver_sql("SET SESSION FOREIGN_KEY_CHECKS=0")
             try:
-                for table in reversed(list(dict.fromkeys(tables))):
+                # Migration 019 also creates prefixed tables that this test never recorded; drop them too so the
+                # shared integration database is left as the ledger migrations produced it.
+                leftovers = (await connection.exec_driver_sql(
+                    "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE %s",
+                    (prefix + "%",),
+                )).scalars().all()
+                for table in dict.fromkeys([*reversed(list(dict.fromkeys(tables))), *leftovers]):
                     assert table.startswith(prefix)
                     await connection.exec_driver_sql(f"DROP TABLE IF EXISTS {table}")
             finally:

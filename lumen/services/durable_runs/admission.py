@@ -1,5 +1,6 @@
 """Durable run admission and atomic persistence."""
 
+import functools
 import json
 import uuid
 from copy import deepcopy
@@ -7,7 +8,8 @@ from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Literal
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from lumen.crypto import encrypt_chat_content
 from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
@@ -307,6 +309,42 @@ async def _bind_user_assets(
     return canonical
 
 
+async def _read_committed(session) -> None:
+    """First statement of an admission transaction.
+
+    The idempotency ``SELECT ... FOR UPDATE`` of a new key takes a gap lock under REPEATABLE READ. Concurrent
+    admissions by one user then deadlock with each other's run INSERT and the provider-row locks (MariaDB 1213,
+    surfaced as HTTP 500). The unique ``uq_chat_runs_idempotency`` index (migration 030) decides same-key races
+    instead, and ``_replay_idempotency_race`` returns the winner's run.
+    """
+    await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+
+
+def _replay_idempotency_race(function):
+    """A racing same-key admission fails its INSERT on the unique index; return the committed winner instead."""
+
+    @functools.wraps(function)
+    async def wrapper(**kwargs):
+        try:
+            return await function(**kwargs)
+        except IntegrityError:
+            previous = await existing_run_for_intent(
+                project_id=kwargs["project_id"],
+                user_id=kwargs["user_id"],
+                client_request_id=kwargs["client_request_id"],
+                intent=_intent_with_credential_authority(
+                    kwargs["intent"], kwargs["capability_snapshot"].get("credential_authority")
+                ),
+                conversation_id=kwargs.get("conversation_id"),
+            )
+            if previous is None:
+                raise
+            return previous
+
+    return wrapper
+
+
+@_replay_idempotency_race
 async def create_persistent_run(
     *,
     project_id: str,
@@ -359,6 +397,7 @@ async def create_persistent_run(
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         from . import budgets
 
         order = budgets.LockOrder()
@@ -511,6 +550,7 @@ async def create_persistent_run(
     return created
 
 
+@_replay_idempotency_race
 async def create_run(
     *,
     project_id: str,
@@ -554,6 +594,7 @@ async def create_run(
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         from . import budgets
 
         order = budgets.LockOrder()
@@ -707,6 +748,7 @@ async def create_run(
     return created
 
 
+@_replay_idempotency_race
 async def create_temp_run(
     *,
     project_id: str,
@@ -743,6 +785,7 @@ async def create_temp_run(
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         existing = (
             await session.execute(
                 select(ChatRun)
@@ -870,6 +913,7 @@ async def create_temp_thread(*, project_id: str, user_id: str) -> ChatTempThread
         return row
 
 
+@_replay_idempotency_race
 async def create_compaction_run(
     *,
     project_id: str,
@@ -905,6 +949,7 @@ async def create_compaction_run(
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         conv = None
         thread = None
         if conversation_id is not None:

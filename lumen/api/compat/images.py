@@ -27,10 +27,11 @@ from lumen.services.conversation_store import ChatStorageUnavailable
 from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.durable_runs import queries
 from lumen.services.durable_runs.images import image_result
+from lumen.services.durable_runs.media import rejection_http_response
 
 router = APIRouter()
 _POLL_INTERVAL_SECONDS = 0.25
-_EDIT_FIELDS = frozenset({"image", "prompt", "model", "n", "size", "quality", "response_format", "provider", "provider_id"})
+_EDIT_FIELDS = frozenset({"image", "prompt", "model", "n", "size", "quality", "complexity", "response_format", "provider", "provider_id"})
 
 
 def _compat_error(exc: HTTPException) -> JSONResponse:
@@ -43,9 +44,11 @@ def _failure(exc: Exception) -> JSONResponse:
 
 
 def _request(
-    model: str, prompt: str, n: int, size: str, quality: str, provider_id: int | None = None
+    model: str, prompt: str, n: int, size: str, quality: str, provider_id: int | None = None,
+    complexity: str | None = None,
 ) -> ImageGenerationRequest:
-    return ImageGenerationRequest(model_id=model, provider_id=provider_id, prompt=prompt, n=n, size=size, quality=quality)
+    return ImageGenerationRequest(model_id=model, provider_id=provider_id, prompt=prompt, n=n, size=size,
+                                  quality=quality, complexity=complexity)
 
 
 async def _replayed_source(path: Path, key: uuid.UUID, principal: Principal) -> str | None:
@@ -113,6 +116,10 @@ async def _completed_image(run_id: str, *, principal: Principal, request: Reques
                     after_seq=max(0, run.last_seq - 8),
                 )
                 terminal = next((event for event in reversed(events) if event.type in {"run.failed", "run.canceled"}), None)
+                if terminal is not None and getattr(terminal.payload, "error_code", None) == "provider_rejected":
+                    # The hold was released at zero: the refusal is reported with the upstream status class.
+                    status, error_type, refusal = rejection_http_response(terminal.payload.safe_message)
+                    return openai_error_response(status, refusal, type_=error_type)
                 message = terminal.payload.safe_message if terminal is not None else "Image generation failed"
                 return openai_error_response(500, message or "Image generation failed", type_="api_error")
         except (durable_errors.DurableRunError, assets.AssetError, assets.AssetUnavailable, ChatStorageUnavailable) as exc:
@@ -133,7 +140,7 @@ async def generate_image(
         return openai_error_response(400, "Specify only one of provider and provider_id")
     try:
         admitted = await admit(
-            _request(body.model, body.prompt, body.n, body.size, body.quality, body.provider_id),
+            _request(body.model, body.prompt, body.n, body.size, body.quality, body.provider_id, body.complexity),
             principal=principal,
             idempotency_key=idempotency_key or uuid.uuid4(),
             api_provider=body.provider,
@@ -155,6 +162,7 @@ async def edit_image(
     n: int = Form(1),
     size: str = Form("auto"),
     quality: str = Form("auto"),
+    complexity: str | None = Form(None),
     response_format: str = Form("b64_json"),
     idempotency_key: uuid.UUID | None = Header(default=None, alias="Idempotency-Key"),
     principal: Principal = Depends(require_api_key_scopes("compat:images:write")),
@@ -169,7 +177,7 @@ async def edit_image(
     if provider is not None and provider_id is not None:
         return openai_error_response(400, "Specify only one of provider and provider_id")
     try:
-        payload = _request(model, prompt, n, size, quality, provider_id)
+        payload = _request(model, prompt, n, size, quality, provider_id, complexity)
     except ValidationError as exc:
         return openai_error_response(400, str(exc), code="invalid_image_request")
     try:

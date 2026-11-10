@@ -238,8 +238,9 @@ jobs:
           AFTERGLOW_CRYPTO_REF: ${{ inputs.afterglow_crypto_ref }}
         run: |
           uv pip install --python .venv/bin/python --reinstall-package afterglow-crypto --no-deps "afterglow-crypto @ git+https://github.com/openstack-afterglow/afterglow-crypto.git@${AFTERGLOW_CRYPTO_REF}"
-      - run: uv run lumen-migrate --apply
-      - run: uv run lumen-migrate --apply
+      # Ledger migrations only: the bootstrap schema repair would create what a migration forgot before the drift guards run.
+      - run: uv run lumen-migrate --apply --no-schema-repair
+      - run: uv run lumen-migrate --apply --no-schema-repair
       - run: uv run pytest -m integration tests
 
   system:

@@ -275,7 +275,8 @@ _TOKEN_BASIS_TEXT_DIRECTIONS = {
 
 
 def media_pricing_available(
-    kind: str, pricing: dict | None, *, text_input_priced: bool = False, text_output_priced: bool = False
+    kind: str, pricing: dict | None, *, text_input_priced: bool = False, text_output_priced: bool = False,
+    duration_families: tuple[str, ...] | None = None,
 ) -> bool:
     """Whether the selected billing basis has every rate its execution needs.
 
@@ -311,8 +312,18 @@ def media_pricing_available(
     if basis == "session":
         return _duration_available(pricing, "realtime_session")
     if basis == "duration":
-        return all(_duration_available(pricing, family) for family in _KIND_DURATION_FAMILIES[kind][:2])
+        families = duration_families or _KIND_DURATION_FAMILIES[kind][:2]
+        return all(_duration_available(pricing, family) for family in families)
     return False
+
+
+def _realtime_duration_families(kind: str, model_name: object) -> tuple[str, ...] | None:
+    """Input-priced realtime kinds (transcription, translation) settle on fewer duration families."""
+    if kind != "realtime":
+        return None
+    from .realtime_transport import duration_families
+
+    return duration_families(model_name)
 
 
 def model_media_pricing_available(model: LlmModel) -> bool:
@@ -322,16 +333,19 @@ def model_media_pricing_available(model: LlmModel) -> bool:
         getattr(model, "media_pricing", None),
         text_input_priced=getattr(model, "input_price", None) is not None,
         text_output_priced=getattr(model, "output_price", None) is not None,
+        duration_families=_realtime_duration_families(_kind(model), getattr(model, "model_name", None)),
     )
 
 
 def route_media_pricing_available(route: dict) -> bool:
     """``media_pricing_available`` for a resolved route, including its frozen text rates."""
+    kind = str(route.get("model_kind") or "text")
     return media_pricing_available(
-        str(route.get("model_kind") or "text"),
+        kind,
         route.get("media_pricing"),
         text_input_priced=route.get("input_price_per_token") is not None,
         text_output_priced=route.get("output_price_per_token") is not None,
+        duration_families=_realtime_duration_families(kind, route.get("api_model_name")),
     )
 
 

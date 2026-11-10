@@ -1,4 +1,9 @@
-"""Ephemeral realtime PCM16 relay; only aggregate byte counts and provider token usage escape."""
+"""Ephemeral realtime PCM16 relay; only aggregate byte counts and provider token usage escape.
+
+OpenAI realtime kinds keep their vendor event names on the compatible wire. Every
+client event is whitelisted per kind and rebuilt from validated fields only; provider
+frames pass through except raw provider error detail, which is replaced.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,9 @@ import asyncio
 import base64
 import binascii
 import json
+import re
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -18,13 +25,34 @@ from websockets.exceptions import ConnectionClosed
 
 from lumen.services.usage_breakdown import UsageBreakdown
 
-from .realtime_transport import CLOSE_TIMEOUT_SECONDS, RealtimeTransportError, upstream_connection_spec
+from .realtime_transport import (
+    CLOSE_TIMEOUT_SECONDS,
+    RealtimeTransportError,
+    realtime_kind,
+    upstream_connection_spec,
+)
 
 _MAX_FRAME_BYTES = 64 * 1024
 _MAX_PCM_BYTES = 32 * 1024
 _IDLE_SECONDS = 60
 _USAGE_DRAIN_SECONDS = 15
 _MAX_METERED_RESPONSES = 4096
+_PCM24 = {"type": "audio/pcm", "rate": 24000}
+_SAFE_PROVIDER_ERROR = {"type": "server_error", "message": "Realtime provider returned an error"}
+_TRANSCRIPTION_DELAYS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+_TRANSCRIPTION_LANGUAGE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z]{2,4})?")
+# Options each transcription-session model takes (probed against the provider 2026-11-10); other
+# models accept the full set.
+_TRANSCRIPTION_OPTIONS_ALL = frozenset({"prompt", "keywords", "languages", "language", "delay"})
+_TRANSCRIPTION_OPTIONS = {"gpt-realtime-whisper": frozenset({"language", "delay"})}
+_TRANSLATION_LANGUAGE = re.compile(r"[a-z]{2,3}(-[A-Za-z0-9]{2,8})?")
+_MAX_TRANSCRIPTION_PROMPT_CHARS = 2048
+_MAX_KEYWORDS = 50
+_MAX_KEYWORD_CHARS = 100
+_MAX_LANGUAGES = 8
+# Kinds whose upstream must receive session.close and be drained until session.closed,
+# otherwise translated or spoken audio still in flight is dropped.
+_DRAINED_CLOSE_KINDS = frozenset({"translation", "live"})
 
 
 @dataclass(frozen=True)
@@ -175,8 +203,173 @@ def _object(value: str | bytes) -> dict[str, Any]:
     return parsed
 
 
+def _string_list(value: object, *, limit: int, valid: Callable[[str], bool]) -> list[str]:
+    if not isinstance(value, list) or len(value) > limit or not all(isinstance(item, str) and valid(item)
+                                                                     for item in value):
+        raise RealtimeTransportError("unsupported realtime transcription options")
+    return list(value)
+
+
+def transcription_session(session: object) -> tuple[str, dict]:
+    """Validate a client transcription ``session.update`` body; return its model and tuning options.
+
+    Only ``audio.input.transcription`` may be set. Server VAD is refused (each turn is
+    committed explicitly) and the PCM16 24 kHz input format is fixed.
+    """
+    invalid = RealtimeTransportError("unsupported realtime transcription session")
+    if not isinstance(session, dict) or set(session) - {"type", "audio"} or session.get("type") != "transcription":
+        raise invalid
+    audio = session.get("audio")
+    input_audio = audio.get("input") if isinstance(audio, dict) and set(audio) == {"input"} else None
+    if not isinstance(input_audio, dict) or set(input_audio) - {"format", "transcription", "turn_detection"}:
+        raise invalid
+    if input_audio.get("format", _PCM24) != _PCM24:
+        raise RealtimeTransportError("realtime PCM format is fixed at admission")
+    if input_audio.get("turn_detection") is not None:
+        raise RealtimeTransportError("unsupported realtime turn detection")
+    transcription = input_audio.get("transcription")
+    if not isinstance(transcription, dict) or set(transcription) - {"model", *_TRANSCRIPTION_OPTIONS_ALL}:
+        raise invalid
+    model = transcription.get("model")
+    if not isinstance(model, str) or not model or len(model) > 190:
+        raise invalid
+    # The provider rejects options a model does not take, after the session already exists upstream.
+    if set(transcription) - {"model"} - _TRANSCRIPTION_OPTIONS.get(model, _TRANSCRIPTION_OPTIONS_ALL):
+        raise RealtimeTransportError("unsupported realtime transcription options")
+    if transcription.get("language") is not None and transcription.get("languages") is not None:
+        raise RealtimeTransportError("unsupported realtime transcription options")
+    options: dict = {}
+    prompt = transcription.get("prompt")
+    if prompt is not None:
+        if not isinstance(prompt, str) or len(prompt) > _MAX_TRANSCRIPTION_PROMPT_CHARS:
+            raise RealtimeTransportError("unsupported realtime transcription options")
+        options["prompt"] = prompt
+    if transcription.get("keywords") is not None:
+        options["keywords"] = _string_list(transcription["keywords"], limit=_MAX_KEYWORDS, valid=lambda item: (
+            0 < len(item) <= _MAX_KEYWORD_CHARS and not set(item) & set("<>\r\n")))
+    if transcription.get("languages") is not None:
+        options["languages"] = _string_list(transcription["languages"], limit=_MAX_LANGUAGES,
+                                            valid=lambda item: bool(_TRANSCRIPTION_LANGUAGE.fullmatch(item)))
+    language = transcription.get("language")
+    if language is not None:
+        if not isinstance(language, str) or not _TRANSCRIPTION_LANGUAGE.fullmatch(language):
+            raise RealtimeTransportError("unsupported realtime transcription options")
+        options["language"] = language
+    delay = transcription.get("delay")
+    if delay is not None:
+        if not isinstance(delay, str) or delay not in _TRANSCRIPTION_DELAYS:
+            raise RealtimeTransportError("unsupported realtime transcription options")
+        options["delay"] = delay
+    return model, options
+
+
+def transcription_update(model: str, options: dict | None) -> dict:
+    """The canonical upstream transcription session; the model is the admitted one."""
+    return {"type": "session.update", "session": {"type": "transcription", "audio": {"input": {
+        "format": dict(_PCM24), "transcription": {"model": model, **(options or {})}, "turn_detection": None}}}}
+
+
+def live_session_start(message: object) -> tuple[str, str | None, str | None]:
+    """Validate a client GPT-Live ``session.start``; return ``(model, instructions, voice)``.
+
+    Backend delegation (separately billed), provider-side storage and seeded input history
+    cannot be metered or bounded, so they are refused; the PCM16 24 kHz format is fixed.
+    """
+    invalid = RealtimeTransportError("unsupported realtime live session")
+    if not isinstance(message, dict) or message.get("type") != "session.start" or set(message) - {
+            "type", "event_id", "session"}:
+        raise invalid
+    event_id = message.get("event_id")
+    session = message.get("session")
+    if (event_id is not None and (not isinstance(event_id, str) or len(event_id) > 128)) or not isinstance(session, dict):
+        raise invalid
+    if set(session) - {"model", "instructions", "audio", "delegation", "store"}:
+        raise invalid
+    if session.get("delegation") is not None:
+        raise RealtimeTransportError("realtime live delegation is unsupported")
+    if session.get("store") is not None and session["store"] is not False:
+        raise RealtimeTransportError("realtime live storage is unsupported")
+    model, instructions = session.get("model"), session.get("instructions")
+    if not isinstance(model, str) or not model or len(model) > 190:
+        raise invalid
+    if instructions is not None and (not isinstance(instructions, str) or len(instructions) > 4096):
+        raise RealtimeTransportError("invalid realtime instructions")
+    audio = session.get("audio", {})
+    if not isinstance(audio, dict) or set(audio) - {"format", "output"}:
+        raise invalid
+    if audio.get("format", _PCM24) != _PCM24:
+        raise RealtimeTransportError("realtime PCM format is fixed at admission")
+    output = audio.get("output", {})
+    if not isinstance(output, dict) or set(output) - {"voice"}:
+        raise invalid
+    voice = output.get("voice")
+    if voice is not None and (not isinstance(voice, str) or not voice or len(voice) > 100):
+        raise invalid
+    return model, instructions, voice
+
+
+def _live_start(model: str, instructions: str | None, voice: str | None) -> dict:
+    session: dict = {"model": model}
+    if instructions:
+        session["instructions"] = instructions
+    session["audio"] = {"format": dict(_PCM24), "output": {"voice": voice}}
+    return {"type": "session.start", "event_id": f"lumen_{uuid.uuid4().hex}", "session": session}
+
+
+def _translation_update(session: object) -> dict:
+    output = None
+    if isinstance(session, dict) and set(session) == {"audio"}:
+        audio = session["audio"]
+        output = audio.get("output") if isinstance(audio, dict) and set(audio) == {"output"} else None
+    language = output.get("language") if isinstance(output, dict) and set(output) == {"language"} else None
+    if not isinstance(language, str) or not _TRANSLATION_LANGUAGE.fullmatch(language):
+        raise RealtimeTransportError("unsupported realtime translation update")
+    return {"type": "session.update", "session": {"audio": {"output": {"language": language}}}}
+
+
+def _kind_client_event(message: dict, kind: str, model: str | None) -> tuple[dict | None, int, bool]:
+    """Whitelisted OpenAI transcription/translation/live client events, rebuilt from validated fields."""
+    event = message.get("type")
+    if event == "session.close":
+        return None, 0, True
+    if kind == "transcription":
+        if event == "input_audio_buffer.append":
+            audio, size = _pcm(message.get("audio"))
+            return {"type": event, "audio": audio}, size, False
+        if event in {"input_audio_buffer.commit", "input_audio_buffer.clear"}:
+            return {"type": event}, 0, False
+        if event == "session.update":
+            requested, options = transcription_session(message.get("session"))
+            if requested != model:
+                raise RealtimeTransportError("realtime model is fixed at admission")
+            return transcription_update(requested, options), 0, False
+    elif kind == "translation":
+        if event == "session.input_audio_buffer.append":
+            audio, size = _pcm(message.get("audio"))
+            return {"type": event, "audio": audio}, size, False
+        if event == "session.update":
+            return _translation_update(message.get("session")), 0, False
+    elif kind == "live":
+        if event == "session.input_audio.append":
+            audio, size = _pcm(message.get("audio"))
+            return {"type": event, "audio": audio}, size, False
+        if event in {"session.input_audio.mute", "session.input_audio.unmute"}:
+            return {"type": event}, 0, False
+        if event == "session.instructions.append":
+            instructions = message.get("instructions")
+            if not isinstance(instructions, str) or not instructions or len(instructions) > 4096:
+                raise RealtimeTransportError("invalid realtime instructions")
+            return {"type": event, "instructions": instructions}, 0, False
+    raise RealtimeTransportError("unsupported realtime client event")
+
+
 def _client_event(message: dict, provider: str, *, wire: str, voice: str | None = None,
-                  allow_transcription: bool = True) -> tuple[dict | None, int, bool]:
+                  allow_transcription: bool = True, kind: str = "conversation",
+                  model: str | None = None) -> tuple[dict | None, int, bool]:
+    if kind != "conversation":
+        if wire != "openai" or provider != "openai":
+            raise RealtimeTransportError("unsupported realtime client event")
+        return _kind_client_event(message, kind, model)
     event = message.get("type")
     if wire == "openai":
         if event == "input_audio_buffer.append":
@@ -244,7 +437,23 @@ def _client_event(message: dict, provider: str, *, wire: str, voice: str | None 
     raise RealtimeTransportError("unsupported realtime client event")
 
 
-def _provider_events(message: dict, provider: str, *, wire: str) -> tuple[list[dict], int]:
+def _kind_provider_events(message: dict) -> tuple[list[dict], int]:
+    """OpenAI transcription/translation/live frames pass through; raw provider error detail never does."""
+    event = message.get("type")
+    if event == "error" or not isinstance(event, str) or len(event) > 128:
+        return [{"type": "error", "error": dict(_SAFE_PROVIDER_ERROR)}], 0
+    if "error" in message:
+        # e.g. conversation.item.input_audio_transcription.failed keeps its item correlation only.
+        safe = {key: message[key] for key in ("type", "item_id", "content_index") if key in message}
+        return [{**safe, "error": dict(_SAFE_PROVIDER_ERROR)}], 0
+    size = _pcm(message.get("delta"))[1] if event == "session.output_audio.delta" else 0
+    return [message], size
+
+
+def _provider_events(message: dict, provider: str, *, wire: str,
+                     kind: str = "conversation") -> tuple[list[dict], int]:
+    if kind != "conversation":
+        return _kind_provider_events(message)
     events: list[dict] = []
     pcm_bytes = 0
     if provider == "openai":
@@ -332,19 +541,25 @@ async def relay_audio(
     route: dict,
     *,
     session_id: str,
-    voice: str,
+    voice: str | None,
     instructions: str | None,
     max_duration_seconds: int,
     wire: str = "native",
     is_canceled: Callable[[], Awaitable[bool]],
     token_usage: bool = False,
     session_time: bool = False,
+    transcription: dict | None = None,
 ) -> AudioMeter:
     """Relay strictly bounded frames and return PCM byte counts; never log or persist audio.
 
     ``token_usage`` sessions additionally meter provider-reported token usage. OpenAI's
     input transcription is a separately billed model whose rates are not frozen, so it is
     neither configured nor accepted for token-basis sessions.
+
+    Non-conversation OpenAI kinds run only on the compatible ``openai`` wire. The upstream
+    setup is built from admitted values only: ``transcription`` holds the pre-validated
+    transcription tuning options, a GPT-Live ``session.start`` carries the admitted model,
+    instructions and voice, and translation waits for the client's language update.
     """
     provider = route["provider_type"]
     input_rate = 24000 if provider == "openai" else 16000
@@ -356,6 +571,10 @@ async def relay_audio(
 
     api_key = await resolve_route_api_key(route)
     url, headers = upstream_connection_spec({**route, "api_key": api_key})
+    kind = realtime_kind({**route, "api_key": api_key})
+    if kind != "conversation" and wire != "openai":
+        raise RealtimeTransportError("realtime model requires its compatible wire")
+    model = route["api_model_name"]
     incoming = outgoing = 0
     tokens = TokenUsageMeter(provider) if token_usage else None
     loop = asyncio.get_running_loop()
@@ -387,7 +606,13 @@ async def relay_audio(
                 hard_at = connected_at + max_duration_seconds - 0.001
                 hard_close = loop.call_at(hard_at, upstream.transport.abort)
                 deadline.reschedule(hard_at)
-            if provider == "openai":
+            if kind == "transcription":
+                await upstream.send(json.dumps(transcription_update(model, transcription)))
+            elif kind == "live":
+                await upstream.send(json.dumps(_live_start(model, instructions, voice)))
+            elif kind == "translation":
+                pass  # The client selects the output language with its own session.update.
+            elif provider == "openai":
                 input_config: dict = {"format": {"type": "audio/pcm", "rate": 24000}}
                 if tokens is None:
                     input_config["transcription"] = {"model": "gpt-4o-mini-transcribe"}
@@ -414,13 +639,18 @@ async def relay_audio(
             client = asyncio.create_task(websocket.receive_text())
             server = asyncio.create_task(upstream.recv())
             last_activity = started
+            # Set once a translation/live client asks to close: relay provider frames until
+            # session.closed (in-flight audio) or this bounded drain deadline.
+            closing_until: float | None = None
             try:
                 while True:
                     now = loop.time()
                     elapsed = now - started
-                    if elapsed >= relay_limit or now - last_activity >= _IDLE_SECONDS or await is_canceled():
+                    if (elapsed >= relay_limit or now - last_activity >= _IDLE_SECONDS or await is_canceled()
+                            or (closing_until is not None and now >= closing_until)):
                         break
-                    done, _ = await asyncio.wait({client, server}, timeout=min(1, relay_limit - elapsed),
+                    done, _ = await asyncio.wait({server} if closing_until is not None else {client, server},
+                                                 timeout=min(1, relay_limit - elapsed),
                                                  return_when=asyncio.FIRST_COMPLETED)
                     if not done:
                         continue
@@ -430,17 +660,23 @@ async def relay_audio(
                         except WebSocketDisconnect:
                             break
                         message, size, close = _client_event(request, provider, wire=wire, voice=voice,
-                                                             allow_transcription=tokens is None)
-                        if close:
+                                                             allow_transcription=tokens is None, kind=kind,
+                                                             model=model)
+                        if close and kind not in _DRAINED_CLOSE_KINDS:
                             break
-                        if incoming + size > 2 * input_rate * max_duration_seconds:
-                            raise RealtimeTransportError("session input exceeds duration bound")
-                        if tokens is not None:
-                            tokens.request_sent(message)
-                        await upstream.send(json.dumps(message, separators=(",", ":")))
-                        last_activity = loop.time()
-                        incoming += size
-                        client = asyncio.create_task(websocket.receive_text())
+                        if close:
+                            await upstream.send(json.dumps({"type": "session.close"}))
+                            last_activity = loop.time()
+                            closing_until = last_activity + _USAGE_DRAIN_SECONDS
+                        else:
+                            if incoming + size > 2 * input_rate * max_duration_seconds:
+                                raise RealtimeTransportError("session input exceeds duration bound")
+                            if tokens is not None:
+                                tokens.request_sent(message)
+                            await upstream.send(json.dumps(message, separators=(",", ":")))
+                            last_activity = loop.time()
+                            incoming += size
+                            client = asyncio.create_task(websocket.receive_text())
                     if server in done:
                         try:
                             response = server.result()
@@ -451,7 +687,7 @@ async def relay_audio(
                         parsed = _object(response)
                         if tokens is not None:
                             tokens.observe(parsed)
-                        events, size = _provider_events(parsed, provider, wire=wire)
+                        events, size = _provider_events(parsed, provider, wire=wire, kind=kind)
                         last_activity = loop.time()
                         if outgoing + size > output_limit:
                             raise RealtimeTransportError("session output exceeds duration bound")
@@ -462,6 +698,8 @@ async def relay_audio(
                             for event in events:
                                 await websocket.send_json(event)
                         except (WebSocketDisconnect, RuntimeError):
+                            break
+                        if kind in _DRAINED_CLOSE_KINDS and parsed.get("type") == "session.closed":
                             break
                 if tokens is not None and tokens.pending:
                     server, outgoing = await _drain_final_usage(upstream, server, tokens, provider=provider,

@@ -9,3 +9,5 @@ dist/
 .pytest_cache/
 .lumen-venv/
 .env
+# macOS Finder metadata changes constantly and would make the architecture source digest stale.
+.DS_Store

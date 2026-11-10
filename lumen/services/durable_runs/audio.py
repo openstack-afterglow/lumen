@@ -59,6 +59,7 @@ from .media import (
     lock_media_run_for_io,
     lock_media_source_in_transaction,
     media_io_allowed,
+    rejection_message,
     validate_batch_media_io_in_transaction,
 )
 
@@ -340,6 +341,9 @@ async def admit_audio_run(request: dict, *, project_id: str, user_id: str, clien
                                        credential_authority=credential_authority)
     try:
         async with _factory()() as session, session.begin():
+            # No gap locks: the unique idempotency index (migration 030) decides same-key races, and the
+            # IntegrityError replay below returns the winner. Gap locks deadlocked concurrent admissions.
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             run = await persist_audio_run_in_transaction(session, prepared, project_id=project_id, user_id=user_id,
                 client_request_id=client_request_id, source=source, api_key_id=api_key_id)
             created = descriptor(run)
@@ -563,11 +567,12 @@ async def _execute(run_id: str, *, owner: str, payload: dict, capability_snapsho
                         transcription = await audio_transport.transcribe_audio(route, data=data, mime_type=mime,
                             language=payload.get("language"), prompt=payload.get("prompt"), **timing)
                 except audio_transport.AudioTransportError as exc:
-                    # Batch only: a confirmed refusal settles at zero; anything else stays unknown.
-                    if not is_batch or confirmed_media_rejection(exc) is None:
+                    # A refusal proven to precede inference settles at zero; anything else stays unknown.
+                    rejected = confirmed_media_rejection(exc)
+                    if rejected is None:
                         raise
                     await _finish(run_id, status="failed", message_id=None, owner=owner,
-                        error_code="provider_rejected", safe_message="upstream provider rejected the request")
+                        error_code="provider_rejected", safe_message=rejection_message(rejected))
                     return True
                 if kind == "tts":
                     data, mime, tokens = speech.data, speech.mime_type, speech.usage
