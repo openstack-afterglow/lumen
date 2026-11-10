@@ -322,6 +322,20 @@ class TestCatalog:
         assert result["diff"]["added"] == ["new"] and result["diff"]["removed"] == ["old"]
         assert store.catalog_writes[0][1][0]["name"] == "new"
 
+    async def test_refresh_reaches_the_real_discovery_wrapper_without_a_context(self, monkeypatch, store):
+        # Regression: fakes that replaced discover_tools hid a missing-keyword TypeError in production.
+        store.rows.append({"id": 5, "tools": []})
+        monkeypatch.setattr(es, "get_global_mcp_revealed", _reveal({"id": 5, "is_active": True, "auth_mode": "none"}))
+
+        class Provider:
+            async def list_tools(self, server, *, context=None):
+                return [{"name": "fresh", "description": "F", "input_schema": {}}]
+
+        monkeypatch.setattr(mcp_connections.mcp_client, "_provider", lambda: Provider())
+        result = await mcp_connections.refresh_catalog(5, user_id=None, project_id=None)
+        assert result["status"] == "ok"
+        assert result["diff"]["added"] == ["fresh"]
+
     async def test_failed_refresh_keeps_the_last_catalog_and_records_only_the_error(self, monkeypatch, store):
         monkeypatch.setattr(es, "get_global_mcp_revealed", _reveal({"id": 5, "is_active": True, "auth_mode": "none"}))
 

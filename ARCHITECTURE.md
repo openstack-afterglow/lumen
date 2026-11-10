@@ -547,9 +547,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "0458085095f78751531323a0ac24f641b554f2ebeab0e06d465a433c73b70d04",
-  "reviewed_at": "2026-11-10T09:07:21Z",
-  "summary": "Removed unused singular selected_lumen_snapshot; ARCHITECTURE multi-grant evidence updated to contract 6,774/SDK 143/integration 450 plus binder tests; admission freeze wording pluralized"
+  "source_sha256": "b78dcc01c0fd13113f5a1be0e2b07e61c4868f0d6f3448f7dd312558565c2b97",
+  "reviewed_at": "2026-11-10T09:51:12Z",
+  "summary": "API docs: scripts/gen_api_docs.py generates reference.md and schemas.md from live OpenAPI; docs/api group READMEs corrected against SCOPE_CAPABILITIES; MCP catalog refresh fix (discover_tools context optional) with regression"
 }
 ```
 <!-- architecture-review:end -->
