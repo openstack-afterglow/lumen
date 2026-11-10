@@ -385,13 +385,15 @@ async def migrate(database_url: str, *, apply: bool, repair_schema_drift: bool =
                 await _verify_active_paths(connection)
                 await _record_migration(connection, migration)
         if repair_schema_drift:
-            # Bootstrap self-repair: after the verified ledger, recreate missing tables, columns and indexes the ORM
-            # declares (additive only; anything else fails closed here, before the API or workers start).
+            # Bootstrap self-repair: after the verified ledger, restore the tables, columns and keys the ledger-shaped
+            # snapshot declares (additive only; anything else fails closed here, before the API or workers start).
             try:
                 if apply:
                     await repair_schema(engine)
                 elif not pending:
-                    pending.extend("schema-repair: " + change for change in await describe_drift(engine))
+                    drift = await describe_drift(engine)
+                    if drift:  # the history checks below would query tables that may be missing
+                        return ["schema-repair: " + change for change in drift], 0
             except SchemaRepairError as exc:
                 raise MigrationLedgerError(f"schema drift cannot be repaired automatically: {exc}") from None
         async with engine.begin() as connection:

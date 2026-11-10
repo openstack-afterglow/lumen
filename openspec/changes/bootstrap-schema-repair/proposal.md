@@ -1,0 +1,18 @@
+## Why
+
+The baseline migration was generated from `CREATE TABLE`, so 48 ORM-declared indexes never reached a migration. Migration 030 adds them, but a database can also drift later (a dropped table, column or index after a restore or manual change), and the API and workers then fail at runtime instead of at bootstrap. The operator asked that `lumen-migrate --apply`, which already runs before every API, worker and controller start, detect a missing or mismatched table and restore it automatically.
+
+## Conflict with the accepted specification
+
+`openspec/specs/engineering-boundaries/spec.md`, requirement "Schema and secrets preserve authority", says schema changes MUST use additive migrations and update `lumen/migrations/manifest.txt` checksums. The bootstrap repair issues `CREATE TABLE`, `ADD COLUMN` and `ADD KEY` outside the checksummed ledger. It does not introduce a schema change (it restores objects the ledger already defines) and it writes no ledger receipt, but it is DDL the accepted wording does not allow. This change records that exception as a reviewable MODIFIED requirement instead of leaving the code to contradict the specification. The implementation in commit `88595f8` landed before this delta existed; its ORM-derived repair was then replaced by the snapshot-derived one described here.
+
+## What Changes
+
+- `lumen-migrate --apply` compares the live schema with `lumen/data/schema_snapshot.sql`, the normalized `SHOW CREATE TABLE` output of a database produced by the ledger migrations alone. An integration test fails when the snapshot differs from the ledger result, so a restored object has exactly the ledger's types, defaults, `datetime(6)` precision, key and foreign-key names. Deriving it from the ORM was rejected after a real run showed `create_all` loses SQL-only defaults and precision and the detector would never notice.
+- Restored automatically: a missing table (empty), a missing nullable or defaulted column that is not a key, foreign-key or check column, and a missing index or unique key (a unique key only after a duplicate probe).
+- Rejected before any DDL, listing every reason: other missing columns, duplicate keys, and any missing table or column of a protected table: the provider-account tables, tables whose columns or names indicate encrypted material, credentials, credit, balances, credit reservations or cloud resources, and the conversation-history tables (the runner's own history integrity checks reject missing membership or active-path rows, and `backfill_history` only rebuilds histories that are not ready, so recreating them empty would only fail after the DDL). Presence is compared by table, column and key name only; types, existing nullability, foreign keys and database-only objects are not compared.
+- A dry run (`lumen-migrate` without `--apply`) reports drift and exits non-zero; `--no-schema-repair` applies the ledger only and is used by the integration layer so a migration that forgets an object is not masked.
+
+## Impact and limits
+
+No new schema. A recreated table is empty: its data is already gone and must come from a backup, and 29 of the 65 tables (agents, skills, memories, workspaces, run events, leases, queues) are recreated that way rather than rejected. Foreign keys, column types and orphan-row checks are not verified or repaired. The snapshot must be regenerated whenever a migration changes a table (`LUMEN_UPDATE_SCHEMA_SNAPSHOT=1 uv run lumen-test integration -k schema_snapshot`); the test fails otherwise. Production was checked read-only on 2026-11-10: no missing table or column and only the 49 keys that migrations 029 and 030 add.
