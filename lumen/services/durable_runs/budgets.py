@@ -64,6 +64,11 @@ def _is_retryable_lock_conflict(exc: BaseException) -> bool:
     return bool(args and isinstance(args[0], int) and args[0] in _LOCK_CONFLICT_CODES)
 
 
+def is_lock_conflict(exc: BaseException) -> bool:
+    """True for the MariaDB lock-conflict codes (1020 snapshot, 1205 timeout, 1213 deadlock)."""
+    return _is_retryable_lock_conflict(exc)
+
+
 async def retry_deadlocks[T](operation: Callable[[], Awaitable[T]], *, attempts: int = 3) -> T:
     """Retry rollback-safe pure DB transactions at most three times; never wrap network I/O."""
     if not 1 <= attempts <= 3:

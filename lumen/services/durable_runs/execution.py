@@ -348,7 +348,7 @@ async def _finish_transaction(
                 segment = (await session.execute(select(ChatRunSegment).where(
                     ChatRunSegment.run_id == run.id, ChatRunSegment.segment_id == f"{run.run_kind}:1"
                 ).with_for_update())).scalar_one()
-                if (run.batch_id is not None and run.run_kind in {"image", "tts", "stt"}
+                if (run.run_kind in {"image", "tts", "stt"}
                         and error_code == "provider_rejected" and segment.status == "provider_started"):
                     # Confirmed refusal, hold release and terminal state commit together.
                     fail_unresolved_segment(segment, error_code="provider_rejected")
@@ -2891,7 +2891,13 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             error_code=getattr(exc, "code", "context_limit_exceeded"),
             safe_message="context input exceeds the configured limit",
         )
-    except Exception:
+    except Exception as exc:
+        # The class name alone is safe to log; messages and tracebacks can carry prompts or credentials.
+        logger.warning(
+            "durable chat run failed with unexpected exception run_id=%s error_type=%s",
+            _safe_log_token(run_id),
+            _safe_log_token(type(exc).__name__),
+        )
         try:
             await flush_deltas(check_cancel=False)
         except Exception:

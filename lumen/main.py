@@ -436,7 +436,7 @@ def custom_openapi() -> dict:
         "openai_responses": "OpenAI Responses-compatible stateless completion (/v1/responses)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
         "openai_images": "OpenAI-compatible durable image generation and edits (/v1/images/generations, /v1/images/edits)",
-        "openai_realtime": "OpenAI-compatible durable realtime WebSocket (/v1/realtime)",
+        "openai_realtime": "OpenAI-compatible durable realtime WebSockets (/v1/realtime, /v1/realtime?intent=transcription, /v1/realtime/translations, /v1/live/sessions)",
         "gemini_live": "Google Gemini Live-compatible WebSocket (/v1beta/realtime)",
         "lumen_native": "Lumen native durable runs (/v1/conversations/{conversation_id}/completions, /v1/temp-completions, /v1/runs/...)",
         "claude_gateway": "Claude Code device-authenticated Anthropic gateway (/v1/claude-gateway)",

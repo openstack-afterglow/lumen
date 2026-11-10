@@ -22,6 +22,9 @@ from lumen import crypto
 from lumen.scripts import migrate as runner
 from lumen.scripts import provider_account_migration as account
 
+# Migration 029 (the chat_runs idempotency unique index) is applied after the 028 cutover these tests exercise.
+_PENDING = [account.ACCOUNT_ID, "029-chat-runs-idempotency-index"]
+
 pytestmark = pytest.mark.integration
 
 
@@ -228,7 +231,14 @@ async def test_pristine_published_upgrade_preserves_ciphertext_generations_attem
     after = await database.snapshot()
     assert after['llm_models'] == before['llm_models']
     assert after['chat_usage_logs'][1][0][:len(before['chat_usage_logs'][1][0])] == before['chat_usage_logs'][1][0]
-    assert after['chat_runs'] == before['chat_runs']
+    before_ddl, before_rows = before['chat_runs']
+    after_ddl, after_rows = after['chat_runs']
+    assert after_rows == before_rows
+    # 028 leaves chat_runs alone; the only DDL difference is migration 029's idempotency unique key.
+    def without_idempotency(ddl):
+        return [line.rstrip(",") for line in ddl.splitlines() if "idempotency" not in line]
+    assert "idempotency" not in before_ddl and "idempotency" in after_ddl
+    assert without_idempotency(after_ddl) == without_idempotency(before_ddl)
     assert after['chat_run_providers'][1][0][:len(before['chat_run_providers'][1][0])] == before['chat_run_providers'][1][0]
     for receipt in before['schema_migrations'][1]:
         assert receipt in after['schema_migrations'][1]
@@ -248,7 +258,7 @@ async def test_exact_historical_receipt_is_preserved_without_replaying027(databa
         await database.sql("UPDATE llm_provider_credentials SET encrypted_api_key='synthetic-rotated-envelope',generation=23 WHERE account_id=(SELECT id FROM llm_provider_accounts WHERE provider_id=71)")
         await database.sql("INSERT INTO chat_provider_usage (event_id,provider_account_id,provider_credential_id,provider_id,provider_credential_generation,raw_cost) VALUES ('historical-deleted-identity',9991,9992,9993,7,0.123)")
     before = await database.snapshot()
-    assert await database.run(monkeypatch) == ([account.ACCOUNT_ID], 0)
+    assert await database.run(monkeypatch) == (_PENDING, 0)
     migration_statements = tuple(database.statements)
     after = await database.snapshot()
     assert (await database.sql("SELECT COUNT(*) FROM llm_providers WHERE encrypted_api_key IS NOT NULL OR api_key_env IS NOT NULL OR encrypted_subscription_tokens IS NOT NULL OR subscription_status <> 'disconnected' OR subscription_expires_at IS NOT NULL OR subscription_generation <> 0")).scalar_one() == 0
@@ -276,7 +286,7 @@ async def test_exact_historical_receipt_is_preserved_without_replaying027(databa
 @pytest.mark.parametrize("apply", [False, True])
 async def test_receipted028_missing_published027_rejects_without_ddl(database, monkeypatch, apply):
     await database.prepare()
-    assert await database.run(monkeypatch) == ([account.ACCOUNT_ID], 0)
+    assert await database.run(monkeypatch) == (_PENDING, 0)
     await database.sql("DELETE FROM schema_migrations WHERE logical_id='027-kubernetes-sandboxes'")
     before = await database.snapshot()
     with pytest.raises(runner.MigrationLedgerError, match="incomplete_published027_prefix"):
@@ -326,7 +336,7 @@ async def test_repaired_dry_run_is_read_only(database, monkeypatch):
     await database.prepare()
     await database.repair()
     before = await database.snapshot()
-    assert await database.run(monkeypatch, apply=False) == ([account.ACCOUNT_ID], 0)
+    assert await database.run(monkeypatch, apply=False) == (_PENDING, 0)
     assert all(sql.lstrip().startswith(('SELECT','SHOW')) for sql in database.statements)
     assert await database.snapshot() == before
 

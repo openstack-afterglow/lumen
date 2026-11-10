@@ -15,6 +15,7 @@ from lumen.services.conversation_store import ChatStorageUnavailable
 from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.durable_runs import queries
 from lumen.services.durable_runs.audio import admit_audio_run, audio_result
+from lumen.services.durable_runs.media import rejection_http_response
 from lumen.services.providers.errors import ProviderValidationError
 
 router = APIRouter()
@@ -81,6 +82,10 @@ async def completed_audio(run_id: str, *, principal: Principal, request: Request
                     after_seq=max(0, run.last_seq - 8),
                 )
                 terminal = next((event for event in reversed(events) if event.type in {"run.failed", "run.canceled"}), None)
+                if terminal is not None and getattr(terminal.payload, "error_code", None) == "provider_rejected":
+                    # The hold was released at zero: the refusal is reported with the upstream status class.
+                    status, _error_type, refusal = rejection_http_response(terminal.payload.safe_message)
+                    raise HTTPException(status_code=status, detail=refusal)
                 message = terminal.payload.safe_message if terminal is not None else "Audio run failed"
                 raise HTTPException(status_code=500, detail=message or "Audio run failed")
         except (durable_errors.DurableRunError, assets.AssetError, assets.AssetUnavailable,

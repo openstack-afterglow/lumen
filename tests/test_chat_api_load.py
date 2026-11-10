@@ -74,7 +74,8 @@ async def test_readiness_probe_does_not_create_api_demand_and_remote_load_is_rej
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/v1/realtime", "/v1beta/realtime", "/v1/chat/realtime/sessions/test-session/ws"])
+@pytest.mark.parametrize("path", ["/v1/realtime", "/v1/realtime/translations", "/v1/live/sessions", "/v1beta/realtime",
+                                  "/v1/chat/realtime/sessions/test-session/ws"])
 async def test_websocket_counts_disconnect_cleanup_until_application_exit(path):
     from datetime import UTC, datetime
     meter = ApiLoadMeter()
