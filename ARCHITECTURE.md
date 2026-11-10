@@ -551,9 +551,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "66bff6b25fce08271caeb0cc96447b4e0749e7d8b105dbb20b7e38c753abd765",
-  "reviewed_at": "2026-11-10T13:03:37Z",
-  "summary": "CI integration job bootstrap에 --no-schema-repair 추가, 텍스트 admission 수정 전 증거를 관찰값(8 failed/4 passed)으로 정정; ARCHITECTURE/operations/testing/CHANGELOG 갱신"
+  "source_sha256": "c7c1e92e0fb330089b4945ddf83c5ee029959cf60f768c27777517727a5c6282",
+  "reviewed_at": "2026-11-10T13:04:12Z",
+  "summary": "macOS .DS_Store를 .gitignore에 추가해 untracked Finder 메타데이터가 architecture source digest를 계속 바꾸지 않게 함; CI 부트스트랩 --no-schema-repair와 증거 정정은 이전 stamp 범위"
 }
 ```
 <!-- architecture-review:end -->
