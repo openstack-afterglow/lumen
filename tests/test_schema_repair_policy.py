@@ -44,18 +44,19 @@ def test_key_foreign_key_and_check_columns_are_never_added_back_as_plain_columns
     assert schema_repair._column_problem(shape, "created_at") is None  # NOT NULL but has a default
 
 
-def test_secret_and_money_tables_are_never_recreated_empty_while_derived_tables_may_be():
-    protected = schema_repair.sensitive_tables(schema_repair.load_snapshot())
+def test_every_table_is_protected_except_the_explicit_ephemeral_list():
+    shapes = schema_repair.load_snapshot()
+    protected = schema_repair.protected_tables(shapes)
+    assert schema_repair.RECREATABLE_EMPTY <= set(shapes)  # a renamed or dropped table must not leave a stale entry
+    assert protected == set(shapes) - schema_repair.RECREATABLE_EMPTY
     assert set(REPAIRED_SCHEMA) <= protected
-    # Wallet balances, key hashes, encrypted credentials and credit holds must not silently reset.
-    assert {"user_wallets", "chat_api_keys", "chat_mcp_credentials", "chat_git_credentials", "chat_mcp_servers",
-            "chat_runs", "chat_model_call_reservations", "chat_agent_reservations", "chat_runtime_resources",
-            "chat_resource_operations"} <= protected
-    # Conversation history: the runner's own integrity checks fail on missing membership or active-path rows.
-    assert {"chat_conversations", "chat_messages", "chat_message_graphs", "chat_conversation_messages",
-            "chat_conversation_active_path"} <= protected
-    # Leases and lock rows that are re-established at runtime may be recreated.
-    assert not {"chat_scheduler_leases", "chat_memory_owner_locks", "chat_worker_registrations"} & protected
+    # Money, credentials, user content and history, run journal and cloud resource state are never recreated empty.
+    assert {"user_wallets", "chat_api_keys", "chat_mcp_credentials", "chat_runs", "chat_model_call_reservations",
+            "chat_agent_reservations", "chat_runtime_resources", "chat_conversations", "chat_messages",
+            "chat_conversation_messages", "chat_conversation_active_path", "chat_agents", "chat_skills",
+            "chat_memories", "chat_workspaces", "chat_run_events"} <= protected
+    # Only leases, registrations, lock rows and pending device logins come back empty.
+    assert not {"chat_scheduler_leases", "chat_worker_registrations"} & protected
 
 
 def test_every_table_in_the_snapshot_parses_with_its_primary_key_and_columns():

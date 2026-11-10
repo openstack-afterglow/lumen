@@ -13,9 +13,10 @@ has exactly the ledger's types, defaults, precision, key and foreign-key names. 
 * a missing index or unique key is created from its snapshot definition. Unique additions are pre-checked for
   duplicate keys, so nothing is deleted and a violating database is rejected before any DDL.
 
-Everything else fails closed before the first DDL statement with every reason listed. Tables that hold secret or money
-state (see ``sensitive_tables``) are never recreated or patched with columns: an empty replacement would silently reset
-balances or drop credentials. Presence is compared by table, column and key name only. Types, existing columns'
+Everything else fails closed before the first DDL statement with every reason listed. Tables outside
+``RECREATABLE_EMPTY`` (see ``protected_tables``) are never recreated or patched with columns: an empty replacement
+would silently reset balances, drop credentials or hide lost user data. Presence is compared by table, column and
+key name only. Types, existing columns'
 nullability, foreign keys and database-only objects are deliberately not compared, because spelling differs between
 servers and an automatic change could lose data.
 
@@ -41,21 +42,13 @@ SNAPSHOT_HEADER = (
     "-- LUMEN_UPDATE_SCHEMA_SNAPSHOT=1 uv run lumen-test integration -k schema_snapshot\n"
 )
 
-# Column names that mark a table as holding secret or money state; table names for credit holds and cloud resources.
-_SENSITIVE_COLUMN = re.compile(r"encrypt|ciphertext|secret|credential|credit|balance|raw_cost|key_hash", re.I)
-_SENSITIVE_TABLE = re.compile(r"credential|secret|wallet|api_key|reservation|resource", re.I)
-# Conversation history. The runner's own integrity checks (``_verify_active_paths``) reject conversations whose
-# message membership or active-path rows are missing, and ``backfill_history`` only rebuilds conversations whose
-# index is not yet ready, so recreating any of these empty would only move the failure to after the DDL.
-_HISTORY_TABLES = frozenset(
-    {
-        "chat_conversations",
-        "chat_messages",
-        "chat_message_graphs",
-        "chat_conversation_messages",
-        "chat_conversation_active_path",
-        "chat_message_assets",
-    }
+# Default deny. Only these ephemeral coordination tables may be recreated empty: their rows are leases, worker
+# registrations, lock rows and pending device logins that the running system re-establishes on its own. Every
+# other table holds user content, history, money, credentials or state other rows point at: an empty replacement
+# would hide the loss, reset balances, drop credentials or make the runner's own history integrity checks
+# (``_verify_active_paths``) fail after the DDL. A new table is therefore protected until it is listed here.
+RECREATABLE_EMPTY = frozenset(
+    {"chat_scheduler_leases", "chat_worker_registrations", "chat_memory_owner_locks", "chat_gateway_device_grants"}
 )
 
 
@@ -149,15 +142,9 @@ def load_snapshot(path: Path = SNAPSHOT_PATH) -> dict[str, TableShape]:
     return parse_snapshot(path.read_text(encoding="utf-8"))
 
 
-def sensitive_tables(shapes: dict[str, TableShape]) -> frozenset[str]:
-    """Tables that must never be recreated empty or patched with columns."""
-    from lumen.scripts.provider_account_migration import REPAIRED_SCHEMA
-
-    protected = set(REPAIRED_SCHEMA) | (_HISTORY_TABLES & set(shapes))
-    for shape in shapes.values():
-        if _SENSITIVE_TABLE.search(shape.name) or any(_SENSITIVE_COLUMN.search(column) for column in shape.columns):
-            protected.add(shape.name)
-    return frozenset(protected)
+def protected_tables(shapes: dict[str, TableShape]) -> frozenset[str]:
+    """Every table except the explicit ephemeral list: never recreated empty or patched with columns."""
+    return frozenset(set(shapes) - RECREATABLE_EMPTY)
 
 
 @dataclass
@@ -213,14 +200,14 @@ async def inspect_drift(
 ) -> Drift:
     """Read only. Compare table, column-name and key-name presence with the ledger-shaped snapshot."""
     shapes = load_snapshot() if shapes is None else shapes
-    protected = sensitive_tables(shapes) if protected is None else protected
+    protected = protected_tables(shapes) if protected is None else protected
     live_tables, live_columns, live_keys = await _live_schema(connection)
     drift = Drift()
     for shape in shapes.values():
         if shape.name not in live_tables:
             if shape.name in protected:
                 drift.problems.append(
-                    f"missing protected table {shape.name} (secret, money or history state, never recreated empty)"
+                    f"missing table {shape.name} (not an ephemeral coordination table, restore it from a backup)"
                 )
             else:
                 drift.tables.append(shape)

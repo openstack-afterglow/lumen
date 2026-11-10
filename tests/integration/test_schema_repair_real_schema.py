@@ -50,7 +50,6 @@ async def _restore(connection, snapshot):
 
 async def test_damaged_real_schema_is_restored_exactly_by_the_cli():
     snapshot = schema_repair.load_snapshot()
-    protected = schema_repair.sensitive_tables(snapshot)
     engine = create_async_engine(os.environ["DATABASE_URL"])
     try:
         async with engine.connect() as connection:
@@ -58,21 +57,26 @@ async def test_damaged_real_schema_is_restored_exactly_by_the_cli():
                 "SELECT DISTINCT REFERENCED_TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE "
                 "WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL")).scalars().all())
             before = await _bodies(connection)
-        victims = [name for name in snapshot if name not in protected and name not in referenced]
-        assert len(victims) >= 10  # real tables with SQL defaults, datetime(6), named keys and foreign keys
+        # Tables come back whole; one column is damaged on a table that stays, because columns are never patched
+        # into protected tables (keys are: chat_agents and chat_runs lose keys below).
+        column_table = "chat_gateway_device_grants"
+        victims = sorted(schema_repair.RECREATABLE_EMPTY - referenced - {column_table})
+        assert len(victims) == len(schema_repair.RECREATABLE_EMPTY) - 1  # real tables with defaults, datetime(6), FKs
         try:
             async with engine.begin() as connection:
                 await connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=0")
                 for name in victims:
                     await connection.exec_driver_sql(f"DROP TABLE `{name}`")
                 await connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=1")
-                await connection.exec_driver_sql("ALTER TABLE chat_agents DROP COLUMN description, DROP INDEX idx_chat_agents_owner")
+                await connection.exec_driver_sql(f"ALTER TABLE {column_table} DROP COLUMN denied_at")
+                await connection.exec_driver_sql("ALTER TABLE chat_agents DROP INDEX idx_chat_agents_owner")
                 await connection.exec_driver_sql("ALTER TABLE chat_runs DROP INDEX uq_chat_runs_idempotency")  # keys of sensitive tables
             code, output = _migrate()  # dry run: reports, changes nothing
             assert code != 0 and "schema-repair: create table" in output
             code, output = _migrate("--apply")
             assert code == 0, output
-            assert "schema repair: add column chat_agents.description" in output
+            assert f"schema repair: add column {column_table}.denied_at" in output
+            assert "schema repair: add index chat_agents.idx_chat_agents_owner" in output
             assert all(f"schema repair: create table {name}" in output for name in victims)
             code, output = _migrate()
             assert code == 0, output  # no drift and nothing pending
@@ -92,7 +96,7 @@ async def test_damaged_real_schema_is_restored_exactly_by_the_cli():
 
 async def test_a_missing_sensitive_table_fails_the_cli_and_creates_nothing():
     snapshot = schema_repair.load_snapshot()
-    assert "user_wallets" in schema_repair.sensitive_tables(snapshot)
+    assert "user_wallets" in schema_repair.protected_tables(snapshot)
     engine = create_async_engine(os.environ["DATABASE_URL"])
     try:
         async with engine.begin() as connection:
@@ -102,7 +106,7 @@ async def test_a_missing_sensitive_table_fails_the_cli_and_creates_nothing():
             await connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=1")
         try:
             code, output = _migrate("--apply")
-            assert code != 0 and "missing protected table user_wallets" in output
+            assert code != 0 and "missing table user_wallets" in output
             async with engine.connect() as connection:
                 tables = set((await connection.exec_driver_sql(
                     "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()")).scalars().all())

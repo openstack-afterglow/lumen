@@ -160,7 +160,7 @@ async def test_null_keys_do_not_count_as_duplicates(schema):
 async def test_protected_tables_are_never_recreated_or_patched_but_their_keys_are_repaired(schema):
     protected = frozenset({schema.child_name, schema.parent_name})
     await schema.sql(f"DROP TABLE `{schema.child_name}`")
-    with pytest.raises(SchemaRepairError, match=f"missing protected table {schema.child_name}"):
+    with pytest.raises(SchemaRepairError, match=f"missing table {schema.child_name}"):
         await schema.repair(protected)
     await schema.sql(f"ALTER TABLE `{schema.parent_name}` DROP COLUMN `note`")
     with pytest.raises(SchemaRepairError, match=f"missing column {schema.parent_name}.note"):
