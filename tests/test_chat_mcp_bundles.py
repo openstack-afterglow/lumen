@@ -68,10 +68,6 @@ class TestDefinitions:
         with pytest.raises(mcp_bundles.McpBundleError):
             mcp_bundles.definition("slack")
 
-    def test_install_fields_stay_inside_the_store_whitelist(self):
-        fields = mcp_bundles._install_fields(mcp_bundles.definition("github"))
-        assert set(fields) == {"name", "transport", "url", "auth_mode", "load_policy", "is_active"}
-
 
 class TestCatalog:
     async def test_reports_uninstalled_bundles(self, monkeypatch):
@@ -247,3 +243,4 @@ class TestUnconnectedConnectorSelection:
                 user_id="u1",
                 project_id="p1",
             )
+

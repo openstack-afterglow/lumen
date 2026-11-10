@@ -464,6 +464,13 @@ class ChatMcpServer(Base):
     load_policy: Mapped[str] = mapped_column(
         VARCHAR(16), nullable=False, default="on_demand", server_default="on_demand"
     )
+    # Template identity: several global connections may share a template and differ by label.
+    template_key: Mapped[str | None] = mapped_column(VARCHAR(100))
+    connection_label: Mapped[str | None] = mapped_column(VARCHAR(100))
+    # Discovery metadata only; refreshing it never bumps config_version.
+    tool_catalog: Mapped[dict | None] = mapped_column(JSON)
+    catalog_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    catalog_error: Mapped[str | None] = mapped_column(VARCHAR(300))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
@@ -472,6 +479,7 @@ class ChatMcpServer(Base):
         Index("idx_chat_mcp_scope", "scope"),
         Index("idx_chat_mcp_owner", "owner_user_id"),
         Index("idx_chat_mcp_servers_project", "project_id"),
+        UniqueConstraint("template_key", "connection_label", name="uq_chat_mcp_template_label"),
     )
 
 

@@ -682,7 +682,13 @@ CREATE TABLE `chat_mcp_servers` (
   `created_at` datetime NOT NULL,
   `updated_at` datetime NOT NULL,
   `auth_requirements` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`auth_requirements`)),
+  `template_key` varchar(100) DEFAULT NULL,
+  `connection_label` varchar(100) DEFAULT NULL,
+  `tool_catalog` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`tool_catalog`)),
+  `catalog_refreshed_at` datetime DEFAULT NULL,
+  `catalog_error` varchar(300) DEFAULT NULL,
   PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_chat_mcp_template_label` (`template_key`,`connection_label`),
   KEY `idx_chat_mcp_owner` (`owner_user_id`),
   KEY `idx_chat_mcp_scope` (`scope`),
   KEY `idx_chat_mcp_servers_project` (`project_id`)

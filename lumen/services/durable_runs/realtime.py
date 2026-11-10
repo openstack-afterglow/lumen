@@ -348,7 +348,7 @@ async def admit_realtime_session(
                "margin_multiplier": format(margin, "f"), "credit_per_usd": format(per_usd, "f")}
     try:
         async with _factory()() as session, session.begin():
-            # No gap locks: the unique idempotency index (migration 029) decides same-key races, and the
+            # No gap locks: the unique idempotency index (migration 030) decides same-key races, and the
             # IntegrityError replay below returns the winner. Gap locks deadlocked concurrent admissions.
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             existing = (await session.execute(select(ChatRun).where(ChatRun.project_id == project_id,

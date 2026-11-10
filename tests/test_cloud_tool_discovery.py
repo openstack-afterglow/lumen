@@ -58,7 +58,9 @@ def bridge(monkeypatch):
         assert request.headers["Authorization"] == f"Bearer {mcp_adapter.get_settings().lumen_mcp_service_token}"
         if request.url.path.endswith("/snapshot"):
             assert payload == {"user_id": "u1", "project_id": "p1"}
+            view = {"snapshot": state.snapshot, "entries": state.entries, "service_fingerprint": "a" * 64}
             return httpx.Response(200, json={
+                "snapshots": [view] if state.snapshot is not None else [],
                 "snapshot": state.snapshot,
                 "entries": state.entries if state.snapshot is not None else [],
                 "service_fingerprint": "a" * 64,
@@ -142,7 +144,7 @@ async def test_active_grant_search_load_and_actual_bridge_dispatch(bridge, proto
             result = await target[name].execute({}, ctx)
             assert result.status == "completed"
     assert {call["name"] for call in bridge.invocations} == expected
-    assert all(call["snapshot"] == ctx.lumen_snapshot for call in bridge.invocations)
+    assert all(call["snapshot"] == ctx.lumen_snapshot[0] for call in bridge.invocations)
 
 
 @pytest.mark.parametrize(("query", "expected"), [
@@ -246,7 +248,7 @@ async def test_installed_afterglow_plugin_uses_bridge_and_revalidates_authority(
     plugin = get_plugin("mcp", "afterglow-mcp")
     snapshots = await plugin.describe(McpSelection(
         namespace=Namespace(user_id=ctx.user_id, project_id=ctx.project_id),
-        authority="afterglow", delegated_snapshot=ctx.lumen_snapshot,
+        authority="afterglow", delegated_snapshot=ctx.lumen_snapshot[0],
     ))
     assert len(snapshots) == 1
     bound = await plugin.bind(snapshots[0], contracts.execution_context(ctx))

@@ -64,8 +64,10 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
         )
         # An OAuth execution needs admission's exact epoch before refresh/discovery.
         items = [
-            server for server in items
-            if server.get("auth_mode") != "oauth" or (
+            server
+            for server in items
+            if server.get("auth_mode") != "oauth"
+            or (
                 type(expected_credential_versions.get(server.get("id"))) is int
                 and expected_credential_versions[server["id"]] > 0
             )
@@ -92,7 +94,9 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
         return []
     usable: list[dict] = []
     for server in items:
-        if server.get("transport") != "http" or not str(server.get("url") or "").lower().startswith("https://"):
+        if server.get("transport") not in {"http", "sse"} or not str(server.get("url") or "").lower().startswith(
+            "https://"
+        ):
             logger.warning("MCP server %s uses an unsupported transport or URL", server.get("id"))
             continue
         server_id = server.get("id")
@@ -117,11 +121,13 @@ def _mcp_config_fingerprint(server: dict) -> str:
     """Freeze execution configuration and consent, excluding secrets and run headers."""
     from lumen.services import extensions_store as es
 
-    return contracts._v2_config_fingerprint({
-        "selection": es.selection_fingerprint(server),
-        "effect_overrides": server.get("effect_overrides"),
-        "oauth_scopes": server.get("oauth_scopes"),
-    })
+    return contracts._v2_config_fingerprint(
+        {
+            "selection": es.selection_fingerprint(server),
+            "effect_overrides": server.get("effect_overrides"),
+            "oauth_scopes": server.get("oauth_scopes"),
+        }
+    )
 
 
 def _mcp_schema(server_id: int, tool: dict) -> dict:
@@ -176,8 +182,11 @@ async def context_tool_schemas(ctx: ToolContext) -> list[dict]:
         dynamic_bindings = await bindings._legacy_dynamic_bindings(ctx)
         return [
             *await tools.tool_schemas(),
-            *(bindings._binding_schema(binding) for binding in dynamic_bindings.values()
-              if binding.definition.source != "mcp" or binding.definition.effect == "read"),
+            *(
+                bindings._binding_schema(binding)
+                for binding in dynamic_bindings.values()
+                if binding.definition.source != "mcp" or binding.definition.effect == "read"
+            ),
         ]
     schemas = await tools.tool_schemas()
     for name, enabled in (

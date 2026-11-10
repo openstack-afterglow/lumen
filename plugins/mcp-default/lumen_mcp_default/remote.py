@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from langchain_core.tools import ToolException
 from lumen_plugin_api.contracts import (
     ExecutionContext,
     Namespace,
@@ -27,6 +28,7 @@ from lumen_plugin_api.tools import GeneratedToolFile, ToolBinding, ToolDefinitio
 from .oauth import RemoteOAuth
 
 _TIMEOUT = 15
+_SSE_READ_TIMEOUT = 60
 _MAX_RESPONSE = 1024 * 1024
 _MAX_TEXT = 6000
 _MAX_FILES = 20
@@ -82,8 +84,8 @@ def result_to_output(result: Any, *, tool_name: str) -> McpToolOutput:
 
 def connection(server: dict[str, Any], http_factory) -> dict[str, Any]:
     transport = (server.get("transport") or "http").lower()
-    if transport not in {"http", "streamable_http", "streamable-http"}:
-        raise ValueError("streamable HTTP MCP transport is required")
+    if transport not in {"http", "streamable_http", "streamable-http", "sse"}:
+        raise ValueError("MCP transport must be streamable HTTP or SSE")
     url = server.get("url") or ""
     parsed = urlsplit(url)
     if parsed.scheme.lower() != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.fragment:
@@ -91,6 +93,8 @@ def connection(server: dict[str, Any], http_factory) -> dict[str, Any]:
     headers = server.get("headers") or {}
     if not isinstance(headers, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items()):
         raise ValueError("MCP headers must be string pairs")
+    if transport == "sse":
+        return {"transport": "sse", "url": url, "headers": headers, "timeout": _TIMEOUT, "sse_read_timeout": _SSE_READ_TIMEOUT, "httpx_client_factory": http_factory}
     return {"transport": "streamable_http", "url": url, "headers": headers, "timeout": _TIMEOUT, "httpx_client_factory": http_factory}
 
 
@@ -171,6 +175,81 @@ class RemoteTransport:
 def _fingerprint(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
+_TOOL_TEXT_LIMIT = 500
+_UNREACHABLE_TEXT = "The MCP server could not be reached. Check its URL and availability, then try again."
+_REJECTED_TEXT = "The MCP server rejected the connection's credentials. Reconnect it (re-authorize for OAuth), then try again."
+
+
+def _single_line(value: object, limit: int = _TOOL_TEXT_LIMIT) -> str:
+    """One bounded line; control characters are removed so server text cannot forge log lines."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value))
+    return re.sub(r" {2,}", " ", text).strip()[:limit]
+
+
+def _tool_error_text(exc: ToolException) -> str:
+    """Text the remote server reported for a failed tool call.
+
+    The adapter raises with the converted content blocks as its first argument; a multi-block error is
+    joined block by block (never the Python repr of the list). A JSON {"error": {...}} body is rendered
+    from its code, field, message and retryable flag only.
+    """
+    blocks = exc.args[0] if exc.args else None
+    if isinstance(blocks, str):
+        raw = blocks
+    elif isinstance(blocks, list):
+        raw = "\n".join(str(block.get("text", "")) for block in blocks if isinstance(block, dict) and block.get("type") == "text")
+    else:
+        raw = ""
+    raw = raw or str(exc)
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        code = _single_line(error.get("code") or "unknown", 80)
+        field = _single_line(error.get("field") or "", 80)
+        message = _single_line(error.get("message") or "")
+        retry = "가능" if error.get("retryable") is True else "불가"
+        where = f" ({field})" if field else ""
+        return f"원격 MCP 도구가 오류를 반환했습니다 [{code}]{where}: {message} (재시도 {retry})"
+    text = _single_line(raw)
+    return f"원격 MCP 도구가 오류를 반환했습니다: {text}" if text else "원격 MCP 도구가 오류를 반환했습니다."
+
+
+def _leaves(exc: BaseException):
+    if isinstance(exc, BaseExceptionGroup):
+        for child in exc.exceptions:
+            yield from _leaves(child)
+    else:
+        yield exc
+
+
+def remote_failure(exc: BaseException) -> PluginError | None:
+    """Consumer-safe error for a failure of the remote MCP server, or None to keep the failure generic.
+
+    Exposed: the server's own tool error fields, the timeout length, the HTTP status class, and fixed texts.
+    Never exposed: URLs, headers, credentials, exception type names, or stack traces. Plugin errors that the
+    host raised itself pass through unchanged so their existing codes stay in force.
+    """
+    if isinstance(exc, PluginError):
+        return None
+    for leaf in _leaves(exc):
+        if isinstance(leaf, ToolException):
+            return PluginError("mcp_tool_error", _tool_error_text(leaf))
+        if isinstance(leaf, TimeoutError):
+            return PluginError("mcp_server_error", f"The MCP server did not respond within {_TIMEOUT} seconds. Try again later.")
+        if isinstance(leaf, httpx.HTTPStatusError):
+            status = leaf.response.status_code
+            if status in (401, 403):
+                return PluginError("mcp_server_error", _REJECTED_TEXT)
+            return PluginError("mcp_server_error", f"The MCP server returned HTTP {status}. Try again later.")
+        if isinstance(leaf, httpx.HTTPError):
+            return PluginError("mcp_server_error", _UNREACHABLE_TEXT)
+    return None
+
+
+
 
 class RemoteMcp:
     manifest = PluginManifest(id="remote-mcp", kind="mcp", version="0.1.1", required_capabilities=("extensions", "public_http", "mcp_connections"))
@@ -204,7 +283,13 @@ class RemoteMcp:
 
     async def list_tools(self, server: dict[str, Any], *, context: ExecutionContext | None = None) -> list[dict[str, Any]]:
         transport, _ = self._ready()
-        return await transport.list_tools(server, context=context)
+        try:
+            return await transport.list_tools(server, context=context)
+        except Exception as exc:
+            mapped = remote_failure(exc)
+            if mapped is None:
+                raise
+            raise mapped from None
 
     async def call_tool(self, server: dict[str, Any], name: str, arguments: dict[str, Any], *, context: ExecutionContext, expected_credential_epoch: int | None) -> McpToolOutput:
         transport, _ = self._ready()
@@ -215,7 +300,13 @@ class RemoteMcp:
             raise PluginError("plugin_authority_revoked")
         if _fingerprint({k: v for k, v in current.items() if k != "headers"}) != expected_configuration:
             raise PluginError("plugin_configuration_changed")
-        return await transport.call_tool(current, name, arguments, context=context)
+        try:
+            return await transport.call_tool(current, name, arguments, context=context)
+        except Exception as exc:
+            mapped = remote_failure(exc)
+            if mapped is None:
+                raise
+            raise mapped from None
 
     async def detect(self, server_id: int, namespace: Namespace) -> dict[str, Any]:
         return await self._ready()[1].detect(server_id, namespace)
@@ -239,7 +330,7 @@ class RemoteMcp:
         return await self._ready()[1].headers_for_user(namespace)
 
     async def _server(self, server_id: int, namespace: Namespace) -> tuple[dict[str, Any], int | None]:
-        transport, _ = self._ready()
+        transport, oauth = self._ready()
         server = await self._extensions.resolve("mcp", server_id, namespace)
         if not server.get("is_active") or server.get("id") != server_id:
             raise PluginError("plugin_authority_revoked")
@@ -257,7 +348,12 @@ class RemoteMcp:
                 if expiry.tzinfo is None:
                     expiry = expiry.replace(tzinfo=UTC)
                 if expiry <= datetime.now(UTC) + timedelta(seconds=60):
-                    raise PluginError("plugin_authority_revoked", "OAuth connection requires refresh")
+                    # Refresh at use time. The row is re-read afterwards so the returned epoch matches the stored one.
+                    if await oauth.refresh(credential.id) is None:
+                        raise PluginError("plugin_authority_revoked", "OAuth connection requires reconnection")
+                    credential = await self._connections.connection(server_id, namespace)
+                    if credential is None or credential.status != "active":
+                        raise PluginError("plugin_authority_revoked")
             token = credential.token.get("access_token")
             if not isinstance(token, str) or not token:
                 raise PluginError("plugin_authority_revoked")

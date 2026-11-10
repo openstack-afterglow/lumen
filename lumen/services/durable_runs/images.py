@@ -230,7 +230,7 @@ async def admit_image_run(request: dict, *, project_id: str, user_id: str, clien
                                        credential_authority=credential_authority)
     try:
         async with _factory()() as session, session.begin():
-            # No gap locks: the unique idempotency index (migration 029) decides same-key races, and the
+            # No gap locks: the unique idempotency index (migration 030) decides same-key races, and the
             # IntegrityError replay below returns the winner. Gap locks deadlocked concurrent admissions.
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             run = await persist_image_run_in_transaction(session, prepared, project_id=project_id, user_id=user_id,

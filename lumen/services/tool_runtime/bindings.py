@@ -44,39 +44,62 @@ def _v2_mcp_result(value: str | mcp_client.McpToolOutput) -> V2ToolExecutionResu
         ],
     )
 
+
 def _v2_mcp_failure(error: PluginError) -> V2ToolExecutionResult:
-    """Expose only fixed text and a typed code, never provider exception details."""
-    content = {
+    """Consumer-safe text: the plugin's own message for remote-server codes, fixed text for everything else."""
+    content = mcp_client.consumer_message(error) or {
         "plugin_authority_revoked": "The selected MCP authority is no longer available.",
         "plugin_configuration_changed": "The selected MCP configuration has changed.",
         "plugin_incompatible": "The selected MCP provider is incompatible.",
     }.get(error.code, "MCP tool execution is unavailable.")
     return V2ToolExecutionResult(
-        status="failed", model_content=content,
-        display=[ToolTextPart(text=content)], error_code=error.code,
+        status="failed",
+        model_content=content,
+        display=[ToolTextPart(text=content)],
+        error_code=error.code,
     )
 
 
-
 async def _lumen_registry_bindings(ctx: ToolContext) -> tuple[ToolBinding, ...]:
-    """Expose only the selected grant's explicit consumer-cloud registry entries."""
+    """Expose the explicit consumer-cloud registry entries of every enabled grant."""
     try:
         if ctx.lumen_snapshot_frozen:
-            snapshot = mcp_lumen.frozen_snapshot(ctx.lumen_snapshot)
+            snapshots = mcp_lumen.frozen_snapshots(ctx.lumen_snapshot)
         else:
-            snapshot = await mcp_lumen.selected_lumen_snapshot(user_id=ctx.user_id, project_id=ctx.project_id)
-        if snapshot is None:
-            return ()
-        if snapshot.user_id != ctx.user_id or snapshot.project_id != ctx.project_id:
-            return ()
-        principal = await mcp_lumen.resolve_lumen_principal(snapshot)
+            snapshots = await mcp_lumen.selected_lumen_snapshots(user_id=ctx.user_id, project_id=ctx.project_id)
     except mcp_lumen.McpLumenAuthorityError:
         return ()
 
     bindings: list[ToolBinding] = []
+    for snapshot in snapshots:
+        if snapshot.user_id != ctx.user_id or snapshot.project_id != ctx.project_id:
+            continue
+        try:
+            principal = await mcp_lumen.resolve_lumen_principal(snapshot)
+        except mcp_lumen.McpLumenAuthorityError:
+            continue
+        bindings.extend(_grant_bindings(snapshot, principal, multi=len(snapshots) > 1))
+    return tuple(bindings)
+
+
+def _public_tool_name(name: str, snapshot, *, multi: bool) -> str | None:
+    """Name a grant's tool for the model. Several grants can expose the same registry name, so a grant suffix keeps them unique.
+    A single grant keeps the plain name, so single-grant tool names do not change."""
+    if not multi:
+        return name
+    public = f"{name}__{snapshot.grant_id.replace('-', '')[:8]}"
+    return public if len(public) <= 128 else None
+
+
+def _grant_bindings(snapshot, principal, *, multi: bool) -> list[ToolBinding]:
+    bindings: list[ToolBinding] = []
     for entry in mcp_registry.enabled_entries(principal):
+        public_name = _public_tool_name(entry.name, snapshot, multi=multi)
+        if public_name is None:
+            logger.warning("Lumen tool name too long with grant suffix; tool excluded")
+            continue
         definition = ToolDefinition(
-            name=entry.name,
+            name=public_name,
             description=entry.description,
             input_schema={**entry.input_schema(), "additionalProperties": False},
             effect=entry.effect,
@@ -256,7 +279,7 @@ async def _lumen_registry_bindings(ctx: ToolContext) -> tuple[ToolBinding, ...]:
                 config_fingerprint=config_fingerprint,
             )
         )
-    return tuple(bindings)
+    return bindings
 
 
 def _binding_schema(binding: ToolBinding) -> dict:
@@ -489,19 +512,31 @@ async def v2_tool_bindings(
             arguments: dict[str, object], context: object, *, tool_id=identifier, original=custom, binding=bound
         ) -> V2ToolExecutionResult:
             if not isinstance(context, ToolContext):
-                return V2ToolExecutionResult(status="failed", model_content="Tool execution context is invalid.", error_code="invalid_tool_context")
+                return V2ToolExecutionResult(
+                    status="failed",
+                    model_content="Tool execution context is invalid.",
+                    error_code="invalid_tool_context",
+                )
             current = next((item for item in await _load_custom(context) if item.get("id") == tool_id), None)
             if current is None or current != original:
-                return V2ToolExecutionResult(status="failed", model_content="The selected custom tool is no longer available.", error_code="extension_unavailable")
+                return V2ToolExecutionResult(
+                    status="failed",
+                    model_content="The selected custom tool is no longer available.",
+                    error_code="extension_unavailable",
+                )
             return await binding.execute(arguments, execution_context(context))
 
-        add(ToolBinding(
-            definition=bound.definition,
-            execute=execute,
-            config_fingerprint=_v2_config_fingerprint(custom),
-            destination_origin=destination_origin,
-            load_policy=custom.get("load_policy") if custom.get("load_policy") in {"preloaded", "on_demand"} else None,
-        ))
+        add(
+            ToolBinding(
+                definition=bound.definition,
+                execute=execute,
+                config_fingerprint=_v2_config_fingerprint(custom),
+                destination_origin=destination_origin,
+                load_policy=custom.get("load_policy")
+                if custom.get("load_policy") in {"preloaded", "on_demand"}
+                else None,
+            )
+        )
 
     for server in await _load_mcp(ctx):
         if extension_load_policy is not None and server.get("load_policy") != extension_load_policy:
@@ -562,9 +597,7 @@ async def v2_tool_bindings(
                         model_content="Tool execution context is invalid.",
                         error_code="invalid_tool_context",
                     )
-                if expected_oauth and (
-                    type(expected_credential_epoch) is not int or expected_credential_epoch < 1
-                ):
+                if expected_oauth and (type(expected_credential_epoch) is not int or expected_credential_epoch < 1):
                     return _v2_mcp_failure(PluginError("plugin_authority_revoked"))
                 current = next((item for item in await _load_mcp(context) if item.get("id") == server_id), None)
                 if (
@@ -578,10 +611,15 @@ async def v2_tool_bindings(
                         error_code="extension_unavailable",
                     )
                 try:
-                    return _v2_mcp_result(await mcp_client.call_tool(
-                        current, method_name, arguments, context=execution_context(context),
-                        expected_credential_epoch=expected_credential_epoch,
-                    ))
+                    return _v2_mcp_result(
+                        await mcp_client.call_tool(
+                            current,
+                            method_name,
+                            arguments,
+                            context=execution_context(context),
+                            expected_credential_epoch=expected_credential_epoch,
+                        )
+                    )
                 except PluginError as error:
                     return _v2_mcp_failure(error)
                 except Exception:
@@ -606,7 +644,6 @@ async def v2_tool_bindings(
             # owner scope before dispatch and again at each actual invocation.
             add(await bind_tool(snapshot, execution_context(ctx)))
 
-
     if (
         include_platform
         and extension_load_policy in {None, "preloaded"}
@@ -627,7 +664,8 @@ async def _legacy_dynamic_bindings(ctx: ToolContext) -> dict[str, ToolBinding]:
             include_platform=False,
         )
         session.legacy_bindings.update(
-            (name, binding) for name, binding in preloaded.items()
+            (name, binding)
+            for name, binding in preloaded.items()
             if binding.definition.source != "mcp" or binding.definition.effect == "read"
         )
         session.legacy_preloaded = True
@@ -654,7 +692,8 @@ async def restore_v2_deferred_bindings(
     )
     if not include_managed:
         deferred = {
-            name: binding for name, binding in deferred.items()
+            name: binding
+            for name, binding in deferred.items()
             if binding.definition.source != "mcp" or binding.definition.effect == "read"
         }
     ctx.binding_session.deferred_bindings = deferred

@@ -152,7 +152,6 @@ class _RefreshLease:
             raise McpOAuthError("OAuth connection has been revoked")
         self._row.encrypted_tokens = _encrypt(token)
         self._row.expires_at = expires_at
-        self._row.credential_version += 1
 
     async def revoke(self) -> None:
         if self._row.status != "revoked":

@@ -243,7 +243,7 @@ def schema_for(mode: str) -> dict[str, str]:
     return schema
 
 
-# Indexes added to the seven inspected tables by migrations after 028. They are recreated by migration 030 (or the
+# Indexes added to the seven inspected tables by migrations after 028. They are recreated by migration 031 (or the
 # bootstrap schema repair) and must not make the exact 028 state comparison reject a correctly migrated database.
 POST_CUTOVER_INDEXES = frozenset({"idx_chat_usage_user_created", "idx_chat_usage_project_created"})
 _POST_CUTOVER_KEY = re.compile(r"^(?:UNIQUE )?KEY `(" + "|".join(sorted(POST_CUTOVER_INDEXES)) + r")`")
@@ -266,7 +266,7 @@ def canonical_schema(ddl: str, installation_default: tuple[str, str] | None = No
     for line in lines[1:-1]:
         line = re.sub(r"\b(bigint|int)\(\d+\)", r"\1", line.strip().rstrip(","))
         if _POST_CUTOVER_KEY.match(line):
-            continue  # Additive later indexes (migration 030) are not part of the 028 identity.
+            continue  # Additive later indexes (migration 031) are not part of the 028 identity.
         definitions.append(line)
     return tuple([lines[0], engine] + sorted(definitions))
 

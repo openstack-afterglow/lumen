@@ -22,15 +22,12 @@ from lumen import crypto
 from lumen.scripts import migrate as runner
 from lumen.scripts import provider_account_migration as account
 
-# Migrations 029 (chat_runs idempotency index) and 030 (ORM index catch-up) are additive and follow the 028 cutover
-# these tests exercise.
-_PENDING = [account.ACCOUNT_ID, "029-chat-runs-idempotency-index", "030-orm-index-catchup"]
-
 
 def _without_secondary_keys(entry):
-    """Migrations 029 and 030 add secondary indexes after the 028 cutover; compare columns, constraints and rows."""
+    """Migrations 030 and 031 add secondary indexes after the 028 cutover; compare columns, constraints and rows."""
     ddl, rows = entry
     return [line.rstrip(",") for line in ddl.splitlines() if not re.match(r"\s*(UNIQUE )?KEY ", line)], rows
+
 
 pytestmark = pytest.mark.integration
 
@@ -74,6 +71,11 @@ class _Connection:
 
     async def execute(self, statement, parameters=None):
         return await self.connection.execute(statement, parameters or {})
+
+
+def _pending_from_account() -> list[str]:
+    """Every manifest migration from the account migration onward; later migrations are pending too."""
+    return [migration.logical_id for migration in runner.load_manifest() if migration.logical_id >= account.ACCOUNT_ID]
 
 
 class _Database:
@@ -242,7 +244,7 @@ async def test_pristine_published_upgrade_preserves_ciphertext_generations_attem
     before_ddl, before_rows = before['chat_runs']
     after_ddl, after_rows = after['chat_runs']
     assert after_rows == before_rows
-    # 028 leaves chat_runs alone; the only DDL differences are the later secondary indexes (029's idempotency key, 030).
+    # 028 leaves chat_runs alone; the only DDL differences are the later secondary indexes (030's idempotency key, 031).
     assert "idempotency" not in before_ddl and "idempotency" in after_ddl
     assert _without_secondary_keys(after['chat_runs']) == _without_secondary_keys(before['chat_runs'])
     assert after['chat_run_providers'][1][0][:len(before['chat_run_providers'][1][0])] == before['chat_run_providers'][1][0]
@@ -264,7 +266,7 @@ async def test_exact_historical_receipt_is_preserved_without_replaying027(databa
         await database.sql("UPDATE llm_provider_credentials SET encrypted_api_key='synthetic-rotated-envelope',generation=23 WHERE account_id=(SELECT id FROM llm_provider_accounts WHERE provider_id=71)")
         await database.sql("INSERT INTO chat_provider_usage (event_id,provider_account_id,provider_credential_id,provider_id,provider_credential_generation,raw_cost) VALUES ('historical-deleted-identity',9991,9992,9993,7,0.123)")
     before = await database.snapshot()
-    assert await database.run(monkeypatch) == (_PENDING, 0)
+    assert await database.run(monkeypatch) == (_pending_from_account(), 0)
     migration_statements = tuple(database.statements)
     after = await database.snapshot()
     assert (await database.sql("SELECT COUNT(*) FROM llm_providers WHERE encrypted_api_key IS NOT NULL OR api_key_env IS NOT NULL OR encrypted_subscription_tokens IS NOT NULL OR subscription_status <> 'disconnected' OR subscription_expires_at IS NOT NULL OR subscription_generation <> 0")).scalar_one() == 0
@@ -292,7 +294,7 @@ async def test_exact_historical_receipt_is_preserved_without_replaying027(databa
 @pytest.mark.parametrize("apply", [False, True])
 async def test_receipted028_missing_published027_rejects_without_ddl(database, monkeypatch, apply):
     await database.prepare()
-    assert await database.run(monkeypatch) == (_PENDING, 0)
+    assert await database.run(monkeypatch) == (_pending_from_account(), 0)
     await database.sql("DELETE FROM schema_migrations WHERE logical_id='027-kubernetes-sandboxes'")
     before = await database.snapshot()
     with pytest.raises(runner.MigrationLedgerError, match="incomplete_published027_prefix"):
@@ -342,7 +344,7 @@ async def test_repaired_dry_run_is_read_only(database, monkeypatch):
     await database.prepare()
     await database.repair()
     before = await database.snapshot()
-    assert await database.run(monkeypatch, apply=False) == (_PENDING, 0)
+    assert await database.run(monkeypatch, apply=False) == (_pending_from_account(), 0)
     assert all(sql.lstrip().startswith(('SELECT','SHOW')) for sql in database.statements)
     assert await database.snapshot() == before
 

@@ -1,6 +1,6 @@
 ## Why
 
-The baseline migration was generated from `CREATE TABLE`, so 48 ORM-declared indexes never reached a migration. Migration 030 adds them, but a database can also drift later (a dropped table, column or index after a restore or manual change), and the API and workers then fail at runtime instead of at bootstrap. The operator asked that `lumen-migrate --apply`, which already runs before every API, worker and controller start, detect a missing or mismatched table and restore it automatically.
+The baseline migration was generated from `CREATE TABLE`, so 48 ORM-declared indexes never reached a migration. Migration 031 adds them, but a database can also drift later (a dropped table, column or index after a restore or manual change), and the API and workers then fail at runtime instead of at bootstrap. The operator asked that `lumen-migrate --apply`, which already runs before every API, worker and controller start, detect a missing or mismatched table and restore it automatically.
 
 ## Conflict with the accepted specification
 
@@ -15,4 +15,4 @@ The baseline migration was generated from `CREATE TABLE`, so 48 ORM-declared ind
 
 ## Impact and limits
 
-No new schema. A table that is recreated is empty. Foreign keys, column types and orphan-row checks are not verified or repaired. The snapshot must be regenerated whenever a migration changes a table (`LUMEN_UPDATE_SCHEMA_SNAPSHOT=1 uv run lumen-test integration -k schema_snapshot`); the test fails otherwise. Production was checked read-only on 2026-11-10: no missing table or column and only the 49 keys that migrations 029 and 030 add.
+No new schema. A table that is recreated is empty. Foreign keys, column types and orphan-row checks are not verified or repaired. The snapshot must be regenerated whenever a migration changes a table (`LUMEN_UPDATE_SCHEMA_SNAPSHOT=1 uv run lumen-test integration -k schema_snapshot`); the test fails otherwise. Production was checked read-only on 2026-11-10: no missing table or column and only the 49 keys that migrations 030 and 031 add.

@@ -1,7 +1,7 @@
 """Concurrent media admissions on one provider: no deadlock, no lost request, one run per key.
 
 Admission runs READ COMMITTED (no gap locks, which used to deadlock racing admissions with MariaDB 1213 and
-surface as HTTP 500). The unique ``uq_chat_runs_idempotency`` index (migration 029) is therefore the sole
+surface as HTTP 500). The unique ``uq_chat_runs_idempotency`` index (migration 030) is therefore the sole
 authority for a same-key race: the loser's INSERT fails and the admission replays the winner's run. Before
 that index existed READ COMMITTED admitted every racing same-key request as its own run.
 """

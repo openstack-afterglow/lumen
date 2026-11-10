@@ -1393,7 +1393,7 @@ async def _admit_native_ceiling_run(native_routes, monkeypatch):
     monkeypatch.setattr(admission, "_bind_user_assets", AsyncMock())
     monkeypatch.setattr(admission, "append_event", AsyncMock())
     monkeypatch.setattr(admission, "wake_run", AsyncMock())
-    monkeypatch.setattr(mcp_adapter, "selected_lumen_snapshot", AsyncMock(return_value=None))
+    monkeypatch.setattr(mcp_adapter, "selected_lumen_snapshots", AsyncMock(return_value=[]))
     monkeypatch.setattr(admission.worker_routing, "resolve_worker_route", AsyncMock(return_value=SimpleNamespace(
         workload_class="chat", worker_pool_id="synthetic-pool")))
     response = await native_routes.client.post("/v1/temp-completions",

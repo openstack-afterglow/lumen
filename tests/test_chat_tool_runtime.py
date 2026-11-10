@@ -655,11 +655,12 @@ class TestRemoteMcpSafety:
         session = contracts.ToolBindingSession(legacy_preloaded=True, legacy_bindings={binding.definition.name: binding})
         dynamic = await tool_runtime.context_execute_result(binding.definition.name, {}, replace(ctx, binding_session=session))
         direct = await tool_runtime.context_execute_result("mcp__7__search", {}, ctx)
+        expected = bindings.mcp_client.CONNECTION_FAILURE_TEXT if code in (None, "plugin_unavailable") else "MCP 도구 실행 중 오류가 발생했습니다."
         for result in (dynamic, direct):
             assert result.status == "failed"
             assert result.warning_code == (code or "plugin_unavailable")
             assert result.visible is True
-            assert result.content == "MCP 도구 실행 중 오류가 발생했습니다."
+            assert result.content == expected
         assert await tool_runtime.context_execute("mcp__7__search", {}, ctx) == direct.content
 
 
@@ -787,11 +788,11 @@ class TestMcpTools:
         out = await tool_runtime.context_execute("mcp__99__x", {}, _CTX)
         assert "MCP" in out  # 안전한 거부
 
-    async def test_legacy_mcp_transport_is_not_exposed(self, monkeypatch):
+    async def test_local_process_mcp_transport_is_not_exposed(self, monkeypatch):
         import lumen.services.extensions_store as es
 
         async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False):
-            return [{"id": 7, "name": "legacy", "transport": "sse", "url": "https://mcp.example/sse"}]
+            return [{"id": 7, "name": "local", "transport": "stdio", "url": "https://mcp.example/stdio"}]
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
         assert await selection._load_mcp(_CTX) == []

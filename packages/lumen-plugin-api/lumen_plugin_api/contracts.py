@@ -9,7 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PluginKind = Literal["database", "memory", "tools", "skills", "mcp"]
 PluginErrorCode = Literal[
-    "plugin_unavailable", "plugin_incompatible", "plugin_configuration_changed", "plugin_authority_revoked"
+    "plugin_unavailable", "plugin_incompatible", "plugin_configuration_changed", "plugin_authority_revoked",
+    "mcp_tool_error", "mcp_server_error",
 ]
 
 

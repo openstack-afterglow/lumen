@@ -1,5 +1,5 @@
 -- The baseline was generated from CREATE TABLE, so the Index(...) objects the ORM declares on baseline tables
--- never reached a migration (029 fixed the idempotency key). This adds the remaining 4 unique and 44 plain
+-- never reached a migration (030 fixed the idempotency key). This adds the remaining 4 unique and 44 plain
 -- indexes in one ALTER per table (online InnoDB DDL, IF NOT EXISTS keeps reruns and repaired databases safe).
 -- Unique additions fail loudly (1062) on duplicate keys, nothing is deleted. Production held 0 duplicates in
 -- every unique key on 2026-11-10. Check first with, for example:

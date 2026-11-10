@@ -3,6 +3,7 @@
 The builtin schemas and handlers belong to the versioned default-tools wheel;
 core retains only the tenant/run context and admission/runtime bridge.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -24,7 +25,7 @@ class ToolContext:
     expected_extension_fingerprints: tuple[tuple[str, int, str], ...] | None = None
     run_id: str | None = None
     tool_call_id: str | None = None
-    lumen_snapshot: dict[str, object] | None = None
+    lumen_snapshot: dict[str, object] | list[dict[str, object]] | None = None
     lumen_snapshot_frozen: bool = False
     execution_hooks: object | None = None
     managed_search: dict[str, Any] | None = None
@@ -48,14 +49,16 @@ async def tool_schemas() -> list[dict]:
         if export.key not in {"list_my_conversations", "get_conversation_detail"}:
             continue
         definition = (await bind_default_tool(export.key, context)).definition
-        result.append({
-            "type": "function",
-            "function": {
-                "name": definition.name,
-                "description": definition.description,
-                "parameters": definition.input_schema,
-            },
-        })
+        result.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": definition.name,
+                    "description": definition.description,
+                    "parameters": definition.input_schema,
+                },
+            }
+        )
     return result
 
 
@@ -77,6 +80,10 @@ async def execute_tool(name: str, args: dict, ctx: ToolContext) -> str:
         result = await binding.execute(safe_args, execution_context(ctx))
         return result.model_content
     except ValueError:
-        return "conversation_id(문자열)가 필요합니다." if name == "get_conversation_detail" else "툴 인자가 올바르지 않습니다."
+        return (
+            "conversation_id(문자열)가 필요합니다."
+            if name == "get_conversation_detail"
+            else "툴 인자가 올바르지 않습니다."
+        )
     except Exception:
         return "툴 실행 중 오류가 발생했습니다."

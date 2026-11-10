@@ -517,7 +517,7 @@ async def test_lumen_bindings_freeze_only_the_selected_grant_snapshot(monkeypatc
             },
         )()
 
-    monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshot", selected)
+    monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshots", selected)
     monkeypatch.setattr(tool_runtime.mcp_lumen, "resolve_lumen_principal", resolve)
     monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_entries", lambda _principal: (entry,))
     monkeypatch.setattr(
@@ -562,7 +562,7 @@ async def test_lumen_binding_refuses_dispatch_after_selection_changes(monkeypatc
     )()
 
     async def selected(**_kwargs):
-        return snapshot
+        return [snapshot]
 
     calls = 0
 
@@ -584,7 +584,7 @@ async def test_lumen_binding_refuses_dispatch_after_selection_changes(monkeypatc
     async def unexpected_dispatch(*_args, **_kwargs):
         raise AssertionError("a stale selection must fail before registry dispatch")
 
-    monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshot", selected)
+    monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshots", selected)
     monkeypatch.setattr(tool_runtime.mcp_lumen, "resolve_lumen_principal", resolve)
     monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_entries", lambda _principal: (entry,))
     monkeypatch.setattr(
@@ -625,7 +625,7 @@ async def test_lumen_mutation_reuses_remote_bridge_with_durable_idempotency(monk
     idempotency_keys: list[str] = []
 
     async def selected(**_kwargs):
-        return snapshot
+        return [snapshot]
 
     async def resolve(value):
         assert value == snapshot
@@ -645,7 +645,7 @@ async def test_lumen_mutation_reuses_remote_bridge_with_durable_idempotency(monk
         return tool_runtime.mcp_ledger.ClaimResult(state="replay", result={"status": "accepted"})
 
     args = type("Args", (), {"model_dump": lambda self, **_kwargs: {"server_id": "server-1"}})()
-    monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshot", selected)
+    monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshots", selected)
     monkeypatch.setattr(tool_runtime.mcp_lumen, "resolve_lumen_principal", resolve)
     monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_entries", lambda _principal: (entry,))
     monkeypatch.setattr(
@@ -689,7 +689,7 @@ async def test_lumen_binding_fingerprint_changes_with_remote_catalog(monkeypatch
     fingerprints = iter(("a" * 64, "b" * 64))
 
     async def selected(**_kwargs):
-        return snapshot
+        return [snapshot]
 
     async def resolve(_snapshot):
         return type(
@@ -702,7 +702,7 @@ async def test_lumen_binding_fingerprint_changes_with_remote_catalog(monkeypatch
             },
         )()
 
-    monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshot", selected)
+    monkeypatch.setattr(tool_runtime.mcp_lumen, "selected_lumen_snapshots", selected)
     monkeypatch.setattr(tool_runtime.mcp_lumen, "resolve_lumen_principal", resolve)
     monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_entries", lambda _principal: (entry,))
 
@@ -719,3 +719,111 @@ def test_lumen_mutation_idempotency_is_unique_per_durable_tool_call():
     assert tool_runtime._lumen_idempotency_key(run_id="run-1", tool_call_id="call-1") != (
         tool_runtime._lumen_idempotency_key(run_id="run-1", tool_call_id="call-2")
     )
+
+
+def _grant(grant_id: str):
+    return tool_runtime.mcp_lumen.LumenSnapshot(
+        grant_id=grant_id, user_id="user", project_id="project", credential_epoch=7, selection_generation=11,
+    )
+
+
+def _grant_principal(snapshot):
+    return type(
+        "Principal",
+        (),
+        {"grant_id": snapshot.grant_id, "scopes": frozenset({"mcp:read"}), "service_fingerprint": "services-fingerprint"},
+    )()
+
+
+def _read_entry():
+    return type(
+        "Entry",
+        (),
+        {
+            "name": "afterglow_vm_list",
+            "description": "List current-project servers.",
+            "effect": "read",
+            "input_schema": lambda self: {"type": "object", "properties": {}},
+        },
+    )()
+
+
+async def test_each_enabled_grant_binds_its_own_suffixed_tool_and_round_trips_frozen_list(monkeypatch):
+    from lumen.services import mcp_adapter
+    from lumen.services.durable_runs import common
+
+    first = _grant("11111111-aaaa-4bbb-8ccc-000000000001")
+    second = _grant("22222222-aaaa-4bbb-8ccc-000000000002")
+    dispatched: list[str] = []
+
+    async def selected(**_kwargs):
+        return [first, second]
+
+    async def resolve(value):
+        return _grant_principal(value)
+
+    async def read_dispatch(context, *, entry, arguments):
+        dispatched.append(context.principal.grant_id)
+        return {"ok": True}
+
+    async def record(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mcp_adapter, "selected_lumen_snapshots", selected)
+    monkeypatch.setattr(tool_runtime.mcp_lumen, "resolve_lumen_principal", resolve)
+    monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_entries", lambda _principal: (_read_entry(),))
+    monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_service_fingerprint", lambda _p: "services-fingerprint")
+    monkeypatch.setattr(
+        tool_runtime.mcp_registry, "parse_entry_arguments",
+        lambda *_args: type("Args", (), {"model_dump": lambda self, **_kwargs: {}})(),
+    )
+    monkeypatch.setattr(tool_runtime.mcp_registry, "dispatch", read_dispatch)
+    monkeypatch.setattr(tool_runtime.mcp_registry, "output_payload", lambda _entry, result: result)
+    monkeypatch.setattr(tool_runtime.mcp_ledger, "record_read_invocation", record)
+
+    payload = await common._freeze_lumen_snapshot(
+        {"execution_protocol_version": 2}, user_id="user", project_id="project",
+    )
+    assert payload["lumen_snapshot"] == [
+        tool_runtime.mcp_lumen.snapshot_payload(first),
+        tool_runtime.mcp_lumen.snapshot_payload(second),
+    ]
+    context = ToolContext(
+        project_id="project", user_id="user",
+        lumen_snapshot=payload["lumen_snapshot"], lumen_snapshot_frozen=True,
+    )
+    bindings = await tool_runtime._lumen_registry_bindings(context)
+    assert [binding.definition.name for binding in bindings] == [
+        "afterglow_vm_list__11111111",
+        "afterglow_vm_list__22222222",
+    ]
+    for binding in bindings:
+        result = await dispatch_tool_call(
+            binding, {}, ToolContext(project_id="project", user_id="user", run_id="run"),
+        )
+        assert result.status == "completed"
+    assert dispatched == [first.grant_id, second.grant_id]
+
+
+async def test_grant_that_fails_resolution_is_dropped_and_survivor_keeps_suffixed_name(monkeypatch):
+    from lumen.services import mcp_adapter
+
+    first = _grant("11111111-aaaa-4bbb-8ccc-000000000001")
+    second = _grant("22222222-aaaa-4bbb-8ccc-000000000002")
+
+    async def selected(**_kwargs):
+        return [first, second]
+
+    async def resolve(value):
+        if value.grant_id == second.grant_id:
+            raise tool_runtime.mcp_lumen.McpLumenAuthorityError("second grant unavailable")
+        return _grant_principal(value)
+
+    monkeypatch.setattr(mcp_adapter, "selected_lumen_snapshots", selected)
+    monkeypatch.setattr(tool_runtime.mcp_lumen, "resolve_lumen_principal", resolve)
+    monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_entries", lambda _principal: (_read_entry(),))
+    monkeypatch.setattr(tool_runtime.mcp_registry, "enabled_service_fingerprint", lambda _p: "services-fingerprint")
+
+    context = ToolContext(project_id="project", user_id="user")
+    bindings = await tool_runtime._lumen_registry_bindings(context)
+    assert [binding.definition.name for binding in bindings] == ["afterglow_vm_list__11111111"]

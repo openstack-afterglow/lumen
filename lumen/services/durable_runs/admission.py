@@ -314,7 +314,7 @@ async def _read_committed(session) -> None:
 
     The idempotency ``SELECT ... FOR UPDATE`` of a new key takes a gap lock under REPEATABLE READ. Concurrent
     admissions by one user then deadlock with each other's run INSERT and the provider-row locks (MariaDB 1213,
-    surfaced as HTTP 500). The unique ``uq_chat_runs_idempotency`` index (migration 029) decides same-key races
+    surfaced as HTTP 500). The unique ``uq_chat_runs_idempotency`` index (migration 030) decides same-key races
     instead, and ``_replay_idempotency_race`` returns the winner's run.
     """
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
