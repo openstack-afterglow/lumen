@@ -94,7 +94,7 @@ async def test_one_template_holds_two_connections_and_catalog_writes_keep_config
     assert failed["status"] == "failed"
     kept = next(row for row in await es.list_global("mcp") if row["id"] == work["server"]["id"])
     assert [tool["name"] for tool in kept["tools"]] == ["search"], "a failed refresh must keep the last good catalog"
-    assert kept["catalog_error"] == "MCP 도구 검색 실패: TimeoutError"
+    assert kept["catalog_error"] == "MCP 도구 검색 실패: unexpected error"
     assert kept["config_version"] == before
 
 
