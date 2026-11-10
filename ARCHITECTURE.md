@@ -547,9 +547,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "bb2398ef67746297ad8c1bad772475f8c7bef03501bcc1bdd76e1a694ca90b07",
-  "reviewed_at": "2026-11-10T10:46:07Z",
-  "summary": "Remote MCP failure classification: ToolException isinstance and adapter block text; server-level mcp_server_error for timeout, rejected credentials, HTTP status and unreachable with fixed texts; one shared consumer message across v2, legacy and catalog refresh; formatting noise removed from the earlier commit"
+  "source_sha256": "b5fa4f7fa46da90855f85560d9d650ca45ba9f3d240dd53f5a509e21fab9827d",
+  "reviewed_at": "2026-11-10T11:56:00Z",
+  "summary": "Restamp on a clean checkout of the MCP consumer-safe failure change (CI-equivalent digest; excludes local macOS .DS_Store). Scope reviewed: remote.py, mcp_client.py, bindings.py, dispatch.py, contracts.py, mcp_connections.py refresh, docs/api chat/tools-mcp wording."
 }
 ```
 <!-- architecture-review:end -->
