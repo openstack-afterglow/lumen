@@ -22,8 +22,15 @@ from lumen import crypto
 from lumen.scripts import migrate as runner
 from lumen.scripts import provider_account_migration as account
 
-# Migration 029 (the chat_runs idempotency unique index) is applied after the 028 cutover these tests exercise.
-_PENDING = [account.ACCOUNT_ID, "029-chat-runs-idempotency-index"]
+# Migrations 029 (chat_runs idempotency index) and 030 (ORM index catch-up) are additive and follow the 028 cutover
+# these tests exercise.
+_PENDING = [account.ACCOUNT_ID, "029-chat-runs-idempotency-index", "030-orm-index-catchup"]
+
+
+def _without_secondary_keys(entry):
+    """Migrations 029 and 030 add secondary indexes after the 028 cutover; compare columns, constraints and rows."""
+    ddl, rows = entry
+    return [line.rstrip(",") for line in ddl.splitlines() if not re.match(r"\s*(UNIQUE )?KEY ", line)], rows
 
 pytestmark = pytest.mark.integration
 
@@ -189,7 +196,8 @@ class _Database:
         monkeypatch.setattr(runner, "count_unready", AsyncMock(return_value=0))
         monkeypatch.setattr(runner, "_verify_active_paths", AsyncMock())
         self.statements.clear()
-        return await runner.migrate(os.environ["DATABASE_URL"], apply=apply)
+        # The prefix-namespaced fixture is not the ORM schema; the bootstrap repair has its own real-DB suite.
+        return await runner.migrate(os.environ["DATABASE_URL"], apply=apply, repair_schema_drift=False)
 
 
 @pytest.fixture
@@ -229,16 +237,14 @@ async def test_pristine_published_upgrade_preserves_ciphertext_generations_attem
     attempt_credential = (await database.sql("SELECT credential_id FROM llm_provider_auth_attempts")).scalar_one()
     assert (await database.sql("SELECT a.provider_id FROM llm_provider_credentials c JOIN llm_provider_accounts a ON a.id=c.account_id WHERE c.id=%s", (attempt_credential,))).scalar_one() == 74
     after = await database.snapshot()
-    assert after['llm_models'] == before['llm_models']
+    assert _without_secondary_keys(after['llm_models']) == _without_secondary_keys(before['llm_models'])
     assert after['chat_usage_logs'][1][0][:len(before['chat_usage_logs'][1][0])] == before['chat_usage_logs'][1][0]
     before_ddl, before_rows = before['chat_runs']
     after_ddl, after_rows = after['chat_runs']
     assert after_rows == before_rows
-    # 028 leaves chat_runs alone; the only DDL difference is migration 029's idempotency unique key.
-    def without_idempotency(ddl):
-        return [line.rstrip(",") for line in ddl.splitlines() if "idempotency" not in line]
+    # 028 leaves chat_runs alone; the only DDL differences are the later secondary indexes (029's idempotency key, 030).
     assert "idempotency" not in before_ddl and "idempotency" in after_ddl
-    assert without_idempotency(after_ddl) == without_idempotency(before_ddl)
+    assert _without_secondary_keys(after['chat_runs']) == _without_secondary_keys(before['chat_runs'])
     assert after['chat_run_providers'][1][0][:len(before['chat_run_providers'][1][0])] == before['chat_run_providers'][1][0]
     for receipt in before['schema_migrations'][1]:
         assert receipt in after['schema_migrations'][1]
@@ -268,7 +274,7 @@ async def test_exact_historical_receipt_is_preserved_without_replaying027(databa
         installation_default = tuple((await connection.exec_driver_sql("SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=DATABASE()")).one())
     assert account.canonical_schema(actual_auth, installation_default) == account.canonical_schema(account.schema_for("accounted")["llm_provider_auth_attempts"], installation_default)
     for table in ('llm_provider_accounts','llm_provider_credentials','chat_provider_usage','chat_run_providers','chat_usage_logs','llm_models'):
-        assert after[table] == before[table]
+        assert _without_secondary_keys(after[table]) == _without_secondary_keys(before[table])
     for receipt in before['schema_migrations'][1]:
         assert receipt in after['schema_migrations'][1]
     assert not any('INSERT INTO' in sql and 'llm_provider_accounts' in sql for sql in migration_statements)

@@ -20,6 +20,7 @@ from lumen.scripts.provider_account_migration import (
     AccountMigrationError,
     inspect_account_state,
 )
+from lumen.scripts.schema_repair import SchemaRepairError, describe_drift, repair_schema
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
 MANIFEST = MIGRATIONS / "manifest.txt"
@@ -302,7 +303,7 @@ async def _historical_media_registry_applied(connection, migration: Migration) -
     return True
 
 
-async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
+async def migrate(database_url: str, *, apply: bool, repair_schema_drift: bool = True) -> tuple[list[str], int]:
     if not database_url:
         raise MigrationLedgerError("database URL is required")
     migrations = load_manifest()
@@ -383,6 +384,16 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
             async with engine.begin() as connection:
                 await _verify_active_paths(connection)
                 await _record_migration(connection, migration)
+        if repair_schema_drift:
+            # Bootstrap self-repair: after the verified ledger, recreate missing tables, columns and indexes the ORM
+            # declares (additive only; anything else fails closed here, before the API or workers start).
+            try:
+                if apply:
+                    await repair_schema(engine)
+                elif not pending:
+                    pending.extend("schema-repair: " + change for change in await describe_drift(engine))
+            except SchemaRepairError as exc:
+                raise MigrationLedgerError(f"schema drift cannot be repaired automatically: {exc}") from None
         async with engine.begin() as connection:
             active_path_applied = (
                 await connection.execute(
@@ -412,10 +423,18 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database-url", default="")
+    parser.add_argument(
+        "--no-schema-repair",
+        action="store_true",
+        help="apply only the ledger migrations; skip the bootstrap repair of missing tables, columns and indexes "
+        "(used by the integration layer so migration coverage is tested without the safety net)",
+    )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     database_url = args.database_url or get_settings().database_url
-    pending, unready = asyncio.run(migrate(database_url, apply=args.apply))
+    pending, unready = asyncio.run(
+        migrate(database_url, apply=args.apply, repair_schema_drift=not args.no_schema_repair)
+    )
     if pending and not args.apply:
         raise SystemExit(f"pending Lumen migrations: {', '.join(pending)}; unready conversation histories: {unready}")
     if unready:

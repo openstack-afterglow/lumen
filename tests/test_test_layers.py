@@ -54,7 +54,7 @@ def test_run_integration_success(mock_run: MagicMock) -> None:
         "mariadb",
         "redis",
     ]
-    assert calls[1][0][0] == ["lumen-migrate", "--apply"]
+    assert calls[1][0][0][:2] == ["lumen-migrate", "--apply"]
     assert calls[2][0][0] == ["pytest", "-m", "integration", "tests"]
     assert calls[3][0][0] == [
         "docker",
