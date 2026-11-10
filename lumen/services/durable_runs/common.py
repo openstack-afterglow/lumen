@@ -93,12 +93,12 @@ async def _freeze_lumen_snapshot(
     from lumen.services import mcp_adapter as mcp_lumen
 
     try:
-        snapshot = await mcp_lumen.selected_lumen_snapshot(user_id=user_id, project_id=project_id)
+        snapshots = await mcp_lumen.selected_lumen_snapshots(user_id=user_id, project_id=project_id)
     except mcp_lumen.McpLumenAuthorityError:
-        snapshot = None
+        snapshots = []
     return {
         **request_payload,
-        "lumen_snapshot": mcp_lumen.snapshot_payload(snapshot) if snapshot is not None else None,
+        "lumen_snapshot": mcp_lumen.snapshot_payloads(snapshots),
     }
 
 
@@ -339,9 +339,11 @@ async def wake_run(run_id: str) -> None:
         from lumen.services import worker_routing
 
         async with _factory()() as session:
-            route = (await session.execute(
-                select(ChatRun.workload_class, ChatRun.worker_pool_id).where(ChatRun.id == run_id)
-            )).one_or_none()
+            route = (
+                await session.execute(
+                    select(ChatRun.workload_class, ChatRun.worker_pool_id).where(ChatRun.id == run_id)
+                )
+            ).one_or_none()
         if route is None or route.workload_class not in worker_routing.WORKER_WORKLOAD_CLASSES:
             return
         redis = await _get_redis()

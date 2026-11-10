@@ -124,7 +124,9 @@ def _delegation_enabled(run: ChatRun, payload: dict[str, Any]) -> bool:
     runtime = get_settings().runtime_config
     return runtime.enabled and any(pool.enabled and pool.role == "sandbox" for pool in runtime.pools)
 
+
 logger = logging.getLogger(__name__)
+
 
 def _safe_log_token(value: object, *, fallback: str = "<invalid>") -> str:
     if isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}", value):
@@ -140,7 +142,6 @@ def _safe_error_code(value: object, *, fallback: str = "run_failed") -> str:
 
 def _field_count(value: object) -> int:
     return len(value) if isinstance(value, dict) else 0
-
 
 
 async def _append_temp_history(
@@ -231,7 +232,9 @@ async def _append(run_id: str, event_type: str, payload: dict[str, Any], *, owne
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "durable chat journal committed run_id=%s event=%s fields=%d",
-            _safe_log_token(run_id), _safe_log_token(event_type), _field_count(payload),
+            _safe_log_token(run_id),
+            _safe_log_token(event_type),
+            _field_count(payload),
         )
 
 
@@ -262,22 +265,36 @@ async def _finish(
     child_result: dict[str, Any] | None = None,
 ) -> None:
     # Pure DB barrier; each attempt re-reads and re-locks with a fresh lock order (MariaDB 1020 retry).
-    transitioned, wake_parent = await budgets.retry_deadlocks(lambda: _finish_transaction(
-        run_id, status=status, message_id=message_id, owner=owner, error_code=error_code,
-        safe_message=safe_message, usage_record=usage_record, message_finalization=message_finalization,
-        completed_parts=completed_parts, child_result=child_result,
-    ))
+    transitioned, wake_parent = await budgets.retry_deadlocks(
+        lambda: _finish_transaction(
+            run_id,
+            status=status,
+            message_id=message_id,
+            owner=owner,
+            error_code=error_code,
+            safe_message=safe_message,
+            usage_record=usage_record,
+            message_finalization=message_finalization,
+            completed_parts=completed_parts,
+            child_result=child_result,
+        )
+    )
     if not transitioned:
         return
     logger.info(
         "durable chat run terminal run_id=%s status=%s error_code=%s",
-        _safe_log_token(run_id), status,
-        "none" if status == "completed" else _safe_error_code(error_code, fallback="canceled" if status == "canceled" else "run_failed"),
+        _safe_log_token(run_id),
+        status,
+        "none"
+        if status == "completed"
+        else _safe_error_code(error_code, fallback="canceled" if status == "canceled" else "run_failed"),
     )
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "durable chat run result committed run_id=%s status=%s part_count=%d usage_fields=%d",
-            _safe_log_token(run_id), status, len(completed_parts) if completed_parts is not None else 0,
+            _safe_log_token(run_id),
+            status,
+            len(completed_parts) if completed_parts is not None else 0,
             _field_count(usage_record),
         )
     if wake_parent is not None:
@@ -313,8 +330,13 @@ async def _finish_transaction(
         has_children = (
             await session.execute(select(ChatRun.id).where(ChatRun.parent_run_id == run_id).limit(1))
         ).scalar_one_or_none() is not None
-        if (unlocked_run.parent_run_id is not None or has_children or unlocked_run.execution_mode == "code"
-                or unlocked_run.credit_ceiling is not None or unlocked_run.assigned_resource_id is not None):
+        if (
+            unlocked_run.parent_run_id is not None
+            or has_children
+            or unlocked_run.execution_mode == "code"
+            or unlocked_run.credit_ceiling is not None
+            or unlocked_run.assigned_resource_id is not None
+        ):
             quota = await budgets.lock_project_quota(session, unlocked_run.project_id, order=order)
         order.take("conversation")
         if unlocked_run.conversation_id is not None:
@@ -337,19 +359,35 @@ async def _finish_transaction(
         if run.run_kind in {"image", "tts", "stt", "realtime", "api_completion"}:
             from lumen.models.chat_runs import ChatModelCallReservation
 
-            reservation = (await session.execute(select(ChatModelCallReservation).where(
-                ChatModelCallReservation.run_id == run.id,
-                ChatModelCallReservation.segment_id == f"{run.run_kind}:1"
-            ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
-            if status == "completed" and (reservation is None or reservation.status != "settled"
-                                          or run.usage_reconciled_at is None):
+            reservation = (
+                await session.execute(
+                    select(ChatModelCallReservation)
+                    .where(
+                        ChatModelCallReservation.run_id == run.id,
+                        ChatModelCallReservation.segment_id == f"{run.run_kind}:1",
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if status == "completed" and (
+                reservation is None or reservation.status != "settled" or run.usage_reconciled_at is None
+            ):
                 raise DurableRunProviderResultUnknown("unsettled media run cannot complete")
             if reservation is not None and reservation.status == "reserved" and status != "completed":
-                segment = (await session.execute(select(ChatRunSegment).where(
-                    ChatRunSegment.run_id == run.id, ChatRunSegment.segment_id == f"{run.run_kind}:1"
-                ).with_for_update())).scalar_one()
-                if (run.batch_id is not None and run.run_kind in {"image", "tts", "stt"}
-                        and error_code == "provider_rejected" and segment.status == "provider_started"):
+                segment = (
+                    await session.execute(
+                        select(ChatRunSegment)
+                        .where(ChatRunSegment.run_id == run.id, ChatRunSegment.segment_id == f"{run.run_kind}:1")
+                        .with_for_update()
+                    )
+                ).scalar_one()
+                if (
+                    run.batch_id is not None
+                    and run.run_kind in {"image", "tts", "stt"}
+                    and error_code == "provider_rejected"
+                    and segment.status == "provider_started"
+                ):
                     # Confirmed refusal, hold release and terminal state commit together.
                     fail_unresolved_segment(segment, error_code="provider_rejected")
                     reservation.actual_credits = Decimal("0")
@@ -470,14 +508,16 @@ async def _finish_transaction(
                     ):
                         deltas[event_message_id][part_type].append(delta)
                 messages = (
-                    (await session.execute(
-                        select(ChatMessage).where(
-                            ChatMessage.id.in_(turn_message_ids),
-                            ChatMessage.conversation_id == run.conversation_id,
-                            ChatMessage.status == "streaming",
-                            reachable_message_clause(run.conversation_id),
+                    (
+                        await session.execute(
+                            select(ChatMessage).where(
+                                ChatMessage.id.in_(turn_message_ids),
+                                ChatMessage.conversation_id == run.conversation_id,
+                                ChatMessage.status == "streaming",
+                                reachable_message_clause(run.conversation_id),
+                            )
                         )
-                    ))
+                    )
                     .scalars()
                     .all()
                 )
@@ -519,15 +559,27 @@ async def _finish_transaction(
             finalized = []
             if has_children and status != "completed":
                 finalized = await children.cancel_descendants(
-                    session, run, quota=quota, order=order, user_id=run.user_id,
-                    release_resources=False, budget_root=root,
+                    session,
+                    run,
+                    quota=quota,
+                    order=order,
+                    user_id=run.user_id,
+                    release_resources=False,
+                    budget_root=root,
                 )
             result = child_result or children.child_result_payload(
                 status=status, error_code=error_code, summary="", artifacts=[]
             )
             wake_parent = await children.record_child_terminal(
-                session, run, quota=quota, root=root, order=order, status=status,
-                error_code=error_code, result=result, release_resource=False,
+                session,
+                run,
+                quota=quota,
+                root=root,
+                order=order,
+                status=status,
+                error_code=error_code,
+                result=result,
+                release_resource=False,
             )
             from lumen.services.infrastructure import store as infra_store
 
@@ -553,7 +605,6 @@ async def _finish_transaction(
     return True, wake_parent
 
 
-
 def _bounded_credits(pricing: dict[str, Any], input_tokens: int, output_tokens: int) -> Decimal:
     """Round a worst-case frozen price upward, never a live catalog price."""
     try:
@@ -562,14 +613,18 @@ def _bounded_credits(pricing: dict[str, Any], input_tokens: int, output_tokens: 
         raise DurableRunError("bounded credit pricing is unavailable") from exc
 
 
-def _provider_credit_bound(run: ChatRun, *, messages: list[dict], tool_schemas: list[dict],
-                           max_tokens: int | None, summary: bool = False) -> Decimal:
+def _provider_credit_bound(
+    run: ChatRun, *, messages: list[dict], tool_schemas: list[dict], max_tokens: int | None, summary: bool = False
+) -> Decimal:
     snapshot = run.pricing_snapshot
     pricing = (snapshot.get("summary_route") or snapshot) if summary and isinstance(snapshot, dict) else snapshot
     if not isinstance(pricing, dict):
         raise DurableRunError("frozen provider pricing is unavailable")
-    pricing = {**pricing, "margin_multiplier": snapshot["margin_multiplier"],
-               "chat_credit_per_usd": snapshot["chat_credit_per_usd"]}
+    pricing = {
+        **pricing,
+        "margin_multiplier": snapshot["margin_multiplier"],
+        "chat_credit_per_usd": snapshot["chat_credit_per_usd"],
+    }
     capabilities = run.capability_snapshot if isinstance(run.capability_snapshot, dict) else {}
     if not summary:
         features = capabilities.get("effective_features")
@@ -581,7 +636,11 @@ def _provider_credit_bound(run: ChatRun, *, messages: list[dict], tool_schemas: 
             keys = ("web_search_request_per_unit", f"web_search_context_{search.get('context_size')}_per_unit")
             if any(key not in prices or Decimal(str(prices[key])) != 0 for key in keys):
                 raise DurableRunError("native web search has no provider-enforced request bound")
-    route = (capabilities.get("summary_route") or capabilities.get("capabilities")) if summary else capabilities.get("capabilities")
+    route = (
+        (capabilities.get("summary_route") or capabilities.get("capabilities"))
+        if summary
+        else capabilities.get("capabilities")
+    )
     route = route if isinstance(route, dict) else capabilities
     limit = route.get("context_limit")
     count = provider_metadata.count_context_tokens(
@@ -622,17 +681,24 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
     elif name == "managed_advisor":
         route = (run.capability_snapshot.get("feature_routes") or {}).get("advisor") or {}
         limit = route.get("context_limit")
-        keys = ("advisor_input_price_per_token", "advisor_cache_read_price_per_token",
-                "advisor_cache_write_price_per_token", "advisor_cache_write_1h_price_per_token",
-                "advisor_cache_read_price_per_token_above_200k",
-                "advisor_cache_write_price_per_token_above_200k",
-                "advisor_cache_write_1h_price_per_token_above_200k")
+        keys = (
+            "advisor_input_price_per_token",
+            "advisor_cache_read_price_per_token",
+            "advisor_cache_write_price_per_token",
+            "advisor_cache_write_1h_price_per_token",
+            "advisor_cache_read_price_per_token_above_200k",
+            "advisor_cache_write_price_per_token_above_200k",
+            "advisor_cache_write_1h_price_per_token_above_200k",
+        )
         rates = [Decimal(str(prices[key])) for key in keys if prices.get(key) is not None]
         if not rates or (max(rates) > 0 and (type(limit) is not int or limit <= 0)):
             raise DurableRunError("bounded advisor input requires frozen context limit")
         if route.get("output_budget_enforced") is False and Decimal(str(prices["advisor_output_price_per_token"])) > 0:
             raise DurableRunError("advisor does not enforce a bounded output budget")
-        usd = max(rates) * (limit if type(limit) is int else 0) + Decimal(str(prices["advisor_output_price_per_token"])) * advisor._MAX_ADVISOR_TOKENS
+        usd = (
+            max(rates) * (limit if type(limit) is int else 0)
+            + Decimal(str(prices["advisor_output_price_per_token"])) * advisor._MAX_ADVISOR_TOKENS
+        )
     else:
         return Decimal("0")
     multiplier = Decimal(str(snapshot["margin_multiplier"])) * Decimal(str(snapshot["chat_credit_per_usd"]))
@@ -642,13 +708,22 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
         Decimal("0.00000001"), rounding=ROUND_CEILING
     )
 
+
 class _DurableExecutionHooks:
     """Persist and replay each external graph boundary for one leased run."""
 
     journals_tool_events = True
 
-    def __init__(self, *, run_id: str, owner: str, credit_bounded: bool = False,
-                 skill_snapshots: list[dict] | None = None, user_id: str = "", project_id: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        owner: str,
+        credit_bounded: bool = False,
+        skill_snapshots: list[dict] | None = None,
+        user_id: str = "",
+        project_id: str = "",
+    ) -> None:
         self.run_id = run_id
         self.owner = owner
         self.requires_credit_reservation = credit_bounded
@@ -766,9 +841,11 @@ class _DurableExecutionHooks:
                 segment_id=segment_id,
                 source="system",
                 model_name=route.get("model_name") or run.model_name,
-                metadata={"operation": "context_compaction", **{
-                    key: value for key, value in execution_identity(route).items() if key != "provider_auth"
-                }, "provider_id": route.get("provider_id")},
+                metadata={
+                    "operation": "context_compaction",
+                    **{key: value for key, value in execution_identity(route).items() if key != "provider_auth"},
+                    "provider_id": route.get("provider_id"),
+                },
             )
             await credit.apply_usage_in_transaction(
                 session,
@@ -832,9 +909,17 @@ class _DurableExecutionHooks:
             ordinal=ordinal,
             endpoint="context_compaction",
             turn_ordinal=round_index,
-            credit_bound=(lambda run: _provider_credit_bound(
-                run, messages=messages, tool_schemas=[], max_tokens=output_bound, summary=True,
-            )) if self.requires_credit_reservation else None,
+            credit_bound=(
+                lambda run: _provider_credit_bound(
+                    run,
+                    messages=messages,
+                    tool_schemas=[],
+                    max_tokens=output_bound,
+                    summary=True,
+                )
+            )
+            if self.requires_credit_reservation
+            else None,
         )
         usage_payload: dict[str, Any] = {}
         if isinstance(started, dict):
@@ -1365,23 +1450,32 @@ class _DurableExecutionHooks:
         identity = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id))).scalar_one()
         order = budgets.LockOrder()
         quota, root, _ancestors = await children._lock_lineage(session, identity, order)
-        run = root if root.id == self.run_id else await budgets.lock_run(
-            session, self.run_id, order=order, lock_class="child"
+        run = (
+            root
+            if root.id == self.run_id
+            else await budgets.lock_run(session, self.run_id, order=order, lock_class="child")
         )
         return quota, root, run
 
-    def _actual_credit(self, run: ChatRun, endpoint: str, usage: dict[str, Any] | None,
-                       result: dict[str, Any] | None) -> Decimal | None:
+    def _actual_credit(
+        self, run: ChatRun, endpoint: str, usage: dict[str, Any] | None, result: dict[str, Any] | None
+    ) -> Decimal | None:
         if endpoint == "tool":
             records = result.get("usage", []) if isinstance(result, dict) else []
             if not isinstance(records, list):
                 raise DurableRunError("tool usage payload is invalid")
-            if not records and isinstance(result, dict) and (
-                result.get("status") == "failed"
-                or result.get("tool_name") in {"managed_web_search", "managed_web_fetch", "managed_advisor"}
+            if (
+                not records
+                and isinstance(result, dict)
+                and (
+                    result.get("status") == "failed"
+                    or result.get("tool_name") in {"managed_web_search", "managed_web_fetch", "managed_advisor"}
+                )
             ):
                 return None
-            cost, _ = _managed_usage_components(records, pricing_snapshot=run.pricing_snapshot, model_name=run.model_name)
+            cost, _ = _managed_usage_components(
+                records, pricing_snapshot=run.pricing_snapshot, model_name=run.model_name
+            )
         else:
             if not isinstance(usage, dict) or usage.get("_durable_estimated") is True:
                 return None
@@ -1392,7 +1486,9 @@ class _DurableExecutionHooks:
                 if isinstance(summary, dict):
                     pricing = summary
             cost = credit.usage_cost_from_pricing_snapshot(
-                pricing, prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens,
+                pricing,
+                prompt_tokens=breakdown.input_tokens,
+                completion_tokens=breakdown.output_tokens,
                 breakdown=breakdown,
                 required_modalities=usage.get("required_token_modalities"),
             ).raw_cost
@@ -1415,7 +1511,9 @@ class _DurableExecutionHooks:
             if self.requires_credit_reservation:
                 quota, root, run = await self._credit_lineage(session)
             else:
-                run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())).scalar_one()
+                run = (
+                    await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())
+                ).scalar_one()
             _require_owned_running_lease(run, self.owner)
             if endpoint == "chat_completions":
                 await self._ensure_provider_turn(session, run, turn_ordinal)
@@ -1441,7 +1539,9 @@ class _DurableExecutionHooks:
             if segment.status == "provider_started":
                 fail_unresolved_segment(segment, error_code="provider_result_unknown")
                 if self.requires_credit_reservation:
-                    await budgets.settle_call_credit(session, run=run, root=root, quota=quota, segment=segment, actual=None)
+                    await budgets.settle_call_credit(
+                        session, run=run, root=root, quota=quota, segment=segment, actual=None
+                    )
                 return {"_boundary_abort": "provider_result_unknown"}
             if segment.status == "failed":
                 return {"_boundary_abort": "provider_result_unknown"}
@@ -1457,17 +1557,24 @@ class _DurableExecutionHooks:
                     summary = snapshot.get("summary_route") or snapshot
                     # Older admitted summary snapshots omitted intrinsic capability metadata.
                     # Resolve it only for a new intent; committed replay above remains unchanged.
-                    if ("web_search_required" not in (summary.get("capabilities") or {})
-                            and isinstance(summary.get("provider_id"), int)
-                            and isinstance(summary.get("model_id"), int)):
+                    if (
+                        "web_search_required" not in (summary.get("capabilities") or {})
+                        and isinstance(summary.get("provider_id"), int)
+                        and isinstance(summary.get("model_id"), int)
+                    ):
                         summary = await ps.resolve_model_snapshot(summary)
                         if summary is None:
                             raise DurableRunError("context compaction route is unavailable")
                     await authorize_run_generation(session, run, resolved=summary)
                 else:
-                    await authorize_api_key_in_transaction(session, api_key_id=run.api_key_id,
-                        user_id=run.user_id, project_id=run.project_id, required_scopes=tuple(sorted(scopes)),
-                        credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
+                    await authorize_api_key_in_transaction(
+                        session,
+                        api_key_id=run.api_key_id,
+                        user_id=run.user_id,
+                        project_id=run.project_id,
+                        required_scopes=tuple(sorted(scopes)),
+                        credential_authority=(run.capability_snapshot or {}).get("credential_authority"),
+                    )
             except ApiKeyForbidden as exc:
                 raise DurableRunInputError("inference_authority_revoked") from exc
             except ApiKeyAuthorityUnavailable as exc:
@@ -1503,7 +1610,9 @@ class _DurableExecutionHooks:
             if self.requires_credit_reservation:
                 quota, root, run = await self._credit_lineage(session)
             else:
-                run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())).scalar_one()
+                run = (
+                    await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())
+                ).scalar_one()
             _require_owned_running_lease(run, self.owner)
             segment = await prepare_segment(
                 session,
@@ -1524,7 +1633,11 @@ class _DurableExecutionHooks:
                 )
             if self.requires_credit_reservation:
                 await budgets.settle_call_credit(
-                    session, run=run, root=root, quota=quota, segment=segment,
+                    session,
+                    run=run,
+                    root=root,
+                    quota=quota,
+                    segment=segment,
                     actual=self._actual_credit(run, endpoint, usage_payload, result_payload),
                 )
             complete_segment_io(segment, result_payload=result_payload, usage_payload=usage_payload)
@@ -1535,8 +1648,11 @@ class _DurableExecutionHooks:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "durable chat segment committed run_id=%s segment=%s endpoint=%s status=completed result_fields=%d usage_fields=%d",
-                _safe_log_token(self.run_id), _safe_log_token(segment_id), _safe_log_token(endpoint),
-                _field_count(result_payload), _field_count(usage_payload),
+                _safe_log_token(self.run_id),
+                _safe_log_token(segment_id),
+                _safe_log_token(endpoint),
+                _field_count(result_payload),
+                _field_count(usage_payload),
             )
 
     async def _fail(
@@ -1553,7 +1669,9 @@ class _DurableExecutionHooks:
             if self.requires_credit_reservation:
                 quota, root, run = await self._credit_lineage(session)
             else:
-                run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())).scalar_one()
+                run = (
+                    await session.execute(select(ChatRun).where(ChatRun.id == self.run_id).with_for_update())
+                ).scalar_one()
             _require_owned_running_lease(run, self.owner)
             segment = await prepare_segment(
                 session,
@@ -1567,20 +1685,35 @@ class _DurableExecutionHooks:
             if segment.status == "provider_started":
                 fail_unresolved_segment(segment, error_code="provider_result_unknown")
                 if self.requires_credit_reservation:
-                    await budgets.settle_call_credit(session, run=run, root=root, quota=quota, segment=segment, actual=None)
+                    await budgets.settle_call_credit(
+                        session, run=run, root=root, quota=quota, segment=segment, actual=None
+                    )
             return {"_boundary_abort": "provider_result_unknown"}
 
-    async def provider_started(self, *, round_index: int, attempt: int,
-                               messages: list[dict] | None = None, tool_schemas: list[dict] | None = None,
-                               max_tokens: int | None = None) -> dict[str, Any] | None:
+    async def provider_started(
+        self,
+        *,
+        round_index: int,
+        attempt: int,
+        messages: list[dict] | None = None,
+        tool_schemas: list[dict] | None = None,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any] | None:
         return await self._start(
             segment_id=f"provider:{round_index}:{attempt}",
             ordinal=round_index * 1_000 + attempt,
             endpoint="chat_completions",
             turn_ordinal=round_index,
-            credit_bound=(lambda run: _provider_credit_bound(
-                run, messages=messages or [], tool_schemas=tool_schemas or [], max_tokens=max_tokens,
-            )) if self.requires_credit_reservation else None,
+            credit_bound=(
+                lambda run: _provider_credit_bound(
+                    run,
+                    messages=messages or [],
+                    tool_schemas=tool_schemas or [],
+                    max_tokens=max_tokens,
+                )
+            )
+            if self.requires_credit_reservation
+            else None,
         )
 
     async def provider_completed(
@@ -1762,11 +1895,13 @@ class _DurableExecutionHooks:
 
 def _usage_payload_breakdown(value: dict[str, Any]) -> UsageBreakdown:
     """Read a journaled usage dict; entries written before cache accounting carry no split."""
-    breakdown = UsageBreakdown.from_runtime({
-        **value,
-        "prompt_tokens": value.get("prompt_tokens") or 0,
-        "completion_tokens": value.get("completion_tokens") or 0,
-    })
+    breakdown = UsageBreakdown.from_runtime(
+        {
+            **value,
+            "prompt_tokens": value.get("prompt_tokens") or 0,
+            "completion_tokens": value.get("completion_tokens") or 0,
+        }
+    )
     if breakdown is None:
         raise ValueError("journaled token usage is invalid")
     return breakdown
@@ -1855,10 +1990,20 @@ def _managed_usage_components(
                 "source": source,
                 "model_name": record.get("model_name") if isinstance(record.get("model_name"), str) else model_name,
                 "metadata": {
-                    **{key: value for key, value in (record.get("metadata") or {}).items() if key in {
-                        "provider_id", "provider_account_id", "provider_credential_id",
-                        "provider_credential_generation", "provider_backend", "provider_backend_version",
-                    } and value is not None},
+                    **{
+                        key: value
+                        for key, value in (record.get("metadata") or {}).items()
+                        if key
+                        in {
+                            "provider_id",
+                            "provider_account_id",
+                            "provider_credential_id",
+                            "provider_credential_generation",
+                            "provider_backend",
+                            "provider_backend_version",
+                        }
+                        and value is not None
+                    },
                     **({"unpriced": True} if unpriced and quantity > 0 else {}),
                 },
             }
@@ -1981,24 +2126,35 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
     if run_kind == "image":
         from .images import execute_image_run
 
-        return await execute_image_run(run_id, owner=owner,
-                                       payload={**payload, "user_id": user_id, "project_id": project_id},
-                                       capability_snapshot=capability_snapshot, pricing_snapshot=pricing_snapshot)
+        return await execute_image_run(
+            run_id,
+            owner=owner,
+            payload={**payload, "user_id": user_id, "project_id": project_id},
+            capability_snapshot=capability_snapshot,
+            pricing_snapshot=pricing_snapshot,
+        )
 
     if run_kind in {"tts", "stt"}:
         from .audio import execute_audio_run
 
-        return await execute_audio_run(run_id, owner=owner,
-                                       payload={**payload, "user_id": user_id, "project_id": project_id},
-                                       capability_snapshot=capability_snapshot, pricing_snapshot=pricing_snapshot)
+        return await execute_audio_run(
+            run_id,
+            owner=owner,
+            payload={**payload, "user_id": user_id, "project_id": project_id},
+            capability_snapshot=capability_snapshot,
+            pricing_snapshot=pricing_snapshot,
+        )
 
     if run_kind == "api_completion":
         from .api_completion import execute_api_completion_run
 
-        return await execute_api_completion_run(run_id, owner=owner,
-                                                payload={**payload, "user_id": user_id, "project_id": project_id},
-                                                capability_snapshot=capability_snapshot,
-                                                pricing_snapshot=pricing_snapshot)
+        return await execute_api_completion_run(
+            run_id,
+            owner=owner,
+            payload={**payload, "user_id": user_id, "project_id": project_id},
+            capability_snapshot=capability_snapshot,
+            pricing_snapshot=pricing_snapshot,
+        )
 
     if run_kind == "compaction":
         input_messages = [dict(m) for m in (payload.get("input_messages") or [])]
@@ -2052,7 +2208,8 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         except context_manager.ContextLimitExceeded as exc:
             logger.warning(
                 "durable compaction rejected run_id=%s error_code=%s",
-                _safe_log_token(run_id), _safe_error_code(getattr(exc, "code", None), fallback="compaction_failed"),
+                _safe_log_token(run_id),
+                _safe_error_code(getattr(exc, "code", None), fallback="compaction_failed"),
             )
             if await _cancel_requested(run_id):
                 await _finish(
@@ -2362,12 +2519,11 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             # Approval-capable chat is not implicitly a managed agent allocation.
             # Ordinary chat retains wallet precheck/settlement; explicit agent
             # budgets and every child still enforce project/root call ceilings.
-            credit_bounded=run.execution_protocol_version == 2 and (
-                run.parent_run_id is not None
-                or run.execution_mode != "chat"
-                or run.credit_ceiling is not None
-            ),
-            skill_snapshots=skill_snapshot, user_id=user_id, project_id=project_id,
+            credit_bounded=run.execution_protocol_version == 2
+            and (run.parent_run_id is not None or run.execution_mode != "chat" or run.credit_ceiling is not None),
+            skill_snapshots=skill_snapshot,
+            user_id=user_id,
+            project_id=project_id,
         )
         feature_options = payload.get("features")
         tool_policy = feature_options.get("tool_policy") if isinstance(feature_options, dict) else None
@@ -2412,10 +2568,16 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             api_key=resolved.get("api_key"),
             provider_auth=resolved.get("provider_auth"),
             token_rates=pricing_snapshot.get("token_rates") or {},
-            max_tokens=(None if (capability_snapshot.get("provider_request_defaults") or {}).get("omit_output_budget")
-                        else payload.get("max_tokens")),
-            temperature=(None if (capability_snapshot.get("provider_request_defaults") or {}).get("omit_sampling")
-                         else payload.get("temperature")),
+            max_tokens=(
+                None
+                if (capability_snapshot.get("provider_request_defaults") or {}).get("omit_output_budget")
+                else payload.get("max_tokens")
+            ),
+            temperature=(
+                None
+                if (capability_snapshot.get("provider_request_defaults") or {}).get("omit_sampling")
+                else payload.get("temperature")
+            ),
             reasoning_effort=payload.get("reasoning_effort"),
             response_format=_provider_response_format(payload.get("features")),
             selected_tool_ids=selected_tool_ids,
@@ -2431,7 +2593,9 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             run_id=run_id,
             execution_hooks=execution_hooks,
             execution_protocol_version=run.execution_protocol_version,
-            lumen_snapshot=payload.get("lumen_snapshot") if isinstance(payload.get("lumen_snapshot"), dict) else None,
+            lumen_snapshot=payload.get("lumen_snapshot")
+            if isinstance(payload.get("lumen_snapshot"), (dict, list))
+            else None,
             lumen_snapshot_frozen=True,
             approval_mode=approval_mode if isinstance(approval_mode, str) else None,
             workspace_write_mode=workspace_write_mode,
@@ -2477,15 +2641,16 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             # events are still draining. Its mutable active identity is not
             # the identity of the event being persisted.
             event_turn_ordinal = event.get("_durable_turn_ordinal", message_turn_ordinal)
-            if isinstance(event_turn_ordinal, bool) or not isinstance(event_turn_ordinal, int) or event_turn_ordinal < 0:
+            if (
+                isinstance(event_turn_ordinal, bool)
+                or not isinstance(event_turn_ordinal, int)
+                or event_turn_ordinal < 0
+            ):
                 raise DurableRunError("durable event turn is invalid")
             if (
                 event_turn_ordinal != message_turn_ordinal
                 or message_id is None
-                or (
-                    conversation_id is None and message_id == f"temp:{run_id}"
-                    and "_durable_turn_ordinal" in event
-                )
+                or (conversation_id is None and message_id == f"temp:{run_id}" and "_durable_turn_ordinal" in event)
             ):
                 async with factory() as session, session.begin():
                     active_run = (
@@ -2493,10 +2658,13 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
                     ).scalar_one()
                     _require_owned_running_lease(active_run, owner)
                     active_turn = await session.get(ChatRunTurn, (run_id, event_turn_ordinal))
-                    if active_turn is None or (conversation_id is not None and active_turn.assistant_message_id is None):
+                    if active_turn is None or (
+                        conversation_id is not None and active_turn.assistant_message_id is None
+                    ):
                         raise DurableRunError("durable event turn is unavailable")
                     active_message_id = (
-                        str(active_turn.assistant_message_id) if conversation_id is not None
+                        str(active_turn.assistant_message_id)
+                        if conversation_id is not None
                         else f"temp:{run_id}:assistant:{event_turn_ordinal}"
                     )
                 if message_id is not None and event_turn_ordinal > message_turn_ordinal:
@@ -2710,10 +2878,14 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
                     value = event.get("usage")
                     if isinstance(value, dict):
                         usage_breakdown = _usage_payload_breakdown(value)
-                        usage = {**usage_breakdown.as_usage_dict(), **(
-                            {"required_token_modalities": value["required_token_modalities"]}
-                            if "required_token_modalities" in value else {}
-                        )}
+                        usage = {
+                            **usage_breakdown.as_usage_dict(),
+                            **(
+                                {"required_token_modalities": value["required_token_modalities"]}
+                                if "required_token_modalities" in value
+                                else {}
+                            ),
+                        }
                     emitted_tool_usage = event.get("tool_usage")
                     if isinstance(emitted_tool_usage, list):
                         managed_tool_usage = [item for item in emitted_tool_usage if isinstance(item, dict)]
@@ -2798,8 +2970,10 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             segment_id="executor:aggregate",
             source="executor",
             model_name=resolved["model_name"],
-            metadata={**{key: value for key, value in execution_identity(resolved).items()
-                         if key != "provider_auth"}, "provider_id": resolved.get("provider_id")},
+            metadata={
+                **{key: value for key, value in execution_identity(resolved).items() if key != "provider_auth"},
+                "provider_id": resolved.get("provider_id"),
+            },
         )
         usage_components.extend(managed_components)
         usage_record = {
@@ -2936,9 +3110,11 @@ async def queued_run_ids(*, registration_id: str, limit: int = 4) -> list[str]:
             (
                 await session.execute(
                     select(ChatRun.id)
-                    .where(*worker_routing.registration_run_filter(registration),
-                           *worker_routing.queued_filter(now=_now()))
-                    .order_by(ChatRun.created_at, ChatRun.id).limit(limit)
+                    .where(
+                        *worker_routing.registration_run_filter(registration), *worker_routing.queued_filter(now=_now())
+                    )
+                    .order_by(ChatRun.created_at, ChatRun.id)
+                    .limit(limit)
                 )
             ).scalars()
         )

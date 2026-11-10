@@ -140,16 +140,16 @@ async def test_run_admission_freezes_lumen_selection_and_overwrites_client_paylo
 
     async def selected(**kwargs):
         assert kwargs == {"user_id": "user-1", "project_id": "project-1"}
-        return snapshot
+        return [snapshot]
 
-    monkeypatch.setattr(mcp_lumen, "selected_lumen_snapshot", selected)
+    monkeypatch.setattr(mcp_lumen, "selected_lumen_snapshots", selected)
     payload = await common._freeze_lumen_snapshot(
         {"lumen_snapshot": {"client": "forbidden"}, "execution_protocol_version": protocol},
         user_id="user-1",
         project_id="project-1",
     )
 
-    assert payload["lumen_snapshot"] == mcp_lumen.snapshot_payload(snapshot)
+    assert payload["lumen_snapshot"] == [mcp_lumen.snapshot_payload(snapshot)]
 
 
 def test_v2_run_snapshots_freeze_model_and_tool_limits():
