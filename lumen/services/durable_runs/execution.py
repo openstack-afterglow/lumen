@@ -12,6 +12,7 @@ from typing import Any
 
 from lumen_plugin_api.contracts import Namespace, PluginError
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
@@ -37,7 +38,7 @@ from lumen.services import conversation_store as cs
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
 from lumen.services.inference_authority import authorize_run_generation, model_required_scopes, native_run_scopes
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
-from lumen.services.message_graph import reachable_message_clause, register_message
+from lumen.services.message_graph import MessageGraphError, reachable_message_clause, register_message
 from lumen.services.providers import routing as ps
 from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.relay_history import receipt_owner
@@ -76,6 +77,7 @@ from .common import (
 )
 from .errors import (
     DurableRunError,
+    DurableRunEventValidationError,
     DurableRunInputError,
     DurableRunLeaseLost,
     DurableRunProtocolMismatch,
@@ -3068,13 +3070,21 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             await flush_deltas(check_cancel=False)
         except Exception:
             logger.warning("failed to persist buffered chat deltas run_id=%s", _safe_log_token(run_id))
+        if isinstance(exc, DurableRunEventValidationError):
+            error_code, safe_message = "internal_validation_failed", "chat run event validation failed"
+        elif isinstance(exc, MessageGraphError):
+            error_code, safe_message = "internal_graph_error", "chat conversation graph update failed"
+        elif isinstance(exc, SQLAlchemyError):
+            error_code, safe_message = "persistence_failed", "chat run persistence failed"
+        else:
+            error_code, safe_message = "provider_failed", "chat provider failed"
         await _finish(
             run_id,
             status="failed",
             message_id=message_id,
             owner=owner,
-            error_code="provider_failed",
-            safe_message="chat provider failed",
+            error_code=error_code,
+            safe_message=safe_message,
         )
     finally:
         if deadline_task is not None:

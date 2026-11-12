@@ -18,7 +18,12 @@ from lumen.models.chat_db import ChatConversation, ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatRunProvider, ChatTempThread
 from lumen.services import worker_routing
 from lumen.services.inference_authority import native_run_scopes
-from lumen.services.message_graph import append_active_message, reachable_message_clause, register_message
+from lumen.services.message_graph import (
+    append_active_message,
+    reachable_message_clause,
+    register_message,
+    replace_active_path,
+)
 from lumen.services.message_parts import serialize_parts
 from lumen.services.message_timestamps import message_timestamps
 from lumen.services.providers import routing as ps
@@ -686,6 +691,12 @@ async def create_run(
 
         await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
         route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
+        if conv is not None and user_message_id is not None and conv.active_leaf_id != user_message_id:
+            # Retry/regeneration selects the saved user turn only after fencing
+            # the observed branch. Completion appends below this same parent.
+            await replace_active_path(session, conversation_id=conversation_id, leaf_id=user_message_id)
+            conv.active_leaf_id = user_message_id
+            conv.history_revision = int(conv.history_revision or 0) + 1
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="persistent" if conversation_id else "temp",

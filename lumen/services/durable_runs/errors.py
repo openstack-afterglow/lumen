@@ -5,6 +5,10 @@ class DurableRunError(RuntimeError):
     pass
 
 
+class DurableRunEventValidationError(RuntimeError):
+    """A server-authored journal event failed its canonical contract."""
+
+
 class DurableRunProtocolMismatch(DurableRunError):
     """A queued payload cannot safely be interpreted by this worker."""
 

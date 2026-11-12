@@ -1082,6 +1082,9 @@ class TestRetryFailedRun:
             "get_settings",
             lambda: SimpleNamespace(chat_execution_protocol_version=1, chat_credit_per_usd=1000.0),
         )
+        monkeypatch.setattr(
+            cs, "get_active_path", lambda *args, **kwargs: _return({"messages": [], "active_leaf_id": "99"})
+        )
 
         class FakeSourceRun:
             id = "run-source-1"
@@ -1193,6 +1196,8 @@ class TestRetryFailedRun:
         assert response.status_code == 202, f"Failed with: {response.json()}"
         assert seen_create["request_payload"]["extension_snapshot"] == {"tools": [], "mcp": [mcp_item]}
         assert seen_create["request_payload"]["skill_ids"] == [3]
+        assert seen_create["user_message_id"] == 12
+        assert seen_create["expected_parent_id"] == 99
 
     async def test_retry_idempotency_returns_same_descriptor_on_lost_response(self, client, monkeypatch):
         await _patch_text_execution(monkeypatch)

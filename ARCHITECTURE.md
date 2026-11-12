@@ -6,7 +6,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: published `lumen` `0.6.14` (annotated tag `0.6.14` on dev merge `77c4b127`, 2026-11-10; published, not deployed) = published `0.6.13` plus OpenAI media/realtime model coverage, admission and wallet race fixes, bootstrap schema repair and dev's MCP registry/multi-connection work. Package/runtime/lock/Kolla image default are `0.6.14`; SDK `0.2.1`, plugin API/default plugins `0.1.1`, database plugin `0.1.2`, sandbox and public API `1.0.0` remain independent. Published 027/028 and dev's 029 (MCP connections) stay immutable; 030 (`chat_runs` idempotency unique index) and 031 (ORM index catch-up) are new and additive. Local checks, tag publication and production acceptance are separate evidence in `docs/testing.md`; production is still at 0.6.13/028.
+- 버전: root release candidate `0.6.15` adds retry path fencing and bounded cloud-tool journal display to published `0.6.14`. Package/runtime/lock/Kolla image default are `0.6.15`; SDK `0.2.1`, plugin API/default plugins `0.1.1`, database plugin `0.1.2`, sandbox and public API `1.0.0` remain independent. No migration is added. On 2026-11-13 all three production controllers ran 0.6.14 revision `77c4b127`; 0.6.15 publication and deployment require separate verification.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
@@ -309,6 +309,8 @@ Step 4 통합 후 contract 2,216건과 실제 MariaDB/Redis integration 195건�
 5. worker가 run lease를 소유한 뒤 graph/engine을 호출한다. provider call, tool call, delta, usage, approval/interaction, terminal result를 journal에 기록한다. lease owner/expiry가 맞지 않으면 write를 중단하고 stale recovery가 재시도 또는 fail-closed한다.
 6. `GET /v1/runs/{run_id}/events`는 owner-scoped MariaDB journal을 cursor 이후 읽고, terminal event까지 polling SSE와 keepalive를 제공한다. HTTP request나 SSE 연결은 실행을 취소하거나 실행 lifetime을 소유하지 않는다.
 
+Retry/regeneration admission fences the observed active leaf and atomically reselects the original user-message path before creating the run; existing sibling messages remain reachable. Durable tool-result events use a bounded, nonempty display projection, including hidden or empty failures, without changing model-facing results. Event-contract validation, message-graph and database failures have separate sanitized terminal codes. This does not repair delegated Keystone credentials; no schema or configuration change is required, but the fix requires a new deployment.
+
 로그 수명은 요청과 실행을 분리한다. API의 HTTP `202`는 journal에 접수된 요청 상태이고 성공 판정이 아니다. Worker의 claim/상태 변경과 terminal INFO는 durable journal transaction의 commit 이후에만 해당 run의 결과로 해석한다. DEBUG는 활성화 검사를 통과한 안전한 query/state/result 메타데이터(상태·유형·개수·식별자 등)만 허용하며 SQL/bind 값, 원문 prompt·tool 인자·provider 응답·예외 문자열은 기록하지 않는다.
 
 Native Search는 `chat_admission`이 고정한 feature options를 `durable_runs.execution` → `engine.stream` → `graph.stream` → provider transport까지 전달한다. 저장된 capability override나 subscription credential은 실제 native 지원 범위를 늘릴 수 없고 capability는 검색 실행 증거가 아니다. Perplexity legacy Sonar는 Chat Completions `web_search_options`를 유지하고, Agent Responses의 non-Sonar native opt-in은 hosted `web_search` tool을 function tools와 함께 보낸다. Agent Sonar에는 중복 hosted tool을 보내지 않는다. Lumen의 자동 `strict=true`는 지원하는 recursively closed schema에만 적용하며, compatibility client의 명시적 strict 선택과 선택적인 description/parameters는 보존한다. 서버 도구 실행은 strict 여부와 무관하게 JSON/schema를 검증하고 실패 시 dispatch하지 않는다. Provider-returned URL citations/search-result items만 canonical durable citation parts로 저장한다. Native 모델의 token 가격이 있어도 managed 검색의 별도 component 가격이 없으면 admission을 거부한다. Perplexity Agent Sonar와 legacy Sonar의 서로 다른 가격은 API base로 구분하고, exact Agent Sonar/GLM-5.3 공식 가격의 provenance를 admission snapshot과 관리자 model projection에 유지한다.
@@ -553,9 +555,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "580548491a2f6a3d08bb902deb8261cbf37311e865ca5dc61ff64d9a22b04c62",
-  "reviewed_at": "2026-11-10T13:19:56Z",
-  "summary": "0.6.14 릴리스 트리: dev의 MCP 작업과 병합하고 media/admission/schema-repair 변경을 migration 030·031로 재번호, snapshot 재생성, 버전 0.6.14; 병합 트리 게이트 contract 6890 / integration 500 / system 38"
+  "source_sha256": "2b76b460bc59e3f8c7809a00ac69974f12ef9b5fd145552b9baa21c0d8445857",
+  "reviewed_at": "2026-11-12T16:53:37Z",
+  "summary": "0.6.15 retry path and hidden cloud-result handling; scoped and full local gates; no migrations"
 }
 ```
 <!-- architecture-review:end -->

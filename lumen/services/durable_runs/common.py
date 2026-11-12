@@ -13,11 +13,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from lumen_plugin_api.tools import AgentExecutionPolicy
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from lumen.crypto import decrypt_chat_content
 from lumen.db import get_session_factory, is_db_available
 from lumen.models.chat_contracts import (
+    MAX_PARTS_PER_MESSAGE,
+    MAX_TEXT_PART_CHARS,
     ChatRunDescriptor,
     ChatRunEvent,
     validate_chat_parts,
@@ -31,7 +34,7 @@ from lumen.services.checkpointer import chat_checkpointer
 from lumen.services.execution_protocol import SUPPORTED_EXECUTION_PROTOCOL_VERSIONS, is_supported
 from lumen.services.message_timestamps import message_timestamps
 
-from .errors import DurableRunError, DurableRunInputError
+from .errors import DurableRunError, DurableRunEventValidationError, DurableRunInputError
 
 _LEASE_SECONDS = 45
 _V2_DEFAULT_MAX_MODEL_TURNS = 8
@@ -111,7 +114,11 @@ def _tool_result_error_code(value: object) -> str | None:
 
 
 def _tool_display_parts(payload: dict[str, Any], *, content: str, visible: bool) -> list[dict[str, Any]]:
-    """Project a validated v2 result into durable, display-only chat parts."""
+    """Bound the display projection without changing the model's replay payload."""
+    failed = _tool_result_status(payload.get("status")) == "failed"
+    if not visible:
+        text = "Tool call failed. Output is hidden." if failed else "Tool output is hidden."
+        return [{"type": "text", "text": text}]
     raw_display = payload.get("display")
     parts = list(raw_display) if isinstance(raw_display, list) else []
     raw_artifacts = payload.get("artifacts")
@@ -149,8 +156,24 @@ def _tool_display_parts(payload: dict[str, Any], *, content: str, visible: bool)
                     }
                 )
                 seen_asset_ids.add(asset_id)
-    if not parts and visible:
-        return [{"type": "text", "text": content}]
+    if not parts:
+        empty_text = "Tool call failed without display output." if failed else "Tool completed without display output."
+        parts = [{"type": "text", "text": content or empty_text}]
+    suffix = "\n[Tool output truncated for display.]"
+    parts = [
+        {**part, "text": part["text"][: MAX_TEXT_PART_CHARS - len(suffix)] + suffix}
+        if isinstance(part, dict)
+        and part.get("type") == "text"
+        and isinstance(part.get("text"), str)
+        and len(part["text"]) > MAX_TEXT_PART_CHARS
+        else part
+        for part in parts
+    ]
+    if len(parts) > MAX_PARTS_PER_MESSAGE:
+        parts = [
+            *parts[: MAX_PARTS_PER_MESSAGE - 1],
+            {"type": "text", "text": "Additional tool output omitted from display."},
+        ]
     return parts
 
 
@@ -180,16 +203,19 @@ _TEMP_THREAD_RETENTION = timedelta(days=30)
 
 def _event(run: ChatRun, event_type: str, payload: dict[str, Any]) -> ChatRunEvent:
     seq = run.last_seq + 1
-    return validate_chat_run_event(
-        {
-            "event_id": f"{run.id}:{seq}",
-            "run_id": run.id,
-            "seq": seq,
-            "type": event_type,
-            "created_at": _now(),
-            "payload": payload,
-        }
-    )
+    try:
+        return validate_chat_run_event(
+            {
+                "event_id": f"{run.id}:{seq}",
+                "run_id": run.id,
+                "seq": seq,
+                "type": event_type,
+                "created_at": _now(),
+                "payload": payload,
+            }
+        )
+    except ValidationError as exc:
+        raise DurableRunEventValidationError("durable run event is invalid") from exc
 
 
 def _canonical_intent(value: Any, *, key: str | None = None) -> Any:
