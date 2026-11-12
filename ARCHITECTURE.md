@@ -6,7 +6,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: root release candidate `0.6.15` adds retry path fencing and bounded cloud-tool journal display to published `0.6.14`. Package/runtime/lock/Kolla image default are `0.6.15`; SDK `0.2.1`, plugin API/default plugins `0.1.1`, database plugin `0.1.2`, sandbox and public API `1.0.0` remain independent. No migration is added. On 2026-11-13 all three production controllers ran 0.6.14 revision `77c4b127`; 0.6.15 publication and deployment require separate verification.
+- 버전: `0.6.15` was published on annotated tag `0.6.15` at dev merge `9f2d4e5431f00583f4053c7c8b7d4e5fc22435de` and deployed on all three production API/worker controllers on 2026-11-13 KST. Package/runtime/lock/Kolla image default are `0.6.15`; SDK `0.2.1`, plugin API/default plugins `0.1.1`, database plugin `0.1.2`, sandbox and public API `1.0.0` remain independent. No migration was added. Real cloud-tool acceptance and grant reissuance are unverified.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.

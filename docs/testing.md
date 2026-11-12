@@ -1,10 +1,12 @@
 # 테스트
 
-## Retry and cloud-tool failure regression (2026-11-13, source only)
+## Retry and cloud-tool failure regression (2026-11-13)
 
-`test-passed`: `uv run --no-sync pytest -q tests/test_chat_completions.py tests/test_chat_run_protocol.py tests/test_cloud_tool_discovery.py` passed 220 tests; `uv run --no-sync lumen-test integration -k 'text_admission_concurrency'` passed 28 against isolated MariaDB/Redis, including retry path selection, fencing, idempotency and snapshot-isolation modes. Targeted Ruff passed. The managed cloud-tool regression covers failed port-list results through graph and journal boundaries, not a real Keystone grant or production deployment. Grant reissuance and real cloud execution remain unverified.
+`test-passed`: `uv run --no-sync pytest -q tests/test_chat_completions.py tests/test_chat_run_protocol.py tests/test_cloud_tool_discovery.py` passed 220 tests; `uv run --no-sync lumen-test integration -k 'text_admission_concurrency'` passed 28 against isolated MariaDB/Redis, including retry path selection, fencing, idempotency and snapshot-isolation modes. Targeted Ruff passed. The managed cloud-tool regression covers failed port-list results through graph and journal boundaries, not a real Keystone grant. Grant reissuance and real cloud execution remain unverified.
 
 Full local gates: `uv run --no-sync lumen-test contract -q` passed 6924 service and 143 SDK tests; `uv run --no-sync lumen-test integration -q` passed 516 with 1 skipped; `uv run --no-sync lumen-test system -q` passed 38. A separately run persistent worker integration exercises a synthetic hidden failed tool result through real MariaDB journal completion, assistant turn finalization and the next model round (2 cases passed). The full integration run began before this extra test was added; its result does not include the added case. These are not real cloud or production acceptance.
+
+Production rollout verification (2026-11-13 KST): all three API containers reported healthy, matching 0.6.15 image revision, and direct `/v1/ready` 200; the three worker processes had recent accepting registrations. Public Lumen health/readiness and Afterglow health returned 200. A disposable API key returned 200 from `/v1/models`, then 401 after revocation. This does not verify a cloud-tool call, grant reissuance, or provider completion.
 
 ## OpenAI media model coverage (2026-11-10, source only; test-passed, live-verified against the provider, not deployed)
 

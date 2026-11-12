@@ -12,7 +12,8 @@ source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra ser
 `docker/Dockerfile`은 migration을 자동 실행하지 않는다. migration 누락 상태로 새 API/worker를 기동하지 않는다.
 ## 0.6.15 release boundary
 
-The 0.6.15 candidate fixes retry graph selection and durable display of failed cloud tools without a schema migration. On 2026-11-13, all three production controllers ran 0.6.14 revision `77c4b127`; the 0.6.15 publication and rollout remain unverified. The fix does not reissue or repair a delegated Keystone grant.
+0.6.15 was deployed to the API and worker on all three production controllers on 2026-11-13 KST, using pinned OCI indexes and revision `9f2d4e5431f00583f4053c7c8b7d4e5fc22435de`. Direct and public readiness returned 200; disposable key models access returned 200 and revoked-key access returned 401. No real cloud-tool or provider completion was tested. The fix does not reissue or repair a delegated Keystone grant. Configuration backup: `/etc/kolla/lumen-0615-backup-20261112T171428Z/`; active pins: `/etc/kolla/globals.d/zzz-lumen-0.6.15.yml`.
+The first host's Kolla `--tags lumen` reconfigure also restarted HAProxy, ProxySQL and keepalived; they recovered and public Lumen and Afterglow health returned 200. Subsequent host reconfigures used `--skip-tags haproxy` and preserved those containers. Bootstrap migration and provider seeding ran through the normal role; no migration was added in this release.
 
 The 0.6.14 section below records the original pre-rollout plan; its historical production-version statement is superseded by the observation above.
 
