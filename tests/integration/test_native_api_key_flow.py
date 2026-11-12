@@ -684,7 +684,8 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
         await close_db()
 
 
-async def test_persistent_tool_round_keeps_its_message_when_provider_advances(monkeypatch):
+@pytest.mark.parametrize("hidden_failure", [False, True])
+async def test_persistent_tool_round_keeps_its_message_when_provider_advances(monkeypatch, hidden_failure):
     """A queued tool result belongs to its emitted turn, not the producer's latest turn."""
     from lumen.models.chat_runs import ChatRunTurn
 
@@ -703,6 +704,22 @@ async def test_persistent_tool_round_keeps_its_message_when_provider_advances(mo
     second_turn_started = asyncio.Event()
     start_provider = execution._DurableExecutionHooks.provider_started
     stream_events = execution.engine.stream
+    complete_tool = execution._DurableExecutionHooks.tool_completed
+
+    async def tool_completed(self, **kwargs):
+        if hidden_failure:
+            kwargs["result_payload"] = {
+                **kwargs["result_payload"],
+                "content": "Cloud control-plane call was denied or is unavailable.",
+                "visible": False,
+                "status": "failed",
+                "error_code": "cloud_control_unavailable",
+                "display": [],
+                "artifacts": [],
+            }
+        return await complete_tool(self, **kwargs)
+
+    monkeypatch.setattr(execution._DurableExecutionHooks, "tool_completed", tool_completed)
 
     async def provider_started(self, **kwargs):
         result = await start_provider(self, **kwargs)
@@ -733,6 +750,8 @@ async def test_persistent_tool_round_keeps_its_message_when_provider_advances(mo
                     raise event
                 if event.get("type") == "tool_result":
                     await asyncio.wait_for(second_turn_started.wait(), timeout=10)
+                    if hidden_failure:
+                        event = {**event, "hidden": True, "status": "failed", "error_code": "cloud_control_unavailable"}
                 yield event
         finally:
             producer.cancel()
@@ -798,9 +817,13 @@ async def test_persistent_tool_round_keeps_its_message_when_provider_advances(mo
             messages = [by_id[message_id] for message_id in assistant_ids]
             assert all(message["status"] == "complete" for message in messages)
             first_parts = messages[0]["parts"]
-            assert [part["type"] for part in first_parts] == ["tool_call", "tool_result"]
-            assert first_parts[0]["call_id"] == first_parts[1]["call_id"] == "turn-owned-call"
-            assert "Owned turn fixture" in str(first_parts[1]["content"])
+            if hidden_failure:
+                assert [part["type"] for part in first_parts] == ["tool_call"]
+                assert first_parts[0]["status"] == "failed"
+            else:
+                assert [part["type"] for part in first_parts] == ["tool_call", "tool_result"]
+                assert first_parts[0]["call_id"] == first_parts[1]["call_id"] == "turn-owned-call"
+                assert "Owned turn fixture" in str(first_parts[1]["content"])
             assert messages[1]["content"] == "The owned conversation lookup completed."
             assert all(part["type"] not in {"tool_call", "tool_result"} for part in messages[1]["parts"])
     finally:

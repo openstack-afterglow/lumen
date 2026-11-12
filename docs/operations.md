@@ -10,6 +10,12 @@ source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra ser
 4. `uv run lumen-worker`를 하나 이상 실행한다. managed runtime을 활성화했다면 전용 `uv run lumen-controller`를 시작하고 admin inventory에서 pool/resource 상태를 확인한다. `/v1/ready`만으로 worker/controller/cloud 가동 여부는 알 수 없다.
 
 `docker/Dockerfile`은 migration을 자동 실행하지 않는다. migration 누락 상태로 새 API/worker를 기동하지 않는다.
+## 0.6.15 release boundary
+
+The 0.6.15 candidate fixes retry graph selection and durable display of failed cloud tools without a schema migration. On 2026-11-13, all three production controllers ran 0.6.14 revision `77c4b127`; the 0.6.15 publication and rollout remain unverified. The fix does not reissue or repair a delegated Keystone grant.
+
+The 0.6.14 section below records the original pre-rollout plan; its historical production-version statement is superseded by the observation above.
+
 
 ## 0.6.14 release boundary
 

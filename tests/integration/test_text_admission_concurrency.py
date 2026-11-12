@@ -18,9 +18,12 @@ from sqlalchemy import delete, event, func, select, text
 
 from lumen import crypto
 from lumen.db import close_db, get_session_factory, init_db
-from lumen.models.chat_db import ChatConversation, ChatMessageGraph, LlmModel, LlmProvider
+from lumen.models.chat_db import ChatConversation, ChatMessage, ChatMessageGraph, LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun
+from lumen.services import conversation_store as cs
 from lumen.services.durable_runs import admission
+from lumen.services.durable_runs.errors import DurableRunConflict, DurableRunNotFound
+from lumen.services.message_graph import projected_message_ids
 from lumen.services.providers import routing
 from lumen.services.providers.credentials import execution_identity
 
@@ -159,3 +162,128 @@ async def test_concurrent_text_admissions_all_succeed_and_one_key_is_one_run(tex
         rows = await session.scalar(select(func.count()).select_from(ChatRun).where(ChatRun.project_id == project_id))
     expected = 1 if same_key else _REQUESTS
     assert rows == expected and len(set(results)) == expected
+
+
+@pytest.mark.parametrize("text_route", ["OFF", "ON"], indirect=True)
+@pytest.mark.parametrize("source_status", ["failed", "canceled"])
+@pytest.mark.parametrize("partial_answer", [False, True], ids=["user-leaf", "assistant-leaf"])
+async def test_retry_reselects_saved_user_parent_and_completion_projects_a_sibling(
+    text_route, source_status, partial_answer,
+):
+    factory, user_id, project_id, snapshot = text_route
+    conversation_id = (await _conversations(factory, project_id, user_id, 1))[0]
+    source_id = await _admit_persistent(snapshot, project_id, user_id)(str(uuid.uuid4()), conversation_id)
+    async with factory() as session, session.begin():
+        source = await session.get(ChatRun, source_id)
+        source.status = source_status
+        user_message_id = source.user_message_id
+    original_answer = None
+    if partial_answer:
+        original_answer = await cs.add_message(
+            conversation_id, role="assistant", content="interrupted", status=source_status,
+            parent_id=user_message_id, set_leaf=True,
+        )
+    async with factory() as session:
+        conversation = await session.get(ChatConversation, conversation_id)
+        observed_leaf = conversation.active_leaf_id
+        original_revision = conversation.history_revision
+    retry_arguments = {
+        "project_id": project_id, "user_id": user_id, "client_request_id": str(uuid.uuid4()),
+        "intent": {"endpoint": "retry", "conversation_id": conversation_id, "source_run_id": source_id},
+        "conversation_id": conversation_id, "temp_thread_id": None, "model_name": _MODEL, "agent_id": None,
+        "user_message_id": user_message_id, "request_payload": dict(_PAYLOAD),
+        "capability_snapshot": snapshot, "pricing_snapshot": {}, "expected_parent_id": observed_leaf,
+    }
+    retry = await admission.create_run(**retry_arguments)
+    expected_revision = original_revision + int(partial_answer)
+    async with factory() as session:
+        conversation = await session.get(ChatConversation, conversation_id)
+        run = await session.get(ChatRun, retry.run_id)
+        assert run.user_message_id == conversation.active_leaf_id == user_message_id
+        assert conversation.history_revision == expected_revision
+        assert await projected_message_ids(session, conversation_id=conversation_id) == [user_message_id]
+        assert await session.scalar(select(func.count()).select_from(ChatMessage).where(
+            ChatMessage.conversation_id == conversation_id, ChatMessage.role == "user",
+        )) == 1
+        assert (await session.get(ChatRun, source_id)).status == source_status
+
+    answer = await cs.add_message(
+        conversation_id, role="assistant", content="", status="streaming", parent_id=user_message_id,
+    )
+    async with factory() as session, session.begin():
+        await cs.complete_message_in_transaction(
+            session, conversation_id, message_id=answer["id"], content="retried answer",
+            reasoning=None, model_name=_MODEL,
+        )
+        run = await session.get(ChatRun, retry.run_id)
+        run.status = "completed"
+    # A lost-response replay must return the admitted run without reselecting its parent.
+    replay = await admission.create_run(**retry_arguments)
+    assert replay.run_id == retry.run_id
+    assert replay.status == "completed"
+    async with factory() as session:
+        conversation = await session.get(ChatConversation, conversation_id)
+        assert conversation.active_leaf_id == answer["id"]
+        assert conversation.history_revision == expected_revision
+        assert await projected_message_ids(session, conversation_id=conversation_id) == [user_message_id, answer["id"]]
+        if original_answer is not None:
+            previous = await session.get(ChatMessage, original_answer["id"])
+            assert previous.parent_id == user_message_id
+            assert previous.status == source_status
+
+
+@pytest.mark.parametrize("text_route", ["OFF", "ON"], indirect=True)
+@pytest.mark.parametrize("conflict", ["branch", "active", "provider", "unreachable"])
+async def test_retry_rejection_does_not_reselect_saved_user_parent(text_route, conflict):
+    factory, user_id, project_id, snapshot = text_route
+    conversation_id = (await _conversations(factory, project_id, user_id, 1))[0]
+    source_id = await _admit_persistent(snapshot, project_id, user_id)(str(uuid.uuid4()), conversation_id)
+    async with factory() as session, session.begin():
+        source = await session.get(ChatRun, source_id)
+        source.status = "failed"
+        user_message_id = source.user_message_id
+    answer = await cs.add_message(
+        conversation_id, role="assistant", content="failed answer", status="failed",
+        parent_id=user_message_id, set_leaf=True,
+    )
+    expected_parent_id = answer["id"]
+    capability_snapshot = snapshot
+    retry_user_message_id = user_message_id
+    if conflict == "branch":
+        await cs.set_active_leaf(
+            conversation_id, user_id=user_id, project_id=project_id, message_id=user_message_id,
+        )
+        error = "context_revision_changed"
+    elif conflict == "active":
+        async with factory() as session, session.begin():
+            source = await session.get(ChatRun, source_id)
+            source.status = "queued"
+        error = "conversation_run_active"
+    elif conflict == "provider":
+        capability_snapshot = {**snapshot, "config_version_hash": "stale"}
+        error = "provider_configuration_changed"
+    else:
+        other_id = (await _conversations(factory, project_id, user_id, 1))[0]
+        other_user = await cs.add_message(other_id, role="user", content="outside conversation")
+        retry_user_message_id = other_user["id"]
+        error = "user message was not found in conversation"
+    async with factory() as session:
+        conversation = await session.get(ChatConversation, conversation_id)
+        before = (conversation.active_leaf_id, conversation.history_revision)
+        before_path = await projected_message_ids(session, conversation_id=conversation_id)
+    error_type = DurableRunNotFound if conflict == "unreachable" else DurableRunConflict
+    with pytest.raises(error_type, match=error):
+        await admission.create_run(
+            project_id=project_id, user_id=user_id, client_request_id=str(uuid.uuid4()),
+            intent={"endpoint": "retry", "source_run_id": source_id},
+            conversation_id=conversation_id, temp_thread_id=None, model_name=_MODEL, agent_id=None,
+            user_message_id=retry_user_message_id, request_payload=dict(_PAYLOAD),
+            capability_snapshot=capability_snapshot, pricing_snapshot={}, expected_parent_id=expected_parent_id,
+        )
+    async with factory() as session:
+        conversation = await session.get(ChatConversation, conversation_id)
+        assert (conversation.active_leaf_id, conversation.history_revision) == before
+        assert await projected_message_ids(session, conversation_id=conversation_id) == before_path
+        assert await session.scalar(select(func.count()).select_from(ChatRun).where(
+            ChatRun.conversation_id == conversation_id,
+        )) == 1

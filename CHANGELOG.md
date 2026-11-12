@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.15 — 2026-11-13 (release candidate; not yet published or deployed)
+
+- Fix retry and regeneration after an intermediate assistant turn: admission fences the current branch and atomically reselects the original user-message path before creating the run. Prior branches remain available.
+- Preserve failed cloud-tool results with empty display content in the durable journal; bound display-only output without changing model-facing results. Internal event validation, message-graph and database errors receive distinct sanitized failure codes rather than `provider_failed`.
+- This does not repair invalid Keystone application credentials or reissue grants. Production rollout and real-cloud acceptance remain unverified.
+
 ## 0.6.14 — 2026-11-10 (KST; published, not deployed)
 
 - **English — MCP (already on dev, summarized here because it had no changelog entry):** GitHub MCP Registry catalog (`scripts/sync_mcp_registry.py`, `lumen/services/mcp_registry_catalog.json`, admin `/v1/admin/mcp-registry` with install and install-all) and multi-connection MCP: migration 029 adds `template_key`, `connection_label`, `tool_catalog`, `catalog_refreshed_at`, `catalog_error` and the unique `uq_chat_mcp_template_label (template_key, connection_label)` to `chat_mcp_servers`, so one template can have several global connections with their own credentials, permissions and label; catalog refresh is metadata and never bumps `config_version`. Afterglow multi-grant MCP bindings (per-grant snapshots, suffixed tool names, list freeze), SSE gate, consumer-safe remote failures (`mcp_tool_error`, `mcp_server_error`, one shared message rule across v2, legacy and catalog refresh) and grouped API reference docs generated from OpenAPI (`docs/api/tools-mcp`). Three of its commits are titled `WIP:`; its own evidence is in the ARCHITECTURE row for the MCP registry and in its tests.

@@ -50,6 +50,7 @@ def bridge(monkeypatch):
         requests=[],
         invocations=[],
         reject_execute=False,
+        execute_failure_status=403,
     )
 
     def handle(request):
@@ -68,7 +69,7 @@ def bridge(monkeypatch):
         assert request.url.path.endswith("/execute")
         if (state.reject_execute or payload["snapshot"] != state.snapshot
                 or payload["name"] not in {entry["name"] for entry in state.entries}):
-            return httpx.Response(403, json={"detail": "selection unavailable"})
+            return httpx.Response(state.execute_failure_status, json={"detail": "selection unavailable"})
         state.invocations.append(payload)
         return httpx.Response(200, json={"tool": payload["name"], "fixture": "read-result"})
 
@@ -270,3 +271,107 @@ async def test_legacy_chat_never_dispatches_delegated_cloud_mutations(bridge):
     assert result.content == "알 수 없는 툴입니다: afterglow_vm_delete"
     assert bridge.invocations == []
     assert not any(path.endswith("/execute") for path, _ in bridge.requests)
+
+
+@pytest.mark.parametrize("protocol", [1, 2])
+@pytest.mark.parametrize("upstream_status", [403, 502])
+async def test_failed_port_list_journals_valid_result_and_reaches_next_model_turn(
+    monkeypatch, bridge, protocol, upstream_status,
+):
+    from unittest.mock import AsyncMock
+
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from lumen import crypto
+    from lumen.models.chat_runs import ChatRunSegment
+    from lumen.services import graph
+    from lumen.services.durable_runs import common, execution
+    from lumen.services.run_store import complete_segment_io, load_segment_payload
+
+    bridge.entries = [_entry("afterglow_port_list", "List project-owned Neutron ports.")]
+    ctx = await _admitted_context(protocol)
+    bound, = await bindings._lumen_registry_bindings(ctx)
+    bridge.reject_execute = True
+    bridge.execute_failure_status = upstream_status
+    hooks = execution._DurableExecutionHooks(run_id="port-failure", owner="worker#1")
+    journal = []
+    segments = []
+    provider_messages = []
+    retained = None
+
+    async def loaded_bindings(_context, **_kwargs):
+        return {"afterglow_port_list": bound}
+
+    async def schemas(_context):
+        return [{
+            "type": "function",
+            "function": {"name": bound.definition.name, "description": bound.definition.description,
+                         "parameters": bound.definition.input_schema},
+        }]
+
+    async def start(**kwargs):
+        if kwargs["endpoint"] == "tool" and retained is not None:
+            return {**retained, "_durable_replay": True}
+        return None
+
+    async def complete(**kwargs):
+        nonlocal retained
+        if kwargs["endpoint"] != "tool":
+            return
+        segment = ChatRunSegment(endpoint="tool", status="provider_started")
+        complete_segment_io(segment, result_payload=kwargs["result_payload"], usage_payload=None)
+        retained = load_segment_payload(segment.result_payload)
+        segments.append(segment)
+        event_type, payload = kwargs["journal_completed"]
+        journal.append(common._event(SimpleNamespace(id="port-failure", last_seq=len(journal)), event_type, payload))
+
+    async def completion_stream(**kwargs):
+        provider_messages.append(kwargs["messages"])
+        first_turn = len(provider_messages) % 2 == 1
+
+        async def chunks():
+            if first_turn:
+                yield {"choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "port-call", "function": {"name": "afterglow_port_list", "arguments": "{}"},
+                }]}}]}
+            else:
+                yield {"choices": [{"delta": {"content": "The tool could not list ports."}}]}
+            yield {"usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+
+        return chunks()
+
+    monkeypatch.setattr(crypto, "_get_key", lambda: bytes.fromhex("ab" * 32))
+    monkeypatch.setattr(hooks, "_start", start)
+    monkeypatch.setattr(hooks, "_complete", complete)
+    monkeypatch.setattr(hooks, "prepare_context", AsyncMock(return_value=None))
+    monkeypatch.setattr(hooks, "loaded_tool_names", AsyncMock(return_value=None))
+    monkeypatch.setattr(bindings, "v2_tool_bindings", loaded_bindings)
+    monkeypatch.setattr(bindings, "_legacy_dynamic_bindings", loaded_bindings)
+    monkeypatch.setattr(selection, "context_tool_schemas", schemas)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
+
+    for run_id in ("port-failure", "port-failure-replay"):
+        events = [event async for event in graph.stream(
+            model="test-model", messages=[{"role": "user", "content": "list ports"}],
+            project_id="p1", user_id="u1", execution_protocol_version=protocol, execution_hooks=hooks,
+            run_id=run_id, lumen_snapshot=ctx.lumen_snapshot, lumen_snapshot_frozen=True,
+        )]
+        result = next(event for event in events if event["type"] == "tool_result")
+        assert result["status"] == "failed"
+        assert result["error_code"] == "cloud_control_unavailable"
+        assert result["hidden"] is True
+        assert result["content"] == ""
+        assert result["_durable_journaled"] is True
+        assert any(event.get("text") == "The tool could not list ports." for event in events)
+        assert not any(event["type"] == "error" for event in events)
+        assert provider_messages[-1][-1]["content"] == "Cloud control-plane call was denied or is unavailable."
+
+    assert len(journal) == len(segments) == 1
+    assert segments[0].status == "completed"
+    assert journal[0].payload.status == "failed"
+    assert journal[0].payload.error_code == "cloud_control_unavailable"
+    assert journal[0].payload.content[0].text == "Tool call failed. Output is hidden."
+    assert retained["content"] == "Cloud control-plane call was denied or is unavailable."
+    assert retained["visible"] is False
+    assert len([path for path, _payload in bridge.requests if path.endswith("/execute")]) == 1
