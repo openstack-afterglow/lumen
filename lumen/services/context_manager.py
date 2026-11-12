@@ -10,7 +10,7 @@ from typing import Any
 
 from lumen.models.chat_contracts import ContextState
 from lumen.services import context_inspector
-from lumen.services.litellm_client import ContextTokenCount, count_context_tokens
+from lumen.services.provider_metadata import ContextTokenCount, count_context_tokens
 
 # Public so provider-native compaction resolves its own trigger from the same
 # occupancy threshold instead of restating it.  The denominators are not

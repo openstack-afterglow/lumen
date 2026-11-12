@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from lumen.api import assets as asset_api
 from lumen.auth import get_principal
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import asset_inspector, assets
 
 
@@ -23,7 +24,8 @@ def asset_client():
     app = FastAPI()
     app.include_router(asset_api.router, prefix="/api/v1/chat")
     app.dependency_overrides[get_principal] = lambda: {
-        "user_id": "user-1", "project_id": "project-1", "auth_type": "keystone"
+        "user_id": "user-1", "project_id": "project-1", "auth_type": "keystone",
+        "roles": ["member", *sorted(SERVICE_CAPABILITIES)], "is_system_admin": False,
     }
     return TestClient(app)
 

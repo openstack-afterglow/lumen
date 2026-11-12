@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 from openstack import proxy
 
 from ._api import _LumenApiMixin
 
 
 class Proxy(_LumenApiMixin, proxy.Proxy):
+    def request(self, url, method, *args, **kwargs):
+        # The shared facade includes /v1; Keystone discovery may already supply it.
+        # Preserve unversioned endpoint overrides and any deployment path prefix.
+        if url == "/v1" or url.startswith("/v1/"):
+            endpoint = self.get_endpoint()
+            if endpoint and urlsplit(endpoint).path.rstrip("/").endswith("/v1"):
+                url = url[3:] or "/"
+        return super().request(url, method, *args, **kwargs)
+
     def _json_request(
         self,
         method: str,

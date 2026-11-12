@@ -14,7 +14,7 @@ async def test_embedding_uses_caller_supplied_route(monkeypatch):
         captured.update(kwargs)
         return Response()
 
-    monkeypatch.setattr(memory_embeddings.litellm, "aembedding", fake_embedding)
+    monkeypatch.setattr(memory_embeddings.provider_client, "aembedding", fake_embedding)
     route = {
         "model_name": "embed",
         "api_key": "secret",
@@ -35,7 +35,7 @@ async def test_embedding_rejects_dimension_mismatch_without_fallback(monkeypatch
     async def fake_embedding(**_kwargs):
         return Response()
 
-    monkeypatch.setattr(memory_embeddings.litellm, "aembedding", fake_embedding)
+    monkeypatch.setattr(memory_embeddings.provider_client, "aembedding", fake_embedding)
     with pytest.raises(memory_embeddings.EmbeddingUnavailable, match="dimension"):
         await memory_embeddings.embed_with_route(
             route={"model_name": "embed", "api_key": "secret", "api_base": None, "provider_type": "openai"},

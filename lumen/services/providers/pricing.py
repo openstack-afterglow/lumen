@@ -9,10 +9,15 @@ from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal, InvalidOperation, l
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.services.capabilities import (
     apply_subscription_capability_limits,
-    litellm_capabilities,
     normalize_capabilities,
+    provider_capabilities,
 )
-from lumen.services.litellm_client import bundled_cache_rates, effective_prices_per_million, official_price_source
+from lumen.services.provider_metadata import (
+    CATALOG_VERSION,
+    bundled_cache_rates,
+    effective_prices_per_million,
+    official_price_source,
+)
 
 from .billing import billing_capability_for
 from .credentials import api_key_source, api_model_name
@@ -270,7 +275,8 @@ _TOKEN_BASIS_TEXT_DIRECTIONS = {
 
 
 def media_pricing_available(
-    kind: str, pricing: dict | None, *, text_input_priced: bool = False, text_output_priced: bool = False
+    kind: str, pricing: dict | None, *, text_input_priced: bool = False, text_output_priced: bool = False,
+    duration_families: tuple[str, ...] | None = None,
 ) -> bool:
     """Whether the selected billing basis has every rate its execution needs.
 
@@ -306,8 +312,18 @@ def media_pricing_available(
     if basis == "session":
         return _duration_available(pricing, "realtime_session")
     if basis == "duration":
-        return all(_duration_available(pricing, family) for family in _KIND_DURATION_FAMILIES[kind][:2])
+        families = duration_families or _KIND_DURATION_FAMILIES[kind][:2]
+        return all(_duration_available(pricing, family) for family in families)
     return False
+
+
+def _realtime_duration_families(kind: str, model_name: object) -> tuple[str, ...] | None:
+    """Input-priced realtime kinds (transcription, translation) settle on fewer duration families."""
+    if kind != "realtime":
+        return None
+    from .realtime_transport import duration_families
+
+    return duration_families(model_name)
 
 
 def model_media_pricing_available(model: LlmModel) -> bool:
@@ -317,16 +333,19 @@ def model_media_pricing_available(model: LlmModel) -> bool:
         getattr(model, "media_pricing", None),
         text_input_priced=getattr(model, "input_price", None) is not None,
         text_output_priced=getattr(model, "output_price", None) is not None,
+        duration_families=_realtime_duration_families(_kind(model), getattr(model, "model_name", None)),
     )
 
 
 def route_media_pricing_available(route: dict) -> bool:
     """``media_pricing_available`` for a resolved route, including its frozen text rates."""
+    kind = str(route.get("model_kind") or "text")
     return media_pricing_available(
-        str(route.get("model_kind") or "text"),
+        kind,
         route.get("media_pricing"),
         text_input_priced=route.get("input_price_per_token") is not None,
         text_output_priced=route.get("output_price_per_token") is not None,
+        duration_families=_realtime_duration_families(kind, route.get("api_model_name")),
     )
 
 
@@ -466,11 +485,14 @@ def _json_decimal_strings(value):
 
 def _provider_public(row: LlmProvider) -> dict:
     """Administrator projection without plaintext or encrypted credential material."""
+    from .accounts import default_credential
+
+    credential = default_credential(row)
     auth_mode = getattr(row, "auth_mode", "api_key")
-    source = api_key_source(row)
-    subscription_status = getattr(row, "subscription_status", "disconnected")
-    subscription_expires_at = getattr(row, "subscription_expires_at", None)
-    encrypted_subscription_tokens = getattr(row, "encrypted_subscription_tokens", None)
+    source = api_key_source(credential) if credential is not None else None
+    subscription_status = getattr(credential, "subscription_status", "disconnected")
+    subscription_expires_at = getattr(credential, "subscription_expires_at", None)
+    encrypted_subscription_tokens = getattr(credential, "encrypted_subscription_tokens", None)
     if auth_mode == "api_key":
         has_credentials = source is not None
         auth_status = "configured" if has_credentials else "disconnected"
@@ -496,13 +518,15 @@ def _provider_public(row: LlmProvider) -> dict:
         "api_provider": row.api_provider,
         "sort_order": row.sort_order,
         "api_base": row.api_base,
+        "selection_policy": getattr(row, "selection_policy", "priority"),
+        "selected_credential_id": getattr(row, "selected_credential_id", None),
         "auth_mode": auth_mode,
         "has_credentials": has_credentials,
         "auth_status": auth_status,
         "auth_expires_at": auth_expires_at,
         "has_api_key": source is not None,
         "api_key_source": source,
-        "api_key_env": row.api_key_env if auth_mode == "api_key" else None,
+        "api_key_env": getattr(credential, "api_key_env", None) if auth_mode == "api_key" else None,
         "has_billing_admin_key": bool(getattr(row, "encrypted_billing_admin_key", None)),
         "billing_capability": billing_capability_for(row.provider_type, auth_mode, row.api_base),
         "is_active": row.is_active,
@@ -576,11 +600,11 @@ def _effective_capabilities(
                 for name in ("text", "image_output", "audio_input", "audio_output")
             }
         }, "registry"
-    detected = litellm_capabilities(row.model_name, provider_type)
+    detected = provider_capabilities(row.model_name, provider_type)
     if row.capabilities:
         effective = normalize_capabilities(row.capabilities, detected)
         return apply_subscription_capability_limits(effective, auth_mode), (row.capability_source or "override")
-    return apply_subscription_capability_limits(detected, auth_mode), "litellm"
+    return apply_subscription_capability_limits(detected, auth_mode), "catalog"
 
 
 def _model_public(
@@ -803,12 +827,7 @@ def _resolved_base_prices(
     if price_source == "models.dev":
         price_version = str(metadata.get("fetched_at") or metadata.get("last_updated") or "models.dev")
     elif price_source == "litellm":
-        try:
-            import litellm
-
-            price_version = str(getattr(litellm, "__version__", "litellm"))
-        except Exception:
-            price_version = "litellm"
+        price_version = CATALOG_VERSION
     elif price_source == "manual":
         price_version = str(getattr(model, "updated_at", None) or "manual")
     else:

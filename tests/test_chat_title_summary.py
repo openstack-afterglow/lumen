@@ -1,18 +1,20 @@
-"""Pure first-exchange title generation tests (no database/provider side effects)."""
+"""First-exchange title generation, budget and neutral provider-wire regressions."""
 
-from types import SimpleNamespace
+import json
 
+import httpx
 import pytest
 
 from lumen.services import title_summary as ts
+from lumen.services.provider_client import ProviderObject
 
 pytestmark = pytest.mark.asyncio
 
 
 def _resp(text: str):
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
-        usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4),
+    return ProviderObject(
+        choices=[{"message": {"content": text}}],
+        usage={"prompt_tokens": 12, "completion_tokens": 4},
     )
 
 
@@ -23,7 +25,7 @@ async def test_title_uses_both_first_exchange_messages_and_safe_limits(monkeypat
         observed.update(model=model, messages=messages, kwargs=kwargs)
         return _resp('"배포 장애 원인 분석"\n')
 
-    monkeypatch.setattr(ts.litellm_client, "acompletion", fake_acompletion)
+    monkeypatch.setattr(ts.provider_client, "acompletion", fake_acompletion)
     result = await ts.generate_title(
         exchange=[
             {"role": "user", "content": "서비스 배포가 실패했어요"},
@@ -46,22 +48,20 @@ async def test_title_uses_both_first_exchange_messages_and_safe_limits(monkeypat
     assert result.completion_tokens == 4
 
 
-async def test_title_reasoning_params_bind_to_real_acompletion_signature(monkeypatch):
-    """A route-advertised effort must bind to the real acompletion signature via extra."""
-    import inspect
+async def test_title_reasoning_and_usage_cross_actual_provider_boundary(monkeypatch):
+    observed = []
 
-    real_signature = inspect.signature(ts.litellm_client.acompletion)
-    observed = {}
+    async def ready():
+        return "http://127.0.0.1:18643", "internal-token"
 
-    async def fake_acompletion(model, messages, **kwargs):
-        real_signature.bind(model, messages, **kwargs)
-        observed.update(kwargs)
-        return _resp("추론 모델 제목")
+    def handle(request):
+        observed.append(json.loads(request.content))
+        return httpx.Response(200, headers={"X-Lumen-Bifrost-Contract": "single-attempt-v1"},
+            json={"choices": [{"message": {"content": "추론 모델 제목"}}],
+                  "usage": {"prompt_tokens": 12, "completion_tokens": 4}})
 
-    monkeypatch.setattr(ts.litellm_client, "acompletion", fake_acompletion)
-    monkeypatch.setattr(
-        ts.litellm_client, "_reasoning_params", lambda model, effort, provider: {"reasoning_effort": effort}
-    )
+    monkeypatch.setattr(ts.provider_client, "get_bifrost_runtime", ready)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(handle))
     result = await ts.generate_title(
         exchange=[
             {"role": "user", "content": "배포 장애를 분석해 줘"},
@@ -78,7 +78,9 @@ async def test_title_reasoning_params_bind_to_real_acompletion_signature(monkeyp
     )
 
     assert result.title == "추론 모델 제목"
-    assert observed["extra"] == {"reasoning_effort": "low"}
+    assert len(observed) == 1 and observed[0]["single_attempt"] is True
+    assert observed[0]["body"]["reasoning_effort"] == "low"
+    assert result.prompt_tokens == 12 and result.completion_tokens == 4
 
 
 async def test_title_input_truncates_each_role_front_three_quarters_back_quarter(monkeypatch):
@@ -92,8 +94,8 @@ async def test_title_input_truncates_each_role_front_three_quarters_back_quarter
     async def fake_acompletion(_model, _messages, **_kwargs):
         return _resp("긴 제목")
 
-    monkeypatch.setattr(ts.litellm_client, "count_tokens", fake_count)
-    monkeypatch.setattr(ts.litellm_client, "acompletion", fake_acompletion)
+    monkeypatch.setattr(ts.provider_metadata, "count_tokens", fake_count)
+    monkeypatch.setattr(ts.provider_client, "acompletion", fake_acompletion)
     result = await ts.generate_title(
         exchange=[
             {"role": "user", "content": "U" * 500},
@@ -123,8 +125,8 @@ async def test_title_budget_accounts_for_system_and_role_framing(monkeypatch):
         observed["messages"] = messages
         return _resp("배포 계획")
 
-    monkeypatch.setattr(ts.litellm_client, "count_tokens", framed_count)
-    monkeypatch.setattr(ts.litellm_client, "acompletion", fake_acompletion)
+    monkeypatch.setattr(ts.provider_metadata, "count_tokens", framed_count)
+    monkeypatch.setattr(ts.provider_client, "acompletion", fake_acompletion)
     result = await ts.generate_title(
         exchange=[
             {"role": "user", "content": "U" * 500},
@@ -147,7 +149,7 @@ async def test_empty_or_incomplete_exchange_does_not_call_provider(monkeypatch):
         called = True
         return _resp("제목")
 
-    monkeypatch.setattr(ts.litellm_client, "acompletion", fake_acompletion)
+    monkeypatch.setattr(ts.provider_client, "acompletion", fake_acompletion)
     with pytest.raises(ValueError, match="incomplete"):
         await ts.generate_title(exchange=[{"role": "user", "content": "질문"}], route={"model_name": "model"})
     assert called is False
@@ -163,16 +165,14 @@ def _effort_caps(*values):
     return {"reasoning": True, "reasoning_options": [{"type": "effort", "values": list(values)}]}
 
 
-async def _title_kwargs(monkeypatch, route, *, supports_reasoning=True):
+async def _title_kwargs(monkeypatch, route):
     observed = {}
 
-    async def fake_acompletion(**kwargs):
+    async def fake_acompletion(model, messages, **kwargs):
         observed.update(kwargs)
         return _resp("배포 권한 점검")
 
-    monkeypatch.setattr("litellm.supports_reasoning", lambda **_kwargs: supports_reasoning)
-    monkeypatch.setattr("litellm.drop_params", False)
-    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr(ts.provider_client, "acompletion", fake_acompletion)
     result = await ts.generate_title(exchange=_EXCHANGE, route=route)
     assert result.title == "배포 권한 점검"
     return observed
@@ -204,13 +204,13 @@ async def test_title_sends_cheapest_advertised_reasoning_effort(monkeypatch, mod
         monkeypatch, {"model_name": model, "provider_type": provider, "capabilities": capabilities}
     )
 
-    assert kwargs["reasoning_effort"] == expected
+    assert kwargs["extra"]["reasoning_effort"] == expected
 
 
 @pytest.mark.parametrize(
     ("model", "provider", "capabilities"),
     [
-        # Budget-only: LiteLLM maps none to thinkingBudget 0, below the 128 minimum.
+        # Budget-only capabilities cannot authorize an effort string.
         ("gemini-2.5-pro", "gemini", {"reasoning": True, "reasoning_options": [{"type": "budget_tokens", "min": 128}]}),
         ("claude-sonnet-4-5", "anthropic", {"reasoning": True, "reasoning_options": [{"type": "budget_tokens"}]}),
         ("gpt-5", "openai", {"reasoning": True, "reasoning_options": []}),
@@ -231,24 +231,13 @@ async def test_title_omits_reasoning_effort_without_advertised_effort(monkeypatc
 
     kwargs = await _title_kwargs(monkeypatch, route)
 
-    assert "reasoning_effort" not in kwargs
+    assert "reasoning_effort" not in kwargs.get("extra", {})
 
 
-async def test_title_omits_advertised_effort_when_provider_probe_rejects_reasoning(monkeypatch):
-    kwargs = await _title_kwargs(
-        monkeypatch,
-        {"model_name": "gpt-5", "provider_type": "openai", "capabilities": _effort_caps("minimal", "low")},
-        supports_reasoning=False,
-    )
-
-    assert "reasoning_effort" not in kwargs
-
-
-async def test_title_preserves_advertised_none_with_stale_provider_catalogue(monkeypatch):
+async def test_title_preserves_advertised_none_for_new_model(monkeypatch):
     kwargs = await _title_kwargs(
         monkeypatch,
         {"model_name": "new-reasoning-model", "provider_type": "openai", "capabilities": _effort_caps("none", "low")},
-        supports_reasoning=False,
     )
 
-    assert kwargs["reasoning_effort"] == "none"
+    assert kwargs["extra"]["reasoning_effort"] == "none"

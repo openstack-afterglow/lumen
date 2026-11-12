@@ -1,22 +1,33 @@
 """Durable run admission and atomic persistence."""
 
+import functools
 import json
 import uuid
+from copy import deepcopy
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Literal
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from lumen.crypto import encrypt_chat_content
 from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
 from lumen.models.chat_contracts import ChatRunDescriptor, validate_user_input_parts
 from lumen.models.chat_db import ChatConversation, ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatRunProvider, ChatTempThread
-from lumen.services.message_graph import append_active_message, reachable_message_clause, register_message
+from lumen.services import worker_routing
+from lumen.services.inference_authority import native_run_scopes
+from lumen.services.message_graph import (
+    append_active_message,
+    reachable_message_clause,
+    register_message,
+    replace_active_path,
+)
 from lumen.services.message_parts import serialize_parts
 from lumen.services.message_timestamps import message_timestamps
 from lumen.services.providers import routing as ps
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.run_store import NONTERMINAL, append_event
 
 from .common import (
@@ -24,7 +35,7 @@ from .common import (
     _event,
     _factory,
     _fingerprint,
-    _freeze_v2_lumen_snapshot,
+    _freeze_lumen_snapshot,
     _freeze_v2_tool_call_limit,
     _now,
     _require_supported_execution_protocol_version,
@@ -92,6 +103,15 @@ async def _apply_root_budget(
     return True
 
 
+def _intent_with_credential_authority(
+    intent: dict[str, Any], credential_authority: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind trusted non-secret attenuation to UUID reuse, preserving legacy intents."""
+    if credential_authority is None:
+        return intent
+    return {**intent, "_credential_authority": deepcopy(credential_authority)}
+
+
 async def existing_run_for_intent(
     *,
     project_id: str,
@@ -134,6 +154,8 @@ def _add_run_providers(session, run: ChatRun, capability_snapshot: dict[str, Any
             provider_label=capability_snapshot["provider_name"],
             model_label=capability_snapshot["model_name"],
             config_version_hash=capability_snapshot["config_version_hash"],
+            **{key: value for key, value in execution_identity(capability_snapshot).items()
+               if key not in {"provider_auth", "provider_quota_group"}},
         )
     )
     summary = capability_snapshot.get("summary_route")
@@ -147,8 +169,20 @@ def _add_run_providers(session, run: ChatRun, capability_snapshot: dict[str, Any
                 provider_label=summary["provider_name"],
                 model_label=summary["model_name"],
                 config_version_hash=summary["config_version_hash"],
+                **{key: value for key, value in execution_identity(summary).items()
+                   if key not in {"provider_auth", "provider_quota_group"}},
             )
         )
+    for purpose, route in (capability_snapshot.get("feature_routes") or {}).items():
+        if purpose not in {"search", "advisor"} or not isinstance(route, dict):
+            continue
+        session.add(ChatRunProvider(
+            run_id=run.id, purpose=purpose, provider_id=route["provider_id"], model_id=route.get("model_id"),
+            provider_label=route["provider_name"], model_label=route.get("model_name") or purpose,
+            config_version_hash=route["config_version_hash"],
+            **{key: value for key, value in execution_identity(route).items()
+               if key not in {"provider_auth", "provider_quota_group"}},
+        ))
 
 
 async def _lock_run_configurations(
@@ -280,6 +314,42 @@ async def _bind_user_assets(
     return canonical
 
 
+async def _read_committed(session) -> None:
+    """First statement of an admission transaction.
+
+    The idempotency ``SELECT ... FOR UPDATE`` of a new key takes a gap lock under REPEATABLE READ. Concurrent
+    admissions by one user then deadlock with each other's run INSERT and the provider-row locks (MariaDB 1213,
+    surfaced as HTTP 500). The unique ``uq_chat_runs_idempotency`` index (migration 030) decides same-key races
+    instead, and ``_replay_idempotency_race`` returns the winner's run.
+    """
+    await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+
+
+def _replay_idempotency_race(function):
+    """A racing same-key admission fails its INSERT on the unique index; return the committed winner instead."""
+
+    @functools.wraps(function)
+    async def wrapper(**kwargs):
+        try:
+            return await function(**kwargs)
+        except IntegrityError:
+            previous = await existing_run_for_intent(
+                project_id=kwargs["project_id"],
+                user_id=kwargs["user_id"],
+                client_request_id=kwargs["client_request_id"],
+                intent=_intent_with_credential_authority(
+                    kwargs["intent"], kwargs["capability_snapshot"].get("credential_authority")
+                ),
+                conversation_id=kwargs.get("conversation_id"),
+            )
+            if previous is None:
+                raise
+            return previous
+
+    return wrapper
+
+
+@_replay_idempotency_race
 async def create_persistent_run(
     *,
     project_id: str,
@@ -318,16 +388,21 @@ async def create_persistent_run(
         "client_timezone": client_timezone,
         "execution_protocol_version": execution_protocol_version,
     }
+    request_payload["required_scopes"] = list(native_run_scopes({
+        **request_payload, "execution_mode": execution_mode,
+        "required_scopes": capability_snapshot.get("required_scopes", ()),
+    }, agent_id=agent_id))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
-    request_payload = await _freeze_v2_lumen_snapshot(
+    request_payload = await _freeze_lumen_snapshot(
         request_payload,
         user_id=user_id,
         project_id=project_id,
-        execution_protocol_version=execution_protocol_version,
     )
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         from . import budgets
 
         order = budgets.LockOrder()
@@ -419,6 +494,7 @@ async def create_persistent_run(
             session.add(ChatRunAsset(run_id=run_id, asset_id=part["asset_id"], purpose="input"))
             session.add(ChatMessageAsset(message_id=user_message.id, asset_id=part["asset_id"], part_index=index))
 
+        route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
         run = ChatRun(
             id=run_id,
             run_scope="persistent",
@@ -442,6 +518,8 @@ async def create_persistent_run(
             fingerprint_version=1,
             last_seq=0,
             run_kind=run_kind,
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             current_ordinal=0,
             status="queued",
             execution_mode=execution_mode,
@@ -477,6 +555,7 @@ async def create_persistent_run(
     return created
 
 
+@_replay_idempotency_race
 async def create_run(
     *,
     project_id: str,
@@ -506,16 +585,21 @@ async def create_run(
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
+    request_payload["required_scopes"] = list(native_run_scopes({
+        **request_payload, "execution_mode": execution_mode,
+        "required_scopes": capability_snapshot.get("required_scopes", ()),
+    }, agent_id=agent_id))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
-    request_payload = await _freeze_v2_lumen_snapshot(
+    request_payload = await _freeze_lumen_snapshot(
         request_payload,
         user_id=user_id,
         project_id=project_id,
-        execution_protocol_version=execution_protocol_version,
     )
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         from . import budgets
 
         order = budgets.LockOrder()
@@ -606,6 +690,13 @@ async def create_run(
                 raise DurableRunConflict("conversation_run_active")
 
         await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
+        route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
+        if conv is not None and user_message_id is not None and conv.active_leaf_id != user_message_id:
+            # Retry/regeneration selects the saved user turn only after fencing
+            # the observed branch. Completion appends below this same parent.
+            await replace_active_path(session, conversation_id=conversation_id, leaf_id=user_message_id)
+            conv.active_leaf_id = user_message_id
+            conv.history_revision = int(conv.history_revision or 0) + 1
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="persistent" if conversation_id else "temp",
@@ -631,6 +722,8 @@ async def create_run(
             last_seq=0,
             current_ordinal=0,
             run_kind=run_kind,
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             status="queued",
             execution_mode=execution_mode,
         )
@@ -666,6 +759,7 @@ async def create_run(
     return created
 
 
+@_replay_idempotency_race
 async def create_temp_run(
     *,
     project_id: str,
@@ -689,16 +783,20 @@ async def create_temp_run(
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
+    request_payload["required_scopes"] = list(native_run_scopes({
+        **request_payload, "required_scopes": capability_snapshot.get("required_scopes", ()),
+    }))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
-    request_payload = await _freeze_v2_lumen_snapshot(
+    request_payload = await _freeze_lumen_snapshot(
         request_payload,
         user_id=user_id,
         project_id=project_id,
-        execution_protocol_version=execution_protocol_version,
     )
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         existing = (
             await session.execute(
                 select(ChatRun)
@@ -749,6 +847,7 @@ async def create_temp_run(
         ).scalar_one_or_none()
         if active is not None:
             raise DurableRunConflict("conversation_run_active")
+        route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="temp",
@@ -771,6 +870,8 @@ async def create_temp_run(
             last_seq=0,
             current_ordinal=0,
             run_kind=run_kind,
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             status="queued",
         )
         session.add(run)
@@ -823,6 +924,7 @@ async def create_temp_thread(*, project_id: str, user_id: str) -> ChatTempThread
         return row
 
 
+@_replay_idempotency_race
 async def create_compaction_run(
     *,
     project_id: str,
@@ -852,9 +954,13 @@ async def create_compaction_run(
 
     _require_supported_execution_protocol_version(execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
+    request_payload["required_scopes"] = ["native:runs:write",
+        "native:conversations:read" if conversation_id is not None else "native:runs:read"]
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         conv = None
         thread = None
         if conversation_id is not None:
@@ -937,6 +1043,7 @@ async def create_compaction_run(
 
         await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
 
+        route = await worker_routing.resolve_worker_route(session, run_kind="compaction")
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="persistent" if conversation_id else "temp",
@@ -962,6 +1069,8 @@ async def create_compaction_run(
             last_seq=0,
             current_ordinal=0,
             run_kind="compaction",
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             status="queued",
         )
         session.add(run)

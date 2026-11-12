@@ -14,6 +14,7 @@ from PIL import Image
 from lumen.api import images as native_images
 from lumen.api.compat import images as image_api
 from lumen.auth import get_principal
+from lumen.service_authority import SERVICE_CAPABILITIES
 
 
 def _png(rgb: tuple[int, int, int]) -> bytes:
@@ -89,6 +90,7 @@ def _principal():
         "api_key_id": 4,
         "scopes": ("compat:images:write", "native:assets:write"),
         "source": "api",
+        "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False,
     }
 
 
@@ -147,3 +149,85 @@ def test_compat_edit_scans_png_and_returns_generated_image(monkeypatch):
     assert unsupported.status_code == 400
     assert "mask" in unsupported.json()["error"]["message"]
     assert len(uploads) == 1
+
+
+def test_compat_generation_and_edit_forward_complexity_and_reject_unknown_levels(monkeypatch):
+    source = _png((20, 30, 40))
+    requests = []
+
+    async def create_uploaded_asset(*, path, original_name, user_id, project_id):
+        return {"id": str(uuid4()), "status": "clean"}
+
+    async def admit_image_run(request, **owner):
+        requests.append(request)
+        return SimpleNamespace(run_id="run-complexity")
+
+    async def owned_run_response(**owner):
+        return SimpleNamespace(status="completed")
+
+    async def image_result(**owner):
+        return {"created": 1, "data": [{"b64_json": base64.b64encode(source).decode()}]}
+
+    monkeypatch.setattr(image_api.assets, "create_uploaded_asset", create_uploaded_asset)
+    monkeypatch.setattr(native_images, "admit_image_run", admit_image_run)
+    monkeypatch.setattr(image_api.queries, "owned_run_response", owned_run_response)
+    monkeypatch.setattr(image_api, "image_result", image_result)
+    app = FastAPI()
+    app.include_router(image_api.router, prefix="/v1")
+    app.dependency_overrides[get_principal] = _principal
+    client = TestClient(app)
+    body = {"model": "gpt-image-2.6-flare", "prompt": "Draw", "provider": "openai", "size": "1536x864",
+            "quality": "xhigh"}
+
+    assert client.post("/v1/images/generations", json={**body, "complexity": "low"}).status_code == 200
+    assert client.post("/v1/images/generations", json=body).status_code == 200
+    edit = client.post("/v1/images/edits", data={**body, "complexity": "high"},
+                       files={"image": ("source.png", source, "image/png")})
+    assert edit.status_code == 200
+    assert [(item["size"], item["quality"], item.get("complexity")) for item in requests] == [
+        ("1536x864", "xhigh", "low"), ("1536x864", "xhigh", None), ("1536x864", "xhigh", "high")]
+
+    rejected = client.post("/v1/images/generations", json={**body, "complexity": "extreme"})
+    assert rejected.status_code in (400, 422)
+    assert len(requests) == 3
+
+
+def test_compat_generation_maps_a_settled_provider_refusal_to_the_caller_status(monkeypatch):
+    """A refusal proven to precede inference is the caller's 4xx, not an opaque 500 with a pinned hold."""
+    outcomes = {"400": (400, "invalid_request_error"), "422": (400, "invalid_request_error"),
+                "429": (429, "rate_limit_error"), "404": (502, "api_error"), "401": (502, "api_error")}
+    current = {}
+
+    async def admit_image_run(request, **owner):
+        return SimpleNamespace(run_id="run-1")
+
+    async def owned_run_response(**owner):
+        return SimpleNamespace(status="failed", last_seq=9)
+
+    async def owned_events(**owner):
+        payload = SimpleNamespace(error_code="provider_rejected",
+                                  safe_message=f"upstream provider rejected the request (HTTP {current['status']})")
+        return [SimpleNamespace(type="run.failed", payload=payload)], 9
+
+    monkeypatch.setattr(native_images, "admit_image_run", admit_image_run)
+    monkeypatch.setattr(image_api.queries, "owned_run_response", owned_run_response)
+    monkeypatch.setattr(image_api.queries, "owned_events", owned_events)
+    app = FastAPI()
+    app.include_router(image_api.router, prefix="/v1")
+    app.dependency_overrides[get_principal] = _principal
+    client = TestClient(app)
+    for upstream, (status, error_type) in outcomes.items():
+        current["status"] = upstream
+        response = client.post("/v1/images/generations", json={"model": "gpt-image-1", "prompt": "A red dot",
+                                                              "provider": "openai"})
+        assert response.status_code == status
+        assert response.json()["error"]["type"] == error_type
+        assert f"HTTP {upstream}" in response.json()["error"]["message"]
+
+    async def unknown_events(**owner):
+        payload = SimpleNamespace(error_code="provider_result_unknown", safe_message="image provider result unknown")
+        return [SimpleNamespace(type="run.failed", payload=payload)], 9
+
+    monkeypatch.setattr(image_api.queries, "owned_events", unknown_events)
+    assert client.post("/v1/images/generations", json={"model": "gpt-image-1", "prompt": "A red dot",
+                                                       "provider": "openai"}).status_code == 500

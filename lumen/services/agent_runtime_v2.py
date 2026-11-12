@@ -12,6 +12,7 @@ import logging
 from lumen_plugin_api.tools import ToolArtifactRef, ToolBinding, ToolExecutionResult, validate_tool_arguments
 
 from lumen.services import assets
+from lumen.services.infrastructure.tool_manifest import PinnedMCPToolDefinition
 from lumen.services.tool_runtime.contracts import execution_context
 from lumen.services.tools import ToolContext
 
@@ -25,7 +26,10 @@ async def dispatch_tool_call(binding: ToolBinding, arguments: object, context: o
     Neither path invokes a fallback tool or widens authority.
     """
     try:
-        validated_arguments = validate_tool_arguments(binding.definition.input_schema, arguments)
+        if isinstance(binding.definition, PinnedMCPToolDefinition):
+            validated_arguments = binding.definition.validate_arguments(arguments)
+        else:
+            validated_arguments = validate_tool_arguments(binding.definition.input_schema, arguments)
     except ValueError:
         return ToolExecutionResult(
             status="failed",

@@ -23,11 +23,11 @@ from lumen.db import get_session_factory
 from lumen.models.chat_infrastructure import ChatRuntimeResource, ChatWorkerRegistration
 from lumen.models.chat_runs import ChatRun
 from lumen.services.infrastructure.config import RuntimeConfig
+from lumen.services.infrastructure.identity import IdentityRejected, accepts_fingerprint, peer_resource_id
 from lumen.services.infrastructure.transport import (
     InternalTransport,
     InternalTransportError,
     derive_dispatch_key,
-    resource_identity,
     sign_dispatch_capability,
 )
 
@@ -70,6 +70,20 @@ async def authorize_dispatch(
     if factory is None:
         raise RuntimeError("database is not configured")
     now = datetime.now(UTC)
+    is_fixed_worker = False
+    worker_id = None
+    worker_generation = None
+    try:
+        worker_id, worker_generation, role = peer_resource_id(client_identity)
+        if role != "worker":
+            raise IdentityRejected()
+    except IdentityRejected:
+        from lumen.services.infrastructure.fixed_worker import approved_peer
+
+        if approved_peer(config, client_identity, client_fingerprint):
+            is_fixed_worker = True
+        else:
+            raise DispatchRejected("dispatch unavailable") from None
     async with factory() as session:
         run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id))).scalar_one_or_none()
         if (
@@ -89,24 +103,36 @@ async def authorize_dispatch(
         ))).scalar_one_or_none()
         if resource is None or not resource.address or not resource.certificate_fingerprint:
             raise DispatchRejected("dispatch unavailable")
-        worker = (await session.execute(select(ChatRuntimeResource).where(
-            ChatRuntimeResource.role == "worker", ChatRuntimeResource.observed_state == "ready",
-            ChatRuntimeResource.desired_state != "deleting",
-            ChatRuntimeResource.certificate_fingerprint == client_fingerprint,
-        ))).scalars().first()
-        if worker is None or client_identity != resource_identity("worker", worker.id, worker.generation):
-            raise DispatchRejected("dispatch unavailable")
-        registration = (await session.execute(select(ChatWorkerRegistration).where(
-            ChatWorkerRegistration.resource_id == worker.id,
-            ChatWorkerRegistration.resource_generation == worker.generation,
-            ChatWorkerRegistration.certificate_fingerprint == client_fingerprint,
-            ChatWorkerRegistration.pool_id == worker.pool_id,
-            ChatWorkerRegistration.worker_identity == lease_owner.rpartition("#")[0],
-            # Drain forbids new claims, not capabilities for this already running lease.
-            ChatWorkerRegistration.heartbeat_at >= now - timedelta(seconds=20),
-        ))).scalars().first()
-        if registration is None:
-            raise DispatchRejected("dispatch unavailable")
+        if is_fixed_worker:
+            registration = (await session.execute(select(ChatWorkerRegistration).where(
+                ChatWorkerRegistration.id == run.worker_registration_id,
+                ChatWorkerRegistration.resource_id.is_(None),
+                ChatWorkerRegistration.certificate_fingerprint == client_fingerprint,
+                ChatWorkerRegistration.worker_identity == lease_owner.rpartition("#")[0],
+                ChatWorkerRegistration.heartbeat_at >= now - timedelta(seconds=20),
+            ))).scalars().first()
+            if registration is None:
+                raise DispatchRejected("dispatch unavailable")
+        else:
+            worker = (await session.execute(select(ChatRuntimeResource).where(
+                ChatRuntimeResource.id == worker_id, ChatRuntimeResource.generation == worker_generation,
+                ChatRuntimeResource.role == "worker", ChatRuntimeResource.observed_state.in_(["ready", "draining"]),
+                ChatRuntimeResource.desired_state != "deleting",
+            ))).scalars().first()
+            if worker is None or not accepts_fingerprint(worker, client_fingerprint, now=now):
+                raise DispatchRejected("dispatch unavailable")
+            registration = (await session.execute(select(ChatWorkerRegistration).where(
+                ChatWorkerRegistration.id == run.worker_registration_id,
+                ChatWorkerRegistration.resource_id == worker.id,
+                ChatWorkerRegistration.resource_generation == worker.generation,
+                ChatWorkerRegistration.certificate_fingerprint == worker.certificate_fingerprint,
+                ChatWorkerRegistration.pool_id == worker.pool_id,
+                ChatWorkerRegistration.worker_identity == lease_owner.rpartition("#")[0],
+                # Drain forbids new claims, not capabilities for this already running lease.
+                ChatWorkerRegistration.heartbeat_at >= now - timedelta(seconds=20),
+            ))).scalars().first()
+            if registration is None:
+                raise DispatchRejected("dispatch unavailable")
     if config.dispatch_key is None:
         raise RuntimeError("controller dispatch key is not configured")
     try:

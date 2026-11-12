@@ -1,11 +1,11 @@
 """빌트인 AI 채팅 확장(MCP 서버 / 커스텀 HTTP 툴) 관리 저장소 (MySQL).
 
 스코프 모델:
-- scope='global' (owner_* NULL): 관리자만 생성/수정/삭제, 모든 사용자에게 적용.
+- scope='global' (owner_* NULL): 관리자만 생성/수정/삭제; MCP 실행은 소유자별 승인 필요.
 - scope='user' (owner_user_id/owner_project_id): 소유자만 생성/수정/삭제, 본인에게만 적용.
 
 ⚠️ IDOR: user 스코프 수정/삭제는 (owner_user_id, owner_project_id)가 요청자와 일치할 때만 허용.
-사용자는 목록에서 자신의 것 + 활성 global 만 본다.
+사용자는 MCP 목록에서 global catalogue + 자신의 행을 본다. 실행은 현재 revision 승인만 허용한다.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import hashlib
 import json
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.crypto import (
@@ -24,15 +24,15 @@ from lumen.crypto import (
     encrypt_llm_provider_key,
 )
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
-from lumen.models.chat_db import ChatCustomTool, ChatMcpOAuthConnection, ChatMcpServer, ChatSkill
+from lumen.models.chat_db import ChatCustomTool, ChatMcpActivation, ChatMcpOAuthConnection, ChatMcpServer, ChatSkill
 from lumen.services import ssrf
 
 logger = logging.getLogger(__name__)
 
 _MODELS = {"mcp": ChatMcpServer, "tool": ChatCustomTool, "skill": ChatSkill}
 
-# MCP supports only HTTPS streamable HTTP. Local process and legacy SSE transports are rejected.
-_MCP_TRANSPORTS = ("http",)
+# MCP supports hosted streamable HTTP and SSE only. Local process (stdio) transports are rejected.
+_MCP_TRANSPORTS = ("http", "sse")
 
 _AUTH_MODES = ("none", "oauth", "admin")
 _LOAD_POLICIES = ("preloaded", "on_demand")
@@ -115,16 +115,20 @@ def _load_policy(row: ChatMcpServer | ChatCustomTool) -> str:
     return policy if policy in _LOAD_POLICIES else "on_demand"
 
 
+def _stored_tools(raw) -> list[dict]:
+    tools = raw.get("tools") if isinstance(raw, dict) else None
+    return [tool for tool in tools if isinstance(tool, dict)] if isinstance(tools, list) else []
+
+
 def _public_mcp(row: ChatMcpServer) -> dict:
     # Header values remain write-only and are exposed only as administrator configuration state.
-    headers = _decrypt_headers(row)
     return {
         "id": row.id,
         "scope": row.scope,
         "name": row.name,
         "transport": row.transport,
         "url": row.url,
-        "has_headers": bool(row.encrypted_headers) or bool(headers),
+        "has_headers": bool(row.encrypted_headers) or bool(row.headers),
         "auth_mode": _mcp_auth_mode(row),
         "oauth_scopes": _clean_oauth_scopes(getattr(row, "oauth_scopes", None)),
         "has_oauth_client": bool(getattr(row, "oauth_client_id", None)),
@@ -133,6 +137,12 @@ def _public_mcp(row: ChatMcpServer) -> dict:
         "load_policy": _load_policy(row),
         "effect_overrides": row.tool_effect_overrides,
         "config_version": row.config_version,
+        "template_key": row.template_key,
+        "connection_label": row.connection_label,
+        "tools": [{"name": tool.get("name"), "description": tool.get("description")} for tool in _stored_tools(row.tool_catalog)],
+        "tool_count": len(_stored_tools(row.tool_catalog)),
+        "catalog_refreshed_at": _iso(row.catalog_refreshed_at),
+        "catalog_error": row.catalog_error,
         "created_at": _iso(row.created_at),
     }
 
@@ -187,13 +197,13 @@ def _public_tool(row: ChatCustomTool) -> dict:
     }
 
 
-def _public_skill(row: ChatSkill) -> dict:
+def _public_skill(row: ChatSkill, *, include_private: bool = True) -> dict:
     return {
         "id": row.id,
         "scope": row.scope,
         "name": row.name,
         "description": row.description,
-        "instructions": decrypt_chat_content(row.instructions) if row.instructions else "",
+        **({"instructions": decrypt_chat_content(row.instructions) if row.instructions else ""} if include_private else {}),
         "is_active": row.is_active,
         "created_at": _iso(row.created_at),
     }
@@ -218,6 +228,8 @@ def selection_fingerprint(item: dict) -> str:
             "load_policy",
         )
     }
+    if item.get("activation_generation"):
+        material["activation_generation"] = item["activation_generation"]
     return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -349,7 +361,7 @@ def _apply_fields(kind: str, row, fields: dict) -> None:
             row.name = str(fields["name"]).strip()
         if "transport" in fields and fields["transport"]:
             if fields["transport"] not in _MCP_TRANSPORTS:
-                raise ExtensionValidationError("transport 는 http(streamable HTTP)만 지원합니다")
+                raise ExtensionValidationError("transport 는 http(streamable HTTP) 또는 sse 만 지원합니다")
             row.transport = fields["transport"]
         if "url" in fields:
             url = (fields["url"] or "").strip()
@@ -495,6 +507,87 @@ async def list_global(kind: str) -> list[dict]:
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
+async def _owner_activations(session, user_id: str, project_id: str) -> dict[int, ChatMcpActivation]:
+    return {
+        row.mcp_server_id: row
+        for row in (await session.execute(select(ChatMcpActivation).where(
+            ChatMcpActivation.owner_user_id == user_id,
+            ChatMcpActivation.owner_project_id == project_id,
+        ))).scalars()
+    }
+
+
+def _mcp_effectively_active(row: ChatMcpServer, activation: ChatMcpActivation | None) -> bool:
+    return bool(row.is_active and (
+        row.scope == "user" or (
+            activation and activation.is_active and activation.config_version == row.config_version
+        )
+    ))
+
+
+def _mcp_connected(row: ChatMcpServer, connection: ChatMcpOAuthConnection | None) -> bool:
+    return _mcp_auth_mode(row) != "oauth" or bool(
+        connection and connection.status == "active" and connection.encrypted_tokens
+        and connection.server_config_version == row.config_version
+    )
+
+
+def _activation_metadata(row: ChatMcpServer, activation: ChatMcpActivation | None) -> dict:
+    return {
+        "is_active": _mcp_effectively_active(row, activation),
+        "server_is_active": bool(row.is_active),
+        "activation_is_active": bool(activation and activation.is_active) if row.scope == "global" else bool(row.is_active),
+        "activation_config_version": activation.config_version if activation else None,
+        "activation_generation": activation.generation if activation else 0,
+    }
+
+
+async def set_mcp_activation(
+    item_id: int, *, user_id: str, project_id: str, is_active: bool, config_version: int
+) -> dict:
+    """Approve only this owner's exact global revision; never mutate publication."""
+    if not user_id or not project_id:
+        raise ExtensionForbidden("MCP activation requires an owner and project")
+    if type(is_active) is not bool or type(config_version) is not int or config_version < 1:
+        raise ExtensionValidationError("is_active and positive config_version are required")
+    factory = _require_db()
+    try:
+        async with factory() as session, session.begin():
+            # Serialize first activation and every epoch transition on the published row.
+            server = await session.get(ChatMcpServer, item_id, with_for_update=True)
+            if server is None:
+                raise ExtensionNotFound(f"MCP 서버 {item_id} 를 찾을 수 없습니다")
+            if server.scope != "global":
+                raise ExtensionForbidden("Only administrator-published MCP servers support activation")
+            if not server.is_active:
+                raise ExtensionValidationError("MCP server is unavailable")
+            if server.config_version != config_version:
+                raise ExtensionValidationError("MCP configuration changed; review the current version")
+            key = (item_id, user_id, project_id)
+            activation = await session.get(ChatMcpActivation, key, with_for_update=True)
+            if activation is None:
+                activation = ChatMcpActivation(
+                    mcp_server_id=item_id, owner_user_id=user_id, owner_project_id=project_id,
+                    is_active=is_active, config_version=config_version, generation=1,
+                )
+                session.add(activation)
+            elif activation.is_active != is_active or activation.config_version != config_version:
+                activation.is_active = is_active
+                activation.config_version = config_version
+                activation.generation += 1
+            await session.flush()
+            connection = (await session.execute(select(ChatMcpOAuthConnection).where(
+                ChatMcpOAuthConnection.mcp_server_id == item_id,
+                ChatMcpOAuthConnection.owner_user_id == user_id,
+                ChatMcpOAuthConnection.owner_project_id == project_id,
+            ))).scalar_one_or_none()
+            metadata = _activation_metadata(server, activation)
+            metadata["is_active"] = metadata["is_active"] and _mcp_connected(server, connection)
+            return {**_public_mcp(server), **metadata}
+    except OperationalError as exc:
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
 async def list_for_user(
     kind: str,
     *,
@@ -502,8 +595,9 @@ async def list_for_user(
     project_id: str,
     active_only: bool = False,
     reveal_secrets: bool = False,
+    include_private: bool = True,
 ) -> list[dict]:
-    """사용자용 — 활성 global + 본인 user 스코프.
+    """사용자용 — MCP catalogue + 본인 user 스코프; 실행은 유효한 소유자 승인만.
 
     reveal_secrets=True 는 MCP 실행 경로(tool_runtime) 전용으로, 복호화된 실제
     인증 헤더를 포함한 dict 를 반환한다. API 응답으로는 절대 노출하지 말 것.
@@ -513,14 +607,40 @@ async def list_for_user(
     serialize = _reveal_mcp if (reveal_secrets and kind == "mcp") else _PUBLIC[kind]
     try:
         async with factory() as session:
+            global_visible = model.scope == "global"
+            if kind != "mcp":
+                global_visible = global_visible & model.is_active.is_(True)
             stmt = select(model).where(
-                ((model.scope == "global") & (model.is_active.is_(True)))
+                global_visible
                 | ((model.scope == "user") & (model.owner_user_id == user_id) & (model.owner_project_id == project_id))
             )
             if active_only:
                 stmt = stmt.where(model.is_active.is_(True))
             rows = (await session.execute(stmt.order_by(model.id))).scalars().all()
-            return [serialize(r) for r in rows]
+            if kind != "mcp":
+                return [
+                    _public_skill(r, include_private=include_private) if kind == "skill" else serialize(r)
+                    for r in rows
+                ]
+            activations = await _owner_activations(session, user_id, project_id)
+            connections = {
+                row.mcp_server_id: row
+                for row in (await session.execute(select(ChatMcpOAuthConnection).where(
+                    ChatMcpOAuthConnection.owner_user_id == user_id,
+                    ChatMcpOAuthConnection.owner_project_id == project_id,
+                ))).scalars()
+            }
+            result = []
+            for row in rows:
+                activation = activations.get(row.id)
+                active = _mcp_effectively_active(row, activation) and _mcp_connected(row, connections.get(row.id))
+                if (active_only or reveal_secrets) and not active:
+                    continue
+                item = serialize(row)
+                item.update(_activation_metadata(row, activation))
+                item["is_active"] = active
+                result.append(item)
+            return result
     except OperationalError as exc:
         # 선택적 확장 목록 — 전역 circuit breaker 를 열지 않는다(스키마 미적용/일시 실패가
         # 핵심 채팅(conversations 등)까지 503 으로 블랙아웃시키는 연쇄 방지). 진짜 DB 다운은 핵심 쿼리가 감지.
@@ -564,6 +684,9 @@ async def create(
         **_required_defaults.get(kind, {}),
     )
     _apply_fields(kind, row, fields)
+    if kind == "mcp":
+        row.template_key = fields.get("template_key")
+        row.connection_label = fields.get("connection_label")
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
@@ -572,6 +695,45 @@ async def create(
             return _PUBLIC[kind](row)
     except IntegrityError as exc:
         raise ExtensionValidationError("제약 위반(중복 등)") from exc
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def get_global_mcp_revealed(item_id: int) -> dict:
+    """Administrator execution view of one global MCP connection, with decrypted admin headers."""
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            row = await session.get(ChatMcpServer, item_id)
+            if row is None or row.scope != "global":
+                raise ExtensionNotFound(f"{item_id} 를 찾을 수 없습니다")
+            return _reveal_mcp(row)
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def record_catalog(item_id: int, *, tools: list[dict] | None, error: str | None) -> list[dict]:
+    """Store discovery metadata only. It never bumps config_version, so OAuth connections stay valid.
+
+    Returns the previously stored tools so the caller can report what changed. A failure keeps the last good catalog.
+    """
+    factory = _require_db()
+    try:
+        async with factory() as session, session.begin():
+            row = await session.get(ChatMcpServer, item_id)
+            if row is None or row.scope != "global":
+                raise ExtensionNotFound(f"{item_id} 를 찾을 수 없습니다")
+            previous = _stored_tools(row.tool_catalog)
+            if tools is not None:
+                row.tool_catalog = {"tools": tools}
+                row.catalog_refreshed_at = func.utc_timestamp()
+                row.catalog_error = None
+            else:
+                row.catalog_error = (error or "")[:300] or None
+            await session.flush()
+            return previous
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc

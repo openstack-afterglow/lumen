@@ -10,6 +10,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import delete, select
 
+from lumen.crypto import encrypt_chat_content
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_infrastructure import (
     ChatAgentReservation,
@@ -18,15 +19,44 @@ from lumen.models.chat_infrastructure import (
     ChatProjectAgentQuota,
 )
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunEventRow
+from lumen.services import worker_routing
 from lumen.services.durable_runs import budgets, children, lifecycle
 from lumen.services.durable_runs.errors import DurableRunError
-from lumen.services.run_store import claim_queued_run, replay_events
+from lumen.services.infrastructure import store
+from lumen.services.run_store import append_event, claim_queued_run, replay_events
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
+
+
+async def _fixed_text_worker(identity: str) -> str:
+    return await store.register_worker(
+        worker_identity=identity, boot_id=str(uuid.uuid4()), capacity=1, protocol_versions=[1, 2],
+        plugin_digest="0" * 64, schema_version=1, workload_classes=["online_text"],
+    )
+
+
+async def _claim_as_fixed_worker(factory, run_id: str, identity: str) -> str | None:
+    """Claim through a real fixed online_text registration; returns the fenced lease owner."""
+    registration_id = await _fixed_text_worker(identity)
+    async with factory() as session, session.begin():
+        await worker_routing.use_read_committed(session)
+        claimed = await claim_queued_run(session, run_id, owner=identity, registration_id=registration_id)
+        return claimed.lease_owner if claimed is not None else None
 
 
 @pytest.fixture
-async def family():
+async def family(request):
+    if hasattr(request, "param"):
+        from sqlalchemy import event
+        from sqlalchemy.pool import Pool
+
+        def pin_isolation(connection, _record):
+            cursor = connection.cursor()
+            cursor.execute(f"SET SESSION innodb_snapshot_isolation={request.param}")
+            cursor.close()
+
+        event.listen(Pool, "connect", pin_isolation)
+        request.addfinalizer(lambda: event.remove(Pool, "connect", pin_isolation))
     init_db(os.environ["DATABASE_URL"], pool_size=3, max_overflow=1)
     factory = get_session_factory()
     assert factory is not None
@@ -45,6 +75,7 @@ async def family():
             session.add(ChatRun(
                 id=root_id, run_scope="persistent", project_id=project_id, user_id=user_id,
                 model_name="scripted-parent", capability_snapshot={}, pricing_snapshot={},
+                request_payload=encrypt_chat_content('{"required_scopes":["native:runs:write"]}'),
                 client_request_id=str(uuid.uuid4()), request_fingerprint=nonce, fingerprint_version=1,
                 execution_protocol_version=2, status="running", lease_owner=owner,
                 lease_expires_at=now + timedelta(minutes=5), credit_ceiling=Decimal("2"),
@@ -57,6 +88,7 @@ async def family():
                 session.add(ChatRun(
                     id=child_id, run_scope="child", project_id=project_id, user_id=user_id,
                     model_name="scripted-child", capability_snapshot={}, pricing_snapshot={},
+                    request_payload=encrypt_chat_content('{"required_scopes":["native:runs:write","native:agents:use","native:tools:execute"]}'),
                     client_request_id=str(uuid.uuid4()), request_fingerprint=f"{nonce}-{ordinal}",
                     fingerprint_version=1, execution_protocol_version=2, status="waiting_resource",
                     parent_run_id=root_id, root_run_id=root_id, delegation_call_id=call_id, depth=1,
@@ -145,10 +177,8 @@ async def test_children_settle_and_join_in_call_order_once(family, finish_before
     assert len(state["reservation_statuses"]) == 8
     assert [item[1]["call_id"] for item in state["events"] if item[0] == "child.completed"] == ["call-1", "call-0"]
 
-    async with factory() as session, session.begin():
-        claimed = await claim_queued_run(session, root_id, owner="replacement-worker")
-        assert claimed is not None
-        replacement_owner = claimed.lease_owner
+    replacement_owner = await _claim_as_fixed_worker(factory, root_id, f"replacement-worker-{uuid.uuid4().hex}")
+    assert replacement_owner is not None
     assert await children.pending_wait_group(root_id) == group_id
     first = await children.delegation_results(parent_run_id=root_id, owner=replacement_owner, wait_group_id=group_id)
     second = await children.delegation_results(parent_run_id=root_id, owner=replacement_owner, wait_group_id=group_id)
@@ -199,7 +229,7 @@ async def test_root_budget_ceiling_and_cancellation_settle_every_child_once(fami
 
 async def test_child_credit_overrun_blocks_child_and_parent_without_recharging_replay(family, monkeypatch):
     from lumen.models.chat_runs import ChatRunSegment
-    from lumen.services import litellm_client
+    from lumen.services import provider_metadata
     from lumen.services.durable_runs.execution import _DurableExecutionHooks
 
     factory, project, _user, root_id, _group_id, child_ids, owner = family
@@ -220,8 +250,8 @@ async def test_child_credit_overrun_blocks_child_and_parent_without_recharging_r
         root.credit_ceiling = Decimal("3")
 
     monkeypatch.setattr(
-        litellm_client, "count_context_tokens",
-        lambda *_args: litellm_client.ContextTokenCount(tokens=1, measurement="tokenizer"),
+        provider_metadata, "count_context_tokens",
+        lambda *_args: provider_metadata.ContextTokenCount(tokens=1, measurement="tokenizer"),
     )
     child_hooks = _DurableExecutionHooks(run_id=child_ids[0], owner=owner, credit_bounded=True)
     call = {"round_index": 0, "attempt": 1, "messages": [{"role": "user", "content": "hi"}],
@@ -259,8 +289,62 @@ async def test_child_credit_overrun_blocks_child_and_parent_without_recharging_r
         assert (await session.get(ChatRun, root_id)).reserved_credits == Decimal("1.2")
 
 
+@pytest.mark.parametrize("family", ["ON", "OFF"], indirect=True)
+@pytest.mark.parametrize("target", ["root", "child"])
+async def test_bounded_call_settlement_survives_concurrent_delta(family, monkeypatch, target):
+    from lumen.models.chat_runs import ChatRunSegment
+    from lumen.services import provider_metadata
+    from lumen.services.durable_runs.execution import _DurableExecutionHooks, _event
+
+    factory, _project, _user, root_id, _group, child_ids, owner = family
+    run_id = root_id if target == "root" else child_ids[0]
+    async with factory() as session, session.begin():
+        run = await session.get(ChatRun, run_id)
+        run.pricing_snapshot = {
+            "input_price_per_token": "0.01", "output_price_per_token": "0",
+            "margin_multiplier": "1", "chat_credit_per_usd": "1", "component_prices": {},
+        }
+        run.capability_snapshot = {"capabilities": {"context_limit": 1}}
+        run.status = "running"
+        run.lease_owner = owner
+        run.lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+        (await session.get(ChatRun, root_id)).credit_ceiling = Decimal("3")
+    monkeypatch.setattr(provider_metadata, "count_context_tokens",
+                        lambda *_args: provider_metadata.ContextTokenCount(tokens=1, measurement="tokenizer"))
+    hooks = _DurableExecutionHooks(run_id=run_id, owner=owner, credit_bounded=True)
+    call = {"round_index": 0, "attempt": 1, "messages": [{"role": "user", "content": "hi"}],
+            "tool_schemas": [], "max_tokens": 1}
+    assert await hooks.provider_started(**call) is None
+    lock_run = budgets.lock_run
+    interleaved = []
+
+    async def commit_delta_then_lock(session, locked_id, **kwargs):
+        if locked_id == run_id and not interleaved:
+            async with factory() as rival, rival.begin():
+                row = await rival.get(ChatRun, run_id, with_for_update=True)
+                await append_event(rival, row, _event(row, "part.delta", {
+                    "message_id": f"temp:{run_id}:assistant:0", "part_index": 0,
+                    "part_type": "text", "delta": "concurrent text",
+                }))
+            interleaved.append(run_id)
+        return await lock_run(session, locked_id, **kwargs)
+
+    monkeypatch.setattr(budgets, "lock_run", commit_delta_then_lock)
+    result = {"text": "settled response", "usage": {"prompt_tokens": 2, "completion_tokens": 0}}
+    await hooks.provider_completed(round_index=0, attempt=1, usage=result["usage"], result_payload=result)
+    replay = await hooks.provider_started(**call)
+    assert replay["_durable_replay"] is True and replay["text"] == "settled response"
+    assert interleaved == [run_id]
+    async with factory() as session:
+        segment = await session.get(ChatRunSegment, (run_id, "provider:0:1"))
+        reservation = await session.get(ChatModelCallReservation, (run_id, "provider:0:1"))
+        assert segment.status == "completed"
+        assert (reservation.status, reservation.actual_credits) == ("settled", Decimal("0.02"))
+        assert (await session.get(ChatRun, run_id)).reserved_credits == Decimal("0.02")
+
+
 async def test_zero_price_provider_call_keeps_fence_without_credit_headroom(family, monkeypatch):
-    from lumen.services import litellm_client
+    from lumen.services import provider_metadata
     from lumen.services.durable_runs.execution import _DurableExecutionHooks
 
     factory, _project, _user, root_id, _group_id, _child_ids, owner = family
@@ -272,8 +356,8 @@ async def test_zero_price_provider_call_keeps_fence_without_credit_headroom(fami
         }
         root.capability_snapshot = {"capabilities": {}}
     monkeypatch.setattr(
-        litellm_client, "count_context_tokens",
-        lambda *_args: litellm_client.ContextTokenCount(tokens=1, measurement="tokenizer"),
+        provider_metadata, "count_context_tokens",
+        lambda *_args: provider_metadata.ContextTokenCount(tokens=1, measurement="tokenizer"),
     )
     hooks = _DurableExecutionHooks(run_id=root_id, owner=owner, credit_bounded=True)
     call = {"round_index": 0, "attempt": 1, "messages": [{"role": "user", "content": "hi"}],
@@ -289,7 +373,7 @@ async def test_zero_price_provider_call_keeps_fence_without_credit_headroom(fami
 
 
 async def test_unknown_provider_holds_bound_and_priced_tool_is_denied_before_dispatch(family, monkeypatch):
-    from lumen.services import litellm_client
+    from lumen.services import provider_metadata
     from lumen.services.durable_runs.execution import _DurableExecutionHooks
 
     factory, _project, _user, _root_id, _group_id, child_ids, owner = family
@@ -306,8 +390,8 @@ async def test_unknown_provider_holds_bound_and_priced_tool_is_denied_before_dis
         }
         child.capability_snapshot = {"capabilities": {"context_limit": 1}}
     monkeypatch.setattr(
-        litellm_client, "count_context_tokens",
-        lambda *_args: litellm_client.ContextTokenCount(tokens=1, measurement="tokenizer"),
+        provider_metadata, "count_context_tokens",
+        lambda *_args: provider_metadata.ContextTokenCount(tokens=1, measurement="tokenizer"),
     )
     hooks = _DurableExecutionHooks(run_id=child_id, owner=owner, credit_bounded=True)
     with pytest.raises(budgets.BudgetExceeded, match="child credit ceiling"):
@@ -335,7 +419,10 @@ async def test_expired_parent_lease_requeues_prepared_children_without_an_unresu
     async with factory() as session, session.begin():
         root = await session.get(ChatRun, root_id)
         root.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
-    recovered = await lifecycle.recover_stale_runs(owner="recovery-worker")
+    recovery_identity = f"recovery-worker-{uuid.uuid4().hex}"
+    recovered = await lifecycle.recover_stale_runs(
+        owner=recovery_identity, registration_id=await _fixed_text_worker(f"{recovery_identity}-scan"),
+    )
     assert root_id in recovered
     state = await _snapshot(factory, project, root_id, group_id, child_ids)
     assert state["parent_status"] == "queued"
@@ -343,10 +430,8 @@ async def test_expired_parent_lease_requeues_prepared_children_without_an_unresu
     assert state["checkpoint"] is None
     assert state["child_statuses"] == ["waiting_resource", "waiting_resource"]
     assert await children.pending_wait_group(root_id) is None
-    async with factory() as session, session.begin():
-        claimed = await claim_queued_run(session, root_id, owner="recovery-worker")
-        assert claimed is not None
-        replacement_owner = claimed.lease_owner
+    replacement_owner = await _claim_as_fixed_worker(factory, root_id, recovery_identity)
+    assert replacement_owner is not None
     assert await children.mark_waiting_children(
         parent_run_id=root_id, owner=replacement_owner, wait_group_id=group_id, checkpoint_id="recovered-checkpoint"
     ) == "waiting_children"
@@ -354,7 +439,8 @@ async def test_expired_parent_lease_requeues_prepared_children_without_an_unresu
     assert (await _snapshot(factory, project, root_id, group_id, child_ids))["quota"] == (0, 0, Decimal("0"), 0)
 
 
-async def test_two_child_group_commits_resources_and_replays_without_duplicate_reservations(monkeypatch):
+@pytest.mark.parametrize("restricted", [False, True], ids=["human-parent", "reduced-parent"])
+async def test_two_child_group_commits_resources_and_replays_without_duplicate_reservations(monkeypatch, restricted):
     """Two siblings must commit atomically despite ledger/resource lock-class boundaries."""
     from types import SimpleNamespace
 
@@ -373,6 +459,10 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
     root_id, pool_id = str(uuid.uuid4()), str(uuid.uuid4())
     owner = f"spawn-worker-{nonce}#1"
     policy = default_execution_policy().model_copy(update={"can_delegate_read": True, "max_children": 2, "max_parallel_children": 2})
+    original_authority = {
+        "credential_restricted": True, "user_id": user, "source_project_id": project,
+        "source_system_scope": "", "issued_role_ids": ["member-id", "chat-id", "tools-id"],
+    } if restricted else None
     try:
         async with factory() as session, session.begin():
             session.add(ChatProjectAgentQuota(
@@ -392,7 +482,10 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
             parent_agent.delegable_agent_ids = [child_agent.id]
             session.add(ChatRun(
                 id=root_id, run_scope="persistent", project_id=project, user_id=user,
-                model_name="scripted-parent", capability_snapshot={"execution_policy": policy.model_dump(mode="json")},
+                model_name="scripted-parent", capability_snapshot={
+                    "execution_policy": policy.model_dump(mode="json"),
+                    **({"credential_authority": original_authority} if restricted else {}),
+                },
                 pricing_snapshot={}, request_payload=encrypt_chat_content("{}"),
                 client_request_id=str(uuid.uuid4()), request_fingerprint=nonce, fingerprint_version=1,
                 agent_id=parent_agent.id, execution_protocol_version=2, status="running", lease_owner=owner,
@@ -404,7 +497,11 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
             return {
                 "policy": policy, "direct_effects": frozenset({"read"}),
                 "route": {"model_name": "scripted-child"},
-                "capability_snapshot": {}, "pricing_snapshot": {}, "extension_selection": {},
+                # Prepared child data cannot replace or invent original provenance.
+                "capability_snapshot": {"credential_authority": {
+                    "credential_restricted": True, "user_id": "foreign-owner", "source_project_id": "foreign-project",
+                    "source_system_scope": "", "issued_role_ids": ["admin-id"],
+                }}, "pricing_snapshot": {}, "extension_selection": {},
                 "plugin_tool_snapshots": [], "skill_instructions": [], "skill_snapshot": [],
                 "max_tokens": 128, "temperature": None,
             }
@@ -437,6 +534,9 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
             quota = await session.get(ChatProjectAgentQuota, project)
             root = await session.get(ChatRun, root_id)
             assert {row.id for row in rows} == set(child_ids)
+            assert all(row.capability_snapshot.get("credential_authority") == original_authority for row in rows)
+            if not restricted:
+                assert all("credential_authority" not in row.capability_snapshot for row in rows)
             assert len(resources) == 2 and {row.run_id for row in resources} == set(child_ids)
             assert all(row.assigned_resource_id in {resource.id for resource in resources} for row in rows)
             assert len(reservations) == 8 and all(row.status == "reserved" for row in reservations)
@@ -781,7 +881,7 @@ async def test_terminal_paths_decide_on_the_locked_row_not_an_earlier_read(monke
                     row.lease_fence = 2
                     row.lease_owner = rival_owner
                 else:
-                    assert await claim_queued_run(rival, run_id, owner=f"worker-b-{nonce}") is not None
+                    assert await _claim_as_fixed_worker(factory, run_id, f"worker-b-{nonce}") is not None
             interleaved.append(locked_id)
         return await lock_run(session, locked_id, **kwargs)
 

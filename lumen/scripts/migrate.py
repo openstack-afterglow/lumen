@@ -14,6 +14,13 @@ from sqlalchemy import text
 from lumen.config import get_settings
 from lumen.plugins.registry import get_plugin
 from lumen.scripts.backfill_history import backfill_history, count_unready
+from lumen.scripts.provider_account_migration import (
+    ACCOUNT_ID,
+    REPAIRED_CUTOVER_SQL,
+    AccountMigrationError,
+    inspect_account_state,
+)
+from lumen.scripts.schema_repair import SchemaRepairError, describe_drift, repair_schema
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
 MANIFEST = MIGRATIONS / "manifest.txt"
@@ -296,7 +303,7 @@ async def _historical_media_registry_applied(connection, migration: Migration) -
     return True
 
 
-async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
+async def migrate(database_url: str, *, apply: bool, repair_schema_drift: bool = True) -> tuple[list[str], int]:
     if not database_url:
         raise MigrationLedgerError("database URL is required")
     migrations = load_manifest()
@@ -304,17 +311,31 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
     engine = handle.engine
     pending: list[str] = []
     try:
-        async with engine.begin() as connection:
-            await connection.exec_driver_sql(
-                """
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                  logical_id VARCHAR(100) NOT NULL PRIMARY KEY,
-                  relative_path VARCHAR(255) NOT NULL,
-                  sha256 CHAR(64) NOT NULL,
-                  applied_at DATETIME(6) NOT NULL
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
+        account_cutover = any(migration.logical_id == ACCOUNT_ID for migration in migrations)
+        bootstrapping = False
+        if account_cutover:
+            # Classify and verify the complete ledger before even CREATE IF NOT
+            # EXISTS: MariaDB DDL commits implicitly, including on failure.
+            async with engine.connect() as connection:
+                try:
+                    state = await inspect_account_state(connection, migrations)
+                except AccountMigrationError as exc:
+                    raise MigrationLedgerError(str(exc)) from None
+            bootstrapping = state == "bootstrap"
+            if state == "bootstrap" and not apply:
+                return [migration.logical_id for migration in migrations], 0
+        if apply:
+            async with engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                      logical_id VARCHAR(100) NOT NULL PRIMARY KEY,
+                      relative_path VARCHAR(255) NOT NULL,
+                      sha256 CHAR(64) NOT NULL,
+                      applied_at DATETIME(6) NOT NULL
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
         for migration in migrations:
             async with engine.begin() as connection:
                 row = (
@@ -335,6 +356,19 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
                     # Preserve the original ledger row; add the canonical identity without repeating DDL.
                     await _record_migration(connection, migration)
                     continue
+                if migration.logical_id == ACCOUNT_ID and not bootstrapping:
+                    try:
+                        state = await inspect_account_state(connection, migrations)
+                    except AccountMigrationError as exc:
+                        raise MigrationLedgerError(str(exc)) from None
+                    if state in {"repaired", "accounted"}:
+                        if state == "repaired":
+                            for statement in REPAIRED_CUTOVER_SQL:
+                                await connection.exec_driver_sql(statement)
+                        # Neither branch executes, edits or substitutes the old
+                        # account027 receipt. Only the new028 success is recorded.
+                        await _record_migration(connection, migration)
+                        continue
                 for statement in _statements(MIGRATIONS / migration.relative_path):
                     await connection.exec_driver_sql(statement)
                     if migration.logical_id == "019-shared-message-membership" and statement.startswith(
@@ -350,6 +384,18 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
             async with engine.begin() as connection:
                 await _verify_active_paths(connection)
                 await _record_migration(connection, migration)
+        if repair_schema_drift:
+            # Bootstrap self-repair: after the verified ledger, restore the tables, columns and keys the ledger-shaped
+            # snapshot declares (additive only; anything else fails closed here, before the API or workers start).
+            try:
+                if apply:
+                    await repair_schema(engine)
+                elif not pending:
+                    drift = await describe_drift(engine)
+                    if drift:  # the history checks below would query tables that may be missing
+                        return ["schema-repair: " + change for change in drift], 0
+            except SchemaRepairError as exc:
+                raise MigrationLedgerError(f"schema drift cannot be repaired automatically: {exc}") from None
         async with engine.begin() as connection:
             active_path_applied = (
                 await connection.execute(
@@ -379,10 +425,18 @@ async def migrate(database_url: str, *, apply: bool) -> tuple[list[str], int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database-url", default="")
+    parser.add_argument(
+        "--no-schema-repair",
+        action="store_true",
+        help="apply only the ledger migrations; skip the bootstrap repair of missing tables, columns and indexes "
+        "(used by the integration layer so migration coverage is tested without the safety net)",
+    )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     database_url = args.database_url or get_settings().database_url
-    pending, unready = asyncio.run(migrate(database_url, apply=args.apply))
+    pending, unready = asyncio.run(
+        migrate(database_url, apply=args.apply, repair_schema_drift=not args.no_schema_repair)
+    )
     if pending and not args.apply:
         raise SystemExit(f"pending Lumen migrations: {', '.join(pending)}; unready conversation histories: {unready}")
     if unready:

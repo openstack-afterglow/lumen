@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from lumen import worker as chat_worker
-from lumen.services import checkpointer
+from lumen.services import auxiliary, checkpointer
 
 
 class _FakeCheckpointer:
@@ -35,6 +35,9 @@ def _settings(**overrides):
         worker_concurrency=4,
         worker_heartbeat_seconds=5,
         worker_drain_seconds=300,
+        worker_workload_classes=["online_text", "online_media"],
+        batch_enabled=False,
+        runtime_config=SimpleNamespace(enabled=False, pools=[]),
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -61,6 +64,11 @@ def _patch_serve_dependencies(monkeypatch, fake_checkpointer, **settings_overrid
     monkeypatch.setattr(chat_worker, "build_host", lambda: None)
     monkeypatch.setattr(checkpointer, "chat_checkpointer", fake_checkpointer)
 
+    async def start_bifrost_runtime() -> None:
+        return None
+
+    monkeypatch.setattr("lumen.services.bifrost_runtime.start_bifrost_runtime", start_bifrost_runtime)
+
     async def register(self) -> None:
         self.registration_id = "registration-1"
 
@@ -70,7 +78,7 @@ def _patch_serve_dependencies(monkeypatch, fake_checkpointer, **settings_overrid
     monkeypatch.setattr(chat_worker.WorkerLoop, "register", register)
     monkeypatch.setattr(chat_worker.WorkerLoop, "heartbeat", heartbeat)
 
-    async def no_recovery(*, owner):
+    async def no_recovery(*, owner, registration_id):
         return []
 
     monkeypatch.setattr(chat_worker, "recover_stale_runs", no_recovery)
@@ -106,7 +114,7 @@ async def test_slow_maintenance_never_blocks_claims(monkeypatch, caplog):
         await asyncio.sleep(3600)  # never finishes during the test
         return []
 
-    async def next_run_ids(limit: int) -> list[str]:
+    async def next_run_ids(limit: int, **_routing) -> list[str]:
         claims.append(f"claim-{len(claims)}")
         if len(claims) == 1:
             return ["run-1"]
@@ -149,7 +157,8 @@ async def test_worker_run_logs_dispatch_and_claim_without_claimed_success(monkey
 
     monkeypatch.setattr(chat_worker, "execute_queued_run", rejected_claim)
     with caplog.at_level(logging.DEBUG, logger="lumen.worker"):
-        loop = chat_worker.WorkerLoop(owner="host:1", capacity=1, heartbeat_seconds=5, drain_seconds=30)
+        loop = chat_worker.WorkerLoop(owner="host:1", capacity=1, heartbeat_seconds=5, drain_seconds=30,
+                                      workload_classes=["online_text"])
         loop.launch(run_id)
         await asyncio.gather(loop.active[run_id])
         loop.start_drain()
@@ -170,7 +179,8 @@ async def test_worker_provider_error_does_not_log_secret_or_untrusted_run_id(mon
 
     monkeypatch.setattr(chat_worker, "execute_queued_run", provider_failure)
     with caplog.at_level(logging.DEBUG, logger="lumen.worker"):
-        loop = chat_worker.WorkerLoop(owner="host:1", capacity=1, heartbeat_seconds=5, drain_seconds=30)
+        loop = chat_worker.WorkerLoop(owner="host:1", capacity=1, heartbeat_seconds=5, drain_seconds=30,
+                                      workload_classes=["online_text"])
         loop.launch(malicious_run_id)
         await asyncio.gather(loop.active[malicious_run_id])
 
@@ -194,7 +204,9 @@ async def test_worker_title_and_maintenance_errors_do_not_log_provider_text(capl
     with caplog.at_level(logging.DEBUG, logger="lumen.worker"):
         maintenance = chat_worker._Maintenance("heartbeat", provider_failure, interval=1)
         await maintenance._run()
-        title_task = asyncio.create_task(chat_worker._title_processor_loop(title_failure, owner="worker"))
+        title_task = asyncio.create_task(
+            chat_worker._title_processor_loop(title_failure, owner="worker", stop=asyncio.Event()),
+        )
         await title_called.wait()
         title_task.cancel()
         await asyncio.gather(title_task, return_exceptions=True)
@@ -240,9 +252,256 @@ async def test_title_processor_loop_keeps_draining_until_cancelled():
         return True
 
     with pytest.raises(asyncio.CancelledError):
-        await chat_worker._title_processor_loop(processor, owner="worker-1")
+        await chat_worker._title_processor_loop(processor, owner="worker-1", stop=asyncio.Event())
 
     assert calls == ["worker-1", "worker-1"]
+
+
+async def test_title_processor_loop_stopped_before_start_never_claims():
+    stop = asyncio.Event()
+    stop.set()
+
+    async def processor(*, owner):
+        pytest.fail("a stopped title scheduler must not claim work")
+
+    await chat_worker._title_processor_loop(processor, owner="worker", stop=stop)
+
+
+async def test_title_processor_loop_stop_interrupts_idle_sleep(monkeypatch):
+    stop = asyncio.Event()
+    sleeping = asyncio.Event()
+    calls = []
+
+    async def processor(*, owner):
+        calls.append(owner)
+        return False
+
+    async def idle_sleep(delay):
+        assert delay == 0.5
+        sleeping.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(chat_worker.asyncio, "sleep", idle_sleep)
+    task = asyncio.create_task(chat_worker._title_processor_loop(processor, owner="worker", stop=stop))
+    try:
+        await asyncio.wait_for(sleeping.wait(), timeout=1)
+        stop.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+        assert calls == ["worker"]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("worked", [False, True])
+async def test_title_processor_loop_consumed_cancel_cannot_resume_scheduling(monkeypatch, worked):
+    stop = asyncio.Event()
+    entered = asyncio.Event()
+    calls = []
+    sleeps = []
+
+    async def processor(*, owner):
+        calls.append(owner)
+        if len(calls) > 1:
+            await asyncio.Event().wait()
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return worked
+
+    async def idle_sleep(delay):
+        sleeps.append(delay)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(chat_worker.asyncio, "sleep", idle_sleep)
+    task = asyncio.create_task(chat_worker._title_processor_loop(processor, owner="worker", stop=stop))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        stop.set()
+        task.cancel()
+        _, pending = await asyncio.wait({task}, timeout=1)
+        assert not pending, "a consumed cancellation must not keep the title scheduler alive"
+        await task
+        assert calls == ["worker"]
+        assert sleeps == []
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_title_processor_loop_stop_preserves_admitted_step_and_lease(monkeypatch):
+    stop = asyncio.Event()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    steps = []
+    calls = []
+    cancelled = []
+
+    async def begin(owner):
+        steps.append(("begin", owner))
+        return True
+
+    async def end(owner):
+        steps.append(("end", owner))
+
+    @auxiliary.worker_step
+    async def processor(*, owner):
+        calls.append(owner)
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.append(owner)
+            raise
+        return True
+
+    monkeypatch.setattr(auxiliary, "_begin_step", begin)
+    monkeypatch.setattr(auxiliary, "_end_step", end)
+    task = asyncio.create_task(chat_worker._title_processor_loop(processor, owner="worker", stop=stop))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        stop.set()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert steps == [("begin", "worker")]
+        assert calls == ["worker"]
+        assert cancelled == []
+        release.set()
+        _, pending = await asyncio.wait({task}, timeout=1)
+        assert not pending
+        assert task.cancelled()
+        assert steps == [("begin", "worker"), ("end", "worker")]
+        assert calls == ["worker"]
+        assert cancelled == []
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("cleanup", ["drain", "error"])
+async def test_worker_title_cleanup_stops_after_consumed_cancel(monkeypatch, cleanup):
+    fake = _FakeCheckpointer()
+    _patch_serve_dependencies(monkeypatch, fake)
+    entered = asyncio.Event()
+    loops = []
+    calls = []
+    title_tasks = []
+
+    async def register(self):
+        self.registration_id = "registration-1"
+        loops.append(self)
+
+    async def processor(*, owner):
+        calls.append(owner)
+        title_tasks.append(asyncio.current_task())
+        entered.set()
+        if len(calls) > 1:
+            await asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return False
+
+    async def next_run_ids(*_args, **_kwargs):
+        await entered.wait()
+        if cleanup == "error":
+            raise RuntimeError("claim loop failed")
+        loops[0].start_drain()
+        return ["not-admitted-during-drain"]
+
+    async def drain_transition(self):
+        return True
+
+    async def close_db():
+        return None
+
+    monkeypatch.setattr(chat_worker.WorkerLoop, "register", register)
+    monkeypatch.setattr(chat_worker.WorkerLoop, "mark_draining", drain_transition)
+    monkeypatch.setattr(chat_worker.WorkerLoop, "acknowledge_drain", drain_transition)
+    monkeypatch.setattr(chat_worker._Maintenance, "tick", lambda self, now: None)
+    monkeypatch.setattr(chat_worker, "_next_run_ids", next_run_ids)
+    monkeypatch.setattr("lumen.services.title_jobs.process_one", processor)
+    monkeypatch.setattr("lumen.db.close_db", close_db)
+    task = asyncio.create_task(chat_worker._serve())
+    try:
+        _, pending = await asyncio.wait({task}, timeout=1)
+        assert not pending, "worker cleanup must finish after title cancellation is consumed"
+        if cleanup == "error":
+            with pytest.raises(RuntimeError, match="claim loop failed"):
+                await task
+        else:
+            await task
+        assert loops[0].draining.is_set() is (cleanup == "drain")
+        assert calls == ["registration-1"]
+        assert title_tasks[0].done()
+        assert not title_tasks[0].cancelled()
+        assert fake.closed
+    finally:
+        for title_task in title_tasks:
+            if not title_task.done():
+                title_task.cancel()
+        task.cancel()
+        await asyncio.gather(task, *title_tasks, return_exceptions=True)
+
+
+async def test_worker_title_stop_precedes_other_auxiliary_cleanup(monkeypatch):
+    fake = _FakeCheckpointer()
+    _patch_serve_dependencies(monkeypatch, fake)
+    entered = asyncio.Event()
+    release_processor = asyncio.Event()
+    stopping = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    calls = []
+    title_tasks = []
+
+    async def processor(*, owner):
+        calls.append(owner)
+        title_tasks.append(asyncio.current_task())
+        entered.set()
+        await release_processor.wait()
+        return False
+
+    async def next_run_ids(*_args, **_kwargs):
+        await entered.wait()
+        raise RuntimeError("claim loop failed")
+
+    async def maintenance_stop(self):
+        stopping.set()
+        await release_cleanup.wait()
+
+    async def close_db():
+        return None
+
+    monkeypatch.setattr(chat_worker._Maintenance, "tick", lambda self, now: None)
+    monkeypatch.setattr(chat_worker._Maintenance, "stop", maintenance_stop)
+    monkeypatch.setattr(chat_worker, "_next_run_ids", next_run_ids)
+    monkeypatch.setattr("lumen.services.title_jobs.process_one", processor)
+    monkeypatch.setattr("lumen.db.close_db", close_db)
+    task = asyncio.create_task(chat_worker._serve())
+    try:
+        await asyncio.wait_for(stopping.wait(), timeout=1)
+        release_processor.set()
+        _, pending = await asyncio.wait({title_tasks[0]}, timeout=1)
+        assert not pending, "title scheduling must stop before awaiting other maintenance"
+        assert calls == ["registration-1"]
+        assert not task.done()
+        release_cleanup.set()
+        with pytest.raises(RuntimeError, match="claim loop failed"):
+            await asyncio.wait_for(asyncio.shield(task), timeout=1)
+        assert fake.closed
+    finally:
+        release_processor.set()
+        release_cleanup.set()
+        for title_task in title_tasks:
+            if not title_task.done():
+                title_task.cancel()
+        task.cancel()
+        await asyncio.gather(task, *title_tasks, return_exceptions=True)
 
 
 async def test_worker_loop_refills_freed_slot_and_drain_rejects_new_claims(monkeypatch):
@@ -256,7 +515,8 @@ async def test_worker_loop_refills_freed_slot_and_drain_rejects_new_claims(monke
         return True
 
     monkeypatch.setattr(chat_worker, "execute_queued_run", execute_run)
-    loop = chat_worker.WorkerLoop(owner="w", capacity=2, heartbeat_seconds=5, drain_seconds=300)
+    loop = chat_worker.WorkerLoop(owner="w", capacity=2, heartbeat_seconds=5, drain_seconds=300,
+                                  workload_classes=["online_text"])
 
     loop.launch("a")
     loop.launch("b")
@@ -283,13 +543,49 @@ async def test_worker_loop_refills_freed_slot_and_drain_rejects_new_claims(monke
 
 
 async def test_lost_registration_enters_drain(monkeypatch):
-    loop = chat_worker.WorkerLoop(owner="w", capacity=1, heartbeat_seconds=5, drain_seconds=300)
+    loop = chat_worker.WorkerLoop(owner="w", capacity=1, heartbeat_seconds=5, drain_seconds=300,
+                                  workload_classes=["online_text"])
     loop.registration_id = "registration-1"
 
-    async def heartbeat_worker(registration_id, *, active_count, accepting):
-        return False
+    async def heartbeat_worker(registration_id, *, accepting):
+        return None
 
     monkeypatch.setattr("lumen.services.infrastructure.store.heartbeat_worker", heartbeat_worker, raising=False)
     await loop.heartbeat()
     assert loop.draining.is_set()
     assert loop.free_slots == 0
+
+
+async def test_controller_drain_stops_claims_without_cancelling_admitted_work(monkeypatch):
+    loop = chat_worker.WorkerLoop(owner="w", capacity=2, heartbeat_seconds=5, drain_seconds=300,
+                                  workload_classes=["online_text"])
+    loop.registration_id = "registration-1"
+    entered, finish = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def execute(run_id, **kwargs):
+        entered.set()
+        await finish.wait()
+        return True
+
+    async def heartbeat(registration_id, *, accepting):
+        assert registration_id == loop.registration_id
+        calls.append(accepting)
+        return "draining"
+
+    monkeypatch.setattr(chat_worker, "execute_queued_run", execute)
+    monkeypatch.setattr("lumen.services.infrastructure.store.heartbeat_worker", heartbeat)
+    loop.launch("admitted")
+    task = loop.active["admitted"]
+    await entered.wait()
+    try:
+        await loop.heartbeat()
+        assert loop.draining.is_set() and loop.free_slots == 0
+        loop.launch("late")
+        assert set(loop.active) == {"admitted"} and not task.done()
+        await loop.heartbeat()
+        assert calls == [True, False]
+    finally:
+        finish.set()
+        await task
+    assert not loop.active

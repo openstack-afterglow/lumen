@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lumen-plugin-api"
-version = "0.1.0"
+version = "0.1.1"
 description = "Versioned host capability contracts for trusted Lumen plugins"
 requires-python = ">=3.11"
 dependencies = ["pydantic==2.13.4", "jsonschema==4.26.0"]

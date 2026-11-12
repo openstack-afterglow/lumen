@@ -129,8 +129,11 @@ async def test_admin_quota_rejects_zero_limit(admin_client):
 
 async def test_set_user_quota_creates_wallet_and_represents_unlimited_weekly(monkeypatch):
     class ScalarResult:
+        def __init__(self, value=Decimal("0")):
+            self.value = value
+
         def scalar_one(self):
-            return Decimal("0")
+            return self.value
 
     class FakeSession:
         def __init__(self):
@@ -158,6 +161,16 @@ async def test_set_user_quota_creates_wallet_and_represents_unlimited_weekly(mon
             return None
 
         async def execute(self, stmt):
+            if getattr(stmt, "is_insert", False):
+                # The no-op upsert that creates the missing wallet row (user_id is the primary key).
+                params = stmt.compile().params
+                self.wallet = self.wallet or credit.UserWallet(
+                    user_id=params["user_id"], project_id=params["project_id"], max_quota_monthly=None,
+                    max_quota_weekly=None, used_quota_this_month=Decimal("0"), reserved_credits=Decimal("0"),
+                    is_active=True)
+                return ScalarResult()
+            if str(stmt).startswith("SELECT user_wallets"):
+                return ScalarResult(self.wallet)  # the locking re-read of the created row
             return ScalarResult()
 
     session = FakeSession()

@@ -1,0 +1,16 @@
+{
+  "browser": {
+    "browserName": "chromium",
+    "isolated": true,
+    "launchOptions": {
+      "headless": true,
+      "executablePath": "/opt/ms-playwright/chromium",
+      "chromiumSandbox": true,
+      "downloadsPath": "/work/downloads",
+      "tracesDir": "/work/traces"
+    }
+  },
+  "outputDir": "/work",
+  "allowUnrestrictedFileAccess": false,
+  "webmcp": false
+}

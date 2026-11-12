@@ -28,7 +28,7 @@ def _route(provider, model, variants):
 def _mock_provider(monkeypatch, handler):
     client_type = httpx.AsyncClient
     monkeypatch.setattr(image_transport.httpx, "AsyncClient", lambda **kwargs: client_type(
-        transport=httpx.MockTransport(handler), **kwargs,
+        **{**kwargs, "transport": httpx.MockTransport(handler)},
     ))
 
 
@@ -256,3 +256,113 @@ async def test_invalid_image_basis_or_envelope_rejects_before_io(monkeypatch, in
     with pytest.raises(ProviderValidationError):
         await image_transport.generate_images(route, prompt="draw", size="auto", quality="auto", n=1)
     assert calls == []
+
+
+# Rows mirror the live OpenAI Images API (2026-11-10): legacy models take presets only and quality <= high,
+# gpt-image-2 adds custom sizes, 2.5/2.6 add xhigh/max, and only 2.6 accepts complexity.
+@pytest.mark.parametrize("model,size,quality,complexity,accepted", [
+    ("gpt-image-1.5", "1024x1024", "high", None, True),
+    ("gpt-image-1.5", "1536x864", "low", None, False),
+    ("gpt-image-1.5", "1024x1024", "xhigh", None, False),
+    ("gpt-image-1-mini", "1536x864", "low", None, False),
+    ("gpt-image-2", "1536x864", "low", None, True),
+    ("gpt-image-2", "1024x1024", "xhigh", None, False),
+    ("gpt-image-2-2026-04-21", "1536x864", "high", None, True),
+    ("gpt-image-2.5-flare", "1536x864", "xhigh", None, True),
+    ("gpt-image-2.5-sunburst", "1024x1024", "max", None, True),
+    ("gpt-image-2.5-sunburst-2026-09-08", "auto", "max", None, True),
+    ("gpt-image-2.5-sunburst", "1024x1024", "low", "low", False),
+    ("gpt-image-2.6-flare", "1024x1024", "max", "high", True),
+    ("gpt-image-2.6-sunburst", "auto", "auto", "medium", True),
+    ("gpt-image-2.6-sunburst", "auto", "auto", "extreme", False),
+    ("gpt-image-2.6-flare", "1024x1024", "ultra", None, False),
+])
+def test_openai_image_models_enforce_the_live_verified_option_matrix(model, size, quality, complexity, accepted):
+    route = {**_token_route(), "api_model_name": model}
+    call = lambda: image_transport.validate_image_request(  # noqa: E731
+        route, size=size, quality=quality, n=1, edit=False, complexity=complexity)
+    if accepted:
+        assert call() == Decimal("0.01")
+    else:
+        with pytest.raises(ProviderValidationError):
+            call()
+
+
+@pytest.mark.parametrize("size,accepted", [
+    ("1536x864", True), ("2048x704", True), ("2304x768", True),  # ratio exactly 3:1 is allowed
+    ("3840x2160", True),  # both edge and total-pixel maximum
+    ("1024x640", True),  # total-pixel minimum, 655,360
+    ("1000x1000", False),  # not a multiple of 16
+    ("1008x640", False),  # 645,120 px is below the minimum
+    ("512x512", False),
+    ("3856x2160", False),  # edge above 3840
+    ("3840x2176", False),  # 8,355,840 px is above the maximum
+    ("3072x1008", False),  # ratio above 3:1
+    ("1024", False), ("0x1024", False), ("1536X864", False), (" 1536x864", False), ("1536x864\n", False),
+])
+def test_custom_image_sizes_follow_the_documented_bounds(size, accepted):
+    route = {**_token_route(), "api_model_name": "gpt-image-2.5-flare"}
+    call = lambda: image_transport.validate_image_request(route, size=size, quality="low", n=1, edit=False)  # noqa: E731
+    if accepted:
+        call()
+    else:
+        with pytest.raises(ProviderValidationError):
+            call()
+
+
+def test_custom_size_and_flagship_quality_need_exact_unit_prices_and_stay_model_scoped():
+    flex = _route("openai", "gpt-image-2", {"1536x864:high": "0.20", "1024x1024:xhigh": "0.40"})
+    assert image_transport.validate_image_request(flex, size="1536x864", quality="high", n=1, edit=False) == Decimal("0.20")
+    with pytest.raises(ProviderValidationError):  # valid geometry, but no exact price for this quality
+        image_transport.validate_image_request(flex, size="1536x864", quality="low", n=1, edit=False)
+    # gpt-image-2 stops at high even when an administrator priced xhigh; the legacy model cannot use custom sizes.
+    assert image_transport.available_image_variants(flex) == ["1536x864:high"]
+    legacy = _route("openai", "gpt-image-1.5", {"1536x864:high": "0.20"})
+    assert image_transport.available_image_variants(legacy) == []
+    flagship = {**_token_route(), "api_model_name": "gpt-image-2.5-flare"}
+    assert "1024x1024:max" in image_transport.available_image_variants(flagship)
+    assert "1024x1024:max" not in image_transport.available_image_variants(_token_route())
+
+
+@pytest.mark.asyncio
+async def test_complexity_and_custom_size_reach_generation_and_edit_wires_only_when_requested(monkeypatch):
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        # The live 2.5/2.6 responses add a generation_id next to b64_json; it must be tolerated, not forwarded.
+        return httpx.Response(200, json={"data": [{"b64_json": base64.b64encode(_PNG).decode(), "generation_id": "gen_1"}]})
+
+    _mock_provider(monkeypatch, handle)
+    route = _route("openai", "gpt-image-2.6-flare", {"1536x864:xhigh": "0.30"})
+    kwargs = {"prompt": "Draw", "size": "1536x864", "quality": "xhigh", "n": 1}
+    assert (await image_transport.generate_images(route, **kwargs, complexity="low")).images == [(_PNG, "image/png")]
+    await image_transport.generate_images(route, **kwargs)
+    await image_transport.generate_images(route, **kwargs, complexity="high", source_image=_PNG, source_mime="image/png")
+    with_complexity, without, edit = requests
+    assert json.loads(with_complexity.content) == {"model": "gpt-image-2.6-flare", **kwargs, "complexity": "low"}
+    assert "complexity" not in json.loads(without.content)
+    assert edit.url.path == "/v1/images/edits"
+    assert b'name="complexity"' in edit.content and b"high" in edit.content
+
+
+@pytest.mark.asyncio
+async def test_unsupported_complexity_never_reaches_the_provider(monkeypatch):
+    calls = []
+    _mock_provider(monkeypatch, lambda request: calls.append(request) or httpx.Response(500))
+    for model, provider in (("gpt-image-2.5-flare", "openai"), ("gpt-image-1.5", "openai"),
+                            ("gemini-3.1-flash-image", "gemini")):
+        route = _route(provider, model, {"auto:auto": "0.10"})
+        with pytest.raises(ProviderValidationError, match="complexity"):
+            await image_transport.generate_images(route, prompt="draw", size="auto", quality="auto", n=1,
+                                                  complexity="low")
+    assert calls == []
+
+
+def test_complexity_is_fingerprinted_only_when_requested():
+    from lumen.services.durable_runs import images as durable_images
+
+    base = {"model_id": "7", "prompt": "draw", "size": "auto", "quality": "auto", "n": 1}
+    assert "complexity" not in durable_images._intent(base)
+    assert "complexity" not in durable_images._intent({**base, "complexity": None})
+    assert durable_images._intent({**base, "complexity": "low"})["complexity"] == "low"

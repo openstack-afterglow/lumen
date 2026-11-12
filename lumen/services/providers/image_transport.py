@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -17,6 +18,7 @@ import httpx
 
 from lumen.services.usage_breakdown import UsageBreakdown
 
+from .credentials import api_key_route_configured, resolve_route_api_key
 from .errors import ProviderValidationError
 from .pricing import (
     exact_media_price,
@@ -32,7 +34,20 @@ _MAX_SOURCE_BYTES = 5 * 1024 * 1024
 _MAX_PROMPT_CHARS = 32000
 _MAX_RESPONSE_BYTES_PER_IMAGE = (_MAX_IMAGE_BYTES * 4 // 3) + 8192
 _TIMEOUT = httpx.Timeout(120.0, connect=10.0, read=120.0, write=30.0, pool=10.0)
-_OPENAI_MODELS = frozenset({"gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5"})
+# GPT Image families, verified against the live OpenAI Images API (2026-11-10): the legacy models accept only the
+# three presets and quality up to high; gpt-image-2 adds custom WxH sizes; 2.5/2.6 add quality xhigh/max; only
+# 2.6 accepts ``complexity``. Anything else is rejected before any provider I/O.
+_OPENAI_PRESET_MODELS = frozenset({"gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5"})
+_OPENAI_FLEX_MODELS = frozenset({"gpt-image-2", "gpt-image-2-2026-04-21"})
+_OPENAI_FLAGSHIP_MODELS = frozenset({
+    "gpt-image-2.5-flare", "gpt-image-2.5-flare-2026-09-08",
+    "gpt-image-2.5-sunburst", "gpt-image-2.5-sunburst-2026-09-08",
+    "gpt-image-2.6-flare", "gpt-image-2.6-sunburst",
+})
+_OPENAI_COMPLEXITY_MODELS = frozenset({"gpt-image-2.6-flare", "gpt-image-2.6-sunburst"})
+_OPENAI_MODELS = _OPENAI_PRESET_MODELS | _OPENAI_FLEX_MODELS | _OPENAI_FLAGSHIP_MODELS
+_COMPLEXITIES = frozenset({"low", "medium", "high"})
+_CUSTOM_SIZE = re.compile(r"([1-9][0-9]{0,4})x([1-9][0-9]{0,4})")
 _GEMINI_MODELS = frozenset({
     "gemini-2.5-flash-image", "gemini-2.5-flash-image-preview",
     "gemini-3-pro-image", "gemini-3-pro-image-preview",
@@ -44,6 +59,11 @@ _MIMES = {"image/png", "image/jpeg", "image/webp"}
 
 class ImageTransportError(RuntimeError):
     """An image provider failed or returned an unusable bounded result."""
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        # Only the integer upstream status survives; provider bodies are never retained.
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -80,7 +100,7 @@ def _image_usage(route: dict, result: dict, provider: str) -> UsageBreakdown | N
 
 def _model(route: dict) -> tuple[str, str]:
     """Accept only canonical direct endpoints, API-key authentication and known models."""
-    if route.get("model_kind") != "image" or route.get("provider_auth") is not None:
+    if not isinstance(route, dict) or route.get("model_kind") != "image" or not api_key_route_configured(route):
         raise ProviderValidationError("image route is not directly executable")
     provider = route.get("provider_type")
     model = route.get("api_model_name")
@@ -96,8 +116,6 @@ def _model(route: dict) -> tuple[str, str]:
     if configured_base is not None and (not isinstance(configured_base, str)
                                         or configured_base.rstrip("/") not in accepted_bases):
         raise ProviderValidationError("unsupported image provider endpoint")
-    if not isinstance(route.get("api_key"), str) or not route["api_key"].strip():
-        raise ProviderValidationError("image provider credential is unavailable")
     return provider, model
 
 
@@ -105,11 +123,26 @@ def image_billing_basis(route: dict) -> str:
     return media_billing_basis("image", route.get("media_pricing"))
 
 
-def validate_image_request(route: dict, *, size: str, quality: str, n: int, edit: bool) -> Decimal:
+def _custom_size(size: str) -> bool:
+    """WIDTHxHEIGHT per the GPT Image 2+ rules: multiples of 16, ratio within 3:1, edge <= 3840, 0.65–8.29 MP."""
+    match = _CUSTOM_SIZE.fullmatch(size)
+    if match is None:
+        return False
+    width, height = int(match[1]), int(match[2])
+    return (width % 16 == 0 and height % 16 == 0 and max(width, height) <= 3840
+            and width <= 3 * height and height <= 3 * width
+            and 655_360 <= width * height <= 8_294_400)
+
+
+def validate_image_request(route: dict, *, size: str, quality: str, n: int, edit: bool,
+                           complexity: str | None = None) -> Decimal:
     """Return USD per unit or the whole-request token envelope, before provider I/O.
 
     OpenAI GPT Image 1/1-mini/1.5: sizes auto, 1024x1024, 1536x1024,
     1024x1536; qualities auto, low, medium, high; count 1–10.
+    gpt-image-2 additionally accepts custom WIDTHxHEIGHT sizes; 2.5 and 2.6
+    (Flare/Sunburst) also accept quality xhigh and max; only 2.6 accepts
+    ``complexity`` (low, medium, high).
     Gemini 2.5 Flash Image: same sizes, quality auto, count 1. Gemini 3
     Pro/3.1 Flash Image: same sizes, quality auto/1k/2k/4k, count 1.
     Gemini dimension presets select output aspect ratio, not guaranteed pixels.
@@ -117,14 +150,22 @@ def validate_image_request(route: dict, *, size: str, quality: str, n: int, edit
     combination, including auto; token mode prices actual provider counts only.
     """
     provider, model = _model(route)
-    if not isinstance(size, str) or size not in _SIZES or not isinstance(quality, str):
+    if not isinstance(size, str) or not isinstance(quality, str):
+        raise ProviderValidationError("unsupported image size or quality")
+    custom_sizes = provider == "openai" and model not in _OPENAI_PRESET_MODELS
+    if size not in _SIZES and not (custom_sizes and _custom_size(size)):
         raise ProviderValidationError("unsupported image size or quality")
     if type(n) is not int or not 1 <= n <= (10 if provider == "openai" else 1):
         raise ProviderValidationError("unsupported image count")
     if type(edit) is not bool:
         raise ProviderValidationError("invalid image operation")
+    if complexity is not None and (provider != "openai" or model not in _OPENAI_COMPLEXITY_MODELS
+                                   or not isinstance(complexity, str) or complexity not in _COMPLEXITIES):
+        raise ProviderValidationError("unsupported image complexity")
     if provider == "openai":
         qualities = {"auto", "low", "medium", "high"}
+        if model in _OPENAI_FLAGSHIP_MODELS:
+            qualities |= {"xhigh", "max"}
     elif model.startswith("gemini-2.5-"):
         qualities = {"auto"}
     else:
@@ -166,7 +207,8 @@ def available_image_variants(route: dict) -> list[str]:
     pricing = route.get("media_pricing")
     try:
         if image_billing_basis(route) == "tokens":
-            variants = {f"{size}:{quality}" for size in _SIZES for quality in ("auto", "low", "medium", "high", "1k", "2k", "4k")}
+            variants = {f"{size}:{quality}" for size in _SIZES
+                        for quality in ("auto", "low", "medium", "high", "xhigh", "max", "1k", "2k", "4k")}
         else:
             variants = pricing.get("image_variants") if isinstance(pricing, dict) else None
     except ProviderValidationError:
@@ -213,16 +255,20 @@ def _decode_image(encoded: object, mime: str | None = None) -> tuple[bytes, str]
 
 
 async def _post(url: str, *, headers: dict, count: int, json_body: dict | None = None,
-                form: dict | None = None, files: dict | None = None) -> dict:
+                form: dict | None = None, files: dict | None = None, relay_ref=None, relay_model=None) -> dict:
     # Streaming avoids buffering an unlimited upstream body in httpx before validation.
     max_bytes = count * _MAX_RESPONSE_BYTES_PER_IMAGE + 65536
     try:
         async with (
-            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False) as client,
+            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False,
+                              transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False)) as client,
             client.stream("POST", url, headers=headers, json=json_body, data=form, files=files) as response,
         ):
+            from .relay_history import record_dispatch
+            record_dispatch(relay_ref, endpoint=url, model=relay_model, operation="image", status_code=response.status_code)
             if response.status_code != 200:
-                raise ImageTransportError(f"image provider returned HTTP {response.status_code}")
+                raise ImageTransportError(f"image provider returned HTTP {response.status_code}",
+                                          status_code=response.status_code)
             if response.headers.get("content-length", "").isdecimal() and int(response.headers["content-length"]) > max_bytes:
                 raise ImageTransportError("image provider response exceeds size limit")
             chunks = bytearray()
@@ -242,9 +288,11 @@ async def _post(url: str, *, headers: dict, count: int, json_body: dict | None =
 
 
 async def generate_images(route: dict, *, prompt: str, size: str, quality: str, n: int,
-                          source_image: bytes | None = None, source_mime: str | None = None) -> ImageResult:
+                          source_image: bytes | None = None, source_mime: str | None = None,
+                          complexity: str | None = None) -> ImageResult:
     """Execute one direct call, preserving provider usage alongside bounded image bytes."""
-    validate_image_request(route, size=size, quality=quality, n=n, edit=source_image is not None)
+    validate_image_request(route, size=size, quality=quality, n=n, edit=source_image is not None,
+                           complexity=complexity)
     provider, model = _model(route)
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > _MAX_PROMPT_CHARS:
         raise ProviderValidationError("image prompt is empty or too long")
@@ -255,14 +303,19 @@ async def generate_images(route: dict, *, prompt: str, size: str, quality: str, 
             raise ProviderValidationError("source image MIME is invalid")
     elif source_mime is not None:
         raise ProviderValidationError("source image MIME without data")
+    api_key = await resolve_route_api_key(route)
     if provider == "openai":
         body = {"model": model, "prompt": prompt, "size": size, "quality": quality, "n": n}
-        headers = {"Authorization": f"Bearer {route['api_key']}"}
+        if complexity is not None:
+            body["complexity"] = complexity
+        headers = {"Authorization": f"Bearer {api_key}"}
         if source_image is None:
             result = await _post("https://api.openai.com/v1/images/generations", headers=headers,
+                                 relay_ref=route.get("provider_auth"), relay_model=model,
                                  count=n, json_body=body)
         else:
             result = await _post("https://api.openai.com/v1/images/edits", headers=headers,
+                                 relay_ref=route.get("provider_auth"), relay_model=model,
                                  count=n, form=body,
                                  files={"image": ("source.png", source_image, source_mime)})
         data = result.get("data")
@@ -283,7 +336,8 @@ async def generate_images(route: dict, *, prompt: str, size: str, quality: str, 
         response_format["image_size"] = quality.upper()
     result = await _post(
         "https://generativelanguage.googleapis.com/v1beta/interactions",
-        headers={"x-goog-api-key": route["api_key"]}, count=1,
+        relay_ref=route.get("provider_auth"), relay_model=model,
+        headers={"x-goog-api-key": api_key}, count=1,
         json_body={"model": model, "input": inputs, "response_format": response_format, "store": False},
     )
     if result.get("status") != "completed":

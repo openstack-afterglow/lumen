@@ -2,7 +2,7 @@ name: Lumen Package Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['[0-9]*.[0-9]*.[0-9]*', 'v*']
   workflow_dispatch:
 
 permissions:
@@ -35,10 +35,11 @@ jobs:
           PYTHON_VER=$(python3 -c "import lumen; print(lumen.__version__)")
           echo "Package version: ${PYTHON_VER}"
 
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TAG_VER="${GITHUB_REF#refs/tags/v}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_VER="${GITHUB_REF#refs/tags/}"
+            TAG_VER="${TAG_VER#v}"
             echo "Git tag version: ${TAG_VER}"
-            if [ "${PYTHON_VER}" != "${TAG_VER}" ]; then
+            if [[ ! "${TAG_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [ "${PYTHON_VER}" != "${TAG_VER}" ]; then
               echo "ERROR: Git tag version (${TAG_VER}) does not match package version (${PYTHON_VER})"
               exit 1
             fi
@@ -78,7 +79,7 @@ jobs:
           path: dist/*.whl
 
       - name: Attach Wheel to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.whl

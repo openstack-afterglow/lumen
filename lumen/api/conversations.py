@@ -1,6 +1,6 @@
 """빌트인 AI 채팅 대화/메시지 API (사용자 소유 리소스).
 
-전 엔드포인트 get_token_info 인증 + user_id 소유권 검증(IDOR 방어, 프로젝트 무관).
+모든 경로는 서비스 scope 및 user/project 소유권을 검증한다.
 서비스(conversation_store)가 소유권을 강제하고, 예외를 HTTP 상태로 매핑한다.
 """
 
@@ -137,7 +137,10 @@ async def get_chat_capabilities(
         )
     if model_kind == "realtime":
         gates = (resolved.get("capabilities") or {}).get("feature_gates") or {}
-        if all((gates.get(name) or {}).get("available") is True for name in ("audio_input", "audio_output")):
+        # Transcription/translation/GPT-Live models speak only their compatible WebSocket
+        # wires; the native voice session cannot execute them, so it advertises no options.
+        if (all((gates.get(name) or {}).get("available") is True for name in ("audio_input", "audio_output"))
+                and realtime_transport.realtime_kind(resolved) == "conversation"):
             result.update(realtime_transport.available_realtime_options(resolved))
         else:
             result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,
@@ -366,7 +369,7 @@ async def get_conversation(
 
 @router.delete("/conversations/{conversation_id}", status_code=204)
 async def delete_conversation(
-    conversation_id: str, token_info: dict = Depends(require_scopes("native:conversations:write"))
+    conversation_id: str, token_info: dict = Depends(require_scopes("native:conversations:delete"))
 ):
     try:
         await cs.delete_conversation(

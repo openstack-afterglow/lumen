@@ -3,59 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from lumen.auth import Principal, require_scopes
+from lumen.auth import Principal, credential_authority_snapshot, require_scopes
+from lumen.models.api_requests import SpeechRequest, TranscriptionRequest
 from lumen.services import assets, credit, openai_compat
 from lumen.services.conversation_store import ChatStorageUnavailable
 from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.durable_runs import queries
 from lumen.services.durable_runs.audio import admit_audio_run, audio_result
+from lumen.services.durable_runs.media import rejection_http_response
 from lumen.services.providers.errors import ProviderValidationError
 
 router = APIRouter()
 _POLL_INTERVAL_SECONDS = 0.25
-
-
-class SpeechRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    model_id: str = Field(min_length=1, max_length=190)
-    provider_id: int | str | None = None
-
-    input: str = Field(min_length=1, max_length=4096)
-    voice: str = Field(min_length=1, max_length=190)
-    response_format: str = "mp3"
-
-    @field_validator("model_id", "input", "voice")
-    @classmethod
-    def not_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("audio fields must not be blank")
-        return value
-
-
-class TranscriptionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    model_id: str = Field(min_length=1, max_length=190)
-    provider_id: int | str | None = None
-    input_asset_id: UUID
-    language: str | None = Field(default=None, max_length=16, pattern=r"^[A-Za-z-]+$")
-    prompt: str | None = Field(default=None, max_length=1024)
-    # Omitted/[] keeps the plain transcript contract. One entry also rejects duplicates.
-    timestamp_granularities: list[Literal["segment"]] = Field(default_factory=list, max_length=1)
-
-    @field_validator("model_id")
-    @classmethod
-    def not_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("audio model must not be blank")
-        return value
 
 
 def audio_error(exc: Exception) -> HTTPException:
@@ -78,7 +42,8 @@ def audio_error(exc: Exception) -> HTTPException:
 
 
 async def admit(payload: SpeechRequest | TranscriptionRequest, *, kind: str, principal: Principal,
-                idempotency_key: UUID, api_provider: str | None = None) -> str:
+                idempotency_key: UUID, api_provider: str | None = None,
+                required_scopes: tuple[str, ...] | None = None) -> str:
     body = payload.model_dump(mode="json")
     body["kind"] = kind
     if api_provider is not None:
@@ -88,6 +53,8 @@ async def admit(payload: SpeechRequest | TranscriptionRequest, *, kind: str, pri
             body, project_id=principal["project_id"], user_id=principal["user_id"],
             client_request_id=str(idempotency_key), source=principal.get("source", "web"),
             api_key_id=principal.get("api_key_id"),
+            required_scopes=required_scopes,
+            credential_authority=credential_authority_snapshot(principal),
         )
     except (durable_errors.DurableRunError, assets.AssetError, assets.AssetUnavailable,
             ChatStorageUnavailable, credit.QuotaExceeded, ProviderValidationError) as exc:
@@ -115,6 +82,10 @@ async def completed_audio(run_id: str, *, principal: Principal, request: Request
                     after_seq=max(0, run.last_seq - 8),
                 )
                 terminal = next((event for event in reversed(events) if event.type in {"run.failed", "run.canceled"}), None)
+                if terminal is not None and getattr(terminal.payload, "error_code", None) == "provider_rejected":
+                    # The hold was released at zero: the refusal is reported with the upstream status class.
+                    status, _error_type, refusal = rejection_http_response(terminal.payload.safe_message)
+                    raise HTTPException(status_code=status, detail=refusal)
                 message = terminal.payload.safe_message if terminal is not None else "Audio run failed"
                 raise HTTPException(status_code=500, detail=message or "Audio run failed")
         except (durable_errors.DurableRunError, assets.AssetError, assets.AssetUnavailable,

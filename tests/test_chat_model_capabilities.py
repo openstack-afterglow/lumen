@@ -1,4 +1,4 @@
-"""모델 능력(capability) 해석 precedence 단위 테스트 — override > models_dev > litellm."""
+"""Capability precedence: override > stored models.dev > exact local catalog."""
 
 from __future__ import annotations
 
@@ -47,30 +47,26 @@ class TestEffectiveCapabilities:
         assert eff["vision"] is True
         assert eff["feature_gates"]["image_input"]["available"] is True
 
-    def test_litellm_fallback_when_no_stored(self, monkeypatch):
-        import litellm
+    def test_catalog_fallback_when_no_stored(self, monkeypatch):
+        from lumen.services import provider_metadata
 
-        monkeypatch.setattr(litellm, "supports_vision", lambda model: True)
-        monkeypatch.setattr(litellm, "supports_reasoning", lambda model: True)
-        monkeypatch.setattr(litellm, "supports_function_calling", lambda model: False)
+        monkeypatch.setattr(provider_metadata, "_catalog", lambda: {
+            "claude-x": {"litellm_provider": "anthropic", "supports_vision": True,
+                         "supports_reasoning": True, "supports_function_calling": False},
+        })
         row = _Row(model_name="claude-x", capabilities=None)
         eff, source = ps._effective_capabilities(row, "anthropic")
-        assert source == "litellm"
+        assert source == "catalog"
         assert eff["vision"] is True and eff["reasoning"] is True and eff["tool_call"] is False
         assert eff["attachment"] is True  # attachment ≈ vision
-        assert eff["modalities"] is None  # litellm 은 modality 목록 미제공
+        assert eff["modalities"] is None
 
-    def test_litellm_errors_are_safe_false(self, monkeypatch):
-        import litellm
+    def test_catalog_missing_is_safe_false(self, monkeypatch):
+        from lumen.services import provider_metadata
 
-        def _boom(model):
-            raise RuntimeError("unknown model")
-
-        monkeypatch.setattr(litellm, "supports_vision", _boom)
-        monkeypatch.setattr(litellm, "supports_reasoning", _boom)
-        monkeypatch.setattr(litellm, "supports_function_calling", _boom)
+        monkeypatch.setattr(provider_metadata, "_catalog", lambda: {})
         eff, source = ps._effective_capabilities(_Row(capabilities=None), None)
-        assert source == "litellm"
+        assert source == "catalog"
         assert eff["vision"] is False and eff["reasoning"] is False and eff["tool_call"] is False
 
     @pytest.mark.parametrize("model_name", ("perplexity/sonar", "perplexity/glm-5.3"))

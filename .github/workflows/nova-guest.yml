@@ -1,0 +1,147 @@
+name: Nova Guest Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Already published version tag containing the guest builder'
+        required: true
+        type: string
+      release_commit:
+        description: 'Full commit SHA of the published release'
+        required: true
+        type: string
+      api_image:
+        description: 'Published canonical lumen-api OCI index digest reference'
+        required: true
+        type: string
+      worker_image:
+        description: 'Published canonical lumen-worker OCI index digest reference'
+        required: true
+        type: string
+      build_inputs:
+        description: 'Public pinned JSON: dib_version and amd64/arm64 Ubuntu/package-lock inputs; see operations guide'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nova-guest-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: ${{ github.repository == 'openstack-afterglow/lumen' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      release_commit: ${{ steps.source.outputs.release_commit }}
+      api_image: ${{ steps.source.outputs.api_image }}
+      worker_image: ${{ steps.source.outputs.worker_image }}
+      dib_version: ${{ steps.source.outputs.dib_version }}
+      build_inputs: ${{ steps.source.outputs.build_inputs }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Verify release source and required approval policy
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+          API_IMAGE: ${{ inputs.api_image }}
+          WORKER_IMAGE: ${{ inputs.worker_image }}
+          BUILD_INPUTS: ${{ inputs.build_inputs }}
+        run: python3 deploy/nova/release.py validate-source
+
+  build:
+    needs: validate
+    environment: nova-guest-build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        role: [api, worker]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.release_commit }}
+      API_IMAGE: ${{ needs.validate.outputs.api_image }}
+      WORKER_IMAGE: ${{ needs.validate.outputs.worker_image }}
+      BUILD_INPUTS: ${{ needs.validate.outputs.build_inputs }}
+      DIB_VERSION: ${{ needs.validate.outputs.dib_version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.release_commit }}
+          persist-credentials: false
+      - name: Install native build tools and the pinned DIB version
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo qemu-utils debootstrap kpartx gdisk dosfstools squashfs-tools curl
+          python3 -m venv .dib
+          .dib/bin/pip install "diskimage-builder==${DIB_VERSION}"
+          echo "${PWD}/.dib/bin" >> "$GITHUB_PATH"
+      - name: Verify published OCI and build a native preloaded guest
+        env:
+          GUEST_ARCH: ${{ matrix.arch }}
+          GUEST_ROLE: ${{ matrix.role }}
+        run: python3 deploy/nova/release.py build --arch "$GUEST_ARCH" --role "$GUEST_ROLE" --directory guest-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-guest-${{ matrix.role }}-${{ matrix.arch }}
+          path: guest-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: [validate, build]
+    environment: nova-guest-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.release_commit }}
+      API_IMAGE: ${{ needs.validate.outputs.api_image }}
+      WORKER_IMAGE: ${{ needs.validate.outputs.worker_image }}
+      BUILD_INPUTS: ${{ needs.validate.outputs.build_inputs }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.release_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nova-guest-*
+          path: guest-assets
+          merge-multiple: true
+      - name: Independently verify the complete qcow2/checksum/manifest bundle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils
+          python3 deploy/nova/release.py verify-bundle --directory guest-assets
+      - name: Revalidate release identity and approval policy before attachment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 deploy/nova/release.py validate-source
+      - name: Attach verified guests to the existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" guest-assets/* --repo openstack-afterglow/lumen

@@ -1,15 +1,20 @@
 """Canonical, fail-closed model capability detection.
 
-Provider-specific SDK probes are normalized here.  Callers must gate a requested
-feature on the returned availability rather than silently dropping parameters.
+Exact local metadata is normalized here. Callers gate a requested feature on
+availability; an absent observation is not a provider denial.
 """
 
 from typing import Any
 from urllib.parse import urlsplit
 
 from lumen.services.execution_protocol import v2_runtime_ready
-from lumen.services.litellm_client import chatgpt_model_metadata
-from lumen.services.providers.credentials import api_model_name, litellm_model_name
+from lumen.services.provider_metadata import (
+    CATALOG_VERSION,
+    catalog_model_metadata,
+    chatgpt_model_metadata,
+    provider_output_budget_enforced,
+)
+from lumen.services.providers.credentials import transport_model_name
 
 _RUNTIME_TOOL_FEATURES = (
     "mcp",
@@ -162,44 +167,34 @@ def effective_runtime_capabilities(
 
 
 def _probe(name: str, *, model_name: str, provider_type: str | None) -> bool:
-    try:
-        import litellm
-
-        probe = getattr(litellm, name)
-        try:
-            return bool(probe(model=model_name, custom_llm_provider=provider_type))
-        except TypeError:
-            try:
-                return bool(probe(model=model_name))
-            except TypeError:
-                return bool(probe(model_name))
-    except Exception:
-        return False
+    return catalog_model_metadata(model_name, provider_type).get(name) is True
 
 
 def reasoning_explicitly_unsupported(model_name: str, source: str | None, overrides: dict | None) -> bool:
-    """Unknown LiteLLM probes are false too; only a known denial can discard input."""
+    """Only an explicit administrator/catalog denial can discard caller input."""
     if source == "override" and isinstance(overrides, dict) and overrides.get("reasoning") is False:
         return True
-    try:
-        import litellm
-
-        catalog = litellm.model_cost
-        metadata = catalog.get(litellm_model_name(model_name)) if isinstance(catalog, dict) else None
-        return isinstance(metadata, dict) and not bool(metadata.get("supports_reasoning"))
-    except Exception:
-        return False
+    return catalog_model_metadata(model_name).get("supports_reasoning") is False
 
 
 _NATIVE_WEB_SEARCH_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "perplexity"})
 
 
 def _is_perplexity_sonar(model_name: str, provider_type: str | None) -> bool:
-    return provider_type == "perplexity" and model_name.rsplit("/", 1)[-1].lower().startswith("sonar")
+    # Exact legacy search products, not a family-prefix inference.
+    if provider_type != "perplexity":
+        return False
+    from lumen.services.providers.credentials import api_model_name
+
+    return api_model_name(model_name, "perplexity") in {
+        "sonar", "sonar-pro", "sonar-reasoning", "sonar-reasoning-pro", "sonar-deep-research",
+        "perplexity/sonar", "perplexity/sonar-pro", "perplexity/sonar-reasoning",
+        "perplexity/sonar-reasoning-pro", "perplexity/sonar-deep-research",
+    }
 
 
 def _native_web_search_available(model_name: str, provider_type: str | None) -> bool:
-    """Accept native search only when this transport can activate LiteLLM's exact capability."""
+    """Exact catalog observation intersected with native transport support."""
     return provider_type in _NATIVE_WEB_SEARCH_PROVIDERS and _probe(
         "supports_web_search", model_name=model_name, provider_type=provider_type
     )
@@ -216,44 +211,21 @@ def _detected_native_web_search_available(detected: dict[str, Any]) -> bool:
     )
 
 
+def _unavailable_reason(metadata: dict, key: str, *, transport_unsupported: bool = False) -> str:
+    return "provider_unsupported" if transport_unsupported or metadata.get(key) is False else "metadata_unknown"
+
+
 def _catalog_context_limit(model_name: str, provider_type: str | None) -> int | None:
-    """Read only an exact LiteLLM catalog input-window entry.
-
-    Stored Perplexity routes retain their transport prefix (for example,
-    ``perplexity/perplexity/sonar``), while LiteLLM's catalog is keyed by the
-    canonical Agent API identifier (``perplexity/sonar``).  Project that one
-    provider-specific alias, but never infer a limit from a model family or a
-    generic ``max_tokens`` field.
-    """
-    normalized = litellm_model_name(model_name)
-    candidates = [normalized]
-    if provider_type == "perplexity":
-        canonical = api_model_name(normalized, "perplexity")
-        if canonical and canonical not in candidates:
-            candidates.append(canonical)
-    try:
-        import litellm
-
-        catalog = getattr(litellm, "model_cost", {})
-        for candidate in candidates:
-            metadata = catalog.get(candidate) if isinstance(catalog, dict) else None
-            value = metadata.get("max_input_tokens") if isinstance(metadata, dict) else None
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                return value
-    except Exception:
-        pass
-    return None
+    """Only an exact input window counts; max_tokens is not an input limit."""
+    value = catalog_model_metadata(model_name, provider_type).get("max_input_tokens")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str, Any]:
-    """Return the legacy display fields plus canonical feature gates.
-
-    LiteLLM cannot infer managed routes or pricing, so those are deliberately
-    unavailable rather than guessed.
-    """
-    normalized_model = litellm_model_name(model_name)
+def provider_capabilities(model_name: str, provider_type: str | None) -> dict[str, Any]:
+    """Fail-closed availability, retaining observed/unknown metadata provenance."""
+    normalized_model = transport_model_name(model_name)
     is_chatgpt = provider_type == "chatgpt" or model_name.startswith("chatgpt/")
-    metadata = chatgpt_model_metadata(model_name) if is_chatgpt else {}
+    metadata = chatgpt_model_metadata(model_name) if is_chatgpt else catalog_model_metadata(model_name, provider_type)
     vision = (
         bool(metadata.get("supports_vision"))
         if is_chatgpt
@@ -299,8 +271,17 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
         "modalities": None,
         "reasoning_options": [],
         "context_limit": context_limit,
+        "metadata_source": "catalog" if metadata else None,
+        "metadata_status": "observed" if metadata else "missing",
+        "metadata_version": CATALOG_VERSION if metadata else None,
+        "capability_observations": {
+            key: metadata.get(key) if isinstance(metadata.get(key), bool) else None
+            for key in ("supports_vision", "supports_pdf_input", "supports_reasoning",
+                        "supports_function_calling", "supports_response_schema", "supports_web_search")
+        },
         # Canonical gate contract.
         "streaming": True,
+        "output_budget_enforced": provider_output_budget_enforced("chatgpt" if is_chatgpt else provider_type),
         "function_calling": function_calling,
         "parallel_function_calling": parallel_function_calling,
         "structured_output": structured_output,
@@ -322,13 +303,15 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
             "structured_output": {
                 "available": structured_output,
                 "mode": "native" if structured_output else "none",
-                "reason_code": None if structured_output else "provider_unsupported",
+                "reason_code": None if structured_output else _unavailable_reason(
+                    metadata, "supports_response_schema", transport_unsupported=is_chatgpt
+                ),
                 "pricing_available": structured_output,
             },
             "web_search": {
                 "available": supports_web_search,
                 "mode": "native" if supports_web_search else "none",
-                "reason_code": None if supports_web_search else "provider_unsupported",
+                "reason_code": None if supports_web_search else _unavailable_reason(metadata, "supports_web_search"),
                 "pricing_available": supports_web_search,
             },
             "web_fetch": {
@@ -347,13 +330,13 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
             "image_input": {
                 "available": vision,
                 "mode": "native" if vision else "none",
-                "reason_code": None if vision else "provider_unsupported",
+                "reason_code": None if vision else _unavailable_reason(metadata, "supports_vision"),
                 "pricing_available": vision,
             },
             "document_input": {
                 "available": pdf_input,
                 "mode": "native" if pdf_input else "none",
-                "reason_code": None if pdf_input else "provider_unsupported",
+                "reason_code": None if pdf_input else _unavailable_reason(metadata, "supports_pdf_input"),
                 "pricing_available": pdf_input,
             },
             "audio_input": {
@@ -426,6 +409,7 @@ def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode
     )
     gates["web_search"] = gate
     if auth_mode == "chatgpt_device":
+        normalized["output_budget_enforced"] = False
         normalized["structured_output"] = False
         normalized["responses_api"] = True
         normalized["endpoints"] = ["responses"]
@@ -442,14 +426,11 @@ def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode
 
 
 def reasoning_can_be_disabled(capabilities: dict[str, Any] | None, provider_type: str | None) -> bool:
-    """Whether an explicit ``reasoning_effort="none"`` is a valid request, not only a value LiteLLM forwards.
+    """Whether explicit reasoning_effort='none' is supported by stored metadata.
 
-    LiteLLM 1.93 passes ``none`` unchanged to OpenAI (gpt-5 and o3 reject it) and maps it to
-    ``thinkingBudget: 0`` for Gemini (below gemini-2.5-pro's minimum). Only models.dev metadata
-    that advertises disabling qualifies: an effort list with ``none``, a ``toggle``, or a
-    ``budget_tokens`` minimum of exactly 0. Anthropic thinking is opt-in and LiteLLM sends no
-    thinking block for ``none``, so its ``budget_tokens`` minimum is not a floor on disabling.
-    Chat admission and the user model catalog share this rule.
+    Only models.dev metadata advertising disabling qualifies: an effort list
+    with 'none', a toggle, or a budget_tokens minimum of exactly zero. Anthropic
+    thinking is opt-in, so its minimum is not a floor on disabling.
     """
     capabilities = capabilities or {}
     if not capabilities.get("reasoning"):
@@ -476,6 +457,8 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
         return detected
     normalized = dict(detected)
     normalized.update({key: value for key, value in stored.items() if key != "feature_gates"})
+    # Executor parameter fidelity is not an administrator/model capability override.
+    normalized["output_budget_enforced"] = detected.get("output_budget_enforced")
     # ``CapabilitiesInput`` always serializes context_limit, so a stored override that
     # only changed an unrelated flag carries context_limit=None. Never let that erase an
     # exact catalog window (for example the Perplexity Agent route perplexity/sonar);

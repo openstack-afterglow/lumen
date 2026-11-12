@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -198,6 +199,7 @@ def _child_payload(parent_payload: dict[str, Any], agent: dict[str, Any], call: 
         "v2_max_model_turns": prepared["policy"].max_model_turns,
         "v2_max_tool_calls": prepared["policy"].max_tool_calls,
         "lumen_snapshot": None,
+        "required_scopes": ["native:runs:write", "native:agents:use", "native:tools:execute"],
         "delegation": {"call_id": call.call_id, "access": call.access, "fingerprint": call.fingerprint()},
     }
 
@@ -438,11 +440,19 @@ async def prepare_delegations(
                 except DelegationDenied as exc:
                     raise ChildFailure("child_policy_denied", str(exc)) from exc
                 prepared = prepared_inputs[call.call_id]
+                capability_snapshot = dict(prepared["capability_snapshot"])
+                if "credential_authority" in (parent.capability_snapshot or {}):
+                    capability_snapshot["credential_authority"] = deepcopy(parent.capability_snapshot["credential_authority"])
+                else:
+                    capability_snapshot.pop("credential_authority", None)
                 child_id = str(uuid.uuid4())
                 child = ChatRun(
                     id=child_id,
                     run_scope="child",
                     run_kind="completion",
+                    # Agent children execute on the parent's online_text route; no separate pool lookup.
+                    workload_class=parent.workload_class,
+                    worker_pool_id=parent.worker_pool_id,
                     project_id=parent.project_id,
                     user_id=parent.user_id,
                     model_name=prepared["route"]["model_name"],
@@ -455,8 +465,8 @@ async def prepare_delegations(
                     root_run_id=root.id,
                     delegation_call_id=call.call_id,
                     depth=int(parent.depth or 0) + 1,
-                    capability_snapshot=prepared["capability_snapshot"],
-                    required_plugin_digest=prepared["capability_snapshot"].get("required_plugin_digest"),
+                    capability_snapshot=capability_snapshot,
+                    required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
                     pricing_snapshot=prepared["pricing_snapshot"],
                     policy_snapshot={"policy": prepared["policy"].model_dump(mode="json"), "access": call.access},
                     request_payload=encrypt_chat_content(
@@ -511,7 +521,7 @@ async def prepare_delegations(
                             "conversation_id": None,
                             "temp_thread_id": None,
                             "model_name": child.model_name,
-                            "effective_features": (prepared["capability_snapshot"].get("effective_features") or {}),
+                            "effective_features": (capability_snapshot.get("effective_features") or {}),
                             "run_kind": "completion",
                         },
                     ),

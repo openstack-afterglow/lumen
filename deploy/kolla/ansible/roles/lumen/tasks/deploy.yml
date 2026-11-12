@@ -1,10 +1,9 @@
 ---
+- name: Include pull tasks
+  ansible.builtin.include_tasks: pull.yml
+
 - name: Include precheck tasks
   ansible.builtin.include_tasks: precheck.yml
-
-- name: Include source build tasks
-  ansible.builtin.include_tasks: source_build.yml
-  when: lumen_source_mode | default(false) | bool
 
 - name: Include config tasks
   ansible.builtin.include_tasks: config.yml

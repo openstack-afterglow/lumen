@@ -16,7 +16,8 @@ from lumen.crypto import decrypt_llm_provider_billing_admin_key
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import ChatUsageLog, LlmProvider
 
-from .credentials import resolve_api_key
+from .accounts import selected_credential
+from .credentials import resolve_inference_credential
 from .errors import ChatStorageUnavailable
 
 BillingCapability = Literal[
@@ -601,7 +602,10 @@ async def _provider_snapshot(provider: LlmProvider, local_usage: dict | None) ->
         return await _organization_usage_snapshot(base, capability, admin_key, datetime.now(UTC))
 
     try:
-        api_key = resolve_api_key(provider)
+        account, credential = selected_credential(provider)
+        material = await resolve_inference_credential({"provider_id": provider.id, "account_id": account.id,
+            "credential_id": credential.id, "generation": credential.generation, "auth_mode": credential.auth_mode})
+        api_key = material.get("api_key")
     except Exception:
         return {**base, "reason": "credential_unavailable"}
     if not api_key:

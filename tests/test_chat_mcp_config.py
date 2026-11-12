@@ -40,11 +40,15 @@ def _row(**kw) -> ChatMcpServer:
 
 
 class TestTransportPolicy:
-    def test_only_streamable_http_allowed(self):
+    def test_streamable_http_and_sse_are_allowed(self):
         row = _row()
-        es._apply_fields("mcp", row, {"transport": "http"})
-        assert row.transport == "http"
-        for transport in ("sse", "stdio", "grpc"):
+        for transport in ("http", "sse"):
+            es._apply_fields("mcp", row, {"transport": transport})
+            assert row.transport == transport
+
+    def test_local_process_transports_are_rejected(self):
+        row = _row()
+        for transport in ("stdio", "grpc"):
             with pytest.raises(es.ExtensionValidationError):
                 es._apply_fields("mcp", row, {"transport": transport})
 

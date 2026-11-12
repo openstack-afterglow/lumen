@@ -8,31 +8,51 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from lumen_plugin_api.contracts import ExecutionContext, PluginError
 from lumen_plugin_api.mcp import McpGeneratedFile, McpRemoteProvider, McpToolOutput
 
 from lumen.plugins.registry import get_plugin
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["McpGeneratedFile", "McpToolOutput", "list_tools", "call_tool"]
+__all__ = ["McpGeneratedFile", "McpToolOutput", "consumer_message", "list_tools", "call_tool"]
+
+# Codes whose message the plugin wrote for consumers, plus the one connection-level text every path shares.
+_CONSUMER_CODES = frozenset({"mcp_tool_error", "mcp_server_error"})
+CONNECTION_FAILURE_TEXT = "The MCP server could not complete the request. Check the connection status and try again."
+
+
+def consumer_message(exc: BaseException) -> str | None:
+    """Safe consumer-facing text for a remote MCP failure, or None when the failure must stay generic.
+
+    A host-side plugin_unavailable carries internal wording, so only the fixed connection text is returned for it.
+    """
+    if not isinstance(exc, PluginError):
+        return None
+    if exc.code in _CONSUMER_CODES:
+        return str(exc)
+    if exc.code == "plugin_unavailable":
+        return CONNECTION_FAILURE_TEXT
+    return None
 
 
 def _provider() -> McpRemoteProvider:
     return get_plugin("mcp", "remote-mcp")
 
 
-async def list_tools(server: dict[str, Any]) -> list[dict[str, Any]]:
+async def list_tools(server: dict[str, Any], *, context: ExecutionContext | None = None) -> list[dict[str, Any]]:
     try:
-        return await _provider().list_tools(server)
+        return await _provider().list_tools(server, context=context)
     except Exception:
         logger.warning("MCP list_tools failed name=%s", server.get("name"), exc_info=True)
         return []
 
 
-async def call_tool(server: dict[str, Any], tool_name: str, args: dict[str, Any]) -> str | McpToolOutput:
-    try:
-        output = await _provider().call_tool(server, tool_name, args)
-        return output if output.files else output.text
-    except Exception:
-        logger.warning("MCP call_tool failed name=%s tool=%s", server.get("name"), tool_name, exc_info=True)
-        return "MCP 도구 실행 중 오류가 발생했습니다."
+async def discover_tools(server: dict[str, Any], *, context: ExecutionContext | None = None) -> list[dict[str, Any]]:
+    """Strict discovery for catalog refresh: a failure propagates instead of becoming an empty catalog."""
+    return await _provider().list_tools(server, context=context)
+
+
+async def call_tool(server: dict[str, Any], tool_name: str, args: dict[str, Any], *, context: ExecutionContext, expected_credential_epoch: int | None) -> str | McpToolOutput:
+    output = await _provider().call_tool(server, tool_name, args, context=context, expected_credential_epoch=expected_credential_epoch)
+    return output if output.files else output.text

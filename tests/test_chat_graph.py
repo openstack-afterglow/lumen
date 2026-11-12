@@ -1,6 +1,6 @@
 """Phase 2 LangGraph 에이전트 그래프(graph.stream) 단위 테스트.
 
-litellm_client.acompletion_stream 을 mock 해 네트워크 없이 검증:
+provider_client.acompletion_stream 경계에서 검증:
 - stream_mode="custom" 로 token/usage 이벤트가 순서대로 yield 되는지
 - 시작 실패/스트리밍 중 오류 시 error 이벤트
 - **툴 루프**: tool_call 델타 → 테넌트 안전 실행(ToolContext) → 툴 결과 반영 후 최종 답변 스트리밍,
@@ -15,9 +15,26 @@ import pytest
 from lumen_plugin_api.contracts import PluginError
 
 from lumen.models.chat_contracts import validate_chat_run_event
-from lumen.services import graph, litellm_client
+from lumen.services import graph, provider_client
 from lumen.services.tool_runtime import contracts, selection
 from lumen.services.tool_runtime import dispatch as tool_runtime
+
+
+def _runtime_wire(monkeypatch, handler):
+    """Exercise the real Python request/stream boundary with runtime wire JSON."""
+    async def ready():
+        return "http://127.0.0.1:18643", "internal-token"
+
+    monkeypatch.setattr(provider_client, "get_bifrost_runtime", ready)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(handler))
+
+
+def _chat_sse(chunks, *, terminal=True):
+    body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+    if terminal:
+        body += "data: [DONE]\n\n"
+    return httpx.Response(200, headers={"content-type": "text/event-stream",
+        "X-Lumen-Bifrost-Contract": "single-attempt-v1"}, content=body.encode())
 
 # Runtime usage dicts always carry the prompt-cache split; these rounds report no cache.
 _NO_CACHE = {"cache_read_input_tokens": 0, "cache_creation_5m_input_tokens": 0, "cache_creation_1h_input_tokens": 0}
@@ -27,30 +44,30 @@ _MSGS = [{"role": "user", "content": "안녕하세요"}]
 
 
 # --- 텍스트 스트리밍 청크 ---
-class _Delta:
+class _Delta(provider_client.ProviderObject):
     def __init__(self, content):
         self.content = content
 
 
-class _Choice:
+class _Choice(provider_client.ProviderObject):
     def __init__(self, content):
         self.delta = _Delta(content)
 
 
-class _Chunk:
+class _Chunk(provider_client.ProviderObject):
     def __init__(self, content=None, usage=None):
         self.choices = [_Choice(content)]
         self.usage = usage
 
 
 # --- tool_call 델타 청크 ---
-class _ToolFn:
+class _ToolFn(provider_client.ProviderObject):
     def __init__(self, name=None, arguments=None):
         self.name = name
         self.arguments = arguments
 
 
-class _ToolCallDelta:
+class _ToolCallDelta(provider_client.ProviderObject):
     def __init__(self, index=0, id=None, name=None, arguments=None):
         self.index = index
         self.id = id
@@ -67,18 +84,18 @@ class _DummyContextHooks:
         return self.prepared if self.prepared is not None else messages
 
 
-class _DeltaTC:
+class _DeltaTC(provider_client.ProviderObject):
     def __init__(self, content=None, tool_calls=None):
         self.content = content
         self.tool_calls = tool_calls
 
 
-class _ChoiceTC:
+class _ChoiceTC(provider_client.ProviderObject):
     def __init__(self, delta):
         self.delta = delta
 
 
-class _ChunkTC:
+class _ChunkTC(provider_client.ProviderObject):
     def __init__(self, delta, usage=None):
         self.choices = [_ChoiceTC(delta)]
         self.usage = usage
@@ -125,7 +142,7 @@ async def test_modality_call_requires_split_only_while_actual_media_is_present(m
             self.completed.append(kwargs["usage"])
     if replay:
         rounds.pop(0)
-    monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+    monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
     monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
     hooks = Hooks()
     events = [event async for event in graph.stream(model="model", messages=image_messages,
@@ -152,7 +169,7 @@ async def test_actual_priced_image_without_split_is_not_completed_or_replayed(mo
             completed.append(kwargs)
     async def fake_stream(**_kwargs):
         return _aiter([_Chunk("answer", usage={"prompt_tokens": 10, "completion_tokens": 1})])
-    monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+    monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
     with pytest.raises(ValueError, match="image_input"):
         async for _event in graph.stream(model="model", project_id="p1", user_id="u1", execution_hooks=Hooks(),
             token_rates={"image": {"input_per_million": "100000"}},
@@ -163,35 +180,17 @@ async def test_actual_priced_image_without_split_is_not_completed_or_replayed(mo
 
 
 class TestGraphStream:
-    async def test_emits_tokens_then_usage(self, monkeypatch):
-        chunks = [
-            _Chunk("안녕"),
-            _Chunk("하세요"),
-            _Chunk(None, usage={"prompt_tokens": 5, "completion_tokens": 2}),
-        ]
-
-        async def fake_stream(**kwargs):
-            return _aiter(chunks)
-
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-
-        events = [ev async for ev in graph.stream(model="gpt-3.5-turbo", messages=_MSGS, project_id="p1", user_id="u1")]
-        types = [e["type"] for e in events]
-        assert types.count("token") == 2
-        assert events[0] == {"type": "token", "text": "안녕"}
-        usage = [e for e in events if e["type"] == "usage"][-1]
-        assert usage["usage"] == {"prompt_tokens": 5, "completion_tokens": 2, **_NO_CACHE}
 
     async def test_emits_reasoning_events(self, monkeypatch):
         """reasoning_content 델타 → reasoning 이벤트(최종 답변 텍스트와 분리)."""
 
-        class _RDelta:
+        class _RDelta(provider_client.ProviderObject):
             def __init__(self, content=None, reasoning_content=None):
                 self.content = content
                 self.reasoning_content = reasoning_content
                 self.tool_calls = None
 
-        class _RChunk:
+        class _RChunk(provider_client.ProviderObject):
             def __init__(self, delta, usage=None):
                 self.choices = [_ChoiceTC(delta)]
                 self.usage = usage
@@ -205,7 +204,7 @@ class TestGraphStream:
         async def fake_stream(**kwargs):
             return _aiter(chunks)
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         events = [
             ev
             async for ev in graph.stream(
@@ -247,14 +246,14 @@ class TestGraphStream:
     async def test_emits_citations(self, monkeypatch):
         """Perplexity(search_results/citations) + Gemini(annotations) 출처를 정규화·중복제거해 emit."""
 
-        class _CDelta:
+        class _CDelta(provider_client.ProviderObject):
             def __init__(self, content=None, annotations=None, provider_specific_fields=None):
                 self.content = content
                 self.annotations = annotations
                 self.provider_specific_fields = provider_specific_fields
                 self.tool_calls = None
 
-        class _CChunk:
+        class _CChunk(provider_client.ProviderObject):
             def __init__(self, delta, citations=None, search_results=None, content=None, usage=None):
                 self.choices = [_ChoiceTC(delta)]
                 self.citations = citations
@@ -298,7 +297,7 @@ class TestGraphStream:
         async def fake_stream(**kwargs):
             return _aiter(chunks)
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         events = [
             ev async for ev in graph.stream(model="perplexity/sonar", messages=_MSGS, project_id="p1", user_id="u1")
         ]
@@ -329,7 +328,7 @@ class TestGraphStream:
         async def fake_stream(**_kwargs):
             return _aiter([_ChunkTC(_DeltaTC(content="No provider sources."))])
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         events = [
             event
             async for event in graph.stream(
@@ -345,16 +344,16 @@ class TestGraphStream:
         assert not [event for event in events if event["type"] == "citations"]
 
     async def test_anthropic_native_search_citations_become_web_sources(self, monkeypatch):
-        """LiteLLM Anthropic 통합 citation 은 web_search_result_location(URL)과 문서 인용을 함께 싣는다."""
+        """Anthropic citation metadata includes both web and document references."""
 
-        class _PDelta:
+        class _PDelta(provider_client.ProviderObject):
             def __init__(self, content=None, provider_specific_fields=None):
                 self.content = content
                 self.provider_specific_fields = provider_specific_fields
                 self.annotations = None
                 self.tool_calls = None
 
-        class _PChunk:
+        class _PChunk(provider_client.ProviderObject):
             def __init__(self, delta, usage=None):
                 self.choices = [_ChoiceTC(delta)]
                 self.usage = usage
@@ -415,7 +414,7 @@ class TestGraphStream:
         async def fake_stream(**kwargs):
             return _aiter(chunks)
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         events = [
             ev
             async for ev in graph.stream(
@@ -442,141 +441,43 @@ class TestGraphStream:
             "end_index": 9,
         }
 
-    @pytest.mark.parametrize(
-        "source_event",
-        [
-            "annotations",
-            "response.reasoning.search_results",
-            "response.output_item.added",
-            "response.output_item.done",
-            "response.completed",
-        ],
-    )
-    async def test_perplexity_agent_stream_sources_survive_installed_responses_bridge(self, monkeypatch, source_event):
-        """Actual installed LiteLLM must retain annotations and Perplexity's separate search-result events."""
+    @pytest.mark.parametrize("source_field", ["annotations", "search_results", "citations"])
+    async def test_runtime_stream_sources_become_durable_citations(self, monkeypatch, source_field):
+        source = {"url": "https://news.example/seoul", "title": "Seoul weather",
+                  "snippet": "Official weather observation"}
+        chunk = {"choices": [{"index": 0, "delta": {"content": "서울"}, "finish_reason": None}]}
+        if source_field == "annotations":
+            chunk["choices"][0]["delta"]["annotations"] = [{
+                "type": "url_citation", "url": source["url"], "title": source["title"],
+                "start_index": 0, "end_index": 2,
+            }]
+        elif source_field == "search_results":
+            chunk["search_results"] = [source]
+        else:
+            chunk["citations"] = [source["url"]]
+        requests = []
 
-        annotation = {
-            "type": "url_citation",
-            "url": "https://news.example/seoul",
-            "title": "Seoul weather",
-            "start_index": 0,
-            "end_index": 2,
-        }
-        completed = {
-            "type": "response.completed",
-            "response": {
-                "id": "resp_stream",
-                "object": "response",
-                "created_at": 1,
-                "status": "completed",
-                "model": "perplexity/sonar",
-                "output": [
-                    {
-                        "id": "msg_1",
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": "서울", "annotations": [annotation]}],
-                    }
-                ],
-                "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
-                "error": None,
-                "incomplete_details": None,
-                "instructions": None,
-                "metadata": {},
-            },
-        }
-        events = [
-            {
-                "type": "response.output_text.delta",
-                "item_id": "msg_1",
-                "output_index": 0,
-                "content_index": 0,
-                "delta": "서울",
-            },
-            {
-                "type": "response.output_text.annotation.added",
-                "item_id": "msg_1",
-                "output_index": 0,
-                "content_index": 0,
-                "annotation_index": 0,
-                "annotation": annotation,
-            },
-            completed,
-        ]
-        source = {
-            "id": 1,
-            "url": annotation["url"],
-            "title": annotation["title"],
-            "snippet": "Official weather observation",
-        }
-        if source_event != "annotations":
-            completed["response"]["output"][0]["content"][0]["annotations"] = []
-            source_item = {"type": "search_results", "results": [source]}
-            if source_event == "response.completed":
-                completed["response"]["output"].insert(0, source_item)
-                events = [events[0], completed]
-            else:
-                source_payload = (
-                    {"results": [source]}
-                    if source_event == "response.reasoning.search_results"
-                    else {"item": source_item}
-                )
-                events = [
-                    {"type": source_event, "sequence_number": 1, **source_payload},
-                    events[0],
-                    completed,
-                ]
-        body = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
-        body += "data: [DONE]\n\n"
-        captured = {}
+        def handle(request):
+            requests.append(json.loads(request.content))
+            return _chat_sse([chunk, {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 7}}])
 
-        class _Sender:
-            async def post(self, *, url, headers, **kwargs):
-                captured.update(url=url, body=kwargs.get("json"))
-                return httpx.Response(
-                    200,
-                    request=httpx.Request("POST", url),
-                    headers={"content-type": "text/event-stream"},
-                    content=body.encode(),
-                )
-
-        sender = _Sender()
-        monkeypatch.setattr(
-            "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
-            lambda **_kwargs: sender,
-        )
-
-        stream_events = [
-            ev
-            async for ev in graph.stream(
-                model="perplexity/perplexity/sonar",
-                messages=_MSGS,
-                project_id="p1",
-                user_id="u1",
-                custom_llm_provider="perplexity",
-                api_base="https://api.perplexity.ai/v1",
-                api_key="route-key",
-                native_web_search={"search_context_size": "medium"},
-            )
-        ]
-
-        assert "".join(e["text"] for e in stream_events if e["type"] == "token") == "서울"
-        items = [e for e in stream_events if e["type"] == "citations"][-1]["items"]
-        assert items == [
-            {
-                "source_kind": "web",
-                "url": "https://news.example/seoul",
-                "title": "Seoul weather",
-                **(
-                    {"snippet": None, "start_index": 0, "end_index": 2}
-                    if source_event == "annotations"
-                    else {"snippet": source["snippet"]}
-                ),
-            }
-        ]
-        # Intrinsic Sonar search must not acquire a duplicate hosted web_search tool.
-        assert [tool for tool in captured["body"].get("tools") or [] if tool.get("type") == "web_search"] == []
+        _runtime_wire(monkeypatch, handle)
+        events = [event async for event in graph.stream(
+            model="perplexity/sonar", messages=_MSGS, project_id="p1", user_id="u1",
+            custom_llm_provider="perplexity", api_base="https://api.perplexity.ai/v1", api_key="route-key",
+            native_web_search={"search_context_size": "medium"},
+        )]
+        assert "".join(event["text"] for event in events if event["type"] == "token") == "서울"
+        items = [event for event in events if event["type"] == "citations"][-1]["items"]
+        assert len(items) == 1 and items[0]["url"] == source["url"]
+        assert items[0]["source_kind"] == "web"
+        if source_field == "annotations":
+            assert items[0]["start_index"] == 0 and items[0]["end_index"] == 2
+        if source_field == "search_results":
+            assert items[0]["snippet"] == source["snippet"]
+        assert len(requests) == 1 and requests[0]["provider"] == "perplexity"
+        assert requests[0]["body"]["web_search_options"] == {"search_context_size": "medium"}
+        assert not [tool for tool in requests[0]["body"].get("tools", []) if tool.get("type") == "web_search"]
 
     def test_managed_tool_citations_filter_unsafe_urls_and_bound_snippets(self):
         citations = graph._managed_tool_citations(
@@ -605,7 +506,7 @@ class TestGraphStream:
         async def fake_stream(**kwargs):
             return _aiter([_Chunk("답변"), _Chunk(None, usage={"prompt_tokens": 1, "completion_tokens": 1})])
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         events = [ev async for ev in graph.stream(model="gpt-4o", messages=_MSGS, project_id="p1", user_id="u1")]
         assert not any(e["type"] == "citations" for e in events)
 
@@ -616,7 +517,7 @@ class TestGraphStream:
             captured.update(kwargs)
             return _aiter([_Chunk("x")])
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         _ = [
             ev
             async for ev in graph.stream(
@@ -629,594 +530,173 @@ class TestGraphStream:
         ]
         assert captured.get("reasoning_effort") == "high"
 
-    @pytest.mark.parametrize("probe_raises", [False, True])
-    async def test_direct_openai_explicit_none_uses_responses_and_reports_usage(self, monkeypatch, probe_raises):
-        provider_calls = []
+    async def test_explicit_none_reaches_runtime_and_reports_usage(self, monkeypatch):
+        requests = []
 
-        def supports_reasoning(**_kwargs):
-            if probe_raises:
-                raise RuntimeError("catalogue unavailable")
-            return False
+        def handle(request):
+            requests.append(json.loads(request.content))
+            return _chat_sse([
+                {"choices": [{"index": 0, "delta": {"content": "답변"}, "finish_reason": "stop"}]},
+                {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 2}},
+            ])
 
-        async def provider_post(_sender, *, url, headers, **kwargs):
-            provider_calls.append((url, kwargs["json"]))
-            response = {
-                "id": "resp_test", "object": "response", "created_at": 1, "status": "completed",
-                "model": "new-reasoning-model", "output": [{
-                    "id": "msg_1", "type": "message", "status": "completed", "role": "assistant",
-                    "content": [{"type": "output_text", "text": "답변", "annotations": []}],
-                }],
-                "usage": {"input_tokens": 7, "output_tokens": 2, "total_tokens": 9},
-                "error": None, "incomplete_details": None, "instructions": None, "metadata": {},
-            }
-            events = [
-                {"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0,
-                 "content_index": 0, "delta": "답변"},
-                {"type": "response.completed", "response": response},
-            ]
-            data = "".join(f"event: {ev['type']}\ndata: {json.dumps(ev)}\n\n" for ev in events)
-            return httpx.Response(
-                200, request=httpx.Request("POST", url), headers={"content-type": "text/event-stream"},
-                content=(data + "data: [DONE]\n\n").encode(),
-            )
-
-        monkeypatch.setattr("litellm.supports_reasoning", supports_reasoning)
-        monkeypatch.setattr(
-            "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
-            lambda **_kwargs: type("Sender", (), {"post": provider_post})(),
-        )
-        events = [
-            event async for event in graph.stream(
-                model="new-reasoning-model", messages=_MSGS, project_id="p1", user_id="u1",
-                custom_llm_provider="openai", api_key="test-key", reasoning_effort="none",
-                reasoning_can_be_disabled=True, reasoning_route_key="new-route-v1",
-            )
-        ]
-        assert len(provider_calls) == 1
-        assert provider_calls[0][0] == "https://api.openai.com/v1/responses"
-        assert provider_calls[0][1]["reasoning"] == {"effort": "none"}
-        assert provider_calls[0][1]["stream"] is True
-        assert "".join(e["text"] for e in events if e["type"] == "token") == "답변"
-        assert [e for e in events if e["type"] == "usage"][-1]["usage"] == {
+        _runtime_wire(monkeypatch, handle)
+        events = [event async for event in graph.stream(
+            model="new-reasoning-model", messages=_MSGS, project_id="p1", user_id="u1",
+            custom_llm_provider="openai", api_key="test-key", reasoning_effort="none",
+        )]
+        assert len(requests) == 1
+        assert requests[0]["body"]["reasoning_effort"] == "none"
+        assert requests[0]["body"]["stream"] is True
+        assert "".join(event["text"] for event in events if event["type"] == "token") == "답변"
+        assert [event for event in events if event["type"] == "usage"][-1]["usage"] == {
             "prompt_tokens": 7, "completion_tokens": 2, **_NO_CACHE,
         }
 
-    async def test_direct_openai_truncated_responses_stream_fails_without_committing_usage(self, monkeypatch):
-        class Sender:
-            async def post(self, *, url, headers, **kwargs):
-                assert url == "https://api.openai.com/v1/responses"
-                assert kwargs["json"]["stream"] is True
-                event = {"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0,
-                         "content_index": 0, "delta": "부분"}
-                return httpx.Response(
-                    200, request=httpx.Request("POST", url), headers={"content-type": "text/event-stream"},
-                    content=f"event: response.output_text.delta\ndata: {json.dumps(event)}\n\n".encode(),
-                )
+    async def test_truncated_runtime_stream_fails_without_committing_usage(self, monkeypatch):
+        calls = []
 
-        monkeypatch.setattr(
-            "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
-            lambda **_kwargs: Sender(),
-        )
+        def handle(request):
+            calls.append(request)
+            return _chat_sse([
+                {"choices": [{"index": 0, "delta": {"content": "부분"}, "finish_reason": None}]},
+            ], terminal=False)
+
+        _runtime_wire(monkeypatch, handle)
         events = [event async for event in graph.stream(
             model="gpt-4.1-mini", messages=_MSGS, project_id="p1", user_id="u1",
             custom_llm_provider="openai", api_key="test-key",
         )]
         assert any(event["type"] == "error" for event in events), events
         assert not any(event["type"] == "usage" for event in events)
+        assert len(calls) == 1
 
-    async def test_direct_openai_responses_tool_result_continues_into_second_round(self, monkeypatch):
+    async def test_runtime_tool_result_continues_into_second_round(self, monkeypatch):
         requests = []
 
-        async def fake_schemas(_ctx):
-            return [{"type": "function", "function": {
-                "name": "list_my_conversations", "description": "List owned conversations",
-                "parameters": {"type": "object", "properties": {}},
-            }}]
+        async def schemas(_ctx):
+            return [{"type": "function", "function": {"name": "list_my_conversations", "description": "List owned conversations",
+                    "parameters": {"type": "object", "properties": {}}}}]
 
-        async def fake_execute(name, args, ctx):
+        async def execute(name, args, ctx):
             assert name == "list_my_conversations" and ctx.project_id == "p1"
             return contracts.ToolExecutionResult("대화 3개")
 
-        class Sender:
-            async def post(self, *, url, headers, **kwargs):
-                assert url == "https://api.openai.com/v1/responses"
-                body = kwargs["json"]
-                requests.append(body)
-                second = len(requests) == 2
-                item = (
-                    {"id": "msg_2", "type": "message", "status": "completed", "role": "assistant",
-                     "content": [{"type": "output_text", "text": "대화는 3개입니다", "annotations": []}]}
-                    if second else
-                    {"id": "fc_1", "type": "function_call", "status": "completed",
-                     "call_id": "call_Qx7Lm2", "name": "list_my_conversations", "arguments": "{}"}
-                )
-                response = {
-                    "id": f"resp_{len(requests)}", "object": "response", "created_at": 1,
-                    "status": "completed", "model": "gpt-4.1-mini", "output": [item],
-                    "usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13},
-                    "error": None, "incomplete_details": None, "instructions": None, "metadata": {},
-                }
-                stream_events = (
-                    [{"type": "response.output_text.delta", "item_id": "msg_2", "output_index": 0,
-                      "content_index": 0, "delta": "대화는 3개입니다"}]
-                    if second else [
-                        {"type": "response.output_item.added", "output_index": 0,
-                         "item": {**item, "status": "in_progress", "arguments": ""}},
-                        {"type": "response.function_call_arguments.delta", "item_id": "fc_1",
-                         "output_index": 0, "delta": "{}"},
-                    ]
-                )
-                stream_events.append({"type": "response.completed", "response": response})
-                data = "".join(f"event: {ev['type']}\ndata: {json.dumps(ev)}\n\n" for ev in stream_events)
-                return httpx.Response(
-                    200, request=httpx.Request("POST", url), headers={"content-type": "text/event-stream"},
-                    content=(data + "data: [DONE]\n\n").encode(),
-                )
+        def handle(request):
+            requests.append(json.loads(request.content))
+            delta = ({"content": "대화는 3개입니다"} if len(requests) == 2 else {"tool_calls": [{
+                "index": 0, "id": "call_Qx7Lm2", "type": "function",
+                "function": {"name": "list_my_conversations", "arguments": "{}"},
+            }]})
+            return _chat_sse([
+                {"choices": [{"index": 0, "delta": delta, "finish_reason": "stop" if len(requests) == 2 else "tool_calls"}]},
+                {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 3}},
+            ])
 
-        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
-        monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
-        monkeypatch.setattr(
-            "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
-            lambda **_kwargs: Sender(),
-        )
+        monkeypatch.setattr(selection, "context_tool_schemas", schemas)
+        monkeypatch.setattr(tool_runtime, "context_execute_result", execute)
+        _runtime_wire(monkeypatch, handle)
         events = [event async for event in graph.stream(
             model="gpt-4.1-mini", messages=_MSGS, project_id="p1", user_id="u1",
             custom_llm_provider="openai", api_key="test-key",
         )]
         assert len(requests) == 2, events
-        assert requests[0]["tools"][0]["name"] == "list_my_conversations"
-        assert {item["type"] for item in requests[1]["input"]} >= {"function_call", "function_call_output"}
-        assert all(item.get("call_id") == "call_Qx7Lm2" for item in requests[1]["input"] if item["type"].startswith("function_call"))
-        assert "".join(e["text"] for e in events if e["type"] == "token") == "대화는 3개입니다"
-        assert [e for e in events if e["type"] == "usage"][-1]["usage"] == {
+        assert requests[0]["body"]["tools"][0]["function"]["name"] == "list_my_conversations"
+        messages = requests[1]["body"]["messages"]
+        assistant = next(message for message in messages if message.get("tool_calls"))
+        result = next(message for message in messages if message["role"] == "tool")
+        assert assistant["tool_calls"][0]["id"] == result["tool_call_id"] == "call_Qx7Lm2"
+        assert result["content"] == "대화 3개"
+        assert "".join(event["text"] for event in events if event["type"] == "token") == "대화는 3개입니다"
+        assert [event for event in events if event["type"] == "usage"][-1]["usage"] == {
             "prompt_tokens": 20, "completion_tokens": 6, **_NO_CACHE,
         }
 
-    async def test_tool_reasoning_conflict_retries_with_explicit_none(self, monkeypatch):
-        model = "gpt-tool-reasoning-conflict"
-        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
-        calls: list[dict] = []
+    @pytest.mark.parametrize("status", [400, 429, 503, "disconnect"])
+    @pytest.mark.parametrize("effort", ["auto", "high", "none"])
+    @pytest.mark.parametrize("durable", [False, True])
+    async def test_sanitized_provider_failure_never_retries_or_rewrites_intent(self, monkeypatch, caplog, status, effort, durable):
+        calls = []
+        boundaries = []
 
-        async def fake_schemas(_ctx):
+        async def schemas(_ctx):
             return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
-
-        async def fake_stream(**kwargs):
-            calls.append(kwargs)
-            if kwargs.get("extra") is None:
-                raise RuntimeError("Function tools with reasoning_effort are not supported")
-            return _aiter([_Chunk("답변")])
-
-        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-        events = [
-            ev
-            async for ev in graph.stream(
-                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="high",
-                reasoning_route_key="route-a-v1",
-            )
-        ]
-
-        assert any(event["type"] == "token" for event in events)
-        assert [call.get("extra") for call in calls] == [None, {"reasoning_effort": "none"}]
-
-        calls.clear()
-        _ = [
-            ev
-            async for ev in graph.stream(
-                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="high",
-                reasoning_route_key="route-a-v1",
-            )
-        ]
-        assert [call.get("reasoning_effort") for call in calls] == [None]
-        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
-
-    async def test_gpt5_tools_auto_starts_with_explicit_none_before_durable_boundary(self, monkeypatch):
-        model = "gpt-5.6-luna"
-        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
-        calls: list[dict] = []
-
-        async def fake_schemas(_ctx):
-            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
-
-        async def fake_stream(**kwargs):
-            calls.append(kwargs)
-            return _aiter([_Chunk("답변")])
 
         class Hooks:
-            async def provider_started(self, **_payload):
-                return None
-
-            async def provider_failed(self, **_payload):
-                raise AssertionError("compatible first request must not fail its durable boundary")
-
-        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-        monkeypatch.setattr(litellm_client, "direct_openai_stream_completed", lambda _stream: True)
-
-        events = [
-            ev
-            async for ev in graph.stream(
-                model=model,
-                messages=_MSGS,
-                project_id="p1",
-                user_id="u1",
-                custom_llm_provider="openai",
-                reasoning_effort="auto",
-                reasoning_can_be_disabled=True,
-                execution_hooks=Hooks(),
-            )
-        ]
-
-        assert any(event["type"] == "token" for event in events)
-        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
-
-    @pytest.mark.parametrize("effort", ["auto", None])
-    async def test_gpt5_tools_without_advertised_none_keep_provider_default(self, monkeypatch, effort):
-        """gpt-5/gpt-5-mini list minimal..high only; LiteLLM would forward `none` and fail the round."""
-        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
-        calls: list[dict] = []
-
-        async def fake_schemas(_ctx):
-            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
-
-        async def fake_stream(**kwargs):
-            calls.append(kwargs)
-            if (kwargs.get("extra") or {}).get("reasoning_effort") == "none":
-                raise RuntimeError("Unsupported value: 'reasoning_effort' does not support 'none' with this model.")
-            return _aiter([_Chunk("답변")])
-
-        class Hooks:
-            async def provider_started(self, **_payload):
-                return None
-
-            async def provider_failed(self, **_payload):
-                raise AssertionError("a model without advertised none must not record a failed provider call")
-
-        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-        monkeypatch.setattr(litellm_client, "direct_openai_stream_completed", lambda _stream: True)
-
-        events = [
-            ev
-            async for ev in graph.stream(
-                model="gpt-5-mini",
-                messages=_MSGS,
-                project_id="p1",
-                user_id="u1",
-                custom_llm_provider="openai",
-                reasoning_effort=effort,
-                reasoning_can_be_disabled=False,
-                execution_hooks=Hooks(),
-            )
-        ]
-
-        assert any(event["type"] == "token" for event in events)
-        assert [call.get("extra") for call in calls] == [None]
-        assert [call.get("reasoning_effort") for call in calls] == [effort]
-
-    @pytest.mark.parametrize("effort", ["auto", None])
-    async def test_durable_rejected_implicit_none_fails_once_then_is_memoized(self, monkeypatch, effort):
-        """Durable hooks abort at provider_failed, so stale `none` metadata costs one failed run per process."""
-        model = "gpt-5-stale-metadata"
-        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
-        calls: list[dict] = []
-        failed: list[dict] = []
-
-        async def fake_schemas(_ctx):
-            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
-
-        async def fake_stream(**kwargs):
-            calls.append(kwargs)
-            if (kwargs.get("extra") or {}).get("reasoning_effort") == "none":
-                raise RuntimeError("Unsupported value: 'reasoning_effort' does not support 'none' with this model.")
-            return _aiter([_Chunk("답변")])
-
-        class DurableHooks:
-            async def provider_started(self, **_payload):
-                return None
+            async def provider_started(self, **payload):
+                boundaries.append(("started", payload))
 
             async def provider_failed(self, **payload):
-                # Same contract as durable_runs.execution._DurableExecutionHooks._fail.
-                failed.append(payload)
+                boundaries.append(("failed", payload))
                 return {"_boundary_abort": "provider_result_unknown"}
 
-        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-        monkeypatch.setattr(litellm_client, "direct_openai_stream_completed", lambda _stream: True)
+        def handle(request):
+            calls.append(json.loads(request.content))
+            if status == "disconnect":
+                raise httpx.RemoteProtocolError("secret upstream body", request=request)
+            return httpx.Response(status, headers={"X-Lumen-Bifrost-Contract": "single-attempt-v1"},
+                json={"error": {"code": "upstream_rejected", "message": "Function tools with reasoning_effort secret upstream body"}})
 
-        async def run_once(route_key="route-a-v1"):
-            return [
-                ev
-                async for ev in graph.stream(
-                    model=model,
-                    messages=_MSGS,
-                    project_id="p1",
-                    user_id="u1",
-                    custom_llm_provider="openai",
-                    reasoning_effort=effort,
-                    reasoning_can_be_disabled=True,
-                    reasoning_route_key=route_key,
-                    execution_hooks=DurableHooks(),
-                )
-            ]
-
-        first = await run_once()
-        assert [event.get("code") for event in first if event["type"] == "error"] == ["provider_result_unknown"]
-        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
-
-        calls.clear()
-        second = await run_once()
-        assert any(event["type"] == "token" for event in second)
-        assert not any(event["type"] == "error" for event in second)
-        assert [call.get("extra") for call in calls] == [None]
-        assert [call.get("reasoning_effort") for call in calls] == [effort]
-        assert len(failed) == 1
-
-        # Another provider/model row or a new frozen version must not inherit the rejection.
-        calls.clear()
-        other = await run_once("route-b-v1")
-        assert [event.get("code") for event in other if event["type"] == "error"] == ["provider_result_unknown"]
-        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
-
-    async def test_hookless_rejected_implicit_none_retries_default_in_same_round(self, monkeypatch):
-        model = "gpt-5-stale-metadata"
-        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
-        calls: list[dict] = []
-
-        async def fake_schemas(_ctx):
-            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
-
-        async def fake_stream(**kwargs):
-            calls.append(kwargs)
-            if (kwargs.get("extra") or {}).get("reasoning_effort") == "none":
-                raise RuntimeError("Unsupported value: 'reasoning_effort' does not support 'none' with this model.")
-            return _aiter([_Chunk("답변")])
-
-        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-
-        events = [
-            ev
-            async for ev in graph.stream(
-                model=model,
-                messages=_MSGS,
-                project_id="p1",
-                user_id="u1",
-                custom_llm_provider="openai",
-                reasoning_effort="auto",
-                reasoning_can_be_disabled=True,
-            )
-        ]
-
-        assert any(event["type"] == "token" for event in events)
-        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}, None]
-        assert [call.get("reasoning_effort") for call in calls] == [None, "auto"]
-
-    async def test_implicit_none_transient_failure_is_not_memoized_or_retried(self, monkeypatch):
-        model = "gpt-5.1-flaky"
-        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
-        calls: list[dict] = []
-
-        async def fake_schemas(_ctx):
-            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
-
-        async def fake_stream(**kwargs):
-            calls.append(kwargs)
-            raise RuntimeError("upstream connection reset")
-
-        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-
-        events = [
-            ev
-            async for ev in graph.stream(
-                model=model,
-                messages=_MSGS,
-                project_id="p1",
-                user_id="u1",
-                custom_llm_provider="openai",
-                reasoning_effort="auto",
-                reasoning_can_be_disabled=True,
-            )
-        ]
-
+        monkeypatch.setattr(selection, "context_tool_schemas", schemas)
+        _runtime_wire(monkeypatch, handle)
+        events = [event async for event in graph.stream(
+            model="new-reasoning-model", messages=_MSGS, project_id="p1", user_id="u1",
+            custom_llm_provider="openai", api_key="secret-key", reasoning_effort=effort,
+            execution_hooks=Hooks() if durable else None,
+        )]
+        assert len(calls) == 1
         assert any(event["type"] == "error" for event in events)
-        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
+        assert not any(event["type"] in {"token", "usage"} for event in events)
+        assert "secret upstream body" not in json.dumps(events) + caplog.text
+        if effort != "auto":
+            assert calls[0]["body"]["reasoning_effort"] == effort
+        if durable:
+            assert [kind for kind, _ in boundaries] == ["started", "failed"]
 
-    async def test_durable_tool_conflict_without_metadata_fails_once_then_sends_none(self, monkeypatch):
-        """A gpt-5.x route without advertised `none` that needs it learns from one failed run."""
-        model = "gpt-5.6-no-metadata"
-        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
-        calls: list[dict] = []
+    @pytest.mark.parametrize("effort", [None, "auto", "none", "high"])
+    async def test_tool_request_preserves_reasoning_intent_through_durable_boundary(self, monkeypatch, effort):
+        requests = []
+        started = []
 
-        async def fake_schemas(_ctx):
+        async def schemas(_ctx):
             return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
 
-        async def fake_stream(**kwargs):
-            calls.append(kwargs)
-            if kwargs.get("extra") is None:
-                raise RuntimeError("Function tools with reasoning_effort are not supported")
-            return _aiter([_Chunk("답변")])
-
-        class DurableHooks:
-            async def provider_started(self, **_payload):
-                return None
+        class Hooks:
+            async def provider_started(self, **payload):
+                started.append(payload)
 
             async def provider_failed(self, **_payload):
-                return {"_boundary_abort": "provider_result_unknown"}
+                pytest.fail("successful request crossed a failed provider boundary")
 
-        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        def handle(request):
+            requests.append(json.loads(request.content))
+            return _chat_sse([
+                {"choices": [{"index": 0, "delta": {"content": "답변"}, "finish_reason": "stop"}]},
+                {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 2}},
+            ])
 
-        async def run_once(route_key="route-a-v1"):
-            return [
-                ev
-                async for ev in graph.stream(
-                    model=model,
-                    messages=_MSGS,
-                    project_id="p1",
-                    user_id="u1",
-                    custom_llm_provider="openai",
-                    reasoning_effort="auto",
-                    reasoning_can_be_disabled=False,
-                    reasoning_route_key=route_key,
-                    execution_hooks=DurableHooks(),
-                )
-            ]
+        monkeypatch.setattr(selection, "context_tool_schemas", schemas)
+        _runtime_wire(monkeypatch, handle)
+        events = [event async for event in graph.stream(
+            model="new-reasoning-model", messages=_MSGS, project_id="p1", user_id="u1",
+            custom_llm_provider="openai", api_key="test-key", reasoning_effort=effort,
+            execution_hooks=Hooks(),
+        )]
+        assert len(requests) == len(started) == 1
+        if effort in {None, "auto"}:
+            assert "reasoning_effort" not in requests[0]["body"]
+        else:
+            assert requests[0]["body"]["reasoning_effort"] == effort
+        assert requests[0]["body"]["tools"][0]["function"]["name"] == "lookup"
+        assert "".join(event["text"] for event in events if event["type"] == "token") == "답변"
+        assert not any(event["type"] == "error" for event in events)
 
-        first = await run_once()
-        assert [event.get("code") for event in first if event["type"] == "error"] == ["provider_result_unknown"]
-
-        calls.clear()
-        second = await run_once()
-        assert any(event["type"] == "token" for event in second)
-        assert [call.get("extra") for call in calls] == [{"reasoning_effort": "none"}]
-
-        for route_key in ("route-b-v1", "route-a-v2", None):
-            calls.clear()
-            other = await run_once(route_key)
-            assert [event.get("code") for event in other if event["type"] == "error"] == ["provider_result_unknown"]
-            assert [call.get("extra") for call in calls] == [None]
-
-    async def test_tool_conflict_after_rejected_none_restores_explicit_none(self, monkeypatch):
-        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_NONE_REJECTED", set())
-        calls: list[dict] = []
-
-        async def fake_schemas(_ctx):
-            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
-
-        async def fake_stream(**kwargs):
-            calls.append(kwargs)
-            if len(calls) == 1:
-                raise RuntimeError("Unsupported value: reasoning_effort does not support none")
-            if len(calls) == 3:
-                raise RuntimeError("Function tools with reasoning_effort are not supported")
-            return _aiter([_Chunk("답변")])
-
-        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-
-        for _ in range(2):
-            events = [
-                ev
-                async for ev in graph.stream(
-                    model="gpt-5.6-luna", messages=_MSGS, project_id="p1", user_id="u1",
-                    custom_llm_provider="openai", reasoning_effort="auto",
-                    reasoning_can_be_disabled=True, reasoning_route_key="route-a-v1",
-                )
-            ]
-            assert any(event["type"] == "token" for event in events)
-
-        assert [call.get("extra") for call in calls] == [
-            {"reasoning_effort": "none"}, None, None, {"reasoning_effort": "none"},
-        ]
-
-    async def test_gpt5_tools_preserve_explicit_reasoning_effort(self, monkeypatch):
-        calls: list[dict] = []
-
-        async def fake_schemas(_ctx):
-            return [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
-
-        async def fake_stream(**kwargs):
-            calls.append(kwargs)
-            return _aiter([_Chunk("답변")])
-
-        monkeypatch.setattr(selection, "context_tool_schemas", fake_schemas)
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-
-        _ = [
-            ev
-            async for ev in graph.stream(
-                model="gpt-5.6-luna",
-                messages=_MSGS,
-                project_id="p1",
-                user_id="u1",
-                custom_llm_provider="openai",
-                reasoning_effort="high",
-            )
-        ]
-
-        assert [call.get("extra") for call in calls] == [None]
-        assert [call.get("reasoning_effort") for call in calls] == ["high"]
-
-    async def test_reasoning_rejection_falls_back_and_caches(self, monkeypatch):
-        """reasoning 파라미터 400(예: Claude thinking.type 불일치) → reasoning 없이 재시도해 채팅 유지 +
-        해당 모델을 캐시해 이후 요청은 처음부터 reasoning 생략."""
-        model = "claude-fallback-test"
-        monkeypatch.setattr(graph, "_REASONING_UNSUPPORTED", set())
-        monkeypatch.setattr(graph, "_TOOL_REASONING_EXPLICIT_NONE", set())
-        calls: list[dict] = []
-
-        async def fake_stream(**kwargs):
-            calls.append(kwargs)
-            if kwargs.get("reasoning_effort"):
-                raise RuntimeError("thinking.type.enabled is not supported for this model")
-            return _aiter([_Chunk("답변"), _Chunk(None, usage={"prompt_tokens": 1, "completion_tokens": 1})])
-
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
-        events = [
-            ev
-            async for ev in graph.stream(
-                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="low",
-                reasoning_route_key="route-a-v1",
-            )
-        ]
-        # 재시도로 정상 응답, error 이벤트 없음
-        assert any(e["type"] == "token" for e in events)
-        assert not any(e["type"] == "error" for e in events)
-        assert [call.get("reasoning_effort") for call in calls] == ["low", None]
-
-        # 캐시 이후: 다음 요청은 처음부터 reasoning 없이(실패 요청 반복 안 함)
-        calls.clear()
-        _ = [
-            ev
-            async for ev in graph.stream(
-                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="low",
-                reasoning_route_key="route-a-v1",
-            )
-        ]
-        assert [call.get("reasoning_effort") for call in calls] == [None]
-        assert [call.get("extra") for call in calls] == [None]
-        calls.clear()
-        _ = [
-            ev
-            async for ev in graph.stream(
-                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="low",
-                reasoning_route_key="route-a-v2",
-            )
-        ]
-        assert [call.get("reasoning_effort") for call in calls] == ["low", None]
-
-        # Explicit disable intent is not silently replaced with provider-default reasoning.
-        calls.clear()
-        events = [
-            ev
-            async for ev in graph.stream(
-                model=model, messages=_MSGS, project_id="p1", user_id="u1", reasoning_effort="none",
-                reasoning_route_key="route-a-v1",
-            )
-        ]
-        assert [call.get("reasoning_effort") for call in calls] == ["none"]
-        assert any(event["type"] == "error" for event in events)
 
     async def test_error_on_start_failure(self, monkeypatch, caplog):
         async def fake_fail(**kwargs):
             raise RuntimeError("secret-provider-response-body")
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_fail)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_fail)
         events = [ev async for ev in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
         assert any(e["type"] == "error" for e in events)
         assert not any(e["type"] == "token" for e in events)
@@ -1239,7 +719,7 @@ class TestGraphStream:
             async def provider_failed(self, **_payload):
                 return {"_boundary_abort": "provider_result_unknown"}
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_fail)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_fail)
         events = [
             event
             async for event in graph.stream(
@@ -1273,7 +753,7 @@ class TestGraphStream:
             async def provider_failed(self, **_payload):
                 return {"_boundary_abort": "provider_result_unknown"}
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         events = [
             event
             async for event in graph.stream(
@@ -1295,7 +775,7 @@ class TestGraphStream:
             captured.update(kwargs)
             return _aiter([_Chunk("x")])
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         _ = [
             ev
             async for ev in graph.stream(
@@ -1340,7 +820,7 @@ class TestToolLoop:
             captured["user_id"] = ctx.user_id
             return contracts.ToolExecutionResult("대화 3개")
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
 
         events = [ev async for ev in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
@@ -1385,7 +865,7 @@ class TestToolLoop:
                 if self.validations == 2:
                     raise PluginError("plugin_authority_revoked", "skill binding revoked")
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
         hooks = Hooks()
         with pytest.raises(PluginError, match="skill binding revoked"):
@@ -1396,22 +876,14 @@ class TestToolLoop:
         assert provider_calls == 1 and hooks.validations == 2
 
     async def test_multistep_usage_sums_prompt_cache_categories(self, monkeypatch):
-        """Each round's LiteLLM-normalized cache split survives the round sum."""
-        from litellm.llms.anthropic.chat.transformation import AnthropicConfig
-
+        """Each round's neutral cache split survives the round sum."""
         def anthropic_usage(uncached, output, read, five_minute, one_hour):
-            return AnthropicConfig().calculate_usage(
-                {
-                    "input_tokens": uncached,
-                    "output_tokens": output,
-                    "cache_read_input_tokens": read,
-                    "cache_creation_input_tokens": five_minute + one_hour,
-                    "cache_creation": {
-                        "ephemeral_5m_input_tokens": five_minute,
-                        "ephemeral_1h_input_tokens": one_hour,
-                    },
-                },
-                None,
+            return provider_client.ProviderObject(
+                prompt_tokens=uncached + read + five_minute + one_hour,
+                completion_tokens=output,
+                cache_read_input_tokens=read,
+                cache_creation_5m_input_tokens=five_minute,
+                cache_creation_1h_input_tokens=one_hour,
             )
 
         responses = [
@@ -1434,7 +906,7 @@ class TestToolLoop:
         async def fake_execute(_name, _args, _ctx):
             return contracts.ToolExecutionResult("대화 3개")
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
 
         events = [ev async for ev in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
@@ -1498,7 +970,7 @@ class TestToolLoop:
             async def tool_completed(self, **_payload):
                 return None
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
 
         events = [
@@ -1577,7 +1049,7 @@ class TestToolLoop:
             async def tool_failed(self, **payload):
                 self.events.append(("tool_failed", payload))
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
         hooks = Hooks()
 
@@ -1647,7 +1119,7 @@ class TestToolLoop:
             async def tool_failed(self, **_payload):
                 pass
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
         _ = [
             event
@@ -1684,7 +1156,7 @@ class TestToolLoop:
             async def tool_started(self, **_payload):
                 return {"content": "replayed tool result"}
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fail_execute)
         events = [
             event
@@ -1716,7 +1188,7 @@ class TestToolLoop:
                     "usage": {"prompt_tokens": 2, "completion_tokens": 3},
                 }
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fail_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fail_stream)
         events = [
             event
             async for event in graph.stream(
@@ -1756,7 +1228,7 @@ class TestToolLoop:
         async def fake_execute(name, _args, _ctx):
             return contracts.ToolExecutionResult(f"{name} result")
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
 
         events = [event async for event in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
@@ -1792,7 +1264,7 @@ class TestToolLoop:
         async def fake_execute(*_args):
             return contracts.ToolExecutionResult("private advice", visible=False, warning_code="advisor_call_failed")
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
         events = [event async for event in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
 
@@ -1827,7 +1299,7 @@ class TestToolLoop:
                 status="failed",
             )
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", invalid_arguments)
         events = [event async for event in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
 
@@ -1860,7 +1332,7 @@ class TestToolLoop:
         async def must_not_dispatch(*_args):
             raise AssertionError("malformed tool JSON must fail before dispatch")
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", must_not_dispatch)
         events = [event async for event in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
 
@@ -1885,8 +1357,8 @@ class TestUsageEstimation:
         async def fake_schemas(*_):
             return []
 
-        monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_stream)
-        monkeypatch.setattr(graph.litellm_client, "extract_usage", lambda *_: (9, 3))
+        monkeypatch.setattr(graph.provider_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(graph.provider_metadata, "extract_usage", lambda *_: (9, 3))
         monkeypatch.setattr(graph.selection, "context_tool_schemas", fake_schemas)
 
         events = [
@@ -1904,7 +1376,7 @@ async def test_graph_invokes_prepare_context_hook(monkeypatch):
         assert kwargs["messages"] == [{"role": "user", "content": "compacted prompt"}]
         return _aiter([_Chunk(content="Hello")])
 
-    monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+    monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
     hooks = _DummyContextHooks(prepared=[{"role": "user", "content": "compacted prompt"}])
     events = [
         event

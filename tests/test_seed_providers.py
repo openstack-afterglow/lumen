@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from lumen.models.chat_db import LlmModel, LlmProvider
+from lumen.models.chat_db import LlmModel, LlmProvider, LlmProviderAccount, LlmProviderCredential
 from lumen.scripts import seed_providers as seeder
 from lumen.services.providers import repository
 from lumen.services.providers.errors import ProviderValidationError
@@ -72,11 +72,13 @@ def db(monkeypatch: pytest.MonkeyPatch):
     engine = create_engine("sqlite:///:memory:")
     LlmProvider.__table__.create(engine)
     LlmModel.__table__.create(engine)
+    LlmProviderAccount.__table__.create(engine)
+    LlmProviderCredential.__table__.create(engine)
     with engine.begin() as connection:
         connection.exec_driver_sql("CREATE TABLE chat_runs (id TEXT PRIMARY KEY, status TEXT)")
         connection.exec_driver_sql("CREATE TABLE chat_run_providers (run_id TEXT, provider_id INTEGER, model_id INTEGER)")
     sync_factory = sessionmaker(engine, expire_on_commit=False)
-    ids = {LlmProvider: 1, LlmModel: 100}
+    ids = {LlmProvider: 1, LlmModel: 100, LlmProviderAccount: 1000, LlmProviderCredential: 1000}
     monkeypatch.setattr(repository, "_require_db", lambda: lambda: _AsyncSession(sync_factory(), ids))
     monkeypatch.setattr("lumen.services.assets.asset_pipeline_available", lambda: True)
     yield sync_factory, ids
@@ -85,7 +87,14 @@ def db(monkeypatch: pytest.MonkeyPatch):
 
 def _add_provider(db, **fields):
     sync_factory, ids = db
-    row = LlmProvider(id=ids[LlmProvider], auth_mode="api_key", margin_multiplier=1, is_active=True, **fields)
+    key = fields.pop("encrypted_api_key", None)
+    env = fields.pop("api_key_env", None)
+    identity = ids[LlmProvider]
+    row = LlmProvider(id=identity, auth_mode="api_key", margin_multiplier=1, is_active=True,
+        accounts=[LlmProviderAccount(id=identity, provider_id=identity, name="default",
+            credentials=[LlmProviderCredential(id=identity, account_id=identity, name="default", auth_mode="api_key",
+                encrypted_api_key=key, api_key_env=env, subscription_status="disconnected", generation=0,
+                is_active=True, priority=0, weight=1)], is_active=True, priority=0, weight=1)], **fields)
     ids[LlmProvider] += 1
     with sync_factory.begin() as session:
         session.add(row)
@@ -94,7 +103,8 @@ def _add_provider(db, **fields):
 
 def _snapshot(db):
     with db[0]() as session:
-        providers = [(p.name, p.provider_type, p.api_base, p.api_key_env, p.encrypted_api_key)
+        providers = [(p.name, p.provider_type, p.api_base,
+                      p.accounts[0].credentials[0].api_key_env, p.accounts[0].credentials[0].encrypted_api_key)
                      for p in session.scalars(select(LlmProvider).order_by(LlmProvider.id))]
         models = [(m.provider_id, m.model_name, m.model_kind, m.input_price, m.media_pricing)
                   for m in session.scalars(select(LlmModel).order_by(LlmModel.id))]

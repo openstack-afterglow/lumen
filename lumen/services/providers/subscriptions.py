@@ -13,14 +13,6 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
-from litellm.llms.chatgpt.common_utils import (
-    CHATGPT_AUTH_BASE,
-    CHATGPT_CLIENT_ID,
-    CHATGPT_DEVICE_CODE_URL,
-    CHATGPT_DEVICE_TOKEN_URL,
-    CHATGPT_DEVICE_VERIFY_URL,
-    CHATGPT_OAUTH_TOKEN_URL,
-)
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
@@ -28,7 +20,8 @@ from lumen.crypto import decrypt_llm_provider_key, encrypt_llm_provider_key
 from lumen.db import mark_db_unhealthy
 from lumen.models.chat_db import LlmProvider, LlmProviderAuthAttempt
 
-from .credentials import ProviderAuthRef
+from .accounts import _eligible, credential_public, lock_credential
+from .credentials import ProviderAuthRef, validate_auth_ref
 from .errors import (
     ActiveRunConfigurationConflict,
     ChatStorageUnavailable,
@@ -39,8 +32,14 @@ from .errors import (
     ProviderValidationError,
 )
 from .pricing import _provider_public
-from .routing import _lock_mutable_route, _require_db
+from .routing import _require_db
 
+CHATGPT_AUTH_BASE = "https://auth.openai.com"
+CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CHATGPT_DEVICE_CODE_URL = f"{CHATGPT_AUTH_BASE}/api/accounts/deviceauth/usercode"
+CHATGPT_DEVICE_TOKEN_URL = f"{CHATGPT_AUTH_BASE}/api/accounts/deviceauth/token"
+CHATGPT_DEVICE_VERIFY_URL = f"{CHATGPT_AUTH_BASE}/codex/device"
+CHATGPT_OAUTH_TOKEN_URL = f"{CHATGPT_AUTH_BASE}/oauth/token"
 _DEVICE_LIFETIME = timedelta(minutes=15)
 _REFRESH_SKEW = timedelta(seconds=60)
 _MIN_POLL_INTERVAL_SECONDS = 5
@@ -231,28 +230,27 @@ async def _post(url: str, **kwargs: Any) -> httpx.Response:
         raise ProviderSubscriptionError("subscription_upstream_unavailable", 503) from None
 
 
-async def begin_device_auth(provider_id: int, *, user_id: str, project_id: str) -> dict:
+async def begin_device_auth(provider_id: int, *, user_id: str, project_id: str, account_id: int | None = None, credential_id: int | None = None) -> dict:
     factory = _require_db()
     delayed_error: Exception | None = None
     result: dict[str, Any] | None = None
     try:
         async with factory() as session, session.begin():
-            provider, _ = await _lock_mutable_route(session, provider_id=provider_id)
+            provider, account, credential = await lock_credential(session, provider_id, account_id=account_id, credential_id=credential_id)
             if provider is None:
                 raise ProviderNotFoundError("프로바이더를 찾을 수 없습니다")
             _validate_provider_mode(provider, "chatgpt_device")
             attempt = (
                 await session.execute(
                     select(LlmProviderAuthAttempt)
-                    .where(LlmProviderAuthAttempt.provider_id == provider_id)
-                    .with_for_update()
+                    .where(LlmProviderAuthAttempt.credential_id == credential.id).execution_options(populate_existing=True).with_for_update()
                 )
             ).scalar_one_or_none()
             now = _now()
             if attempt is not None and attempt.status == "pending" and not _is_expired(attempt.expires_at):
                 if attempt.initiated_by_user_id != user_id or attempt.initiated_by_project_id != project_id:
                     raise ProviderAuthAttemptConflict("다른 관리자가 구독 연결을 진행 중입니다")
-                if attempt.provider_generation != provider.subscription_generation:
+                if attempt.provider_generation != credential.generation:
                     _terminalize(attempt, "error", _MIN_POLL_INTERVAL_SECONDS)
                     delayed_error = ProviderConfigurationChangedError("프로바이더 인증 설정이 변경되었습니다")
                 else:
@@ -280,12 +278,12 @@ async def begin_device_auth(provider_id: int, *, user_id: str, project_id: str) 
                 expires_at = _device_expiry(upstream, now)
                 payload = {"device_auth_id": device_auth_id, "user_code": user_code, "interval": interval}
                 if attempt is None:
-                    attempt = LlmProviderAuthAttempt(provider_id=provider_id)
+                    attempt = LlmProviderAuthAttempt(provider_id=provider_id, credential_id=credential.id)
                     session.add(attempt)
                 attempt.id = str(uuid.uuid4())
                 attempt.initiated_by_user_id = user_id
                 attempt.initiated_by_project_id = project_id
-                attempt.provider_generation = provider.subscription_generation
+                attempt.provider_generation = credential.generation
                 attempt.encrypted_payload = _encrypt(payload)
                 attempt.status = "pending"
                 attempt.expires_at = expires_at
@@ -324,13 +322,15 @@ async def poll_device_auth(
     *,
     user_id: str,
     project_id: str,
+    account_id: int | None = None,
+    credential_id: int | None = None,
 ) -> dict:
     factory = _require_db()
     delayed_error: Exception | None = None
     result: dict[str, Any] | None = None
     try:
         async with factory() as session, session.begin():
-            provider, _ = await _lock_mutable_route(session, provider_id=provider_id)
+            provider, account, credential = await lock_credential(session, provider_id, account_id=account_id, credential_id=credential_id)
             if provider is None:
                 raise ProviderNotFoundError("인증 요청을 찾을 수 없습니다")
             _validate_provider_mode(provider, "chatgpt_device")
@@ -338,10 +338,9 @@ async def poll_device_auth(
                 await session.execute(
                     select(LlmProviderAuthAttempt)
                     .where(
-                        LlmProviderAuthAttempt.provider_id == provider_id,
+                        LlmProviderAuthAttempt.credential_id == credential.id,
                         LlmProviderAuthAttempt.id == attempt_id,
-                    )
-                    .with_for_update()
+                    ).execution_options(populate_existing=True).with_for_update()
                 )
             ).scalar_one_or_none()
             if (
@@ -357,7 +356,7 @@ async def poll_device_auth(
             if _is_expired(attempt.expires_at):
                 _terminalize(attempt, "expired", interval)
                 return _attempt_status(attempt, interval=interval)
-            if attempt.provider_generation != provider.subscription_generation:
+            if attempt.provider_generation != credential.generation:
                 _terminalize(attempt, "error", interval)
                 delayed_error = ProviderConfigurationChangedError("프로바이더 인증 설정이 변경되었습니다")
             elif _utc(attempt.next_poll_at) > _now():
@@ -422,13 +421,13 @@ async def poll_device_auth(
                             ):
                                 _terminalize(attempt, "error", interval)
                                 delayed_error = ProviderSubscriptionError("subscription_auth_invalid_response", 502)
-                            elif attempt.provider_generation != provider.subscription_generation:
+                            elif attempt.provider_generation != credential.generation:
                                 _terminalize(attempt, "error", interval)
                                 delayed_error = ProviderConfigurationChangedError(
                                     "프로바이더 인증 설정이 변경되었습니다"
                                 )
                             else:
-                                provider.encrypted_subscription_tokens = _encrypt(
+                                credential.encrypted_subscription_tokens = _encrypt(
                                     {
                                         "access_token": access_token,
                                         "refresh_token": refresh_token,
@@ -437,9 +436,9 @@ async def poll_device_auth(
                                         "expires_at": expires_at.isoformat(),
                                     }
                                 )
-                                provider.subscription_status = "configured"
-                                provider.subscription_expires_at = expires_at
-                                provider.subscription_generation += 1
+                                credential.subscription_status = "configured"
+                                credential.subscription_expires_at = expires_at
+                                credential.generation += 1
                                 _terminalize(attempt, "connected", interval)
                                 result = _attempt_status(attempt, interval=interval)
             await session.flush()
@@ -468,11 +467,13 @@ async def cancel_device_auth(
     *,
     user_id: str,
     project_id: str,
+    account_id: int | None = None,
+    credential_id: int | None = None,
 ) -> None:
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
-            provider, _ = await _lock_mutable_route(session, provider_id=provider_id)
+            provider, account, credential = await lock_credential(session, provider_id, account_id=account_id, credential_id=credential_id)
             if provider is None:
                 raise ProviderNotFoundError("인증 요청을 찾을 수 없습니다")
             _validate_provider_mode(provider, "chatgpt_device")
@@ -480,10 +481,9 @@ async def cancel_device_auth(
                 await session.execute(
                     select(LlmProviderAuthAttempt)
                     .where(
-                        LlmProviderAuthAttempt.provider_id == provider_id,
+                        LlmProviderAuthAttempt.credential_id == credential.id,
                         LlmProviderAuthAttempt.id == attempt_id,
-                    )
-                    .with_for_update()
+                    ).execution_options(populate_existing=True).with_for_update()
                 )
             ).scalar_one_or_none()
             if (
@@ -514,7 +514,7 @@ def _validate_claude_token(token: str) -> str:
     return token
 
 
-async def set_subscription_token(provider_id: int, *, token: str, expires_at: datetime | None) -> dict:
+async def set_subscription_token(provider_id: int, *, token: str, expires_at: datetime | None, account_id: int | None = None, credential_id: int | None = None) -> dict:
     token = _validate_claude_token(token)
     if expires_at is not None:
         expires_at = _utc(expires_at)
@@ -523,18 +523,18 @@ async def set_subscription_token(provider_id: int, *, token: str, expires_at: da
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
-            provider, _ = await _lock_mutable_route(session, provider_id=provider_id)
+            provider, account, credential = await lock_credential(session, provider_id, account_id=account_id, credential_id=credential_id)
             if provider is None:
                 raise ProviderNotFoundError("프로바이더를 찾을 수 없습니다")
             _validate_provider_mode(provider, "anthropic_subscription")
-            provider.encrypted_subscription_tokens = _encrypt(
+            credential.encrypted_subscription_tokens = _encrypt(
                 {"access_token": token, "expires_at": expires_at.isoformat() if expires_at else None}
             )
-            provider.subscription_status = "configured"
-            provider.subscription_expires_at = expires_at
-            provider.subscription_generation += 1
+            credential.subscription_status = "configured"
+            credential.subscription_expires_at = expires_at
+            credential.generation += 1
             await session.flush()
-            return _provider_public(provider)
+            return _provider_public(provider) if credential_id is None else credential_public(credential)
     except (
         ActiveRunConfigurationConflict,
         ChatStorageUnavailable,
@@ -547,23 +547,22 @@ async def set_subscription_token(provider_id: int, *, token: str, expires_at: da
         raise ChatStorageUnavailable("chat DB 오류") from None
 
 
-async def disconnect_subscription(provider_id: int) -> None:
+async def disconnect_subscription(provider_id: int, *, account_id: int | None = None, credential_id: int | None = None) -> None:
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
-            provider, _ = await _lock_mutable_route(session, provider_id=provider_id)
+            provider, account, credential = await lock_credential(session, provider_id, account_id=account_id, credential_id=credential_id)
             if provider is None:
                 raise ProviderNotFoundError("프로바이더를 찾을 수 없습니다")
             _validate_provider_mode(provider)
-            provider.encrypted_subscription_tokens = None
-            provider.subscription_status = "disconnected"
-            provider.subscription_expires_at = None
-            provider.subscription_generation += 1
+            credential.encrypted_subscription_tokens = None
+            credential.subscription_status = "disconnected"
+            credential.subscription_expires_at = None
+            credential.generation += 1
             attempt = (
                 await session.execute(
                     select(LlmProviderAuthAttempt)
-                    .where(LlmProviderAuthAttempt.provider_id == provider_id)
-                    .with_for_update()
+                    .where(LlmProviderAuthAttempt.credential_id == credential.id).execution_options(populate_existing=True).with_for_update()
                 )
             ).scalar_one_or_none()
             if attempt is not None and attempt.status == "pending":
@@ -583,38 +582,45 @@ async def disconnect_subscription(provider_id: int) -> None:
 
 
 async def resolve_subscription_credential(ref: ProviderAuthRef) -> dict:
+    validate_auth_ref(ref)
     factory = _require_db()
     delayed_error: ProviderSubscriptionError | None = None
     result: dict[str, Any] | None = None
     try:
         async with factory() as session, session.begin():
-            provider = (
-                await session.execute(select(LlmProvider).where(LlmProvider.id == ref["provider_id"]).with_for_update())
-            ).scalar_one_or_none()
+            try:
+                provider, account, credential = await lock_credential(
+                    session, ref["provider_id"], account_id=ref["account_id"], credential_id=ref["credential_id"])
+            except ProviderNotFoundError:
+                raise ProviderSubscriptionError("subscription_auth_required", 502) from None
             if (
                 provider is None
                 or not provider.is_active
+                or not account.is_active
+                or not credential.is_active
+                or not _eligible(account, ref.get("model_id"), ref.get("required_capabilities", ()))
+                or not _eligible(credential, ref.get("model_id"), ref.get("required_capabilities", ()))
                 or provider.auth_mode != ref["auth_mode"]
-                or provider.subscription_generation != ref["generation"]
-                or provider.subscription_status != "configured"
+                or credential.generation != ref["generation"]
+                or credential.subscription_status != "configured"
             ):
                 raise ProviderSubscriptionError("subscription_auth_required", 502)
-            bundle = _decrypt(provider.encrypted_subscription_tokens)
+            bundle = _decrypt(credential.encrypted_subscription_tokens)
             access_token = _string(bundle, "access_token")
             if access_token is None:
                 raise ProviderSubscriptionError("subscription_auth_required", 502)
             expires_at = _bundle_expiry(bundle)
             if provider.auth_mode == "anthropic_subscription":
                 if expires_at is not None and _is_expired(expires_at):
-                    provider.subscription_status = "reauth_required"
+                    credential.subscription_status = "reauth_required"
                     delayed_error = ProviderSubscriptionError("subscription_auth_required", 502)
             elif expires_at is None:
-                provider.subscription_status = "reauth_required"
+                credential.subscription_status = "reauth_required"
                 delayed_error = ProviderSubscriptionError("subscription_auth_required", 502)
             elif _is_expired(expires_at, skew=_REFRESH_SKEW):
                 refresh_token = _string(bundle, "refresh_token")
                 if refresh_token is None:
-                    provider.subscription_status = "reauth_required"
+                    credential.subscription_status = "reauth_required"
                     delayed_error = ProviderSubscriptionError("subscription_auth_required", 502)
                 else:
                     response = await _post(
@@ -634,7 +640,7 @@ async def resolve_subscription_credential(ref: ProviderAuthRef) -> dict:
                             "invalid_token",
                             "unauthorized_client",
                         }:
-                            provider.subscription_status = "reauth_required"
+                            credential.subscription_status = "reauth_required"
                             delayed_error = ProviderSubscriptionError("subscription_auth_required", 502)
                         else:
                             _raise_upstream_status(response)
@@ -644,7 +650,9 @@ async def resolve_subscription_credential(ref: ProviderAuthRef) -> dict:
                         id_token = _string(refreshed, "id_token")
                         refreshed_expiry = _jwt_expiry(access_token or "")
                         account_id = _jwt_account_id(id_token or access_token or "") or _string(bundle, "account_id")
-                        if access_token is None or id_token is None or refreshed_expiry is None or account_id is None:
+                        if (access_token is None or id_token is None or refreshed_expiry is None
+                                or _is_expired(refreshed_expiry) or account_id is None
+                                or account_id != _string(bundle, "account_id")):
                             raise ProviderSubscriptionError("subscription_auth_invalid_response", 502)
                         bundle = {
                             "access_token": access_token,
@@ -653,8 +661,8 @@ async def resolve_subscription_credential(ref: ProviderAuthRef) -> dict:
                             "account_id": account_id,
                             "expires_at": refreshed_expiry.isoformat(),
                         }
-                        provider.encrypted_subscription_tokens = _encrypt(bundle)
-                        provider.subscription_expires_at = refreshed_expiry
+                        credential.encrypted_subscription_tokens = _encrypt(bundle)
+                        credential.subscription_expires_at = refreshed_expiry
                         expires_at = refreshed_expiry
             if delayed_error is None:
                 result = {
@@ -677,23 +685,26 @@ async def resolve_subscription_credential(ref: ProviderAuthRef) -> dict:
 
 async def _mark_subscription_credential_rejected(ref: ProviderAuthRef, fingerprint: str) -> None:
     """Mark only the still-current rejected credential; stale requests cannot poison a rotation."""
+    validate_auth_ref(ref)
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
-            provider = (
-                await session.execute(select(LlmProvider).where(LlmProvider.id == ref["provider_id"]).with_for_update())
-            ).scalar_one_or_none()
+            try:
+                provider, account, credential = await lock_credential(
+                    session, ref["provider_id"], account_id=ref["account_id"], credential_id=ref["credential_id"])
+            except ProviderNotFoundError:
+                return
             if (
                 provider is None
                 or provider.auth_mode != ref["auth_mode"]
-                or provider.subscription_generation != ref["generation"]
-                or provider.subscription_status != "configured"
+                or credential.generation != ref["generation"]
+                or credential.subscription_status != "configured"
             ):
                 return
-            bundle = _decrypt(provider.encrypted_subscription_tokens)
+            bundle = _decrypt(credential.encrypted_subscription_tokens)
             current = _string(bundle, "access_token")
             if current is not None and hmac.compare_digest(_credential_fingerprint(current), fingerprint):
-                provider.subscription_status = "reauth_required"
+                credential.subscription_status = "reauth_required"
     except (ChatStorageUnavailable, ProviderSubscriptionError):
         raise
     except (IntegrityError, OperationalError):
