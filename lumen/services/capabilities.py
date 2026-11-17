@@ -224,7 +224,7 @@ def provider_capabilities(model_name: str, provider_type: str | None, api_base: 
     prompt_caching = metadata.get("supports_prompt_caching") is True
     parallel_function_calling = bool(metadata.get("supports_parallel_function_calling")) if is_chatgpt else False
     supports_web_search = _native_web_search_available(normalized_model, provider_type, api_base)
-    web_search_required = supports_web_search and _is_perplexity_sonar(normalized_model, provider_type, api_base)
+    web_search_required = _is_perplexity_sonar(normalized_model, provider_type, api_base)
     configured_context_limit = metadata.get("max_input_tokens")
     context_limit = (
         configured_context_limit

@@ -666,6 +666,8 @@ Perplexity Sonar's built-in search remains a separate, pre-existing behavior: it
 when the optional native-search gate is unavailable or an override disables that gate.
 Sonar remains admitted as before; its unbilled provider search fees are a documented
 known gap, not permission to drop the tools scope or claim complete fee accounting.
+The exact native Sonar product list controls this floor even when a variant is absent
+from the bundled catalog and is enabled through administrator-supplied prices.
 
 ChatGPT subscriptions use OpenAI catalog specifications for discovery, capabilities and
 context only, followed by the existing subscription transport limits. They never borrow
