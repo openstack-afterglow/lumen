@@ -452,6 +452,8 @@ Raw JSON body는 최대 **16 MiB**다(전체 서비스의 더 작은 receive 상
 
 공유 `input`은 최대 10,485,760자 string 또는 최대 131,072개 message/tool item 배열이다. User content는 `input_text`, `input_image`, `input_json`; developer/system은 input text만, assistant는 `output_text`/`refusal`만 받는다. Function/custom call과 text/image output은 앞선 같은 종류 call의 `call_id`와 일치해야 한다. Content part 배열 상한은 16,384개다. Files/file IDs, audio, item references 및 알 수 없는 필드는 거절한다.
 
+Input item은 `type`(생략 시 message)으로 한 번만 분기한다. Decisions 422 응답은 최대 20개 오류의 bounded `type`/`loc`/`msg`만 반환하며 원본 input/body를 echo하지 않는다.
+
 `input_json.data`는 object 또는 object 배열이다. Root를 포함한 container 깊이 32, root/container를 포함한 값 10,000개, compact UTF-8 JSON 256 KiB가 상한이며 NaN/Infinity는 거절한다. Data 내부 `role`, `type`, `image_url` 등은 일반 JSON 값이지 protocol part가 아니다. `input_image.image_url`은 `data:`, `http://`, `https://`로 시작해야 하며 detail은 `low|high|auto|original` 또는 null이다. 공유 input과 질문 instructions 전체 image 합계는 최대 16개다. **Lumen은 image URL을 직접 fetch하지 않는다.** `prompt_cache_key`는 최대 64자, `safety_identifier`는 최대 128자, `prompt_cache_options.ttl`은 `"30m"`만 받는다.
 
 ### 응답과 정산
@@ -464,11 +466,15 @@ Usage의 input/output/total과 cached/cache-write/reasoning count는 필수인 �
 
 모델의 effective manual/catalog rate를 사용한다. `input_tokens > long_context_threshold_tokens`이고 해당 tier rate가 있을 때 그 rate를 사용한다. 입력 가격이 없으면 upstream 전에 거절한다. Cached/cache-write usage가 보고되었으나 해당 가격이 없으면 502로 fail closed하며 quota hold는 unknown으로 보존한다. 모델의 다른 endpoint output 가격은 Decisions에 적용하지 않는다. Cache write는 기존 ledger의 `cache_creation_5m_input_tokens` 저장 slot에 매핑하지만 pricing snapshot에는 실제 `"30m"` TTL을 명시한다.
 
+다른 chat endpoint의 `fallback_input:*` 등 추정 cache 가격은 Decisions의 공시/수동 가격으로 인정하지 않는다. 검증된 usage와 가격은 answer 형식 검사보다 먼저 정산한다. 따라서 answer만 잘못된 응답은 502여도 실제 비용 원장/settled hold를 유지하며 full-bound unknown으로 남기지 않는다. 공식 schema의 빈 probability 배열과 반올림된 분포를 허용하고 probability 합계의 임의 허용오차로 거절하지 않는다.
+
 MariaDB wallet lock과 READ COMMITTED transaction 안에서 upper-bound credit hold를 먼저 등록한다. User 월·주간 한도와 API-key 월·주간 한도 모두 durable + stateless active hold를 합산한다. 정산은 hold→settled와 immutable usage/wallet debit을 같은 transaction에서 적용하고 event UUID로 정확히 한 번 debit한다. Usage component category/kind는 `decision`이며 counts/cost만 남기고 prompt/JSON/image URL/question/answer content는 저장하지 않는다.
 
-Upper bound는 전체 text/JSON/tool/choice wire skeleton의 기존 tokenizer estimate와 UTF-8 byte 수 중 큰 값 + 4,096 framing tokens + **image당 1,000,000 tokens**다. 전체 상한은 32,000,000 tokens이고 cache-write/long-context를 포함한 가장 높은 effective input rate로 예약한다. [공식 vision 규칙](https://developers.openai.com/api/docs/guides/images-vision#calculating-costs)은 patch limit 30,000과 모델별 multiplier를 설명하지만 현재 표에는 `gpt-6-luna` profile/multiplier가 없다. 따라서 image당 1,000,000은 공식 견적이 아닌 보수적인 **로컬 admission ceiling**이다. 실제 usage가 입장 시 token ceiling을 넘으면 502 및 unknown hold로 처리한다.
+Upper bound는 전체 text/JSON/tool/choice wire skeleton의 **UTF-8 byte 수 + 4,096 framing tokens + image당 1,000,000 tokens**다. Byte-level tokenizer는 UTF-8 byte 수보다 많은 토큰을 만들지 않으므로 같은 큰 body를 다시 tokenize하지 않는다. 전체 상한은 32,000,000 tokens이고 cache-write/long-context를 포함한 가장 높은 effective input rate로 예약한다. [공식 vision 규칙](https://developers.openai.com/api/docs/guides/images-vision#calculating-costs)은 patch limit 30,000과 모델별 multiplier를 설명하지만 현재 표에는 `gpt-6-luna` profile/multiplier가 없다. 따라서 image당 1,000,000은 공식 견적이 아닌 보수적인 **로컬 admission ceiling**이다. 실제 usage가 입장 시 token ceiling을 넘으면 502 및 unknown hold로 처리한다.
 
 Upstream은 `{api_base or https://api.openai.com/v1}/decisions`에 single attempt로 전송하며 redirects/environment proxies/retries를 쓰지 않는다. 전체 120초, connect 10초, write 30초, response 8 MiB 상한이다. 명확한 connection-before-send 실패와 provider rejection은 hold를 release한다. Send 이후 timeout/cancel/불명확한 응답/정산 실패는 `unknown`, process crash는 `reserved`를 유지한다. **두 상태는 시간이 지나도 quota에서 제외하지 않는다.** 자동 재전송/자동 만료/자동 재정산은 없다.
+
+Durable provider 경계와 같은 명확한 rejection status(400/401/403/404/413/415/422/429)만 hold를 release한다. 그 외 non-200 응답(redirect, 다른 success status, 408/409/499 등)은 unknown이다. Cleanup DB failure는 event UUID로 기록하며 원래의 API 오류를 raw 500으로 바꾸지 않는다.
 
 공식 OpenAI root(`https://api.openai.com` 및 trailing slash 포함)는 기존 direct-provider base 판별을 재사용해 `/v1/decisions`로 정규화한다. 공식 `/v1` base와 미지정 base도 같은 URL을 쓴다. Third-party custom root/prefix에는 `/v1`을 임의로 추가하지 않고 저장된 prefix 뒤 `/decisions`만 붙인다.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import uuid
 from collections.abc import Callable
@@ -14,10 +15,13 @@ from lumen.config import get_settings
 from lumen.models.decision_contracts import DecisionRequest
 from lumen.services import credit, provider_metadata, stateless_credit
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
+from lumen.services.durable_runs.api_completion import _REJECTION_STATUSES
 from lumen.services.inference_authority import authorize_new_io
 from lumen.services.providers import errors, routing
 from lumen.services.providers.credentials import resolve_route_api_key
 from lumen.services.usage_breakdown import UsageBreakdown
+
+logger = logging.getLogger(__name__)
 
 # The published vision table does not specify gpt-6-luna's image multiplier.
 # Use a conservative local admission ceiling, not a claimed official token count.
@@ -63,6 +67,15 @@ def _validate_route(route: dict) -> None:
 
 def _rate(route: dict, key: str, *, required: bool = False) -> Decimal | None:
     raw = route.get(key)
+    category = {
+        "cache_read_price_per_token": "cache_read",
+        "cache_write_price_per_token": "cache_creation_5m",
+    }.get(key.removesuffix("_above_200k"))
+    if category is not None:
+        sources = route.get("cache_price_sources") or {}
+        source = sources.get(f"{category}_above_200k", sources.get(category)) if key.endswith("_above_200k") else sources.get(category)
+        if isinstance(source, str) and source.startswith("fallback_"):
+            raw = None
     if raw is None:
         if required:
             raise DecisionError(422, f"decision pricing unavailable: {key}")
@@ -76,8 +89,8 @@ def _rate(route: dict, key: str, *, required: bool = False) -> Decimal | None:
     return value
 
 
-def input_token_bound(body: DecisionRequest, route: dict) -> int:
-    """Tokenizer estimate plus byte-safe text ceiling, framing and per-image cap."""
+def input_token_bound(body: DecisionRequest) -> int:
+    """Byte-safe text ceiling, framing and conservative per-image cap."""
     payload = body.model_dump(exclude_none=True)
     images = 0
 
@@ -97,10 +110,9 @@ def input_token_bound(body: DecisionRequest, route: dict) -> int:
     text = json.dumps(without_images(payload), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     if images > MAX_IMAGES:
         raise DecisionError(422, "decisions supports at most 16 images per request")
-    estimated = provider_metadata.count_tokens(route["model_name"], text=text)
-    # One UTF-8 byte per token bounds tokenizer unknown/fallback estimates. The
-    # complete wire skeleton includes role/choice/tool text and JSON object keys.
-    bound = max(estimated, len(text.encode("utf-8"))) + 4096 + images * IMAGE_TOKEN_CEILING
+    # Byte-level BPE cannot exceed one token per UTF-8 byte; avoid redundant
+    # synchronous tokenization of the complete wire skeleton.
+    bound = len(text.encode("utf-8")) + 4096 + images * IMAGE_TOKEN_CEILING
     if bound > MAX_INPUT_TOKEN_BOUND:
         raise DecisionError(422, "decision input exceeds local token reservation ceiling")
     return bound
@@ -190,15 +202,15 @@ def validate_answers(raw: object, body: DecisionRequest) -> list[dict]:
                 clean["confidence"] = _probability(answer["confidence"])
                 probabilities = answer["probabilities"]
                 options = question.choices if kind == "choice" else question.levels
-                if not isinstance(probabilities, list) or len(probabilities) != len(options):
+                if not isinstance(probabilities, list) or len(probabilities) > 2000:
                     raise ValueError
                 result = []
                 seen = set()
+                allowed = {(type(option.value), option.value) for option in options} if kind == "choice" else set()
                 for item in probabilities:
                     value = item["value"]
                     if kind == "choice":
                         key = (type(value), value)
-                        allowed = {(type(option.value), option.value) for option in options}
                         if key not in allowed or key in seen:
                             raise ValueError
                         seen.add(key)
@@ -210,12 +222,10 @@ def validate_answers(raw: object, body: DecisionRequest) -> list[dict]:
                             raise ValueError
                         seen.add(value)
                         result.append({"value": value, "label": item["label"], "probability": _probability(item["probability"])})
-                if abs(sum(item["probability"] for item in result) - 1) > 0.001:
-                    raise ValueError
                 clean["probabilities"] = result
                 if kind == "choice":
                     choice = answer["choice"]
-                    if (type(choice), choice) not in seen:
+                    if (type(choice), choice) not in allowed:
                         raise ValueError
                     clean["choice"] = choice
                 else:
@@ -253,7 +263,8 @@ async def transport(route: dict, body: DecisionRequest, *, on_dispatch: Callable
             ) as response:
                 if response.status_code != 200:
                     status = 429 if response.status_code == 429 else 502
-                    raise DecisionError(status, "upstream decision request rejected", uncertain=response.status_code >= 500)
+                    raise DecisionError(status, "upstream decision request rejected",
+                                        uncertain=response.status_code not in _REJECTION_STATUSES)
                 content = bytearray()
                 async for chunk in response.aiter_bytes():
                     if len(content) + len(chunk) > MAX_RESPONSE_BYTES:
@@ -275,7 +286,7 @@ async def transport(route: dict, body: DecisionRequest, *, on_dispatch: Callable
 async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id: str,
                  api_key_id: int | None, required_scopes: tuple[str, ...], source: str = "api") -> dict:
     _validate_route(route)
-    tokens = input_token_bound(body, route)
+    tokens = input_token_bound(body)
     bound = credit_bound(route, tokens)
     event_id = str(uuid.uuid4())
     reserved = sent = False
@@ -298,7 +309,6 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
             cost = decision_cost(route, usage)
         except DecisionError as exc:
             raise DecisionError(502, "reported decision cache usage has no valid rate", uncertain=True) from exc
-        answers = validate_answers(response.get("answers"), body)
         credited = await stateless_credit.settle(
             event_id=event_id, user_id=user_id, project_id=project_id, model_name=route["model_name"],
             provider=route.get("provider_name"), prompt_tokens=usage["input_tokens"],
@@ -310,6 +320,7 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
                                "output_tokens": usage["output_tokens"]}],
         )
         reserved = False
+        answers = validate_answers(response.get("answers"), body)
         return {"model": route["model_name"], "answers": answers, "usage": usage,
                 "cost_usd": float(cost.raw_cost), "credited_cost": float(credited), "usage_log_id": event_id}
     except credit.QuotaExceeded as exc:
@@ -333,4 +344,7 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
         raise DecisionError(503, "decision usage or service unavailable", uncertain=sent) from exc
     finally:
         if reserved:
-            await asyncio.shield(stateless_credit.finish(event_id, uncertain=sent))
+            try:
+                await asyncio.shield(stateless_credit.finish(event_id, uncertain=sent))
+            except Exception:
+                logger.exception("Decision reservation cleanup failed event_id=%s", event_id)

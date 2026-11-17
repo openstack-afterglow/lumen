@@ -17,7 +17,7 @@ Expose OpenAI's generally available classification/scoring endpoint without crea
 
 ## Bound and compatibility
 
-Text admission uses the existing tokenizer plus a UTF-8 byte-safe bound and 4096 framing tokens. Images reserve 1,000,000 input tokens each, up to 16 images and 32,000,000 total reserved tokens. This is a conservative local ceiling: the official vision guide lacks a gpt-6-luna image multiplier. It is not a claim about measured provider tokens.
+Text admission uses a UTF-8 byte-safe bound and 4096 framing tokens, without redundant whole-body tokenization. Images reserve 1,000,000 input tokens each, up to 16 images and 32,000,000 total reserved tokens. This is a conservative local ceiling: the official vision guide lacks a gpt-6-luna image multiplier. It is not a claim about measured provider tokens.
 
 Migration 034 is additive and must precede new writers together with pending 033. Old writers ignore the table but do not count these holds; do not enable Decisions during a mixed old/new quota-writer rollout. Preserve hold and ledger rows on code rollback. Embeddings remains unchanged; its existing precheck-only concurrency limitation is a separate issue.
 
