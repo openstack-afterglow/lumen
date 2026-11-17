@@ -762,7 +762,9 @@ async def relay_audio(
                 if tokens is not None and tokens.pending:
                     server, outgoing = await _drain_final_usage(upstream, server, tokens, provider=provider,
                         wire=wire, outgoing=outgoing, output_limit=output_limit)
-                if kind == "transcription" and closing_until is not None and pending_transcriptions:
+                if kind == "transcription" and pending_transcriptions:
+                    # Deadline, idle, cancel, disconnect and clean upstream close must
+                    # not turn an unfinished committed item into a successful terminal.
                     raise RealtimeTransportError("realtime transcription drain is incomplete")
             finally:
                 client.cancel()

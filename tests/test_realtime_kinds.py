@@ -808,3 +808,37 @@ async def test_native_transcription_matching_priced_kind_reaches_credit_boundary
     intent = admission.existing_run_for_intent.await_args.kwargs["intent"]
     assert intent["realtime_kind"] == "transcription"
     assert "kind" not in intent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", ["deadline", "idle", "upstream_close"])
+async def test_native_transcription_pending_turn_cannot_succeed_on_other_exits(monkeypatch, exit_path):
+    from websockets.exceptions import ConnectionClosedOK
+    from websockets.frames import Close
+
+    class ClosingUpstream(ScriptedUpstream):
+        async def send(self, message):
+            await super().send(message)
+            if exit_path == "upstream_close" and self.sent[-1]["type"] == "input_audio_buffer.commit":
+                await self.queue.put(ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True))
+
+        async def recv(self):
+            frame = await self.queue.get()
+            if isinstance(frame, Exception):
+                raise frame
+            return frame
+
+    if exit_path == "idle":
+        monkeypatch.setattr(realtime_protocol, "_IDLE_SECONDS", 0.01)
+    upstream = ClosingUpstream(lambda _sent: ())
+    _connect(monkeypatch, upstream)
+    browser = ScriptedBrowser([{"type": "audio.input.append", "audio": _PCM},
+                               {"type": "audio.input.commit"}])
+    with pytest.raises(RealtimeTransportError) as failure:
+        await asyncio.wait_for(realtime_protocol.relay_audio(browser,
+            _route("gpt-live-transcribe", _TRANSCRIBE), session_id="session", voice=None, instructions=None,
+            max_duration_seconds=1 if exit_path == "deadline" else 30, is_canceled=_not_canceled), timeout=5)
+    assert failure.value.meter.input_bytes == 320
+    assert [frame["type"] for frame in upstream.sent] == [
+        "session.update", "input_audio_buffer.append", "input_audio_buffer.commit"]
+    assert not any(event["type"] == "session.closed" for event in browser.events)
