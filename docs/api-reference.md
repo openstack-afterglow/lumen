@@ -29,7 +29,7 @@ Authenticated `GET /v1/policy/capabilities` has no service-entitlement prerequis
 | Surface | API-key scope | Keystone only |
 | --- | --- | --- |
 | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities` | `models:read` | 아니오 |
-| `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` | `compat:completions:write` | 아니오 |
+| `POST /v1/chat/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` | `compat:completions:write` | API-key routes reject Keystone credentials |
 | conversations read/write | `native:conversations:read` / `native:conversations:write` | 아니오 |
 | native run read/write | `native:runs:read` / `native:runs:write` | 아니오 |
 | `GET /v1/runs/{id}/children` | `native:runs:read` (same user/project parent) | 아니오 |
@@ -56,12 +56,12 @@ API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만
 | 그룹 | Route |
 | --- | --- |
 | Discovery/health | `GET /`, `/v1/` (both advertise `rel=models` for `/v1/models`), `/v1/health`, `/v1/ready`, compat `GET /v1/compat` |
-| Compat | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` |
+| Compat | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`; Gemini `POST /v1beta/models/{model}:embedContent` and `:batchEmbedContents` |
 | Legacy Lumen device gateway | `/.well-known/oauth-authorization-server`, `/oauth/device/code`, `/oauth/token`, `/v1/managed-settings`, `/v1/models`, `/v1/messages`, `/v1/messages/count_tokens` under the configured `/v1/claude-gateway` base; not the current Claude Apps Gateway protocol |
 | Conversations | `POST/GET /v1/conversations`, `GET/DELETE /v1/conversations/{id}`, projected message pages/search/fork/workspace/active-leaf, completion/regenerate/retry/runs subroutes |
 | Native runs/children | `POST /v1/temp-completions`; `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/events`, `/v1/runs/{id}/children`, `/v1/temp-threads/{id}`; approval/interaction/cancel POST routes |
 | Context | `POST /v1/conversations/{id}/context-preview`, `/compactions`; equivalent `POST /v1/temp-threads/{id}/context-preview`, `/compactions`. Preview is read-only; compaction requires `Idempotency-Key` and `expected_context_revision`, returns a durable `run_kind="compaction"` descriptor. |
-| Media | Native `POST /v1/chat/images/generations`, `/edits`, `/v1/chat/audio/speech`, `/transcriptions`, `/v1/chat/realtime/sessions`; native realtime `WS /v1/chat/realtime/sessions/{session_id}/ws` (conversation models only); compat `POST /v1/images/generations`, `/edits`, `/v1/audio/speech`, `/transcriptions`; API-key-only `WS /v1/realtime` (conversation, or `?intent=transcription`), `/v1/realtime/translations`, `/v1/live/sessions`, `/v1beta/realtime` |
+| Media and embeddings | Native `POST /v1/chat/images/generations`, `/edits`, `/v1/chat/audio/speech`, `/transcriptions`, `/v1/chat/embeddings`, `/v1/chat/realtime/sessions`; native realtime `WS /v1/chat/realtime/sessions/{session_id}/ws`; compat `POST /v1/images/generations`, `/edits`, `/v1/audio/speech`, `/transcriptions`, `/v1/embeddings`; Gemini `POST /v1beta/models/{model}:embedContent` and `:batchEmbedContents`; realtime compat WS remains `/v1/realtime`, `/v1/realtime/translations`, `/v1/live/sessions`, `/v1beta/realtime` |
 | Batch | Native `POST/GET /v1/chat/batches`, `GET /v1/chat/batches/{id}`, `GET /v1/chat/batches/{id}/items`, `POST /v1/chat/batches/{id}/cancel`; compat `POST/GET /v1/files`, `GET/DELETE /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, `POST/GET /v1/batches`, `GET /v1/batches/{batch_id}`, `POST /v1/batches/{batch_id}/cancel` |
 | Extensions | `GET/POST/PATCH/DELETE /v1/custom-tools`, `/v1/mcp-servers`, `/v1/skills`; OAuth status/disconnect; OAuth start is Keystone-only |
 | Installed plugins | `GET /v1/admin/plugins`; `GET/POST/PATCH/DELETE /v1/admin/plugin-bindings` (verified system admin); `GET/POST/PATCH/DELETE /v1/plugin-bindings` (`native:extensions:read|write|delete`, selected user-configurable exports only). Inventory omits private config unless editor-authorized `include_private=true`; no HTTP wheel installer. |
@@ -132,6 +132,15 @@ Keystone-only `GET /v1/api-keys/issuance-policy`는 fresh keys-editor/current ow
 상세 연동 스펙, 프로필별 Base URL 규칙(OpenAI base URL `/v1` 접미사 vs Anthropic Origin), `CHAT_API_HOSTS` 은닉(404), 에러 JSON 구조 및 SSE 이벤트 처리, TypeScript/Python 연동 예제는 [Afterglow 연동 가이드](afterglow-integration.md)를 참고한다.
 
 인증 없는 `GET /v1/compat`는 현재 요청 origin을 기준으로 OpenAI `sdk_base_url` (`/v1` 포함), Anthropic `sdk_base_url` (Origin), `/v1/responses`, `/v1/messages/count_tokens`, legacy Lumen device base/metadata를 제공한다. 모델 목록과 completion 호출 자체에는 `models:read`, `compat:completions:write` scope를 가진 API key가 필요하다. 런타임 전체 스펙은 `/openapi.json` (`x-required-api-key-scopes` 포함)을 참조한다.
+
+### Text embeddings
+
+Embedding models are registered with `model_kind="embedding"` and the existing input-price-per-million field. They are not chat models or durable media runs. Model discovery marks exact catalog mode `embedding` as a non-chat candidate; an administrator must register the provider/model and configure a supported direct OpenAI or Gemini API-key route.
+
+- `POST /v1/embeddings` requires `compat:completions:write` and accepts `{model, input, dimensions?, encoding_format?, provider?}`. `input` is a string or 1–2048 non-empty strings. Each input is limited by the selected model's input-token limit; OpenAI total input is capped at 300,000 tokens. `dimensions` is supported for OpenAI `text-embedding-3-*` and Gemini embedding models, and cannot exceed that model's default vector size. `encoding_format` is `float` or `base64`; base64 is little-endian float32. Response follows OpenAI `{object:"list",data:[{object:"embedding",index,embedding}],model,usage:{prompt_tokens,total_tokens}}`.
+- `POST /v1beta/models/{model}:embedContent` accepts Gemini `content`, `taskType`, `title`, and `outputDimensionality`; batch endpoint accepts 1–100 requests with the same model and dimensions/task metadata. Auth accepts `x-goog-api-key`, `x-api-key`, or API-key Bearer. Use Google GenAI `http_options.base_url` set to the Lumen origin (without `/v1`); model path is `/v1beta`.
+- `POST /v1/chat/embeddings` is a separate Keystone-session endpoint for the dashboard BFF. It accepts `{model_id,input:[...],dimensions?}` with at most16 inputs and returns indexed vectors, dimensions, usage estimate status and credited cost. It does not persist input or vectors.
+- All routes authorize the selected model's `embeddings` credential operation, perform quota checks, and settle input tokens through the existing usage ledger. Gemini's batch endpoint may omit usage metadata; Lumen uses an offline tokenizer estimate and labels it as estimated in the native response. It never claims vendor-reported usage in that case.
 
 Standalone Compose는 `seed-local`이 같은 scope와 native Console scope를 가진 local key를 발급하고 mode `0600` connection manifest에 저장한다. `docker compose run --rm --no-deps -T lumen-connection`을 명시적으로 실행할 때만 `/v1`로 끝나는 host `base_url`, Compose-network `container_base_url`, key, model을 출력한다. 생성 key를 반환하는 HTTP endpoint는 없다.
 

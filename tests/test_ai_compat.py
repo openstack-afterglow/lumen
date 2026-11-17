@@ -805,7 +805,9 @@ class TestOpenAIEndpoint:
     async def test_models(self, client, _auth, monkeypatch):
         from lumen.services.providers import routing
 
-        async def fake_list():
+        async def fake_list(model_kind=None):
+            if model_kind == "embedding":
+                return []
             return [
                 {
                     "model_name": "gpt-4o",
@@ -978,7 +980,9 @@ class TestOpenAILumenVirtualModel:
 
         monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
 
-        async def fake_list():
+        async def fake_list(model_kind=None):
+            if model_kind == "embedding":
+                return []
             return [
                 {
                     "model_name": "gpt-4o",
@@ -1003,7 +1007,9 @@ class TestOpenAILumenVirtualModel:
 
         monkeypatch.setattr(get_settings(), "chat_default_model", "")
 
-        async def fake_list():
+        async def fake_list(model_kind=None):
+            if model_kind == "embedding":
+                return []
             return [
                 {
                     "model_name": "gpt-4o",
@@ -1599,7 +1605,9 @@ class TestOpenAILumenVirtualModel:
 
         monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
 
-        async def fake_list():
+        async def fake_list(model_kind=None):
+            if model_kind == "embedding":
+                return []
             return [
                 {
                     "model_name": "gpt-4o",

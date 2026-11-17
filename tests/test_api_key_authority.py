@@ -262,6 +262,25 @@ async def test_system_owner_key_has_service_authority_not_platform_admin(monkeyp
     assert error.value.status_code == 403
 
 
+async def test_gemini_api_key_header_uses_regular_scoped_key_authority(monkeypatch):
+    current_roles(monkeypatch, ["member"])
+    session = stored_key(monkeypatch)
+    request = Request({"type": "http", "method": "POST", "path": "/v1beta/models/test:embedContent",
+                       "headers": [(b"x-goog-api-key", _RAW.encode())]})
+    principal = await auth.get_principal(request)
+    assert principal["auth_type"] == "api_key"
+    assert principal["api_key_id"] == 7
+    assert principal["scopes"] == tuple(session.row.scopes)
+
+    request_with_two_keys = Request({
+        "type": "http", "method": "POST", "path": "/v1beta/models/test:embedContent",
+        "headers": [(b"x-api-key", _RAW.encode()), (b"x-goog-api-key", _RAW.encode())],
+    })
+    with pytest.raises(HTTPException) as error:
+        await auth.get_principal(request_with_two_keys)
+    assert error.value.status_code == 400
+
+
 @pytest.mark.parametrize("roles,expected", [
     (["member"], [200, 201, 200, 200, 204]),
     (["manager"], [200, 201, 200, 200, 204]),

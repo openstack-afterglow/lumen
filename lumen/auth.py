@@ -476,6 +476,10 @@ async def get_principal(
     del _keystone_token, _keystone_bearer, _api_key_bearer, _x_api_key
 
     x_api_key = (request.headers.get("X-API-Key") or "").strip()
+    x_goog_api_key = (request.headers.get("X-Goog-Api-Key") or "").strip()
+    if x_api_key and x_goog_api_key:
+        raise HTTPException(status_code=400, detail="여러 API 키 헤더를 동시에 보낼 수 없습니다")
+    x_api_key = x_api_key or x_goog_api_key
     authorization = (request.headers.get("Authorization") or "").strip()
     x_auth_token = (request.headers.get("X-Auth-Token") or "").strip()
     if x_api_key and authorization:

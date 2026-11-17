@@ -311,6 +311,7 @@ async def list_models(
     del token_info
     try:
         models = await routing.list_api_models()
+        models.extend(await routing.list_api_models(model_kind="embedding"))
     except errors.ChatStorageUnavailable:
         models = []
     if x_lumen_provider is not None:

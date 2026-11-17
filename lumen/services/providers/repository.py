@@ -83,11 +83,13 @@ def _validate_model_kind(provider: LlmProvider, kind: str) -> None:
     if kind not in MODEL_KINDS:
         raise ProviderValidationError("지원하지 않는 model_kind 입니다")
     if kind != "text" and (provider.provider_type not in _MEDIA_PROVIDERS or provider.auth_mode != "api_key" or not direct_provider_route(provider.provider_type, provider.api_base)):
-        raise ProviderValidationError("media 모델은 지원되는 direct API-key 프로바이더에서만 등록할 수 있습니다")
+        raise ProviderValidationError("media and embedding models require supported direct API-key provider routes")
 
 
 def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: tuple) -> dict | None:
-    """Media models may carry text input/output/cache-read rates for a token basis, never cache writes."""
+    """Media models may carry applicable text rates; embeddings are input-only."""
+    if kind == "embedding" and any(value is not None for value in token_prices[1:]):
+        raise ProviderValidationError("embedding models support input-token pricing only")
     if kind != "text" and any(value is not None for value in token_prices[3:]):
         raise ProviderValidationError("media 모델에는 cache write 가격을 설정할 수 없습니다")
     return validate_media_pricing(kind, media_pricing)
