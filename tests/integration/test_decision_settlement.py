@@ -114,7 +114,7 @@ async def test_concurrent_decisions_only_one_fitting_request_enters_upstream(sql
         assert "Private" not in str(rows[0].pricing_snapshot) + str(rows[0].usage_components)
 
 
-async def test_settlement_is_atomic_and_idempotent(sql_owner):
+async def test_settlement_is_atomic_and_idempotent(sql_owner, monkeypatch):
     factory, user, project = sql_owner
     event_id = str(uuid.uuid4())
     await stateless_credit.reserve(event_id=event_id, user_id=user, project_id=project, api_key_id=None, bound=Decimal("1"))
@@ -132,6 +132,19 @@ async def test_settlement_is_atomic_and_idempotent(sql_owner):
         assert wallet.used_quota_this_month == amounts[0]
         hold = await session.get(StatelessCallReservation, event_id)
         assert hold.status == "settled" and hold.actual_credits == amounts[0]
+    # Verified billable usage settles even when the provider answer is invalid.
+    invalid = _response()
+    invalid["answers"] = []
+    monkeypatch.setattr(decisions, "transport", AsyncMock(return_value=invalid))
+    with pytest.raises(decisions.DecisionError, match="invalid decision answers"):
+        await decisions.decide(route=_route(), body=_body(), user_id=user, project_id=project,
+                               api_key_id=None, required_scopes=("native:runs:write",))
+    async with factory() as session:
+        holds = (await session.execute(select(StatelessCallReservation).where(
+            StatelessCallReservation.user_id == user))).scalars().all()
+        assert len(holds) == 2 and all(hold.status == "settled" for hold in holds)
+        total = await session.scalar(select(func.sum(ChatUsageLog.credited_cost)).where(ChatUsageLog.user_id == user))
+        assert (await session.get(UserWallet, user)).used_quota_this_month == total == amounts[0] * 2
 
 
 @pytest.mark.parametrize("status", ["reserved", "unknown"])

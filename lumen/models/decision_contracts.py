@@ -4,7 +4,17 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    StrictBool,
+    StrictStr,
+    Tag,
+    field_validator,
+    model_validator,
+)
 
 MAX_DECISION_BODY_BYTES = 16 * 1024 * 1024
 Text = Annotated[StrictStr, Field(max_length=10485760)]
@@ -123,7 +133,21 @@ class ToolOutput(WireModel):
 
 
 Message = Annotated[UserMessage | InstructionMessage | AssistantMessage, Field(discriminator="role")]
-InputItem = Message | FunctionCall | CustomToolCall | ToolOutput
+
+
+def _input_item_type(value: Any) -> str | None:
+    kind = value.get("type", "message") if isinstance(value, dict) else getattr(value, "type", None)
+    return kind if isinstance(kind, str) else None
+
+
+InputItem = Annotated[
+    Annotated[Message, Tag("message")]
+    | Annotated[FunctionCall, Tag("function_call")]
+    | Annotated[CustomToolCall, Tag("custom_tool_call")]
+    | Annotated[ToolOutput, Tag("function_call_output")]
+    | Annotated[ToolOutput, Tag("custom_tool_call_output")],
+    Discriminator(_input_item_type),
+]
 
 
 class QuestionText(WireModel):

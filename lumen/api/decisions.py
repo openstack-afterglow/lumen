@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from lumen.auth import Principal, require_scopes
@@ -23,7 +25,20 @@ class BoundedDecisionRoute(APIRoute):
                     raise HTTPException(413, "decision request body exceeds 16 MiB")
                 content.extend(chunk)
             request._body = bytes(content)
-            return await handler(request)
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                # Do not echo request content or amplify one invalid item into an
+                # unbounded error response. Tag values can also occur in messages.
+                errors = [
+                    {
+                        "type": error["type"][:80],
+                        "loc": [part[:80] if isinstance(part, str) else part for part in error["loc"][:8]],
+                        "msg": error["msg"][:240],
+                    }
+                    for error in exc.errors()[:20]
+                ]
+                return JSONResponse(status_code=422, content={"detail": errors}, headers={"Cache-Control": "no-store"})
         return bounded
 
 

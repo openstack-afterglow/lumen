@@ -55,7 +55,6 @@ def lifecycle(monkeypatch):
     monkeypatch.setattr(decisions, "authorize_new_io", effects["authorize"])
     for name in ("reserve", "finish", "settle"):
         monkeypatch.setattr(stateless_credit, name, effects[name])
-    monkeypatch.setattr(decisions.provider_metadata, "count_tokens", lambda *_args, **_kwargs: 10)
     return effects
 
 
@@ -177,17 +176,16 @@ def test_input_json_limits_and_literal_protocol_keys():
         InputJSON(data=[1])
 
 
-def test_image_bound_counts_only_wire_parts(monkeypatch):
-    monkeypatch.setattr(decisions.provider_metadata, "count_tokens", lambda *_args, **_kwargs: 1)
+def test_image_bound_counts_only_wire_parts():
     plain = DecisionRequest.model_validate(request(input=[{"role": "user", "content": [
         {"type": "input_json", "data": {"type": "input_image", "image_url": "ordinary data"}}]}]))
-    assert decisions.input_token_bound(plain, route()) < decisions.IMAGE_TOKEN_CEILING
+    assert decisions.input_token_bound(plain) < decisions.IMAGE_TOKEN_CEILING
     images = [{"type": "input_image", "image_url": "https://example.test/x"}] * 16
     body = DecisionRequest.model_validate(request(input=[{"role": "user", "content": images}]))
-    assert decisions.input_token_bound(body, route()) >= decisions.IMAGE_TOKEN_CEILING * 16
+    assert decisions.input_token_bound(body) >= decisions.IMAGE_TOKEN_CEILING * 16
     body = DecisionRequest.model_validate(request(input=[{"role": "user", "content": images + images[:1]}]))
     with pytest.raises(decisions.DecisionError, match="16 images"):
-        decisions.input_token_bound(body, route())
+        decisions.input_token_bound(body)
 
 
 @pytest.mark.parametrize("change", [{"provider_type": "anthropic"}, {"model_kind": "embedding"},
@@ -366,14 +364,14 @@ async def test_real_synthetic_http_success_all_answer_types(lifecycle, monkeypat
     lifecycle["finish"].assert_not_called()
 
 
-@pytest.mark.parametrize("status", [302, 401, 429, 503])
+@pytest.mark.parametrize("status", [201, 202, 302, 400, 401, 403, 404, 408, 409, 413, 415, 422, 429, 499, 503])
 async def test_synthetic_http_errors_single_attempt_no_redirect(lifecycle, status):
     with fake_provider({"error": "private upstream body"}, status) as (base, calls):
         with pytest.raises(decisions.DecisionError) as caught:
             await run(selected_route=route(api_base=base))
     assert len(calls) == 1
     assert "private" not in caught.value.message
-    assert lifecycle["finish"].call_args.kwargs["uncertain"] is (status >= 500)
+    assert lifecycle["finish"].call_args.kwargs["uncertain"] is (status not in decisions._REJECTION_STATUSES)
 
 
 async def test_connection_failure_releases_hold(lifecycle):
@@ -513,3 +511,128 @@ async def test_credential_resolution_failure_releases_before_dispatch(lifecycle,
     assert lifecycle["finish"].call_args.kwargs == {"uncertain": False}
     transport.assert_not_called()
     lifecycle["settle"].assert_not_called()
+
+
+@pytest.mark.parametrize("path", ["/v1/decisions", "/v1/chat/decisions"])
+def test_large_invalid_body_has_bounded_validation_response(path):
+    body = request(input=[{"type": "unknown", "payload": "do-not-echo-" + "x" * 69}] * 131072)
+    encoded = json.dumps(body).encode()
+    assert 14 * 1024 * 1024 < len(encoded) < native.MAX_DECISION_BODY_BYTES
+    reply = client().post(path, content=encoded, headers={"Content-Type": "application/json"})
+    assert reply.status_code == 422
+    assert len(reply.content) < 12000
+    errors = reply.json()["detail"]
+    assert len(errors) == 20
+    assert all(set(error) == {"type", "loc", "msg"} for error in errors)
+    assert b"do-not-echo" not in reply.content
+
+
+def test_input_discriminator_reports_one_branch_per_invalid_item():
+    with pytest.raises(ValidationError) as caught:
+        DecisionRequest.model_validate(request(input=[{"type": "unknown"}] * 10))
+    assert len(caught.value.errors()) == 11  # One string-arm error plus one tag error per item.
+    for invalid in ([], {}, 1):
+        with pytest.raises(ValidationError):
+            DecisionRequest.model_validate(request(input=[{"type": invalid}]))
+
+
+def _real_resolved_route(*, custom=False):
+    from provider_fixtures import configured_provider
+
+    from lumen.models.chat_db import LlmModel
+    from lumen.services.providers import routing
+
+    provider = configured_provider(
+        id=1, name="decisions-provider", api_provider="decisions-provider", provider_type="openai",
+        auth_mode="api_key", api_base="https://compatible.example.test/openai/v1" if custom else None,
+        is_active=True, margin_multiplier=Decimal("1"),
+    )
+    provider.accounts[0].id = 2
+    provider.accounts[0].provider_id = 1
+    provider.accounts[0].credentials[0].id = 3
+    provider.accounts[0].credentials[0].account_id = 2
+    model = LlmModel(
+        id=10, provider_id=1, model_name="gpt-6-luna", model_kind="text", is_active=True,
+        input_price=Decimal("0.0000001") if custom else None, output_price=None,
+        capabilities={"decisions": True} if custom else None,
+        capability_source="override" if custom else None,
+    )
+    return routing._resolved_model(model, provider, required_capabilities=("decisions",))
+
+
+@pytest.mark.parametrize("inputs,expected", [(100, "0.00000845"), (272000, "0.02719845"), (272001, "0.0543971")])
+def test_real_catalog_route_uses_luna_30m_cache_write_and_long_context(inputs, expected):
+    selected = _real_resolved_route()
+    assert selected["capabilities"]["decisions"] is True
+    assert selected["cache_write_price_per_token"] * 1000000 == Decimal("0.125")
+    assert selected["cache_write_price_per_token_above_200k"] * 1000000 == Decimal("0.25")
+    assert selected["long_context_threshold_tokens"] == 272000
+    assert decisions.decision_cost(selected, usage(inputs)).raw_cost == Decimal(expected)
+
+
+async def test_real_compatible_input_only_route_refuses_inherited_cache_write(lifecycle, monkeypatch):
+    selected = _real_resolved_route(custom=True)
+    assert selected["cache_price_sources"]["cache_creation_5m"].startswith("fallback_input:")
+    assert selected["cache_write_price_per_token"] == selected["input_price_per_token"]
+    payload = response()
+    payload["usage"] = usage(cached=0, written=10)
+    monkeypatch.setattr(decisions, "transport", AsyncMock(return_value=payload))
+    with pytest.raises(decisions.DecisionError, match="no valid rate"):
+        await run(selected_route=selected)
+    lifecycle["settle"].assert_not_called()
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
+    # The missing tier must not resurrect the inherited base rate above threshold.
+    with pytest.raises(decisions.DecisionError, match="pricing unavailable"):
+        decisions.decision_cost(selected, usage(inputs=272001, cached=0, written=10))
+
+
+@pytest.mark.parametrize("kind", ["choice", "score"])
+def test_official_empty_probabilities_are_accepted(kind):
+    if kind == "choice":
+        question = {"type": kind, "instructions": "", "choices": [{"value": "a"}, {"value": True}]}
+        answer = {"type": kind, "name": None, "choice": True, "confidence": 0.9, "probabilities": []}
+    else:
+        question = {"type": kind, "instructions": "", "levels": [{"label": "low"}, {"label": "high"}]}
+        answer = {"type": kind, "name": None, "score": 0.5, "confidence": 0.9, "probabilities": []}
+    body = DecisionRequest.model_validate(request(questions=[question]))
+    assert decisions.validate_answers([answer], body)[0]["probabilities"] == []
+
+
+def test_rounded_255_choice_probabilities_are_not_rejected_by_sum():
+    options = [{"value": str(index)} for index in range(255)]
+    body = DecisionRequest.model_validate(request(questions=[{"type": "choice", "instructions": "", "choices": options}]))
+    answer = {"type": "choice", "name": None, "choice": "0", "confidence": 0.004,
+              "probabilities": [{"value": str(index), "probability": 0.004} for index in range(255)]}
+    assert len(decisions.validate_answers([answer], body)[0]["probabilities"]) == 255
+
+
+async def test_valid_priced_usage_settles_before_invalid_answers(lifecycle, monkeypatch):
+    payload = response()
+    payload["answers"] = []
+    monkeypatch.setattr(decisions, "transport", AsyncMock(return_value=payload))
+    with pytest.raises(decisions.DecisionError, match="invalid decision answers") as caught:
+        await run()
+    assert caught.value.status_code == 502
+    lifecycle["settle"].assert_awaited_once()
+    lifecycle["finish"].assert_not_called()
+
+
+async def test_cleanup_failure_logs_event_without_masking_original_error(lifecycle, monkeypatch, caplog):
+    original = decisions.DecisionError(429, "original provider rejection")
+    monkeypatch.setattr(decisions, "transport", AsyncMock(side_effect=original))
+    lifecycle["finish"].side_effect = credit.ChatStorageUnavailable("cleanup store unavailable")
+    with pytest.raises(decisions.DecisionError) as caught:
+        await run()
+    assert caught.value is original
+    event_id = lifecycle["reserve"].call_args.kwargs["event_id"]
+    assert f"event_id={event_id}" in caplog.text
+
+
+def test_byte_bound_does_not_tokenize(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("byte-safe quota bound must not invoke a tokenizer")
+
+    monkeypatch.setattr(decisions.provider_metadata, "count_tokens", forbidden)
+    body = DecisionRequest.model_validate(request(input="한국어 " * 100))
+    text = json.dumps(body.model_dump(exclude_none=True), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    assert decisions.input_token_bound(body) == len(text.encode("utf-8")) + 4096
