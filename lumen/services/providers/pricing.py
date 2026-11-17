@@ -27,7 +27,7 @@ _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _USD_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
 _MAX_RATE = Decimal("100000000")
-MODEL_KINDS = frozenset({"text", "image", "tts", "stt", "realtime"})
+MODEL_KINDS = frozenset({"text", "image", "tts", "stt", "realtime", "embedding"})
 _UNIT_SECONDS = {"second": 1, "minute": 60, "hour": 3600}
 # Duration family -> (JSON key, seconds per priced unit). Legacy aliases stay accepted.
 DURATION_PRICE_FAMILIES: dict[str, tuple[tuple[str, int], ...]] = {
@@ -49,7 +49,7 @@ BILLING_BASES = {
     "stt": frozenset({"duration", "tokens"}),
     "realtime": frozenset({"duration", "session", "tokens"}),
 }
-_DEFAULT_BASIS = {"text": "tokens", "image": "unit", "tts": "duration", "stt": "duration", "realtime": "duration"}
+_DEFAULT_BASIS = {"text": "tokens", "image": "unit", "tts": "duration", "stt": "duration", "realtime": "duration", "embedding": "tokens"}
 TOKEN_RATE_MODALITIES = ("image", "audio")
 TOKEN_RATE_FIELDS = ("input_per_million", "cache_read_per_million", "output_per_million")
 MEDIA_PRICE_FIELDS = {
@@ -58,6 +58,7 @@ MEDIA_PRICE_FIELDS = {
     "tts": ("audio_per_character",),
     "stt": (),
     "realtime": (),
+    "embedding": (),
 }
 for _kind_name, _families in _KIND_DURATION_FAMILIES.items():
     MEDIA_PRICE_FIELDS[_kind_name] += tuple(key for family in _families for key, _ in DURATION_PRICE_FAMILIES[family])
@@ -546,6 +547,17 @@ def _effective_capabilities(
     api_base: str | None = None,
 ) -> tuple[dict, str]:
     """Stored override/models.dev data wins before transport limits are applied."""
+    if _kind(row) == "embedding":
+        ready = auth_mode == "api_key" and api_key_configured and provider_type not in {"anthropic", "chatgpt"}
+        gates = {
+            name: {"available": False, "mode": "none", "reason_code": "route_unavailable", "pricing_available": False}
+            for name in ("text", "image_output", "audio_input", "audio_output")
+        }
+        gates["embeddings"] = {
+            "available": ready, "mode": "native" if ready else "none",
+            "reason_code": None if ready else "route_unavailable", "pricing_available": ready,
+        }
+        return {"feature_gates": gates}, "registry"
     if _kind(row) != "text":
         # Media metadata does not imply an executable route. A real direct
         # provider, configured API key, supported price and asset pipeline matter.
@@ -649,7 +661,7 @@ def _model_public(
         input_price=effective_input,
         output_price=effective_output,
     )
-    if _kind(row) != "text":
+    if _kind(row) not in {"text", "embedding"}:
         effective_price_source = "manual" if model_media_pricing_available(row) else "unpriced"
     # Stored manual cache columns stay nullable; effective rates are projected separately.
     effective_cache, effective_cache_sources = _effective_cache_prices(
@@ -716,6 +728,16 @@ def _pricing_aware_capabilities(
     input_price: Decimal | None = None,
     output_price: Decimal | None = None,
 ) -> dict:
+    if _kind(model) == "embedding":
+        normalized = dict(capabilities)
+        gates = {name: dict(gate) for name, gate in (capabilities.get("feature_gates") or {}).items()}
+        gate = gates.get("embeddings")
+        if gate is not None:
+            gate["pricing_available"] = bool(gate.get("available")) and (
+                (model.input_price if input_price is None else input_price) is not None
+            )
+        normalized["feature_gates"] = gates
+        return normalized
     if _kind(model) != "text":
         normalized = dict(capabilities)
         gates = {name: dict(gate) for name, gate in (capabilities.get("feature_gates") or {}).items()}
@@ -794,6 +816,13 @@ def _pricing_aware_capabilities(
 def _resolved_base_prices(
     model: LlmModel, provider: LlmProvider
 ) -> tuple[Decimal | None, Decimal | None, str, str | None]:
+    if _kind(model) == "embedding":
+        input_price = Decimal(model.input_price) if model.input_price is not None else None
+        fallback_input = effective_prices_per_million(model.model_name, provider.provider_type, api_base=provider.api_base)[0] if input_price is None else None
+        if input_price is None and fallback_input is not None:
+            input_price = _per_token_price(fallback_input, "litellm_input_price_per_million")
+        source = model.price_source or official_price_source(model.model_name, provider.provider_type, api_base=provider.api_base) or "litellm"
+        return input_price, Decimal(0), source if input_price is not None else "unpriced", CATALOG_VERSION if input_price is not None else None
     if _kind(model) != "text":
         # Manual text rates only price a token basis; media never borrows catalog prices.
         priced = model_media_pricing_available(model)

@@ -327,6 +327,7 @@ from lumen.api import (
     chat_code_workspaces_router,
     chat_completions_router,
     chat_conversations_router,
+    chat_embeddings_router,
     chat_extensions_admin_router,
     chat_extensions_user_router,
     chat_images_router,
@@ -346,6 +347,7 @@ from lumen.api.compat import audio as compat_audio
 from lumen.api.compat import batches as compat_batches
 from lumen.api.compat import cli as compat_cli
 from lumen.api.compat import discovery as compat_discovery
+from lumen.api.compat import embeddings as compat_embeddings
 from lumen.api.compat import files as compat_files
 from lumen.api.compat import images as compat_images
 from lumen.api.compat import openai as compat_openai
@@ -370,6 +372,7 @@ for router, tag in (
     (chat_assets_router, "Chat Assets"),
     (chat_images_router, "Images"),
     (chat_audio_router, "Audio"),
+    (chat_embeddings_router, "Embeddings"),
     (chat_realtime_router, "Realtime Voice"),
     (batch_routes.router, "Batches"),
     (chat_api_keys_router, "Chat API Keys"),
@@ -389,6 +392,7 @@ for router, tag in (
     (compat_discovery.router, "AI Compat Discovery"),
     (compat_images.router, "OpenAI Images Compat"),
     (compat_audio.router, "OpenAI Audio Compat"),
+    (compat_embeddings.router, "OpenAI and Gemini Embeddings Compat"),
     (compat_openai.router, "OpenAI Compat"),
     (compat_cli.router, "Coding CLI Model Catalog"),
     (compat_anthropic.router, "Anthropic Compat"),
@@ -398,6 +402,10 @@ for router, tag in (
 ):
     app.include_router(router, prefix="/v1", tags=[tag], dependencies=[Depends(require_chat_api_host)])
 app.include_router(compat_realtime.router, tags=["Realtime Voice Compat"])
+app.include_router(
+    compat_embeddings.google_router, tags=["Gemini Embeddings Compat"],
+    dependencies=[Depends(require_chat_api_host)],
+)
 
 # Claude Code's public machine protocol is host-gated with the other direct
 # compatibility APIs. The Keystone-only browser authorization handoff is
@@ -434,6 +442,8 @@ def custom_openapi() -> dict:
         "openai_lumen": "OpenAI-compatible Lumen durable completion (/v1/chat/completions, model='lumen')",
         "openai_stateless": "OpenAI-compatible stateless provider completion (/v1/chat/completions, provider model IDs)",
         "openai_responses": "OpenAI Responses-compatible stateless completion (/v1/responses)",
+        "openai_embeddings": "OpenAI-compatible stateless text embeddings (/v1/embeddings)",
+        "gemini_embeddings": "Google Gemini-compatible text embeddings (/v1beta/models/{model}:embedContent, :batchEmbedContents)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
         "openai_images": "OpenAI-compatible durable image generation and edits (/v1/images/generations, /v1/images/edits)",
         "openai_realtime": "OpenAI-compatible durable realtime WebSockets (/v1/realtime, /v1/realtime?intent=transcription, /v1/realtime/translations, /v1/live/sessions)",
@@ -462,6 +472,12 @@ def custom_openapi() -> dict:
         "name": "x-api-key",
         "description": "API key header (x-api-key: <key>)",
     }
+    security_schemes["GoogleApiKey"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-goog-api-key",
+        "description": "Gemini SDK API key header (x-goog-api-key: <key>)",
+    }
     api_key_security = [{"APIKeyBearer": []}, {"XApiKey": []}]
     for path, method in (
         ("/v1/chat/completions", "post"),
@@ -469,6 +485,9 @@ def custom_openapi() -> dict:
         ("/v1/images/edits", "post"),
         ("/v1/audio/speech", "post"),
         ("/v1/audio/transcriptions", "post"),
+        ("/v1/embeddings", "post"),
+        ("/v1beta/models/{model}:embedContent", "post"),
+        ("/v1beta/models/{model}:batchEmbedContents", "post"),
         ("/v1/responses", "post"),
         ("/v1/messages", "post"),
         ("/v1/messages/count_tokens", "post"),
@@ -490,6 +509,9 @@ def custom_openapi() -> dict:
     ):
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             schema["paths"][path][method]["security"] = api_key_security
+    for path in ("/v1beta/models/{model}:embedContent", "/v1beta/models/{model}:batchEmbedContents"):
+        if path in schema.get("paths", {}) and "post" in schema["paths"][path]:
+            schema["paths"][path]["post"]["security"] = [*api_key_security, {"GoogleApiKey": []}]
 
     route_scopes: dict[tuple[str, str], list[str]] = {
         ("/v1/images/generations", "post"): ["compat:images:write"],
@@ -497,6 +519,9 @@ def custom_openapi() -> dict:
         ("/v1/audio/speech", "post"): ["compat:audio:write"],
         ("/v1/audio/transcriptions", "post"): ["compat:audio:write", "native:assets:write"],
         ("/v1/chat/completions", "post"): ["compat:completions:write"],
+        ("/v1/embeddings", "post"): ["compat:completions:write"],
+        ("/v1beta/models/{model}:embedContent", "post"): ["compat:completions:write"],
+        ("/v1beta/models/{model}:batchEmbedContents", "post"): ["compat:completions:write"],
         ("/v1/responses", "post"): ["compat:completions:write"],
         ("/v1/messages", "post"): ["compat:completions:write"],
         ("/v1/messages/count_tokens", "post"): ["compat:completions:write"],

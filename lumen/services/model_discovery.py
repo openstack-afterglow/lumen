@@ -59,10 +59,10 @@ _DEFAULT_BASES: dict[str, str] = {
 # azure 는 제외: 동일 이름이라도 실제 deployment discovery 는 api-version query 와 별도 경로가
 # 필요해 일반 OpenAI 호환 /models 계약으로 라이브 조회를 대표할 수 없다(정적 참고 목록만 제공).
 _OPENAI_COMPATIBLE = set(_DEFAULT_BASES)
-_MODEL_MODES: dict[str, Literal["text", "image", "tts", "stt", "realtime"]] = {
+_MODEL_MODES: dict[str, Literal["text", "image", "tts", "stt", "realtime", "embedding"]] = {
     "chat": "text", "completion": "text", "responses": "text",
     "image_generation": "image", "audio_speech": "tts",
-    "audio_transcription": "stt", "realtime": "realtime",
+    "audio_transcription": "stt", "realtime": "realtime", "embedding": "embedding",
 }
 
 
@@ -91,7 +91,7 @@ class DiscoveredCandidate:
     generation_methods: tuple[str, ...] = ()
     input_token_limit: int | None = None
     output_token_limit: int | None = None
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] | None = None
 
 
 @dataclass(frozen=True)
@@ -346,7 +346,7 @@ def _gemini_parse_page(payload: Any) -> _PageResult:
 
 
 
-def _catalog_kind(provider_type: str, model_id: str) -> Literal["text", "image", "tts", "stt", "realtime"] | None:
+def _catalog_kind(provider_type: str, model_id: str) -> Literal["text", "image", "tts", "stt", "realtime", "embedding"] | None:
     """Exact catalog operation hint, never an execution or price guarantee."""
     return _MODEL_MODES.get(catalog_model_metadata(model_id, provider_type).get("mode"))
 

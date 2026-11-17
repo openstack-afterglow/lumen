@@ -242,6 +242,8 @@ def _provider_auth_ref(provider, account, credential, *, model_id=None, required
 def _backend_identity(provider_type: str, kind: str = "text") -> dict[str, str]:
     if kind == "search":
         return {"provider_backend": "lumen-search-http", "provider_backend_version": "1"}
+    if kind == "embedding":
+        return {"provider_backend": "bifrost", "provider_backend_version": BIFROST_VERSION}
     if kind != "text":
         return {"provider_backend": "lumen-media-direct", "provider_backend_version": "1"}
     if provider_type == "chatgpt":
@@ -254,7 +256,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider, *, ref=None, require
     if ref is not None:
         required_capabilities = ref.get("required_capabilities", ())
     elif not required_capabilities:
-        required_capabilities = ("chat" if _kind(model) == "text" else _kind(model),)
+        required_capabilities = ({"text": "chat", "embedding": "embeddings"}.get(_kind(model), _kind(model)),)
     account, credential = selected_credential(provider, model_id=model.id, required_capabilities=required_capabilities, ref=ref)
     provider_auth = _provider_auth_ref(provider, account, credential, model_id=model.id, required_capabilities=required_capabilities)
     api_key = None

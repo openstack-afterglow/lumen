@@ -15,6 +15,7 @@ _ROUTERS = {
     "chat_conversations_router": ".conversations",
     "chat_completions_router": ".completions",
     "chat_assets_router": ".assets",
+    "chat_embeddings_router": ".embeddings",
     "chat_images_router": ".images",
     "chat_audio_router": ".audio",
     "chat_realtime_router": ".realtime",

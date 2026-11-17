@@ -1,5 +1,9 @@
 # 운영 가이드
 
+## 0.6.16 텍스트 임베딩 롤아웃 메모
+
+0.6.16에는 새 migration이 없다. `llm_models.model_kind`의 기존 `VARCHAR(16)`이 `embedding`을 저장한다. API/worker 이미지를 교체한 뒤 관리자 화면 또는 `python -m lumen.scripts.seed_providers`(`LUMEN_BOOTSTRAP_MODELS_JSON`에 정확한 입력 단가 제공)로 임베딩 모델을 등록해야 `/v1/embeddings`, `/v1beta/models/*:embedContent|batchEmbedContents`, `/v1/chat/embeddings`가 모델을 노출한다. 입력 단가가 없으면 해당 route는 가격 gate(`pricing_available=false`)로 닫힌다. Afterglow Embedding Studio는 이 Lumen이 먼저 배포된 뒤에만 `/chat/models?model_kind=embedding`을 호출할 수 있으므로 Lumen을 먼저 배포한다. 실제 공급자 호출, vendor 청구서 대조, 운영 롤아웃은 작성 시점에 검증하지 않았다.
+
 ## 기동과 readiness
 
 source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra service --locked`로 runtime dependency를 설치한다. `pyproject.toml`과 `uv.lock`이 다르면 중단하며, 의도한 dependency 변경은 개발 단계에서 lock을 갱신한 뒤 검증한다.

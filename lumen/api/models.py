@@ -325,7 +325,7 @@ class ModelCreateRequest(BaseModel):
     model_name: str = Field(..., max_length=190)
     display_name: str | None = Field(default=None, max_length=150)
     sort_order: int = Field(default=0, strict=True, ge=0, le=2147483647)
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text"
     media_pricing: dict | None = None
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -374,7 +374,7 @@ class ModelUpdateRequest(BaseModel):
     model_name: str | None = Field(default=None, max_length=190)
     display_name: str | None = Field(default=None, max_length=150)
     sort_order: int | None = Field(default=None, strict=True, ge=0, le=2147483647)
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] | None = None
     media_pricing: dict | None = None
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -435,7 +435,7 @@ class ModelResponse(BaseModel):
     id: int
     provider_id: int
     model_name: str
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text"
     media_pricing: dict | None = None
     api_model_name: str
     api_provider: str
@@ -718,7 +718,7 @@ class AvailableModelCandidate(BaseModel):
     input_token_limit: int | None = None
     output_token_limit: int | None = None
     # Classified from the exact installed catalog mode; ``None`` stays manually selectable.
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] | None = None
 
     model_config = {"protected_namespaces": ()}
 

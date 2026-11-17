@@ -5,7 +5,8 @@ and ``gemini`` API-key providers when OPENAI_API_KEY / GEMINI_API_KEY are
 present. Only the variable *name* is persisted; the key is read at request time.
 Optional LUMEN_BOOTSTRAP_MODELS_JSON lists explicitly priced models:
 ``{provider, model_name, model_kind: 'text', input_price_per_million,
-output_price_per_million}`` or ``{provider, model_name, model_kind, media_pricing}``.
+output_price_per_million}``, ``{provider, model_name, model_kind: 'embedding',
+input_price_per_million}`` or ``{provider, model_name, model_kind, media_pricing}``.
 Existing providers and models are never overwritten.
 """
 
@@ -22,12 +23,13 @@ from lumen.services.providers.audio_transport import validate_audio_request
 from lumen.services.providers.credentials import api_model_name, canonical_subscription_model_name
 from lumen.services.providers.errors import ProviderValidationError
 from lumen.services.providers.image_transport import validate_image_request
-from lumen.services.providers.pricing import MODEL_KINDS, _validate_price_pair, validate_media_pricing
+from lumen.services.providers.pricing import MODEL_KINDS, _per_token_price, _validate_price_pair, validate_media_pricing
 from lumen.services.providers.realtime_transport import validate_realtime_request
 
 ENVIRONMENT_PROVIDERS = {"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
 MODELS_ENV = "LUMEN_BOOTSTRAP_MODELS_JSON"
 _TEXT_FIELDS = {"provider", "model_name", "model_kind", "input_price_per_million", "output_price_per_million"}
+_EMBEDDING_FIELDS = {"provider", "model_name", "model_kind", "input_price_per_million"}
 _MEDIA_FIELDS = {"provider", "model_name", "model_kind", "media_pricing"}
 
 
@@ -48,6 +50,8 @@ def _validate_media_route(provider: dict, model_name: str, kind: str, pricing: d
             or not direct_provider_route(provider["provider_type"], provider.get("api_base"))):
         raise ProviderValidationError("media model provider is not a supported direct API-key route")
     route = _validation_route(provider, model_name, kind, pricing)
+    if kind == "embedding":
+        return
     if kind == "image":
         variants = pricing.get("image_variants")
         if not isinstance(variants, dict) or not variants:
@@ -82,7 +86,7 @@ def _parse_models(raw: str, providers: dict[str, dict]) -> list[dict]:
         kind = entry.get("model_kind")
         if not isinstance(kind, str) or kind not in MODEL_KINDS:
             raise ProviderValidationError(f"{label} has an unsupported model_kind")
-        allowed = _TEXT_FIELDS if kind == "text" else _MEDIA_FIELDS
+        allowed = _TEXT_FIELDS if kind == "text" else _EMBEDDING_FIELDS if kind == "embedding" else _MEDIA_FIELDS
         if set(entry) != allowed:
             raise ProviderValidationError(f"{label} must contain exactly: {', '.join(sorted(allowed))}")
         provider_name, model_name = entry["provider"], entry["model_name"]
@@ -105,6 +109,13 @@ def _parse_models(raw: str, providers: dict[str, dict]) -> list[dict]:
             _validate_price_pair(*prices)
             planned.append({"provider": provider_name, "model_name": model_name, "model_kind": kind,
                             "input_price_per_million": prices[0], "output_price_per_million": prices[1]})
+        elif kind == "embedding":
+            if entry["input_price_per_million"] is None:
+                raise ProviderValidationError(f"{label} needs an explicit input price")
+            _per_token_price(entry["input_price_per_million"], "input_price_per_million")
+            _validate_media_route(provider, model_name, kind, {})
+            planned.append({"provider": provider_name, "model_name": model_name, "model_kind": kind,
+                            "input_price_per_million": entry["input_price_per_million"]})
         else:
             pricing = validate_media_pricing(kind, entry["media_pricing"])
             if not pricing:

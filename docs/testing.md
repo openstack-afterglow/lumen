@@ -1,5 +1,9 @@
 # 테스트
 
+## Text embeddings qualification (2026-11-17)
+
+Worktree from `origin/dev` b129ec05 (0.6.15), Python 3.12 via `uv`. `test-passed`: `uv run lumen-test contract` 6,933 service tests passed/556 deselected plus 143 SDK tests; `uv run ruff check lumen tests` clean; `uv run lumen-test integration` on disposable MariaDB/Redis 519 passed/1 skipped, including `tests/integration/test_embedding_settlement.py` (OpenAI and Gemini embedding rows: one `chat_usage_logs` row, input-token raw cost, credited cost and wallet charge; provider transport faked at `provider_client.aembedding`); `uv run lumen-test system` 38 passed; `tests/test_kolla_assets.py` and `tests/test_migrations.py` 113 passed; `uv build --wheel` built and contains the embedding modules. No migration is added (`model_kind` is `VARCHAR(16)`). OpenAI SDK and google-genai 3.4.0 were exercised against a local synthetic service. Not verified: live OpenAI/Gemini calls, vendor invoice accuracy, Kolla/production rollout. Deploy Lumen before the Afterglow release that exposes Embedding Studio.
+
 ## Retry and cloud-tool failure regression (2026-11-13)
 
 `test-passed`: `uv run --no-sync pytest -q tests/test_chat_completions.py tests/test_chat_run_protocol.py tests/test_cloud_tool_discovery.py` passed 220 tests; `uv run --no-sync lumen-test integration -k 'text_admission_concurrency'` passed 28 against isolated MariaDB/Redis, including retry path selection, fencing, idempotency and snapshot-isolation modes. Targeted Ruff passed. The managed cloud-tool regression covers failed port-list results through graph and journal boundaries, not a real Keystone grant. Grant reissuance and real cloud execution remain unverified.

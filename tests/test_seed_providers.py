@@ -268,6 +268,24 @@ async def test_valid_media_model_is_active_and_available(monkeypatch, db, entry,
     assert model["effective_capabilities"]["feature_gates"][gate]["available"] is True
 
 
+
+@pytest.mark.asyncio
+async def test_valid_embedding_model_bootstraps_with_input_price_only(monkeypatch, db):
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    entry = {
+        "provider": "openai", "model_name": "text-embedding-3-small",
+        "model_kind": "embedding", "input_price_per_million": "0.02",
+    }
+    _models(monkeypatch, entry)
+    await seeder.seed_environment_providers()
+    (model,) = await repository.list_models()
+    assert (model["model_name"], model["model_kind"], model["is_active"]) == (
+        entry["model_name"], "embedding", True)
+    gate = model["effective_capabilities"]["feature_gates"]["embeddings"]
+    assert gate["available"] is True
+    assert gate["pricing_available"] is True
+    assert str(model["effective_output_price_per_million"]) == "0"
+
 @pytest.mark.asyncio
 async def test_cli_closes_db_on_failure_and_prints_no_secret(monkeypatch, capsys):
     calls = []

@@ -504,11 +504,13 @@ async def aembedding(
     api_base: str | None = None, api_key: str | None = None,
     custom_llm_provider: str | None = None, provider_auth: ProviderAuthRef | None = None,
     dimensions: int | None = None, encoding_format: str | None = None, user: str | None = None,
+    task_type: str | None = None, title: str | None = None,
 ) -> ProviderObject:
     provider = _provider(model, custom_llm_provider)
     if provider_auth is not None and provider_auth.get("auth_mode") != "api_key":
         raise ProviderSubscriptionError("subscription_protocol_unsupported", 400)
     body: dict[str, Any] = {"model": _model(model, provider), "input": input}
-    body.update({key: value for key, value in dict(dimensions=dimensions, encoding_format=encoding_format, user=user).items()
+    body.update({key: value for key, value in dict(dimensions=dimensions, encoding_format=encoding_format, user=user,
+                                                    task_type=task_type, title=title).items()
                  if value is not None})
     return await _execute("embeddings", provider, body, api_base=api_base, api_key=api_key, provider_auth=provider_auth)

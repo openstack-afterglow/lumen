@@ -33,7 +33,7 @@ class AvailableModel(BaseModel):
     provider_type: str
     provider_sort_order: int = 0
     sort_order: int = 0
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text"
     display_name: str
     provider: str | None = None
     provider_api_key_configured: bool
@@ -49,7 +49,7 @@ class AvailableModel(BaseModel):
 
 @router.get("/chat/models", response_model=list[AvailableModel])
 async def list_available_models(
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text",
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text",
     token_info: dict = Depends(require_scopes("models:read")),
 ):
     """사용자용 활성 모델 카탈로그(키·가격 미포함, provider명·능력 포함). 저장소 장애 시 빈 목록(graceful)."""
@@ -93,7 +93,7 @@ async def list_available_models(
 @router.get("/capabilities")
 async def get_chat_capabilities(
     model_id: int = Query(..., ge=1),
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text",
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text",
     token_info: dict = Depends(require_scopes("models:read")),
 ):
     """Expose selected-model and deployment runtime gates without secrets."""
@@ -145,6 +145,28 @@ async def get_chat_capabilities(
         else:
             result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,
                           output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0)
+    if model_kind == "embedding":
+        from lumen.services.provider_metadata import catalog_model_metadata
+
+        model_name = resolved["model_name"]
+        provider_type = resolved.get("provider_type")
+        metadata = catalog_model_metadata(model_name, provider_type or "")
+        default_dimensions = metadata.get("output_vector_size")
+        supports_dimensions = (
+            provider_type == "gemini" and "embedding" in model_name.lower()
+        ) or (
+            provider_type == "openai" and model_name.startswith("text-embedding-3-")
+        )
+        if default_dimensions is None and supports_dimensions:
+            default_dimensions = 3072 if provider_type == "gemini" or "large" in model_name else 1536
+        result.update(
+            default_dimensions=default_dimensions,
+            supports_dimensions=supports_dimensions,
+            min_dimensions=1 if supports_dimensions else None,
+            max_dimensions=default_dimensions if supports_dimensions else None,
+            max_input_tokens=metadata.get("max_input_tokens"),
+            max_inputs=16,
+        )
     return result
 
 
