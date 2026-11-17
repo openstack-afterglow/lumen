@@ -6,7 +6,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: `0.6.15` was published on annotated tag `0.6.15` at dev merge `9f2d4e5431f00583f4053c7c8b7d4e5fc22435de` and deployed on all three production API/worker controllers on 2026-11-13 KST. Package/runtime/lock/Kolla image default are `0.6.15`; SDK `0.2.1`, plugin API/default plugins `0.1.1`, database plugin `0.1.2`, sandbox and public API `1.0.0` remain independent. No migration was added. Real cloud-tool acceptance and grant reissuance are unverified.
+- 버전: package/runtime/lock/Kolla image default `0.6.17`은 통합 검증 중인 미발행 후보이다. 직전 운영 버전은 `0.6.16`이며 immutable tag와 배포 기록은 CHANGELOG의 해당 절에 보존한다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 새 schema 033은 서비스 전환 전에 적용해야 하며 새 writer와 기존 writer의 혼합 실행을 승인하지 않는다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
@@ -18,6 +18,10 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 `GET /v1/mcp-settings` combines registry entries, personal/global/domain connection states and managed sandbox availability. Personal `/v1/mcp-connections` and exact-domain `/v1/domains/{id}/mcp-connections` reuse the existing OAuth/activation lifecycle. Featured installation uses the admin route and never makes a catalog connection implicitly selected. Playwright and Markitdown require real sandbox manifest/image qualification; their catalog presence does not enable execution.
 
 Protocol-v2 cloud bindings consume the bridge's JSON preview and require human approval for every managed external mutation, even under internal automatic mode. Discovery explains project-bound manage consent and explicit VM parameters without fabricating native identifiers. Protocol v1 intentionally retains its read-only tool set. Isolated encrypted-PostgreSQL approval/recovery checks are local evidence, not production VM acceptance.
+
+The selected sandbox path uses `features.tool_policy.enabled_sandbox_tools` (default `[]`) rather than implicit bindings from every configured manifest. Admission freezes approved names and pool/image/manifest identity before resource holds or provider I/O. A selected run waits for the existing controller-owned resource, reuses that Pod, and releases it through the durable terminal/cancel/expiry lifecycle. Empty selection and history browsing create no resource. Pod disappearance does not prove full resource deletion: exact owned Service/Secret/NetworkPolicy absence must also be confirmed before occupancy is released.
+
+Kolla optionally manages ClamAV with `enable_lumen_clamav`. The pinned official image uses host networking with clamd bound only to `127.0.0.1:3310`, finite memory/CPU/PID limits and persistent signature storage. Loaded-signature freshness plus PING/VERSION gates API/worker startup. The external-scanner path remains supported. This host-network choice is required by the observed production Docker configuration (`bridge=none`, iptables and forwarding disabled); a Docker bridge recipe is not a qualified production path.
 
 ### 0.6.12 cooperative title scheduling stop
 

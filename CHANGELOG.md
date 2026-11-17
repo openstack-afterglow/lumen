@@ -1,11 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.6.17 — release preparation (not published or deployed)
 
 - **한국어 — 클라우드 승인:** 프로토콜 v2의 Afterglow 변경 미리보기 JSON 처리를 수정하고 VM 생성의 명시적 이미지·flavor·네트워크·부팅 볼륨·키·보안그룹 선택과 관리 권한 동의 경로를 안내한다. 클라우드 변경은 내부 자동 승인 설정에서도 사용자의 승인을 요구한다. 프로토콜 v1의 조회 전용 경계는 유지하며 실제 VM을 생성하지 않았다.
 - **English — Cloud approval:** Correct protocol-v2 JSON mutation previews and explain explicit VM resource choices and manage consent. Cloud mutations always require human approval, including internal automatic mode. Protocol v1 remains read-only; no live VM creation was performed.
 - **한국어 — MCP 연결:** GitHub MCP Registry 896개를 카탈로그에 반영하고 원격 HTTPS 634개와 지원되지 않는 transport를 구분한다. 개인·조직·전역 연결을 분리하며 조직 연결은 exact-domain manager 또는 human system admin만 관리한다. 구성원에게 비밀을 노출하지 않고 개인 활성화·frozen-run 재검증을 유지한다. 새 API는 `/v1/mcp-settings`, `/v1/mcp-connections`, `/v1/domains/{id}/mcp-connections`, `/v1/admin/mcp-registry/install-featured`다. Schema 033을 먼저 적용해야 한다. Playwright·Markitdown은 managed sandbox 항목으로 표시하며 실제 사용에는 별도 검증된 sandbox pool이 필요하다.
 - **English — MCP connections:** Catalog all 896 GitHub registry entries, distinguishing 634 HTTPS remotes from unsupported transports. Add personal, organization and global connection states; exact-domain managers and human system admins alone manage organization credentials. Member views are secret-free and require personal activation; frozen runs retain authority/configuration fences. Apply migration 033 before the new APIs. Playwright and Markitdown remain managed sandbox tools, available only with a separately qualified pool.
+- **한국어 — 선택형 sandbox:** 사용자가 명시한 managed tool 이름만 admission에서 고정하고 실행 시작 시 기존 Kubernetes resource intent를 자동 예약한다. 같은 실행은 같은 Pod를 재사용하며 완료·취소·만료 후 기존 durable 정리 경로로 회수한다. 도구 미선택·이력 열람은 Pod를 만들지 않는다. Pod가 이미 없어도 소유 Service·Secret·NetworkPolicy를 정리하기 전에는 점유를 해제하지 않는다.
+- **English — Selected sandbox:** Freeze explicitly selected managed tools at admission and automatically reserve the existing Kubernetes resource intent. Calls within one run reuse one Pod; terminal/cancel/expiry reclamation remains durable. No selection or history browsing creates no Pod. Confirm owned auxiliary-resource deletion before releasing occupancy, including vanished Pods.
+- **한국어 — 관리형 검사기:** 선택적 Kolla ClamAV를 immutable digest, host-network의 loopback 전용 listener, 자원 상한과 영속 서명으로 제공한다. PING·VERSION·최신 서명 확인 전에 애플리케이션 시작을 차단하며 기존 외부 검사기·악성 파일 거부를 유지한다.
+- **English — Managed scanner:** Add optional digest-pinned Kolla ClamAV with a host-network loopback-only listener, bounded resources and persistent signatures. Require PING, VERSION and fresh loaded signatures before application startup; preserve external scanning and malicious-file rejection.
 
 ## 0.6.16 — 2026-11-17 (published and deployed; no embedding models registered)
 
