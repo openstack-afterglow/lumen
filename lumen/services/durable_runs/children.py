@@ -388,33 +388,6 @@ async def prepare_delegations(
             deadline = _aware(root.deadline_at)
             if deadline is not None and deadline <= _now():
                 raise ChildFailure("resource_deadline_exceeded", "root run deadline has passed")
-            root_sandbox_deadline = None
-            if (root.capability_snapshot or {}).get("sandbox_tools"):
-                # Read without a resource lock: lineage locks precede child and ledger locks.
-                resource = (
-                    await session.get(ChatRuntimeResource, root.assigned_resource_id)
-                    if root.assigned_resource_id is not None
-                    else None
-                )
-                if (
-                    resource is None
-                    or resource.run_id != root.id
-                    or resource.logical_project_id != root.project_id
-                    or resource.logical_user_id != root.user_id
-                    or resource.role != "sandbox"
-                    or resource.backend != "kubernetes"
-                ):
-                    raise ChildFailure("sandbox_unavailable", "root selected sandbox is unavailable")
-                root_sandbox_deadline = _aware(resource.deadline_at)
-                if root_sandbox_deadline is not None and root_sandbox_deadline <= _now():
-                    raise ChildFailure("sandbox_expired", "root selected sandbox lifetime has expired")
-                if (
-                    root_sandbox_deadline is None
-                    or resource.deleted_at is not None
-                    or resource.desired_state in {"deleting", "deleted", "failed"}
-                    or resource.observed_state in {"deleting", "deleted", "failed"}
-                ):
-                    raise ChildFailure("sandbox_unavailable", "root selected sandbox is unavailable")
             policy = _policy_from_snapshot(parent.capability_snapshot or {})
             existing_children = await _locked_children(session, parent.id, order)
             order.take("ledger")
@@ -446,6 +419,33 @@ async def prepare_delegations(
                     if by_call[call.call_id].fingerprint != call.fingerprint():
                         raise DurableRunConflict("replayed delegation call has a different fingerprint")
                 return _group_view(group, rows)
+            root_sandbox_deadline = None
+            if (root.capability_snapshot or {}).get("sandbox_tools"):
+                # Only new groups need a live root Pod; frozen groups replay after expiry.
+                resource = (
+                    await session.get(ChatRuntimeResource, root.assigned_resource_id)
+                    if root.assigned_resource_id is not None
+                    else None
+                )
+                if (
+                    resource is None
+                    or resource.run_id != root.id
+                    or resource.logical_project_id != root.project_id
+                    or resource.logical_user_id != root.user_id
+                    or resource.role != "sandbox"
+                    or resource.backend != "kubernetes"
+                ):
+                    raise ChildFailure("sandbox_unavailable", "root selected sandbox is unavailable")
+                root_sandbox_deadline = _aware(resource.deadline_at)
+                if root_sandbox_deadline is not None and root_sandbox_deadline <= _now():
+                    raise ChildFailure("sandbox_expired", "root selected sandbox lifetime has expired")
+                if (
+                    root_sandbox_deadline is None
+                    or resource.deleted_at is not None
+                    or resource.desired_state in {"deleting", "deleted", "failed"}
+                    or resource.observed_state in {"deleting", "deleted", "failed"}
+                ):
+                    raise ChildFailure("sandbox_unavailable", "root selected sandbox is unavailable")
 
             parent_agent = await session.get(ChatAgent, parent.agent_id) if parent.agent_id is not None else None
             delegable = {

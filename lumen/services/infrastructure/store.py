@@ -781,6 +781,10 @@ async def _mark_ready_locked(session: AsyncSession, resource: ChatRuntimeResourc
             or (resource.observed_state not in {"booting", "ready"}
                 and not (resource.role == "api" and policy_verified and resource.observed_state == "unavailable"))):
         return False
+    if resource.role == "sandbox" and (
+        resource.deadline_at is None or _utc(resource.deadline_at) <= _now()
+    ):
+        return False
     if policy_verified and resource.role in {"sandbox", "api"}:
         resource.heartbeat_at = _now()
     if (resource.desired_state == "deleting" or resource.drain_requested_at is not None
@@ -875,7 +879,10 @@ async def wake_ready_runs(resource_id: str) -> list[str]:
             ChatRuntimeResource.id == resource_id,
             ChatRuntimeResource.observed_state == "ready", ChatRuntimeResource.desired_state != "deleting"
         ).with_for_update())).scalar_one_or_none()
-        if resource is None:
+        if resource is None or (
+            resource.role == "sandbox"
+            and (resource.deadline_at is None or _utc(resource.deadline_at) <= _now())
+        ):
             return []
         for run in runs:
             run.status = "queued"
