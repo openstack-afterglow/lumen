@@ -327,6 +327,7 @@ from lumen.api import (
     chat_code_workspaces_router,
     chat_completions_router,
     chat_conversations_router,
+    chat_decisions_router,
     chat_embeddings_router,
     chat_extensions_admin_router,
     chat_extensions_user_router,
@@ -346,6 +347,7 @@ from lumen.api.compat import anthropic as compat_anthropic
 from lumen.api.compat import audio as compat_audio
 from lumen.api.compat import batches as compat_batches
 from lumen.api.compat import cli as compat_cli
+from lumen.api.compat import decisions as compat_decisions
 from lumen.api.compat import discovery as compat_discovery
 from lumen.api.compat import embeddings as compat_embeddings
 from lumen.api.compat import files as compat_files
@@ -373,6 +375,7 @@ for router, tag in (
     (chat_images_router, "Images"),
     (chat_audio_router, "Audio"),
     (chat_embeddings_router, "Embeddings"),
+    (chat_decisions_router, "Decisions"),
     (chat_realtime_router, "Realtime Voice"),
     (batch_routes.router, "Batches"),
     (chat_api_keys_router, "Chat API Keys"),
@@ -393,6 +396,7 @@ for router, tag in (
     (compat_images.router, "OpenAI Images Compat"),
     (compat_audio.router, "OpenAI Audio Compat"),
     (compat_embeddings.router, "OpenAI and Gemini Embeddings Compat"),
+    (compat_decisions.router, "OpenAI Decisions Compat"),
     (compat_openai.router, "OpenAI Compat"),
     (compat_cli.router, "Coding CLI Model Catalog"),
     (compat_anthropic.router, "Anthropic Compat"),
@@ -443,6 +447,7 @@ def custom_openapi() -> dict:
         "openai_stateless": "OpenAI-compatible stateless provider completion (/v1/chat/completions, provider model IDs)",
         "openai_responses": "OpenAI Responses-compatible stateless completion (/v1/responses)",
         "openai_embeddings": "OpenAI-compatible stateless text embeddings (/v1/embeddings)",
+        "openai_decisions": "OpenAI-compatible stateless typed decisions (/v1/decisions)",
         "gemini_embeddings": "Google Gemini-compatible text embeddings (/v1beta/models/{model}:embedContent, :batchEmbedContents)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
         "openai_images": "OpenAI-compatible durable image generation and edits (/v1/images/generations, /v1/images/edits)",
@@ -486,6 +491,7 @@ def custom_openapi() -> dict:
         ("/v1/audio/speech", "post"),
         ("/v1/audio/transcriptions", "post"),
         ("/v1/embeddings", "post"),
+        ("/v1/decisions", "post"),
         ("/v1beta/models/{model}:embedContent", "post"),
         ("/v1beta/models/{model}:batchEmbedContents", "post"),
         ("/v1/responses", "post"),
@@ -520,6 +526,7 @@ def custom_openapi() -> dict:
         ("/v1/audio/transcriptions", "post"): ["compat:audio:write", "native:assets:write"],
         ("/v1/chat/completions", "post"): ["compat:completions:write"],
         ("/v1/embeddings", "post"): ["compat:completions:write"],
+        ("/v1/decisions", "post"): ["compat:completions:write"],
         ("/v1beta/models/{model}:embedContent", "post"): ["compat:completions:write"],
         ("/v1beta/models/{model}:batchEmbedContents", "post"): ["compat:completions:write"],
         ("/v1/responses", "post"): ["compat:completions:write"],

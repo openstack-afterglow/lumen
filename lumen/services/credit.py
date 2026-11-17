@@ -391,6 +391,7 @@ async def reserve_call_credit_in_transaction(session, *, user_id: str, project_i
     wallet/key gate. No remote I/O runs under this row lock.
     """
     from lumen.models.chat_runs import ChatModelCallReservation, ChatRun
+    from lumen.models.stateless_reservations import StatelessCallReservation
 
     if not bound.is_finite() or bound < 0:
         raise QuotaExceeded("호출 사용 한도가 올바르지 않습니다")
@@ -407,7 +408,12 @@ async def reserve_call_credit_in_transaction(session, *, user_id: str, project_i
         ChatRun, ChatRun.id == ChatModelCallReservation.run_id).where(
         ChatRun.user_id == user_id, ChatModelCallReservation.status.in_(("reserved", "unknown"))
     )
+    stateless_held = select(func.coalesce(func.sum(StatelessCallReservation.bound_credits), Decimal("0"))).where(
+        StatelessCallReservation.user_id == user_id,
+        StatelessCallReservation.status.in_(("reserved", "unknown")),
+    )
     pending = Decimal(str((await session.execute(held)).scalar_one()))
+    pending += Decimal(str((await session.execute(stateless_held)).scalar_one()))
     system = await quota_policy.get_system_quota(session, user_id)
     if system.monthly > 0 and wallet.used_quota_this_month + pending + bound > system.monthly:
         raise QuotaExceeded("월 사용 한도를 초과했습니다")
@@ -422,6 +428,9 @@ async def reserve_call_credit_in_transaction(session, *, user_id: str, project_i
             raise ChatStorageUnavailable("chat DB 오류")
         held_key = held.where(ChatRun.api_key_id == api_key_id)
         key_pending = Decimal(str((await session.execute(held_key)).scalar_one()))
+        key_pending += Decimal(str((await session.execute(
+            stateless_held.where(StatelessCallReservation.api_key_id == api_key_id)
+        )).scalar_one()))
         monthly = calculate_effective_limit(key.owner_monthly_credit_limit,
                                             key.admin_monthly_credit_limit, system.monthly)
         if monthly is not None:
