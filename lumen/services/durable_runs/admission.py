@@ -47,12 +47,15 @@ from .errors import DurableRunConflict, DurableRunError, DurableRunInputError, D
 
 def _validate_sandbox_snapshot(
     request_payload: dict[str, Any], capability_snapshot: dict[str, Any], protocol: int,
+    *, execution_mode: str = "chat",
 ) -> None:
     from lumen.models.chat_contracts import ToolPolicy
     from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
 
     try:
         policy = ToolPolicy.model_validate((request_payload.get("features") or {}).get("tool_policy") or {})
+        if execution_mode == "code" and policy.enabled_sandbox_tools:
+            raise SandboxSelectionError("sandbox_code_combination_unsupported")
         selected = validate_selection(capability_snapshot.get("sandbox_tools", []))
         if policy.enabled_sandbox_tools != [item["name"] for item in selected]:
             raise SandboxSelectionError("sandbox_selection_invalid")
@@ -78,6 +81,8 @@ async def _apply_root_budget(
 
     from . import budgets
 
+    if execution_mode == "code" and (run.capability_snapshot or {}).get("sandbox_tools"):
+        raise DurableRunInputError("sandbox_code_combination_unsupported")
     try:
         pool_name = selected_pool((run.capability_snapshot or {}).get("sandbox_tools", []))
     except SandboxSelectionError as exc:
@@ -105,7 +110,13 @@ async def _apply_root_budget(
     config = get_settings().runtime_config
     seconds = run.sandbox_seconds_ceiling
     if pool_name is not None:
-        seconds = min(seconds or 1800, config.pool(pool_name).max_lifetime_seconds)
+        pool_limit = config.pool(pool_name).max_lifetime_seconds
+        if agent_budget is None:
+            seconds = min(1800, pool_limit)
+        else:
+            # The ceiling covers the entire lineage, not just the root Pod.
+            # Reserve at most half (capped at five minutes) for root tools.
+            seconds = min(300, max(1, int(seconds) // 2), pool_limit, run.wall_time_seconds)
     deadline = _now() + timedelta(seconds=seconds)
     if run.deadline_at is not None:
         deadline = min(deadline, run.deadline_at)
@@ -409,7 +420,9 @@ async def create_persistent_run(
     except ValueError as exc:
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
-    _validate_sandbox_snapshot(request_payload, capability_snapshot, execution_protocol_version)
+    _validate_sandbox_snapshot(
+        request_payload, capability_snapshot, execution_protocol_version, execution_mode=execution_mode,
+    )
     request_payload = {
         **request_payload,
         "client_timezone": client_timezone,
@@ -611,7 +624,9 @@ async def create_run(
     except ValueError as exc:
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
-    _validate_sandbox_snapshot(request_payload, capability_snapshot, execution_protocol_version)
+    _validate_sandbox_snapshot(
+        request_payload, capability_snapshot, execution_protocol_version, execution_mode=execution_mode,
+    )
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
     request_payload["required_scopes"] = list(native_run_scopes({
         **request_payload, "execution_mode": execution_mode,

@@ -164,3 +164,32 @@ async def test_resumed_binding_revalidates_manifest_bytes_before_dispatch(select
     selected_runtime.path.write_text("{}")
     result = await binding.execute({}, context)
     assert result.error_code == "sandbox_tool_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_code_with_selected_tools_is_rejected_before_native_admission_work(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("unsupported code selection must fail before prerequisite or provider work")
+
+    monkeypatch.setattr(chat_admission, "_agent_runtime_prerequisites", forbidden)
+    monkeypatch.setattr(chat_admission, "_freeze_sandbox_tools", forbidden)
+    features = ChatFeatureOptions(tool_policy=ToolPolicy(enabled_sandbox_tools=["browser_snapshot"]))
+    with pytest.raises(HTTPException) as exc:
+        await chat_admission.prepare_context_input(
+            user_id="owner", project_id="project", model_id="fixture", features=features,
+            execution_mode="code",
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail == "sandbox_code_combination_unsupported"
+
+
+def test_durable_code_selection_guard_precedes_manifest_and_preserves_empty_nova(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("unsupported combination must fail before manifest lookup")
+
+    payload = {"features": {"tool_policy": {"enabled_sandbox_tools": ["browser_snapshot"]}}}
+    with monkeypatch.context() as patch:
+        patch.setattr(sandbox_selection, "freeze_selection", forbidden)
+        with pytest.raises(admission.DurableRunInputError, match="^sandbox_code_combination_unsupported$"):
+            admission._validate_sandbox_snapshot(payload, {}, 2, execution_mode="code")
+    admission._validate_sandbox_snapshot({"features": {"tool_policy": {}}}, {}, 2, execution_mode="code")

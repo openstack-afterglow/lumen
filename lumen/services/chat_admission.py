@@ -1102,6 +1102,8 @@ async def prepare_context_input(
             raise HTTPException(status_code=422, detail="temporary chats do not support agents or code workspaces")
         if execution_mode != "chat":
             raise HTTPException(status_code=422, detail="requested chat execution mode is not available")
+    if execution_mode == "code" and features.tool_policy.enabled_sandbox_tools:
+        raise HTTPException(status_code=422, detail="sandbox_code_combination_unsupported")
     if execution_mode != "chat":
         _agent_runtime_prerequisites(execution_mode)
     sandbox_tools = _freeze_sandbox_tools(features)

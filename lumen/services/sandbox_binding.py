@@ -350,6 +350,10 @@ async def ensure_sandbox_for_run(
             raise SandboxDispatchError(exc.code, "sandbox selection is no longer valid") from exc
         if (selected != pool_name or root.project_id != run.project_id or root.user_id != run.user_id):
             raise SandboxDispatchError("sandbox_tool_unselected", "sandbox pool was not selected for this run")
+        if run.assigned_resource_id is not None:
+            existing = await session.get(ChatRuntimeResource, run.assigned_resource_id)
+            if existing is not None and existing.deadline_at is not None and existing.deadline_at.replace(tzinfo=UTC) <= now:
+                raise SandboxDispatchError("sandbox_expired", "the selected sandbox lifetime has expired")
         deadline = min(
             run.deadline_at.replace(tzinfo=UTC) if run.deadline_at is not None else now + timedelta(seconds=1800),
             now + timedelta(seconds=pool.max_lifetime_seconds),

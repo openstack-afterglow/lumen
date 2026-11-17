@@ -246,9 +246,22 @@ async def _prepare_child_inputs(
     from lumen.models.chat_contracts import ChatFeatureOptions
     from lumen.services import agent_policy, chat_admission
     from lumen.services.providers import routing as ps
+    from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
 
-    parent_policy = _policy_from_snapshot(parent.capability_snapshot or {})
+    features = ChatFeatureOptions.model_validate({**(parent_payload.get("features") or {}), "memory": False})
+    try:
+        sandbox_tools = validate_selection((parent.capability_snapshot or {}).get("sandbox_tools", []))
+    except SandboxSelectionError as exc:
+        raise ChildFailure(exc.code, "parent sandbox selection is no longer valid") from exc
+    if features.tool_policy.enabled_sandbox_tools != [item["name"] for item in sandbox_tools]:
+        raise ChildFailure("child_policy_denied", "child sandbox selection exceeds frozen parent authority")
     mode = "code" if call.access == "write" else "plan"
+    if mode == "code" and sandbox_tools:
+        raise ChildFailure(
+            "sandbox_code_combination_unsupported",
+            "code execution cannot use selected sandbox tools",
+        )
+    parent_policy = _policy_from_snapshot(parent.capability_snapshot or {})
     try:
         child_policy = agent_policy.resolve_execution_policy(agent, execution_mode=mode)
         direct_effects = agent_policy.resolve_direct_effects(agent, execution_mode=mode)
@@ -267,7 +280,6 @@ async def _prepare_child_inputs(
             "can_delegate_write": False,
         }
     )
-    features = ChatFeatureOptions.model_validate({**(parent_payload.get("features") or {}), "memory": False})
     route = None
     if agent.get("model_name"):
         try:
@@ -309,14 +321,6 @@ async def _prepare_child_inputs(
     capability_snapshot["execution_policy"] = child_policy.model_dump(mode="json")
     capability_snapshot["direct_effects"] = sorted(direct_effects)
     capability_snapshot["execution_protocol_version"] = 2
-    from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
-
-    try:
-        sandbox_tools = validate_selection((parent.capability_snapshot or {}).get("sandbox_tools", []))
-    except SandboxSelectionError as exc:
-        raise ChildFailure(exc.code, "parent sandbox selection is no longer valid") from exc
-    if features.tool_policy.enabled_sandbox_tools != [item["name"] for item in sandbox_tools]:
-        raise ChildFailure("child_policy_denied", "child sandbox selection exceeds frozen parent authority")
     capability_snapshot["sandbox_tools"] = sandbox_tools
     capability_snapshot["extensions"] = chat_admission._capability_extension_snapshot(extension_selection)
     if plugin_tool_snapshots or plugin_skill_snapshots:
@@ -384,6 +388,33 @@ async def prepare_delegations(
             deadline = _aware(root.deadline_at)
             if deadline is not None and deadline <= _now():
                 raise ChildFailure("resource_deadline_exceeded", "root run deadline has passed")
+            root_sandbox_deadline = None
+            if (root.capability_snapshot or {}).get("sandbox_tools"):
+                # Read without a resource lock: lineage locks precede child and ledger locks.
+                resource = (
+                    await session.get(ChatRuntimeResource, root.assigned_resource_id)
+                    if root.assigned_resource_id is not None
+                    else None
+                )
+                if (
+                    resource is None
+                    or resource.run_id != root.id
+                    or resource.logical_project_id != root.project_id
+                    or resource.logical_user_id != root.user_id
+                    or resource.role != "sandbox"
+                    or resource.backend != "kubernetes"
+                ):
+                    raise ChildFailure("sandbox_unavailable", "root selected sandbox is unavailable")
+                root_sandbox_deadline = _aware(resource.deadline_at)
+                if root_sandbox_deadline is not None and root_sandbox_deadline <= _now():
+                    raise ChildFailure("sandbox_expired", "root selected sandbox lifetime has expired")
+                if (
+                    root_sandbox_deadline is None
+                    or resource.deleted_at is not None
+                    or resource.desired_state in {"deleting", "deleted", "failed"}
+                    or resource.observed_state in {"deleting", "deleted", "failed"}
+                ):
+                    raise ChildFailure("sandbox_unavailable", "root selected sandbox is unavailable")
             policy = _policy_from_snapshot(parent.capability_snapshot or {})
             existing_children = await _locked_children(session, parent.id, order)
             order.take("ledger")
@@ -569,7 +600,7 @@ async def prepare_delegations(
                 if deadline is not None:
                     allocation_deadline = min(allocation_deadline, deadline)
                 try:
-                    await infra_store.assign_sandbox(
+                    resource = await infra_store.assign_sandbox(
                         session,
                         run=child,
                         config=settings.runtime_config,
@@ -577,8 +608,17 @@ async def prepare_delegations(
                         order=order,
                         pool_name=pool_name,
                     )
+                    if pool_name is not None:
+                        pool = settings.runtime_config.pool(pool_name)
+                        if resource.image_ref != pool.image or resource.policy_digest != pool.digest():
+                            raise ChildFailure(
+                                "sandbox_configuration_changed",
+                                "sandbox configuration changed before child admission",
+                            )
                 except infra_store.ResourceUnavailable as exc:
                     raise ChildFailure(exc.code, str(exc)) from exc
+            if root_sandbox_deadline is not None and root_sandbox_deadline <= _now():
+                raise ChildFailure("sandbox_expired", "root selected sandbox lifetime has expired")
             return _group_view(group, rows)
 
     return await budgets.retry_deadlocks(transaction)
@@ -701,11 +741,7 @@ async def record_child_terminal(
     await budgets.settle(session, quota=quota, root=root, run_id=child.id, kind="credit", actual=settled_credits, order=order)
     await budgets.release(session, quota=quota, root=root, run_id=child.id, kind="child_slot", order=order)
     await budgets.release(session, quota=quota, root=root, run_id=child.id, kind="sandbox_slot", order=order)
-    ready_at = None
-    if child.assigned_resource_id is not None:
-        ready_at = (await session.execute(select(ChatRuntimeResource.ready_at).where(
-            ChatRuntimeResource.id == child.assigned_resource_id))).scalar_one_or_none()
-    sandbox_used = max(0, int((_now() - _aware(ready_at)).total_seconds())) if ready_at else 0
+    sandbox_used = await budgets.sandbox_seconds_used(session, child.assigned_resource_id, now=_now())
     await budgets.settle(
         session, quota=quota, root=root, run_id=child.id, kind="sandbox_seconds", actual=sandbox_used, order=order
     )
