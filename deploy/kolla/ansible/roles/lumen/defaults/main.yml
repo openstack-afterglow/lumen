@@ -176,7 +176,7 @@ lumen_bifrost_shutdown_seconds: 30
 # Managed runtime is opt-in. Supply the complete typed RuntimeConfig, including
 # pools, managed CIDRs and TLS references; Nova additionally needs cloud profiles.
 # Kubernetes sandbox pools use an operator-created, qualified cluster, with
-# bearer_token.file, CA, qualification and tool manifest in the controller mount.
+# either bearer_token.file or renewable drover source, CA, qualification and tool manifest.
 # The role never creates clusters or guesses image/flavor/network IDs.
 lumen_runtime_enabled: false
 lumen_runtime_config: {}
@@ -208,6 +208,21 @@ lumen_controller_secrets_dir: "/etc/kolla/lumen/controller"
 lumen_controller_dispatch_key_file: "{{ lumen_controller_secrets_dir }}/dispatch.key"
 lumen_worker_secrets_dir: "/etc/kolla/lumen/worker"
 lumen_worker_runtime_volumes: "{{ [lumen_worker_secrets_dir ~ ':/etc/lumen/controller:ro'] if lumen_runtime_enabled | bool else [] }}"
+# API receives public tool manifests only, never any controller or worker key.
+# Public copies preserve the source path relative to /etc/lumen/controller.
+lumen_api_tools_dir: "/etc/kolla/lumen/api-tools"
+# Hosts without a controller reuse their existing approved worker manifest copies.
+# API-only hosts may override this with a dedicated public staging directory.
+lumen_public_manifest_source_dir: "{{ lumen_controller_secrets_dir if enable_lumen_controller | bool else lumen_worker_secrets_dir }}"
+lumen_api_tools_enabled: >-
+  {%- set selected = namespace(enabled=false) -%}
+  {%- for pool in lumen_runtime_config.pools | default([]) -%}
+  {%- if pool.backend == 'kubernetes' and pool.enabled | default(false) | bool -%}
+  {%- set selected.enabled = true -%}
+  {%- endif -%}
+  {%- endfor -%}
+  {{- lumen_runtime_enabled | bool and selected.enabled -}}
+lumen_api_runtime_volumes: "{{ [lumen_api_tools_dir ~ ':/etc/lumen/controller:ro'] if lumen_api_tools_enabled | bool else [] }}"
 # Optional dynamic API pool: when set, both Kolla HAProxy listeners point at the
 # operator's Octavia VIP instead of the inventory nodes.
 lumen_api_dynamic_ingress_vip: ""
@@ -343,10 +358,7 @@ lumen_services:
     network_mode: host
     command: ["uvicorn", "lumen.main:app", "--host", "{{ lumen_api_listen_address }}", "--port", "{{ lumen_api_listen_port | string }}"]
     restart_policy: unless-stopped
-    volumes:
-      - "/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro"
-      - "{{ lumen_policy_directory }}:/etc/lumen/policy.d:ro"
-      - "kolla_logs:/var/log/kolla/"
+    volumes: "{{ ['/etc/kolla/lumen/lumen.conf:/etc/lumen/lumen.conf:ro', lumen_policy_directory ~ ':/etc/lumen/policy.d:ro', 'kolla_logs:/var/log/kolla/'] + lumen_api_runtime_volumes }}"
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://{{ lumen_api_listen_address }}:{{ lumen_api_listen_port }}/v1/health', timeout=5); assert response.status == 200"]
       interval: 30s

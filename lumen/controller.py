@@ -130,6 +130,18 @@ def build_providers(config: RuntimeConfig) -> dict[str, object]:
 
 async def run_controller(config: RuntimeConfig, providers: dict[str, object], *,
                          stop: asyncio.Event | None = None) -> None:
+    """Drain controller work before closing provider HTTP and credential clients."""
+    try:
+        await _run_controller(config, providers, stop=stop)
+    finally:
+        for provider in {id(value): value for value in providers.values()}.values():
+            close = getattr(provider, "close", None)
+            if close is not None:
+                await asyncio.to_thread(close)
+
+
+async def _run_controller(config: RuntimeConfig, providers: dict[str, object], *,
+                          stop: asyncio.Event | None = None) -> None:
     """Preflight providers and serve bootstrap/dispatch alongside reconciliation."""
     if config.tls is None:
         raise ValueError("controller TLS material is required")
