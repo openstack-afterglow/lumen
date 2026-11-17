@@ -1,5 +1,16 @@
 # 운영 가이드
 
+## 0.6.17 롤아웃 메모
+
+- **Migration:** 033(MCP domain scope)과 034(`chat_stateless_call_reservations`)는 새 API/worker를 기동하기 전에 적용한다. 둘 다 additive이지만 기존 writer는 무상태 예약을 quota에 반영하지 않으므로, 새 Decisions admission과 기존 writer가 quota를 공유하며 함께 돌면 안 된다. 순서는 admission 중지·worker drain → 백업 → migrate → 새 cohort 기동이다.
+- **Protocol v2:** 같은 API·worker cohort에서 함께 켠다. Worker 등록은 {1,2}를 광고하므로 drain 없이 섞지 않는다. v2에서 대기 중인 승인이 있으면 v1로 되돌릴 수 없다.
+- **ClamAV:** `enable_lumen_clamav: true`, `lumen_clamav_host`는 비운다. Host network, `127.0.0.1:3310`, 서명 신선도·PING·VERSION 확인 전에는 API/worker가 기동하지 않는다.
+- **Kolla reconfigure:** 항상 `--skip-tags haproxy`를 붙인다.
+- **네이티브 카탈로그:** 공식 endpoint 모델 중 저장 단가가 없는 행은 배포 즉시 카탈로그 단가로 과금된다. 운영 전후 표(Gemini 이미지·일부 텍스트, `gpt-image-1.5`·`gpt-image-2`, Perplexity `glm-5.3-flash`·`kimi-k3` 등)를 확인한 뒤 배포한다. 현재 rate card에 없는 Perplexity 모델 5개는 계속 미가격이다. 사용자 지정 base의 호환 공급자는 관리자 단가가 필수다. Perplexity Sonar는 provider 내장 검색을 계속 수행하며 검색 수수료는 아직 청구하지 않는다(기존 한계). 공급자 기본 웹 검색 gate는 수수료를 청구할 수 있을 때까지 닫혀 있다.
+- **운영자 레지스트리 정리(명시적 편집):** `stt`로 잘못 저장된 OpenAI 실시간 전사 모델은 `realtime`으로 바꾸고 `realtime_input_per_minute` 단가를 넣은 뒤 활성화한다. 자동 SQL 변경은 하지 않는다.
+- **Decisions:** 공식 지원 모델은 `gpt-6-luna`(카탈로그 `decisions=true`). 불확실한 무상태 예약은 명시적 처분 전까지 quota에 남는다. 처분 API는 없으며 event UUID와 공급자 사용 증거를 대조한 뒤 유지보수 절차로만 정산·해제한다.
+- **Sandbox runtime:** 최종 0.6.17 sandbox 이미지·manifest digest와 mTLS 검증 전에는 `lumen_runtime_enabled: false`를 유지한다.
+
 ## 0.6.16 텍스트 임베딩 롤아웃 메모
 
 0.6.16에는 새 migration이 없다. `llm_models.model_kind`의 기존 `VARCHAR(16)`이 `embedding`을 저장한다. API/worker 이미지를 교체한 뒤 관리자 화면 또는 `python -m lumen.scripts.seed_providers`(`LUMEN_BOOTSTRAP_MODELS_JSON`에 정확한 입력 단가 제공)로 임베딩 모델을 등록해야 `/v1/embeddings`, `/v1beta/models/*:embedContent|batchEmbedContents`, `/v1/chat/embeddings`가 모델을 노출한다. 입력 단가가 없으면 해당 route는 가격 gate(`pricing_available=false`)로 닫힌다. Afterglow Embedding Studio는 이 Lumen이 먼저 배포된 뒤에만 `/chat/models?model_kind=embedding`을 호출할 수 있으므로 Lumen을 먼저 배포한다. 실제 공급자 호출, vendor 청구서 대조, 운영 롤아웃은 작성 시점에 검증하지 않았다.
