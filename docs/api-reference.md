@@ -415,3 +415,14 @@ Individual cancel은 미시작 run을 취소하지만 이미 provider 결과가 
 
 
 주요 오류는 unauthenticated/invalid key 401, project mismatch 또는 scope denial 403, invalid request 422(Anthropic Messages 계열은 400 `invalid_request_error`), quota 402(native) / 429(compat), idempotency conflict 409, store/config unavailable 503, expired event cursor 410이다. OpenAI route가 생성하는 HTTP 오류는 최상위 `{ "error": { "message": ..., "type": ..., "code": ... } }`, Anthropic route가 생성하는 오류는 최상위 `{ "type": "error", "error": { "type": ..., "message": ... } }` 구조를 사용한다. 인증·admission 경계 오류는 `{ "detail": ... }`일 수 있다. 호환 스트리밍 failure는 in-band SSE error, Native 스트리밍 실패는 `run.failed` 이벤트로 전달된다.
+
+## Catalog-backed embedding dimensions
+
+Embedding model responses expose an `embedding` object with published default, caller
+selection support, minimum/maximum and optional exhaustive `allowed_dimensions` list.
+`effective_capabilities.embedding` reflects explicit administrator override before native
+catalog data; compatible routes accept only the override. `GET /v1/capabilities` for an
+embedding model exposes the same `default_dimensions`, `supports_dimensions`,
+`min_dimensions`, `max_dimensions` and `allowed_dimensions` values for Studio controls.
+Unknown metadata allows the provider default but rejects an explicit dimension request.
+Requests outside a published range or exhaustive list fail before provider I/O.

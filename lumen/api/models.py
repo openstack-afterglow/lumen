@@ -17,7 +17,7 @@ from pydantic_core import PydanticCustomError
 
 from lumen.auth import require_admin
 from lumen.services import model_discovery
-from lumen.services.native_catalog import catalog_response
+from lumen.services.native_catalog import catalog_response, validate_embedding_metadata
 from lumen.services.providers import accounts, billing, credentials, errors, repository, subscriptions
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
@@ -338,8 +338,14 @@ class CapabilitiesInput(BaseModel):
     modalities: dict | None = None
     reasoning_options: list = Field(default_factory=list)
     context_limit: int | None = Field(default=None, ge=0)
+    embedding: dict | None = None
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("embedding")
+    @classmethod
+    def validate_embedding(cls, value: dict | None) -> dict | None:
+        return validate_embedding_metadata(value)
 
 
 class ModelCreateRequest(BaseModel):

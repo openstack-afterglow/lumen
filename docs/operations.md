@@ -641,3 +641,17 @@ The removed models.dev import endpoints return 404. Historical nullable import-i
 columns remain in SQL/schema snapshots for compatibility, but the ORM no longer maps
 them. `LICENSE.litellm` remains necessary for the existing search-transport mapping
 attribution; removal of the old catalog does not remove that independent attribution.
+
+Embedding entries may additionally carry `embedding` with `default_dimensions`,
+`supports_dimensions`, `min_dimensions`, `max_dimensions` and `allowed_dimensions`.
+Use null for unpublished bounds or a non-exhaustive recommendation list; recommendations
+must not become an exhaustive allowlist. Native requests enforce the exact published
+range/list. Unknown metadata permits the provider default but refuses an explicit
+dimension request. Compatible endpoints use only an administrator `capabilities.embedding`
+override; they never borrow native dimensions from a matching public model ID.
+
+An explicit capability override may remove catalog uncertainty only where Lumen implements
+that protocol feature. For example, native search can be enabled for an unknown model on
+an implemented search transport, while subscription search remains unavailable. Decisions
+can be enabled only for OpenAI-protocol text routes, including custom compatible endpoints;
+an Anthropic/Gemini/Perplexity or subscription override cannot enable that endpoint.

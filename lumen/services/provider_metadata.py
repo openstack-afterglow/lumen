@@ -104,6 +104,12 @@ def catalog_model_metadata(model: str, provider_type: str | None = None, api_bas
         },
         "supports_pdf_input": "pdf" in (entry["input_modalities"] or []),
     }
+    embedding = entry.get("embedding")
+    if embedding is not None:
+        metadata.update(embedding=embedding, output_vector_size=embedding["default_dimensions"])
+        metadata.update({key: embedding[key] for key in (
+            "supports_dimensions", "min_dimensions", "max_dimensions", "allowed_dimensions",
+        )})
     token = entry["token_pricing"] or {}
     fields = {
         "input": "input_cost_per_token", "output": "output_cost_per_token",

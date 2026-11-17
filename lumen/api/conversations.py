@@ -158,23 +158,9 @@ async def get_chat_capabilities(
             result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,
                           output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0)
     if model_kind == "embedding":
-        from lumen.services.provider_metadata import catalog_model_metadata
+        from lumen.services.embeddings import embedding_metadata
 
-        model_name = resolved["model_name"]
-        provider_type = resolved.get("provider_type")
-        metadata = catalog_model_metadata(model_name, provider_type or "", resolved.get("api_base"))
-        default_dimensions = metadata.get("output_vector_size")
-        if type(default_dimensions) is not int or default_dimensions < 1:
-            default_dimensions = None
-        supports_dimensions = metadata.get("supports_dimensions") is True and default_dimensions is not None
-        result.update(
-            default_dimensions=default_dimensions,
-            supports_dimensions=supports_dimensions,
-            min_dimensions=1 if supports_dimensions else None,
-            max_dimensions=default_dimensions if supports_dimensions else None,
-            max_input_tokens=metadata.get("max_input_tokens"),
-            max_inputs=16,
-        )
+        result.update(embedding_metadata(resolved), max_inputs=16)
     return result
 
 

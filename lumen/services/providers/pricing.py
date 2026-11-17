@@ -14,7 +14,9 @@ from lumen.services.capabilities import (
 )
 from lumen.services.provider_metadata import (
     bundled_cache_rates,
+    catalog_model_metadata,
     catalog_version,
+    direct_provider_route,
     effective_prices_per_million,
     native_catalog_entry,
     provider_family,
@@ -554,7 +556,16 @@ def _effective_capabilities(
             "available": ready, "mode": "native" if ready else "none",
             "reason_code": None if ready else "route_unavailable", "pricing_available": ready,
         }
-        return {"feature_gates": gates}, "registry"
+        stored = row.capabilities if row.capability_source == "override" and row.capabilities else {}
+        metadata = (
+            catalog_model_metadata(row.model_name, provider_type, api_base)
+            if direct_provider_route(provider_type, api_base) else {}
+        )
+        override = stored.get("embedding")
+        embedding = override if isinstance(override, dict) else metadata.get("embedding")
+        context_limit = stored.get("context_limit") or metadata.get("max_input_tokens")
+        source = "override" if isinstance(override, dict) else "native_catalog" if metadata else "defaults"
+        return {"feature_gates": gates, "embedding": embedding, "context_limit": context_limit}, source
     if _kind(row) != "text":
         # Media metadata does not imply an executable route. A real direct
         # provider, configured API key, supported price and asset pipeline matter.

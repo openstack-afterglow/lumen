@@ -20,7 +20,8 @@ _OFFICIAL_HOSTS = {
     "perplexity": {"docs.perplexity.ai", "www.perplexity.ai", "perplexity.ai"},
 }
 _TOKEN_FIELDS = frozenset({"input", "output", "cache_read", "cache_write", "cache_write_long"})
-_ENTRY_FIELDS = frozenset({"id", "aliases", "kind", "display_name", "status", "context_window", "max_output_tokens", "input_modalities", "output_modalities", "capabilities", "token_pricing", "media_pricing", "source_urls", "verified_at", "notes"})
+_ENTRY_FIELDS = frozenset({"id", "aliases", "kind", "display_name", "status", "context_window", "max_output_tokens", "input_modalities", "output_modalities", "capabilities", "token_pricing", "media_pricing", "source_urls", "verified_at", "notes", "embedding"})
+_EMBEDDING_FIELDS = frozenset({"default_dimensions", "supports_dimensions", "min_dimensions", "max_dimensions", "allowed_dimensions"})
 
 
 def _object(value: object, allowed: set | frozenset, location: str, required=()) -> dict:
@@ -72,6 +73,35 @@ def _sources(value: object, provider: str, location: str) -> None:
             raise ValueError(f"{location}: official HTTPS source required")
 
 
+def validate_embedding_metadata(value: object) -> dict | None:
+    """Validate published dimension constraints without inferring missing bounds."""
+    if value is None:
+        return None
+    embedding = _object(value, _EMBEDDING_FIELDS, "embedding", _EMBEDDING_FIELDS)
+    if type(embedding["supports_dimensions"]) is not bool:
+        raise ValueError("embedding.supports_dimensions: boolean required")
+    for field in ("default_dimensions", "min_dimensions", "max_dimensions"):
+        _positive_integer(embedding[field], f"embedding.{field}")
+    minimum, maximum = embedding["min_dimensions"], embedding["max_dimensions"]
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError("embedding: minimum exceeds maximum")
+    default = embedding["default_dimensions"]
+    allowed = embedding["allowed_dimensions"]
+    if allowed is not None:
+        if not isinstance(allowed, list) or not allowed:
+            raise ValueError("embedding.allowed_dimensions: nonempty list or null required")
+        for dimension in allowed:
+            _positive_integer(dimension, "embedding.allowed_dimensions", nullable=False)
+        if len(allowed) != len(set(allowed)):
+            raise ValueError("embedding.allowed_dimensions: duplicate values")
+    for dimension in ([default] if default is not None else []) + (allowed or []):
+        if minimum is not None and dimension < minimum or maximum is not None and dimension > maximum:
+            raise ValueError("embedding: dimension outside published bounds")
+    if default is not None and allowed is not None and default not in allowed:
+        raise ValueError("embedding: default outside allowed dimensions")
+    return copy.deepcopy(embedding)
+
+
 def validate_catalog(value: object) -> dict:
     """Reject malformed source data rather than silently changing billing or capabilities."""
     root = _object(value, {"schema_version", "catalog_version", "providers"}, "catalog", {"schema_version", "catalog_version", "providers"})
@@ -89,7 +119,7 @@ def validate_catalog(value: object) -> dict:
             raise ValueError(f"{provider}.models: list required")
         identities: set[str] = set()
         for entry in record["models"]:
-            entry = _object(entry, _ENTRY_FIELDS, f"{provider}.model", _ENTRY_FIELDS)
+            entry = _object(entry, _ENTRY_FIELDS, f"{provider}.model", _ENTRY_FIELDS - {"embedding"})
             model_id = _string(entry["id"], "id")
             names = [model_id, *_strings(entry["aliases"], "aliases")]
             if len(names) != len(set(names)) or identities.intersection(names):
@@ -97,6 +127,9 @@ def validate_catalog(value: object) -> dict:
             identities.update(names)
             if entry["kind"] not in _MODEL_KINDS or entry["status"] not in {"active", "preview", "deprecated"}:
                 raise ValueError(f"{provider}/{model_id}: invalid kind or status")
+            if entry.get("embedding") is not None and entry["kind"] != "embedding":
+                raise ValueError("embedding metadata is only valid for kind=embedding")
+            validate_embedding_metadata(entry.get("embedding"))
             _string(entry["display_name"], "display_name")
             _positive_integer(entry["context_window"], "context_window")
             _positive_integer(entry["max_output_tokens"], "max_output_tokens")

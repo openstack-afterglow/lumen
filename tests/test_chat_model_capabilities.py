@@ -172,11 +172,13 @@ class TestEffectiveCapabilities:
         assert source == ("override" if overridden else "defaults")
         for flag in (
             "vision", "tool_call", "function_calling", "reasoning",
-            "structured_output", "prompt_caching", "decisions",
+            "structured_output", "prompt_caching",
         ):
             assert eff[flag] is overridden
-        for feature in ("image_input", "structured_output", "decisions"):
+        for feature in ("image_input", "structured_output"):
             assert eff["feature_gates"][feature]["available"] is overridden
+        assert eff["decisions"] is (overridden and provider_type == "openai")
+        assert eff["feature_gates"]["decisions"]["available"] is (overridden and provider_type == "openai")
         assert eff["web_search"] is False
         assert eff["context_limit"] is None
         assert eff["metadata_version"] is None
@@ -198,7 +200,7 @@ class TestEffectiveCapabilities:
         }
 
     @pytest.mark.parametrize("model_name", ("perplexity/sonar", "perplexity/glm-5.3"))
-    def test_stale_perplexity_and_glm_legacy_search_overrides_cannot_enable_native_search(
+    def test_explicit_search_override_wins_missing_catalog_support(
         self, monkeypatch, model_name
     ):
         monkeypatch.setattr(capability_service, "_native_web_search_available", lambda _model, _provider, _base: False)
@@ -209,13 +211,13 @@ class TestEffectiveCapabilities:
         )
 
         assert source == "override"
-        assert capabilities["web_search"] is False
+        assert capabilities["web_search"] is True
         assert capabilities["web_search_required"] is False
         assert capabilities["feature_gates"]["web_search"] == {
-            "available": False,
-            "mode": "none",
-            "reason_code": "provider_unsupported",
-            "pricing_available": False,
+            "available": True,
+            "mode": "native",
+            "reason_code": None,
+            "pricing_available": True,
         }
 
     @pytest.mark.parametrize(("transport_available", "expected_required"), ((False, False), (True, True)))
@@ -237,5 +239,5 @@ class TestEffectiveCapabilities:
             "perplexity",
         )
 
-        assert capabilities["web_search"] is transport_available
+        assert capabilities["web_search"] is True
         assert capabilities["web_search_required"] is expected_required

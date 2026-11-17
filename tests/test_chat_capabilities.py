@@ -98,6 +98,7 @@ def _detected_native_search_capabilities(*, available: bool, required: bool = Fa
     return {
         "web_search": available,
         "web_search_required": required,
+        "native_web_search_transport_supported": available,
         "feature_gates": {
             "web_search": {
                 "available": available,

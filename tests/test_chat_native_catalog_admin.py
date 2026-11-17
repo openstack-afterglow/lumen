@@ -12,7 +12,7 @@ from test_chat_api_model_routing import provider_db as provider_db
 from lumen.api.models import ModelCreateRequest, ModelUpdateRequest, ProviderCreateRequest, ProviderUpdateRequest
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.services.native_catalog import catalog_response, native_catalog
-from lumen.services.providers import errors, pricing, repository
+from lumen.services.providers import errors, pricing, repository, routing
 
 _UNSUPPORTED = [
     "groq", "deepseek", "mistral", "together_ai", "openrouter", "xai", "ollama",
@@ -325,3 +325,136 @@ async def test_optional_capability_flags_preserve_explicit_false_without_storing
         row = await session.get(LlmModel, created["id"])
         assert flag not in row.capabilities
         assert row.capabilities["decisions"] is False
+
+
+@pytest.mark.parametrize("model,provider_type,minimum", [
+    ("text-embedding-3-large", "openai", 1),
+    ("gemini-embedding-001", "gemini", 128),
+    ("gemini-embedding-2", "gemini", 128),
+])
+async def test_bundled_embedding_dimensions_reach_admin_and_capabilities_http(
+    provider_db, admin_client, monkeypatch, model, provider_type, minimum,
+):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type=provider_type)
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr(routing, "_effective_capabilities", pricing._effective_capabilities)
+    monkeypatch.setattr(routing, "_pricing_aware_capabilities", pricing._pricing_aware_capabilities)
+    expected = {
+        "default_dimensions": 3072, "supports_dimensions": True,
+        "min_dimensions": minimum, "max_dimensions": 3072, "allowed_dimensions": None,
+    }
+    created = await admin_client.post("/v1/admin/models", json={
+        "provider_id": 1, "model_name": model, "model_kind": "embedding",
+    })
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["effective_capabilities"]["embedding"] == expected
+    assert body["effective_capability_source"] == "native_catalog"
+    listed = await admin_client.get("/v1/admin/models")
+    assert listed.status_code == 200, listed.text
+    assert listed.json()[0]["effective_capabilities"]["embedding"] == expected
+    capabilities = await admin_client.get("/v1/capabilities", params={
+        "model_id": body["id"], "model_kind": "embedding",
+    })
+    assert capabilities.status_code == 200, capabilities.text
+    assert {field: capabilities.json()[field] for field in expected} == expected
+    assert capabilities.json()["model_capabilities"]["embedding"] == expected
+
+
+async def test_compatible_embedding_admin_override_round_trips_without_catalog_lookup(
+    provider_db, admin_client, monkeypatch,
+):
+    from lumen.services import provider_metadata
+
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="openai")
+    await _set_provider(api_base="https://compatible.invalid/v1")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr(routing, "_effective_capabilities", pricing._effective_capabilities)
+    monkeypatch.setattr(routing, "_pricing_aware_capabilities", pricing._pricing_aware_capabilities)
+
+    def forbidden():
+        pytest.fail("compatible embedding routes must never load the bundled catalog")
+
+    monkeypatch.setattr(provider_metadata, "native_catalog", forbidden)
+    expected = {
+        "default_dimensions": 256, "supports_dimensions": True,
+        "min_dimensions": 128, "max_dimensions": 512, "allowed_dimensions": [128, 256, 512],
+    }
+    created = await admin_client.post("/v1/admin/models", json={
+        "provider_id": 1, "model_name": "text-embedding-3-large", "model_kind": "embedding",
+        "input_price_per_million": "0", "capabilities": {"embedding": expected, "context_limit": 4096},
+    })
+    assert created.status_code == 201, created.text
+    body = created.json()
+    model_id = body["id"]
+    assert body["provider_family"] == "compatible"
+    assert body["effective_capabilities"]["embedding"] == expected
+    assert body["effective_capability_source"] == "override"
+    async with repository._require_db()() as session:
+        row = await session.get(LlmModel, model_id)
+        assert row.capabilities["embedding"] == expected
+        assert row.capability_source == "override"
+    listed = await admin_client.get("/v1/admin/models")
+    assert listed.status_code == 200, listed.text
+    assert listed.json()[0]["effective_capabilities"]["embedding"] == expected
+    response = await admin_client.get("/v1/capabilities", params={"model_id": model_id, "model_kind": "embedding"})
+    assert response.status_code == 200, response.text
+    assert {field: response.json()[field] for field in expected} == expected
+    assert response.json()["max_input_tokens"] == 4096
+    cleared = await admin_client.patch(f"/v1/admin/models/{model_id}", json={"capabilities": None})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["effective_capabilities"]["embedding"] is None
+    response = await admin_client.get("/v1/capabilities", params={"model_id": model_id, "model_kind": "embedding"})
+    assert response.status_code == 200, response.text
+    assert response.json()["default_dimensions"] is None
+    assert response.json()["supports_dimensions"] is False
+    assert response.json()["min_dimensions"] is None
+    assert response.json()["max_dimensions"] is None
+    assert response.json()["allowed_dimensions"] is None
+    assert response.json()["max_input_tokens"] is None
+
+
+@pytest.mark.parametrize("source", [None, "models_dev", "override"])
+def test_compatible_embedding_metadata_uses_only_stored_override(monkeypatch, source):
+    from lumen.services import provider_metadata
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("compatible embedding metadata must never consult the native catalog")
+
+    monkeypatch.setattr(pricing, "catalog_model_metadata", forbidden)
+    monkeypatch.setattr(provider_metadata, "native_catalog", forbidden)
+    embedding = {
+        "default_dimensions": 256, "supports_dimensions": False,
+        "min_dimensions": None, "max_dimensions": None, "allowed_dimensions": None,
+    }
+    row = LlmModel(
+        model_name="text-embedding-3-large", model_kind="embedding",
+        capability_source=source, capabilities={"embedding": embedding, "context_limit": 42},
+    )
+    caps, origin = pricing._effective_capabilities(
+        row, "openai", api_base="https://compatible.invalid/v1", api_key_configured=True,
+    )
+    assert caps["embedding"] == (embedding if source == "override" else None)
+    assert caps["context_limit"] == (42 if source == "override" else None)
+    assert origin == ("override" if source == "override" else "defaults")
+
+
+@pytest.mark.parametrize("patch", [
+    {"default_dimensions": True}, {"default_dimensions": 0}, {"supports_dimensions": "yes"},
+    {"min_dimensions": 513}, {"max_dimensions": 127}, {"allowed_dimensions": []},
+    {"allowed_dimensions": [128, 128, 256]}, {"allowed_dimensions": [128, 512]},
+    {"allowed_dimensions": [True, 256]}, {"allowed_dimensions": [64, 256]},
+    {"unknown": 1},
+])
+def test_embedding_override_rejects_invalid_dimension_constraints(patch):
+    embedding = {
+        "default_dimensions": 256, "supports_dimensions": True,
+        "min_dimensions": 128, "max_dimensions": 512, "allowed_dimensions": [128, 256, 512],
+        **patch,
+    }
+    with pytest.raises(ValidationError):
+        ModelCreateRequest(
+            provider_id=1, model_name="embedding", model_kind="embedding", capabilities={"embedding": embedding},
+        )
