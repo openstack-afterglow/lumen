@@ -26,7 +26,8 @@ from sqlalchemy import select
 
 from lumen.db import get_session_factory
 from lumen.models.chat_infrastructure import ChatRuntimePool, ChatRuntimeResource
-from lumen.services.durable_runs import lifecycle
+from lumen.services import worker_routing
+from lumen.services.durable_runs import budgets, lifecycle
 from lumen.services.infrastructure import bootstrap, store
 from lumen.services.infrastructure._coordination import HEARTBEAT_SECONDS, PoolCoordinator
 from lumen.services.infrastructure.config import PoolConfig, RuntimeConfig
@@ -91,22 +92,33 @@ class ResourceController:
             return await self._settled(function, *args)
 
     async def _fenced_cloud(self, resource, fence: int, function, *args, action: str | None = None):
-        """Order non-conditional cloud writes with takeover using the pool row lock."""
+        """Retry only the DB prefix; native submission and its commit are never replayed."""
         factory = get_session_factory()
-        async with self.limiter, factory() as session, session.begin():
-            row, lease = await store._locked_resource(session, resource.id, resource.generation)
-            if row is None or not store._owns(lease, self.owner, fence):
-                raise PoolLeaseLost()
-            if action == "create" and row.desired_state != "requested":
-                raise PoolLeaseLost()
-            if action == "delete":
-                if row.desired_state != "deleting":
+        submitted = False
+
+        def submit():
+            nonlocal submitted
+            submitted = True
+            return function(*args)
+
+        async def transaction():
+            async with self.limiter, factory() as session, session.begin():
+                await worker_routing.use_read_committed(session)
+                row, lease = await store._locked_resource(session, resource.id, resource.generation)
+                if row is None or not store._owns(lease, self.owner, fence):
                     raise PoolLeaseLost()
-                if (row.role == "worker" and (row.ready_at is not None or row.drain_requested_at is not None
-                        or row.observed_state in {"ready", "draining"}) and row.drain_ack_at is None
-                        and row.failure_code != "resource_vanished"):
-                    raise store.ResourceUnavailable("drain_pending")
-            return await self._renewed_effect(lease, function, *args)
+                if action == "create" and row.desired_state != "requested":
+                    raise PoolLeaseLost()
+                if action == "delete":
+                    if row.desired_state != "deleting":
+                        raise PoolLeaseLost()
+                    if (row.role == "worker" and (row.ready_at is not None or row.drain_requested_at is not None
+                            or row.observed_state in {"ready", "draining"}) and row.drain_ack_at is None
+                            and row.failure_code != "resource_vanished"):
+                        raise store.ResourceUnavailable("drain_pending")
+                return await self._renewed_effect(lease, submit)
+
+        return await budgets.retry_deadlocks(transaction, retry_if=lambda: not submitted)
 
     async def _renewed_effect(self, lease, function, *args):
         await self._check_assignment()
@@ -530,6 +542,7 @@ class ResourceController:
         try:
             # Limiter first: a coroutine holding the pool row lock never waits on the limiter.
             async with self.limiter, factory() as session, session.begin():
+                await worker_routing.use_read_committed(session)
                 row, lease = await store._locked_resource(session, resource.id, resource.generation)
                 if (row is None or row.pool_id != pool.id or not store._owns(lease, self.owner, fence)
                         or row.drain_requested_at is not None or not row.accepting
@@ -667,6 +680,7 @@ class ResourceController:
             return
         factory = get_session_factory()
         async with factory() as session, session.begin():
+            await worker_routing.use_read_committed(session)
             row, lease = await store._locked_resource(session, resource.id, resource.generation)
             if row is None or not store._owns(lease, self.owner, fence) or row.drain_requested_at is None:
                 raise PoolLeaseLost()

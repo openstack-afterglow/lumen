@@ -69,15 +69,18 @@ def is_lock_conflict(exc: BaseException) -> bool:
     return _is_retryable_lock_conflict(exc)
 
 
-async def retry_deadlocks[T](operation: Callable[[], Awaitable[T]], *, attempts: int = 3) -> T:
-    """Retry rollback-safe pure DB transactions at most three times; never wrap network I/O."""
+async def retry_deadlocks[T](
+    operation: Callable[[], Awaitable[T]], *, attempts: int = 3, retry_if: Callable[[], bool] | None = None,
+) -> T:
+    """Retry rollback-safe DB attempts; an optional guard fences a prefix before external I/O."""
     if not 1 <= attempts <= 3:
         raise ValueError("lock conflict retries are bounded to three attempts")
     for attempt in range(1, attempts + 1):
         try:
             return await operation()
         except OperationalError as exc:
-            if not _is_retryable_lock_conflict(exc) or attempt == attempts:
+            if (not _is_retryable_lock_conflict(exc) or attempt == attempts
+                    or (retry_if is not None and not retry_if())):
                 raise
             logger.info("retrying conflicting durable transaction attempt=%d", attempt)
             await asyncio.sleep(0.02 * attempt)

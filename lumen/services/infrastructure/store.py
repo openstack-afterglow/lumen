@@ -114,41 +114,53 @@ async def claim_pool_lease(pool_id: str, owner: str, lease_seconds: int) -> tupl
         raise ValueError("invalid controller owner")
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive")
-    now = _now()
-    async with _factory()() as session, session.begin():
-        row = (await session.execute(select(ChatRuntimePool).where(
-            ChatRuntimePool.id == pool_id).with_for_update())).scalar_one_or_none()
-        if row is None or not row.enabled:
-            return None
-        if row.reconcile_lease_expires_at and _utc(row.reconcile_lease_expires_at) > now and row.reconcile_lease_owner != owner:
-            return None
-        row.reconcile_fence += 1
-        row.reconcile_lease_owner = owner
-        row.reconcile_lease_expires_at = now + timedelta(seconds=lease_seconds)
-        return row, row.reconcile_fence
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            row = (await session.execute(select(ChatRuntimePool).where(
+                ChatRuntimePool.id == pool_id).with_for_update())).scalar_one_or_none()
+            if row is None or not row.enabled:
+                return None
+            now = _now()
+            if row.reconcile_lease_expires_at and _utc(row.reconcile_lease_expires_at) > now and row.reconcile_lease_owner != owner:
+                return None
+            row.reconcile_fence += 1
+            row.reconcile_lease_owner = owner
+            row.reconcile_lease_expires_at = now + timedelta(seconds=lease_seconds)
+            return row, row.reconcile_fence
+
+    return await retry_deadlocks(transaction)
 
 
 async def renew_pool_lease(pool_id: str, owner: str, fence: int, lease_seconds: int) -> bool:
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive")
-    async with _factory()() as session, session.begin():
-        pool = (await session.execute(select(ChatRuntimePool).where(ChatRuntimePool.id == pool_id).with_for_update())).scalar_one_or_none()
-        if not _owns(pool, owner, fence):
-            return False
-        pool.reconcile_lease_expires_at = _now() + timedelta(seconds=lease_seconds)
-        return True
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            pool = (await session.execute(select(ChatRuntimePool).where(ChatRuntimePool.id == pool_id).with_for_update())).scalar_one_or_none()
+            if not _owns(pool, owner, fence):
+                return False
+            pool.reconcile_lease_expires_at = _now() + timedelta(seconds=lease_seconds)
+            return True
+
+    return await retry_deadlocks(transaction)
 
 
 async def release_pool_lease(pool_id: str, owner: str, fence: int) -> bool:
     """Relinquish only this SQL fence, after all of its external work settles."""
-    async with _factory()() as session, session.begin():
-        pool = (await session.execute(select(ChatRuntimePool).where(
-            ChatRuntimePool.id == pool_id).with_for_update())).scalar_one_or_none()
-        if pool is None or pool.reconcile_lease_owner != owner or pool.reconcile_fence != fence:
-            return False
-        pool.reconcile_lease_owner = _UNCLAIMED
-        pool.reconcile_lease_expires_at = None
-        return True
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            pool = (await session.execute(select(ChatRuntimePool).where(
+                ChatRuntimePool.id == pool_id).with_for_update())).scalar_one_or_none()
+            if pool is None or pool.reconcile_lease_owner != owner or pool.reconcile_fence != fence:
+                return False
+            pool.reconcile_lease_owner = _UNCLAIMED
+            pool.reconcile_lease_expires_at = None
+            return True
+
+    return await retry_deadlocks(transaction)
 
 
 async def pool_lease_owned(pool_id: str, owner: str, fence: int) -> bool:
@@ -163,6 +175,7 @@ def _owns(pool: ChatRuntimePool | None, owner: str, fence: int) -> bool:
 
 
 async def _locked_resource(session: AsyncSession, resource_id: str, generation: int | None = None):
+    """Lock pool before resource; callers select isolation before their first SQL."""
     pool_id = (await session.execute(select(ChatRuntimeResource.pool_id).where(
         ChatRuntimeResource.id == resource_id))).scalar_one_or_none()
     if pool_id is None:
@@ -204,51 +217,54 @@ async def request_resource(pool: ChatRuntimePool, *, role: str, request_fingerpr
                            logical_user_id: str | None = None, owner: str | None = None,
                            fence: int | None = None, replacement_for: str | None = None,
                            physical_limit: int | None = None) -> ChatRuntimeResource:
-    async with _factory()() as session, session.begin():
-        await worker_routing.use_read_committed(session)
-        locked = (await session.execute(select(ChatRuntimePool).where(ChatRuntimePool.id == pool.id)
-                                        .with_for_update().execution_options(populate_existing=True))).scalar_one()
-        if not locked.enabled or locked.role != role:
-            raise ResourceUnavailable("pool_unavailable")
-        if owner is not None and (fence is None or not _owns(locked, owner, fence)):
-            raise ResourceUnavailable("pool_lease_lost")
-        if run_id:
-            prior = (await session.execute(select(ChatRuntimeResource).where(ChatRuntimeResource.run_id == run_id)
-                                           .order_by(ChatRuntimeResource.generation.desc()).with_for_update())).scalars().first()
-            if prior is not None:
-                return prior
-        count = await occupancy(locked.id, session=session)
-        limit = locked.max_replicas
-        if replacement_for is not None:
-            if role not in {"api", "worker"} or owner is None or locked.max_surge == 0:
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            locked = (await session.execute(select(ChatRuntimePool).where(ChatRuntimePool.id == pool.id)
+                                            .with_for_update().execution_options(populate_existing=True))).scalar_one()
+            if not locked.enabled or locked.role != role:
+                raise ResourceUnavailable("pool_unavailable")
+            if owner is not None and (fence is None or not _owns(locked, owner, fence)):
+                raise ResourceUnavailable("pool_lease_lost")
+            if run_id:
+                prior = (await session.execute(select(ChatRuntimeResource).where(ChatRuntimeResource.run_id == run_id)
+                                               .order_by(ChatRuntimeResource.generation.desc()).with_for_update())).scalars().first()
+                if prior is not None:
+                    return prior
+            count = await occupancy(locked.id, session=session)
+            limit = locked.max_replicas
+            if replacement_for is not None:
+                if role not in {"api", "worker"} or owner is None or locked.max_surge == 0:
+                    raise ResourceUnavailable("pool_capacity_exceeded")
+                old = (await session.execute(select(ChatRuntimeResource).where(
+                    ChatRuntimeResource.id == replacement_for, ChatRuntimeResource.pool_id == locked.id,
+                ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+                if (old is None or old.observed_state != "ready" or old.drain_requested_at is not None
+                        or old.desired_state == "deleting" or (_now() - _utc(old.created_at)).total_seconds()
+                        < locked.max_lifetime_seconds - locked.boot_timeout_seconds - locked.drain_seconds):
+                    raise ResourceUnavailable("replacement_not_due")
+                prior = await session.scalar(select(ChatRuntimeResource.id).where(
+                    ChatRuntimeResource.pool_id == locked.id,
+                    ChatRuntimeResource.drain_reason == "replacement:" + replacement_for,
+                    ChatRuntimeResource.observed_state != "deleted",
+                ))
+                if prior is not None:
+                    raise ResourceUnavailable("replacement_pending")
+                limit += locked.max_surge
+            if physical_limit is not None:
+                limit = min(limit, physical_limit)
+            if count >= limit:
                 raise ResourceUnavailable("pool_capacity_exceeded")
-            old = (await session.execute(select(ChatRuntimeResource).where(
-                ChatRuntimeResource.id == replacement_for, ChatRuntimeResource.pool_id == locked.id,
-            ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
-            if (old is None or old.observed_state != "ready" or old.drain_requested_at is not None
-                    or old.desired_state == "deleting" or (_now() - _utc(old.created_at)).total_seconds()
-                    < locked.max_lifetime_seconds - locked.boot_timeout_seconds - locked.drain_seconds):
-                raise ResourceUnavailable("replacement_not_due")
-            prior = await session.scalar(select(ChatRuntimeResource.id).where(
-                ChatRuntimeResource.pool_id == locked.id,
-                ChatRuntimeResource.drain_reason == "replacement:" + replacement_for,
-                ChatRuntimeResource.observed_state != "deleted",
-            ))
-            if prior is not None:
-                raise ResourceUnavailable("replacement_pending")
-            limit += locked.max_surge
-        if physical_limit is not None:
-            limit = min(limit, physical_limit)
-        if count >= limit:
-            raise ResourceUnavailable("pool_capacity_exceeded")
-        resource = await _insert_resource(session, locked, role=role, request_fingerprint=request_fingerprint,
-                                          image_ref=image_ref, policy_digest=policy_digest, deadline=deadline,
-                                          run_id=run_id, logical_project_id=logical_project_id,
-                                          logical_user_id=logical_user_id)
-        if replacement_for is not None:
-            resource.drain_reason = "replacement:" + replacement_for
-        await session.flush()
-        return resource
+            resource = await _insert_resource(session, locked, role=role, request_fingerprint=request_fingerprint,
+                                              image_ref=image_ref, policy_digest=policy_digest, deadline=deadline,
+                                              run_id=run_id, logical_project_id=logical_project_id,
+                                              logical_user_id=logical_user_id)
+            if replacement_for is not None:
+                resource.drain_reason = "replacement:" + replacement_for
+            await session.flush()
+            return resource
+
+    return await retry_deadlocks(transaction)
 
 
 async def claim_operation(resource_id: str, generation: int, action: str, owner: str, fence: int) -> ChatResourceOperation | None:
@@ -257,6 +273,7 @@ async def claim_operation(resource_id: str, generation: int, action: str, owner:
         raise ValueError("invalid operation owner")
     async def transaction() -> ChatResourceOperation | None:
         async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
             resource, pool = await _locked_resource(session, resource_id, generation)
             if not resource or not _owns(pool, owner, fence) or resource.observed_state == "deleted":
                 return None
@@ -317,89 +334,105 @@ async def defer_unsubmitted_operation(resource_id: str, generation: int, action:
 async def abort_unsubmitted_create(resource_id: str, generation: int, owner: str, fence: int,
                                    error_code: str) -> bool:
     """Release a claimed create only when the caller certifies no cloud call occurred."""
-    async with _factory()() as session, session.begin():
-        resource, pool = await _locked_resource(session, resource_id, generation)
-        if not resource or not _owns(pool, owner, fence) or resource.provider_id is not None:
-            return False
-        operation = (await session.execute(select(ChatResourceOperation).where(
-            ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.generation == generation,
-            ChatResourceOperation.action == "create").with_for_update())).scalar_one_or_none()
-        if not operation or operation.owner != owner or operation.fence != fence or operation.request_status != "claimed":
-            return False
-        operation.request_status = "failed"
-        operation.error_code = error_code
-        resource.failure_code = error_code
-        resource.desired_state = "deleting"
-        resource.observed_state = "deleted"
-        resource.deleted_at = _now()
-        return True
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            resource, pool = await _locked_resource(session, resource_id, generation)
+            if not resource or not _owns(pool, owner, fence) or resource.provider_id is not None:
+                return False
+            operation = (await session.execute(select(ChatResourceOperation).where(
+                ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.generation == generation,
+                ChatResourceOperation.action == "create").with_for_update())).scalar_one_or_none()
+            if not operation or operation.owner != owner or operation.fence != fence or operation.request_status != "claimed":
+                return False
+            operation.request_status = "failed"
+            operation.error_code = error_code
+            resource.failure_code = error_code
+            resource.desired_state = "deleting"
+            resource.observed_state = "deleted"
+            resource.deleted_at = _now()
+            return True
+
+    return await retry_deadlocks(transaction)
 
 
 
 async def record_observation(resource_id: str, generation: int, owner: str, fence: int, observation: Observation) -> bool:
     """Persist a provider observation under the current lease; cloud ACTIVE is booting, not ready."""
-    async with _factory()() as session, session.begin():
-        resource, pool = await _locked_resource(session, resource_id, generation)
-        if not resource or not _owns(pool, owner, fence) or resource.observed_state == "deleted":
-            return False
-        if not isinstance(observation, Observation) or not observation.provider_id:
-            return False
-        identity = {"lumen_deployment": pool.deployment_id, "lumen_pool": pool.name,
-                    "lumen_resource": resource.id, "lumen_generation": str(generation),
-                    "lumen_fingerprint": resource.request_fingerprint, "lumen_policy": resource.policy_digest}
-        if any(str(observation.metadata.get(key)) != value for key, value in identity.items()):
-            return False
-        if resource.provider_id and resource.provider_id != observation.provider_id:
-            return False
-        resource.provider_id = observation.provider_id
-        if observation.address is not None:
-            resource.address = observation.address
-        if observation.port is not None:
-            resource.port = observation.port
-        state = observation.state.lower()
-        if resource.desired_state == "deleting":
-            resource.observed_state = "deleting"
-        elif state in {"error", "failed"}:
-            resource.observed_state = "unavailable"
-        elif state in {"active", "running", "ready", "booting"} and resource.observed_state not in {"ready", "draining"}:
-            resource.observed_state = "booting"
-        elif state in {"build", "creating", "created", "stopped"} and resource.observed_state not in {"ready", "draining"}:
-            resource.observed_state = "creating"
-        operation = (await session.execute(select(ChatResourceOperation).where(
-            ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.generation == generation,
-            ChatResourceOperation.action == "create").with_for_update())).scalar_one_or_none()
-        if operation and operation.request_status in {"claimed", "unknown", "submitted"}:
-            operation.request_status = "succeeded"
-            operation.provider_request_id = observation.provider_id
-        return True
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            resource, pool = await _locked_resource(session, resource_id, generation)
+            if not resource or not _owns(pool, owner, fence) or resource.observed_state == "deleted":
+                return False
+            if not isinstance(observation, Observation) or not observation.provider_id:
+                return False
+            identity = {"lumen_deployment": pool.deployment_id, "lumen_pool": pool.name,
+                        "lumen_resource": resource.id, "lumen_generation": str(generation),
+                        "lumen_fingerprint": resource.request_fingerprint, "lumen_policy": resource.policy_digest}
+            if any(str(observation.metadata.get(key)) != value for key, value in identity.items()):
+                return False
+            if resource.provider_id and resource.provider_id != observation.provider_id:
+                return False
+            resource.provider_id = observation.provider_id
+            if observation.address is not None:
+                resource.address = observation.address
+            if observation.port is not None:
+                resource.port = observation.port
+            state = observation.state.lower()
+            if resource.desired_state == "deleting":
+                resource.observed_state = "deleting"
+            elif state in {"error", "failed"}:
+                resource.observed_state = "unavailable"
+            elif state in {"active", "running", "ready", "booting"} and resource.observed_state not in {"ready", "draining"}:
+                resource.observed_state = "booting"
+            elif state in {"build", "creating", "created", "stopped"} and resource.observed_state not in {"ready", "draining"}:
+                resource.observed_state = "creating"
+            operation = (await session.execute(select(ChatResourceOperation).where(
+                ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.generation == generation,
+                ChatResourceOperation.action == "create").with_for_update())).scalar_one_or_none()
+            if operation and operation.request_status in {"claimed", "unknown", "submitted"}:
+                operation.request_status = "succeeded"
+                operation.provider_request_id = observation.provider_id
+            return True
+
+    return await retry_deadlocks(transaction)
 
 
 async def mark_unknown(resource_id: str, generation: int, owner: str, fence: int, action: str = "create") -> bool:
-    async with _factory()() as session, session.begin():
-        resource, pool = await _locked_resource(session, resource_id, generation)
-        if not resource or not _owns(pool, owner, fence):
-            return False
-        op = (await session.execute(select(ChatResourceOperation).where(
-            ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.generation == generation,
-            ChatResourceOperation.action == action).with_for_update())).scalar_one_or_none()
-        if not op or op.owner != owner or op.fence != fence or op.request_status not in {"claimed", "submitted"}:
-            return False
-        op.request_status = "unknown"
-        if action == "create":
-            resource.observed_state = "unknown"
-        return True
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            resource, pool = await _locked_resource(session, resource_id, generation)
+            if not resource or not _owns(pool, owner, fence):
+                return False
+            op = (await session.execute(select(ChatResourceOperation).where(
+                ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.generation == generation,
+                ChatResourceOperation.action == action).with_for_update())).scalar_one_or_none()
+            if not op or op.owner != owner or op.fence != fence or op.request_status not in {"claimed", "submitted"}:
+                return False
+            op.request_status = "unknown"
+            if action == "create":
+                resource.observed_state = "unknown"
+            return True
+
+    return await retry_deadlocks(transaction)
 
 
 async def mark_failed_with_cleanup(resource_id: str, generation: int, owner: str, fence: int, error_code: str) -> bool:
-    async with _factory()() as session, session.begin():
-        resource, pool = await _locked_resource(session, resource_id, generation)
-        if not resource or not _owns(pool, owner, fence) or resource.observed_state == "deleted":
-            return False
-        resource.failure_code = error_code
-        resource.observed_state = "failed"
-        resource.desired_state = "deleting"
-        await _request_delete(session, resource)
-        return True
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            resource, pool = await _locked_resource(session, resource_id, generation)
+            if not resource or not _owns(pool, owner, fence) or resource.observed_state == "deleted":
+                return False
+            resource.failure_code = error_code
+            resource.observed_state = "failed"
+            resource.desired_state = "deleting"
+            await _request_delete(session, resource)
+            return True
+
+    return await retry_deadlocks(transaction)
 
 
 async def _request_delete(session: AsyncSession, resource: ChatRuntimeResource) -> ChatResourceOperation:
@@ -479,22 +512,26 @@ async def begin_drain(resource_id: str, generation: int, owner: str, fence: int,
 
 async def prove_absent(resource_id: str, generation: int, owner: str, fence: int) -> bool:
     """Only caller-supplied positive provider absence is sufficient; never infer from a listing."""
-    async with _factory()() as session, session.begin():
-        resource, pool = await _locked_resource(session, resource_id, generation)
-        if not resource or not _owns(pool, owner, fence) or resource.desired_state != "deleting":
-            return False
-        create = (await session.execute(select(ChatResourceOperation).where(
-            ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.generation == generation,
-            ChatResourceOperation.action == "create").with_for_update())).scalar_one_or_none()
-        if resource.provider_id is None and create and (create.owner != _UNCLAIMED or create.request_status != "claimed"):
-            return False
-        delete = await _request_delete(session, resource)
-        if resource.provider_id is not None and delete.owner == _UNCLAIMED:
-            return False
-        resource.observed_state = "deleted"
-        resource.deleted_at = _now()
-        delete.request_status = "succeeded"
-        return True
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            resource, pool = await _locked_resource(session, resource_id, generation)
+            if not resource or not _owns(pool, owner, fence) or resource.desired_state != "deleting":
+                return False
+            create = (await session.execute(select(ChatResourceOperation).where(
+                ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.generation == generation,
+                ChatResourceOperation.action == "create").with_for_update())).scalar_one_or_none()
+            if resource.provider_id is None and create and (create.owner != _UNCLAIMED or create.request_status != "claimed"):
+                return False
+            delete = await _request_delete(session, resource)
+            if resource.provider_id is not None and delete.owner == _UNCLAIMED:
+                return False
+            resource.observed_state = "deleted"
+            resource.deleted_at = _now()
+            delete.request_status = "succeeded"
+            return True
+
+    return await retry_deadlocks(transaction)
 
 
 async def occupancy(pool_id: str, *, session: AsyncSession | None = None) -> int:
@@ -814,10 +851,14 @@ async def _mark_ready_locked(session: AsyncSession, resource: ChatRuntimeResourc
 
 async def mark_ready(resource_id: str, generation: int, owner: str, fence: int, *, policy_verified: bool = False) -> bool:
     """Bootstrap identity and explicit health verification gate application readiness."""
-    async with _factory()() as session, session.begin():
-        resource, pool = await _locked_resource(session, resource_id, generation)
-        if not await _mark_ready_locked(session, resource, pool, owner, fence, policy_verified=policy_verified):
-            return False
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            resource, pool = await _locked_resource(session, resource_id, generation)
+            return await _mark_ready_locked(session, resource, pool, owner, fence, policy_verified=policy_verified)
+
+    if not await retry_deadlocks(transaction):
+        return False
     await wake_ready_runs(resource_id)
     return True
 
@@ -869,25 +910,29 @@ async def wake_ready_runs(resource_id: str) -> list[str]:
     """Append run stage journal in the same transaction, publish hints after commit."""
     from lumen.services import run_store
     from lumen.services.durable_runs.common import _event, wake_run
-    async with _factory()() as session, session.begin():
-        runs = list((await session.execute(select(ChatRun).where(
-            ChatRun.assigned_resource_id == resource_id, ChatRun.status == "waiting_resource"
-        ).with_for_update())).scalars())
-        if not runs:
-            return []
-        resource = (await session.execute(select(ChatRuntimeResource).where(
-            ChatRuntimeResource.id == resource_id,
-            ChatRuntimeResource.observed_state == "ready", ChatRuntimeResource.desired_state != "deleting"
-        ).with_for_update())).scalar_one_or_none()
-        if resource is None or (
-            resource.role == "sandbox"
-            and (resource.deadline_at is None or _utc(resource.deadline_at) <= _now())
-        ):
-            return []
-        for run in runs:
-            run.status = "queued"
-            await run_store.append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
-        ids = [run.id for run in runs]
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            runs = list((await session.execute(select(ChatRun).where(
+                ChatRun.assigned_resource_id == resource_id, ChatRun.status == "waiting_resource"
+            ).with_for_update())).scalars())
+            if not runs:
+                return []
+            resource = (await session.execute(select(ChatRuntimeResource).where(
+                ChatRuntimeResource.id == resource_id,
+                ChatRuntimeResource.observed_state == "ready", ChatRuntimeResource.desired_state != "deleting"
+            ).with_for_update())).scalar_one_or_none()
+            if resource is None or (
+                resource.role == "sandbox"
+                and (resource.deadline_at is None or _utc(resource.deadline_at) <= _now())
+            ):
+                return []
+            for run in runs:
+                run.status = "queued"
+                await run_store.append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+            return [run.id for run in runs]
+
+    ids = await retry_deadlocks(transaction)
     for run_id in ids:
         await wake_run(run_id)
     return ids

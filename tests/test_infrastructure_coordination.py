@@ -328,6 +328,7 @@ async def test_claimed_operation_distinguishes_preflight_loss_from_started_sdk(
     session = MagicMock()
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=None)
+    session.connection = AsyncMock(return_value=SimpleNamespace())
     session.begin.return_value = session
     monkeypatch.setattr(controller_module, "get_session_factory", lambda: lambda: session)
     monkeypatch.setattr(controller_module.store, "_locked_resource", AsyncMock(return_value=(resource, SimpleNamespace())))
