@@ -137,10 +137,12 @@ async def get_chat_capabilities(
         )
     if model_kind == "realtime":
         gates = (resolved.get("capabilities") or {}).get("feature_gates") or {}
-        # Transcription/translation/GPT-Live models speak only their compatible WebSocket
-        # wires; the native voice session cannot execute them, so it advertises no options.
-        if (all((gates.get(name) or {}).get("available") is True for name in ("audio_input", "audio_output"))
-                and realtime_transport.realtime_kind(resolved) == "conversation"):
+        kind = realtime_transport.realtime_kind(resolved) if realtime_transport.realtime_route_ready(resolved) else None
+        result["realtime_kind"] = kind
+        # Native transcription needs input only; translation/live keep their compatible wires.
+        if ((gates.get("audio_input") or {}).get("available") is True and (
+                kind == "transcription" or kind == "conversation"
+                and (gates.get("audio_output") or {}).get("available") is True)):
             result.update(realtime_transport.available_realtime_options(resolved))
         else:
             result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,

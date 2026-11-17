@@ -280,9 +280,8 @@ async def admit_realtime_session(
 ) -> dict:
     """``provider_type`` is the transport a vendor wire fixes, never the editable public selector.
 
-    ``kind`` is the realtime kind the calling endpoint speaks. The native session endpoint
-    and plain compatible wires only speak ``conversation``; a model of another kind is
-    admitted only through its own compatible endpoint.
+    ``kind`` is the realtime kind the calling endpoint speaks. Native sessions support
+    conversation and transcription; translation and live retain their compatible endpoints.
     """
     from .admission import _intent_with_credential_authority, _lock_run_configurations, existing_run_for_intent
 
@@ -534,8 +533,8 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
         await _finish(run_id, status="failed", message_id=None, owner=owner,
                       error_code="provider_result_unknown", safe_message="realtime price changed before connection")
         raise DurableRunProviderResultUnknown("realtime price changed before connection")
-    if pricing.get("realtime_kind", "conversation") != "conversation" and wire != "openai":
-        # The native event schema models conversations only; other kinds own their compatible wire.
+    if pricing.get("realtime_kind", "conversation") not in {"conversation", "transcription"} and wire != "openai":
+        # Translation and live retain their own compatible wire.
         await _finish(run_id, status="failed", message_id=None, owner=owner,
                       error_code="provider_result_unknown", safe_message="realtime model requires its compatible wire")
         raise DurableRunInputError("realtime model requires its compatible wire")

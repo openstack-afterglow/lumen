@@ -367,7 +367,15 @@ def _client_event(message: dict, provider: str, *, wire: str, voice: str | None 
                   allow_transcription: bool = True, kind: str = "conversation",
                   model: str | None = None) -> tuple[dict | None, int, bool]:
     if kind != "conversation":
-        if wire != "openai" or provider != "openai":
+        if provider != "openai":
+            raise RealtimeTransportError("unsupported realtime client event")
+        if wire == "native" and kind == "transcription":
+            event = message.get("type")
+            if event in {"audio.input.append", "audio.input.commit"}:
+                message = {**message, "type": event.replace("audio.input.", "input_audio_buffer.")}
+            elif event != "session.close":
+                raise RealtimeTransportError("unsupported realtime client event")
+        elif wire != "openai":
             raise RealtimeTransportError("unsupported realtime client event")
         return _kind_client_event(message, kind, model)
     event = message.get("type")
@@ -450,9 +458,36 @@ def _kind_provider_events(message: dict) -> tuple[list[dict], int]:
     return [message], size
 
 
+def _native_transcription_events(message: dict) -> tuple[list[dict], int]:
+    """Project only bounded item-correlated transcript frames; settlement owns session.closed."""
+    event = message.get("type")
+    item_id = message.get("item_id")
+    prefix = "conversation.item.input_audio_transcription."
+    if event == "error":
+        return [{"type": "error", "code": "upstream_error",
+                 "message": "Realtime provider returned an error"}], 0
+    if not isinstance(item_id, str) or not item_id or len(item_id) > 256:
+        return [], 0
+    if event == prefix + "failed":
+        return [{"type": "transcript.input.failed", "item_id": item_id}], 0
+    if event in {prefix + "delta", prefix + "completed"}:
+        source, target = ("delta", "delta") if event.endswith(".delta") else ("transcript", "text")
+        text = message.get(source)
+        # The input frame already passed the 64-KiB JSON bound; long final transcripts
+        # must not disappear while their committed turn is marked drained.
+        if isinstance(text, str) and len(text) <= _MAX_FRAME_BYTES:
+            return [{"type": "transcript.input." + event.rsplit(".", 1)[1],
+                     "item_id": item_id, target: text}], 0
+        if event.endswith(".completed"):
+            return [{"type": "transcript.input.failed", "item_id": item_id}], 0
+    return [], 0
+
+
 def _provider_events(message: dict, provider: str, *, wire: str,
                      kind: str = "conversation") -> tuple[list[dict], int]:
     if kind != "conversation":
+        if wire == "native" and kind == "transcription":
+            return _native_transcription_events(message)
         return _kind_provider_events(message)
     events: list[dict] = []
     pcm_bytes = 0
@@ -556,10 +591,10 @@ async def relay_audio(
     input transcription is a separately billed model whose rates are not frozen, so it is
     neither configured nor accepted for token-basis sessions.
 
-    Non-conversation OpenAI kinds run only on the compatible ``openai`` wire. The upstream
-    setup is built from admitted values only: ``transcription`` holds the pre-validated
-    transcription tuning options, a GPT-Live ``session.start`` carries the admitted model,
-    instructions and voice, and translation waits for the client's language update.
+    Native transcription and compatible non-conversation kinds use the same admitted
+    upstream setup. ``transcription`` holds pre-validated tuning options, a GPT-Live
+    ``session.start`` carries the admitted model, instructions and voice, and translation
+    waits for the client's language update.
     """
     provider = route["provider_type"]
     input_rate = 24000 if provider == "openai" else 16000
@@ -572,10 +607,12 @@ async def relay_audio(
     api_key = await resolve_route_api_key(route)
     url, headers = upstream_connection_spec({**route, "api_key": api_key})
     kind = realtime_kind({**route, "api_key": api_key})
-    if kind != "conversation" and wire != "openai":
+    if kind != "conversation" and wire != "openai" and not (wire == "native" and kind == "transcription"):
         raise RealtimeTransportError("realtime model requires its compatible wire")
     model = route["api_model_name"]
     incoming = outgoing = 0
+    pending_transcriptions = 0
+    finished_transcriptions: set[str] = set()
     tokens = TokenUsageMeter(provider) if token_usage else None
     loop = asyncio.get_running_loop()
     connected_ns: int | None = None
@@ -587,7 +624,8 @@ async def relay_audio(
         usage, state = tokens.result() if tokens is not None else (None, "unmetered")
         if failed and tokens is not None and state != "invalid":
             state = "incomplete"
-        return AudioMeter(incoming, outgoing, input_rate, 24000, usage=usage, usage_state=state,
+        return AudioMeter(incoming, outgoing, input_rate, 0 if kind == "transcription" else 24000,
+                          usage=usage, usage_state=state,
                           connected_seconds=elapsed)
 
     try:
@@ -632,15 +670,16 @@ async def relay_audio(
                 await upstream.send(json.dumps({"setup": setup}))
             if wire == "native":
                 await websocket.send_json({"type": "session.ready", "session_id": session_id,
-                                           "provider_type": provider, "input_sample_rate_hz": input_rate,
-                                           "output_sample_rate_hz": 24000})
+                                           "provider_type": provider, "realtime_kind": kind,
+                                           "input_sample_rate_hz": input_rate,
+                                           "output_sample_rate_hz": 0 if kind == "transcription" else 24000})
             # Session basis counts from upstream open; legacy PCM mode retains its post-setup deadline.
             started = connected_at if session_time else loop.time()
             client = asyncio.create_task(websocket.receive_text())
             server = asyncio.create_task(upstream.recv())
             last_activity = started
-            # Set once a translation/live client asks to close: relay provider frames until
-            # session.closed (in-flight audio) or this bounded drain deadline.
+            # Stop client input on close, then drain committed transcription items or
+            # translation/live output until completion or this bounded drain deadline.
             closing_until: float | None = None
             try:
                 while True:
@@ -662,6 +701,10 @@ async def relay_audio(
                         message, size, close = _client_event(request, provider, wire=wire, voice=voice,
                                                              allow_transcription=tokens is None, kind=kind,
                                                              model=model)
+                        if close and kind == "transcription" and pending_transcriptions:
+                            last_activity = loop.time()
+                            closing_until = last_activity + _USAGE_DRAIN_SECONDS
+                            continue
                         if close and kind not in _DRAINED_CLOSE_KINDS:
                             break
                         if close:
@@ -676,6 +719,10 @@ async def relay_audio(
                             await upstream.send(json.dumps(message, separators=(",", ":")))
                             last_activity = loop.time()
                             incoming += size
+                            if kind == "transcription" and message["type"] == "input_audio_buffer.commit":
+                                pending_transcriptions += 1
+                                if pending_transcriptions + len(finished_transcriptions) > _MAX_METERED_RESPONSES:
+                                    raise RealtimeTransportError("too many realtime transcription turns")
                             client = asyncio.create_task(websocket.receive_text())
                     if server in done:
                         try:
@@ -687,6 +734,15 @@ async def relay_audio(
                         parsed = _object(response)
                         if tokens is not None:
                             tokens.observe(parsed)
+                        if kind == "transcription" and parsed.get("type") in {
+                            "conversation.item.input_audio_transcription.completed",
+                            "conversation.item.input_audio_transcription.failed",
+                        }:
+                            item_id = parsed.get("item_id")
+                            if (pending_transcriptions and isinstance(item_id, str) and 0 < len(item_id) <= 256
+                                    and item_id not in finished_transcriptions):
+                                finished_transcriptions.add(item_id)
+                                pending_transcriptions -= 1
                         events, size = _provider_events(parsed, provider, wire=wire, kind=kind)
                         last_activity = loop.time()
                         if outgoing + size > output_limit:
@@ -701,9 +757,13 @@ async def relay_audio(
                             break
                         if kind in _DRAINED_CLOSE_KINDS and parsed.get("type") == "session.closed":
                             break
+                        if kind == "transcription" and closing_until is not None and not pending_transcriptions:
+                            break
                 if tokens is not None and tokens.pending:
                     server, outgoing = await _drain_final_usage(upstream, server, tokens, provider=provider,
                         wire=wire, outgoing=outgoing, output_limit=output_limit)
+                if kind == "transcription" and closing_until is not None and pending_transcriptions:
+                    raise RealtimeTransportError("realtime transcription drain is incomplete")
             finally:
                 client.cancel()
                 server.cancel()
