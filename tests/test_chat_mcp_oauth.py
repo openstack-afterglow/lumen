@@ -340,3 +340,14 @@ class TestMcpOAuthRoutes:
         assert status.json()["connected"] is True
         assert deleted.status_code == 204
         assert disconnected == [(7, "test-user-123", "test-project-123")]
+
+
+@pytest.fixture(autouse=True)
+def _organization_row_precheck_needs_no_database(monkeypatch):
+    """These route tests run without SQL; the organization-row OAuth pre-check fails closed on purpose (tested in
+    tests/test_mcp_settings.py), so the route behaviour under test stubs only that lookup."""
+    from unittest.mock import AsyncMock
+
+    from lumen.services import mcp_settings
+
+    monkeypatch.setattr(mcp_settings, "check_oauth_management", AsyncMock(return_value=None))

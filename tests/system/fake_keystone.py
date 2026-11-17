@@ -393,6 +393,19 @@ class KeystoneHandler(BaseHTTPRequestHandler):
                     self.respond(404, {"error": {"code": 404, "message": "Unknown synthetic domain"}})
                 else:
                     self.respond(200, {"domain": domain})
+            elif (path.startswith("/v3/system/users/") or path.startswith("/v3/system/groups/")) and path.endswith("/roles"):
+                # Keystone's direct system role listing (``ks.roles.list(user|group=..., system='all')``): the raw
+                # system grants of this subject, same rows as the role_assignments view, 404 for unknown subjects.
+                kind = "user" if path.startswith("/v3/system/users/") else "group"
+                subject = path.split("/")[-2]
+                known = {OWNER_ID, DIRECTORY_ID, PROJECTLESS_ADMIN_ID} if kind == "user" else {SYSTEM_GROUP_ID}
+                if subject not in known:
+                    self.respond(404, {"error": {"code": 404, "message": "Unknown synthetic subject"}})
+                else:
+                    rows = state.assignments({f"{kind}.id": [subject], "scope.system": ["all"]})
+                    self.respond(200, {"roles": [{"id": row["role"]["id"], "name": state.roles[row["role"]["id"]]["name"],
+                                                  "domain_id": None} for row in rows],
+                                       "links": {"next": None, "previous": None}})
             elif path.startswith("/v3/users/") and path.endswith("/groups"):
                 subject = path.split("/")[-2]
                 groups = [{"id": SYSTEM_GROUP_ID, "name": SYSTEM_GROUP_ID, "domain_id": "default"}]

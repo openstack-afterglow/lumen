@@ -36,20 +36,22 @@ async def domain_db(monkeypatch):
     foreign = {"user_id": f"foreign-{suffix}", "project_id": f"pb-{suffix}", "auth_type": "keystone"}
     ids = []
 
-    async def resolve(user_id, project_id, domain_id=None, *, credential_authority=None, compute_manage=True):
+    async def resolve(user_id, project_id, domain_id=None, *, credential_authority=None, compute_manage=True,
+                      unrestricted_human=False):
         target = domain_a if project_id == manager["project_id"] else domain_b
         if domain_id is not None and domain_id != target:
             raise HTTPException(403, "wrong domain")
         return {"domain_id": target, "is_member": True,
-                "can_manage": user_id in {manager["user_id"], manager_b["user_id"]} and credential_authority is None}
+                "can_manage": user_id in {manager["user_id"], manager_b["user_id"]} and credential_authority is None
+                and unrestricted_human}
 
     async def project_domain(project_id):
         return domain_a if project_id == manager["project_id"] else domain_b
 
     monkeypatch.setattr("lumen.services.mcp_domain_authority.project_domain_id", project_domain)
 
-    async def access(user_id, project_id, domain_id=None, *, manage=False):
-        result = await resolve(user_id, project_id, domain_id)
+    async def access(user_id, project_id, domain_id=None, *, manage=False, human=None):
+        result = await resolve(user_id, project_id, domain_id, unrestricted_human=True)
         if manage and not result["can_manage"]:
             raise es.ExtensionForbidden("manager required")
         return result

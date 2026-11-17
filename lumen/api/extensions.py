@@ -397,7 +397,8 @@ async def user_list_mcp(
     uid, pid = _owner(token_info)
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
-        return await es.list_for_user("mcp", user_id=uid, project_id=pid, active_only=active_only)
+        with mcp_settings.actor(token_info):
+            return await es.list_for_user("mcp", user_id=uid, project_id=pid, active_only=active_only)
     except es.ChatStorageUnavailable:
         return []
     except _EXC as exc:
@@ -422,10 +423,11 @@ async def user_activate_mcp(
 ):
     uid, pid = _owner(token_info)
     try:
-        return await es.set_mcp_activation(
-            item_id, user_id=uid, project_id=pid,
-            is_active=body.is_active, config_version=body.config_version,
-        )
+        with mcp_settings.actor(token_info):
+            return await es.set_mcp_activation(
+                item_id, user_id=uid, project_id=pid,
+                is_active=body.is_active, config_version=body.config_version,
+            )
     except _EXC as exc:
         raise _http(exc) from exc
 
@@ -459,7 +461,8 @@ async def user_delete_mcp(item_id: int, token_info: dict = Depends(require_scope
 async def user_get_mcp_oauth_status(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:read"))):
     uid, pid = _owner(token_info)
     try:
-        return await mcp_oauth.status(item_id, user_id=uid, project_id=pid)
+        with mcp_settings.actor(token_info):
+            return await mcp_oauth.status(item_id, user_id=uid, project_id=pid)
     except _EXC + (mcp_oauth.McpOAuthError,) as exc:
         raise _http(exc) from exc
 
@@ -476,13 +479,14 @@ async def user_start_mcp_oauth(
     initiator_nonce = secrets.token_urlsafe(32)
     try:
         await mcp_settings.check_oauth_management(token_info, item_id)
-        result = await mcp_oauth.begin(
-            item_id,
-            user_id=uid,
-            project_id=pid,
-            initiator_nonce=initiator_nonce,
-            return_origin=request.headers.get("origin"),
-        )
+        with mcp_settings.actor(token_info):
+            result = await mcp_oauth.begin(
+                item_id,
+                user_id=uid,
+                project_id=pid,
+                initiator_nonce=initiator_nonce,
+                return_origin=request.headers.get("origin"),
+            )
     except _EXC + (mcp_oauth.McpOAuthError,) as exc:
         raise _http(exc) from exc
     response.set_cookie(
@@ -504,7 +508,8 @@ async def user_disconnect_mcp_oauth(
     uid, pid = _owner(token_info)
     try:
         await mcp_settings.check_oauth_management(token_info, item_id)
-        await mcp_oauth.disconnect(item_id, user_id=uid, project_id=pid)
+        with mcp_settings.actor(token_info):
+            await mcp_oauth.disconnect(item_id, user_id=uid, project_id=pid)
     except _EXC + (mcp_oauth.McpOAuthError,) as exc:
         raise _http(exc) from exc
     return Response(status_code=204)
@@ -715,9 +720,10 @@ async def user_activate_domain_connection(
     """Member's personal consent to an exact organization revision; not organization mutation."""
     try:
         await mcp_settings.scoped_connection(token_info, item_id, domain_id)
-        return await es.set_mcp_activation(
-            item_id, user_id=token_info["user_id"], project_id=token_info["project_id"],
-            is_active=body.is_active, config_version=body.config_version,
-        )
+        with mcp_settings.actor(token_info):
+            return await es.set_mcp_activation(
+                item_id, user_id=token_info["user_id"], project_id=token_info["project_id"],
+                is_active=body.is_active, config_version=body.config_version,
+            )
     except _EXC as exc:
         raise _http(exc) from exc

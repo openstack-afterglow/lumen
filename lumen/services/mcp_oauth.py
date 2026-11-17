@@ -252,9 +252,10 @@ class SqlMcpConnectionStore(McpConnectionStore):
                     if server is not None and server.scope == "domain":
                         from lumen.services.extensions_store import _domain_access
                         await _domain_access(
-                            request.owner_user_id, request.owner_project_id, server.owner_domain_id, manage=True
+                            request.owner_user_id, request.owner_project_id, server.owner_domain_id,
+                            manage=True, human=True,  # the owner already passed the unrestricted-human start
                         )
-                except HTTPException as exc:
+                except (HTTPException, ExtensionForbidden) as exc:
                     raise McpOAuthError("MCP OAuth management authority is no longer available") from exc
                 payload = _decrypt(request.encrypted_payload)
                 request.status = "processing"
@@ -300,7 +301,8 @@ class SqlMcpConnectionStore(McpConnectionStore):
                 if server.scope == "domain":
                     from lumen.services.extensions_store import _domain_access
                     await _domain_access(
-                        request.owner_user_id, request.owner_project_id, server.owner_domain_id, manage=True
+                        request.owner_user_id, request.owner_project_id, server.owner_domain_id,
+                        manage=True, human=True,
                     )
                     namespace = Namespace(user_id=server.owner_domain_id, project_id=server.owner_domain_id)
                 connection = await _connection_row(session, request.mcp_server_id, namespace, lock=True)

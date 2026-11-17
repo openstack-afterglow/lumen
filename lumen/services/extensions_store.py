@@ -13,7 +13,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -909,10 +911,32 @@ async def delete(
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def _domain_access(user_id: str, project_id: str, domain_id: str | None = None, *, manage: bool = False) -> dict:
+# Whether the current request is an unrestricted human Keystone session. API keys, reduced credentials and background
+# work are never human here, so they cannot use system-admin cross-domain reach or manage organization state.
+_actor_human: ContextVar[bool] = ContextVar("mcp_actor_human", default=False)
+
+
+@contextmanager
+def actor_scope(*, human: bool) -> Iterator[None]:
+    token = _actor_human.set(bool(human))
+    try:
+        yield
+    finally:
+        _actor_human.reset(token)
+
+
+async def _domain_access(
+    user_id: str, project_id: str, domain_id: str | None = None, *, manage: bool = False, human: bool | None = None,
+) -> dict:
+    """Exact domain membership (or manager authority). ``human`` defaults to the request actor, i.e. not human."""
     from lumen.services.mcp_domain_authority import resolve_domain_authority
 
-    authority = await resolve_domain_authority(user_id, project_id, domain_id, compute_manage=manage)
+    is_human = _actor_human.get() if human is None else human
+    if manage and not is_human:
+        raise ExtensionForbidden("Exact domain manager authority required")
+    authority = await resolve_domain_authority(
+        user_id, project_id, domain_id, compute_manage=manage, unrestricted_human=is_human,
+    )
     if not authority["is_member"] or (manage and not authority["can_manage"]):
         raise ExtensionForbidden("Exact domain manager authority required" if manage else "Domain membership required")
     return authority

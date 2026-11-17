@@ -8,7 +8,13 @@ from fastapi import HTTPException
 from keystoneclient.exceptions import NotFound
 
 from lumen import auth
-from lumen.services.mcp_domain_authority import resolve_domain_authority
+from lumen.services import mcp_domain_authority as _authority
+
+
+async def resolve_domain_authority(*args, **kwargs):
+    """These cases model an unrestricted human Keystone session; non-human actors are covered in the native tests."""
+    kwargs.setdefault("unrestricted_human", True)
+    return await _authority.resolve_domain_authority(*args, **kwargs)
 
 
 def assignment(role="member-id", *, project=None, domain=None, system=False, group=None, inherited=False):
