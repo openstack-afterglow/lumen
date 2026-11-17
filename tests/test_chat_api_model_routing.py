@@ -435,7 +435,7 @@ def test_capabilities_detect_exact_native_search_support():
 
     caps_sonar = provider_capabilities("sonar", "perplexity")
     assert caps_sonar["web_search"] is True
-    assert caps_sonar["web_search_required"] is False
+    assert caps_sonar["web_search_required"] is True
     assert caps_sonar["feature_gates"]["web_search"] == {
         "available": False,
         "mode": "none",

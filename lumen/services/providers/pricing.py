@@ -623,7 +623,11 @@ def _effective_capabilities(
             }
         }, "registry"
     detected = provider_capabilities(row.model_name, provider_type, api_base)
-    legacy = row.capabilities if row.capability_source in {"models_dev", "models.dev"} and isinstance(row.capabilities, dict) else {}
+    legacy = row.capabilities if (
+        direct_provider_route(provider_type, api_base)
+        and row.capability_source in {"models_dev", "models.dev"}
+        and isinstance(row.capabilities, dict)
+    ) else {}
     if not detected.get("reasoning_options") and isinstance(legacy.get("reasoning_options"), list):
         detected["reasoning_options"] = legacy["reasoning_options"]
     legacy_limit = legacy.get("context_limit")
@@ -817,7 +821,6 @@ def _pricing_aware_capabilities(
         gates["web_search"].update(
             available=False, mode="none", reason_code="pricing_unavailable", pricing_available=False,
         )
-        normalized["web_search_required"] = False
     from lumen.services.assets import asset_pipeline_available
 
     for feature in ("image_input", "document_input"):
@@ -871,7 +874,8 @@ def _resolved_context_tiers(model: LlmModel, provider_type: str | None, api_base
     token = entry.get("token_pricing") or {}
     tier = token.get("long_context") or {}
     catalog_media = getattr(model, "media_pricing", None) is None and entry.get("kind") == _kind(model)
-    follow_text = bool(tier) and catalog_media and bool((entry.get("media_pricing") or {}).get("token_rates"))
+    catalog_text = all(getattr(model, field, None) is None for field in ("input_price", "output_price", "cache_read_price"))
+    follow_text = bool(tier) and catalog_media and catalog_text and bool((entry.get("media_pricing") or {}).get("token_rates"))
     media = entry.get("media_pricing") if catalog_media else None
     tier_rates = tier.get("token_rates") or {}
     input_rate, output_rate = _effective_model_rates(model, provider_type, api_base)
@@ -893,7 +897,7 @@ def _resolved_context_tiers(model: LlmModel, provider_type: str | None, api_base
             Decimal(value) == Decimal(tier.get(field.removesuffix("_per_million"), token[field.removesuffix("_per_million")]))
             for field, value in tier_rates.get(modality, {}).items()
         ) if same_base else False
-        if same_base and same_tier:
+        if follow_text and same_base and same_tier:
             continue
         resolved_modality_tiers[modality] = {
             field: tier_rates.get(modality, {}).get(

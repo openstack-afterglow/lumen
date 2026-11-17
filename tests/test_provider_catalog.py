@@ -443,7 +443,7 @@ def test_official_reasoning_effort_survives_imported_capability_rows(provider, m
     assert caps["reasoning_options"] == metadata.catalog_model_metadata(model_name, provider)["reasoning_options"]
 
 
-def test_subscription_catalog_mapping_is_discovery_only(catalog):
+def test_subscription_catalog_capabilities_do_not_enable_api_pricing(catalog):
     row = model()
     row.model_name = "chatgpt/opaque"
     provider = SimpleNamespace(provider_type="chatgpt", api_base=None)
@@ -453,6 +453,8 @@ def test_subscription_catalog_mapping_is_discovery_only(catalog):
     assert tiers["output_price_per_token_above_200k"] is None
     assert tiers["token_rates_follow_text"] is False
     caps, _ = _effective_capabilities(row, "chatgpt", "chatgpt_device")
-    assert caps["context_limit"] is None
-    assert caps["metadata_status"] == "missing"
+    assert caps["context_limit"] == 400000
+    assert caps["metadata_status"] == "observed"
+    assert caps["vision"] is True
+    assert caps["function_calling"] is True
     assert caps["output_budget_enforced"] is False

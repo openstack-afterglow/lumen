@@ -667,6 +667,30 @@ async def test_realtime_transcription_discovery_uses_tracked_native_kind(monkeyp
     )["model_kind"] is None
 
 
+@pytest.mark.parametrize("provider_type", ["openai", "anthropic"])
+async def test_native_uncatalogued_discovery_preserves_live_display_name(monkeypatch, provider_type):
+    _provider(monkeypatch, provider_type=provider_type)
+    _no_static(monkeypatch)
+    item = {"id": "unlisted-live-model", "display_name": "Live Unlisted Model"}
+    payload = _page([item]) if provider_type == "anthropic" else {"data": [item]}
+    _transport(monkeypatch, lambda _: httpx.Response(200, json=payload))
+
+    result = await model_discovery.discover_models(1)
+
+    assert result["provider_family"] == "native"
+    assert result["models"] == ["unlisted-live-model"]
+    candidate = result["candidates"][0]
+    assert candidate["display_name"] == "Live Unlisted Model"
+    assert candidate["catalog_entry"] is None
+    assert candidate["catalog_version"] is None
+    assert candidate["token_pricing"] is None
+    assert candidate["media_pricing"] is None
+    assert candidate["capabilities"] is None
+    assert candidate["status"] is None
+    assert candidate["verified_at"] is None
+    assert candidate["source_urls"] == []
+
+
 async def test_native_live_ids_get_exact_catalog_prices_capabilities_and_provenance(monkeypatch):
     _provider(monkeypatch, provider_type="openai")
     entry = {
@@ -701,7 +725,8 @@ async def test_native_live_ids_get_exact_catalog_prices_capabilities_and_provena
 
 
 @pytest.mark.parametrize("provider_type", ["openai", "anthropic"])
-async def test_compatible_discovery_never_accesses_catalog_or_guesses_kind(monkeypatch, provider_type):
+@pytest.mark.parametrize("display_name", ["Live Compatible Model", None])
+async def test_compatible_discovery_never_accesses_catalog_or_guesses_kind(monkeypatch, provider_type, display_name):
     _provider(monkeypatch, provider_type=provider_type, api_base="https://compatible.example/v1")
 
     def forbidden(*_):
@@ -709,7 +734,7 @@ async def test_compatible_discovery_never_accesses_catalog_or_guesses_kind(monke
 
     monkeypatch.setattr(model_discovery, "native_catalog", forbidden)
     monkeypatch.setattr(model_discovery, "native_catalog_entry", forbidden)
-    item = {"id": "text-embedding-3-small", "display_name": "Untrusted", "max_input_tokens": 1000}
+    item = {"id": "text-embedding-3-small", "display_name": display_name, "max_input_tokens": 1000}
     payload = _page([item]) if provider_type == "anthropic" else {"data": [item]}
     _transport(monkeypatch, lambda _: httpx.Response(200, json=payload))
     result = await model_discovery.discover_models(1)
@@ -721,10 +746,16 @@ async def test_compatible_discovery_never_accesses_catalog_or_guesses_kind(monke
     assert candidate["requires_manual_pricing"] is True
     assert candidate["purpose"] == "unknown"
     assert candidate["model_kind"] is None
-    assert candidate["display_name"] is None
+    assert candidate["display_name"] == display_name
     assert candidate["input_token_limit"] is None
+    assert candidate["output_token_limit"] is None
+    assert candidate["generation_methods"] == []
     assert candidate["capabilities"] is None
     assert candidate["token_pricing"] is None
+    assert candidate["media_pricing"] is None
+    assert candidate["status"] is None
+    assert candidate["verified_at"] is None
+    assert candidate["catalog_version"] is None
     assert candidate["source_urls"] == []
     assert candidate["catalog_entry"] is None
 

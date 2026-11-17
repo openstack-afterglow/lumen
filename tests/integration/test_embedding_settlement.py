@@ -31,12 +31,12 @@ async def _register(factory, nonce: str, *, provider_type: str, model_name: str)
         return provider.id
 
 
-@pytest.mark.parametrize("provider_type, model_name, usage, estimated", [
-    ("openai", "text-embedding-3-small", {"prompt_tokens": 1234, "total_tokens": 1234}, False),
-    ("gemini", "gemini-embedding-001", None, True),
+@pytest.mark.parametrize("provider_type, model_name, usage, estimated, dimensions", [
+    ("openai", "text-embedding-3-small", {"prompt_tokens": 1234, "total_tokens": 1234}, False, 2),
+    ("gemini", "gemini-embedding-001", None, True, 128),
 ])
 async def test_embedding_call_persists_one_usage_row_and_wallet_charge(
-        monkeypatch, provider_type, model_name, usage, estimated):
+        monkeypatch, provider_type, model_name, usage, estimated, dimensions):
     init_db(os.environ["DATABASE_URL"], pool_size=2, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
@@ -48,7 +48,7 @@ async def test_embedding_call_persists_one_usage_row_and_wallet_charge(
 
     async def provider(**kwargs):
         provider_calls.append(kwargs)
-        return SimpleNamespace(data=[{"embedding": [0.25, -0.5]}], usage=usage)
+        return SimpleNamespace(data=[{"embedding": [0.25] * dimensions}], usage=usage)
 
     monkeypatch.setattr(provider_client, "aembedding", provider)
     try:
@@ -56,9 +56,11 @@ async def test_embedding_call_persists_one_usage_row_and_wallet_charge(
         route = await embeddings.resolve(model_name, provider=provider_name)
         result = await embeddings.embed(
             route=route, inputs=["hello embeddings"], user_id=user_id, project_id=project_id,
-            api_key_id=None, required_scopes=("native:runs:write",), dimensions=2,
+            api_key_id=None, required_scopes=("native:runs:write",), dimensions=dimensions,
         )
         assert len(provider_calls) == 1
+        assert provider_calls[0]["dimensions"] == dimensions
+        assert len(result["embeddings"][0]["embedding"]) == dimensions
         tokens = result["usage"]["prompt_tokens"]
         assert tokens > 0 and result["usage"]["estimated"] is estimated
         if not estimated:

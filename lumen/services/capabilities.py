@@ -11,6 +11,7 @@ from lumen.services.execution_protocol import v2_runtime_ready
 from lumen.services.provider_metadata import (
     catalog_model_metadata,
     catalog_version,
+    direct_provider_route,
     provider_output_budget_enforced,
 )
 from lumen.services.providers.credentials import transport_model_name
@@ -182,6 +183,18 @@ _NATIVE_WEB_SEARCH_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "perp
 
 
 
+def _is_perplexity_sonar(model_name: str, provider_type: str | None, api_base: str | None) -> bool:
+    """Exact built-in search products retain their independent authorization scope."""
+    if provider_type != "perplexity" or not direct_provider_route(provider_type, api_base):
+        return False
+    from lumen.services.providers.credentials import api_model_name
+
+    return api_model_name(model_name, "perplexity") in {
+        "perplexity/sonar", "perplexity/sonar-pro", "perplexity/sonar-reasoning",
+        "perplexity/sonar-reasoning-pro", "perplexity/sonar-deep-research",
+    }
+
+
 def _native_web_search_available(model_name: str, provider_type: str | None, api_base: str | None = None) -> bool:
     """Exact catalog observation intersected with native transport support."""
     return provider_type in _NATIVE_WEB_SEARCH_PROVIDERS and catalog_model_metadata(
@@ -201,7 +214,7 @@ def provider_capabilities(model_name: str, provider_type: str | None, api_base: 
     """Fail-closed availability, retaining observed/unknown metadata provenance."""
     normalized_model = transport_model_name(model_name)
     is_chatgpt = provider_type == "chatgpt" or model_name.startswith("chatgpt/")
-    metadata = {} if is_chatgpt else catalog_model_metadata(model_name, provider_type, api_base)
+    metadata = catalog_model_metadata(normalized_model, "openai") if is_chatgpt else catalog_model_metadata(model_name, provider_type, api_base)
     vision = metadata.get("supports_vision") is True
     pdf_input = metadata.get("supports_pdf_input") is True
     reasoning = metadata.get("supports_reasoning") is True
@@ -211,7 +224,7 @@ def provider_capabilities(model_name: str, provider_type: str | None, api_base: 
     prompt_caching = metadata.get("supports_prompt_caching") is True
     parallel_function_calling = bool(metadata.get("supports_parallel_function_calling")) if is_chatgpt else False
     supports_web_search = _native_web_search_available(normalized_model, provider_type, api_base)
-    web_search_required = False  # Native request/search fees are not yet billable.
+    web_search_required = supports_web_search and _is_perplexity_sonar(normalized_model, provider_type, api_base)
     configured_context_limit = metadata.get("max_input_tokens")
     context_limit = (
         configured_context_limit
@@ -433,6 +446,8 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
         return detected
     normalized = dict(detected)
     normalized.update({key: value for key, value in stored.items() if key != "feature_gates"})
+    if not stored.get("reasoning_options"):
+        normalized["reasoning_options"] = detected.get("reasoning_options") or []
     # Executor parameter fidelity is not an administrator/model capability override.
     normalized["output_budget_enforced"] = detected.get("output_budget_enforced")
     normalized["native_web_search_transport_supported"] = detected.get("native_web_search_transport_supported") is True
@@ -543,12 +558,8 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
             "pricing_available": False,
         }
         normalized["web_search"] = available
-    web_search_gate = gates["web_search"]
-    normalized["web_search_required"] = (
-        bool(detected.get("web_search_required"))
-        and web_search_gate.get("available") is True
-        and web_search_gate.get("mode") == "native"
-    )
+    # Built-in search is an authorization floor, independent of optional tool gates/pricing.
+    normalized["web_search_required"] = detected.get("web_search_required") is True
     if not normalized["decisions_transport_supported"]:
         normalized["decisions"] = False
         if "decisions" in gates:
