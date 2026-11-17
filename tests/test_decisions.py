@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from contextlib import contextmanager
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -514,23 +515,25 @@ async def test_credential_resolution_failure_releases_before_dispatch(lifecycle,
 
 
 @pytest.mark.parametrize("path", ["/v1/decisions", "/v1/chat/decisions"])
-def test_large_invalid_body_has_bounded_validation_response(path):
+def test_full_size_invalid_body_has_bounded_validation_cost(path):
     body = request(input=[{"type": "unknown", "payload": "do-not-echo-" + "x" * 69}] * 131072)
     encoded = json.dumps(body).encode()
     assert 14 * 1024 * 1024 < len(encoded) < native.MAX_DECISION_BODY_BYTES
+    started = time.perf_counter()
     reply = client().post(path, content=encoded, headers={"Content-Type": "application/json"})
+    assert time.perf_counter() - started < 5
     assert reply.status_code == 422
     assert len(reply.content) < 12000
     errors = reply.json()["detail"]
-    assert len(errors) == 20
+    assert len(errors) == 2
     assert all(set(error) == {"type", "loc", "msg"} for error in errors)
     assert b"do-not-echo" not in reply.content
 
 
-def test_input_discriminator_reports_one_branch_per_invalid_item():
+def test_input_discriminator_fails_fast_on_first_invalid_item():
     with pytest.raises(ValidationError) as caught:
         DecisionRequest.model_validate(request(input=[{"type": "unknown"}] * 10))
-    assert len(caught.value.errors()) == 11  # One string-arm error plus one tag error per item.
+    assert len(caught.value.errors()) == 2  # One string-arm error and the first invalid list item's tag error.
     for invalid in ([], {}, 1):
         with pytest.raises(ValidationError):
             DecisionRequest.model_validate(request(input=[{"type": invalid}]))
@@ -636,3 +639,88 @@ def test_byte_bound_does_not_tokenize(monkeypatch):
     body = DecisionRequest.model_validate(request(input="한국어 " * 100))
     text = json.dumps(body.model_dump(exclude_none=True), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     assert decisions.input_token_bound(body) == len(text.encode("utf-8")) + 4096
+
+
+def _invalid_list_body(shape):
+    if shape == "input_items":
+        return request(input=[0] * 131072)
+    if shape == "input_json_values":
+        return request(input=[{"role": "user", "content": [{"type": "input_json", "data": [0] * 10000}]}])
+    if shape == "message_parts":
+        return request(input=[{"role": "user", "content": [0] * 16384}] * 16)
+    return request(questions=[{"type": "predicate", "instructions": [0] * 16384}] * 16)
+
+
+@pytest.mark.parametrize("shape", ["input_items", "input_json_values", "message_parts", "question_parts"])
+def test_invalid_list_validation_fails_fast_with_small_error_count(shape):
+    body = _invalid_list_body(shape)
+    started = time.perf_counter()
+    with pytest.raises(ValidationError) as caught:
+        DecisionRequest.model_validate(body)
+    errors = caught.value.errors(include_input=False, include_url=False, include_context=False)
+    assert time.perf_counter() - started < 2
+    assert 1 <= len(errors) <= 4
+    assert len(json.dumps(errors).encode()) < 4000
+
+
+@pytest.mark.parametrize("path", ["/v1/decisions", "/v1/chat/decisions"])
+@pytest.mark.parametrize("shape", ["input_items", "input_json_values", "message_parts", "question_parts"])
+def test_invalid_list_http_validation_has_bounded_time_and_size(path, shape, monkeypatch):
+    encoded = json.dumps(_invalid_list_body(shape), separators=(",", ":")).encode()
+    resolve = AsyncMock()
+    monkeypatch.setattr(decisions, "resolve", resolve)
+    started = time.perf_counter()
+    reply = client().post(path, content=encoded, headers={"Content-Type": "application/json"})
+    assert time.perf_counter() - started < 5
+    assert reply.status_code == 422
+    assert 1 <= len(reply.json()["detail"]) <= 4
+    assert len(reply.content) < 4000
+    resolve.assert_not_called()
+
+
+def test_input_json_wide_nested_values_stop_without_materializing_all_children():
+    started = time.perf_counter()
+    with pytest.raises(ValidationError, match="10000 values"):
+        InputJSON(data={"wide": [0] * 100000})
+    assert time.perf_counter() - started < 2
+
+
+def test_valid_mixed_official_request_round_trips_with_fail_fast_lists():
+    body = request(input=[
+        {"role": "developer", "content": [{"type": "input_text", "text": "Rules"}]},
+        {"role": "user", "content": [
+            {"type": "input_text", "text": "Evidence", "prompt_cache_breakpoint": {"mode": "explicit"}},
+            {"type": "input_json", "data": [{"order": {"damaged": True}}]},
+            {"type": "input_image", "image_url": "https://example.test/image.png", "detail": "original"},
+        ]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "Checking"}, {"type": "refusal", "refusal": "No"}]},
+        {"type": "function_call", "name": "lookup", "call_id": "fn", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "fn", "output": [{"type": "input_text", "text": "Found"}]},
+        {"type": "custom_tool_call", "name": "check", "call_id": "custom", "input": "Evidence"},
+        {"type": "custom_tool_call_output", "call_id": "custom", "output": [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]},
+    ], questions=[
+        {"type": "predicate", "name": "damaged", "instructions": [
+            {"type": "input_text", "text": "Is it damaged?"}, {"type": "input_json", "data": {"rule": True}},
+        ]},
+        {"type": "choice", "instructions": "Route", "choices": [{"value": "true"}, {"value": True}]},
+        {"type": "score", "instructions": "Severity", "levels": [{"label": "low"}, {"label": "high"}]},
+    ], prompt_cache_options={"mode": "explicit", "ttl": "30m"})
+    assert DecisionRequest.model_validate(body).model_dump(exclude_unset=True) == body
+
+
+def test_every_request_list_schema_is_fail_fast():
+    lists = []
+
+    def visit(schema):
+        if isinstance(schema, dict):
+            if schema.get("type") == "list":
+                lists.append(schema)
+            for value in schema.values():
+                visit(value)
+        elif isinstance(schema, list):
+            for value in schema:
+                visit(value)
+
+    visit(DecisionRequest.__pydantic_core_schema__)
+    assert len(lists) >= 9
+    assert all(schema.get("fail_fast") is True for schema in lists)

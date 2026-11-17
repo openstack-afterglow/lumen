@@ -45,15 +45,20 @@ class InputImage(WireModel):
 
 class InputJSON(WireModel):
     type: Literal["input_json"] = "input_json"
-    data: dict[str, Any] | list[dict[str, Any]]
+    data: dict[str, Any] | Annotated[list[dict[str, Any]], Field(max_length=10000, fail_fast=True)]
 
     @field_validator("data")
     @classmethod
     def bounded_json(cls, data):
-        pending = [(data, 0)]
+        pending = [(iter((data,)), 0)]
         values = 0
         while pending:
-            value, parent_depth = pending.pop()
+            children, parent_depth = pending[-1]
+            try:
+                value = next(children)
+            except StopIteration:
+                pending.pop()
+                continue
             values += 1
             if values > 10000:
                 raise ValueError("input_json exceeds 10000 values")
@@ -61,7 +66,7 @@ class InputJSON(WireModel):
                 depth = parent_depth + 1
                 if depth > 32:
                     raise ValueError("input_json exceeds 32 container levels")
-                pending.extend((item, depth) for item in (value.values() if isinstance(value, dict) else value))
+                pending.append((iter(value.values() if isinstance(value, dict) else value), depth))
         try:
             encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         except (ValueError, UnicodeError, TypeError) as exc:
@@ -88,19 +93,19 @@ class RefusalText(WireModel):
 class UserMessage(WireModel):
     type: Literal["message"] = "message"
     role: Literal["user"]
-    content: Text | Annotated[list[InputPart], Field(max_length=16384)]
+    content: Text | Annotated[list[InputPart], Field(max_length=16384, fail_fast=True)]
 
 
 class InstructionMessage(WireModel):
     type: Literal["message"] = "message"
     role: Literal["developer", "system"]
-    content: Text | Annotated[list[InputText], Field(max_length=16384)]
+    content: Text | Annotated[list[InputText], Field(max_length=16384, fail_fast=True)]
 
 
 class AssistantMessage(WireModel):
     type: Literal["message"] = "message"
     role: Literal["assistant"]
-    content: Text | Annotated[list[Annotated[OutputText | RefusalText, Field(discriminator="type")]], Field(max_length=16384)]
+    content: Text | Annotated[list[Annotated[OutputText | RefusalText, Field(discriminator="type")]], Field(max_length=16384, fail_fast=True)]
     phase: Literal["commentary", "final_answer"] | None = None
 
 
@@ -127,7 +132,7 @@ class CustomToolCall(WireModel):
 class ToolOutput(WireModel):
     type: Literal["function_call_output", "custom_tool_call_output"]
     call_id: CallId
-    output: Text | Annotated[list[ToolPart], Field(max_length=16384)]
+    output: Text | Annotated[list[ToolPart], Field(max_length=16384, fail_fast=True)]
     id: ShortText | None = None
     status: Literal["in_progress", "completed", "incomplete"] | None = None
 
@@ -162,7 +167,7 @@ class QuestionImage(WireModel):
 
 
 QuestionPart = Annotated[QuestionText | QuestionImage | InputJSON, Field(discriminator="type")]
-Instructions = ShortText | Annotated[list[QuestionPart], Field(min_length=1, max_length=16384)]
+Instructions = ShortText | Annotated[list[QuestionPart], Field(min_length=1, max_length=16384, fail_fast=True)]
 
 
 class PredicateQuestion(WireModel):
@@ -184,7 +189,7 @@ class Choice(WireModel):
 
 class ChoiceQuestion(PredicateQuestion):
     type: Literal["choice"]
-    choices: Annotated[list[Choice], Field(min_length=2, max_length=255)]
+    choices: Annotated[list[Choice], Field(min_length=2, max_length=255, fail_fast=True)]
 
     @field_validator("choices")
     @classmethod
@@ -202,7 +207,7 @@ class Level(WireModel):
 
 class ScoreQuestion(PredicateQuestion):
     type: Literal["score"]
-    levels: Annotated[list[Level], Field(min_length=2, max_length=10)]
+    levels: Annotated[list[Level], Field(min_length=2, max_length=10, fail_fast=True)]
 
 
 Question = Annotated[PredicateQuestion | ChoiceQuestion | ScoreQuestion, Field(discriminator="type")]
@@ -215,8 +220,8 @@ class PromptCacheOptions(WireModel):
 
 class DecisionRequest(WireModel):
     model: Annotated[StrictStr, Field(min_length=1, max_length=190)]
-    input: Text | Annotated[list[InputItem], Field(max_length=131072)]
-    questions: Annotated[list[Question], Field(min_length=1, max_length=400)]
+    input: Text | Annotated[list[InputItem], Field(max_length=131072, fail_fast=True)]
+    questions: Annotated[list[Question], Field(min_length=1, max_length=400, fail_fast=True)]
     prompt_cache_key: Annotated[StrictStr, Field(max_length=64)] | None = None
     prompt_cache_options: PromptCacheOptions | None = None
     safety_identifier: Annotated[StrictStr, Field(max_length=128)] | None = None
