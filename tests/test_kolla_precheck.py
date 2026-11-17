@@ -500,8 +500,10 @@ def _tasks(name):
     return yaml.safe_load((ROLE / "tasks" / name).read_text())
 
 
-@pytest.mark.parametrize(("runtime_enabled", "worker_enabled"), [(False, False), (True, False), (True, True)])
-def test_deployment_wires_helper_result_into_assertions(runtime_enabled, worker_enabled):
+@pytest.mark.parametrize(("runtime_enabled", "worker_enabled", "controller_enabled"), [
+    (False, False, False), (True, False, True), (True, True, True), (True, False, False), (True, True, False),
+])
+def test_deployment_wires_helper_result_into_assertions(runtime_enabled, worker_enabled, controller_enabled):
     from jinja2.nativetypes import NativeEnvironment
 
     tasks = _tasks("precheck.yml")
@@ -510,19 +512,22 @@ def test_deployment_wires_helper_result_into_assertions(runtime_enabled, worker_
     environment = NativeEnvironment()
     environment.filters.update(bool=bool, from_json=json.loads)
     context = {"lumen_runtime_enabled": runtime_enabled, "enable_lumen_worker": worker_enabled,
+               "enable_lumen_controller": controller_enabled,
                "lumen_precheck_script": {"path": "/tmp/validator.py"},
                "lumen_controller_secrets_dir": "/srv/controller-only",
                "lumen_worker_secrets_dir": "/srv/worker-client",
-               "lumen_api_image_ref": f"registry.test/lumen@sha256:{DIGEST}"}
+               "lumen_api_image_ref": f"registry.test/lumen-api@sha256:{DIGEST}",
+               "lumen_controller_image_ref": f"registry.test/lumen-controller@sha256:{DIGEST}"}
     argv = environment.from_string(command["ansible.builtin.command"]["argv"]).render(**context)
     assert argv[argv.index("--network") + 1] == "none"
-    assert argv[-3:] == [context["lumen_api_image_ref"], "/precheck.py", "material"]
+    image = context["lumen_controller_image_ref" if runtime_enabled and controller_enabled else "lumen_api_image_ref"]
+    assert argv[-3:] == [image, "/precheck.py", "material" if runtime_enabled and controller_enabled else "config"]
     assert [argv[index + 1] for index, value in enumerate(argv) if value == "--volume"] == [
         "/tmp/validator.py:/precheck.py:ro",
-        *(["/srv/controller-only:/etc/lumen/controller:ro"] if runtime_enabled else []),
-        *(["/srv/worker-client:/etc/lumen/worker-precheck:ro"] if runtime_enabled and worker_enabled else []),
+        *(["/srv/controller-only:/etc/lumen/controller:ro"] if runtime_enabled and controller_enabled else []),
+        *(["/srv/worker-client:/etc/lumen/worker-precheck:ro"] if runtime_enabled and controller_enabled and worker_enabled else []),
     ]
-    assert environment.from_string(command["vars"]["lumen_precheck_input"]["worker_enabled"]).render(
+    assert environment.from_string(block["vars"]["lumen_precheck_input"]["worker_enabled"]).render(
         **context) is worker_enabled
     assert command["no_log"] is True
     assert command["failed_when"] is False
@@ -622,8 +627,7 @@ def _actual_shared_frontend(inventory):
     from jinja2.nativetypes import NativeEnvironment
 
     block = next(task for task in _tasks("precheck.yml") if task.get("name") == "Precheck | Validate typed runtime and deployment prerequisites")
-    command = next(task for task in block["block"] if "ansible.builtin.command" in task)
-    expression = command["vars"]["lumen_precheck_input"]["external_single_frontend_options"]
+    expression = block["vars"]["lumen_precheck_input"]["external_single_frontend_options"]
     environment = NativeEnvironment(undefined=jinja2.StrictUndefined)
     options = environment.from_string(expression).render(**inventory)
     environment.filters["bool"] = lambda value: value in (True, "yes", "true")
@@ -811,8 +815,7 @@ def test_kubernetes_only_configuration_and_actual_material_succeed(kubernetes_de
 
     block = next(task for task in _tasks("precheck.yml") if "block" in task
                  and any("ansible.builtin.command" in child for child in task["block"]))
-    command = next(task for task in block["block"] if "ansible.builtin.command" in task)
-    inputs = command["vars"]["lumen_precheck_input"]
+    inputs = block["vars"]["lumen_precheck_input"]
     environment = NativeEnvironment()
     environment.filters["bool"] = bool
     context = {"lumen_runtime_enabled": True, "enable_lumen_worker": True, "lumen_runtime_config": d.runtime}

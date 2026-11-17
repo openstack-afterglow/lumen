@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from lumen.services.infrastructure.config import RuntimeConfig
+from lumen.services.infrastructure.sandbox_credentials import SandboxCredentialError, ca_identity
 from lumen.services.infrastructure.tool_manifest import MAX_TOOL_MANIFEST_BYTES, ToolManifestError, parse_tool_manifest
 
 
@@ -42,6 +43,8 @@ def _typed_reason(error: dict) -> str:
         return "runtime_kubernetes_qualification"
     if field == "tool_manifest_sha256":
         return "runtime_kubernetes_manifest"
+    if "credential source" in message and "kubernetes_clusters" in loc:
+        return "runtime_kubernetes_mount"
     if field == "tool_manifest_file" or ("kubernetes_clusters" in loc and (
             field in {"ca_file", "qualification_file"} or "bearer_token" in loc)):
         return "runtime_kubernetes_mount"
@@ -190,7 +193,10 @@ def validate_config(payload: dict) -> tuple[RuntimeConfig | None, list[dict]]:
                 cluster = config.kubernetes_cluster(pool.profile.cluster_profile_id)
                 entries = [
                     {"path": cluster.ca_file, "kind": "kubernetes_ca"},
-                    {"path": cluster.bearer_token.file, "kind": "kubernetes_token"},
+                    *([{"path": cluster.bearer_token.file, "kind": "kubernetes_token"}] if cluster.bearer_token else [
+                        {"path": cluster.drover.password.file, "kind": "drover_password"},
+                        {"path": cluster.drover.ca_file, "kind": "drover_ca"},
+                    ]),
                     {"path": cluster.qualification_file, "kind": "kubernetes_qualification", "pool_name": pool.name},
                     {"path": pool.profile.tool_manifest_file, "kind": "kubernetes_manifest", "pool_name": pool.name},
                 ]
@@ -318,6 +324,43 @@ def _worker_inventory(config: RuntimeConfig) -> dict[str, list[str]]:
     return {"files": sorted(files | manifests), "directories": sorted(directories), "manifests": sorted(manifests)}
 
 
+def _api_inventory(config: RuntimeConfig) -> dict[str, list[str]]:
+    root = Path("/etc/lumen/api-precheck")
+    manifests, directories = set(), set()
+    for pool in config.pools:
+        if pool.enabled and pool.role == "sandbox" and pool.backend == "kubernetes":
+            path = root / Path(pool.profile.tool_manifest_file).relative_to("/etc/lumen/controller")
+            manifests.add(str(path))
+            directories.update(str(parent) for parent in path.parents if parent.is_relative_to(root) and parent != root)
+    return {"files": sorted(manifests), "directories": sorted(directories), "manifests": sorted(manifests)}
+
+
+def _validate_api_material(config: RuntimeConfig, read_material, inspect_directory) -> None:
+    expected = _api_inventory(config)
+    root = "/etc/lumen/api-precheck"
+    try:
+        inventory = inspect_directory(root)
+        if set(inventory) != {root, *expected["files"], *expected["directories"]}:
+            raise ValueError()
+        for path, metadata in inventory.items():
+            directory = path == root or path in expected["directories"]
+            if (metadata.get("islnk") or not metadata.get("isdir" if directory else "isreg")
+                    or metadata.get("uid") != 0 or metadata.get("gid") != 0
+                    or metadata.get("mode") not in ({"0755"} if directory else {"0444", "0644"})):
+                raise ValueError()
+        for pool in config.pools:
+            if pool.enabled and pool.role == "sandbox" and pool.backend == "kubernetes":
+                path = str(Path(root) / Path(pool.profile.tool_manifest_file).relative_to("/etc/lumen/controller"))
+                data, metadata = read_material(path)
+                if (b"PRIVATE KEY" in data or not metadata.get("isreg") or metadata.get("islnk")
+                        or metadata.get("uid") != 0 or metadata.get("gid") != 0
+                        or metadata.get("mode") not in {"0444", "0644"}):
+                    raise ValueError()
+                parse_tool_manifest(data, pool.profile.tool_manifest_sha256)
+    except (OSError, ValueError, ToolManifestError):
+        raise PrecheckFailure("runtime_api_mount_material") from None
+
+
 def _inspect_worker_directory(root: str = "/etc/lumen/worker-precheck") -> dict[str, dict]:
     """Inventory every entry without following links, including the mount root."""
     inventory = {}
@@ -340,7 +383,8 @@ def _inspect_worker_directory(root: str = "/etc/lumen/worker-precheck") -> dict[
 
 def _read_material(path: str, *, mount_root: str = "/etc/lumen/controller") -> tuple[bytes, dict]:
     candidate = Path(path)
-    root = Path("/etc/lumen/worker-precheck") if candidate.is_relative_to("/etc/lumen/worker-precheck") else Path(mount_root)
+    root = next((Path(prefix) for prefix in ("/etc/lumen/worker-precheck", "/etc/lumen/api-precheck", "/etc/lumen/public-source")
+                 if candidate.is_relative_to(prefix)), Path(mount_root))
     if candidate.is_relative_to(root) and not candidate.parent.resolve(strict=True).is_relative_to(root.resolve(strict=True)):
         raise OSError("parent escapes controller mount")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -348,12 +392,13 @@ def _read_material(path: str, *, mount_root: str = "/etc/lumen/controller") -> t
         metadata = os.fstat(stream.fileno())
         if not stat.S_ISREG(metadata.st_mode):
             raise OSError("not a regular file")
-        limit = MAX_TOOL_MANIFEST_BYTES + 1 if candidate.is_relative_to("/etc/lumen/worker-precheck") else -1
+        limit = MAX_TOOL_MANIFEST_BYTES + 1
         return stream.read(limit), {"isreg": True, "uid": metadata.st_uid, "gid": metadata.st_gid,
                                    "mode": f"{stat.S_IMODE(metadata.st_mode):04o}"}
 
 
-def _validate_worker_material(config: RuntimeConfig, read_material, now: datetime, inspect_worker_directory) -> None:
+def _validate_worker_material(config: RuntimeConfig, read_material, now: datetime, inspect_worker_directory,
+                              *, inspect_controller: bool = True) -> None:
     from cryptography import x509
     from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
     from cryptography.hazmat.primitives import hashes, serialization
@@ -392,12 +437,14 @@ def _validate_worker_material(config: RuntimeConfig, read_material, now: datetim
         if len(private_blocks) != (1 if path == tls.worker_client_key_file else 0):
             raise PrecheckFailure("runtime_worker_mount_material")
         contents[path] = data
-    try:
-        ca_bytes, _ = read_material(tls.ca_file)
-    except OSError:
-        raise PrecheckFailure("runtime_worker_mount_material") from None
-    if contents[tls.ca_file] != ca_bytes:
-        raise PrecheckFailure("runtime_worker_mount_material")
+    ca_bytes = contents[tls.ca_file]
+    if inspect_controller:
+        try:
+            controller_ca, _ = read_material(tls.ca_file)
+        except OSError:
+            raise PrecheckFailure("runtime_worker_mount_material") from None
+        if ca_bytes != controller_ca:
+            raise PrecheckFailure("runtime_worker_mount_material")
     try:
         leaves = x509.load_pem_x509_certificates(contents[tls.worker_client_cert_file])
         if len(leaves) != 1:
@@ -422,7 +469,7 @@ def _validate_worker_material(config: RuntimeConfig, read_material, now: datetim
         if public != public_bytes(leaf.public_key()) or public == public_bytes(ca.public_key()):
             raise ValueError()
         # Reject copying controller private material even under worker filenames.
-        for path in (tls.ca_key_file, tls.key_file, tls.operator_client_key_file):
+        for path in ((tls.ca_key_file, tls.key_file, tls.operator_client_key_file) if inspect_controller else ()):
             data, _ = read_material(path)
             if data == contents[tls.worker_client_key_file]:
                 raise ValueError()
@@ -449,9 +496,10 @@ def _validate_worker_material(config: RuntimeConfig, read_material, now: datetim
             raise PrecheckFailure("runtime_worker_mount_material")
         try:
             parse_tool_manifest(data, pool.profile.tool_manifest_sha256)
-            controller_data, _ = read_material(pool.profile.tool_manifest_file)
-            if data != controller_data:
-                raise PrecheckFailure("runtime_kubernetes_manifest")
+            if inspect_controller:
+                controller_data, _ = read_material(pool.profile.tool_manifest_file)
+                if data != controller_data:
+                    raise PrecheckFailure("runtime_kubernetes_manifest")
         except ToolManifestError:
             raise PrecheckFailure("runtime_kubernetes_manifest") from None
         except OSError:
@@ -492,6 +540,10 @@ def _validate_kubernetes_material(config: RuntimeConfig, entry: dict, data: byte
     if not data or len(data) > limit or hashlib.sha256(data).hexdigest() != digest:
         raise PrecheckFailure(reason)
     if not qualification:
+        try:
+            parse_tool_manifest(data, pool.profile.tool_manifest_sha256)
+        except ToolManifestError:
+            raise PrecheckFailure("runtime_kubernetes_manifest") from None
         return
     try:
         report = json.loads(data)
@@ -501,6 +553,8 @@ def _validate_kubernetes_material(config: RuntimeConfig, entry: dict, data: byte
             "cluster_cidrs": list(cluster.cluster_cidrs), "pool_digest": pool.digest(),
         }
         if not isinstance(report, dict) or any(report.get(key) != value for key, value in expected.items()):
+            raise ValueError()
+        if cluster.drover is not None and report.get("namespace_uid") != cluster.drover.namespace_uid:
             raise ValueError()
         for key in ("runtime_probe_sha256", "cni_probe_sha256", "runtime_class_spec_sha256"):
             if not isinstance(report.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", report[key]):
@@ -517,7 +571,7 @@ def _validate_kubernetes_material(config: RuntimeConfig, entry: dict, data: byte
 
 
 def validate_material(payload: dict, *, now: datetime | None = None, read_material=None,
-                      inspect_worker_directory=None) -> None:
+                      inspect_worker_directory=None, inspect_api_directory=None) -> None:
     from cryptography import x509
 
     config, files = validate_config(payload)
@@ -526,6 +580,31 @@ def validate_material(payload: dict, *, now: datetime | None = None, read_materi
     now = now or datetime.now(UTC)
     read_material = read_material or _read_material
     profiles = {profile.id: profile for profile in config.guest_profiles}
+    role = payload.get("material_role", "controller")
+    if role == "public_source":
+        for pool in config.pools:
+            if not (pool.enabled and pool.backend == "kubernetes" and pool.role == "sandbox"):
+                continue
+            path = Path("/etc/lumen/public-source") / Path(pool.profile.tool_manifest_file).relative_to("/etc/lumen/controller")
+            try:
+                data, metadata = read_material(str(path))
+                if (not metadata.get("isreg") or metadata.get("islnk") or metadata.get("uid") != 0
+                        or metadata.get("gid") != 0 or metadata.get("mode") not in {"0400", "0600", "0444", "0644"}):
+                    raise ValueError()
+                parse_tool_manifest(data, pool.profile.tool_manifest_sha256)
+            except (OSError, ValueError, ToolManifestError):
+                raise PrecheckFailure("runtime_kubernetes_manifest") from None
+        return
+    if role == "api":
+        if _api_inventory(config)["files"]:
+            _validate_api_material(config, read_material, inspect_api_directory or _inspect_worker_directory)
+        return
+    if role == "worker":
+        _validate_worker_material(config, read_material, now, inspect_worker_directory or _inspect_worker_directory,
+                                  inspect_controller=False)
+        return
+    if role != "controller":
+        raise PrecheckFailure("runtime_material_role")
     for entry in files:
         reason = ("runtime_ca_invalid" if entry["kind"] == "ca" else
                   "runtime_guest_config_file" if entry["kind"] == "profile" else
@@ -536,6 +615,22 @@ def validate_material(payload: dict, *, now: datetime | None = None, read_materi
             raise PrecheckFailure(reason) from None
         if not metadata.get("isreg") or metadata.get("islnk") or metadata.get("uid") != 0:
             raise PrecheckFailure(reason)
+        if entry["kind"].startswith("drover_"):
+            try:
+                if metadata.get("gid") != 0:
+                    raise ValueError()
+                if entry["kind"] == "drover_password":
+                    password = data.decode("utf-8").removesuffix("\n")
+                    if (metadata.get("mode") != "0600" or not password or len(data) > 16384
+                            or any(ord(char) < 32 or ord(char) == 127 for char in password)):
+                        raise ValueError()
+                else:
+                    if metadata.get("mode") not in {"0400", "0600", "0444", "0644"}:
+                        raise ValueError()
+                    ca_identity(data)
+            except (ValueError, UnicodeError, SandboxCredentialError):
+                raise PrecheckFailure("runtime_drover_material") from None
+            continue
         if entry["kind"].startswith("kubernetes_"):
             _validate_kubernetes_material(config, entry, data, metadata, now)
             continue
@@ -608,6 +703,7 @@ def main() -> int:
             validate_material(payload)
         result = {"ok": True, "reasons": [], "files": files,
                   "worker_inventory": _worker_inventory(config) if config and payload.get("worker_enabled") is True else {}}
+        result["api_inventory"] = _api_inventory(config) if config else {}
     except PrecheckFailure as exc:
         result = {"ok": False, "reasons": exc.reasons}
     except (ValueError, TypeError, KeyError, AttributeError):
