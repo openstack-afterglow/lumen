@@ -408,6 +408,14 @@ async def test_cloud_creation_discovery_explains_consent_and_runtime(bridge, pro
     assert access["consent_url"] == "/dashboard/chat/settings?section=mcp"
     assert "owner/project write consent" in access["instructions"]
     assert "boot_volume_size_gb" in access["vm_creation"]
+    assert access["write_consent_required"] is (False if protocol == 2 else None)
+    if protocol == 2:
+        assert access["managed_mutation_eligible"] is True
+        assert "do not deactivate or re-consent" in access["instructions"]
+        assert "choose Read and manage" not in access["instructions"]
+    else:
+        assert "operator" in access["instructions"] and "first" in access["instructions"]
+        assert "choose Read and manage" not in access["instructions"]
     assert "afterglow_vm_list" in loaded["loaded_tools"]
     assert bridge.invocations == []
 
@@ -420,7 +428,21 @@ async def test_v2_read_consent_does_not_acquire_creation_authority(bridge):
     assert "afterglow_vm_create" not in target
     assert loaded["cloud_access"]["runtime_supports_mutations"] is True
     assert loaded["cloud_access"]["consent_url"] == "/dashboard/chat/settings?section=mcp"
+    assert loaded["cloud_access"]["write_consent_required"] is True
+    assert loaded["cloud_access"]["managed_mutation_eligible"] is False
+    assert "choose Read and manage" in loaded["cloud_access"]["instructions"]
     assert bridge.previews == bridge.invocations == []
+
+
+async def test_v2_manage_consent_guidance_uses_all_eligible_bindings_not_only_search_hits(bridge):
+    ctx = await _admitted_context(2)
+    target = await bindings.v2_tool_bindings(ctx)
+    result = await target["list_available_tools"].execute({"query": "Nova", "max_results": 1}, ctx)
+    loaded = json.loads(result.model_content)
+    assert loaded["loaded_tools"] == ["afterglow_vm_list"]
+    assert loaded["cloud_access"]["write_consent_required"] is False
+    assert loaded["cloud_access"]["managed_mutation_eligible"] is True
+    assert "choose Read and manage" not in loaded["cloud_access"]["instructions"]
 
 
 @pytest.mark.parametrize("approval_mode", ["required_for_mutations", "never"])

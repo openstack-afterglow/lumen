@@ -144,6 +144,10 @@ async def _snapshot(state):
             status=run.status, owner=run.lease_owner, lease_expires_at=run.lease_expires_at,
             approvals={row.call_id: row for row in approvals},
             requests=[event.payload.call_id for event in events if event.type == "tool.approval_required"],
+            approval_payloads={
+                event.payload.call_id: event.payload.model_dump(mode="json")
+                for event in events if event.type == "tool.approval_required"
+            },
             events=len(events),
         )
 
@@ -322,6 +326,8 @@ async def test_encrypted_postgres_vm_approval_survives_fresh_process(
         "boot_volume_size_gb": 24,
         "key_name": "owned-key",
         "security_group_ids": ["33333333-3333-4333-8333-333333333333"],
+        "delete_boot_volume_on_termination": True,
+        "availability_zone": "zone-b",
     }
     state.tool_arguments = arguments
     snapshot = {
@@ -335,6 +341,7 @@ async def test_encrypted_postgres_vm_approval_survives_fresh_process(
             "type": "object", "additionalProperties": False,
             "properties": {
                 name: {"type": "integer", "minimum": 1} if name == "boot_volume_size_gb"
+                else {"type": "boolean"} if name == "delete_boot_volume_on_termination"
                 else {"type": "array", "items": {"type": "string"}, "minItems": 1}
                 if name == "security_group_ids" else {"type": "string", "minLength": 1}
                 for name in arguments
@@ -366,7 +373,11 @@ async def test_encrypted_postgres_vm_approval_survives_fresh_process(
                     f"nova-keypair:{state.user}:{arguments['key_name']}",
                     f"neutron-security-group:{arguments['security_group_ids'][0]}",
                 ],
-                "destructive": False, "estimated_effect": "create VM with 24 GiB boot volume",
+                "destructive": False,
+                "estimated_effect": (
+                    "create VM with 24 GiB boot volume"
+                    "; delete_boot_volume_on_termination=true; availability_zone=zone-b"
+                ),
                 "fingerprint": "b" * 64,
             })
         assert request.url.path.endswith("/execute")
@@ -445,6 +456,14 @@ asyncio.run(main())
         )
         before = await _snapshot(state)
         assert before.status == "awaiting_input" and before.requests == ["create-vm"]
+        public = before.approval_payloads["create-vm"]
+        assert public["redacted_arguments"] == {name: "[REDACTED]" for name in arguments}
+        public_text = "\n".join(part["text"] for part in public["preview"])
+        for field in ("name", "image_id", "flavor_id", "network_id", "key_name", "availability_zone"):
+            assert arguments[field] in public_text
+        assert arguments["security_group_ids"][0] in public_text
+        assert "24 GiB" in public_text
+        assert "delete_boot_volume_on_termination=true" in public_text
         assert authority.mutations == []
         await checkpoint.close()
 

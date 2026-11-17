@@ -428,25 +428,42 @@ async def _search_and_load_bindings(
         for binding in selected
     ]
     payload: dict[str, object] = {"loaded_tools": [item["name"] for item in catalog], "tools": catalog}
-    if _catalog_terms(query) & {"cloud", "nova", "vm", "instance", "instances", "cinder", "neutron"}:
+    if _catalog_terms(query.casefold()) & {"cloud", "nova", "vm", "instance", "instances", "cinder", "neutron"}:
+        managed_mutation_eligible = any(
+            binding.definition.source == "managed" and binding.definition.effect == "external_mutation"
+            for binding in deferred.values()
+        )
+        instructions = "Cloud writes require protocol v2 and explicit owner/project write consent. "
+        if not include_managed:
+            instructions += (
+                "An operator must qualify and enable protocol v2 on both API and workers first. "
+                "Changing consent alone cannot enable writes; inspect tools again after activation "
+                "to determine whether write consent is missing."
+            )
+        elif not managed_mutation_eligible:
+            instructions += (
+                "No managed cloud mutation is currently eligible. If access is read-only or disabled, "
+                "open Afterglow chat settings → MCP → Afterglow MCP, deactivate read-only access if active, "
+                "then activate, choose Read and manage, verify the current project and approve. "
+                "Current native role ceilings and service availability still apply."
+            )
+        else:
+            instructions += "Managed cloud mutations are already eligible; do not deactivate or re-consent."
         payload["cloud_access"] = {
             "mutation_protocol_version": 2,
             "runtime_supports_mutations": include_managed,
+            "managed_mutation_eligible": managed_mutation_eligible,
+            "write_consent_required": not managed_mutation_eligible if include_managed else None,
             "consent_url": "/dashboard/chat/settings?section=mcp",
-            "instructions": (
-                "Cloud writes require protocol v2 and explicit owner/project write consent. "
-                "In Afterglow chat settings → MCP → Afterglow MCP, deactivate existing read-only access first, "
-                "then activate, choose Read and manage, verify the current project and approve. "
-                "If runtime_supports_mutations is false, an operator must qualify and enable protocol v2 "
-                "on both API and workers; changing consent alone cannot enable writes. "
-                "Explain these prerequisites and the consent link instead of claiming cloud creation does not exist."
-            ),
+            "instructions": instructions,
             "vm_creation": (
                 "Use image, flavor, network, keypair, security group and quota read tools to gather choices. "
                 "Ask the user for missing selections; never invent IDs or silently choose access settings. "
                 "Propose afterglow_vm_create with explicit image_id, flavor_id, network_id, "
                 "boot_volume_size_gb, user-owned key_name and project-owned security_group_ids. "
-                "Human approval must show exact arguments before execution. Acceptance is not guest readiness."
+                "Review the server-validated public preview of VM selections, boot-volume deletion policy, "
+                "availability zone and schedule before human approval. Raw argument values are redacted "
+                "in public approval events. Acceptance is not guest readiness."
             ),
         }
     return V2ToolExecutionResult(
