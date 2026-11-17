@@ -61,6 +61,7 @@ async def test_two_keys_exact_single_send_with_structured_then_preselected_plain
             assert envelope["single_attempt"] is True
             assert envelope["body"]["max_tokens"] == 32
             assert envelope["body"]["stream"] is False
+            assert "capabilities_override" not in envelope["body"]
     assert probe_authority.await_count == 4
 
 

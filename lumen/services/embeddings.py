@@ -53,20 +53,20 @@ def _values(response: Any) -> list[dict]:
 
 
 def _limits(route: dict, inputs: list[str], dimensions: int | None) -> tuple[int, bool]:
-    metadata = provider_metadata.catalog_model_metadata(route["model_name"], route.get("provider_type") or "")
-    model = route["model_name"].lower()
+    metadata = provider_metadata.catalog_model_metadata(
+        route["model_name"], route.get("provider_type") or "", route.get("api_base"),
+    )
     provider = route.get("provider_type")
     max_dimensions = metadata.get("output_vector_size")
-    supports_dimensions = (provider == "openai" and model.startswith("text-embedding-3-")) or (
-        provider == "gemini" and "embedding" in model
-    )
-    if max_dimensions is None and supports_dimensions:
-        max_dimensions = 3072 if provider == "gemini" or "large" in model else 1536
-    if dimensions is not None and (not supports_dimensions or dimensions > max_dimensions):
+    max_dimensions = max_dimensions if type(max_dimensions) is int and max_dimensions > 0 else None
+    supports_dimensions = metadata.get("supports_dimensions") is True and max_dimensions is not None
+    if dimensions is not None and (
+        type(dimensions) is not int or dimensions < 1 or not supports_dimensions or dimensions > max_dimensions
+    ):
         raise EmbeddingError(400, "dimensions is unsupported or exceeds this model's output dimensions")
-    max_tokens = metadata.get("max_input_tokens") or (8191 if provider == "openai" else 2048)
+    max_tokens = metadata.get("max_input_tokens")
     counts = [provider_metadata.count_tokens(route["model_name"], text=value) for value in inputs]
-    if any(count > max_tokens for count in counts):
+    if max_tokens is not None and any(count > max_tokens for count in counts):
         raise EmbeddingError(400, "input exceeds the model token limit")
     if provider == "openai" and sum(counts) > 300000:
         raise EmbeddingError(400, "input exceeds the request token limit")

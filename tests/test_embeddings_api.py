@@ -150,7 +150,7 @@ def test_embedding_limit_checks_dimensions_and_input_count(monkeypatch):
 
     route = {"model_name": "text-embedding-3-small", "provider_type": "openai"}
     monkeypatch.setattr(embeddings.provider_metadata, "catalog_model_metadata", lambda *_: {
-        "output_vector_size": 1536, "max_input_tokens": 8,
+        "output_vector_size": 1536, "supports_dimensions": True, "max_input_tokens": 8,
     })
     monkeypatch.setattr(embeddings.provider_metadata, "count_tokens", lambda *_args, **_kwargs: 2)
     assert embeddings._limits(route, ["a"], 128) == (128, True)
@@ -190,7 +190,7 @@ async def test_embedding_usage_settlement_marks_missing_usage_estimated(monkeypa
     monkeypatch.setattr(embeddings, "authorize_new_io", authorize)
     monkeypatch.setattr(provider_client, "aembedding", embedding)
     monkeypatch.setattr(provider_metadata, "catalog_model_metadata", lambda *_: {
-        "output_vector_size": 2, "max_input_tokens": 10,
+        "output_vector_size": 2, "supports_dimensions": True, "max_input_tokens": 10,
     })
     monkeypatch.setattr(provider_metadata, "count_tokens", lambda *_args, **_kwargs: 3)
     monkeypatch.setattr(provider_metadata, "cost_from_usage", lambda *_args, **_kwargs: object())
@@ -206,3 +206,91 @@ async def test_embedding_usage_settlement_marks_missing_usage_estimated(monkeypa
     assert result["credited_cost"] == 0.00001
     assert effects == ["precheck", ("authorize", ("compat:completions:write",)),
                        ("provider", "RETRIEVAL_QUERY", "context"), ("settle", 3, 0)]
+
+
+@pytest.mark.parametrize("model,provider", [
+    ("text-embedding-3-small", "openai"), ("text-embedding-3-large", "openai"),
+    ("gemini-embedding-001", "gemini"), ("unknown-embedding", "openai"),
+])
+def test_embedding_dimensions_are_unknown_without_tracked_metadata(monkeypatch, model, provider):
+    from lumen.services import embeddings
+
+    monkeypatch.setattr(embeddings.provider_metadata, "catalog_model_metadata", lambda *_: {})
+    monkeypatch.setattr(embeddings.provider_metadata, "count_tokens", lambda *_args, **_kwargs: 1)
+    route = {"model_name": model, "provider_type": provider}
+    assert embeddings._limits(route, ["hello"], None) == (0, False)
+    with pytest.raises(embeddings.EmbeddingError, match="dimensions"):
+        embeddings._limits(route, ["hello"], 128)
+
+
+def test_embedding_dimension_metadata_is_endpoint_scoped(monkeypatch):
+    from lumen.services import embeddings
+
+    seen = []
+    def metadata(model, provider, api_base):
+        seen.append((model, provider, api_base))
+        return {}
+
+    monkeypatch.setattr(embeddings.provider_metadata, "catalog_model_metadata", metadata)
+    monkeypatch.setattr(embeddings.provider_metadata, "count_tokens", lambda *_args, **_kwargs: 1)
+    route = {"model_name": "text-embedding-3-small", "provider_type": "openai",
+             "api_base": "https://compatible.example/v1"}
+    assert embeddings._limits(route, ["hello"], None) == (0, False)
+    assert seen == [("text-embedding-3-small", "openai", "https://compatible.example/v1")]
+
+
+@pytest.mark.parametrize("dimension", [0, -1, True, 1537])
+def test_embedding_dimensions_require_positive_supported_range(monkeypatch, dimension):
+    from lumen.services import embeddings
+
+    monkeypatch.setattr(embeddings.provider_metadata, "catalog_model_metadata", lambda *_: {
+        "output_vector_size": 1536, "supports_dimensions": True,
+    })
+    with pytest.raises(embeddings.EmbeddingError, match="dimensions"):
+        embeddings._limits({"model_name": "opaque", "provider_type": "openai"}, ["hello"], dimension)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_base", [None, "https://compatible.example/v1"])
+async def test_embedding_capability_response_does_not_invent_dimensions(monkeypatch, api_base):
+    from lumen.api import conversations
+    from lumen.services import provider_metadata
+
+    route = {"model_name": "text-embedding-3-small", "provider_type": "openai",
+             "api_base": api_base, "capabilities": {}}
+    async def resolve(*_args, **_kwargs):
+        return route
+
+    seen = []
+    def metadata(model, provider, base):
+        seen.append((model, provider, base))
+        return {}
+
+    monkeypatch.setattr(conversations.routing, "resolve_model_by_id", resolve)
+    monkeypatch.setattr(provider_metadata, "catalog_model_metadata", metadata)
+    result = await conversations.get_chat_capabilities(model_id=1, model_kind="embedding", token_info={})
+    assert result["default_dimensions"] is None
+    assert result["supports_dimensions"] is False
+    assert result["min_dimensions"] is None
+    assert result["max_dimensions"] is None
+    assert result["max_input_tokens"] is None
+    assert seen == [("text-embedding-3-small", "openai", api_base)]
+
+
+@pytest.mark.asyncio
+async def test_embedding_capability_response_projects_only_tracked_dimensions(monkeypatch):
+    from lumen.api import conversations
+    from lumen.services import provider_metadata
+
+    async def resolve(*_args, **_kwargs):
+        return {"model_name": "opaque", "provider_type": "openai", "capabilities": {}}
+
+    monkeypatch.setattr(conversations.routing, "resolve_model_by_id", resolve)
+    monkeypatch.setattr(provider_metadata, "catalog_model_metadata", lambda *_: {
+        "output_vector_size": 1024, "supports_dimensions": True, "max_input_tokens": 8192,
+    })
+    result = await conversations.get_chat_capabilities(model_id=1, model_kind="embedding", token_info={})
+    assert result["default_dimensions"] == result["max_dimensions"] == 1024
+    assert result["min_dimensions"] == 1
+    assert result["supports_dimensions"] is True
+    assert result["max_input_tokens"] == 8192

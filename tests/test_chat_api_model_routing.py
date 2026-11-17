@@ -660,7 +660,7 @@ def test_admin_projection_exposes_effective_cache_without_overwriting_manual_fie
     assert projection["effective_cache_write_price_per_million"] == 2
     assert projection["effective_cache_write_1h_price_per_million"] == 3
     assert projection["effective_cache_price_sources"] == {
-        "cache_read": "manual", "cache_creation_5m": "fallback_input:manual", "cache_creation_1h": "litellm",
+        "cache_read": "manual", "cache_creation_5m": "fallback_input:manual", "cache_creation_1h": "native_catalog",
     }
 
 

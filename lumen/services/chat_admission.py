@@ -205,14 +205,17 @@ _CACHE_PRICE_KEYS = (
     "cache_read_price_per_token_above_200k",
     "cache_write_price_per_token_above_200k",
     "cache_write_1h_price_per_token_above_200k",
+    "input_price_per_token_above_200k",
+    "output_price_per_token_above_200k",
 )
 
 
 def _cache_price_snapshot(route: dict[str, Any]) -> dict[str, Any]:
-    """Freeze resolved direct-provider or manual cache prices and provenance."""
+    """Freeze resolved cache/base tiers and their per-model token threshold."""
     return {
         **{key: str(route[key]) if route.get(key) is not None else None for key in _CACHE_PRICE_KEYS},
         "cache_price_sources": dict(route.get("cache_price_sources") or {}),
+        "long_context_threshold_tokens": route.get("long_context_threshold_tokens", 200_000),
     }
 
 
@@ -323,6 +326,8 @@ def _run_snapshots(
         for price_key, route_key in (
             ("advisor_input_price_per_token", "input_price_per_token"),
             ("advisor_output_price_per_token", "output_price_per_token"),
+            ("advisor_input_price_per_token_above_200k", "input_price_per_token_above_200k"),
+            ("advisor_output_price_per_token_above_200k", "output_price_per_token_above_200k"),
             # Advisor prices use the same resolved manual or direct-provider rates.
             ("advisor_cache_read_price_per_token", "cache_read_price_per_token"),
             ("advisor_cache_write_price_per_token", "cache_write_price_per_token"),
@@ -353,6 +358,7 @@ def _run_snapshots(
         "output_price_per_token": str(resolved["output_price_per_token"]),
         "component_prices": component_prices,
         "advisor_cache_price_sources": dict((advisor_route or {}).get("cache_price_sources") or {}),
+        "advisor_long_context_threshold_tokens": (advisor_route or {}).get("long_context_threshold_tokens", 200_000),
         "price_source": resolved.get("price_source"),
         "price_version": resolved.get("price_version"),
         "provider_name": resolved["provider_name"],

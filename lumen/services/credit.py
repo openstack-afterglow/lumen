@@ -90,6 +90,14 @@ def _snapshot_price(pricing_snapshot: dict, key: str, *, required: bool) -> Deci
     return price
 
 
+def long_context_threshold_tokens(pricing_snapshot: dict) -> int:
+    """Read the frozen threshold, retaining the legacy tier boundary when absent."""
+    threshold = pricing_snapshot.get("long_context_threshold_tokens", 200_000)
+    if type(threshold) is not int or threshold <= 0:
+        raise ValueError("durable pricing snapshot is invalid")
+    return threshold
+
+
 def usage_cost_from_pricing_snapshot(
     pricing_snapshot: dict,
     *,
@@ -115,6 +123,9 @@ def usage_cost_from_pricing_snapshot(
     try:
         input_price = _snapshot_price(pricing_snapshot, "input_price_per_token", required=True)
         output_price = _snapshot_price(pricing_snapshot, "output_price_per_token", required=True)
+        input_tier = _snapshot_price(pricing_snapshot, "input_price_per_token_above_200k", required=False)
+        output_tier = _snapshot_price(pricing_snapshot, "output_price_per_token_above_200k", required=False)
+        threshold = long_context_threshold_tokens(pricing_snapshot)
         cache_prices = {
             name: (_snapshot_price(pricing_snapshot, key, required=False),
                    _snapshot_price(pricing_snapshot, tier_key, required=False))
@@ -129,6 +140,11 @@ def usage_cost_from_pricing_snapshot(
         max(0, int(completion_tokens)),
     ):
         raise ValueError("usage breakdown totals do not match prompt/completion tokens")
+    if breakdown.input_tokens > threshold:
+        if input_tier is not None:
+            input_price = input_tier
+        if output_tier is not None:
+            output_price = output_tier
     frozen_required = pricing_snapshot.get("required_token_modalities") or ()
     if not isinstance(frozen_required, (list, tuple)):
         raise ValueError("durable pricing snapshot is invalid")
@@ -165,7 +181,7 @@ def usage_cost_from_pricing_snapshot(
         rate, tier_rate = cache_prices[name]
         source = sources.get(name, "manual")
         # Frozen tiers exist only for real catalog rates (own or inherited by a fallback write).
-        if breakdown.input_tokens > 200_000 and source != "manual" and tier_rate is not None:
+        if breakdown.input_tokens > threshold and source != "manual" and tier_rate is not None:
             rate = tier_rate
             # A fallback base and its real catalog tier carry separate provenance.
             source = sources.get(f"{name}_above_200k") or source
@@ -284,11 +300,12 @@ def worst_case_token_rates(pricing_snapshot: dict) -> tuple[Decimal, Decimal, De
     outputs: list[Decimal] = []
     categories = 5
     try:
-        for key in ("input_price_per_token", *_WORST_CASE_INPUT_KEYS):
+        for key in ("input_price_per_token", "input_price_per_token_above_200k", *_WORST_CASE_INPUT_KEYS):
             if pricing_snapshot.get(key) is not None:
                 inputs.append(Decimal(str(pricing_snapshot[key])))
-        if pricing_snapshot.get("output_price_per_token") is not None:
-            outputs.append(Decimal(str(pricing_snapshot["output_price_per_token"])))
+        for key in ("output_price_per_token", "output_price_per_token_above_200k"):
+            if pricing_snapshot.get(key) is not None:
+                outputs.append(Decimal(str(pricing_snapshot[key])))
         token_rates = pricing_snapshot.get("token_rates") or {}
         if not isinstance(token_rates, dict):
             raise ValueError("durable pricing snapshot is invalid")

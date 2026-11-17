@@ -267,6 +267,7 @@ async def generate_title(*, exchange: Sequence[Mapping[str, Any]], route: Mappin
         "provider_auth": route.get("provider_auth"),
         "max_tokens": None if route.get("provider_type") == "chatgpt" else _TITLE_MAX_TOKENS,
         "temperature": None if route.get("provider_type") == "chatgpt" else 0.0,
+        "extra": {"capabilities_override": dict(_route_capabilities(route))},
     }
     params = {key: value for key, value in params.items() if value is not None}
     # Send only an effort the frozen route advertises, through the wrapper's
@@ -276,7 +277,7 @@ async def generate_title(*, exchange: Sequence[Mapping[str, Any]], route: Mappin
     if effort is not None and callable(reasoning_params):
         reasoning = reasoning_params(model, effort, route.get("provider_type"))
         if reasoning:
-            params["extra"] = reasoning
+            params["extra"].update(reasoning)
     response = await provider_client.acompletion(model, messages, **params)
     raw = _resp_text(response)
     title = _clean(raw)

@@ -22,7 +22,7 @@ from lumen.services.provider_errors import (
     Timeout,
     error_for_status,
 )
-from lumen.services.provider_metadata import catalog_model_metadata, direct_provider_route
+from lumen.services.provider_metadata import catalog_model_metadata
 from lumen.services.providers.credentials import ProviderAuthRef, api_model_name, transport_model_name
 from lumen.services.providers.errors import ProviderSubscriptionError
 
@@ -101,11 +101,15 @@ def _anthropic_cached_messages(
     model: str, messages: list[dict], provider_type: str | None, api_base: str | None,
     *, tools: list[dict] | None = None, extra: dict | None = None,
 ) -> list[dict]:
-    if provider_type != "anthropic" or not direct_provider_route(provider_type, api_base):
+    if provider_type != "anthropic":
         return messages
     if _cache_marker_present(messages) or _cache_marker_present(tools) or _cache_marker_present(extra):
         return messages
-    if not catalog_model_metadata(model, provider_type).get("supports_prompt_caching"):
+    override = (extra or {}).get("capabilities_override")
+    enabled = override.get("prompt_caching") if isinstance(override, Mapping) else None
+    if enabled is None:
+        enabled = catalog_model_metadata(model, provider_type, api_base).get("supports_prompt_caching")
+    if enabled is not True:
         return messages
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
@@ -394,6 +398,8 @@ async def _completion(
 ) -> Any:
     provider = _provider(model, custom_llm_provider)
     options = dict(extra or {})
+    # Runtime capability metadata controls local policy, never provider wire options.
+    options.pop("capabilities_override", None)
     collision = _RESERVED.intersection(options)
     if collision:
         raise ValueError("provider_transport_options_reserved")
