@@ -474,7 +474,12 @@ async def test_chatgpt_stream_bridges_tool_delta_citations_and_reasoning_native_
 
 @pytest.mark.parametrize("provider", ["azure", "bedrock", "vertex", "ollama", "openrouter", "deepseek", "xai",
                                       "vertex_ai", "azure_ai", "mistral", "cohere", "groq", "together", "together_ai"])
-def test_all_owned_runtime_adapters_admit_single_attempt(provider):
+def test_removed_inference_adapters_reject_single_attempt(provider):
+    assert not client.provider_once_supported(provider)
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "gemini", "perplexity"])
+def test_native_runtime_adapters_admit_single_attempt(provider):
     assert client.provider_once_supported(provider)
 
 

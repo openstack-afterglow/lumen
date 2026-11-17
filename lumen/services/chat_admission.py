@@ -370,10 +370,19 @@ def _run_snapshots(
     }
     try:
         token_pricing = frozen_token_pricing(resolved)
+        advisor_token_pricing = frozen_token_pricing(advisor_route) if isinstance(advisor_route, dict) else None
         summary_token_pricing = frozen_token_pricing(summary_route) if summary_route is not None else None
         token_rates = token_pricing["token_rates"]
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=422, detail="model token pricing is invalid") from exc
+    pricing_snapshot["token_rates_follow_text"] = token_pricing.get("token_rates_follow_text") is True
+    if token_pricing.get("token_rates_above_200k"):
+        pricing_snapshot["token_rates_above_200k"] = token_pricing["token_rates_above_200k"]
+    if advisor_token_pricing is not None:
+        pricing_snapshot["advisor_token_rates_follow_text"] = advisor_token_pricing.get("token_rates_follow_text") is True
+        for key in ("token_rates", "token_rates_above_200k"):
+            if advisor_token_pricing.get(key):
+                pricing_snapshot[f"advisor_{key}"] = advisor_token_pricing[key]
     if token_rates:
         # Frozen with the run: later model price edits never reprice it.
         pricing_snapshot["token_rates"] = token_rates

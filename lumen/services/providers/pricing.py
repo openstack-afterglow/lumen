@@ -245,6 +245,8 @@ def frozen_token_pricing(route: dict) -> dict:
         "price_source": route.get("price_source"),
         "price_version": route.get("price_version"),
         "token_rates": route_token_rates(route),
+        "token_rates_above_200k": _validate_token_rates(route.get("token_rates_above_200k") or {}),
+        "token_rates_follow_text": route.get("token_rates_follow_text") is True,
     }
 
 
@@ -545,7 +547,7 @@ def _effective_capabilities(
     api_key_configured: bool = False,
     api_base: str | None = None,
 ) -> tuple[dict, str]:
-    """Administrator overrides win; imported historical metadata is provenance only."""
+    """Overrides win; legacy imported options/windows fill only missing catalog fields."""
     if _kind(row) == "embedding":
         ready = auth_mode == "api_key" and api_key_configured and provider_type not in {"anthropic", "chatgpt"}
         gates = {
@@ -621,6 +623,12 @@ def _effective_capabilities(
             }
         }, "registry"
     detected = provider_capabilities(row.model_name, provider_type, api_base)
+    legacy = row.capabilities if row.capability_source in {"models_dev", "models.dev"} and isinstance(row.capabilities, dict) else {}
+    if not detected.get("reasoning_options") and isinstance(legacy.get("reasoning_options"), list):
+        detected["reasoning_options"] = legacy["reasoning_options"]
+    legacy_limit = legacy.get("context_limit")
+    if detected.get("context_limit") is None and type(legacy_limit) is int and legacy_limit > 0:
+        detected["context_limit"] = legacy_limit
     if row.capabilities and row.capability_source == "override":
         effective = normalize_capabilities(row.capabilities, detected)
         return apply_subscription_capability_limits(effective, auth_mode), "override"
@@ -654,6 +662,13 @@ def _model_public(
         or (provider_type == "gemini" and display_name.startswith("gemini/"))
     ):
         display_name = public_model_name
+    resolved_input, resolved_output, resolved_source, _ = _resolved_model_prices(row, provider_type, api_base)
+    if effective_input_price_per_million is None:
+        effective_input_price_per_million = _per_million_price(resolved_input)
+    if effective_output_price_per_million is None:
+        effective_output_price_per_million = _per_million_price(resolved_output)
+    if effective_price_source is None:
+        effective_price_source = resolved_source
     effective_input = (
         effective_input_price_per_million / _TOKENS_PER_MILLION
         if effective_input_price_per_million is not None
@@ -671,11 +686,7 @@ def _model_public(
         output_price=effective_output,
     )
     entry = native_catalog_entry(row.model_name, provider_type, api_base)
-    has_manual = any(getattr(row, field, None) is not None for field in (
-        "input_price", "output_price", "cache_read_price", "cache_write_price", "cache_write_1h_price", "media_pricing",
-    ))
-    catalog_priced = bool(entry.get("token_pricing") or entry.get("media_pricing"))
-    price_origin = "manual" if has_manual else "native_catalog" if catalog_priced else None
+    price_origin = resolved_source if resolved_source in {"manual", "native_catalog"} else None
     # Stored manual cache columns stay nullable; effective rates are projected separately.
     effective_cache, effective_cache_sources = _effective_cache_prices(
         row, _resolved_cache_prices(row, provider_type, api_base), effective_input, effective_price_source or row.price_source
@@ -783,15 +794,14 @@ def _pricing_aware_capabilities(
         # Native providers report their own search work. Price the selected
         # model's text usage, but never fabricate a managed-search component.
         "web_search": (
-            base_priced
-            if search_gate.get("mode") == "native"
-            else _has_component_prices(
+            _has_component_prices(
                 metadata,
                 "web_search_request_per_unit",
                 "web_search_context_low_per_unit",
                 "web_search_context_medium_per_unit",
                 "web_search_context_high_per_unit",
             )
+            if search_gate.get("mode") == "managed" else False
         ),
         "web_fetch": _has_component_prices(metadata, "web_fetch_request_per_unit", "web_fetch_context_per_unit"),
         "image_output": _has_component_prices(metadata, "image_per_unit"),
@@ -803,6 +813,11 @@ def _pricing_aware_capabilities(
     for feature, gate in gates.items():
         if feature in requirements:
             gate["pricing_available"] = requirements[feature]
+    if search_gate.get("mode") == "native":
+        gates["web_search"].update(
+            available=False, mode="none", reason_code="pricing_unavailable", pricing_available=False,
+        )
+        normalized["web_search_required"] = False
     from lumen.services.assets import asset_pipeline_available
 
     for feature in ("image_input", "document_input"):
@@ -841,6 +856,8 @@ def _effective_model_rates(
     )
 
 
+
+
 def _effective_media_pricing(model: LlmModel, provider_type: str | None, api_base: str | None) -> dict | None:
     manual = getattr(model, "media_pricing", None)
     if manual is not None:
@@ -850,10 +867,44 @@ def _effective_media_pricing(model: LlmModel, provider_type: str | None, api_bas
 
 
 def _resolved_context_tiers(model: LlmModel, provider_type: str | None, api_base: str | None) -> dict:
-    token = native_catalog_entry(model.model_name, provider_type, api_base).get("token_pricing") or {}
+    entry = native_catalog_entry(model.model_name, provider_type, api_base)
+    token = entry.get("token_pricing") or {}
     tier = token.get("long_context") or {}
+    catalog_media = getattr(model, "media_pricing", None) is None and entry.get("kind") == _kind(model)
+    follow_text = bool(tier) and catalog_media and bool((entry.get("media_pricing") or {}).get("token_rates"))
+    media = entry.get("media_pricing") if catalog_media else None
+    tier_rates = tier.get("token_rates") or {}
+    input_rate, output_rate = _effective_model_rates(model, provider_type, api_base)
+    cache_read = getattr(model, "cache_read_price", None)
+    if cache_read is None and token.get("cache_read") is not None:
+        cache_read = Decimal(token["cache_read"]) / _TOKENS_PER_MILLION
+    effective_text = {
+        "input_per_million": input_rate * _TOKENS_PER_MILLION if input_rate is not None else None,
+        "output_per_million": output_rate * _TOKENS_PER_MILLION if output_rate is not None else None,
+        "cache_read_per_million": Decimal(cache_read) * _TOKENS_PER_MILLION if cache_read is not None else None,
+    }
+    resolved_modality_tiers = {}
+    for modality, fields in (((media or {}).get("token_rates") or {}) if tier else {}).items():
+        same_base = all(
+            effective_text.get(field) is not None and Decimal(value) == effective_text[field]
+            for field, value in fields.items()
+        )
+        same_tier = all(
+            Decimal(value) == Decimal(tier.get(field.removesuffix("_per_million"), token[field.removesuffix("_per_million")]))
+            for field, value in tier_rates.get(modality, {}).items()
+        ) if same_base else False
+        if same_base and same_tier:
+            continue
+        resolved_modality_tiers[modality] = {
+            field: tier_rates.get(modality, {}).get(
+                field, tier.get(field.removesuffix("_per_million"), token.get(field.removesuffix("_per_million"))),
+            )
+            for field in fields
+        }
     return {
         "long_context_threshold_tokens": tier.get("threshold_tokens", 200_000),
+        "token_rates_above_200k": resolved_modality_tiers,
+        "token_rates_follow_text": follow_text,
         **{
             f"{direction}_price_per_token_above_200k": (
                 Decimal(tier[direction]) / _TOKENS_PER_MILLION
@@ -867,10 +918,16 @@ def _resolved_context_tiers(model: LlmModel, provider_type: str | None, api_base
 def _resolved_base_prices(
     model: LlmModel, provider: LlmProvider,
 ) -> tuple[Decimal | None, Decimal | None, str, str | None]:
-    input_price, output_price = _effective_model_rates(model, provider.provider_type, provider.api_base)
+    return _resolved_model_prices(model, provider.provider_type, provider.api_base)
+
+
+def _resolved_model_prices(
+    model: LlmModel, provider_type: str | None, api_base: str | None,
+) -> tuple[Decimal | None, Decimal | None, str, str | None]:
+    input_price, output_price = _effective_model_rates(model, provider_type, api_base)
     if _kind(model) == "embedding":
         output_price = Decimal(0)
-    media = _effective_media_pricing(model, provider.provider_type, provider.api_base)
+    media = _effective_media_pricing(model, provider_type, api_base)
     priced = input_price is not None and output_price is not None
     if _kind(model) not in {"text", "embedding"}:
         priced = media_pricing_available(

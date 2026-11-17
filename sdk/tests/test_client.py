@@ -26,6 +26,70 @@ def test_client_uses_api_key_and_shared_json_routes():
     client.close()
 
 
+def test_client_native_catalog_preserves_metadata_and_filters_provider():
+    requests: list[httpx.Request] = []
+    payload = {
+        "schema_version": 1,
+        "catalog_version": "2026-11-17",
+        "providers": [
+            {
+                "provider_type": "openai",
+                "display_name": "OpenAI",
+                "pricing_sources": ["https://developers.openai.com/api/docs/pricing"],
+                "models": [
+                    {
+                        "id": "text-embedding-3-small",
+                        "reasoning_options": [],
+                        "embedding": {
+                            "default_dimensions": 1536,
+                            "supports_dimensions": True,
+                            "min_dimensions": 1,
+                            "max_dimensions": 1536,
+                            "allowed_dimensions": None,
+                        },
+                        "token_pricing": {"input": "0.02"},
+                    },
+                ],
+            },
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=payload)
+
+    with Client("https://lumen.example", "sk-afgl-test", transport=httpx.MockTransport(handler)) as client:
+        assert client.admin_native_catalog() == payload
+        assert client.admin_native_catalog(provider_type="openai") == payload
+
+    assert [(request.method, request.url.path, dict(request.url.params)) for request in requests] == [
+        ("GET", "/v1/admin/models/native-catalog", {}),
+        ("GET", "/v1/admin/models/native-catalog", {"provider_type": "openai"}),
+    ]
+    assert all(request.headers["authorization"] == "Bearer sk-afgl-test" for request in requests)
+
+
+def test_async_client_native_catalog_supports_optional_provider_filter():
+    requests: list[httpx.Request] = []
+    payload = {"schema_version": 1, "catalog_version": "2026-11-17", "providers": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=payload)
+
+    async def scenario() -> None:
+        async with AsyncClient("https://lumen.example", "sk-afgl-test", transport=httpx.MockTransport(handler)) as client:
+            assert await client.admin_native_catalog(provider_type=None) == payload
+            assert await client.admin_native_catalog(provider_type="anthropic") == payload
+
+    asyncio.run(scenario())
+    assert [(request.method, request.url.path, dict(request.url.params)) for request in requests] == [
+        ("GET", "/v1/admin/models/native-catalog", {}),
+        ("GET", "/v1/admin/models/native-catalog", {"provider_type": "anthropic"}),
+    ]
+    assert all(request.headers["authorization"] == "Bearer sk-afgl-test" for request in requests)
+
+
 def test_client_fetches_plaintext_memory_document():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/memories/document"

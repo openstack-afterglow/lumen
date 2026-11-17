@@ -145,6 +145,34 @@ class TestSnapshotUsageCost:
         assert credit.worst_case_token_rates(pricing)[:2] == (Decimal("0.000003"), Decimal("0.000004"))
         assert credit.call_credit_bound(pricing, input_tokens=300_000, output_tokens=10) == Decimal("0.90004001")
 
+    def test_reservation_bounds_include_distinct_frozen_modality_tiers(self):
+        pricing = {
+            "input_price_per_token": "0",
+            "output_price_per_token": "0",
+            "token_rates": {"audio": {"input_per_million": "2", "output_per_million": "4"}},
+            "token_rates_above_200k": {"audio": {
+                "input_per_million": "30", "cache_read_per_million": "40", "output_per_million": "60",
+            }},
+            "long_context_threshold_tokens": 272_000,
+            "margin_multiplier": "1",
+            "chat_credit_per_usd": "1",
+        }
+        assert credit.worst_case_token_rates(pricing) == (
+            Decimal("0.000040"), Decimal("0.000060"), Decimal("0.0000000008"),
+        )
+        assert credit.call_credit_bound(pricing, input_tokens=300_000, output_tokens=10) == Decimal("12.00060001")
+
+    @pytest.mark.parametrize("invalid", [[], {"video": {}}, {"audio": {"input_per_million": "NaN"}}])
+    def test_invalid_frozen_modality_tier_fails_below_threshold(self, invalid):
+        with pytest.raises(ValueError, match="token rate"):
+            credit.usage_cost_from_pricing_snapshot(
+                {
+                    "input_price_per_token": "0", "output_price_per_token": "0",
+                    "token_rates_above_200k": invalid, "long_context_threshold_tokens": 272_000,
+                },
+                prompt_tokens=1, completion_tokens=1,
+            )
+
 
 class TestPrecheckFailClosed:
     async def test_raises_when_db_unavailable(self, monkeypatch):

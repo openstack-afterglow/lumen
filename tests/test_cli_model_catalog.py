@@ -292,6 +292,27 @@ class TestCliCatalog:
             assert row["capabilities"]["function_calling"] is False
             assert row["usable"] is True
 
+    @pytest.mark.parametrize("source", [None, "models_dev", "probe", "override"])
+    @pytest.mark.parametrize("flag", ["tool_call", "function_calling"])
+    async def test_only_override_can_disable_catalog_tools(
+        self, client, catalog, api_key_principal, source, flag,
+    ):
+        with catalog.begin() as session:
+            model = session.get(LlmModel, 15)
+            model.model_name = "gpt-4o"
+            model.capabilities = {flag: False}
+            model.capability_source = source
+
+        response = await client.get("/v1/cli/models", headers=_H)
+
+        assert response.status_code == 200
+        row = next(item for item in response.json()["models"] if item["id"] == "lumen/1/15")
+        disabled = source == "override"
+        assert row["usable"] is not disabled
+        assert row["disabled_reason"] == ("tools_disabled" if disabled else None)
+        assert row["protocols"] == ([] if disabled else ["messages", "responses"])
+        assert row["capabilities"]["function_calling"] is not disabled
+
     @pytest.mark.parametrize("change", [
         "disabled-account", "disabled-credential", "account-model", "credential-model",
         "account-capability", "credential-capability", "expired", "cooldown", "reauth",

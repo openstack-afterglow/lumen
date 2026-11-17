@@ -111,10 +111,10 @@ def usage_cost_from_pricing_snapshot(
     ``prompt_tokens`` is total input; the input rate applies to its uncached
     share. A cache category without a frozen rate — including every snapshot
     frozen before cache rates existed — bills 0 and marks the usage partial.
-    Frozen ``token_rates`` bill reported image/audio shares at their own rates
-    and the text rates apply only to the residual. The text input/output keys
-    must be frozen; a ``None`` text rate is allowed only while its residual is
-    zero (media models price only the applicable text directions).
+    Frozen ``token_rates`` bill image/audio shares at their own rates. Catalog
+    buckets marked ``token_rates_follow_text`` retain text's context tier when
+    equivalent; manual rates remain literal. Explicit modality tiers use the
+    same threshold. A ``None`` text rate requires a zero text residual.
 
     ``required_modalities`` describes this actual provider call. An explicit
     empty iterable permits a genuinely text-only segment after media was
@@ -140,6 +140,11 @@ def usage_cost_from_pricing_snapshot(
         max(0, int(completion_tokens)),
     ):
         raise ValueError("usage breakdown totals do not match prompt/completion tokens")
+    base_text_rates = {
+        "input": input_price,
+        "output": output_price,
+        "cache_read": cache_prices["cache_read"][0],
+    }
     if breakdown.input_tokens > threshold:
         if input_tier is not None:
             input_price = input_tier
@@ -152,6 +157,10 @@ def usage_cost_from_pricing_snapshot(
         breakdown,
         pricing_snapshot.get("token_rates"),
         frozen_required if required_modalities is None else required_modalities,
+        base_text_rates=base_text_rates,
+        token_rates_above_200k=pricing_snapshot.get("token_rates_above_200k"),
+        token_rates_follow_text=pricing_snapshot.get("token_rates_follow_text") is True,
+        above_threshold=breakdown.input_tokens > threshold,
     )
     uncached_tokens = text.uncached_input_tokens
     for price, tokens in ((input_price, uncached_tokens), (output_price, text.output_tokens)):
@@ -299,6 +308,7 @@ def worst_case_token_rates(pricing_snapshot: dict) -> tuple[Decimal, Decimal, De
     inputs: list[Decimal] = []
     outputs: list[Decimal] = []
     categories = 5
+    modalities: set[str] = set()
     try:
         for key in ("input_price_per_token", "input_price_per_token_above_200k", *_WORST_CASE_INPUT_KEYS):
             if pricing_snapshot.get(key) is not None:
@@ -306,16 +316,19 @@ def worst_case_token_rates(pricing_snapshot: dict) -> tuple[Decimal, Decimal, De
         for key in ("output_price_per_token", "output_price_per_token_above_200k"):
             if pricing_snapshot.get(key) is not None:
                 outputs.append(Decimal(str(pricing_snapshot[key])))
-        token_rates = pricing_snapshot.get("token_rates") or {}
-        if not isinstance(token_rates, dict):
-            raise ValueError("durable pricing snapshot is invalid")
-        for fields in token_rates.values():
-            if not isinstance(fields, dict):
+        for rates_key in ("token_rates", "token_rates_above_200k"):
+            token_rates = pricing_snapshot.get(rates_key) or {}
+            if not isinstance(token_rates, dict):
                 raise ValueError("durable pricing snapshot is invalid")
-            categories += 3
-            for key, value in fields.items():
-                rate = Decimal(str(value)) / Decimal("1000000")
-                (outputs if key == "output_per_million" else inputs).append(rate)
+            for modality, fields in token_rates.items():
+                if not isinstance(fields, dict):
+                    raise ValueError("durable pricing snapshot is invalid")
+                if modality not in modalities:
+                    modalities.add(modality)
+                    categories += 3
+                for key, value in fields.items():
+                    rate = Decimal(str(value)) / Decimal("1000000")
+                    (outputs if key == "output_per_million" else inputs).append(rate)
     except (InvalidOperation, TypeError) as exc:
         raise ValueError("durable pricing snapshot is invalid") from exc
     if any(not rate.is_finite() or rate < 0 for rate in (*inputs, *outputs)):

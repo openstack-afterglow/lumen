@@ -12,11 +12,13 @@
           "id": "gpt-6-astra",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "GPT-6 Astra",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -51,21 +53,24 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-6-astra.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 922,000."
+          "notes": "Published maximum input tokens: 922,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-6.1-sol",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "GPT-6.1 Sol",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -100,21 +105,24 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-6.1-sol.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 922,000."
+          "notes": "Published maximum input tokens: 922,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-6.1-terra",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh", "max"]}],
           "display_name": "GPT-6.1 Terra",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -149,21 +157,24 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-6.1-terra.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 922,000."
+          "notes": "Published maximum input tokens: 922,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-6-luna",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh", "max"]}],
           "display_name": "GPT-6 Luna",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -198,22 +209,25 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-6-luna.md",
             "https://developers.openai.com/api/docs/guides/decisions"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Decisions endpoint bills no output tokens; Responses/Chat output uses token_pricing.output. Decisions supports only 30m explicit writes. Published maximum input tokens: 922,000."
+          "notes": "Decisions endpoint bills no output tokens; Responses/Chat output uses token_pricing.output. Decisions supports only 30m explicit writes. Published maximum input tokens: 922,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Decisions does not accept files. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-6-sol",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh", "max"]}],
           "display_name": "GPT-6 Sol",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -248,21 +262,24 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-6-sol.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 922,000."
+          "notes": "Published maximum input tokens: 922,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.6-sol",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh", "max"]}],
           "display_name": "GPT-5.6 Sol",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -297,21 +314,24 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.6-sol.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Promotional Standard pricing through November 30, 2026; re-verify before expiry. Published maximum input tokens: 922,000."
+          "notes": "Promotional Standard pricing through November 30, 2026; re-verify before expiry. Published maximum input tokens: 922,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.6-terra",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh", "max"]}],
           "display_name": "GPT-5.6 Terra",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -346,21 +366,24 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.6-terra.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 922,000."
+          "notes": "Published maximum input tokens: 922,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.6-luna",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh", "max"]}],
           "display_name": "GPT-5.6 Luna",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -395,11 +418,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.6-luna.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 922,000."
+          "notes": "Published maximum input tokens: 922,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.5",
@@ -407,11 +431,13 @@
             "gpt-5.5-2026-04-23"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}],
           "display_name": "GPT-5.5",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -440,11 +466,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.5.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.5-pro",
@@ -452,11 +479,13 @@
             "gpt-5.5-pro-2026-04-23"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["medium", "high", "xhigh"]}],
           "display_name": "GPT-5.5 Pro",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -482,11 +511,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.5-pro.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.4",
@@ -494,11 +524,13 @@
             "gpt-5.4-2026-03-05"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}],
           "display_name": "GPT-5.4",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -527,11 +559,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.4.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.4-pro",
@@ -539,11 +572,13 @@
             "gpt-5.4-pro-2026-03-05"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["medium", "high", "xhigh"]}],
           "display_name": "GPT-5.4 Pro",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -568,11 +603,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.4-pro.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.4-mini",
@@ -580,11 +616,13 @@
             "gpt-5.4-mini-2026-03-17"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}],
           "display_name": "GPT-5.4 mini",
           "status": "active",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -607,11 +645,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.4-mini.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 272,000."
+          "notes": "Published maximum input tokens: 272,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.4-nano",
@@ -619,11 +658,13 @@
             "gpt-5.4-nano-2026-03-17"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}],
           "display_name": "GPT-5.4 nano",
           "status": "deprecated",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -646,11 +687,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.4-nano.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 272,000."
+          "notes": "Published maximum input tokens: 272,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.2",
@@ -658,11 +700,13 @@
             "gpt-5.2-2025-12-11"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high", "xhigh"]}],
           "display_name": "GPT-5.2",
           "status": "active",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -685,11 +729,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.2.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.2-pro",
@@ -697,11 +742,13 @@
             "gpt-5.2-pro-2025-12-11"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["medium", "high", "xhigh"]}],
           "display_name": "GPT-5.2 Pro",
           "status": "active",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -721,11 +768,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.2-pro.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5.1",
@@ -733,11 +781,13 @@
             "gpt-5.1-2025-11-13"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["none", "low", "medium", "high"]}],
           "display_name": "GPT-5.1",
           "status": "deprecated",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -760,11 +810,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.1.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5",
@@ -772,11 +823,13 @@
             "gpt-5-2025-08-07"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
           "display_name": "GPT-5",
           "status": "deprecated",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -799,11 +852,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 272,000."
+          "notes": "Published maximum input tokens: 272,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5-mini",
@@ -811,11 +865,13 @@
             "gpt-5-mini-2025-08-07"
           ],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-5 mini",
           "status": "deprecated",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -838,11 +894,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5-mini.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 272,000."
+          "notes": "Published maximum input tokens: 272,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "gpt-5-nano",
@@ -850,11 +907,13 @@
             "gpt-5-nano-2025-08-07"
           ],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-5 nano",
           "status": "deprecated",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -876,11 +935,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5-nano.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 272,000."
+          "notes": "Published maximum input tokens: 272,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "gpt-5-pro",
@@ -888,11 +948,13 @@
             "gpt-5-pro-2025-10-06"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["high"]}],
           "display_name": "GPT-5 pro",
           "status": "deprecated",
           "context_window": 400000,
           "max_output_tokens": 272000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -913,11 +975,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5-pro.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-4.1",
@@ -925,11 +988,13 @@
             "gpt-4.1-2025-04-14"
           ],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-4.1",
           "status": "deprecated",
           "context_window": 1047576,
           "max_output_tokens": 32768,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -951,11 +1016,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-4.1.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "gpt-4.1-mini",
@@ -963,11 +1029,13 @@
             "gpt-4.1-mini-2025-04-14"
           ],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-4.1 mini",
           "status": "deprecated",
           "context_window": 1047576,
           "max_output_tokens": 32768,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -989,11 +1057,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-4.1-mini.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "gpt-4o",
@@ -1001,11 +1070,13 @@
             "gpt-4o-2024-08-06"
           ],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-4o",
           "status": "deprecated",
           "context_window": 128000,
           "max_output_tokens": 16384,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -1027,11 +1098,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-4o.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "gpt-4o-mini",
@@ -1039,11 +1111,13 @@
             "gpt-4o-mini-2024-07-18"
           ],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-4o mini",
           "status": "deprecated",
           "context_window": 128000,
           "max_output_tokens": 16384,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -1065,11 +1139,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-4o-mini.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "o3-pro",
@@ -1077,11 +1152,13 @@
             "o3-pro-2025-06-10"
           ],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "o3-pro",
           "status": "deprecated",
           "context_window": 200000,
           "max_output_tokens": 100000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -1101,11 +1178,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/o3-pro.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "o3",
@@ -1113,11 +1191,13 @@
             "o3-2025-04-16"
           ],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "o3",
           "status": "deprecated",
           "context_window": 200000,
           "max_output_tokens": 100000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -1139,21 +1219,24 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/o3.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "gpt-6-cyber",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-6 Cyber",
           "status": "active",
           "context_window": 1050000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -1186,21 +1269,24 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-6-cyber.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Restricted-access model; published rate does not imply account entitlement. Restricted-access model; published rate does not imply account entitlement. Published maximum input tokens: 922,000."
+          "notes": "Restricted-access model; published rate does not imply account entitlement. Restricted-access model; published rate does not imply account entitlement. Published maximum input tokens: 922,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "gpt-5.6-cyber",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-5.6 Cyber",
           "status": "active",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -1227,16 +1313,18 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.6-cyber.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Restricted-access model; published rate does not imply account entitlement. Restricted-access model; published rate does not imply account entitlement. Published maximum input tokens: 272,000."
+          "notes": "Restricted-access model; published rate does not imply account entitlement. Restricted-access model; published rate does not imply account entitlement. Published maximum input tokens: 272,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "gpt-5.5-cyber-preview",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "gpt-5.5-cyber-preview",
           "status": "preview",
           "context_window": null,
@@ -1262,6 +1350,7 @@
           "id": "gpt-6-rosalind",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "gpt-6-rosalind",
           "status": "active",
           "context_window": null,
@@ -1299,6 +1388,7 @@
           "id": "gpt-rosalind-research",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "gpt-rosalind-research",
           "status": "active",
           "context_window": null,
@@ -1324,6 +1414,7 @@
           "id": "gpt-rosalind-discovery",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "gpt-rosalind-discovery",
           "status": "active",
           "context_window": null,
@@ -1349,6 +1440,7 @@
           "id": "gpt-6-astra-law",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "gpt-6-astra-law",
           "status": "active",
           "context_window": null,
@@ -1374,11 +1466,13 @@
           "id": "chat-latest",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "Chat Latest",
           "status": "active",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -1399,21 +1493,24 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/chat-latest.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 272,000."
+          "notes": "Published maximum input tokens: 272,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
         },
         {
           "id": "gpt-5.3-codex",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh"]}],
           "display_name": "GPT-5.3-Codex",
           "status": "deprecated",
           "context_window": 400000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -1436,16 +1533,18 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/file-inputs.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-5.3-codex.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Published maximum input tokens: 272,000."
+          "notes": "Published maximum input tokens: 272,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply. Reasoning options API parameter: reasoning.effort (Responses) / reasoning_effort (Chat Completions where that endpoint is supported)."
         },
         {
           "id": "gpt-5-search-api",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "gpt-5-search-api",
           "status": "active",
           "context_window": null,
@@ -2074,6 +2173,7 @@
           "id": "gpt-audio-1.5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-Audio-1.5",
           "status": "active",
           "context_window": 128000,
@@ -2116,6 +2216,7 @@
             "gpt-audio-mini-2025-12-15"
           ],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-Audio mini",
           "status": "deprecated",
           "context_window": 128000,
@@ -2159,6 +2260,7 @@
             "gpt-audio-2025-08-28"
           ],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "GPT-Audio",
           "status": "deprecated",
           "context_window": 128000,
@@ -2577,11 +2679,13 @@
           "id": "claude-fable-5-2",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "Claude Fable 5.2",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -2607,6 +2711,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -2615,17 +2721,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-mythos-5-2",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "Claude Mythos 5.2",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -2651,6 +2759,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -2659,17 +2769,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Limited availability requires organization verification; published prices do not imply account entitlement."
+          "notes": "Limited availability requires organization verification; published prices do not imply account entitlement. Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-fable-5-1",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "Claude Fable 5.1",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -2695,6 +2807,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -2703,17 +2817,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-mythos-5-1",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "Claude Mythos 5.1",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -2739,6 +2855,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -2747,17 +2865,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Limited availability requires organization verification; published prices do not imply account entitlement."
+          "notes": "Limited availability requires organization verification; published prices do not imply account entitlement. Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-fable-5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "Claude Fable 5",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -2783,6 +2903,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -2791,17 +2913,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-mythos-5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "Claude Mythos 5",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -2827,6 +2951,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -2835,17 +2961,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Limited availability requires organization verification; published prices do not imply account entitlement."
+          "notes": "Limited availability requires organization verification; published prices do not imply account entitlement. Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-opus-5-5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "Claude Opus 5.5",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -2871,6 +2999,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -2879,17 +3009,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-opus-5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "Claude Opus 5",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -2915,6 +3047,9 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -2923,17 +3058,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "thinking.type=\"disabled\" is accepted only at effort low/medium/high; xhigh/max require adaptive thinking. Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-opus-4-8",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}, {"type": "toggle"}],
           "display_name": "Claude Opus 4.8",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -2959,6 +3096,9 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -2967,17 +3107,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Reasoning options API parameter: output_config.effort. The independent thinking toggle maps on to thinking.type=\"adaptive\" and off to thinking.type=\"disabled\"; both are accepted at every supported effort level. thinking.type=\"enabled\" is rejected; use adaptive rather than manual extended thinking."
         },
         {
           "id": "claude-opus-4-7",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}, {"type": "toggle"}],
           "display_name": "Claude Opus 4.7",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -3003,6 +3145,9 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -3011,17 +3156,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Reasoning options API parameter: output_config.effort. The independent thinking toggle maps on to thinking.type=\"adaptive\" and off to thinking.type=\"disabled\"; both are accepted at every supported effort level. thinking.type=\"enabled\" is rejected; use adaptive rather than manual extended thinking."
         },
         {
           "id": "claude-opus-4-6",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "max"]}, {"type": "toggle"}, {"type": "budget_tokens", "min": 1024}],
           "display_name": "Claude Opus 4.6",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -3047,6 +3194,10 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
+            "https://platform.claude.com/docs/en/build-with-claude/extended-thinking.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -3055,7 +3206,7 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Adaptive thinking is supported; legacy thinking.type=\"enabled\" with budget_tokens >=1024 is still accepted but deprecated. effort xhigh is not published for this model; do not borrow it from later versions. Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-opus-4-5-20251101",
@@ -3063,11 +3214,13 @@
             "claude-opus-4-5"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}, {"type": "toggle"}, {"type": "budget_tokens", "min": 1024}],
           "display_name": "Claude Opus 4.5",
           "status": "active",
           "context_window": 200000,
           "max_output_tokens": 64000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -3093,6 +3246,10 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
+            "https://platform.claude.com/docs/en/build-with-claude/extended-thinking.md",
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -3101,17 +3258,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Extended thinking is enabled with thinking.type=\"enabled\" and thinking.budget_tokens >=1024, normally <max_tokens; disabling uses thinking.type=\"disabled\". No fixed budget maximum independent of max_tokens is published. Adaptive thinking is rejected for this 4.5 model. Reasoning options API parameter: output_config.effort; thinking.type (enabled / disabled) and thinking.budget_tokens."
         },
         {
           "id": "claude-sonnet-5-5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "Claude Sonnet 5.5",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -3137,6 +3296,9 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -3145,17 +3307,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "thinking.type=\"between_tools\" is accepted only at effort low/medium/high; \"disabled\" and \"enabled\" are rejected, and xhigh/max require adaptive thinking. Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-sonnet-5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}, {"type": "toggle"}],
           "display_name": "Claude Sonnet 5",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -3181,6 +3345,9 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -3189,17 +3356,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Reasoning options API parameter: output_config.effort. The independent thinking toggle maps on to thinking.type=\"adaptive\" and off to thinking.type=\"disabled\"; both are accepted at every supported effort level. thinking.type=\"enabled\" is rejected; use adaptive rather than manual extended thinking."
         },
         {
           "id": "claude-sonnet-4-6",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "max"]}, {"type": "toggle"}, {"type": "budget_tokens", "min": 1024}],
           "display_name": "Claude Sonnet 4.6",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -3225,6 +3394,10 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
+            "https://platform.claude.com/docs/en/build-with-claude/extended-thinking.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -3233,7 +3406,7 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Adaptive thinking is supported; legacy thinking.type=\"enabled\" with budget_tokens >=1024 is still accepted but deprecated. effort xhigh is not published for this model; do not borrow it from later versions. Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-sonnet-4-5-20250929",
@@ -3241,11 +3414,13 @@
             "claude-sonnet-4-5"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "toggle"}, {"type": "budget_tokens", "min": 1024}],
           "display_name": "Claude Sonnet 4.5",
           "status": "deprecated",
           "context_window": 200000,
           "max_output_tokens": 64000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -3271,6 +3446,9 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/extended-thinking.md",
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -3279,17 +3457,19 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "First-party retirement November 30, 2026."
+          "notes": "First-party retirement November 30, 2026. Extended thinking is enabled with thinking.type=\"enabled\" and thinking.budget_tokens >=1024, normally <max_tokens; disabling uses thinking.type=\"disabled\". No fixed budget maximum independent of max_tokens is published. Adaptive thinking is rejected for this 4.5 model. Reasoning options API parameter: thinking.type (enabled / disabled) and thinking.budget_tokens."
         },
         {
           "id": "claude-haiku-5-5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh", "max"]}],
           "display_name": "Claude Haiku 5.5",
           "status": "active",
           "context_window": 1000000,
           "max_output_tokens": 128000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -3323,6 +3503,9 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/effort.md",
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -3331,7 +3514,7 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "thinking.type=\"disabled\" is accepted only at effort low/medium/high; xhigh/max require adaptive thinking. Reasoning options API parameter: output_config.effort."
         },
         {
           "id": "claude-haiku-4-5-20251001",
@@ -3339,11 +3522,13 @@
             "claude-haiku-4-5"
           ],
           "kind": "text",
+          "reasoning_options": [{"type": "toggle"}, {"type": "budget_tokens", "min": 1024}],
           "display_name": "Claude Haiku 4.5",
           "status": "active",
           "context_window": 200000,
           "max_output_tokens": 64000,
           "input_modalities": [
+            "pdf",
             "text",
             "image"
           ],
@@ -3369,6 +3554,9 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support.md",
+            "https://platform.claude.com/docs/en/build-with-claude/extended-thinking.md",
+            "https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting.md",
             "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
             "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
@@ -3377,7 +3565,7 @@
             "https://platform.claude.com/docs/en/about-claude/model-deprecations.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": null
+          "notes": "Extended thinking is enabled with thinking.type=\"enabled\" and thinking.budget_tokens >=1024, normally <max_tokens; disabling uses thinking.type=\"disabled\". No fixed budget maximum independent of max_tokens is published. Adaptive thinking is rejected for this 4.5 model. Reasoning options API parameter: thinking.type (enabled / disabled) and thinking.budget_tokens."
         }
       ]
     },
@@ -3391,6 +3579,7 @@
           "id": "gemini-4-carbon",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}],
           "display_name": "Gemini 4 Carbon",
           "status": "active",
           "context_window": 1048576,
@@ -3427,16 +3616,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-4-carbon"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Unified 1,048,576-token context; max_output_tokens is default synchronous 65,536. Long decode supports up to 1,048,576 output tokens within the same unified context. Implicit caching only. Introductory prices through November 30, 2026; December 1 rates: input $4.00, output $20.00, cache read $0.20 per 1M tokens. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Unified 1,048,576-token context; max_output_tokens is default synchronous 65,536. Long decode supports up to 1,048,576 output tokens within the same unified context. Implicit caching only. Introductory prices through November 30, 2026; December 1 rates: input $4.00, output $20.00, cache read $0.20 per 1M tokens. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-4-argon",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}],
           "display_name": "Gemini 4 Argon",
           "status": "active",
           "context_window": 1048576,
@@ -3473,16 +3665,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-4-argon"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Unified 1,048,576-token context; max_output_tokens is default synchronous 65,536. Long decode supports up to 1,048,576 output tokens within the same unified context. Implicit caching only. Introductory prices through November 30, 2026; December 1 rates: input $4.00, output $20.00, cache read $0.20 per 1M tokens. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Unified 1,048,576-token context; max_output_tokens is default synchronous 65,536. Long decode supports up to 1,048,576 output tokens within the same unified context. Implicit caching only. Introductory prices through November 30, 2026; December 1 rates: input $4.00, output $20.00, cache read $0.20 per 1M tokens. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-4-hydrogen",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh"]}],
           "display_name": "Gemini 4 Hydrogen",
           "status": "active",
           "context_window": 1048576,
@@ -3519,16 +3714,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-4-hydrogen"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Unified 1,048,576-token context; max_output_tokens is default synchronous 65,536. Long decode supports up to 1,048,576 output tokens within the same unified context. Implicit caching only. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Unified 1,048,576-token context; max_output_tokens is default synchronous 65,536. Long decode supports up to 1,048,576 output tokens within the same unified context. Implicit caching only. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-3.8-flash",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}],
           "display_name": "Gemini 3.8 Flash",
           "status": "active",
           "context_window": 1048576,
@@ -3565,16 +3763,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-3.8-flash"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Introductory prices through December 31, 2026; January 1, 2027 rates: input $1.50, output $7.50, cache read $0.15 per 1M tokens. Cache storage $0.50/1M tokens/hour through December 31; $1.00 thereafter, not expressible in media_pricing. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Introductory prices through December 31, 2026; January 1, 2027 rates: input $1.50, output $7.50, cache read $0.15 per 1M tokens. Cache storage $0.50/1M tokens/hour through December 31; $1.00 thereafter, not expressible in media_pricing. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-3.6-flash",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
           "display_name": "Gemini 3.6 Flash",
           "status": "active",
           "context_window": 1048576,
@@ -3611,16 +3812,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-3.6-flash"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Introductory prices through December 31, 2026; January 1, 2027 rates: input $1.50, output $7.50, cache read $0.15 per 1M tokens. Cache storage $0.50/1M tokens/hour through December 31; $1.00 thereafter, not expressible in media_pricing. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Introductory prices through December 31, 2026; January 1, 2027 rates: input $1.50, output $7.50, cache read $0.15 per 1M tokens. Cache storage $0.50/1M tokens/hour through December 31; $1.00 thereafter, not expressible in media_pricing. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-3.5-flash-lite",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
           "display_name": "Gemini 3.5 Flash-Lite",
           "status": "active",
           "context_window": 1048576,
@@ -3657,16 +3861,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-3.5-flash-lite"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Explicit cache storage $1.00/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Explicit cache storage $1.00/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-3.1-flash-lite",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
           "display_name": "Gemini 3.1 Flash-Lite",
           "status": "active",
           "context_window": 1048576,
@@ -3703,16 +3910,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-3.1-flash-lite"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Explicit cache storage $1.00/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Explicit cache storage $1.00/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-3.1-pro-preview",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}],
           "display_name": "Gemini 3.1 Pro preview",
           "status": "preview",
           "context_window": 1048576,
@@ -3755,16 +3965,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-3.1-pro-preview"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Explicit cache storage $4.50/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Explicit cache storage $4.50/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-3.1-pro-preview-customtools",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "Gemini 3.1 Pro preview",
           "status": "preview",
           "context_window": 1048576,
@@ -3807,6 +4020,7 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-3.1-pro-preview"
           ],
@@ -3817,6 +4031,7 @@
           "id": "gemini-3-flash-preview",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
           "display_name": "Gemini 3 Flash preview",
           "status": "preview",
           "context_window": 1048576,
@@ -3853,16 +4068,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-3-flash-preview"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Explicit cache storage $1.00/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Explicit cache storage $1.00/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-2.5-pro",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "budget_tokens", "min": 128, "max": 32768}],
           "display_name": "Gemini 2.5 Pro",
           "status": "deprecated",
           "context_window": 1048576,
@@ -3905,16 +4123,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-2.5-pro"
           ],
           "verified_at": "2026-11-17",
-          "notes": "December 1, 2026 requests automatically route to the officially documented replacement and its rates; re-verify before that date. Explicit cache storage $4.50/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "December 1, 2026 requests automatically route to the officially documented replacement and its rates; re-verify before that date. Explicit cache storage $4.50/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. generateContent does not support thinkingLevel for Gemini 2.5. Published thinkingBudget interval 128–32768; -1 selects dynamic thinking. Thinking cannot be disabled. Interactions has separate thinking_level mappings; they are not advertised as generateContent enum support. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingBudget (generateContent; SDK thinking_config.thinking_budget)."
         },
         {
           "id": "gemini-2.5-flash",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "budget_tokens", "min": 0, "max": 24576}],
           "display_name": "Gemini 2.5 Flash",
           "status": "deprecated",
           "context_window": 1048576,
@@ -3950,16 +4171,18 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-2.5-flash"
           ],
           "verified_at": "2026-11-17",
-          "notes": "December 1, 2026 requests automatically route to the officially documented replacement and its rates; re-verify before that date. Explicit cache storage $1.00/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "December 1, 2026 requests automatically route to the officially documented replacement and its rates; re-verify before that date. Explicit cache storage $1.00/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. generateContent does not support thinkingLevel for Gemini 2.5. Published thinkingBudget interval 0–24576; -1 selects dynamic thinking. 0 disables thinking. Interactions has separate thinking_level mappings; they are not advertised as generateContent enum support. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingBudget (generateContent; SDK thinking_config.thinking_budget)."
         },
         {
           "id": "gemini-2.5-flash-lite",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "budget_tokens", "min": 512, "max": 24576}, {"type": "toggle"}],
           "display_name": "Gemini 2.5 Flash-Lite",
           "status": "active",
           "context_window": 1048576,
@@ -3996,16 +4219,19 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/document-processing",
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-2.5-flash-lite"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Explicit cache storage $1.00/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Explicit cache storage $1.00/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. generateContent does not support thinkingLevel for Gemini 2.5. Published thinkingBudget interval 512–24576; -1 selects dynamic thinking. 0 disables thinking as a separate sentinel below the positive interval; budgets 1–511 are not asserted valid. Interactions has separate thinking_level mappings; they are not advertised as generateContent enum support. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingBudget (generateContent; SDK thinking_config.thinking_budget)."
         },
         {
           "id": "gemini-robotics-er-2-preview",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
           "display_name": "Gemini Robotics ER 2",
           "status": "preview",
           "context_window": 131072,
@@ -4041,11 +4267,12 @@
             }
           },
           "source_urls": [
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-robotics-er-2-preview"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Explicit cache storage $0.50/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Introductory prices through December 31, 2026; January 1, 2027 token rates double. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Explicit cache storage $0.50/1M tokens/hour is not expressible in media_pricing and is not a cache-write token rate. Introductory prices through December 31, 2026; January 1, 2027 token rates double. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-robotics-er-2-streaming-preview",
@@ -4088,6 +4315,7 @@
           "id": "gemini-nano-banana-2.1",
           "aliases": [],
           "kind": "image",
+          "reasoning_options": [{"type": "effort", "values": ["minimal", "medium", "high"]}],
           "display_name": "Gemini Nano Banana 2.1",
           "status": "active",
           "context_window": 131072,
@@ -4116,11 +4344,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-nano-banana-2.1"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Image output $30.00/1M tokens; image input uses published input token rate. No published reservation_usd; media_pricing remains null. Published image equivalents are resolution-dependent, not a universal per-image tariff. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Image output $30.00/1M tokens; image input uses published input token rate. No published reservation_usd; media_pricing remains null. Published image equivalents are resolution-dependent, not a universal per-image tariff. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level). Exact accepted levels are published on this model page."
         },
         {
           "id": "gemini-3.1-flash-image",
@@ -4164,6 +4393,7 @@
           "id": "gemini-3.1-flash-lite-image",
           "aliases": [],
           "kind": "image",
+          "reasoning_options": [{"type": "effort", "values": ["minimal", "high"]}],
           "display_name": "Gemini 3.1 Flash Lite image",
           "status": "active",
           "context_window": 65536,
@@ -4192,11 +4422,12 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://aistudio.google.com/docs/thinking?generate-content=true",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-3.1-flash-lite-image"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Image output $30.00/1M tokens; image input uses published input token rate. No published reservation_usd; media_pricing remains null. Published image equivalents are resolution-dependent, not a universal per-image tariff."
+          "notes": "Image output $30.00/1M tokens; image input uses published input token rate. No published reservation_usd; media_pricing remains null. Published image equivalents are resolution-dependent, not a universal per-image tariff. Reasoning options API parameter: generationConfig.thinkingConfig.thinkingLevel (generateContent; SDK thinking_config.thinking_level)."
         },
         {
           "id": "gemini-3-pro-image",
@@ -4479,6 +4710,7 @@
           "id": "gemini-3.8-live-extended-thinking",
           "aliases": [],
           "kind": "realtime",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}],
           "display_name": "Gemini 3.8 Live Extended Thinking",
           "status": "active",
           "context_window": 131072,
@@ -4510,12 +4742,13 @@
             "https://aistudio.google.com/docs/models/gemini-3.8-live-extended-thinking"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Audio input $3.00, audio output $12.00, image/video input $1.00 per 1M tokens. Text rates are token_pricing. Duration equivalents do not replace token billing; no published reservation_usd, media_pricing remains null. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Audio input $3.00, audio output $12.00, image/video input $1.00 per 1M tokens. Text rates are token_pricing. Duration equivalents do not replace token billing; no published reservation_usd, media_pricing remains null. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: thinking_config.thinking_level in Live API session setup."
         },
         {
           "id": "gemini-3.1-flash-live-preview",
           "aliases": [],
           "kind": "realtime",
+          "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high"]}],
           "display_name": "Gemini 3.1 Flash live preview",
           "status": "preview",
           "context_window": 131072,
@@ -4547,7 +4780,7 @@
             "https://aistudio.google.com/docs/models/gemini-3.1-flash-live-preview"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Audio input $3.00, audio output $12.00, image/video input $1.00 per 1M tokens. Text rates are token_pricing. Duration equivalents do not replace token billing; no published reservation_usd, media_pricing remains null. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+          "notes": "Audio input $3.00, audio output $12.00, image/video input $1.00 per 1M tokens. Text rates are token_pricing. Duration equivalents do not replace token billing; no published reservation_usd, media_pricing remains null. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees. Reasoning options API parameter: thinkingConfig.thinkingLevel in Live API session setup."
         },
         {
           "id": "gemini-2.5-flash-native-audio-preview-12-2025",
@@ -4768,6 +5001,7 @@
           "id": "anthropic/claude-fable-5-2",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "anthropic/claude-fable-5-2",
           "status": "active",
           "context_window": null,
@@ -4792,6 +5026,7 @@
           "id": "anthropic/claude-opus-5-5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "anthropic/claude-opus-5-5",
           "status": "active",
           "context_window": null,
@@ -4816,6 +5051,7 @@
           "id": "anthropic/claude-sonnet-5-5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "anthropic/claude-sonnet-5-5",
           "status": "active",
           "context_window": null,
@@ -4843,6 +5079,7 @@
           "id": "anthropic/claude-haiku-5-5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "anthropic/claude-haiku-5-5",
           "status": "active",
           "context_window": null,
@@ -4873,6 +5110,7 @@
           "id": "openai/gpt-6.1-sol",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "openai/gpt-6.1-sol",
           "status": "active",
           "context_window": null,
@@ -4903,6 +5141,7 @@
           "id": "openai/gpt-6-astra",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "openai/gpt-6-astra",
           "status": "active",
           "context_window": null,
@@ -4933,6 +5172,7 @@
           "id": "openai/gpt-6-sol",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "openai/gpt-6-sol",
           "status": "active",
           "context_window": null,
@@ -4963,6 +5203,7 @@
           "id": "openai/gpt-6-luna",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "openai/gpt-6-luna",
           "status": "active",
           "context_window": null,
@@ -4993,6 +5234,7 @@
           "id": "openai/gpt-5.6-sol",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "openai/gpt-5.6-sol",
           "status": "active",
           "context_window": null,
@@ -5028,6 +5270,7 @@
           "id": "openai/gpt-5.6-terra",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "openai/gpt-5.6-terra",
           "status": "active",
           "context_window": null,
@@ -5058,6 +5301,7 @@
           "id": "openai/gpt-5.6-luna",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "openai/gpt-5.6-luna",
           "status": "active",
           "context_window": null,
@@ -5088,6 +5332,7 @@
           "id": "openai/gpt-5.5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "openai/gpt-5.5",
           "status": "active",
           "context_window": null,
@@ -5118,6 +5363,7 @@
           "id": "google/gemini-4-argon",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "google/gemini-4-argon",
           "status": "active",
           "context_window": null,
@@ -5142,6 +5388,7 @@
           "id": "google/gemini-4-carbon",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "google/gemini-4-carbon",
           "status": "active",
           "context_window": null,
@@ -5166,6 +5413,7 @@
           "id": "google/gemini-4-hydrogen",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "google/gemini-4-hydrogen",
           "status": "active",
           "context_window": null,
@@ -5190,6 +5438,7 @@
           "id": "xai/grok-4.7",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "xai/grok-4.7",
           "status": "active",
           "context_window": null,
@@ -5220,6 +5469,7 @@
           "id": "xai/grok-4.6",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "xai/grok-4.6",
           "status": "active",
           "context_window": null,
@@ -5250,6 +5500,7 @@
           "id": "xai/grok-4.5",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "xai/grok-4.5",
           "status": "active",
           "context_window": null,
@@ -5280,6 +5531,7 @@
           "id": "perplexity/glm-5.3",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "perplexity/glm-5.3",
           "status": "active",
           "context_window": null,
@@ -5306,6 +5558,7 @@
           "id": "perplexity/glm-5.3-flash",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "perplexity/glm-5.3-flash",
           "status": "active",
           "context_window": null,
@@ -5332,6 +5585,7 @@
           "id": "perplexity/deepseek-v4-pro-0813",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "perplexity/deepseek-v4-pro-0813",
           "status": "active",
           "context_window": null,
@@ -5356,6 +5610,7 @@
           "id": "perplexity/kimi-k3",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["minimal", "low", "medium", "high", "xhigh", "max"]}],
           "display_name": "perplexity/kimi-k3",
           "status": "active",
           "context_window": null,
@@ -5376,12 +5631,13 @@
             "https://docs.perplexity.ai/docs/getting-started/pricing.md"
           ],
           "verified_at": "2026-11-17",
-          "notes": "Agent API model. Rates are Perplexity-published, not direct-provider tariff inference. Tool fees are separate and not expressible in media_pricing: web_search $0.0025/call (fast $0.001), image_search $0.0025/success, fetch_url $0.0005/call, people_search/finance_search $0.005/call, sandbox $0.03/session plus $0.0025/SDK search query."
+          "notes": "Agent API model. Rates are Perplexity-published, not direct-provider tariff inference. Tool fees are separate and not expressible in media_pricing: web_search $0.0025/call (fast $0.001), image_search $0.0025/success, fetch_url $0.0005/call, people_search/finance_search $0.005/call, sandbox $0.03/session plus $0.0025/SDK search query. Reasoning options API parameter: reasoning.effort."
         },
         {
           "id": "perplexity/nemotron-3.5-super-120b-a12b",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "perplexity/nemotron-3.5-super-120b-a12b",
           "status": "active",
           "context_window": 1048576,
@@ -5413,6 +5669,7 @@
           "id": "perplexity/sonar",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "perplexity/sonar",
           "status": "active",
           "context_window": null,
@@ -5563,6 +5820,7 @@
           "id": "sonar",
           "aliases": [],
           "kind": "text",
+          "reasoning_options": null,
           "display_name": "sonar",
           "status": "deprecated",
           "context_window": null,

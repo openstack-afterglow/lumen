@@ -240,8 +240,10 @@ def test_native_search_override_wins_catalog_false_or_unknown(catalog, published
     effective, source = _effective_capabilities(row, "openai")
     assert source == "override"
     assert effective["web_search"] is True
-    assert effective["feature_gates"]["web_search"]["available"] is True
-    assert effective["feature_gates"]["web_search"]["mode"] == "native"
+    assert effective["feature_gates"]["web_search"]["available"] is False
+    assert effective["feature_gates"]["web_search"]["mode"] == "none"
+    assert effective["feature_gates"]["web_search"]["pricing_available"] is False
+    assert effective["feature_gates"]["web_search"]["reason_code"] == "pricing_unavailable"
 
 
 def test_subscription_still_disables_explicit_native_search(catalog):
@@ -306,3 +308,151 @@ def test_decisions_override_cannot_enable_non_openai_transport(provider_type):
     assert effective["decisions_transport_supported"] is False
     assert effective["decisions"] is False
     assert effective["feature_gates"]["decisions"]["available"] is False
+
+
+@pytest.mark.parametrize("limit", [None, 0, -1, True, "4096"])
+def test_unknown_output_limit_is_not_emitted(catalog, limit):
+    catalog["providers"]["openai"]["models"][0]["max_output_tokens"] = limit
+    caps = provider_capabilities("opaque", "openai")
+    assert "max_output_tokens" not in caps
+    assert "max_output_tokens" not in normalize_capabilities({"max_output_tokens": None}, caps)
+
+
+def test_positive_output_limit_survives_null_override(catalog):
+    caps = provider_capabilities("opaque", "openai")
+    assert caps["max_output_tokens"] == 1000
+    assert normalize_capabilities({"max_output_tokens": None}, caps)["max_output_tokens"] == 1000
+
+
+def test_pdf_unknown_is_not_provider_denial(catalog):
+    assert metadata.catalog_model_metadata("opaque", "openai")["supports_pdf_input"] is None
+    caps = provider_capabilities("opaque", "openai")
+    assert caps["capability_observations"]["supports_pdf_input"] is None
+    assert caps["feature_gates"]["document_input"]["reason_code"] == "metadata_unknown"
+    catalog["providers"]["openai"]["models"][0]["input_modalities"].append("pdf")
+    caps = provider_capabilities("opaque", "openai")
+    assert caps["feature_gates"]["document_input"]["available"] is True
+
+
+def test_reasoning_catalog_override_and_imported_fallback_precedence(catalog):
+    from lumen.services.chat_admission import _validated_reasoning_effort
+
+    entry = catalog["providers"]["openai"]["models"][0]
+    entry["capabilities"]["reasoning"] = True
+    entry["context_window"] = None
+    entry["reasoning_options"] = None
+    row = model()
+    row.capability_source = "models_dev"
+    row.capabilities = {
+        "reasoning_options": [{"type": "effort", "values": ["high"]}],
+        "context_limit": 88000, "tool_call": False,
+    }
+    caps, _ = _effective_capabilities(row, "openai")
+    assert caps["context_limit"] == 88000
+    assert caps["reasoning_options"] == row.capabilities["reasoning_options"]
+    assert caps["tool_call"] is True
+    assert _validated_reasoning_effort("high", {"capabilities": caps}) == "high"
+    entry["reasoning_options"] = [{"type": "effort", "values": ["low"]}]
+    entry["context_window"] = 400000
+    caps, _ = _effective_capabilities(row, "openai")
+    assert caps["reasoning_options"] == entry["reasoning_options"]
+    assert caps["context_limit"] == 400000
+    row.capability_source = "override"
+    caps, _ = _effective_capabilities(row, "openai")
+    assert caps["reasoning_options"] == row.capabilities["reasoning_options"]
+    assert caps["context_limit"] == 88000
+
+
+@pytest.mark.parametrize("options", [
+    "high", [{"type": "effort", "values": []}], [{"type": "effort", "values": ["high", "high"]}],
+    [{"type": "budget_tokens", "min": True}], [{"type": "budget_tokens", "min": -1}],
+    [{"type": "budget_tokens", "min": 8, "max": 2}], [{"type": "toggle", "enabled": True}],
+    [{"type": "effort", "values": ["high"]}, {"type": "effort", "values": ["low"]}],
+])
+def test_reasoning_options_schema_rejects_invalid_shape(options):
+    value = fixture_catalog()
+    value["providers"]["openai"]["models"][0]["reasoning_options"] = options
+    with pytest.raises(ValueError):
+        validate_catalog(value)
+
+
+def test_distinct_modality_rate_requires_explicit_complete_tier(catalog):
+    entry = catalog["providers"]["openai"]["models"][0]
+    entry["media_pricing"] = {"token_rates": {"audio": {
+        "input_per_million": "9", "cache_read_per_million": "0.1",
+    }}}
+    with pytest.raises(ValueError, match="distinct tiered modality"):
+        validate_catalog(catalog)
+    entry["token_pricing"]["long_context"]["token_rates"] = {"audio": {"input_per_million": "12"}}
+    validate_catalog(catalog)
+    tiers = _resolved_context_tiers(model(), "openai", None)
+    assert tiers["token_rates_above_200k"] == {"audio": {
+        "input_per_million": "12", "cache_read_per_million": "0.2",
+    }}
+    assert tiers["token_rates_follow_text"] is True
+    entry["token_pricing"]["long_context"]["token_rates"]["audio"]["output_per_million"] = "9"
+    with pytest.raises(ValueError, match="corresponding base rate"):
+        validate_catalog(catalog)
+
+
+@pytest.mark.parametrize("manual", [
+    {"cache_read_price": Decimal(0)}, {"input_price": Decimal(0)}, {},
+])
+def test_public_price_origin_matches_resolved_base_prices(catalog, manual):
+    from lumen.models.chat_db import LlmModel
+    from lumen.services.providers.pricing import _model_public
+
+    row = LlmModel(id=1, provider_id=1, model_name="opaque", model_kind="text", **manual)
+    provider = SimpleNamespace(provider_type="openai", api_base=None)
+    source = _resolved_base_prices(row, provider)[2]
+    public = _model_public(row, provider_type="openai", api_provider="openai")
+    assert public["price_origin"] == source
+    assert public["effective_price_source"] == source
+
+
+@pytest.mark.parametrize("provider,model_name", [
+    ("anthropic", "claude-fable-5"), ("anthropic", "claude-sonnet-5"),
+    ("openai", "gpt-4o"), ("openai", "gpt-4o-mini"), ("openai", "gpt-5.3-codex"),
+    ("openai", "gpt-5.5"), ("openai", "gpt-5.6-luna"), ("openai", "gpt-5.6-sol"),
+    ("openai", "gpt-5.6-terra"),
+])
+def test_official_pdf_support_is_preserved_by_real_catalog(provider, model_name):
+    caps = provider_capabilities(model_name, provider)
+    assert caps["capability_observations"]["supports_pdf_input"] is True
+    assert caps["feature_gates"]["document_input"]["available"] is True
+
+
+@pytest.mark.parametrize("provider,model_name", [
+    ("anthropic", "claude-fable-5"), ("anthropic", "claude-fable-5-1"),
+    ("openai", "gpt-5.3-codex"), ("openai", "gpt-5.5"), ("openai", "gpt-5.6-luna"),
+    ("openai", "gpt-5.6-sol"), ("openai", "gpt-5.6-terra"), ("openai", "gpt-6-astra"),
+    ("openai", "gpt-6-luna"), ("openai", "gpt-6-sol"),
+])
+def test_official_reasoning_effort_survives_imported_capability_rows(provider, model_name):
+    from lumen.services.chat_admission import _validated_reasoning_effort
+
+    row = model()
+    row.model_name = model_name
+    row.capability_source = "models_dev"
+    row.capabilities = {
+        "reasoning": True, "reasoning_options": [{"type": "effort", "values": ["high"]}],
+        "context_limit": 64000,
+    }
+    caps, _ = _effective_capabilities(row, provider)
+    assert _validated_reasoning_effort("high", {"capabilities": caps}) == "high"
+    assert caps["reasoning_options"] == metadata.catalog_model_metadata(model_name, provider)["reasoning_options"]
+
+
+def test_subscription_catalog_mapping_is_discovery_only(catalog):
+    row = model()
+    row.model_name = "chatgpt/opaque"
+    provider = SimpleNamespace(provider_type="chatgpt", api_base=None)
+    assert _resolved_base_prices(row, provider) == (None, None, "unpriced", None)
+    tiers = _resolved_context_tiers(row, "chatgpt", None)
+    assert tiers["input_price_per_token_above_200k"] is None
+    assert tiers["output_price_per_token_above_200k"] is None
+    assert tiers["token_rates_follow_text"] is False
+    caps, _ = _effective_capabilities(row, "chatgpt", "chatgpt_device")
+    assert caps["context_limit"] is None
+    assert caps["metadata_status"] == "missing"
+    assert caps["output_budget_enforced"] is False

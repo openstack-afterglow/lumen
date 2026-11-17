@@ -60,9 +60,6 @@ def catalog_version() -> str:
 
 def native_catalog_entry(model: str, provider_type: str | None, api_base: str | None = None) -> dict[str, Any]:
     """Detached exact native entry; never infer model families or compatible metadata."""
-    if provider_type == "chatgpt":
-        provider_type = "openai"
-        model = model.removeprefix("chatgpt/")
     if not direct_provider_route(provider_type, api_base):
         return {}
     record = native_catalog()["providers"].get(provider_type)
@@ -102,8 +99,10 @@ def catalog_model_metadata(model: str, provider_type: str | None = None, api_bas
                 "decisions": "supports_decisions",
             }.items()
         },
-        "supports_pdf_input": "pdf" in (entry["input_modalities"] or []),
+        "supports_pdf_input": True if "pdf" in (entry["input_modalities"] or []) else None,
     }
+    if entry.get("reasoning_options") is not None:
+        metadata["reasoning_options"] = entry["reasoning_options"]
     embedding = entry.get("embedding")
     if embedding is not None:
         metadata.update(embedding=embedding, output_vector_size=embedding["default_dimensions"])
@@ -129,10 +128,6 @@ def catalog_model_metadata(model: str, provider_type: str | None = None, api_bas
     return metadata
 
 
-def catalog_models(provider_type: str) -> tuple[str, ...]:
-    provider_type = "openai" if provider_type == "chatgpt" else provider_type
-    record = native_catalog()["providers"].get(provider_type)
-    return tuple(sorted(entry["id"] for entry in record["models"])) if record else ()
 
 
 def bundled_cache_rates(model: str, provider_type: str | None, api_base: str | None) -> dict[str, Decimal | None]:
@@ -314,12 +309,6 @@ def _as_decimal(value: object) -> Decimal | None:
     return parsed if parsed.is_finite() and parsed >= 0 else None
 
 
-def chatgpt_model_metadata(model_name: str) -> dict[str, Any]:
-    """Exact catalog entry plus the Codex transport's output-budget limitation."""
-    metadata = catalog_model_metadata(model_name, "chatgpt")
-    if metadata:
-        metadata["output_budget_enforced"] = False
-    return metadata
 
 
 def provider_output_budget_enforced(provider_type: str | None) -> bool | None:
@@ -402,10 +391,6 @@ def effective_prices_per_million(
     return display_price(input_rate), display_price(output_rate)
 
 
-def official_price_source(model: str, provider_type: str | None = None, *, api_base: str | None = None) -> str | None:
-    """Return provenance for an exact documented route price, never a guessed rate."""
-    _, _, source = _fallback_component_rates(model, 0, 0, provider_type, api_base)
-    return source
 
 
 def _decimal_string(value: Decimal | None) -> str | None:
@@ -450,6 +435,8 @@ def cost_from_usage(
     allow_catalog_prices: bool = True,
     allow_cache_write_fallback: bool = True,
     token_rates: Mapping[str, Any] | None = None,
+    token_rates_above_200k: Mapping[str, Any] | None = None,
+    token_rates_follow_text: bool = False,
     required_modalities: Iterable[str] = (),
 ) -> UsageCost:
     """Bill provider-reported token totals using manual or exact catalog prices.
@@ -457,8 +444,9 @@ def cost_from_usage(
     Direct-provider catalog rates fill unset categories. A missing 5m write
     inherits the effective input rate, then a missing 1h write inherits the
     effective 5m rate; cache reads still require their own rate.
-    Configured ``token_rates`` bill reported image/audio shares at their own
-    per-million rates; text prices apply to the residual only.
+    Configured ``token_rates`` bill image/audio shares at their own per-million
+    rates. Catalog-origin text-equivalent buckets retain text's context tier
+    only with ``token_rates_follow_text``; manual rates remain explicit.
     """
     if breakdown is None:
         breakdown = UsageBreakdown.from_totals(prompt_tokens, completion_tokens)
@@ -469,12 +457,36 @@ def cost_from_usage(
         raise ValueError("usage breakdown totals do not match prompt/completion tokens")
     prompt_tokens = breakdown.input_tokens
     completion_tokens = breakdown.output_tokens
-    text, modality_charges = modality_token_charges(breakdown, token_rates, required_modalities)
-    uncached_tokens = text.uncached_input_tokens
+    base_fallback_input, base_fallback_output, _ = (
+        _fallback_component_rates(model, 0, 0, provider_type, api_base)
+        if token_rates_follow_text and token_rates and allow_catalog_prices
+        and (input_price_per_token is None or output_price_per_token is None)
+        else (None, None, None)
+    )
+    catalog_cache = (
+        bundled_cache_rates(model, provider_type, api_base)
+        if allow_catalog_cache and (breakdown.has_cache or (token_rates_follow_text and token_rates))
+        else {}
+    )
     if long_context_threshold_tokens is None:
         entry = native_catalog_entry(model, provider_type, api_base) if allow_catalog_prices or allow_catalog_cache else {}
         tier = (entry.get("token_pricing") or {}).get("long_context") or {}
         long_context_threshold_tokens = tier.get("threshold_tokens", 200_000)
+    text, modality_charges = modality_token_charges(
+        breakdown, token_rates, required_modalities,
+        base_text_rates={
+            "input": input_price_per_token if input_price_per_token is not None else base_fallback_input,
+            "output": output_price_per_token if output_price_per_token is not None else base_fallback_output,
+            "cache_read": (
+                cache_read_price_per_token if cache_read_price_per_token is not None
+                else catalog_cache.get("cache_read_price_per_token")
+            ),
+        },
+        token_rates_above_200k=token_rates_above_200k,
+        token_rates_follow_text=token_rates_follow_text,
+        above_threshold=prompt_tokens > long_context_threshold_tokens,
+    )
+    uncached_tokens = text.uncached_input_tokens
     if prompt_tokens > long_context_threshold_tokens:
         if input_price_per_token_above_200k is not None:
             input_price_per_token = input_price_per_token_above_200k
@@ -501,7 +513,6 @@ def cost_from_usage(
     )
     input_cost = input_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
     output_cost = output_cost.quantize(_RAW_COST_QUANTUM, rounding=ROUND_HALF_UP)
-    catalog_cache = bundled_cache_rates(model, provider_type, api_base) if breakdown.has_cache and allow_catalog_cache else {}
     cache_rates = {
         "cache_read": (
             cache_read_price_per_token, catalog_cache.get("cache_read_price_per_token"),

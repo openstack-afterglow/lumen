@@ -133,7 +133,10 @@ def billing_route(
 
     route = deepcopy(resolved)
     try:
-        route["token_rates"] = frozen_token_pricing(route)["token_rates"]
+        token_pricing = frozen_token_pricing(route)
+        route["token_rates"] = token_pricing["token_rates"]
+        route["token_rates_above_200k"] = token_pricing.get("token_rates_above_200k") or {}
+        route["token_rates_follow_text"] = token_pricing.get("token_rates_follow_text") is True
     except errors.ProviderValidationError as exc:
         raise CompletionError(422, "model token pricing is invalid") from exc
     output_modalities = list((options or {}).get("modalities") or [])
@@ -215,8 +218,13 @@ async def _bill(
     """
     model_name = resolved["model_name"]
     token_rates = resolved.get("token_rates")
+    token_rates_above_200k = resolved.get("token_rates_above_200k")
+    token_rates_follow_text = resolved.get("token_rates_follow_text") is True
     if token_rates is None:
-        token_rates = frozen_token_pricing(resolved)["token_rates"]
+        token_pricing = frozen_token_pricing(resolved)
+        token_rates = token_pricing["token_rates"]
+        token_rates_above_200k = token_pricing.get("token_rates_above_200k")
+        token_rates_follow_text = token_pricing.get("token_rates_follow_text") is True
     required = resolved.get("required_token_modalities")
     if required is None:
         required = required_modalities_for_request(token_rates, messages=messages)
@@ -249,6 +257,8 @@ async def _bill(
             allow_catalog_cache=False,
             allow_catalog_prices=False,
             token_rates=token_rates,
+            token_rates_above_200k=token_rates_above_200k,
+            token_rates_follow_text=token_rates_follow_text,
             required_modalities=required,
         )
     except ValueError as exc:

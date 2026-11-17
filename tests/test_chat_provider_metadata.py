@@ -276,12 +276,6 @@ class TestEffectiveDisplayPrices:
         assert provider_metadata.effective_prices_per_million(
             "perplexity/sonar", "perplexity", api_base="https://api.perplexity.ai"
         ) == (Decimal("17"), Decimal("19"))
-        assert provider_metadata.official_price_source(
-            "perplexity/sonar", "perplexity", api_base="https://api.perplexity.ai"
-        ) == "native_catalog"
-        assert provider_metadata.official_price_source(
-            "perplexity/sonar", "perplexity", api_base="https://api.perplexity.ai/v1"
-        ) == "native_catalog"
 
 
 def test_chatgpt_subscription_token_count_matches_bare_model():
@@ -292,11 +286,19 @@ def test_chatgpt_subscription_token_count_matches_bare_model():
 
 
 def test_chatgpt_subscription_missing_static_prices_remains_unpriced(native_catalog):
-    native_catalog(openai=[_catalog_model("openai", "gpt-5.2-codex")])
+    native_catalog(openai=[_catalog_model("openai", "gpt-5.2-codex", {
+        "input": "9", "output": "11", "cache_read": "1", "cache_write": "3",
+        "long_context": {"threshold_tokens": 272000, "input": "18", "output": "22"},
+    })])
 
     assert provider_metadata.effective_prices_per_million(
         "chatgpt/gpt-5.2-codex",
         "chatgpt",
     ) == (None, None)
+    assert provider_metadata.bundled_cache_rates("chatgpt/gpt-5.2-codex", "chatgpt", None) == {
+        "cache_read_price_per_token": None, "cache_read_price_per_token_above_200k": None,
+        "cache_write_price_per_token": None, "cache_write_price_per_token_above_200k": None,
+        "cache_write_1h_price_per_token": None, "cache_write_1h_price_per_token_above_200k": None,
+    }
 
 

@@ -87,7 +87,7 @@ def _capabilities():
         "feature_gates": {
             "text": {"available": True, "pricing_available": True},
             "structured_output": {"available": True, "pricing_available": True},
-            "web_search": {"available": True, "pricing_available": True},
+            "web_search": {"available": True, "mode": "managed", "pricing_available": True},
             "web_fetch": {"available": True, "pricing_available": True},
             "image_output": {"available": True, "pricing_available": True},
         }
@@ -173,13 +173,18 @@ def test_native_catalog_flags_map_to_canonical_capabilities_and_gates(native_cat
     assert capabilities["metadata_source"] == "catalog"
     assert capabilities["metadata_status"] == "observed"
     assert capabilities["metadata_version"] == "2099-01-01"
-    for feature in ("image_input", "structured_output", "web_search", "decisions"):
+    for feature in ("image_input", "structured_output", "decisions"):
         assert capabilities["feature_gates"][feature] == {
             "available": available,
             "mode": "native" if available else "none",
             "reason_code": None if available else "provider_unsupported",
             "pricing_available": available,
         }
+    assert capabilities["feature_gates"]["web_search"] == {
+        "available": False, "mode": "none",
+        "reason_code": "pricing_unavailable" if available else "provider_unsupported",
+        "pricing_available": False,
+    }
 
 
 @pytest.mark.parametrize("provider_type", ("openai", "anthropic"))
@@ -255,13 +260,15 @@ def test_feature_gate_pricing_is_derived_from_model_prices_and_components():
     assert gates["image_output"]["pricing_available"] is False
 
 
-def test_native_search_uses_selected_model_price_not_managed_component_prices():
+def test_native_search_remains_unpriced_until_search_fees_are_billable():
     caps = _capabilities()
     caps["feature_gates"]["web_search"]["mode"] = "native"
 
     gated = _pricing_aware_capabilities(_model(metadata={}), caps)
 
-    assert gated["feature_gates"]["web_search"]["pricing_available"] is True
+    assert gated["feature_gates"]["web_search"]["pricing_available"] is False
+    assert gated["feature_gates"]["web_search"]["available"] is False
+    assert gated["feature_gates"]["web_search"]["reason_code"] == "pricing_unavailable"
 
     unpriced = _pricing_aware_capabilities(_model(metadata={}, input_price=None, output_price=None), caps)
     assert unpriced["feature_gates"]["web_search"]["pricing_available"] is False
@@ -479,10 +486,10 @@ def test_legacy_native_search_enable_preserves_detected_api_support():
 
     assert normalized["web_search"] is True
     assert normalized["feature_gates"]["web_search"] == {
-        "available": True,
-        "mode": "native",
-        "reason_code": None,
-        "pricing_available": True,
+        "available": False,
+        "mode": "none",
+        "reason_code": "pricing_unavailable",
+        "pricing_available": False,
     }
 
 

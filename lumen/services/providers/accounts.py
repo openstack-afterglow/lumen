@@ -66,7 +66,7 @@ def _eligible(item, model_id, required_capabilities):
             and (item.allowed_capabilities is None or set(required_capabilities) <= set(item.allowed_capabilities)))
 
 def anonymous_allowed(provider) -> bool:
-    return bool(provider.api_base) or provider.provider_type in {"ollama", "duckduckgo", "searxng"}
+    return bool(provider.api_base) or provider.provider_type in {"duckduckgo", "searxng"}
 
 
 def credential_configured(provider, credential) -> bool:

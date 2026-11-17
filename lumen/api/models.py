@@ -160,8 +160,6 @@ class ProviderResponse(BaseModel):
     margin_multiplier: float
     billing_capability: (
         Literal[
-            "openrouter_key",
-            "deepseek_balance",
             "openai_admin_usage",
             "anthropic_admin_usage",
         ]
@@ -250,8 +248,6 @@ class ProviderBillingResponse(BaseModel):
     provider_type: str
     capability: (
         Literal[
-            "openrouter_key",
-            "deepseek_balance",
             "openai_admin_usage",
             "anthropic_admin_usage",
         ]
@@ -501,6 +497,70 @@ class ModelResponse(BaseModel):
     updated_at: str | None
 
     model_config = {"protected_namespaces": ()}
+
+
+class NativeCatalogEmbedding(BaseModel):
+    """Published embedding dimensions; null means the provider did not publish a constraint."""
+
+    default_dimensions: int | None
+    supports_dimensions: bool
+    min_dimensions: int | None
+    max_dimensions: int | None
+    allowed_dimensions: list[int] | None
+
+
+class NativeCatalogTokenPrices(BaseModel):
+    """Published USD prices per million tokens, preserved as decimal strings."""
+
+    input: str | None = None
+    output: str | None = None
+    cache_read: str | None = None
+    cache_write: str | None = None
+    cache_write_long: str | None = None
+
+
+class NativeCatalogLongContextPrices(NativeCatalogTokenPrices):
+    threshold_tokens: int
+    token_rates: dict[str, dict[str, str | None]] | None = None
+
+
+class NativeCatalogTokenPricing(NativeCatalogTokenPrices):
+    cache_write_ttl: str | None = None
+    cache_write_long_ttl: str | None = None
+    long_context: NativeCatalogLongContextPrices | None = None
+
+
+class NativeCatalogModel(BaseModel):
+    id: str
+    aliases: list[str]
+    kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"]
+    display_name: str
+    status: Literal["active", "preview", "deprecated"]
+    context_window: int | None
+    max_output_tokens: int | None
+    input_modalities: list[str] | None
+    output_modalities: list[str] | None
+    capabilities: dict[str, bool]
+    reasoning_options: list[dict] | None = None
+    embedding: NativeCatalogEmbedding | None = None
+    token_pricing: NativeCatalogTokenPricing | None
+    media_pricing: dict | None
+    source_urls: list[str]
+    verified_at: str
+    notes: str | None
+
+
+class NativeCatalogProvider(BaseModel):
+    provider_type: Literal["openai", "anthropic", "gemini", "perplexity"]
+    display_name: str
+    pricing_sources: list[str]
+    models: list[NativeCatalogModel]
+
+
+class NativeCatalogResponse(BaseModel):
+    schema_version: Literal[1]
+    catalog_version: str
+    providers: list[NativeCatalogProvider]
 
 
 class TitleModelRequest(BaseModel):
@@ -803,7 +863,7 @@ async def list_models(active_only: bool = False):
         raise _map_storage(exc) from exc
 
 
-@router.get("/admin/models/native-catalog")
+@router.get("/admin/models/native-catalog", response_model=NativeCatalogResponse, response_model_exclude_unset=True)
 async def get_native_catalog(provider_type: Literal["openai", "anthropic", "gemini", "perplexity"] | None = None):
     """Return the bundled, reviewed official catalog without network or database I/O."""
     return catalog_response(provider_type=provider_type)

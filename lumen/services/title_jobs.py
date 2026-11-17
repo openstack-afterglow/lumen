@@ -502,6 +502,9 @@ async def _apply_result(job: dict[str, Any]) -> bool:
                 allow_catalog_prices=False,
                 # Frozen title snapshots stay literal; new ones already carry admitted writes.
                 allow_cache_write_fallback=False,
+                token_rates=pricing.get("token_rates"),
+                token_rates_above_200k=pricing.get("token_rates_above_200k"),
+                token_rates_follow_text=pricing.get("token_rates_follow_text") is True,
             )
             await credit.apply_usage_in_transaction(
                 session,

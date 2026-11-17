@@ -1928,3 +1928,76 @@ class TestFrozenModelLongContext:
             resolved=route, messages=[], max_tokens=1, temperature=None, tool_choice="auto",
         )
         assert captured["extra"] == {"capabilities_override": route["capabilities"], "tool_choice": "auto"}
+
+    def test_admission_freezes_main_advisor_summary_modality_tier_maps(self):
+        def route(model, threshold):
+            return self._route(
+                model_name=model, long_context_threshold_tokens=threshold,
+                media_pricing={"token_rates": {"audio": {
+                    "input_per_million": "10", "cache_read_per_million": "1", "output_per_million": "20",
+                }}},
+                token_rates_above_200k={"audio": {
+                    "input_per_million": "30", "cache_read_per_million": "3", "output_per_million": "60",
+                }},
+            )
+
+        main = route("main", 272_000)
+        advisor_route = route("advisor", 300_000)
+        summary = route("summary", 250_000)
+        main["token_rates_follow_text"] = True
+        advisor_route["token_rates_follow_text"] = False
+        summary["token_rates_follow_text"] = True
+        _, frozen = _run_snapshots(
+            main, {}, feature_routes={"advisor": advisor_route}, summary_route=summary,
+        )
+        assert frozen["token_rates_follow_text"] is True
+        assert frozen["advisor_token_rates_follow_text"] is False
+        assert frozen["summary_route"]["token_rates_follow_text"] is True
+        for snapshot, prefix in ((frozen, ""), (frozen, "advisor_"), (frozen["summary_route"], "")):
+            assert snapshot[f"{prefix}token_rates"]["audio"]["input_per_million"] == "10"
+            assert snapshot[f"{prefix}token_rates_above_200k"]["audio"]["input_per_million"] == "30"
+        admitted = completion_api.billing_route(main, [], protocol="chat")
+        assert admitted["token_rates_follow_text"] is True
+        for resolved in (main, advisor_route, summary):
+            resolved["media_pricing"]["token_rates"]["audio"]["input_per_million"] = "900"
+            resolved["token_rates_above_200k"]["audio"]["input_per_million"] = "999"
+        assert admitted["token_rates_above_200k"]["audio"]["input_per_million"] == "30"
+        assert frozen["token_rates_above_200k"]["audio"]["input_per_million"] == "30"
+        assert frozen["advisor_token_rates_above_200k"]["audio"]["input_per_million"] == "30"
+        assert frozen["summary_route"]["token_rates_above_200k"]["audio"]["input_per_million"] == "30"
+        json.dumps(frozen)
+
+    async def test_completion_bills_distinct_frozen_modality_tier_without_catalog(self, monkeypatch):
+        route = self._route(
+            token_rates={"audio": {"input_per_million": "10", "cache_read_per_million": "1",
+                                   "output_per_million": "20"}},
+            token_rates_above_200k={"audio": {"input_per_million": "30", "cache_read_per_million": "3",
+                                             "output_per_million": "60"}},
+            required_token_modalities=["audio_input", "audio_output"], margin_multiplier=Decimal("1"),
+        )
+        captured = {}
+
+        def forbid_catalog(*_args, **_kwargs):
+            raise AssertionError("settlement must not read the catalog")
+
+        async def apply_usage(**kwargs):
+            captured.update(kwargs)
+            return Decimal("1")
+
+        monkeypatch.setattr(provider_metadata, "native_catalog_entry", forbid_catalog)
+        monkeypatch.setattr(provider_metadata, "bundled_cache_rates", forbid_catalog)
+        monkeypatch.setattr(credit, "apply_usage", apply_usage)
+        await completion_api._bill(
+            route, [], "", {
+                "prompt_tokens": 272_001, "completion_tokens": 10, "cache_read_input_tokens": 125,
+                "modality_tokens": {"audio": {
+                    "input_tokens": 1000, "output_tokens": 4, "cache_read_input_tokens": 100,
+                }},
+            },
+            event_id="frozen-modality-tier", user_id="u1", project_id="p1", api_key_id=None,
+        )
+        cost = captured["usage_cost"]
+        assert cost.input_cost == 270_976 * Decimal("0.000003") + 900 * Decimal("0.000030")
+        assert cost.output_cost == 6 * Decimal("0.000004") + 4 * Decimal("0.000060")
+        assert cost.cache_read_cost == 25 * Decimal("0.000006") + 100 * Decimal("0.000003")
+        assert cost.raw_cost == cost.input_cost + cost.output_cost + cost.cache_read_cost

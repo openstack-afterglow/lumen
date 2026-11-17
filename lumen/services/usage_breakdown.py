@@ -767,6 +767,11 @@ def modality_token_charges(
     breakdown: UsageBreakdown,
     token_rates: object,
     required: Iterable[str] = (),
+    *,
+    base_text_rates: Mapping[str, Decimal | None] | None = None,
+    token_rates_above_200k: object = None,
+    token_rates_follow_text: bool = False,
+    above_threshold: bool = False,
 ) -> tuple[UsageBreakdown, list[ModalityCharge]]:
     """Split modality-priced tokens off an aggregate and return the text residual.
 
@@ -776,22 +781,39 @@ def modality_token_charges(
     aggregate-only billing always did. Invalid reported usage, an unreported
     ``required`` direction or a required direction without a rate raises
     ``ValueError``. Without rates and requirements the breakdown is unchanged.
+
+    With catalog-origin ``token_rates_follow_text``, a whole modality bucket
+    equivalent to the base text/cache rates remains text, so the caller's text
+    tier also prices that share. Validate its usage and required rates first.
+    Explicit modality tiers override only their supplied fields above the
+    caller's frozen threshold. Manual flat rates never inherit text tiers.
+    ``base_text_rates`` maps input/output/cache_read to per-token Decimal rates;
+    modality maps retain their configured per-million units.
     """
-    if token_rates is None:
-        token_rates = {}
-    if not isinstance(token_rates, Mapping) or set(token_rates) - set(MODALITIES):
-        raise ValueError("token rates are invalid")
-    rates: dict[str, dict[str, Decimal]] = {}
-    for name, fields in token_rates.items():
-        if not isinstance(fields, Mapping) or set(fields) - set(TOKEN_RATE_FIELDS):
+    def parsed_rates(value: object) -> dict[str, dict[str, Decimal]]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping) or set(value) - set(MODALITIES):
             raise ValueError("token rates are invalid")
-        rates[name] = {key: _rate(value) for key, value in fields.items()}
+        result: dict[str, dict[str, Decimal]] = {}
+        for name, fields in value.items():
+            if not isinstance(fields, Mapping) or set(fields) - set(TOKEN_RATE_FIELDS):
+                raise ValueError("token rates are invalid")
+            result[name] = {key: _rate(rate) for key, rate in fields.items()}
+        return result
+
+    base_rates = parsed_rates(token_rates)
+    tier_rates = parsed_rates(token_rates_above_200k)
+    rates = {
+        name: {**base_rates.get(name, {}), **(tier_rates.get(name, {}) if above_threshold else {})}
+        for name in set(base_rates) | set(tier_rates)
+    }
     required = tuple(required)
     if any(item not in MODALITY_DIRECTIONS for item in required):
         raise ValueError("unknown required token modality")
     if not any(rates.values()) and not required:
         return breakdown, []
-    if breakdown.modality_usage_invalid:
+    if breakdown.modality_usage_invalid or not _modalities_consistent(breakdown, breakdown.modality_tokens):
         raise ValueError("provider modality usage is invalid")
     for item in required:
         modality, direction = item.rsplit("_", 1)
@@ -807,11 +829,18 @@ def modality_token_charges(
         modality_rates = rates.get(modality, {})
         tokens = breakdown.modality_tokens.get(modality, ModalityTokens())
         input_rate = modality_rates.get("input_per_million")
+        cached = tokens.cache_read_input_tokens
+        cache_rate = modality_rates.get("cache_read_per_million")
+        if input_rate is not None and tokens.input_tokens is not None and cached and cache_rate is None:
+            raise ValueError(f"{modality} cache read token rate is unavailable")
+        # Equal-rate buckets still require valid observed cache rates.
+        base = base_rates.get(modality, {})
+        text_equivalent = token_rates_follow_text and bool(base) and base_text_rates is not None and all(
+            rate == base_text_rates.get(key.removesuffix("_per_million")) for key, rate in base.items()
+        )
+        if text_equivalent and not (above_threshold and tier_rates.get(modality)):
+            continue
         if input_rate is not None and tokens.input_tokens is not None:
-            cached = tokens.cache_read_input_tokens
-            cache_rate = modality_rates.get("cache_read_per_million")
-            if cached and cache_rate is None:
-                raise ValueError(f"{modality} cache read token rate is unavailable")
             charges.append(ModalityCharge(f"{modality}_input", tokens.input_tokens - cached, input_rate))
             charges.append(ModalityCharge(f"{modality}_cache_read", cached, cache_rate or Decimal("0")))
             text_input -= tokens.input_tokens

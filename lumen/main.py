@@ -202,9 +202,9 @@ async def request_validation_handler(request: Request, exc: RequestValidationErr
                 content={"detail": {
                     "code": "unsupported_provider_type",
                     "message": (
-                        "Supported provider_type values are openai, anthropic, gemini, perplexity "
-                        "and existing chatgpt device authentication. Register third-party APIs "
-                        "as openai or anthropic with a custom api_base."
+                        "Supported inference provider_type values are openai, anthropic, gemini, perplexity "
+                        "and existing chatgpt device authentication. Managed search provider types remain supported. "
+                        "Register third-party inference APIs as openai or anthropic with a custom api_base."
                     ),
                 }},
                 headers={"Cache-Control": "no-store"},
