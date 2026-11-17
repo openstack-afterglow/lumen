@@ -1388,3 +1388,36 @@ async def test_graph_invokes_prepare_context_hook(monkeypatch):
     ]
     assert hooks.called is True
     assert any(e["type"] == "token" and e["text"] == "Hello" for e in events)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_graph_passes_frozen_prompt_cache_capability_to_provider(monkeypatch, enabled):
+    calls = []
+    async def stream(**kwargs):
+        calls.append(kwargs)
+        return _aiter([_Chunk("answer", usage={"prompt_tokens": 2, "completion_tokens": 1})])
+
+    monkeypatch.setattr(provider_client, "acompletion_stream", stream)
+    events = [event async for event in graph.stream(
+        model="opaque", messages=_MSGS, project_id="p1", user_id="u1",
+        custom_llm_provider="anthropic", capabilities_override={"prompt_caching": enabled},
+    )]
+    assert any(event["type"] == "token" for event in events)
+    assert calls[0]["extra"]["capabilities_override"] == {"prompt_caching": enabled}
+
+
+async def test_engine_forwards_frozen_capability_override_to_graph(monkeypatch):
+    from lumen.services import engine
+
+    observed = {}
+    async def stream(**kwargs):
+        observed.update(kwargs)
+        yield {"type": "token", "text": "answer"}
+
+    monkeypatch.setattr(graph, "stream", stream)
+    events = [event async for event in engine.stream(
+        model="opaque", messages=_MSGS, project_id="p1", user_id="u1",
+        capabilities_override={"prompt_caching": False},
+    )]
+    assert observed["capabilities_override"] == {"prompt_caching": False}
+    assert events == [{"type": "token", "text": "answer"}]

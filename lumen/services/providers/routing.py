@@ -17,7 +17,7 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun, ChatRunProvider
 from lumen.services.bifrost_runtime import BIFROST_VERSION
 from lumen.services.capabilities import reasoning_explicitly_unsupported
-from lumen.services.provider_metadata import direct_provider_route
+from lumen.services.provider_metadata import NATIVE_PROVIDER_TYPES, direct_provider_route, provider_family
 from lumen.services.run_store import NONTERMINAL
 
 from .accounts import default_credential, provenance, selected_credential
@@ -28,16 +28,19 @@ from .errors import (
     ChatStorageUnavailable,
     ProviderConfigurationChangedError,
     ProviderNotFoundError,
+    ProviderValidationError,
 )
 from .pricing import (
     _effective_cache_prices,
     _effective_capabilities,
+    _effective_media_pricing,
     _kind,
     _model_public,
     _per_million_price,
     _pricing_aware_capabilities,
     _resolved_base_prices,
     _resolved_cache_prices,
+    _resolved_context_tiers,
 )
 
 # Catalog-issued exact route identity: ``lumen/<provider_id>/<model_id>``. Only the
@@ -239,6 +242,19 @@ def _provider_auth_ref(provider, account, credential, *, model_id=None, required
         ref["model_id"] = model_id
     return ref
 
+def _validate_provider_route(provider: LlmProvider) -> None:
+    provider_type = provider.provider_type
+    auth_mode = getattr(provider, "auth_mode", "api_key")
+    if provider_type == "chatgpt" and auth_mode == "chatgpt_device":
+        return
+    if provider_type not in NATIVE_PROVIDER_TYPES or (
+        not direct_provider_route(provider_type, provider.api_base) and provider_type not in {"openai", "anthropic"}
+    ):
+        raise ProviderValidationError(
+            "unsupported_provider_type: register an OpenAI-compatible or Anthropic-compatible custom api_base"
+        )
+
+
 def _backend_identity(provider_type: str, kind: str = "text") -> dict[str, str]:
     if kind == "search":
         return {"provider_backend": "lumen-search-http", "provider_backend_version": "1"}
@@ -253,6 +269,7 @@ def _backend_identity(provider_type: str, kind: str = "text") -> dict[str, str]:
 
 
 def _resolved_model(model: LlmModel, provider: LlmProvider, *, ref=None, required_capabilities=()) -> dict:
+    _validate_provider_route(provider)
     if ref is not None:
         required_capabilities = ref.get("required_capabilities", ())
     elif not required_capabilities:
@@ -276,7 +293,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider, *, ref=None, require
         output_price=output_price,
     )
     model_kind = _kind(model)
-    media_pricing = getattr(model, "media_pricing", None)
+    media_pricing = _effective_media_pricing(model, provider.provider_type, api_base)
     config_fingerprint = {
         "provider_id": provider.id,
         "model_id": model.id,
@@ -301,6 +318,8 @@ def _resolved_model(model: LlmModel, provider: LlmProvider, *, ref=None, require
     if model_kind != "text" or media_pricing is not None:
         config_fingerprint["model_kind"] = model_kind
         config_fingerprint["media_pricing"] = media_pricing
+    context_tiers = _resolved_context_tiers(model, provider.provider_type, api_base)
+    config_fingerprint.update(context_tiers)
     stated_cache = _resolved_cache_prices(model, provider.provider_type, provider.api_base)
     # Stated catalog/manual rates are frozen with the route fingerprint, so old run
     # snapshots keep their admitted prices after a LiteLLM upgrade. Inherited writes
@@ -325,6 +344,7 @@ def _resolved_model(model: LlmModel, provider: LlmProvider, *, ref=None, require
         "api_provider": provider.api_provider,
         "provider_name": provider.name,
         "provider_type": provider.provider_type,
+        "provider_family": provider_family(provider.provider_type, api_base, provider.auth_mode),
         "api_base": api_base,
         "api_key": api_key,
         "provider_auth": provider_auth,
@@ -338,12 +358,13 @@ def _resolved_model(model: LlmModel, provider: LlmProvider, *, ref=None, require
         "price_metadata": model.price_metadata,
         **cache_prices,
         "cache_price_sources": cache_price_sources,
+        **context_tiers,
         "provider_id": provider.id,
         "model_id": model.id,
         "config_version_hash": config_version_hash,
         "capabilities": capabilities,
         "reasoning_unsupported": reasoning_explicitly_unsupported(
-            model.model_name, model.capability_source, model.capabilities
+            model.model_name, model.capability_source, model.capabilities, provider.provider_type, api_base,
         ),
     }
 
@@ -353,6 +374,7 @@ def _resolved_provider(provider: LlmProvider, *, ref=None, required_capabilities
     if ref is not None:
         required_capabilities = ref.get("required_capabilities", ())
     account, credential = selected_credential(provider, required_capabilities=required_capabilities, ref=ref)
+    _validate_provider_route(provider)
     provider_auth = _provider_auth_ref(provider, account, credential, required_capabilities=required_capabilities)
     api_key = None
     api_base = provider.api_base if provider.auth_mode == "api_key" else None

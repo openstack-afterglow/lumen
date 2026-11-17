@@ -654,7 +654,7 @@ def _build_graph(params: dict, ctx: ToolContext):
             if isinstance(replay_payload, dict):
                 return None, replay_payload
             try:
-                provider_extra = {}
+                provider_extra = {"capabilities_override": params.get("capabilities_override") or {}}
                 if params.get("response_format") is not None:
                     provider_extra["response_format"] = params["response_format"]
                 # Native compaction uses the frozen absolute trigger only on
@@ -1648,6 +1648,7 @@ async def stream(
     api_base: str | None = None,
     api_key: str | None = None,
     provider_auth: dict | None = None,
+    capabilities_override: dict | None = None,
     token_rates: dict | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
@@ -1692,6 +1693,7 @@ async def stream(
         "api_base": api_base,
         "api_key": api_key,
         "provider_auth": provider_auth,
+        "capabilities_override": capabilities_override,
         "token_rates": token_rates or {},
         "max_tokens": max_tokens,
         "temperature": temperature,

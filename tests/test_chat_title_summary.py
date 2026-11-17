@@ -73,6 +73,7 @@ async def test_title_reasoning_and_usage_cross_actual_provider_boundary(monkeypa
             "capabilities": {
                 "reasoning": True,
                 "reasoning_options": [{"type": "effort", "values": ["medium", "low"]}],
+                "prompt_caching": False,
             },
         },
     )
@@ -80,6 +81,8 @@ async def test_title_reasoning_and_usage_cross_actual_provider_boundary(monkeypa
     assert result.title == "추론 모델 제목"
     assert len(observed) == 1 and observed[0]["single_attempt"] is True
     assert observed[0]["body"]["reasoning_effort"] == "low"
+    assert "capabilities_override" not in observed[0]["body"]
+    assert "cache_control" not in json.dumps(observed[0]["body"]["messages"])
     assert result.prompt_tokens == 12 and result.completion_tokens == 4
 
 
@@ -205,6 +208,7 @@ async def test_title_sends_cheapest_advertised_reasoning_effort(monkeypatch, mod
     )
 
     assert kwargs["extra"]["reasoning_effort"] == expected
+    assert kwargs["extra"]["capabilities_override"] == capabilities
 
 
 @pytest.mark.parametrize(

@@ -149,6 +149,64 @@ class TestGenerateMemory:
             },
         ]
 
+    async def test_effective_capabilities_and_long_context_prices_survive_provider_call(self, monkeypatch):
+        resolved = {
+            "model_name": "catalog-model",
+            "provider_name": "native",
+            "provider_type": "openai",
+            "capabilities": {"prompt_caching": True},
+            "input_price_per_token": Decimal("0.000001"),
+            "output_price_per_token": Decimal("0.000002"),
+            "input_price_per_token_above_200k": Decimal("0.000003"),
+            "output_price_per_token_above_200k": Decimal("0.000004"),
+            "cache_read_price_per_token": Decimal("0.000005"),
+            "cache_read_price_per_token_above_200k": Decimal("0.000006"),
+            "cache_price_sources": {"cache_read": "native_catalog"},
+            "long_context_threshold_tokens": 272_000,
+            "price_source": "native_catalog",
+            "margin_multiplier": Decimal("1"),
+        }
+        captured = {}
+
+        async def resolve():
+            return resolved
+
+        async def list_messages(*_args, **_kwargs):
+            return [{"role": "user", "content": "기억해"}]
+
+        async def list_memories(**_kwargs):
+            return []
+
+        async def complete(*_args, **kwargs):
+            assert kwargs["extra"]["capabilities_override"] == resolved["capabilities"]
+            return ProviderObject(
+                choices=[{"message": {"content": "[]"}}],
+                usage={"prompt_tokens": 272_001, "completion_tokens": 2,
+                       "prompt_tokens_details": {"cached_tokens": 10}},
+            )
+
+        async def apply_usage(**kwargs):
+            captured.update(kwargs)
+            return Decimal("0")
+
+        def forbid_catalog(*_args, **_kwargs):
+            raise AssertionError("memory settlement must not read the catalog")
+
+        monkeypatch.setattr(me.ps, "resolve_memory_model", resolve)
+        monkeypatch.setattr(me.cs, "list_messages_for_run", list_messages)
+        monkeypatch.setattr(me.ms, "list_memories", list_memories)
+        monkeypatch.setattr(me.provider_client, "acompletion", complete)
+        monkeypatch.setattr(me.credit, "apply_usage", apply_usage)
+        monkeypatch.setattr(me.provider_metadata, "native_catalog_entry", forbid_catalog)
+        monkeypatch.setattr(me.provider_metadata, "bundled_cache_rates", forbid_catalog)
+        assert await me.generate_memory_if_applicable(
+            conversation_id="c1", project_id="p1", run_id="r1", user_id="u1",
+        ) == []
+        cost = captured["usage_cost"]
+        assert cost.input_cost == 271_991 * Decimal("0.000003")
+        assert cost.output_cost == 2 * Decimal("0.000004")
+        assert cost.cache_read_cost == 10 * Decimal("0.000006")
+
     async def test_transient_provider_failure_is_retryable(self, monkeypatch):
         async def fake_resolve():
             return {

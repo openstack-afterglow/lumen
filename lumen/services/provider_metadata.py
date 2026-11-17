@@ -1,7 +1,7 @@
-"""Deterministic local provider catalog, token estimates, and Decimal usage accounting.
+"""Offline native-provider metadata, token estimates, and Decimal usage accounting.
 
-Stored manual/models.dev metadata remains authoritative. The bundled catalog is a
-frozen historical fallback, not a live provider observation; see data/NOTICE.
+Stored administrator rates win over the manually verified native catalog.
+Compatible endpoints never borrow public-provider specifications or tariffs.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from importlib.resources import files
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+from lumen.services.native_catalog import NATIVE_PROVIDER_TYPES, native_catalog
 from lumen.services.providers.credentials import api_model_name, transport_model_name
 from lumen.services.usage_breakdown import UsageBreakdown, modality_token_charges
 
@@ -27,94 +28,13 @@ logger = logging.getLogger(__name__)
 _RAW_COST_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
 
-# Preserve the historical ledger source; version identifies the frozen fallback.
-CATALOG_VERSION = "litellm-1.93.0"
-CATALOG_SHA256 = "cc1955f7f1cdc2cdd9ebf216e7eebbc90bbb3528b62439327f7e8b893eda7c12"
-CATALOG_PRICE_SOURCE = "litellm"
+CATALOG_PRICE_SOURCE = "native_catalog"
 
-# Catalog labels classify Vertex publishers/modalities beneath one endpoint.
-# These are explicit source-taxonomy aliases, never model-name/family guesses.
-_VERTEX_CATALOG_PROVIDERS = frozenset({
-    "vertex_ai", "vertex_ai-ai21_models", "vertex_ai-anthropic_models",
-    "vertex_ai-deepseek_models", "vertex_ai-embedding-models", "vertex_ai-image-models",
-    "vertex_ai-language-models", "vertex_ai-llama_models", "vertex_ai-minimax_models",
-    "vertex_ai-mistral_models", "vertex_ai-moonshot_models", "vertex_ai-openai_models",
-    "vertex_ai-qwen_models", "vertex_ai-text-models", "vertex_ai-video-models", "vertex_ai-zai_models",
-})
-_CATALOG_PROVIDER_LABELS = {
-    "vertex": _VERTEX_CATALOG_PROVIDERS,
-    "vertex_ai": _VERTEX_CATALOG_PROVIDERS,
-    "azure": frozenset({"azure", "azure_text"}),
-    "bedrock": frozenset({"bedrock", "bedrock_converse"}),
-    "cohere": frozenset({"cohere", "cohere_chat"}),
-    "together": frozenset({"together_ai"}),
-    "together_ai": frozenset({"together_ai"}),
-}
-_CATALOG_PROVIDER_PREFIXES = {
-    "vertex": ("vertex_ai", "vertex"), "vertex_ai": ("vertex_ai", "vertex"),
-    "together": ("together_ai", "together"), "together_ai": ("together_ai", "together"),
-    "cohere": ("cohere", "cohere_chat"),
-}
-
-
-def _catalog_provider_matches(label: object, provider_type: str) -> bool:
-    return label in _CATALOG_PROVIDER_LABELS.get(provider_type, (provider_type,))
-
-
-@functools.cache
-def _catalog() -> dict[str, dict[str, Any]]:
-    raw = files("lumen").joinpath("data/provider_catalog.json").read_bytes()
-    if hashlib.sha256(raw).hexdigest() != CATALOG_SHA256:
-        raise ValueError("provider catalog integrity mismatch")
-    return json.loads(raw, parse_float=Decimal)
-
-
-def catalog_model_metadata(model: str, provider_type: str | None = None) -> dict[str, Any]:
-    """Detached exact entry; never a model-family/name heuristic."""
-    catalog = _catalog()
-    for candidate in _pricing_model_candidates(model, provider_type):
-        prefixes = _CATALOG_PROVIDER_PREFIXES.get(provider_type, (provider_type,))
-        keys = (*(f"{prefix}/{candidate}" for prefix in prefixes), candidate) if provider_type else (candidate,)
-        for key in keys:
-            entry = catalog.get(key)
-            if not isinstance(entry, dict) or key == "sample_spec":
-                continue
-            if provider_type and not _catalog_provider_matches(entry.get("litellm_provider"), provider_type):
-                continue
-            return copy.deepcopy(entry)
-    return {}
-
-
-@functools.cache
-def catalog_models(provider_type: str) -> tuple[str, ...]:
-    """Sorted provider IDs from the frozen catalog, not live discovery."""
-    return tuple(sorted(key for key, entry in _catalog().items()
-                        if key != "sample_spec" and _catalog_provider_matches(entry.get("litellm_provider"), provider_type)))
-
-# Exact token rates published by Perplexity Agent API that are absent from the
-# pinned LiteLLM catalog. This is deliberately not a model-family fallback.
-_OFFICIAL_PRICE_PER_MILLION: dict[tuple[str, str], tuple[Decimal, Decimal, str]] = {
-    ("perplexity", "perplexity/sonar"): (
-        Decimal("0.25"),
-        Decimal("2.50"),
-        "perplexity_agent_api_2026-09",
-    ),
-    ("perplexity", "perplexity/glm-5.3"): (
-        Decimal("1.40"),
-        Decimal("4.40"),
-        "perplexity_agent_api_2026-09",
-    ),
-}
-
-# Custom OpenAI-compatible bases may route the same model ID to a different
-# tariff. Only the actual provider endpoint may use bundled provider prices.
+# Only exact official routes may use public-provider metadata.
 _DIRECT_API_BASES = {
     "openai": {"https://api.openai.com", "https://api.openai.com/v1"},
     "anthropic": {"https://api.anthropic.com", "https://api.anthropic.com/v1"},
     "gemini": {"https://generativelanguage.googleapis.com", "https://generativelanguage.googleapis.com/v1beta"},
-    "deepseek": {"https://api.deepseek.com", "https://api.deepseek.com/v1"},
-    "openrouter": {"https://openrouter.ai/api/v1"},
-    "xai": {"https://api.x.ai/v1"},
     "perplexity": {
         "https://api.perplexity.ai", "https://api.perplexity.ai/v1",
         "https://api.perplexity.ai/router", "https://api.perplexity.ai/router/v1",
@@ -123,27 +43,106 @@ _DIRECT_API_BASES = {
 
 
 def direct_provider_route(provider_type: str | None, api_base: str | None) -> bool:
-    if provider_type not in _DIRECT_API_BASES:
-        return False
-    return api_base is None or api_base.rstrip("/") in _DIRECT_API_BASES[provider_type]
+    return provider_type in _DIRECT_API_BASES and (
+        not api_base or api_base.rstrip("/") in _DIRECT_API_BASES[provider_type]
+    )
+
+
+def provider_family(provider_type: str | None, api_base: str | None, auth_mode: str = "api_key") -> str:
+    if auth_mode in {"chatgpt_device", "anthropic_subscription"}:
+        return "native"
+    return "native" if direct_provider_route(provider_type, api_base) else "compatible"
+
+
+def catalog_version() -> str:
+    return native_catalog()["catalog_version"]
+
+
+def native_catalog_entry(model: str, provider_type: str | None, api_base: str | None = None) -> dict[str, Any]:
+    """Detached exact native entry; never infer model families or compatible metadata."""
+    if provider_type == "chatgpt":
+        provider_type = "openai"
+        model = model.removeprefix("chatgpt/")
+    if not direct_provider_route(provider_type, api_base):
+        return {}
+    record = native_catalog()["providers"].get(provider_type)
+    if record is None:
+        return {}
+    normalized = transport_model_name(model)
+    canonical = api_model_name(normalized, provider_type)
+    if provider_type == "perplexity":
+        candidates = [normalized.removeprefix("perplexity/") if _perplexity_mode(model, api_base) == "legacy" else canonical]
+    else:
+        candidates = [canonical, canonical.removeprefix(f"{provider_type}/")]
+    for candidate in dict.fromkeys(candidates):
+        for entry in record["models"]:
+            if candidate in (entry["id"], *entry["aliases"]):
+                return copy.deepcopy(entry)
+    return {}
+
+
+def catalog_model_metadata(model: str, provider_type: str | None = None, api_base: str | None = None) -> dict[str, Any]:
+    """Project tracked native fields into the executor's existing metadata vocabulary."""
+    entry = native_catalog_entry(model, provider_type, api_base)
+    if not entry:
+        return {}
+    flags = entry["capabilities"]
+    metadata = {
+        "max_input_tokens": entry["context_window"],
+        "max_output_tokens": entry["max_output_tokens"],
+        "input_modalities": entry["input_modalities"],
+        "output_modalities": entry["output_modalities"],
+        "mode": {"text": "chat", "stt": "audio_transcription", "tts": "audio_speech", "image": "image_generation"}.get(entry["kind"], entry["kind"]),
+        **{
+            target: flags.get(source)
+            for source, target in {
+                "vision": "supports_vision", "tool_call": "supports_function_calling",
+                "reasoning": "supports_reasoning", "prompt_caching": "supports_prompt_caching",
+                "structured_output": "supports_response_schema", "web_search": "supports_web_search",
+                "decisions": "supports_decisions",
+            }.items()
+        },
+        "supports_pdf_input": "pdf" in (entry["input_modalities"] or []),
+    }
+    token = entry["token_pricing"] or {}
+    fields = {
+        "input": "input_cost_per_token", "output": "output_cost_per_token",
+        "cache_read": "cache_read_input_token_cost", "cache_write": "cache_creation_input_token_cost",
+        "cache_write_long": "cache_creation_input_token_cost_above_1hr",
+    }
+    for source, target in fields.items():
+        if token.get(source) is not None:
+            metadata[target] = Decimal(token[source]) / _TOKENS_PER_MILLION
+    tier = token.get("long_context") or {}
+    if tier:
+        threshold = tier["threshold_tokens"]
+        metadata["long_context_threshold_tokens"] = threshold
+        for source, target in fields.items():
+            if tier.get(source) is not None:
+                metadata[f"{target}_above_{threshold}_tokens"] = Decimal(tier[source]) / _TOKENS_PER_MILLION
+    return metadata
+
+
+def catalog_models(provider_type: str) -> tuple[str, ...]:
+    provider_type = "openai" if provider_type == "chatgpt" else provider_type
+    record = native_catalog()["providers"].get(provider_type)
+    return tuple(sorted(entry["id"] for entry in record["models"])) if record else ()
 
 
 def bundled_cache_rates(model: str, provider_type: str | None, api_base: str | None) -> dict[str, Decimal | None]:
-    """Exact provider catalog rates; a missing cache category remains unpriced."""
-    if not direct_provider_route(provider_type, api_base):
-        return {}
-    metadata = catalog_model_metadata(model, provider_type)
-    return {
-        key: _as_decimal(metadata.get(field))
-        for key, field in (
-            ("cache_read_price_per_token", "cache_read_input_token_cost"),
-            ("cache_write_price_per_token", "cache_creation_input_token_cost"),
-            ("cache_write_1h_price_per_token", "cache_creation_input_token_cost_above_1hr"),
-            ("cache_read_price_per_token_above_200k", "cache_read_input_token_cost_above_200k_tokens"),
-            ("cache_write_price_per_token_above_200k", "cache_creation_input_token_cost_above_200k_tokens"),
-            ("cache_write_1h_price_per_token_above_200k", "cache_creation_input_token_cost_above_1hr_above_200k_tokens"),
-        )
-    }
+    """Legacy cache slots hold short/long TTL rates, not provider-specific TTL names."""
+    entry = native_catalog_entry(model, provider_type, api_base)
+    token = entry.get("token_pricing") or {}
+    tier = token.get("long_context") or {}
+    rates = {}
+    for source, target in (
+        ("cache_read", "cache_read_price_per_token"),
+        ("cache_write", "cache_write_price_per_token"),
+        ("cache_write_long", "cache_write_1h_price_per_token"),
+    ):
+        rates[target] = Decimal(token[source]) / _TOKENS_PER_MILLION if token.get(source) is not None else None
+        rates[f"{target}_above_200k"] = Decimal(tier[source]) / _TOKENS_PER_MILLION if tier.get(source) is not None else None
+    return rates
 
 
 @dataclass(frozen=True)
@@ -325,37 +324,18 @@ def provider_output_budget_enforced(provider_type: str | None) -> bool | None:
     """
     if provider_type == "chatgpt":
         return False
-    if provider_type in {
-        "openai", "anthropic", "gemini", "azure", "azure_ai", "bedrock",
-        "vertex", "vertex_ai", "ollama", "openrouter", "deepseek", "xai", "perplexity",
-        "mistral", "cohere", "groq", "together", "together_ai",
-    }:
+    if provider_type in NATIVE_PROVIDER_TYPES:
         return True
     return None
 
 
-def _pricing_model_candidates(model: str, provider_type: str | None) -> tuple[str, ...]:
-    normalized_model = transport_model_name(model)
-    candidates = [normalized_model]
-    if provider_type == "perplexity":
-        canonical_model = api_model_name(normalized_model, "perplexity")
-        if canonical_model not in candidates:
-            candidates.append(canonical_model)
-    if provider_type and provider_type != "perplexity":
-        for prefix in _CATALOG_PROVIDER_PREFIXES.get(provider_type, (provider_type,)):
-            if normalized_model.startswith(f"{prefix}/"):
-                candidates.append(normalized_model.removeprefix(f"{prefix}/"))
-    return tuple(candidates)
-
-
 def _catalog_component_rates(
-    model: str, prompt_tokens: int, completion_tokens: int, provider_type: str | None = None
+    model: str, prompt_tokens: int, completion_tokens: int, provider_type: str | None = None,
+    api_base: str | None = None,
 ) -> tuple[Decimal | None, Decimal | None]:
-    metadata = catalog_model_metadata(model, provider_type)
+    metadata = catalog_model_metadata(model, provider_type, api_base)
     input_rate = _as_decimal(metadata.get("input_cost_per_token"))
     output_rate = _as_decimal(metadata.get("output_cost_per_token"))
-    if input_rate is None or output_rate is None or provider_type == "chatgpt" or model.startswith("chatgpt/"):
-        return input_rate, output_rate
     thresholds = []
     for key in metadata:
         match = re.fullmatch(r"input_cost_per_token_above_(\d+)(k?)_tokens", key)
@@ -372,18 +352,6 @@ def _catalog_component_rates(
     return input_rate, output_rate
 
 
-def _official_component_rates(
-    model: str, provider_type: str | None, api_base: str | None = None
-) -> tuple[Decimal | None, Decimal | None, str | None]:
-    if provider_type != "perplexity" or _perplexity_mode(model, api_base) != "agent":
-        return None, None, None
-    canonical_model = api_model_name(transport_model_name(model), "perplexity")
-    published = _OFFICIAL_PRICE_PER_MILLION.get((provider_type, canonical_model))
-    if published is None:
-        return None, None, None
-    input_per_million, output_per_million, source = published
-    return input_per_million / _TOKENS_PER_MILLION, output_per_million / _TOKENS_PER_MILLION, source
-
 
 def _fallback_component_rates(
     model: str,
@@ -392,19 +360,8 @@ def _fallback_component_rates(
     provider_type: str | None = None,
     api_base: str | None = None,
 ) -> tuple[Decimal | None, Decimal | None, str | None]:
-    if api_base and not direct_provider_route(provider_type, api_base):
-        return None, None, None
-    # Agent Sonar is a different priced product from the legacy Sonar API.
-    # Exact published Agent rates must win over its legacy bundled alias.
-    official_input, official_output, official_source = _official_component_rates(model, provider_type, api_base)
-    if official_input is not None and official_output is not None:
-        return official_input, official_output, official_source
-    if provider_type == "perplexity" and _perplexity_mode(model, api_base) == "legacy":
-        # The Responses product has a separate double-prefixed catalog entry.
-        # Legacy Sonar must read only its exact Chat API tariff, not that entry.
-        model = api_model_name(transport_model_name(model), provider_type).removeprefix("perplexity/")
-    input_rate, output_rate = _catalog_component_rates(model, prompt_tokens, completion_tokens, provider_type)
-    return input_rate, output_rate, "litellm" if input_rate is not None or output_rate is not None else None
+    input_rate, output_rate = _catalog_component_rates(model, prompt_tokens, completion_tokens, provider_type, api_base)
+    return input_rate, output_rate, CATALOG_PRICE_SOURCE if input_rate is not None or output_rate is not None else None
 
 
 def _component_cost(
@@ -416,7 +373,8 @@ def _component_cost(
     fallback_source: str | None,
 ) -> tuple[Decimal, Decimal | None, str | None, bool]:
     if stored_rate is not None:
-        return stored_rate * tokens, stored_rate, stored_source, True
+        source = stored_source if stored_source in {"manual", "native_catalog"} else "manual"
+        return stored_rate * tokens, stored_rate, source, True
     if fallback_rate is not None:
         return fallback_rate * tokens, fallback_rate, fallback_source, True
     return Decimal("0"), None, None, False
@@ -426,7 +384,7 @@ def effective_prices_per_million(
     model: str, provider_type: str | None = None, *, api_base: str | None = None
 ) -> tuple[Decimal | None, Decimal | None]:
     """Return exact token prices for the configured API route, never a family alias."""
-    input_rate, output_rate, _ = _fallback_component_rates(model, 1_000_000, 1_000_000, provider_type, api_base)
+    input_rate, output_rate, _ = _fallback_component_rates(model, 0, 0, provider_type, api_base)
 
     def display_price(rate: Decimal | None) -> Decimal | None:
         return (
@@ -440,7 +398,7 @@ def effective_prices_per_million(
 
 def official_price_source(model: str, provider_type: str | None = None, *, api_base: str | None = None) -> str | None:
     """Return provenance for an exact documented route price, never a guessed rate."""
-    _, _, source = _official_component_rates(model, provider_type, api_base)
+    _, _, source = _fallback_component_rates(model, 0, 0, provider_type, api_base)
     return source
 
 
@@ -478,6 +436,9 @@ def cost_from_usage(
     cache_read_price_per_token_above_200k: Decimal | None = None,
     cache_write_price_per_token_above_200k: Decimal | None = None,
     cache_write_1h_price_per_token_above_200k: Decimal | None = None,
+    long_context_threshold_tokens: int | None = None,
+    input_price_per_token_above_200k: Decimal | None = None,
+    output_price_per_token_above_200k: Decimal | None = None,
     cache_price_sources: Mapping[str, str] | None = None,
     allow_catalog_cache: bool = True,
     allow_catalog_prices: bool = True,
@@ -504,6 +465,15 @@ def cost_from_usage(
     completion_tokens = breakdown.output_tokens
     text, modality_charges = modality_token_charges(breakdown, token_rates, required_modalities)
     uncached_tokens = text.uncached_input_tokens
+    if long_context_threshold_tokens is None:
+        entry = native_catalog_entry(model, provider_type, api_base) if allow_catalog_prices or allow_catalog_cache else {}
+        tier = (entry.get("token_pricing") or {}).get("long_context") or {}
+        long_context_threshold_tokens = tier.get("threshold_tokens", 200_000)
+    if prompt_tokens > long_context_threshold_tokens:
+        if input_price_per_token_above_200k is not None:
+            input_price_per_token = input_price_per_token_above_200k
+        if output_price_per_token_above_200k is not None:
+            output_price_per_token = output_price_per_token_above_200k
     fallback_input, fallback_output, fallback_source = (
         _fallback_component_rates(model, prompt_tokens, completion_tokens, provider_type, api_base)
         if allow_catalog_prices and (input_price_per_token is None or output_price_per_token is None)
@@ -549,12 +519,11 @@ def cost_from_usage(
     ):
         configured, catalog, configured_tier, catalog_tier = cache_rates[name]
         rate = configured if configured is not None else catalog
-        source = cache_sources.get(name, "manual") if configured is not None else "litellm" if catalog is not None else None
-        tier = configured_tier if configured_tier is not None else catalog_tier if source == "litellm" else None
-        if prompt_tokens > 200_000 and tier is not None:
+        source = cache_sources.get(name, "manual") if configured is not None else CATALOG_PRICE_SOURCE if catalog is not None else None
+        tier = configured_tier if configured_tier is not None else catalog_tier if source == CATALOG_PRICE_SOURCE else None
+        if prompt_tokens > long_context_threshold_tokens and tier is not None:
             rate = tier
-            # A fallback base and its real catalog tier carry separate provenance.
-            source = cache_sources.get(f"{name}_above_200k") or source or "litellm"
+            source = cache_sources.get(f"{name}_above_200k") or source or CATALOG_PRICE_SOURCE
         if allow_cache_write_fallback and rate is None and name == "cache_creation_5m" and input_rate is not None:
             rate, source = input_rate, f"fallback_input:{input_source or 'unknown'}"
         elif allow_cache_write_fallback and rate is None and name == "cache_creation_1h":

@@ -211,7 +211,7 @@ class ToolsAdvisorAccess:
             usage_components={"components": [
                 _usage(kind, price_key, "token", "advisor", model_name=model_name) | {
                     "quantity": str(quantity),
-                    **({"prompt_tokens": breakdown.input_tokens} if kind.startswith("advisor_cache_") else {}),
+                    "prompt_tokens": breakdown.input_tokens,
                 }
                 for kind, price_key, quantity in tokens
                 if quantity > 0 or not kind.startswith("advisor_cache_")

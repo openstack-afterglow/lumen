@@ -19,6 +19,7 @@ from lumen.auth import require_scopes
 from lumen.config import get_settings
 from lumen.services import capabilities
 from lumen.services import conversation_store as cs
+from lumen.services.provider_metadata import provider_family
 from lumen.services.providers import audio_transport, errors, image_transport, realtime_transport, repository, routing
 
 router = APIRouter()
@@ -31,6 +32,10 @@ class AvailableModel(BaseModel):
     api_provider: str
     provider_id: int
     provider_type: str
+    provider_family: Literal["native", "compatible"]
+    price_origin: Literal["manual", "native_catalog"] | None = None
+    catalog_version: str | None = None
+    catalog_entry: dict | None = None
     provider_sort_order: int = 0
     sort_order: int = 0
     model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text"
@@ -74,6 +79,12 @@ async def list_available_models(
                 "api_provider": m["api_provider"],
                 "provider_id": m["provider_id"],
                 "provider_type": provider_type,
+                "provider_family": m.get("provider_family") or provider_family(
+                    provider_type, (provider or {}).get("api_base"), (provider or {}).get("auth_mode", "api_key"),
+                ),
+                "price_origin": m.get("price_origin"),
+                "catalog_version": m.get("catalog_version"),
+                "catalog_entry": m.get("catalog_entry"),
                 "provider_sort_order": m.get("provider_sort_order", 0),
                 "sort_order": m.get("sort_order", 0),
                 "display_name": m["display_name"],
@@ -113,10 +124,9 @@ async def get_chat_capabilities(
         "model_id": model_id,
         "model_name": resolved["model_name"],
         "runtime": effective,
+        "model_kind": model_kind,
+        "model_capabilities": resolved.get("capabilities"),
     }
-    if model_kind != "text":
-        result["model_kind"] = model_kind
-        result["model_capabilities"] = resolved.get("capabilities")
     if model_kind == "image":
         image_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("image_output") or {}
         routable = image_gate.get("available") is True
@@ -152,15 +162,11 @@ async def get_chat_capabilities(
 
         model_name = resolved["model_name"]
         provider_type = resolved.get("provider_type")
-        metadata = catalog_model_metadata(model_name, provider_type or "")
+        metadata = catalog_model_metadata(model_name, provider_type or "", resolved.get("api_base"))
         default_dimensions = metadata.get("output_vector_size")
-        supports_dimensions = (
-            provider_type == "gemini" and "embedding" in model_name.lower()
-        ) or (
-            provider_type == "openai" and model_name.startswith("text-embedding-3-")
-        )
-        if default_dimensions is None and supports_dimensions:
-            default_dimensions = 3072 if provider_type == "gemini" or "large" in model_name else 1536
+        if type(default_dimensions) is not int or default_dimensions < 1:
+            default_dimensions = None
+        supports_dimensions = metadata.get("supports_dimensions") is True and default_dimensions is not None
         result.update(
             default_dimensions=default_dimensions,
             supports_dimensions=supports_dimensions,

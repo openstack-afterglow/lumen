@@ -13,9 +13,11 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from lumen.auth import require_admin
-from lumen.services import model_discovery, models_dev
+from lumen.services import model_discovery
+from lumen.services.native_catalog import catalog_response
 from lumen.services.providers import accounts, billing, credentials, errors, repository, subscriptions
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
@@ -46,6 +48,14 @@ class ProviderCreateRequest(BaseModel):
     @classmethod
     def validate_name(cls, value):
         return repository.validate_provider_name(value)
+
+    @field_validator("provider_type", mode="before")
+    @classmethod
+    def validate_provider_type(cls, value):
+        try:
+            return repository.validate_provider_type(value)
+        except errors.UnsupportedProviderTypeError as exc:
+            raise PydanticCustomError(exc.code, str(exc)) from None
 
     @field_validator("api_provider", mode="before")
     @classmethod
@@ -97,6 +107,14 @@ class ProviderUpdateRequest(BaseModel):
     def validate_name(cls, value):
         return repository.validate_provider_name(value)
 
+    @field_validator("provider_type", mode="before")
+    @classmethod
+    def validate_provider_type(cls, value):
+        try:
+            return repository.validate_provider_type(value)
+        except errors.UnsupportedProviderTypeError as exc:
+            raise PydanticCustomError(exc.code, str(exc)) from None
+
     @field_validator("api_provider", mode="before")
     @classmethod
     def validate_api_provider(cls, value):
@@ -126,6 +144,7 @@ class ProviderResponse(BaseModel):
     id: int
     name: str
     provider_type: str
+    provider_family: Literal["native", "compatible"] = "native"
     api_provider: str
     sort_order: int = 0
     api_base: str | None
@@ -150,7 +169,6 @@ class ProviderResponse(BaseModel):
     ) = None
     created_at: str | None
     updated_at: str | None
-    models_dev_provider_id: str | None = None
     selection_policy: Literal["explicit", "priority", "weighted"] = "priority"
     selected_credential_id: int | None = None
 
@@ -313,6 +331,10 @@ class CapabilitiesInput(BaseModel):
     reasoning: bool = False
     tool_call: bool = False
     attachment: bool = False
+    decisions: bool = False
+    prompt_caching: bool | None = None
+    structured_output: bool | None = None
+    web_search: bool | None = None
     modalities: dict | None = None
     reasoning_options: list = Field(default_factory=list)
     context_limit: int | None = Field(default=None, ge=0)
@@ -330,8 +352,8 @@ class ModelCreateRequest(BaseModel):
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
     # Optional prompt-cache rates, independent of each other and of input/output prices.
-    # Unset rates use the exact direct-provider catalog; unset cache read then stays
-    # unpriced, while unset writes inherit input (5m) and then 5m (1h) for new runs.
+    # Unset rates use the exact native catalog; cache read otherwise stays unpriced.
+    # Text writes then inherit input (short TTL) and short-TTL writes (long TTL).
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -379,8 +401,8 @@ class ModelUpdateRequest(BaseModel):
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
     # Optional prompt-cache rates, independent of each other and of input/output prices.
-    # Unset rates use the exact direct-provider catalog; unset cache read then stays
-    # unpriced, while unset writes inherit input (5m) and then 5m (1h) for new runs.
+    # Unset rates use the exact native catalog; cache read otherwise stays unpriced.
+    # Text writes then inherit input (short TTL) and short-TTL writes (long TTL).
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -437,9 +459,14 @@ class ModelResponse(BaseModel):
     model_name: str
     model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text"
     media_pricing: dict | None = None
+    effective_media_pricing: dict | None = None
     api_model_name: str
     api_provider: str
     provider_type: str | None = None
+    provider_family: Literal["native", "compatible"] = "native"
+    price_origin: Literal["manual", "native_catalog"] | None = None
+    catalog_version: str | None = None
+    catalog_entry: dict | None = None
     provider_sort_order: int = 0
     sort_order: int = 0
     display_name: str | None
@@ -459,7 +486,6 @@ class ModelResponse(BaseModel):
     effective_cache_write_price_per_million: Decimal | None = None
     effective_cache_write_1h_price_per_million: Decimal | None = None
     effective_cache_price_sources: dict[str, str | None] | None = None
-    models_dev_model_id: str | None = None
     price_source: str | None = None
     capabilities: dict | None = None
     capability_source: str | None = None
@@ -469,19 +495,6 @@ class ModelResponse(BaseModel):
     updated_at: str | None
 
     model_config = {"protected_namespaces": ()}
-
-
-class ModelsDevImportSelection(BaseModel):
-    local_model_id: int
-    models_dev_model_id: str = Field(..., min_length=1, max_length=190)
-
-
-class ModelsDevImportRequest(BaseModel):
-    local_provider_id: int
-    models_dev_provider_id: str = Field(..., min_length=1, max_length=100)
-    selections: list[ModelsDevImportSelection] = Field(..., min_length=1, max_length=500)
-
-    model_config = {"extra": "forbid"}
 
 
 class TitleModelRequest(BaseModel):
@@ -552,6 +565,8 @@ async def list_provider_billing():
 async def create_provider(payload: ProviderCreateRequest):
     try:
         return await repository.create_provider(**payload.model_dump())
+    except errors.UnsupportedProviderTypeError as exc:
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": str(exc)}) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
@@ -566,6 +581,8 @@ async def update_provider(provider_id: int, payload: ProviderUpdateRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except errors.UnsupportedProviderTypeError as exc:
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": str(exc)}) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
@@ -709,7 +726,7 @@ async def delete_provider(provider_id: int):
 
 
 class AvailableModelCandidate(BaseModel):
-    """Additive discovery candidate — factual provider metadata only, never capability/price."""
+    """Live provider IDs with reviewed native metadata, or unannotated compatible IDs."""
 
     id: str
     display_name: str | None = None
@@ -719,6 +736,16 @@ class AvailableModelCandidate(BaseModel):
     output_token_limit: int | None = None
     # Classified from the exact installed catalog mode; ``None`` stays manually selectable.
     model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] | None = None
+    provider_family: Literal["native", "compatible"] = "native"
+    requires_manual_pricing: bool = False
+    status: str | None = None
+    token_pricing: dict | None = None
+    media_pricing: dict | None = None
+    capabilities: dict | None = None
+    source_urls: list[str] = Field(default_factory=list)
+    verified_at: str | None = None
+    catalog_version: str | None = None
+    catalog_entry: dict | None = None
 
     model_config = {"protected_namespaces": ()}
 
@@ -738,13 +765,16 @@ class AvailableModelsResponse(BaseModel):
     error: AvailableModelsError | None = None
     models: list[str]
     candidates: list[AvailableModelCandidate]
+    provider_family: Literal["native", "compatible"] = "native"
+    requires_manual_pricing: bool = False
+    catalog_version: str | None = None
 
     model_config = {"protected_namespaces": ()}
 
 
 @router.get("/admin/providers/{provider_id}/available-models", response_model=AvailableModelsResponse)
 async def available_models(provider_id: int, response: Response):
-    """프로바이더 API(또는 litellm 정적 목록)에서 사용 가능한 모델 후보를 조회. 등록 전 선택/검토용."""
+    """List live provider IDs or the bundled native subscription catalog for administrator review."""
     response.headers.update(_NO_STORE)
     try:
         return await model_discovery.discover_models(provider_id)
@@ -767,75 +797,10 @@ async def list_models(active_only: bool = False):
         raise _map_storage(exc) from exc
 
 
-@router.get("/admin/models/pricing/models-dev/providers")
-async def list_models_dev_providers(
-    local_provider_id: int,
-    refresh: bool = False,
-):
-    try:
-        registered_providers = await repository.list_providers()
-        current_provider = next(
-            (provider for provider in registered_providers if provider["id"] == local_provider_id),
-            None,
-        )
-        if current_provider is None:
-            raise errors.ProviderNotFoundError(f"프로바이더 {local_provider_id} 를 찾을 수 없습니다")
-        catalog = await models_dev.get_catalog(refresh=refresh)
-        current_provider_matches = models_dev.matching_provider_ids(catalog, current_provider)
-        providers = models_dev.registered_provider_list(
-            catalog,
-            registered_providers,
-            current_provider_id=local_provider_id,
-        )
-    except models_dev.ModelsDevCatalogError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except errors.ProviderNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except errors.ChatStorageUnavailable as exc:
-        raise _map_storage(exc) from exc
-    return {
-        "source_url": catalog.source_url,
-        "fetched_at": catalog.fetched_at,
-        "preferred_provider_ids": sorted(current_provider_matches),
-        "providers": providers,
-    }
-
-
-@router.get("/admin/models/pricing/models-dev/providers/{models_dev_provider_id}")
-async def get_models_dev_provider(models_dev_provider_id: str, refresh: bool = False):
-    try:
-        catalog = await models_dev.get_catalog(refresh=refresh)
-    except models_dev.ModelsDevCatalogError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    details = models_dev.provider_detail(catalog, models_dev_provider_id)
-    if details is None:
-        raise HTTPException(status_code=404, detail="models.dev provider를 찾을 수 없습니다")
-    models = details.pop("models")
-    return {"source_url": catalog.source_url, "fetched_at": catalog.fetched_at, "provider": details, "models": models}
-
-
-@router.post("/admin/models/pricing/models-dev/import", response_model=list[ModelResponse])
-async def import_models_dev_prices(payload: ModelsDevImportRequest):
-    try:
-        catalog = await models_dev.get_catalog()
-        return await repository.import_models_dev_prices(
-            local_provider_id=payload.local_provider_id,
-            models_dev_provider_id=payload.models_dev_provider_id,
-            selections=[selection.model_dump() for selection in payload.selections],
-            catalog=catalog,
-        )
-    except models_dev.ModelsDevCatalogError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except errors.ProviderNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except errors.ModelsDevImportConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except errors.ActiveRunConfigurationConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except errors.ProviderValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except errors.ChatStorageUnavailable as exc:
-        raise _map_storage(exc) from exc
+@router.get("/admin/models/native-catalog")
+async def get_native_catalog(provider_type: Literal["openai", "anthropic", "gemini", "perplexity"] | None = None):
+    """Return the bundled, reviewed official catalog without network or database I/O."""
+    return catalog_response(provider_type=provider_type)
 
 
 @router.put("/admin/title-model", status_code=204)

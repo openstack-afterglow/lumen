@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -299,7 +300,36 @@ async def test_title_completed_result_replays_without_provider(monkeypatch):
     assert applied == ["job-1"]
 
 
-async def test_title_late_result_on_custom_route_does_not_bill_public_catalog(monkeypatch):
+@pytest.mark.parametrize(
+    ("frozen_prices", "prompt_tokens", "cache_tokens", "raw_cost", "pricing_status"),
+    [
+        ({"input_price_per_token": None, "output_price_per_token": None}, 3, 0, Decimal("0"), "unpriced"),
+        ({
+            "input_price_per_token": "0.000001",
+            "output_price_per_token": "0.000002",
+            "input_price_per_token_above_200k": "0.000003",
+            "output_price_per_token_above_200k": "0.000004",
+            "cache_read_price_per_token": "0.000005",
+            "cache_read_price_per_token_above_200k": "0.000006",
+            "cache_price_sources": {"cache_read": "native_catalog"},
+            "long_context_threshold_tokens": 272_000,
+        }, 272_000, 10, Decimal("0.272044"), "priced"),
+        ({
+            "input_price_per_token": "0.000001",
+            "output_price_per_token": "0.000002",
+            "input_price_per_token_above_200k": "0.000003",
+            "output_price_per_token_above_200k": "0.000004",
+            "cache_read_price_per_token": "0.000005",
+            "cache_read_price_per_token_above_200k": "0.000006",
+            "cache_price_sources": {"cache_read": "native_catalog"},
+            "long_context_threshold_tokens": 272_000,
+        }, 272_001, 10, Decimal("0.816041"), "priced"),
+    ],
+    ids=["legacy-unpriced", "frozen-threshold-boundary", "frozen-long-context-tier"],
+)
+async def test_title_late_result_on_custom_route_does_not_bill_public_catalog(
+    monkeypatch, frozen_prices, prompt_tokens, cache_tokens, raw_cost, pricing_status,
+):
     payload = {
         "conversation_id": "conversation-1",
         "project_id": "project-1",
@@ -308,9 +338,9 @@ async def test_title_late_result_on_custom_route_does_not_bill_public_catalog(mo
         "expected_title_revision": 1,
         "summary_route": {"model_name": "gemini/gemini-2.5-flash-lite", "provider_name": "private-provider",
                           "provider_type": "gemini", "api_base": "https://custom.example/v1"},
-        "pricing_snapshot": {"input_price_per_token": None, "output_price_per_token": None, "margin_multiplier": "1"},
-        "result": {"title": "오래된 제목", "prompt_tokens": 3, "completion_tokens": 2,
-                   "model_name": "gemini/gemini-2.5-flash-lite"},
+        "pricing_snapshot": {**frozen_prices, "margin_multiplier": "1"},
+        "result": {"title": "오래된 제목", "prompt_tokens": prompt_tokens, "completion_tokens": 2,
+                   "cache_read_input_tokens": cache_tokens, "model_name": "gemini/gemini-2.5-flash-lite"},
     }
 
     class Session:
@@ -358,10 +388,15 @@ async def test_title_late_result_on_custom_route_does_not_bill_public_catalog(mo
     async def fake_apply_usage(_session, **kwargs):
         usage.append(kwargs["event_id"])
         usage_cost = kwargs["usage_cost"]
-        assert usage_cost.raw_cost == 0
-        assert usage_cost.pricing_status == "unpriced"
+        assert usage_cost.raw_cost == raw_cost
+        assert usage_cost.pricing_status == pricing_status
         return 0
 
+    def forbid_catalog(*_args, **_kwargs):
+        raise AssertionError("title settlement must not read the catalog")
+
+    monkeypatch.setattr(title_jobs.provider_metadata, "native_catalog_entry", forbid_catalog)
+    monkeypatch.setattr(title_jobs.provider_metadata, "bundled_cache_rates", forbid_catalog)
     monkeypatch.setattr(title_jobs.credit, "apply_usage_in_transaction", fake_apply_usage)
     assert (
         await title_jobs._apply_result({"job_id": "job-1", "owner": "worker-1", "payload": payload, "replay": True})

@@ -582,3 +582,62 @@ The general Redis wakeup outage note above still applies to durable run workers:
 Coordinate a stop/drain and compatible controller restart using existing approved rollout procedures; mixed old/all-pool and new/assigned controllers are not qualified by these documents. Preserve SQL/cloud journals, encryption/CA/dispatch keys, Redis/DB endpoints, and unrelated WIP. Execute the [local real-Redis/SQL recipe](testing.md#balanced-infrastructure-controller-acceptance-test-passed) only in disposable fixtures. The linked parent receipt records source scope, commands, counts and real/synthetic boundaries; the architecture stamp is in the parent receipt (isolated clone, shared marker untouched). Local test evidence does not authorize promotion, production failover, live provider/cloud, release publication or deployment.
 
 Existing guest supervisor limitation: `lumen/services/infrastructure/guest_api.py` sends the service child SIGTERM, waits at most ten seconds, then sends SIGKILL during supervisor shutdown. Outer Docker/systemd stop timeouts alone do not guarantee active-call drain during stop/reboot. Complete and acknowledge service/run drain before stopping the guest supervisor; do not infer graceful provider completion from outer timeout configuration. This integration does not change that supervisor behavior.
+
+## Manually updating the native model catalog
+
+`lumen/data/native_model_catalog.json` is bundled package data, not a live price feed.
+It applies only to the official OpenAI, Anthropic, Gemini and Perplexity endpoints.
+OpenAI/Anthropic subscription authentication retains its separate transport limits.
+Third-party compatible endpoints receive no bundled models, prices or capabilities;
+administrators register their IDs and required rates explicitly.
+
+1. Re-read each affected provider's official pricing, model specification and lifecycle pages.
+   Record the exact official HTTPS URLs in `source_urls` and the provider's
+   `pricing_sources`. Never use aggregator estimates or infer a newer model's rates
+   from its family. Keep unknown published fields null or omitted where the schema permits.
+2. Edit the matching entry, preserving exact decimal-string USD prices per one million
+   tokens. Set `verified_at` to the review date and bump `catalog_version` for the reviewed
+   cohort. Keep deprecated products explicitly marked; do not alias a retired product to
+   a different paid product. Agent `perplexity/<id>` and legacy Sonar IDs are distinct.
+3. Preserve each model's exact `long_context.threshold_tokens`: billing selects its tier
+   only when total input tokens are greater than that integer. A published inclusive
+   threshold can be represented by the preceding integer, with the source condition
+   explained in `notes`. Never substitute a global 200K boundary.
+4. Use the existing media-pricing shape only when the published tariff fits it exactly.
+   Token-basis media requires a positive administrator funding reservation; a provider
+   tariff does not publish that envelope. Leave unsupported media prices null and explain
+   the missing shape in `notes`; never invent a reservation or approximate a unit tariff.
+   Additional provider search, storage, grounding or tool charges documented in notes are
+   not silently included in token prices.
+5. Run `pytest tests/test_provider_catalog.py tests/test_chat_native_catalog_admin.py`
+   in the service development environment, then the focused capability/pricing suites
+   for affected models. The loader rejects unknown fields, bad kinds, duplicate IDs or
+   aliases, missing/unofficial sources and negative/non-finite/non-string prices.
+6. Build a wheel and inspect that it contains `lumen/data/native_model_catalog.json`.
+   Review a secret-free before/after projection of registered routes, including manual
+   prices, capabilities, cache rates and media availability. Record intentional changes
+   and gaps in the change evidence. Source/local tests do not establish provider or
+   production acceptance, and a catalog edit does not authorize a deployment.
+
+Runtime prices use stored administrator rates first, then exact native catalog rates,
+then no rate. Stored historical `price_source` strings remain provenance only. Runtime
+capabilities use explicit administrator overrides, then catalog flags, then conservative
+defaults. Imported historical capability metadata no longer acts as an override.
+Catalog prices are never copied into model columns. To follow the catalog, PATCH the
+native model's input/output/cache prices and `media_pricing` to null; compatible models
+must retain administrator prices. Read responses distinguish stored `media_pricing`
+from `effective_media_pricing`, expose `price_origin`, `catalog_version` and entry provenance.
+
+The existing cache slots are stable ledger vocabulary, not literal provider TTL claims.
+OpenAI's 30-minute write maps to `cache_write_price_per_million` / `cache_creation_5m`;
+its 12-hour write maps to `cache_write_1h_price_per_million` / `cache_creation_1h`.
+Anthropic retains its published 5-minute/1-hour mapping. The catalog records actual TTLs.
+Likewise `_above_200k` remains the legacy frozen tier-slot suffix; the admission snapshot's
+`long_context_threshold_tokens` controls the real boundary. Old snapshots without that
+field retain their historical 200000 boundary. New admissions freeze effective rates,
+threshold and capabilities; settlement never consults a later catalog revision.
+
+The removed models.dev import endpoints return 404. Historical nullable import-identity
+columns remain in SQL/schema snapshots for compatibility, but the ORM no longer maps
+them. `LICENSE.litellm` remains necessary for the existing search-transport mapping
+attribution; removal of the old catalog does not remove that independent attribution.

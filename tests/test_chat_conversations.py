@@ -157,6 +157,11 @@ class TestAvailableModels:
                     "is_active": True,
                     "input_price": 0.0000025,
                     "output_price": 0.00001,
+                    "provider_family": "native",
+                    "price_origin": "native_catalog",
+                    "catalog_version": "2026-11-17",
+                    "catalog_entry": {"id": "gpt-4o", "status": "active",
+                                      "verified_at": "2026-11-17", "source_urls": ["https://openai.com/api/pricing/"]},
                     "effective_capabilities": {"vision": True, "reasoning": False, "context_limit": 128000},
                     "created_at": None,
                     "updated_at": None,
@@ -181,6 +186,10 @@ class TestAvailableModels:
         assert body[0]["context_limit"] == 128000
         assert body[0]["provider_api_key_configured"] is False
         assert body[0]["reasoning_none_supported"] is False
+        assert body[0]["provider_family"] == "native"
+        assert body[0]["price_origin"] == "native_catalog"
+        assert body[0]["catalog_version"] == "2026-11-17"
+        assert body[0]["catalog_entry"]["id"] == "gpt-4o"
         assert "input_price" not in body[0]
         assert "api_key" not in body[0]
         assert body[0]["id"] == 1
@@ -376,3 +385,15 @@ async def test_messages_rejects_tampered_cursor_after_owner_check(client, monkey
     assert owner_checked is True
     assert response.status_code == 422
     assert response.json()["detail"] == "invalid_history_cursor"
+
+
+async def test_text_capability_response_includes_endpoint_capabilities(monkeypatch):
+    from lumen.api import conversations
+
+    async def resolve(_model_id):
+        return {"model_name": "gpt-6-luna", "capabilities": {"decisions": True}}
+
+    monkeypatch.setattr(conversations.routing, "resolve_model_by_id", resolve)
+    result = await conversations.get_chat_capabilities(model_id=1, model_kind="text", token_info={})
+    assert result["model_kind"] == "text"
+    assert result["model_capabilities"] == {"decisions": True}

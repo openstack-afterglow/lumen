@@ -23,6 +23,7 @@ from lumen.services import stats as stats_service
 from lumen.services.chat_admission import _run_snapshots
 from lumen.services.completion_format import nonstream_response
 from lumen.services.durable_runs import execution
+from lumen.services.native_catalog import validate_catalog
 from lumen.services.provider_client import ProviderObject
 from lumen.services.providers import billing, pricing, repository, routing
 from lumen.services.providers.errors import ActiveRunConfigurationConflict, ProviderValidationError
@@ -78,6 +79,36 @@ _CACHE_PRICES = {
     "cache_write_1h_price_per_token": Decimal("0.000006"),
 }
 _NO_CACHE_PRICES = dict.fromkeys(_CACHE_PRICES)
+
+
+def _install_native_catalog(monkeypatch, provider_type, model_name, token_pricing):
+    source = {
+        "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "gemini": "https://ai.google.dev/gemini-api/docs/pricing",
+        "openai": "https://developers.openai.com/api/docs/pricing",
+    }[provider_type]
+    catalog = validate_catalog({
+        "schema_version": 1,
+        "catalog_version": "test-cache-pricing",
+        "providers": {provider_type: {
+            "display_name": provider_type,
+            "pricing_sources": [source],
+            "models": [{
+                "id": model_name.removeprefix(f"{provider_type}/"), "aliases": [], "kind": "text",
+                "display_name": "Synthetic cache model", "status": "active",
+                "context_window": 1_000_000, "max_output_tokens": 8192,
+                "input_modalities": ["text"], "output_modalities": ["text"],
+                "capabilities": {
+                    "vision": False, "tool_call": True, "reasoning": False,
+                    "prompt_caching": True, "structured_output": True, "web_search": False, "decisions": False,
+                },
+                "token_pricing": token_pricing, "media_pricing": None,
+                "source_urls": [source], "verified_at": "2026-11-17", "notes": None,
+            }],
+        }},
+    })
+    monkeypatch.setattr(provider_metadata, "native_catalog", lambda: catalog)
+    return catalog["providers"][provider_type]["models"][0]
 
 
 class _LedgerSession:
@@ -514,12 +545,26 @@ class TestUsageComponents:
         ("summary_snapshot", "raw_cost", "status"),
         [
             (_frozen_snapshot(_CACHE_PRICES), Decimal("0.0033300000"), "priced"),
+            ({
+                **_frozen_snapshot(_CACHE_PRICES),
+                "long_context_threshold_tokens": 999,
+                "input_price_per_token_above_200k": "0.000006",
+                "output_price_per_token_above_200k": "0.000030",
+                "cache_read_price_per_token_above_200k": "0.0000006",
+                "cache_write_price_per_token_above_200k": "0.0000075",
+                "cache_write_1h_price_per_token_above_200k": "0.000012",
+                "cache_price_sources": {
+                    "cache_read": "native_catalog",
+                    "cache_creation_5m": "native_catalog",
+                    "cache_creation_1h": "native_catalog",
+                },
+            }, Decimal("0.0066600000"), "priced"),
             # Frozen before cache rates existed: writes stay unpriced even though
             # the hash-matching live route now carries inherited write rates.
             ({"input_price_per_token": str(_INPUT), "output_price_per_token": str(_OUTPUT)},
              Decimal("0.0018000000"), "partial"),
         ],
-        ids=["frozen-rates", "legacy-keyless"],
+        ids=["frozen-rates", "frozen-model-tier", "legacy-keyless"],
     )
     async def test_summary_route_bills_cache_from_frozen_summary_prices(
         self, monkeypatch, summary_snapshot, raw_cost, status
@@ -629,6 +674,7 @@ class TestConfigFingerprint:
 
     @pytest.fixture(autouse=True)
     def _routing(self, monkeypatch):
+        _install_native_catalog(monkeypatch, "anthropic", _MODEL, {"input": "3", "output": "15"})
         monkeypatch.setenv("LUMEN_CACHE_TEST_KEY", "key-1")
         monkeypatch.setattr(routing, "derive_encryption_subkey", lambda _domain: b"test-routing-key")
         monkeypatch.setattr(routing, "_effective_capabilities", lambda *_args, **_kwargs: ({}, "test"))
@@ -729,7 +775,7 @@ class TestConfigFingerprint:
 
     @pytest.mark.parametrize(("prompt", "rate", "five_minute", "one_hour"), [
         (200_000, Decimal("0.000003"), "fallback_input:manual", "fallback_5m:fallback_input:manual"),
-        (200_001, Decimal("0.000008"), "litellm", "fallback_5m:litellm"),
+        (200_001, Decimal("0.000008"), "native_catalog", "fallback_5m:native_catalog"),
     ])
     def test_input_fallback_keeps_real_catalog_long_context_write_tier(
         self, monkeypatch, prompt, rate, five_minute, one_hour
@@ -788,15 +834,18 @@ class TestConfigFingerprint:
             )
 
 
-    async def test_direct_gemini_cache_hit_uses_frozen_catalog_rate_and_ledger(self):
+    async def test_direct_gemini_cache_hit_uses_frozen_catalog_rate_and_ledger(self, monkeypatch):
+        _install_native_catalog(monkeypatch, "gemini", "gemini/gemini-cache-test", {
+            "input": "0.1", "output": "0.4", "cache_read": "0.01",
+        })
         model, provider = self._rows()
-        model.model_name = "gemini/gemini-2.5-flash-lite"
+        model.model_name = "gemini/gemini-cache-test"
         model.input_price = Decimal("0.0000001000")
         model.output_price = Decimal("0.0000004000")
         provider.provider_type = "gemini"
         resolved = routing._resolved_model(model, provider)
         assert resolved["cache_read_price_per_token"] == Decimal("0.0000000100")
-        assert resolved["cache_price_sources"]["cache_read"] == "litellm"
+        assert resolved["cache_price_sources"]["cache_read"] == "native_catalog"
 
         _, snapshot = _run_snapshots(resolved, {})
         observed = UsageBreakdown.from_runtime(ProviderObject(
@@ -818,38 +867,35 @@ class TestConfigFingerprint:
         assert direct.raw_cost == frozen.raw_cost == row.raw_cost == Decimal("0.0000979800")
         assert direct.pricing_status == frozen.pricing_status == "priced"
         assert row.cache_read_input_tokens == 2038
-        assert direct.pricing_snapshot["cache_read"]["source"] == "litellm"
-        assert frozen.pricing_snapshot["token_components"]["cache_read"]["source"] == "litellm"
+        assert direct.pricing_snapshot["cache_read"]["source"] == "native_catalog"
+        assert frozen.pricing_snapshot["token_components"]["cache_read"]["source"] == "native_catalog"
         admin = stats_service._cache_price_projection(row.pricing_snapshot)
         assert admin["cache_costs_usd"]["cache_read"] == "0.0000203800"
-        assert admin["cache_price_sources"]["cache_read"] == "litellm"
+        assert admin["cache_price_sources"]["cache_read"] == "native_catalog"
 
     @pytest.mark.parametrize("provider_type,model_name", [
         ("gemini", "gemini/gemini-pro-latest"),
         ("anthropic", "anthropic/claude-sonnet-5"),
     ])
     def test_catalog_long_context_tiers_freeze_at_admission(self, monkeypatch, provider_type, model_name):
-        catalog_key = model_name
-        metadata = {
-            "litellm_provider": provider_type,
-            "cache_read_input_token_cost": "0.0000002",
-            "cache_read_input_token_cost_above_200k_tokens": "0.0000004",
-            "cache_creation_input_token_cost": "0.0000005",
-            "cache_creation_input_token_cost_above_200k_tokens": "0.0000008",
-            "cache_creation_input_token_cost_above_1hr": "0.000001",
-            "cache_creation_input_token_cost_above_1hr_above_200k_tokens": "0.0000015",
-        }
-        monkeypatch.setattr(provider_metadata, "_catalog", lambda: {catalog_key: metadata})
+        entry = _install_native_catalog(monkeypatch, provider_type, model_name, {
+            "input": "3", "output": "15",
+            "cache_read": "0.2", "cache_write": "0.5", "cache_write_long": "1",
+            "long_context": {
+                "threshold_tokens": 200_000,
+                "cache_read": "0.4", "cache_write": "0.8", "cache_write_long": "1.5",
+            },
+        })
         model, provider = self._rows()
         model.model_name = model_name
         provider.provider_type = provider_type
         resolved = routing._resolved_model(model, provider)
         _, frozen = _run_snapshots(resolved, {})
         assert frozen["cache_price_sources"] == {
-            "cache_read": "litellm", "cache_creation_5m": "litellm", "cache_creation_1h": "litellm",
+            "cache_read": "native_catalog", "cache_creation_5m": "native_catalog", "cache_creation_1h": "native_catalog",
         }
         assert Decimal(frozen["cache_read_price_per_token_above_200k"]) == Decimal("0.0000004")
-        metadata["cache_read_input_token_cost_above_200k_tokens"] = "0.000009"
+        entry["token_pricing"]["long_context"]["cache_read"] = "9"
 
         for prompt in (200_000, 200_001):
             breakdown = UsageBreakdown.from_totals(
@@ -891,8 +937,8 @@ class TestConfigFingerprint:
 
     def test_custom_base_uses_configured_prices_not_public_catalog(self):
         model, provider = self._rows(cache_read_price=Decimal("0.0000002500"))
-        model.model_name = "gemini/gemini-2.5-flash-lite"
-        provider.provider_type = "gemini"
+        model.model_name = "compatible-cache-test"
+        provider.provider_type = "openai"
         provider.api_base = "https://tenant.example/v1"
         resolved = routing._resolved_model(model, provider)
         assert resolved["cache_price_sources"]["cache_read"] == "manual"
@@ -901,7 +947,7 @@ class TestConfigFingerprint:
             model.model_name, breakdown.input_tokens, breakdown.output_tokens,
             input_price_per_token=resolved["input_price_per_token"],
             output_price_per_token=resolved["output_price_per_token"],
-            price_source=resolved["price_source"], provider_type="gemini",
+            price_source=resolved["price_source"], provider_type="openai",
             api_base=provider.api_base, breakdown=breakdown,
             cache_read_price_per_token=resolved["cache_read_price_per_token"],
             cache_price_sources=resolved["cache_price_sources"],
@@ -920,13 +966,16 @@ class TestConfigFingerprint:
             "cache_creation_1h": "fallback_5m:fallback_input:manual",
         }
         assert provider_metadata.effective_prices_per_million(
-            model.model_name, "gemini", api_base=provider.api_base
+            model.model_name, "openai", api_base=provider.api_base
         ) == (None, None)
 
 
     async def test_compat_completion_uses_provider_hit_for_charge_and_openai_usage(self, monkeypatch):
+        _install_native_catalog(monkeypatch, "gemini", "gemini/gemini-cache-test", {
+            "input": "0.1", "output": "0.4", "cache_read": "0.01",
+        })
         model, provider = self._rows()
-        model.model_name = "gemini/gemini-2.5-flash-lite"
+        model.model_name = "gemini/gemini-cache-test"
         model.input_price = Decimal("0.0000001000")
         model.output_price = Decimal("0.0000004000")
         provider.provider_type = "gemini"
@@ -1256,7 +1305,10 @@ def test_prompt_cache_migration_is_registered_additive_and_checksummed():
         assert column in LlmModel.__table__.columns
 
 
-async def _execute_with_usage_event(monkeypatch, usage_event: dict, *, component_prices: dict | None = None):
+async def _execute_with_usage_event(
+    monkeypatch, usage_event: dict, *, component_prices: dict | None = None,
+    frozen_prices: dict | None = None, provider_rounds: list[dict] | None = None,
+):
     """Run the durable worker with one engine usage event and return its usage record."""
     import asyncio
 
@@ -1275,6 +1327,7 @@ async def _execute_with_usage_event(monkeypatch, usage_event: dict, *, component
             "component_prices": component_prices or {},
             "margin_multiplier": "1",
             "chat_credit_per_usd": "1",
+            **(frozen_prices or {}),
         },
         execution_protocol_version=1,
         status="queued",
@@ -1333,6 +1386,11 @@ async def _execute_with_usage_event(monkeypatch, usage_event: dict, *, component
     monkeypatch.setattr(execution, "_renew_lease", lambda *_args, **_kwargs: _return(True))
     monkeypatch.setattr(execution.credit, "precheck", lambda *_args, **_kwargs: _return(None))
     monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
+    receipts = [
+        (f"provider:{index}:0", usage)
+        for index, usage in enumerate(provider_rounds if provider_rounds is not None else [usage_event["usage"]])
+    ]
+    monkeypatch.setattr(execution, "_completed_provider_usage", lambda _run_id: _return(receipts))
 
     assert await asyncio.wait_for(
         execution.execute_queued_run("run-1", owner="worker-1", registration_id="registration-1"), timeout=5
@@ -1350,6 +1408,75 @@ async def test_executor_bills_the_usage_event_cache_split(monkeypatch):
     assert record["usage_cost"].raw_cost == Decimal("0.0033300000")
     assert record["usage_cost"].pricing_status == "priced"
     assert {item["kind"]: item["quantity"] for item in record["usage_components"]}["input_tokens"] == "100"
+
+
+@pytest.mark.parametrize("threshold", [None, 272_000], ids=["legacy-default", "catalog-threshold"])
+@pytest.mark.parametrize("round_prompts", [(150_000, 150_000), (150_000, 300_000)])
+async def test_executor_selects_tiers_per_provider_receipt_not_aggregate(monkeypatch, round_prompts, threshold):
+    frozen = {
+        "input_price_per_token": "0.000001",
+        "output_price_per_token": "0.000002",
+        "input_price_per_token_above_200k": "0.000003",
+        "output_price_per_token_above_200k": "0.000004",
+        "cache_read_price_per_token": "0.000005",
+        "cache_read_price_per_token_above_200k": "0.000006",
+        "cache_price_sources": {"cache_read": "native_catalog"},
+        **({"long_context_threshold_tokens": threshold} if threshold is not None else {}),
+        "margin_multiplier": "1",
+        "chat_credit_per_usd": "1",
+    }
+    rounds = [
+        UsageBreakdown.from_totals(prompt, 2, cache_read_input_tokens=10)
+        for prompt in round_prompts
+    ]
+    aggregate = rounds[0] + rounds[1]
+    record = await _execute_with_usage_event(
+        monkeypatch, {"type": "usage", "usage": aggregate.as_usage_dict()},
+        frozen_prices=frozen, provider_rounds=[usage.as_usage_dict() for usage in rounds],
+    )
+    expected = sum((
+        (prompt - 10) * Decimal("0.000003" if prompt > (threshold or 200_000) else "0.000001")
+        + 2 * Decimal("0.000004" if prompt > (threshold or 200_000) else "0.000002")
+        + 10 * Decimal("0.000006" if prompt > (threshold or 200_000) else "0.000005")
+        for prompt in round_prompts
+    ), Decimal("0"))
+    assert record["prompt_tokens"] == sum(round_prompts)
+    assert record["usage_cost"].raw_cost == expected
+    components = record["usage_components"]
+    assert {item["segment_id"] for item in components} == {"provider:0:0", "provider:1:0"}
+    assert sum(Decimal(item["cost_usd"]) for item in components) == expected
+    hooks = execution._DurableExecutionHooks(run_id="run", owner="worker")
+    run = SimpleNamespace(pricing_snapshot=frozen)
+    assert sum(
+        hooks._actual_credit(run, "chat_completions", usage.as_usage_dict(), None)
+        for usage in rounds
+    ) == credit.credits_for_cost(expected, 1, 1)
+
+
+async def test_provider_receipt_loader_keeps_completed_call_identity_and_legacy_result_usage(monkeypatch):
+    usage = UsageBreakdown.from_totals(150_000, 2).as_usage_dict()
+    queries = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, query):
+            queries.append(query)
+            return SimpleNamespace(all=lambda: [
+                ("provider:0:0", usage, None),
+                ("provider:1:0", None, {"usage": usage}),
+            ])
+
+    monkeypatch.setattr(execution, "_factory", lambda: Session)
+    monkeypatch.setattr(execution, "load_segment_payload", lambda value: value)
+    assert await execution._completed_provider_usage("run-1") == [
+        ("provider:0:0", usage), ("provider:1:0", usage),
+    ]
+    assert set(queries[0].compile().params.values()) == {"run-1", "chat_completions", "completed"}
 
 
 class TestInterruptedAnthropicStream:
@@ -1534,15 +1661,15 @@ class TestAdvisorCachePricing:
             ("advisor_output_tokens", "advisor_output_price_per_token", "10"),
             ("advisor_cache_read_tokens", "advisor_cache_read_price_per_token", "800"),
         ]
-        assert usage[-1]["prompt_tokens"] == 1000
+        assert all(item["prompt_tokens"] == 1000 for item in usage)
 
     def test_advisor_cache_tier_uses_each_call_prompt_size(self):
         def call(prompt):
             return [
                 {"kind": "advisor_input_tokens", "price_key": "advisor_input_price_per_token",
-                 "unit": "token", "source": "advisor", "quantity": str(prompt - 120_000)},
+                 "unit": "token", "source": "advisor", "quantity": str(prompt - 120_000), "prompt_tokens": prompt},
                 {"kind": "advisor_output_tokens", "price_key": "advisor_output_price_per_token",
-                 "unit": "token", "source": "advisor", "quantity": "0"},
+                 "unit": "token", "source": "advisor", "quantity": "0", "prompt_tokens": prompt},
                 {"kind": "advisor_cache_read_tokens", "price_key": "advisor_cache_read_price_per_token",
                  "unit": "token", "source": "advisor", "quantity": "120000", "prompt_tokens": prompt},
             ]
@@ -1670,3 +1797,134 @@ class TestAdvisorCachePricing:
         assert record["usage_cost"].pricing_status == status
         kinds = {item["kind"]: item["quantity"] for item in record["usage_components"]}
         assert (kinds["advisor_input_tokens"], kinds["advisor_cache_read_tokens"]) == ("200", "800")
+
+
+class TestFrozenModelLongContext:
+    @staticmethod
+    def _route(**overrides):
+        return {
+            "provider_id": 1,
+            "model_id": 10,
+            "provider_name": "native",
+            "provider_type": "openai",
+            "model_name": "catalog-test-model",
+            "api_model_name": "catalog-test-model",
+            "config_version_hash": "frozen-hash",
+            "input_price_per_token": Decimal("0.000001"),
+            "output_price_per_token": Decimal("0.000002"),
+            "input_price_per_token_above_200k": Decimal("0.000003"),
+            "output_price_per_token_above_200k": Decimal("0.000004"),
+            "cache_read_price_per_token": Decimal("0.000005"),
+            "cache_read_price_per_token_above_200k": Decimal("0.000006"),
+            "cache_price_sources": {"cache_read": "native_catalog"},
+            "long_context_threshold_tokens": 272_000,
+            "capabilities": {"prompt_caching": True, "context_limit": 300_000},
+            "price_source": "native_catalog",
+            **overrides,
+        }
+
+    def test_admission_freezes_main_advisor_and_summary_tiers(self):
+        route = self._route()
+        advisor_route = self._route(long_context_threshold_tokens=300_000)
+        summary_route = self._route(long_context_threshold_tokens=250_000)
+        _, frozen = _run_snapshots(
+            route, {}, feature_routes={"advisor": advisor_route}, summary_route=summary_route,
+        )
+        assert frozen["long_context_threshold_tokens"] == 272_000
+        assert frozen["advisor_long_context_threshold_tokens"] == 300_000
+        assert frozen["summary_route"]["long_context_threshold_tokens"] == 250_000
+        for key in ("input_price_per_token_above_200k", "output_price_per_token_above_200k"):
+            assert Decimal(frozen[key]) == route[key]
+            assert Decimal(frozen["summary_route"][key]) == summary_route[key]
+            assert Decimal(frozen["component_prices"][f"advisor_{key}"]) == advisor_route[key]
+        route["input_price_per_token_above_200k"] = Decimal("1")
+        route["long_context_threshold_tokens"] = 1
+        route["cache_price_sources"]["cache_read"] = "manual"
+        assert frozen["long_context_threshold_tokens"] == 272_000
+        assert Decimal(frozen["input_price_per_token_above_200k"]) == Decimal("0.000003")
+        assert frozen["cache_price_sources"]["cache_read"] == "native_catalog"
+        json.dumps(frozen)
+
+    @pytest.mark.parametrize(("prompt", "tier"), [(200_001, False), (300_000, False), (300_001, True)])
+    def test_advisor_uses_own_frozen_threshold_for_all_token_categories(self, prompt, tier):
+        _, frozen = _run_snapshots(
+            self._route(), {}, feature_routes={"advisor": self._route(long_context_threshold_tokens=300_000)},
+        )
+        records = [
+            {"kind": kind, "price_key": price_key, "unit": "token", "source": "advisor",
+             "quantity": str(quantity), "prompt_tokens": prompt}
+            for kind, price_key, quantity in (
+                ("advisor_input_tokens", "advisor_input_price_per_token", prompt - 10),
+                ("advisor_output_tokens", "advisor_output_price_per_token", 2),
+                ("advisor_cache_read_tokens", "advisor_cache_read_price_per_token", 10),
+            )
+        ]
+        total, components = execution._managed_usage_components(
+            records, pricing_snapshot=frozen, model_name="executor",
+        )
+        rates = [Decimal(rate) for rate in (
+            ("0.000003", "0.000004", "0.000006") if tier else ("0.000001", "0.000002", "0.000005")
+        )]
+        assert total == (prompt - 10) * rates[0] + 2 * rates[1] + 10 * rates[2]
+        assert [Decimal(component["unit_price_usd"]) for component in components] == rates
+
+    def test_advisor_reservation_covers_frozen_base_tiers(self):
+        _, frozen = _run_snapshots(
+            self._route(), {}, feature_routes={"advisor": self._route()},
+        )
+        run = SimpleNamespace(
+            pricing_snapshot=frozen,
+            capability_snapshot={"feature_routes": {"advisor": {"context_limit": 300_000}}},
+        )
+        frozen["chat_credit_per_usd"] = "1"
+        frozen["margin_multiplier"] = "1"
+        frozen["component_prices"]["advisor_cache_read_price_per_token"] = "0"
+        frozen["component_prices"].pop("advisor_cache_read_price_per_token_above_200k")
+        expected = Decimal("0.000003") * 300_000 + Decimal("0.000004") * advisor._MAX_ADVISOR_TOKENS
+        assert execution._tool_credit_bound(run, "managed_advisor") >= expected
+        run.capability_snapshot["feature_routes"]["advisor"]["output_budget_enforced"] = False
+        frozen["component_prices"]["advisor_output_price_per_token"] = "0"
+        with pytest.raises(execution.DurableRunError, match="output budget"):
+            execution._tool_credit_bound(run, "managed_advisor")
+
+    async def test_completion_bills_admitted_tiers_without_reading_catalog(self, monkeypatch):
+        route = self._route(token_rates={}, required_token_modalities=[], margin_multiplier=Decimal("1"))
+        captured = {}
+
+        def forbid_catalog(*_args, **_kwargs):
+            raise AssertionError("settlement must not read the catalog")
+
+        async def apply_usage(**kwargs):
+            captured.update(kwargs)
+            return Decimal("1")
+
+        monkeypatch.setattr(provider_metadata, "native_catalog_entry", forbid_catalog)
+        monkeypatch.setattr(provider_metadata, "bundled_cache_rates", forbid_catalog)
+        monkeypatch.setattr(credit, "apply_usage", apply_usage)
+        prompt_tokens, completion_tokens, _ = await completion_api._bill(
+            route, [], "", ProviderObject(
+                prompt_tokens=272_001, completion_tokens=2, prompt_tokens_details={"cached_tokens": 10},
+            ),
+            event_id="frozen-tier", user_id="u1", project_id="p1", api_key_id=None,
+        )
+        assert (prompt_tokens, completion_tokens) == (272_001, 2)
+        cost = captured["usage_cost"]
+        assert cost.input_cost == 271_991 * Decimal("0.000003")
+        assert cost.output_cost == 2 * Decimal("0.000004")
+        assert cost.cache_read_cost == 10 * Decimal("0.000006")
+
+    async def test_completion_passes_effective_capabilities_to_transport(self, monkeypatch):
+        route = self._route()
+        captured = {}
+
+        async def complete(*_args, **kwargs):
+            captured.update(kwargs)
+            return ProviderObject(choices=[{
+                "message": {"content": "done", "tool_calls": None}, "finish_reason": "stop",
+            }], usage={"prompt_tokens": 1, "completion_tokens": 1})
+
+        monkeypatch.setattr(completion_api.provider_client, "acompletion", complete)
+        await completion_api.invoke_chat_once(
+            resolved=route, messages=[], max_tokens=1, temperature=None, tool_choice="auto",
+        )
+        assert captured["extra"] == {"capabilities_override": route["capabilities"], "tool_choice": "auto"}
