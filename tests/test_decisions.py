@@ -724,3 +724,57 @@ def test_every_request_list_schema_is_fail_fast():
     visit(DecisionRequest.__pydantic_core_schema__)
     assert len(lists) >= 9
     assert all(schema.get("fail_fast") is True for schema in lists)
+
+
+def _unknown_protocol_key_body(level, count):
+    body = request()
+    if level == "root":
+        target = body
+    else:
+        body["input"] = [{"role": "user", "content": "Evidence"}]
+        target = body["input"][0]
+    target.update({f"unknown_{index:06}": "do-not-echo-" + "x" * 100 for index in range(count)})
+    return body, target
+
+
+@pytest.mark.parametrize("level", ["root", "message"])
+def test_many_unknown_protocol_keys_fail_before_error_accumulation(level):
+    body, _target = _unknown_protocol_key_body(level, 10000)
+    started = time.perf_counter()
+    with pytest.raises(ValidationError) as caught:
+        DecisionRequest.model_validate(body)
+    errors = caught.value.errors(include_input=False, include_url=False, include_context=False)
+    assert time.perf_counter() - started < 2
+    assert 1 <= len(errors) <= 2
+    assert len(json.dumps(errors).encode()) < 1000
+
+
+@pytest.mark.parametrize("path", ["/v1/decisions", "/v1/chat/decisions"])
+@pytest.mark.parametrize("level", ["root", "message"])
+def test_full_16mib_many_unknown_keys_http_cost_is_bounded(path, level, monkeypatch):
+    body, target = _unknown_protocol_key_body(level, 100000)
+    target["_padding"] = ""
+    initial = json.dumps(body, separators=(",", ":")).encode()
+    assert 12 * 1024 * 1024 < len(initial) < native.MAX_DECISION_BODY_BYTES
+    target["_padding"] = "p" * (native.MAX_DECISION_BODY_BYTES - len(initial))
+    encoded = json.dumps(body, separators=(",", ":")).encode()
+    assert len(encoded) == native.MAX_DECISION_BODY_BYTES
+    resolve = AsyncMock()
+    monkeypatch.setattr(decisions, "resolve", resolve)
+    started = time.perf_counter()
+    reply = client().post(path, content=encoded, headers={"Content-Type": "application/json"})
+    assert time.perf_counter() - started < 5
+    assert reply.status_code == 422
+    assert 1 <= len(reply.json()["detail"]) <= 2
+    assert len(reply.content) < 1000
+    assert b"do-not-echo" not in reply.content
+    resolve.assert_not_called()
+
+
+def test_protocol_key_guard_leaves_arbitrary_input_json_keys_untouched():
+    data = {f"unknown_{index}": index for index in range(1000)}
+    data.update(type="arbitrary", role="not-a-message", file_id="ordinary-data", audio={"opaque": True})
+    body = request(input=[{"role": "user", "content": [{"type": "input_json", "data": data}]}])
+    parsed = DecisionRequest.model_validate(body)
+    assert parsed.input[0].content[0].data == data
+    assert parsed.model_dump(exclude_unset=True) == body
