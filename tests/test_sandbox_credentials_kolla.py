@@ -251,3 +251,23 @@ def test_dispatch_private_file_checks_apply_only_to_controller_hosts():
     for name in ("Precheck | Verify Lumen controller secret material", "Precheck | Require the controller dispatch key file"):
         task = next(task for task in tasks if task["name"] == name)
         assert "enable_lumen_controller | bool" in task["when"]
+
+
+@pytest.mark.parametrize(("controller", "worker", "image"), [
+    (True, True, "controller-image"), (True, False, "controller-image"),
+    (False, True, "worker-image"), (False, False, "api-image"),
+])
+def test_public_staging_precheck_uses_an_enabled_service_image(controller, worker, image):
+    tasks = yaml.safe_load((ROLE / "tasks/precheck.yml").read_text())
+    block = next(task["block"] for task in tasks if task["name"] == "Precheck | Validate typed runtime and deployment prerequisites")
+    task = next(task for task in block if task["name"] == "Precheck | Validate pinned public source bytes before API distribution")
+    context = {"enable_lumen_controller": controller, "enable_lumen_worker": worker,
+               "lumen_precheck_script": {"path": "/tmp/precheck.py"},
+               "lumen_public_manifest_source_dir": "/srv/public-staging",
+               "lumen_controller_image_ref": "controller-image", "lumen_worker_image_ref": "worker-image",
+               "lumen_api_image_ref": "api-image"}
+    command = _kolla_environment({}, native=True).from_string(task["ansible.builtin.command"]["argv"]).render(**context)
+    assert command[-3:] == [image, "/precheck.py", "material"]
+    assert "/srv/public-staging:/etc/lumen/public-source:ro" in command
+    assert "--pull=never" in command
+    assert ":/etc/lumen/controller:ro" not in " ".join(command)
