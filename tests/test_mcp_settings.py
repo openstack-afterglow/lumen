@@ -52,3 +52,18 @@ def test_credential_header_names_are_bound_to_the_catalog_declaration():
     with pytest.raises(McpRegistryError):
         mcp_settings._check_header_names(entry, {"Authorization": "Bearer value"})
     mcp_settings._check_header_names({"header_hints": [{"description": "unnamed", "secret": True}]}, {"Anything": "v"})
+
+
+async def test_settings_view_survives_a_domain_authority_outage(monkeypatch):
+    from fastapi import HTTPException
+
+    lookup = AsyncMock(side_effect=HTTPException(503, "Current Keystone domain authority unavailable"))
+    monkeypatch.setattr(mcp_settings, "resolve_domain_authority", lookup)
+    monkeypatch.setattr(es, "list_for_user", AsyncMock(return_value=[]))
+    monkeypatch.setattr(mcp_settings, "managed_profiles", lambda: {})
+
+    result = await mcp_settings.view(principal(), limit=1)
+
+    assert result["organization_available"] is False
+    assert result["domain_id"] is None and result["can_manage_domain"] is False
+    assert len(result["entries"]) == 1 and result["total"] > 1

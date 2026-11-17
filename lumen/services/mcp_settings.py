@@ -1,6 +1,7 @@
 """Catalog-backed personal and exact-domain MCP settings; public views contain no secrets."""
 from __future__ import annotations
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
@@ -197,7 +198,13 @@ async def view(
 ) -> dict:
     """Per-user catalog view. Filters apply before pagination: ``q`` matches name/registry_name/description
     case-insensitively; ``state`` filters the computed per-user state."""
-    owner = await authority(principal, hint=True)
+    try:
+        owner = await authority(principal, hint=True)
+        organization_available = True
+    except (HTTPException, es.ExtensionForbidden):
+        # Personal and global entries stay usable; organization rows are omitted by list_for_user the same way.
+        owner = {"domain_id": None, "can_manage": False}
+        organization_available = False
     rows = await es.list_for_user("mcp", user_id=principal["user_id"], project_id=principal["project_id"])
     linked: dict[str, list[dict]] = {}
     for row in rows:
@@ -241,6 +248,7 @@ async def view(
     return {"entries": page, "total": len(selected), "offset": offset, "limit": limit,
             "next_offset": offset + limit if offset + limit < len(selected) else None,
             "domain_id": owner["domain_id"], "can_manage_domain": owner["can_manage"],
+            "organization_available": organization_available,
             "custom_connections": linked.get("", [])}
 
 

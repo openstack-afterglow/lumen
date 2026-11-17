@@ -255,6 +255,8 @@ async def mcp_credential_versions(
         return {}
     factory = _require_db()
     try:
+        # Directory read happens with no SQL connection checked out (only a short probe session precedes it).
+        caller_domain = await _caller_domain(factory, user_id, project_id, ids)
         async with factory() as session:
             servers = {
                 row.id: row
@@ -272,7 +274,6 @@ async def mcp_credential_versions(
                     )
                 ).scalars()
             }
-            caller_domain = await _caller_domain(session, user_id, project_id, ids)
             for server in servers.values():
                 if server.scope == "domain" and server.auth_mode == "oauth":
                     # A member of another domain (or a failed authority read) gets no credential epoch.
@@ -640,9 +641,9 @@ async def list_for_user(
     serialize = _reveal_mcp if (reveal_secrets and kind == "mcp") else _PUBLIC[kind]
     domain_id = None
     try:
+        if kind == "mcp":
+            domain_id = await _caller_domain(factory, user_id, project_id, include_domain)
         async with factory() as session:
-            if kind == "mcp":
-                domain_id = await _caller_domain(session, user_id, project_id, include_domain)
             global_visible = model.scope == "global"
             if kind != "mcp":
                 global_visible = global_visible & model.is_active.is_(True)
@@ -917,12 +918,13 @@ async def _domain_access(user_id: str, project_id: str, domain_id: str | None = 
     return authority
 
 
-async def _caller_domain(session, user_id: str, project_id: str, include: bool | Collection[int]) -> str | None:
+async def _caller_domain(factory, user_id: str, project_id: str, include: bool | Collection[int]) -> str | None:
     """The caller's organization domain, resolved only when organization rows can matter and tolerant of failure.
 
     Organization rows are never implicit, so hot paths pass ``False`` or the explicitly selected ids and pay for the
     Keystone read only when one of those ids is an organization row. Membership only (no manager evaluation).
-    An authority failure hides organization rows; it never fails an unrelated listing or run.
+    An authority failure hides organization rows; it never fails an unrelated listing or run. The probe uses its own
+    short session that is closed before the directory is read, so a slow Keystone never pins a pool connection.
     """
     if include is False:
         return None
@@ -932,7 +934,9 @@ async def _caller_domain(session, user_id: str, project_id: str, include: bool |
         if not ids:
             return None
         probe = probe.where(ChatMcpServer.id.in_(ids))
-    if (await session.execute(probe.limit(1))).first() is None:
+    async with factory() as session:
+        present = (await session.execute(probe.limit(1))).first() is not None
+    if not present:
         return None
     from fastapi import HTTPException
 
