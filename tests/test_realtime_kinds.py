@@ -1,8 +1,8 @@
 """OpenAI realtime-family kinds: transcription, translation and GPT-Live sessions.
 
 Each kind has a fixed upstream endpoint and setup frame, a strict client-event whitelist,
-an input-only duration or connected-session billing plan, and is admitted only through
-its own compatible WebSocket endpoint.
+an input-only duration or connected-session billing plan, and a kind-specific wire.
+Native conversation/transcription share the signed-ticket session endpoint.
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from lumen.api import realtime as native_api
 from lumen.api.compat import realtime as compat
+from lumen.auth import get_principal
 from lumen.services.durable_runs import admission, execution, realtime
 from lumen.services.durable_runs.errors import (
     DurableRunInputError,
@@ -104,6 +105,7 @@ def test_kind_options_and_voices():
     transcription = realtime_transport.available_realtime_options(_route("gpt-live-transcribe", _TRANSCRIBE))
     assert (transcription["available_voices"], transcription["default_voice"],
             transcription["input_sample_rate_hz"], transcription["output_sample_rate_hz"]) == ([], None, 24000, 0)
+    assert transcription["realtime_kind"] == "transcription"
     translation = realtime_transport.available_realtime_options(_route("gpt-realtime-translate", _TRANSLATE))
     assert (translation["available_voices"], translation["default_voice"],
             translation["output_sample_rate_hz"]) == ([], None, 24000)
@@ -565,7 +567,7 @@ def test_compat_endpoints_discover_and_validate_kind_setup(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_native_capabilities_advertise_options_only_for_conversation_models(monkeypatch):
+async def test_native_capabilities_advertise_conversation_and_input_only_transcription(monkeypatch):
     from lumen.api import conversations
 
     gates = {"feature_gates": {name: {"available": True} for name in ("audio_input", "audio_output")}}
@@ -577,7 +579,13 @@ async def test_native_capabilities_advertise_options_only_for_conversation_model
         monkeypatch.setattr(conversations.routing, "resolve_model_by_id", AsyncMock(return_value=resolved))
         result = await conversations.get_chat_capabilities(model_id=1, model_kind="realtime", token_info={})
         assert result["default_voice"] == voice
-        assert (result["max_duration_seconds"] > 0) is (voice is not None)
+        assert (result["max_duration_seconds"] > 0) is (model != "gpt-live-1")
+        assert result["realtime_kind"] == realtime_transport.realtime_kind(resolved)
+        if model == "gpt-live-transcribe":
+            assert (result["input_sample_rate_hz"], result["output_sample_rate_hz"]) == (24000, 0)
+            resolved["capabilities"] = {"feature_gates": {"audio_input": {"available": True}}}
+            result = await conversations.get_chat_capabilities(model_id=1, model_kind="realtime", token_info={})
+            assert result["max_duration_seconds"] == 900
 
 
 def _transcription(model, **options):
@@ -600,3 +608,237 @@ def test_transcription_options_follow_what_each_model_accepts():
         _transcription("gpt-live-transcribe", language="en", languages=["en"])
     with pytest.raises(realtime_transport.RealtimeTransportError):
         _transcription("gpt-live-transcribe", language="english!")
+
+
+def test_native_transcription_projects_correlated_items_and_hides_provider_errors():
+    def project(event):
+        return realtime_protocol._provider_events(event, "openai", wire="native", kind="transcription")
+
+    prefix = "conversation.item.input_audio_transcription."
+    assert project({"type": prefix + "delta", "item_id": "second", "delta": "he"}) == (
+        [{"type": "transcript.input.delta", "item_id": "second", "delta": "he"}], 0)
+    assert project({"type": prefix + "completed", "item_id": "first", "transcript": "hello",
+                    "usage": {"secret": "not projected"}}) == (
+        [{"type": "transcript.input.completed", "item_id": "first", "text": "hello"}], 0)
+    assert project({"type": prefix + "failed", "item_id": "third", "error": {"message": "secret"}}) == (
+        [{"type": "transcript.input.failed", "item_id": "third"}], 0)
+    for event in ({"type": "session.closed"}, {"type": prefix + "delta", "delta": "uncorrelated"}):
+        assert project(event) == ([], 0)
+    assert project({"type": prefix + "completed", "item_id": "first", "transcript": None}) == (
+        [{"type": "transcript.input.failed", "item_id": "first"}], 0)
+    assert "secret" not in repr(project({"type": "error", "error": {"message": "secret"}}))
+
+
+def test_native_transcription_accepts_only_native_input_commands():
+    def translate(event):
+        return realtime_protocol._client_event(event, "openai", wire="native",
+            kind="transcription", model="gpt-live-transcribe")
+
+    assert translate({"type": "audio.input.append", "audio": _PCM}) == (
+        {"type": "input_audio_buffer.append", "audio": _PCM}, 320, False)
+    assert translate({"type": "audio.input.commit"}) == ({"type": "input_audio_buffer.commit"}, 0, False)
+    assert translate({"type": "session.close"}) == (None, 0, True)
+    for event in ({"type": "response.cancel"}, {"type": "session.update", "session": {}},
+                  {"type": "input_audio_buffer.commit"}, {"type": "audio.input.append", "audio": "bad"}):
+        with pytest.raises(RealtimeTransportError):
+            translate(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["hello", "x" * 8192], ids=["short", "long"])
+async def test_native_transcription_close_drains_committed_items_without_upstream_close(monkeypatch, text):
+    prefix = "conversation.item.input_audio_transcription."
+
+    def react(sent):
+        if sent["type"] == "input_audio_buffer.commit":
+            return ({"type": prefix + "delta", "item_id": "item_1", "delta": "he"},
+                    {"type": prefix + "completed", "item_id": "item_1", "transcript": text})
+        return ()
+
+    upstream = ScriptedUpstream(react)
+    captured = _connect(monkeypatch, upstream)
+    browser = ScriptedBrowser([{"type": "audio.input.append", "audio": _PCM},
+                               {"type": "audio.input.commit"}, {"type": "session.close"}])
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(browser,
+        _route("gpt-live-transcribe", _TRANSCRIBE), session_id="session", voice=None, instructions=None,
+        max_duration_seconds=30, is_canceled=_not_canceled, transcription={"language": "ko"}), timeout=5)
+    assert captured["url"] == "wss://api.openai.com/v1/realtime?intent=transcription"
+    assert upstream.sent == [realtime_protocol.transcription_update("gpt-live-transcribe", {"language": "ko"}),
+        {"type": "input_audio_buffer.append", "audio": _PCM}, {"type": "input_audio_buffer.commit"}]
+    assert browser.events == [
+        {"type": "session.ready", "session_id": "session", "provider_type": "openai",
+         "realtime_kind": "transcription", "input_sample_rate_hz": 24000, "output_sample_rate_hz": 0},
+        {"type": "transcript.input.delta", "item_id": "item_1", "delta": "he"},
+        {"type": "transcript.input.completed", "item_id": "item_1", "text": text}]
+    assert (meter.input_bytes, meter.output_bytes, meter.output_sample_rate_hz) == (320, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_native_transcription_missing_terminal_fails_bounded_drain(monkeypatch):
+    monkeypatch.setattr(realtime_protocol, "_USAGE_DRAIN_SECONDS", 0.01)
+    _connect(monkeypatch, ScriptedUpstream(lambda _sent: ()))
+    browser = ScriptedBrowser([{"type": "audio.input.append", "audio": _PCM},
+                               {"type": "audio.input.commit"}, {"type": "session.close"}])
+    with pytest.raises(RealtimeTransportError) as failure:
+        await asyncio.wait_for(realtime_protocol.relay_audio(browser,
+            _route("gpt-live-transcribe", _TRANSCRIBE), session_id="session", voice=None, instructions=None,
+            max_duration_seconds=30, is_canceled=_not_canceled), timeout=5)
+    assert failure.value.meter.input_bytes == 320
+    assert not any(event["type"] == "session.closed" for event in browser.events)
+
+
+@pytest.mark.parametrize("kind", [None, "conversation", "transcription"])
+def test_native_http_passes_kind_separately_without_changing_conversation_intent(monkeypatch, kind):
+    app = FastAPI()
+    app.include_router(native_api.router, prefix="/v1")
+    principal = {"user_id": "owner", "project_id": "project", "auth_type": "keystone",
+                 "source": "web", "roles": ["member", "lumen-audio_user"], "is_system_admin": False}
+    app.dependency_overrides[get_principal] = lambda: principal
+    admitted = AsyncMock(return_value={"session_id": str(uuid4())})
+    monkeypatch.setattr(native_api, "admit_realtime_session", admitted)
+    key = str(uuid4())
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/realtime/sessions", json={"model_id": "selected",
+            **({"kind": kind} if kind is not None else {})}, headers={"Idempotency-Key": key})
+    assert response.status_code == 201
+    assert admitted.await_args.kwargs["kind"] == (kind or "conversation")
+    assert admitted.await_args.kwargs["client_request_id"] == key
+    assert "kind" not in admitted.await_args.args[0]
+    assert admitted.await_args.kwargs["project_id"] == "project"
+
+
+def test_native_transcription_requires_current_audio_permission_and_valid_kind(monkeypatch):
+    app = FastAPI()
+    app.include_router(native_api.router, prefix="/v1")
+    principal = {"user_id": "owner", "project_id": "project", "auth_type": "keystone",
+                 "source": "web", "roles": ["reader"], "is_system_admin": False}
+    app.dependency_overrides[get_principal] = lambda: principal
+    admitted = AsyncMock(return_value={"session_id": str(uuid4())})
+    monkeypatch.setattr(native_api, "admit_realtime_session", admitted)
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/realtime/sessions", json={"model_id": "selected", "kind": "transcription"},
+            headers={"Idempotency-Key": str(uuid4())})
+        assert response.status_code == 403
+        principal["roles"] = ["member"]
+        for kind in ("translation", "live", "", None):
+            response = client.post("/v1/chat/realtime/sessions", json={"model_id": "selected", "kind": kind},
+                headers={"Idempotency-Key": str(uuid4())})
+            assert response.status_code == 422
+    admitted.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_transcription_mismatch_and_missing_price_fail_before_credit(monkeypatch):
+    _routing(monkeypatch, _route("gpt-live-transcribe", _TRANSCRIBE))
+    with pytest.raises(RealtimeKindMismatch):
+        await realtime.admit_realtime_session({"model_id": "gpt-live-transcribe"},
+            project_id="p", user_id="u", client_request_id=str(uuid4()))
+    _routing(monkeypatch, _route("gpt-realtime", _TRANSCRIBE | {"realtime_output_per_minute": "1"}))
+    with pytest.raises(RealtimeKindMismatch):
+        await realtime.admit_realtime_session({"model_id": "gpt-realtime"},
+            project_id="p", user_id="u", client_request_id=str(uuid4()), kind="transcription")
+    _routing(monkeypatch, _route("gpt-live-transcribe", {}))
+    with pytest.raises(ProviderValidationError):
+        await realtime.admit_realtime_session({"model_id": "gpt-live-transcribe"},
+            project_id="p", user_id="u", client_request_id=str(uuid4()), kind="transcription")
+    realtime.credit.precheck.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settlement_fails", [False, True])
+async def test_native_transcription_terminal_follows_settlement_and_finish(monkeypatch, settlement_fails):
+    route = _route("gpt-live-transcribe", _TRANSCRIBE)
+    pricing = {**realtime_transport.validate_realtime_request(route), "max_duration_seconds": 30}
+    monkeypatch.setattr(realtime, "consume_ticket", AsyncMock(return_value=("u", "p")))
+    monkeypatch.setattr(realtime, "_start", AsyncMock(return_value=({}, pricing,
+        {"voice": None, "instructions": None, "realtime_kind": "transcription"}, "owner")))
+    monkeypatch.setattr(realtime.routing, "resolve_model_snapshot", AsyncMock(return_value=route))
+    meter = AudioMeter(320, 0, 24000, 0)
+    relay = AsyncMock(return_value=meter)
+    monkeypatch.setattr(realtime_protocol, "relay_audio", relay)
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return SimpleNamespace(one_or_none=lambda: ("running", "owner", None))
+
+    monkeypatch.setattr(realtime, "_factory", lambda: Session)
+    order = []
+
+    async def settle(*_args, **_kwargs):
+        order.append("settle")
+        if settlement_fails:
+            raise DurableRunProviderResultUnknown("settlement incomplete")
+        return {"input_audio_seconds": "0.0066666667"}
+
+    async def finish(*_args, **_kwargs):
+        order.append("finish")
+
+    class Browser:
+        async def send_json(self, event):
+            order.append(event)
+
+    monkeypatch.setattr(realtime, "_settle", settle)
+    monkeypatch.setattr(execution, "_finish", finish)
+    if settlement_fails:
+        with pytest.raises(DurableRunProviderResultUnknown):
+            await realtime.run_realtime_session(Browser(), run_id="run", token="t" * 40)
+        assert order == ["settle", "finish"]
+    else:
+        await realtime.run_realtime_session(Browser(), run_id="run", token="t" * 40)
+        assert order == ["settle", "finish",
+            {"type": "session.closed", "input_audio_seconds": "0.0066666667"}]
+    assert relay.await_args.kwargs["wire"] == "native"
+
+
+@pytest.mark.asyncio
+async def test_native_transcription_matching_priced_kind_reaches_credit_boundary(monkeypatch):
+    _routing(monkeypatch, _route("gpt-live-transcribe", _TRANSCRIBE))
+    precheck = AsyncMock(side_effect=DurableRunInputError("credit boundary"))
+    monkeypatch.setattr(realtime.credit, "precheck", precheck)
+    with pytest.raises(DurableRunInputError, match="credit boundary"):
+        await realtime.admit_realtime_session({"model_id": "gpt-live-transcribe"},
+            project_id="p", user_id="u", client_request_id=str(uuid4()), kind="transcription")
+    precheck.assert_awaited_once_with("u", "p", None)
+    intent = admission.existing_run_for_intent.await_args.kwargs["intent"]
+    assert intent["realtime_kind"] == "transcription"
+    assert "kind" not in intent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", ["deadline", "idle", "upstream_close"])
+async def test_native_transcription_pending_turn_cannot_succeed_on_other_exits(monkeypatch, exit_path):
+    from websockets.exceptions import ConnectionClosedOK
+    from websockets.frames import Close
+
+    class ClosingUpstream(ScriptedUpstream):
+        async def send(self, message):
+            await super().send(message)
+            if exit_path == "upstream_close" and self.sent[-1]["type"] == "input_audio_buffer.commit":
+                await self.queue.put(ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True))
+
+        async def recv(self):
+            frame = await self.queue.get()
+            if isinstance(frame, Exception):
+                raise frame
+            return frame
+
+    if exit_path == "idle":
+        monkeypatch.setattr(realtime_protocol, "_IDLE_SECONDS", 0.01)
+    upstream = ClosingUpstream(lambda _sent: ())
+    _connect(monkeypatch, upstream)
+    browser = ScriptedBrowser([{"type": "audio.input.append", "audio": _PCM},
+                               {"type": "audio.input.commit"}])
+    with pytest.raises(RealtimeTransportError) as failure:
+        await asyncio.wait_for(realtime_protocol.relay_audio(browser,
+            _route("gpt-live-transcribe", _TRANSCRIBE), session_id="session", voice=None, instructions=None,
+            max_duration_seconds=1 if exit_path == "deadline" else 30, is_canceled=_not_canceled), timeout=5)
+    assert failure.value.meter.input_bytes == 320
+    assert [frame["type"] for frame in upstream.sent] == [
+        "session.update", "input_audio_buffer.append", "input_audio_buffer.commit"]
+    assert not any(event["type"] == "session.closed" for event in browser.events)

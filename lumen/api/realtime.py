@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -23,6 +24,7 @@ class RealtimeSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model_id: str = Field(min_length=1, max_length=190)
     provider_id: str | int | None = None
+    kind: Literal["conversation", "transcription"] = "conversation"
     voice: str | None = Field(default=None, max_length=100)
     instructions: str | None = Field(default=None, max_length=4096)
     max_duration_seconds: int = Field(default=300, ge=10, le=900)
@@ -60,7 +62,8 @@ async def create_session(
     principal: Principal = Depends(require_scopes("native:realtime:write")),
 ):
     try:
-        return await admit_realtime_session(payload.model_dump(), project_id=principal["project_id"],
+        return await admit_realtime_session(payload.model_dump(exclude={"kind"}), kind=payload.kind,
+            project_id=principal["project_id"],
             user_id=principal["user_id"], client_request_id=str(idempotency_key),
             source=principal.get("source", "web"), api_key_id=principal.get("api_key_id"),
             credential_authority=credential_authority_snapshot(principal))

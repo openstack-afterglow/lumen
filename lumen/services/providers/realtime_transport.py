@@ -217,6 +217,7 @@ def available_realtime_options(route: dict) -> dict[str, object]:
         voices = sorted(_GEMINI_VOICES if provider == "gemini" else _OPENAI_VOICES)
         default = "Kore" if provider == "gemini" else "alloy"
     return {
+        "realtime_kind": kind,
         "available_voices": voices,
         "default_voice": default,
         "input_sample_rate_hz": 16000 if provider == "gemini" else 24000,
