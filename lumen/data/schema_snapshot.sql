@@ -1497,3 +1497,20 @@ CREATE TABLE `user_wallets` (
   `max_quota_weekly` decimal(18,8) DEFAULT NULL,
   PRIMARY KEY (`user_id`)
 ) ENGINE=InnoDB;
+
+CREATE TABLE `chat_stateless_call_reservations` (
+  `event_id` char(36) NOT NULL,
+  `user_id` varchar(64) NOT NULL,
+  `project_id` varchar(64) NOT NULL,
+  `api_key_id` bigint DEFAULT NULL,
+  `bound_credits` decimal(18,8) NOT NULL,
+  `actual_credits` decimal(18,8) DEFAULT NULL,
+  `status` varchar(20) NOT NULL,
+  `created_at` datetime(6) NOT NULL,
+  `settled_at` datetime(6) DEFAULT NULL,
+  PRIMARY KEY (`event_id`),
+  KEY `idx_stateless_hold_owner` (`user_id`,`status`),
+  KEY `idx_stateless_hold_key` (`api_key_id`,`status`),
+  CONSTRAINT `ck_stateless_bound` CHECK (`bound_credits` >= 0),
+  CONSTRAINT `ck_stateless_actual` CHECK (`actual_credits` is null or `actual_credits` >= 0)
+) ENGINE=InnoDB;

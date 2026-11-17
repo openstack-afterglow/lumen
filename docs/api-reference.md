@@ -415,3 +415,67 @@ Individual cancel은 미시작 run을 취소하지만 이미 provider 결과가 
 
 
 주요 오류는 unauthenticated/invalid key 401, project mismatch 또는 scope denial 403, invalid request 422(Anthropic Messages 계열은 400 `invalid_request_error`), quota 402(native) / 429(compat), idempotency conflict 409, store/config unavailable 503, expired event cursor 410이다. OpenAI route가 생성하는 HTTP 오류는 최상위 `{ "error": { "message": ..., "type": ..., "code": ... } }`, Anthropic route가 생성하는 오류는 최상위 `{ "type": "error", "error": { "type": ..., "message": ... } }` 구조를 사용한다. 인증·admission 경계 오류는 `{ "detail": ... }`일 수 있다. 호환 스트리밍 failure는 in-band SSE error, Native 스트리밍 실패는 `run.failed` 이벤트로 전달된다.
+
+## OpenAI Decisions
+
+- `POST /v1/decisions`: API-key 인증, `compat:completions:write`, 기존 compat host gate. OpenAI wire shape를 사용한다.
+- `POST /v1/chat/decisions`: 세션/BFF 인증 경로, `native:runs:write`. 같은 body를 받고 `cost_usd`, `credited_cost`, `usage_log_id`(immutable usage event UUID)를 추가한다. 기존 native 모델 사용과 같은 scope/현재 principal 검사를 적용한다.
+- `model`은 활성 등록 text 모델 이름이다. OpenAI 프로토콜/API-key provider와 effective `capabilities.decisions=true`가 필요하다. 공식 endpoint와 관리자 custom `api_base` 모두 지원한다. 공식 지원 모델은 현재 `gpt-6-luna`이며, compatible endpoint는 관리자가 capability와 가격을 명시해야 한다. 미등록/비활성 모델 404, ambiguous name 409, capability/protocol/입력 가격 누락 422다.
+
+```json
+{
+  "model": "gpt-6-luna",
+  "input": [
+    {"role": "user", "content": [
+      {"type": "input_text", "text": "Evaluate this order."},
+      {"type": "input_json", "data": {"order": {"damaged": true}}},
+      {"type": "input_image", "image_url": "https://example.test/product.png", "detail": "auto"}
+    ]}
+  ],
+  "questions": [
+    {"type": "predicate", "name": "damaged", "instructions": "Is the product damaged?"},
+    {"type": "choice", "instructions": "Route the request.", "choices": [
+      {"value": "refund", "description": "Refund requests"},
+      {"value": "other", "description": "Other requests"}
+    ]},
+    {"type": "score", "instructions": "Rate severity.", "levels": [
+      {"label": "low"}, {"label": "high"}
+    ]}
+  ],
+  "prompt_cache_options": {"mode": "implicit", "ttl": "30m"}
+}
+```
+
+### 입력 제한
+
+Raw JSON body는 최대 **16 MiB**다(전체 서비스의 더 작은 receive 상한은 그대로 적용). 모델 이름은 등록 column과 같은 190자 이하다. `questions`는 1–400개, 지정된 `name`은 string이며 중복을 거절한다. `choice.choices`는 2–255개이고 `value`는 string 또는 boolean이며 type을 구별해 유일해야 한다. `score.levels`는 2–10개이며 각 항목에 string `label`이 필요하다. `instructions`는 최대 1,048,576자 string 또는 비어 있지 않은 text/image/JSON part 배열이다.
+
+공유 `input`은 최대 10,485,760자 string 또는 최대 131,072개 message/tool item 배열이다. User content는 `input_text`, `input_image`, `input_json`; developer/system은 input text만, assistant는 `output_text`/`refusal`만 받는다. Function/custom call과 text/image output은 앞선 같은 종류 call의 `call_id`와 일치해야 한다. Content part 배열 상한은 16,384개다. Files/file IDs, audio, item references 및 알 수 없는 필드는 거절한다.
+
+`input_json.data`는 object 또는 object 배열이다. Root를 포함한 container 깊이 32, root/container를 포함한 값 10,000개, compact UTF-8 JSON 256 KiB가 상한이며 NaN/Infinity는 거절한다. Data 내부 `role`, `type`, `image_url` 등은 일반 JSON 값이지 protocol part가 아니다. `input_image.image_url`은 `data:`, `http://`, `https://`로 시작해야 하며 detail은 `low|high|auto|original` 또는 null이다. 공유 input과 질문 instructions 전체 image 합계는 최대 16개다. **Lumen은 image URL을 직접 fetch하지 않는다.** `prompt_cache_key`는 최대 64자, `safety_identifier`는 최대 128자, `prompt_cache_options.ttl`은 `"30m"`만 받는다.
+
+### 응답과 정산
+
+응답은 `{model, answers, usage}`다. `model`은 upstream alias가 아니라 등록 모델 이름이다. `answers`는 질문 순서대로 predicate `{type,name,probability}`, choice `{type,name,choice,confidence,probabilities:[{value,probability}]}`, score `{type,name,score,confidence,probabilities:[{value,label,probability}]}` 또는 refusal `{type:"refusal",name}`다. 지정하지 않은 name은 null이며 score index는 0부터 시작한다.
+
+Usage의 input/output/total과 cached/cache-write/reasoning count는 필수인 유한한 비음수 정수이며 합계/부분집합 관계를 엄격히 검사한다. Output/reasoning은 사용량에 기록하되 **비용은 0**이다. USD 비용은 다음과 같다.
+
+`(input_tokens - cached_tokens - cache_write_tokens) * input_rate + cached_tokens * cache_read_rate + cache_write_tokens * cache_write_30m_rate`
+
+모델의 effective manual/catalog rate를 사용한다. `input_tokens > long_context_threshold_tokens`이고 해당 tier rate가 있을 때 그 rate를 사용한다. 입력 가격이 없으면 upstream 전에 거절한다. Cached/cache-write usage가 보고되었으나 해당 가격이 없으면 502로 fail closed하며 quota hold는 unknown으로 보존한다. 모델의 다른 endpoint output 가격은 Decisions에 적용하지 않는다. Cache write는 기존 ledger의 `cache_creation_5m_input_tokens` 저장 slot에 매핑하지만 pricing snapshot에는 실제 `"30m"` TTL을 명시한다.
+
+MariaDB wallet lock과 READ COMMITTED transaction 안에서 upper-bound credit hold를 먼저 등록한다. User 월·주간 한도와 API-key 월·주간 한도 모두 durable + stateless active hold를 합산한다. 정산은 hold→settled와 immutable usage/wallet debit을 같은 transaction에서 적용하고 event UUID로 정확히 한 번 debit한다. Usage component category/kind는 `decision`이며 counts/cost만 남기고 prompt/JSON/image URL/question/answer content는 저장하지 않는다.
+
+Upper bound는 전체 text/JSON/tool/choice wire skeleton의 기존 tokenizer estimate와 UTF-8 byte 수 중 큰 값 + 4,096 framing tokens + **image당 1,000,000 tokens**다. 전체 상한은 32,000,000 tokens이고 cache-write/long-context를 포함한 가장 높은 effective input rate로 예약한다. [공식 vision 규칙](https://developers.openai.com/api/docs/guides/images-vision#calculating-costs)은 patch limit 30,000과 모델별 multiplier를 설명하지만 현재 표에는 `gpt-6-luna` profile/multiplier가 없다. 따라서 image당 1,000,000은 공식 견적이 아닌 보수적인 **로컬 admission ceiling**이다. 실제 usage가 입장 시 token ceiling을 넘으면 502 및 unknown hold로 처리한다.
+
+Upstream은 `{api_base or https://api.openai.com/v1}/decisions`에 single attempt로 전송하며 redirects/environment proxies/retries를 쓰지 않는다. 전체 120초, connect 10초, write 30초, response 8 MiB 상한이다. 명확한 connection-before-send 실패와 provider rejection은 hold를 release한다. Send 이후 timeout/cancel/불명확한 응답/정산 실패는 `unknown`, process crash는 `reserved`를 유지한다. **두 상태는 시간이 지나도 quota에서 제외하지 않는다.** 자동 재전송/자동 만료/자동 재정산은 없다.
+
+공식 OpenAI root(`https://api.openai.com` 및 trailing slash 포함)는 기존 direct-provider base 판별을 재사용해 `/v1/decisions`로 정규화한다. 공식 `/v1` base와 미지정 base도 같은 URL을 쓴다. Third-party custom root/prefix에는 `/v1`을 임의로 추가하지 않고 저장된 prefix 뒤 `/decisions`만 붙인다.
+
+Fresh provider credential 조회는 dispatch 경계보다 먼저 수행한다. 해당 DB 조회의 cancellation/storage failure는 provider I/O가 없으므로 hold를 release한다. 실제 HTTP dispatch 직전에만 possible-send 상태로 바뀌며 이후 cancellation은 unknown hold로 남는다.
+
+운영자는 unknown/crashed reservation의 event UUID와 provider의 사용 증거를 대조한 뒤 유지·정산·release disposition을 검토해야 한다. 이 변경은 operator disposition API/CLI를 추가하지 않는다. 승인된 유지보수에서만 내부 서비스의 `stateless_credit.settle`(동일 event, 검증된 usage) 또는 **definite-no-charge 확인 뒤** `stateless_credit.finish(event_id, uncertain=False)`를 명시적으로 사용한다. 불명확한 hold를 삭제하거나 clock/TTL로 quota를 복원하면 안 된다. Settled/released row는 감사 보존 정책에 따라, immutable usage event와의 연결을 보존한 별도 유지보수에서만 정리한다.
+
+Migration **034**를 적용한 뒤 새 writer를 시작한다(동시 pending migration 033과 함께 사전 적용). Additive table이므로 old writer는 무시하지만 old writer는 stateless hold를 quota에 반영하지 않는다. 따라서 새 Decisions admission을 연 상태에서 quota를 공유하는 old/new writer를 혼용하지 않는다. Rollback은 새 admission 정지·in-flight drain 뒤 code rollback이며 hold table/ledger를 drop하지 않는다.
+
+공식 계약: [create reference](https://developers.openai.com/api/reference/resources/decisions/methods/create), [Decisions guide](https://developers.openai.com/api/docs/guides/decisions). 위 검증/transport/SQL 테스트는 source/local/synthetic 증거이며 production 또는 유료 provider 검증이 아니다.
