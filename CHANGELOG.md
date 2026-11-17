@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **한국어 — 클라우드 승인:** 프로토콜 v2의 Afterglow 변경 미리보기 JSON 처리를 수정하고 VM 생성의 명시적 이미지·flavor·네트워크·부팅 볼륨·키·보안그룹 선택과 관리 권한 동의 경로를 안내한다. 클라우드 변경은 내부 자동 승인 설정에서도 사용자의 승인을 요구한다. 프로토콜 v1의 조회 전용 경계는 유지하며 실제 VM을 생성하지 않았다.
+- **English — Cloud approval:** Correct protocol-v2 JSON mutation previews and explain explicit VM resource choices and manage consent. Cloud mutations always require human approval, including internal automatic mode. Protocol v1 remains read-only; no live VM creation was performed.
+- **한국어 — MCP 연결:** GitHub MCP Registry 896개를 카탈로그에 반영하고 원격 HTTPS 634개와 지원되지 않는 transport를 구분한다. 개인·조직·전역 연결을 분리하며 조직 연결은 exact-domain manager 또는 human system admin만 관리한다. 구성원에게 비밀을 노출하지 않고 개인 활성화·frozen-run 재검증을 유지한다. 새 API는 `/v1/mcp-settings`, `/v1/mcp-connections`, `/v1/domains/{id}/mcp-connections`, `/v1/admin/mcp-registry/install-featured`다. Schema 033을 먼저 적용해야 한다. Playwright·Markitdown은 managed sandbox 항목으로 표시하며 실제 사용에는 별도 검증된 sandbox pool이 필요하다.
+- **English — MCP connections:** Catalog all 896 GitHub registry entries, distinguishing 634 HTTPS remotes from unsupported transports. Add personal, organization and global connection states; exact-domain managers and human system admins alone manage organization credentials. Member views are secret-free and require personal activation; frozen runs retain authority/configuration fences. Apply migration 033 before the new APIs. Playwright and Markitdown remain managed sandbox tools, available only with a separately qualified pool.
+
 ## 0.6.16 — 2026-11-17 (published and deployed; no embedding models registered)
 
 - **한국어 — 임베딩:** 등록된 OpenAI/Gemini 텍스트 임베딩 모델과 토큰 단가를 위한 별도 `embedding` 종류를 추가한다. API 키 호환 API는 OpenAI `POST /v1/embeddings`와 Gemini `/v1beta/models/{model}:embedContent`·`:batchEmbedContents`를 제공하고, Keystone 세션은 Afterglow Embedding Studio용 native `/v1/chat/embeddings`를 사용한다. 기존 Bifrost 단일 provider 경계·권한·quota·사용량 원장을 재사용한다. 아직 live provider 호출·배포를 검증하지 않았다.

@@ -11,6 +11,14 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
 
+### Dashboard MCP and cloud-approval integration
+
+`mcp_domain_authority` resolves exact current project-domain membership and legitimate canonical-Default/direct-domain manager grants through native Keystone. It rejects reduced/API-key management and ignores Afterglow-derived manager projection grants. `ChatMcpServer` gains domain ownership and a scope-keyed uniqueness boundary in migration 033; the unmerged Drover migration 032 is independent and the loader permits the gap. Domain credentials are encrypted, shared only at execution, and absent from member responses. Personal activation, config fingerprint, credential version and current native membership are rechecked before frozen connections run.
+
+`GET /v1/mcp-settings` combines registry entries, personal/global/domain connection states and managed sandbox availability. Personal `/v1/mcp-connections` and exact-domain `/v1/domains/{id}/mcp-connections` reuse the existing OAuth/activation lifecycle. Featured installation uses the admin route and never makes a catalog connection implicitly selected. Playwright and Markitdown require real sandbox manifest/image qualification; their catalog presence does not enable execution.
+
+Protocol-v2 cloud bindings consume the bridge's JSON preview and require human approval for every managed external mutation, even under internal automatic mode. Discovery explains project-bound manage consent and explicit VM parameters without fabricating native identifiers. Protocol v1 intentionally retains its read-only tool set. Isolated encrypted-PostgreSQL approval/recovery checks are local evidence, not production VM acceptance.
+
 ### 0.6.12 cooperative title scheduling stop
 
 `_title_processor_loop` owns an explicit `asyncio.Event` supplied by the worker. `stop_auxiliary` sets it before any cleanup await or cancellation, including error-finally paths that never entered `WorkerLoop.draining`. The loop checks it before each new claim and before idle sleep; cancellation still interrupts idle waits, while existing `auxiliary.finish_inflight` preserves an admitted operation and lease renewal through completion. A dependency consuming cancellation cannot resume scheduling or keep shutdown gathering forever. This does not clear historical auxiliary counters, manufacture a drain acknowledgment, interrupt/replay provider I/O, or repair an already-loaded old process. Source-bound diagnostics prove the observed old title-loop shutdown blocker, not its earlier initiating application failure.

@@ -4,6 +4,23 @@
 
 > **0.6.10 candidate integration — unverified, not deployed.** Account/private-converter/probe/settled-relay contracts below describe the integrated source, not an accepted release. Any dated test, CLI or provider receipt retained here belongs only to its original source/runtime; it does not validate this candidate. No checks were run for this documentation integration.
 
+## MCP registry and organization connections
+
+Service-native paths use `/v1/*`; the Afterglow browser uses `/api/v1/chat/*` through its authenticated BFF.
+
+| Route | Contract |
+| --- | --- |
+| `GET /v1/mcp-settings` | Search/filter/paginate templates and current user's connection states; response includes server-derived `domain_id` and `can_manage_domain`. |
+| `POST /v1/mcp-connections` | Create a personal catalog connection with `{template_id, label?, variables?, auth_mode?, headers?}`; returns `{created, server}`. |
+| `PATCH /v1/mcp-connections/{id}` | Owner changes credentials/publication; changed authority invalidates prior selections. |
+| `DELETE /v1/mcp-connections/{id}` | Delete the caller's personal connection. |
+| `GET /v1/domains/{id}/mcp-connections` | Exact-domain members receive secret-free, paginated connection state. |
+| `POST`, `PATCH`, `DELETE /v1/domains/{id}/mcp-connections[/connection_id]` | Exact-domain managers or unrestricted human system admins manage the organization's connection. |
+| `PATCH /v1/domains/{id}/mcp-connections/{connection_id}/activation` | Member activates only their own view for an exact `config_version`. |
+| `POST /v1/admin/mcp-registry/install-featured` | System-admin idempotent seed of credential-free featured remote templates; never implicitly selected. |
+
+Domain identity and management authority come from current native Keystone, not request-body roles. Reduced credentials and API keys cannot manage organization connections. Organization OAuth stores a shared encrypted domain-owned credential; only managers may start/disconnect it. Ordinary member responses expose presence/status, never headers or tokens. Existing personal/global OAuth endpoints remain in use. Unavailable managed Playwright/Markitdown entries are not remote-server connections.
+
 ## 인증과 scope
 
 Keystone/API key는 fresh enabled owner/project, exact native effective roles와 service-local oslo.policy를 요구한다. Standard project admin/manager/member는 owned resource를 관리하고 reader는 nonsecret read만 한다. Dedicated Lumen grades/leaves와 personal-project marker는 필요하지 않다. Custom/group/domain/inherited 및 retained legacy native implication은 exact standard role에 도달하면 그대로 유효하다. API key는 `X-API-Key`/Bearer로 전송하며 stored scope는 추가 ceiling이다. Compat text/model route는 API-key-only다. Original source/issued-ID, foreign target, ownership와 downstream credential 경계는 policy override와 독립적이다.
