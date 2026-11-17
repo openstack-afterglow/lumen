@@ -458,3 +458,23 @@ def test_embedding_override_rejects_invalid_dimension_constraints(patch):
         ModelCreateRequest(
             provider_id=1, model_name="embedding", model_kind="embedding", capabilities={"embedding": embedding},
         )
+
+
+@pytest.mark.parametrize("changed_flag", ["decisions", "vision"])
+async def test_capability_editor_empty_options_keep_catalog_reasoning(provider_db, admin_client, monkeypatch, changed_flag):
+    from lumen.services.chat_admission import _validated_reasoning_effort
+
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type="openai")
+    add_model("gpt-6-luna")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    entry = next(model for model in native_catalog()["providers"]["openai"]["models"] if model["id"] == "gpt-6-luna")
+    overrides = {
+        "reasoning": True, "tool_call": True, "attachment": True,
+        "reasoning_options": [], "context_limit": None, changed_flag: True,
+    }
+    saved = await admin_client.patch("/v1/admin/models/10", json={"capabilities": overrides})
+    assert saved.status_code == 200, saved.text
+    effective = saved.json()["effective_capabilities"]
+    assert effective["reasoning_options"] == entry["reasoning_options"]
+    assert _validated_reasoning_effort("high", {"capabilities": effective}) == "high"

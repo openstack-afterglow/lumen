@@ -2,7 +2,8 @@
 
 Live API lists are authoritative for API-key providers. A failed or incomplete live
 fetch never becomes a usable catalog list. Native subscription modes use the tracked
-native catalog. Compatible endpoints supply IDs only, with administrator-owned prices.
+native catalog. Compatible endpoints supply live IDs and display names only, with
+administrator-owned prices.
 Custom bases are trusted (including local endpoints), but redirects and environment
 proxies are disabled so credentials cannot be forwarded to another origin.
 """
@@ -124,7 +125,7 @@ def _serialize_candidate(
     )
     return {
         "id": candidate.id,
-        "display_name": None if compatible else candidate.display_name or entry.get("display_name"),
+        "display_name": candidate.display_name or entry.get("display_name"),
         "purpose": purpose,
         "generation_methods": [] if compatible else list(candidate.generation_methods),
         "input_token_limit": None if compatible else candidate.input_token_limit or entry.get("context_window"),
@@ -445,7 +446,9 @@ async def _fetch_openai_compatible_models(
                 if len(candidates) >= _MAX_MODELS:
                     raise _DiscoveryFailure("discovery_model_limit", "모델 목록 조회 한도를 초과했습니다")
                 seen.add(projected)
-                candidates.append(DiscoveredCandidate(id=projected))
+                display_name = item.get("display_name") if isinstance(item, dict) else None
+                display_name = display_name.strip() if isinstance(display_name, str) and display_name.strip() else None
+                candidates.append(DiscoveredCandidate(id=projected, display_name=display_name))
             return _FetchOutcome("success" if candidates else "empty", tuple(candidates))
     except TimeoutError:
         return _error_outcome("discovery_timeout", "모델 목록 조회 시간이 초과되었습니다", True)

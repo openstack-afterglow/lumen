@@ -223,7 +223,7 @@ class TestEffectiveCapabilities:
             "pricing_available": False,
         }
 
-    @pytest.mark.parametrize(("transport_available", "expected_required"), ((False, False), (True, False)))
+    @pytest.mark.parametrize(("transport_available", "expected_required"), ((False, False), (True, True)))
     def test_sonar_requires_native_search_only_when_exact_transport_supports_it(
         self, monkeypatch, transport_available, expected_required
     ):

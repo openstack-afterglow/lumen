@@ -661,16 +661,28 @@ Separately priced managed search providers remain supported for CRUD and search 
 the inference-only provider allowlist does not remove search adapters.
 Decisions can be enabled only for OpenAI-protocol text routes, including compatible
 endpoints; Anthropic/Gemini/Perplexity or subscription overrides cannot enable it.
+Perplexity Sonar's built-in search remains a separate, pre-existing behavior: its
+`web_search_required` authorization floor still requires `native:tools:execute`, even
+when the optional native-search gate is unavailable or an override disables that gate.
+Sonar remains admitted as before; its unbilled provider search fees are a documented
+known gap, not permission to drop the tools scope or claim complete fee accounting.
 
-ChatGPT subscription discovery can show the OpenAI catalog list, but subscription routes
-never borrow API token/cache/media rates, context tiers or model capability metadata.
-Their existing authentication/transport limits remain; administrator rates are required.
+ChatGPT subscriptions use OpenAI catalog specifications for discovery, capabilities and
+context only, followed by the existing subscription transport limits. They never borrow
+API token/cache/media rates or price tiers; administrator subscription rates are required.
 
 For tiered models, catalog modality rates identical to effective text categories retain
 their required provider observations but settle in the text residual, using that call's
-context tier. The frozen `token_rates_follow_text` provenance enables this inheritance
-only for catalog buckets, never coincidentally equal administrator media prices.
+context tier, only when both the modality and compared text rates are catalog-sourced.
+The frozen `token_rates_follow_text` provenance excludes manual media prices and manual
+text prices, even when their numbers happen to equal the published catalog rates.
 Distinct catalog modality rates require corresponding explicit
 `token_pricing.long_context.token_rates` entries; a future mixed bucket freezes every
 effective tier field. Existing native tiered Gemini audio fields all equal their base
 text categories; no differing native modality tier was silently assumed.
+
+An absent or empty administrator `reasoning_options` list is unspecified, like a null
+context limit: saving another capability toggle retains the detected catalog options.
+Use explicit capability controls rather than an empty list to disable reasoning.
+Live model-discovery display names are retained, including uncatalogued IDs and compatible
+endpoints; compatible IDs still receive no bundled kind, price or capability annotations.

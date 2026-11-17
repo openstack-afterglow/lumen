@@ -826,3 +826,46 @@ async def test_api_generation_segment_keeps_ceiling_before_hold_without_reauthor
     hold.assert_not_awaited()
     assert starts == [] and reservations == [] and run.provider_started_at is None
     assert segment.status == segment_state
+
+
+@pytest.mark.parametrize("search_override", [None, False, True])
+def test_real_catalog_sonar_route_retains_intrinsic_search_scope(search_override):
+    from lumen.models.chat_db import LlmModel
+    from lumen.services.providers import routing
+
+    credential = SimpleNamespace(
+        id=93, account_id=92, name="fixture-key", auth_mode="api_key", generation=0,
+        is_active=True, priority=0, weight=1, allowed_model_ids=None, allowed_capabilities=None,
+        encrypted_api_key="fixture-ciphertext", api_key_env=None, subscription_status="configured",
+    )
+    account = SimpleNamespace(
+        id=92, provider_id=91, name="fixture-account", credentials=[credential], is_active=True,
+        priority=0, weight=1, allowed_model_ids=None, allowed_capabilities=None, quota_group=None,
+    )
+    provider = SimpleNamespace(
+        id=91, name="catalog-sonar", provider_type="perplexity", api_provider="perplexity",
+        api_base=None, auth_mode="api_key", is_active=True, margin_multiplier=Decimal(1),
+        selection_policy="priority", selected_credential_id=None, accounts=[account],
+    )
+    model = LlmModel(
+        id=94, provider_id=91, model_name="perplexity/perplexity/sonar", model_kind="text",
+        is_active=True, capabilities=None if search_override is None else {"web_search": search_override},
+        capability_source=None if search_override is None else "override",
+    )
+    resolved = routing._resolved_model(model, provider)
+    assert resolved["capabilities"]["web_search_required"] is True
+    assert resolved["capabilities"]["feature_gates"]["web_search"]["available"] is False
+    assert inference_authority.model_required_scopes(resolved) == ("native:tools:execute",)
+    assert inference_authority.completion_scopes({}, resolved=resolved) == (
+        "compat:completions:write", "native:tools:execute",
+    )
+    features = ChatFeatureOptions(memory=False, tool_policy=ToolPolicy(mode="none"))
+    admission = dict(parts=[], execution_mode="chat", skill_ids=[], plugin_tool_snapshots=[],
+                     plugin_skill_snapshots=[], agent=None, extension_selection={"tools": [], "mcp": []},
+                     resolved=resolved)
+    with pytest.raises(HTTPException) as denied:
+        chat_admission._require_native_admission_scopes(principal(key=True), features, **admission)
+    assert denied.value.status_code == 403
+    chat_admission._require_native_admission_scopes(
+        principal(key=True, scopes=("native:runs:write", "native:tools:execute")), features, **admission,
+    )

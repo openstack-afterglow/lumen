@@ -36,12 +36,18 @@ options precede missing-field legacy imported options/windows on native direct r
 Other imported flags cannot override native/default capabilities or CLI tool eligibility.
 
 Managed search adapters remain independent of inference-provider restrictions. Native
-paid search stays unavailable until request fees are billable; token prices alone do not
-activate it. Catalog-origin text-equivalent modalities retain required observations and
-inherit text context tiers only at settlement; explicit administrator modality prices
-remain literal. Distinct native modality tiers must be represented explicitly.
+paid optional search stays unavailable until request fees are billable; intrinsic Sonar
+search independently retains its tools-scope authorization floor and existing admission.
+Text-equivalent modalities inherit tiers only when both compared categories are catalog
+sourced, while required observations and literal administrator prices remain preserved.
+Distinct native modality tiers must be represented explicitly.
 
-ChatGPT subscription catalog mapping is discovery-only, not an API tariff fallback.
+ChatGPT subscriptions reuse catalog capabilities/context, never API tariffs or price tiers.
 Retired provider rows can still be deactivated. SDK and generated admin documentation
 replace removed import surfaces with the read-only catalog method. Mixed-row price
 origins derive from the same base/media resolution as runtime pricing.
+
+Empty capability-editor reasoning options are unspecified and retain detected catalog
+options. Live discovery display names remain authoritative even for uncatalogued and
+compatible IDs. Compatible test fixtures must use administrator pricing, and embedding
+fixtures must obey the published per-model dimensionality interval.

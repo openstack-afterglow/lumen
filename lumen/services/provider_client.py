@@ -29,7 +29,6 @@ from lumen.services.providers.errors import ProviderSubscriptionError
 _CONTRACT = "single-attempt-v1"
 _TIMEOUT = httpx.Timeout(90.0, connect=10.0, read=90.0, write=30.0, pool=10.0)
 _PROVIDERS = frozenset({"openai", "anthropic", "gemini", "perplexity", "chatgpt"})
-_PROVIDER_ALIASES = {"vertex_ai": "vertex", "azure_ai": "azure", "together_ai": "together"}
 _RESERVED = frozenset({
     "api_base", "api_key", "base_url", "custom_llm_provider", "provider_auth",
     "model", "messages", "provider", "stream", "headers", "extra_headers",
@@ -71,7 +70,7 @@ def provider_object(value: Any) -> Any:
 
 
 def provider_once_supported(provider_type: str | None) -> bool:
-    return _PROVIDER_ALIASES.get(provider_type, provider_type) in _PROVIDERS - {"chatgpt"}
+    return provider_type in _PROVIDERS - {"chatgpt"}
 
 
 def direct_openai_stream_completed(stream: Any) -> bool:
@@ -372,7 +371,6 @@ async def _execute(
 
 def _provider(model: str, provider: str | None) -> str:
     selected = provider or model.partition("/")[0]
-    selected = _PROVIDER_ALIASES.get(selected, selected)
     return selected if provider or selected in _PROVIDERS else "openai"
 
 
@@ -380,9 +378,6 @@ def _model(model: str, provider: str) -> str:
     name = api_model_name(transport_model_name(model), provider)
     if provider != "perplexity":
         name = name.removeprefix(f"{provider}/")
-        for alias, canonical in _PROVIDER_ALIASES.items():
-            if canonical == provider:
-                name = name.removeprefix(f"{alias}/")
     return name.removeprefix("responses/")
 
 

@@ -487,7 +487,9 @@ def test_equal_manual_audio_prices_never_inherit_text_context_tier(explicit_flag
     "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools", "gemini-2.5-pro",
 ])
 @pytest.mark.parametrize("prompt", [200_000, 200_001])
-@pytest.mark.parametrize("manual_category", [None, "input", "cache_read", "cache_read_free"])
+@pytest.mark.parametrize("manual_category", [
+    None, "input", "cache_read", "cache_read_free", "input_equal", "cache_read_equal", "output_equal",
+])
 def test_resolved_native_gemini_keeps_required_audio_and_effective_tiers(
     model_name, prompt, manual_category, monkeypatch,
 ):
@@ -517,9 +519,15 @@ def test_resolved_native_gemini_keeps_required_audio_and_effective_tiers(
     token = entry["token_pricing"]
     applicable = token["long_context"] if prompt > token["long_context"]["threshold_tokens"] else token
     million = Decimal("1000000")
+    if manual_category == "input_equal":
+        model.input_price = Decimal(token["input"]) / million
+    elif manual_category == "cache_read_equal":
+        model.cache_read_price = Decimal(token["cache_read"]) / million
+    elif manual_category == "output_equal":
+        model.output_price = Decimal(token["output"]) / million
     route = routing._resolved_model(model, provider)
     _, snapshot = _run_snapshots(route, {}, parts=[SimpleNamespace(type="audio")], summary_route=route)
-    assert snapshot["token_rates_follow_text"] is True
+    assert snapshot["token_rates_follow_text"] is (manual_category is None)
     assert snapshot["token_rates"]["audio"]["input_per_million"]
     assert snapshot["required_token_modalities"] == ["audio_input"]
     admitted = completion_api.billing_route(
@@ -546,7 +554,7 @@ def test_resolved_native_gemini_keeps_required_audio_and_effective_tiers(
     text_cache_rate = model.cache_read_price if model.cache_read_price is not None else audio_cache_rate
     expected_input = (prompt - 950) * text_input_rate + 600 * audio_input_rate
     expected_cache = 50 * text_cache_rate + 300 * audio_cache_rate
-    expected_output = 50 * Decimal(applicable["output"]) / million
+    expected_output = 50 * (model.output_price if model.output_price is not None else Decimal(applicable["output"]) / million)
     for frozen in (snapshot, snapshot["summary_route"]):
         observed = _cost(frozen, reported, required=["audio_input"])
         assert observed.input_cost == expected_input

@@ -410,7 +410,7 @@ def test_stored_canonical_gates_and_detected_modalities_are_preserved():
     assert normalized["output_modalities"] == ["text"]
 
 
-def test_managed_search_does_not_retain_native_sonar_requirement():
+def test_managed_search_does_not_remove_intrinsic_sonar_scope_floor():
     normalized = normalize_capabilities(
         {
             "feature_gates": {
@@ -426,7 +426,7 @@ def test_managed_search_does_not_retain_native_sonar_requirement():
     )
 
     assert normalized["feature_gates"]["web_search"]["mode"] == "managed"
-    assert normalized["web_search_required"] is False
+    assert normalized["web_search_required"] is True
 
 
 def test_stored_native_search_gate_cannot_enable_unsupported_transport():
@@ -666,14 +666,22 @@ def test_public_model_marks_unpriced_text_route_unavailable():
     assert public["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is False
 
 
-def test_chatgpt_subscription_capabilities_use_static_metadata_without_provider_probe(monkeypatch):
-    monkeypatch.setattr(
-        capability_service,
-        "catalog_model_metadata",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("provider probe is forbidden")),
-    )
+def test_chatgpt_subscription_uses_catalog_capabilities_without_api_prices(monkeypatch):
+    original = capability_service.catalog_model_metadata
+    observed = []
 
-    capabilities = provider_capabilities("chatgpt/gpt-5.2-codex", "chatgpt")
+    def metadata(model_name, provider_type, api_base=None):
+        observed.append((model_name, provider_type))
+        return original(model_name, provider_type, api_base)
+
+    monkeypatch.setattr(capability_service, "catalog_model_metadata", metadata)
+    capabilities = provider_capabilities("chatgpt/gpt-5.5", "chatgpt")
+    assert observed == [("gpt-5.5", "openai")]
+    assert capabilities["vision"] is True
+    assert capabilities["function_calling"] is True
+    assert capabilities["reasoning"] is True
+    assert capabilities["context_limit"] == 1050000
+    assert capabilities["max_output_tokens"] == 128000
 
     assert capabilities["responses_api"] is True
     assert capabilities["endpoints"] == ["responses"]
