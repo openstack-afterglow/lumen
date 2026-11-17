@@ -262,9 +262,17 @@ def _grant_bindings(snapshot, principal, *, multi: bool) -> list[ToolBinding]:
                 entry=registry_entry,
                 arguments=parsed,
             )
-            detail = f"{plan.intended_transition}: {plan.resource_identity}" + (
-                f" (current state: {plan.current_state})" if plan.current_state else ""
-            )
+            transition = plan["intended_transition"]
+            identity = plan["resource_identity"]
+            if not isinstance(transition, str) or not isinstance(identity, str):
+                raise ValueError("Cloud mutation preview is invalid")
+            detail = f"{transition}: {identity}"
+            if plan.get("current_state"):
+                detail += f" (current state: {plan['current_state']})"
+            if plan.get("estimated_effect"):
+                detail += f"\n{plan['estimated_effect']}"
+            for resource in plan.get("dependent_resources", []):
+                detail += f"\n{resource}"
             return {
                 "preview": [ToolTextPart(text=detail).model_dump(mode="json")],
                 "expected_state_revision": None,
@@ -318,6 +326,9 @@ _CATALOG_CAPABILITY_ALIASES = (
     ("컴퓨트", ("compute", "nova", "vm", "server", "servers", "instance", "instances")),
     ("컴퓨팅", ("compute", "nova", "vm", "server", "servers", "instance", "instances")),
     ("가상머신", ("vm", "nova", "server", "servers", "instance", "instances")),
+    ("인스턴스", ("vm", "nova", "server", "servers", "instance", "instances")),
+    ("생성", ("create",)),
+    ("만들", ("create",)),
     ("스토리지", ("storage", "cinder", "volume", "volumes", "swift", "manila")),
     ("볼륨", ("volume", "volumes", "cinder")),
     ("네트워크", ("network", "networks", "neutron", "subnet", "subnets")),
@@ -416,10 +427,32 @@ async def _search_and_load_bindings(
         }
         for binding in selected
     ]
+    payload: dict[str, object] = {"loaded_tools": [item["name"] for item in catalog], "tools": catalog}
+    if _catalog_terms(query) & {"cloud", "nova", "vm", "instance", "instances", "cinder", "neutron"}:
+        payload["cloud_access"] = {
+            "mutation_protocol_version": 2,
+            "runtime_supports_mutations": include_managed,
+            "consent_url": "/dashboard/chat/settings?section=mcp",
+            "instructions": (
+                "Cloud writes require protocol v2 and explicit owner/project write consent. "
+                "In Afterglow chat settings → MCP → Afterglow MCP, deactivate existing read-only access first, "
+                "then activate, choose Read and manage, verify the current project and approve. "
+                "If runtime_supports_mutations is false, an operator must qualify and enable protocol v2 "
+                "on both API and workers; changing consent alone cannot enable writes. "
+                "Explain these prerequisites and the consent link instead of claiming cloud creation does not exist."
+            ),
+            "vm_creation": (
+                "Use image, flavor, network, keypair, security group and quota read tools to gather choices. "
+                "Ask the user for missing selections; never invent IDs or silently choose access settings. "
+                "Propose afterglow_vm_create with explicit image_id, flavor_id, network_id, "
+                "boot_volume_size_gb, user-owned key_name and project-owned security_group_ids. "
+                "Human approval must show exact arguments before execution. Acceptance is not guest readiness."
+            ),
+        }
     return V2ToolExecutionResult(
         status="completed",
         model_content=json.dumps(
-            {"loaded_tools": [item["name"] for item in catalog], "tools": catalog},
+            payload,
             ensure_ascii=False,
             separators=(",", ":"),
         ),

@@ -896,10 +896,13 @@ def _build_graph(params: dict, ctx: ToolContext):
                     "policy_limited": emitted_count + index >= max_tool_calls,
                     "effect_denied": emitted_count + index < max_tool_calls and not effect_allowed,
                     "requires_approval": effect_allowed
-                    and _requires_v2_approval(
-                        effective_effect,
-                        params.get("approval_mode"),
-                        params.get("workspace_write_mode"),
+                    and (
+                        (definition.source == "managed" and effective_effect == "external_mutation")
+                        or _requires_v2_approval(
+                            effective_effect,
+                            params.get("approval_mode"),
+                            params.get("workspace_write_mode"),
+                        )
                     ),
                     "source": definition.source,
                     "effect": effective_effect,

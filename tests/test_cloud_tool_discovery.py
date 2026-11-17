@@ -49,6 +49,7 @@ def bridge(monkeypatch):
         ],
         requests=[],
         invocations=[],
+        previews=[],
         reject_execute=False,
         execute_failure_status=403,
     )
@@ -65,6 +66,26 @@ def bridge(monkeypatch):
                 "snapshot": state.snapshot,
                 "entries": state.entries if state.snapshot is not None else [],
                 "service_fingerprint": "a" * 64,
+            })
+        if request.url.path.endswith("/preview"):
+            if payload["snapshot"] != state.snapshot:
+                return httpx.Response(403, json={"detail": "selection unavailable"})
+            state.previews.append(payload)
+            arguments = payload["arguments"]
+            return httpx.Response(200, json={
+                "resource_identity": f"nova-server:new:p1:{arguments['name']}",
+                "current_state": None,
+                "intended_transition": "create",
+                "dependent_resources": [
+                    f"glance-image:{arguments['image_id']}",
+                    f"nova-flavor:{arguments['flavor_id']}",
+                    f"neutron-network:{arguments['network_id']}",
+                    f"nova-keypair:u1:{arguments['key_name']}",
+                    *[f"neutron-security-group:{group}" for group in arguments["security_group_ids"]],
+                ],
+                "destructive": False,
+                "estimated_effect": f"create one VM with a {arguments['boot_volume_size_gb']} GiB boot volume",
+                "fingerprint": "b" * 64,
             })
         assert request.url.path.endswith("/execute")
         if (state.reject_execute or payload["snapshot"] != state.snapshot
@@ -375,3 +396,171 @@ async def test_failed_port_list_journals_valid_result_and_reaches_next_model_tur
     assert retained["content"] == "Cloud control-plane call was denied or is unavailable."
     assert retained["visible"] is False
     assert len([path for path, _payload in bridge.requests if path.endswith("/execute")]) == 1
+
+
+@pytest.mark.parametrize("protocol", [1, 2])
+async def test_cloud_creation_discovery_explains_consent_and_runtime(bridge, protocol):
+    ctx = await _admitted_context(protocol)
+    loaded, _ = await _search(ctx, "인스턴스를 만들어 줘", protocol)
+    access = loaded["cloud_access"]
+    assert access["mutation_protocol_version"] == 2
+    assert access["runtime_supports_mutations"] is (protocol == 2)
+    assert access["consent_url"] == "/dashboard/chat/settings?section=mcp"
+    assert "owner/project write consent" in access["instructions"]
+    assert "boot_volume_size_gb" in access["vm_creation"]
+    assert "afterglow_vm_list" in loaded["loaded_tools"]
+    assert bridge.invocations == []
+
+
+async def test_v2_read_consent_does_not_acquire_creation_authority(bridge):
+    bridge.entries = [entry for entry in bridge.entries if entry["effect"] == "read"]
+    ctx = await _admitted_context(2)
+    loaded, target = await _search(ctx, "인스턴스 생성", 2)
+    assert "afterglow_vm_create" not in loaded["loaded_tools"]
+    assert "afterglow_vm_create" not in target
+    assert loaded["cloud_access"]["runtime_supports_mutations"] is True
+    assert loaded["cloud_access"]["consent_url"] == "/dashboard/chat/settings?section=mcp"
+    assert bridge.previews == bridge.invocations == []
+
+
+@pytest.mark.parametrize("approval_mode", ["required_for_mutations", "never"])
+@pytest.mark.parametrize("decision", ["approve", "deny", "revoked", "changed_epoch"])
+async def test_vm_creation_chat_requires_exact_human_approval(
+    monkeypatch, bridge, approval_mode, decision,
+):
+    """Synthetic model + HTTP authority: real discovery, graph interrupt and dispatch."""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from lumen.services import graph
+
+    arguments = {
+        "name": "chat-vm",
+        "image_id": "11111111-1111-4111-8111-111111111111",
+        "flavor_id": "small",
+        "network_id": "22222222-2222-4222-8222-222222222222",
+        "boot_volume_size_gb": 24,
+        "key_name": "my-key",
+        "security_group_ids": ["33333333-3333-4333-8333-333333333333"],
+    }
+    create = _entry(
+        "afterglow_vm_create", "Create one Nova VM with explicit selections.", "external_mutation",
+    )
+    create["input_schema"] = {
+        "type": "object",
+        "properties": {
+            name: {"type": "integer", "minimum": 1} if name == "boot_volume_size_gb"
+            else {"type": "array", "items": {"type": "string"}, "minItems": 1} if name == "security_group_ids"
+            else {"type": "string", "minLength": 1}
+            for name in arguments
+        },
+        "required": list(arguments),
+        "additionalProperties": False,
+    }
+    reads = [
+        "afterglow_image_list", "afterglow_flavor_list", "afterglow_network_list",
+        "afterglow_keypair_list", "afterglow_security_group_list", "afterglow_quota_get",
+    ]
+    bridge.entries = [create, *[_entry(name, f"Read available choices: {name}.") for name in reads]]
+    ctx = await _admitted_context(2)
+    loaded_names = []
+    provider_schemas = []
+    provider_messages = []
+
+    class Hooks:
+        async def loaded_tool_names(self):
+            return list(loaded_names)
+
+        async def tool_completed(self, *, tool_name, result_payload, **_kwargs):
+            if tool_name == "list_available_tools":
+                for name in json.loads(result_payload["content"])["loaded_tools"]:
+                    if name not in loaded_names:
+                        loaded_names.append(name)
+
+    async def no_builtins(_context):
+        return {}
+
+    async def completion_stream(**kwargs):
+        provider_messages.append(kwargs["messages"])
+        provider_schemas.append({item["function"]["name"] for item in kwargs.get("tools") or []})
+        turn = len(provider_messages)
+
+        async def chunks():
+            if turn == 1:
+                calls = [("discover-create", "list_available_tools", {"query": "인스턴스를 만들어 줘"})]
+            elif turn == 2:
+                calls = [("discover-choices", "list_available_tools", {
+                    "query": "image flavor network keypair security group quota", "max_results": 8,
+                })]
+            elif turn == 3:
+                calls = [(f"read-{index}", name, {}) for index, name in enumerate(reads)]
+            elif turn == 4:
+                calls = [("create-vm", "afterglow_vm_create", arguments)]
+            else:
+                calls = []
+            if calls:
+                yield {"choices": [{"delta": {"tool_calls": [
+                    {"index": index, "id": call_id, "function": {
+                        "name": name, "arguments": json.dumps(args),
+                    }}
+                    for index, (call_id, name, args) in enumerate(calls)
+                ]}}]}
+            else:
+                yield {"choices": [{"delta": {"content": "VM request handled; guest readiness is not confirmed."}}]}
+            yield {"usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+
+        return chunks()
+
+    monkeypatch.setattr(bindings, "v2_builtin_tool_bindings", no_builtins)
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
+    monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
+    parameters = {
+        "model": "synthetic-model", "messages": [{"role": "user", "content": "인스턴스를 만들어 줘"}],
+        "project_id": "p1", "user_id": "u1", "execution_protocol_version": 2,
+        "approval_mode": approval_mode, "execution_hooks": Hooks(),
+        "run_id": f"vm-create-{decision}-{approval_mode}",
+        "lumen_snapshot": ctx.lumen_snapshot, "lumen_snapshot_frozen": True,
+    }
+    events = [event async for event in graph.stream(**parameters)]
+    approval = next(event["payload"] for event in events if event.get("type") == "input.interrupted")
+    call, = approval["calls"]
+    assert call["call_id"] == "create-vm"
+    assert call["effect"] == "external_mutation"
+    assert json.loads(call["arguments"]) == arguments
+    preview_text = "\n".join(part["text"] for part in call["preview"])
+    assert "nova-server:new:p1:chat-vm" in preview_text
+    assert "24 GiB" in preview_text
+    for field in ("image_id", "flavor_id", "network_id", "key_name"):
+        assert arguments[field] in preview_text
+    assert arguments["security_group_ids"][0] in preview_text
+    assert provider_schemas[0] == {"list_available_tools"}
+    assert "afterglow_vm_create" in provider_schemas[1]
+    assert set(reads) <= provider_schemas[2]
+    assert {item["name"] for item in bridge.invocations} == set(reads)
+    assert len(bridge.previews) == 1
+    assert bridge.previews[0]["arguments"] == arguments
+    assert not any(item["name"] == "afterglow_vm_create" for item in bridge.invocations)
+
+    if decision == "revoked":
+        bridge.snapshot = None
+    elif decision == "changed_epoch":
+        bridge.snapshot = {**bridge.snapshot, "credential_epoch": 4}
+    resume = {"kind": "tool_approval", "decisions": [
+        {"call_id": "create-vm", "decision": "deny" if decision == "deny" else "approve"},
+    ]}
+    if decision in {"revoked", "changed_epoch"}:
+        with pytest.raises(RuntimeError):
+            _ = [event async for event in graph.stream(**parameters, resume=resume)]
+    else:
+        resumed = [event async for event in graph.stream(**parameters, resume=resume)]
+        result = next(event for event in resumed if event.get("type") == "tool_result")
+        assert result["status"] == ("completed" if decision == "approve" else "failed")
+        if decision == "deny":
+            assert result["error_code"] == "tool_denied"
+        assert len(provider_messages) == 5
+
+    mutations = [item for item in bridge.invocations if item["name"] == "afterglow_vm_create"]
+    assert len(mutations) == (1 if decision == "approve" else 0)
+    if mutations:
+        assert mutations[0]["arguments"] == arguments
+        assert mutations[0]["snapshot"] == ctx.lumen_snapshot[0]
+        assert mutations[0]["idempotency_key"]
