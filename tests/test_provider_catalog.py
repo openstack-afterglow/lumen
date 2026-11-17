@@ -225,3 +225,84 @@ def test_subscription_discovery_excludes_known_media_kinds(catalog, monkeypatch)
     monkeypatch.setattr(model_discovery, "native_catalog", lambda: catalog)
     response = model_discovery._subscription_response(1, "2026-11-17", "chatgpt_device")
     assert response["models"] == ["chatgpt/opaque"]
+
+
+@pytest.mark.parametrize("published", [False, None])
+def test_native_search_override_wins_catalog_false_or_unknown(catalog, published):
+    entry = catalog["providers"]["openai"]["models"][0]
+    if published is None:
+        entry["capabilities"].pop("web_search")
+    else:
+        entry["capabilities"]["web_search"] = published
+    row = model()
+    row.capabilities = {"web_search": True}
+    row.capability_source = "override"
+    effective, source = _effective_capabilities(row, "openai")
+    assert source == "override"
+    assert effective["web_search"] is True
+    assert effective["feature_gates"]["web_search"]["available"] is True
+    assert effective["feature_gates"]["web_search"]["mode"] == "native"
+
+
+def test_subscription_still_disables_explicit_native_search(catalog):
+    row = model()
+    row.capabilities = {"web_search": True}
+    row.capability_source = "override"
+    effective, _ = _effective_capabilities(row, "anthropic", auth_mode="anthropic_subscription")
+    assert effective["web_search"] is False
+    assert effective["native_web_search_transport_supported"] is False
+
+
+def test_override_cannot_enable_unimplemented_search_transport(catalog):
+    detected = provider_capabilities("opaque", "unsupported")
+    effective = normalize_capabilities({
+        "web_search": True, "native_web_search_transport_supported": True,
+    }, detected)
+    assert effective["native_web_search_transport_supported"] is False
+    assert effective["web_search"] is False
+    assert effective["feature_gates"]["web_search"]["available"] is False
+
+
+@pytest.mark.parametrize("patch", [
+    {"extra": 1}, {"default_dimensions": True}, {"supports_dimensions": "true"},
+    {"min_dimensions": 0}, {"min_dimensions": 1025}, {"max_dimensions": 1},
+    {"allowed_dimensions": []}, {"allowed_dimensions": [128, 128]},
+    {"allowed_dimensions": [0, 1024]}, {"allowed_dimensions": [128, 256]},
+])
+def test_embedding_schema_rejects_invalid_dimension_metadata(patch):
+    value = fixture_catalog()
+    entry = value["providers"]["openai"]["models"][0]
+    entry["kind"] = "embedding"
+    entry["embedding"] = {
+        "default_dimensions": 1024, "supports_dimensions": True,
+        "min_dimensions": 8, "max_dimensions": 1024, "allowed_dimensions": None,
+        **patch,
+    }
+    with pytest.raises(ValueError):
+        validate_catalog(value)
+
+
+def test_embedding_metadata_is_optional_and_kind_scoped():
+    value = fixture_catalog()
+    entry = value["providers"]["openai"]["models"][0]
+    entry["embedding"] = {
+        "default_dimensions": 1024, "supports_dimensions": False,
+        "min_dimensions": None, "max_dimensions": None, "allowed_dimensions": None,
+    }
+    with pytest.raises(ValueError, match="only valid for kind=embedding"):
+        validate_catalog(value)
+    entry["kind"] = "embedding"
+    assert validate_catalog(value)["providers"]["openai"]["models"][0]["embedding"] == entry["embedding"]
+    entry["embedding"] = None
+    assert validate_catalog(value)["providers"]["openai"]["models"][0]["embedding"] is None
+
+
+@pytest.mark.parametrize("provider_type", ["anthropic", "gemini", "perplexity", "chatgpt", "unsupported"])
+def test_decisions_override_cannot_enable_non_openai_transport(provider_type):
+    detected = provider_capabilities("gpt-6-luna", provider_type, "https://compatible.invalid")
+    effective = normalize_capabilities({
+        "decisions": True, "decisions_transport_supported": True,
+    }, detected)
+    assert effective["decisions_transport_supported"] is False
+    assert effective["decisions"] is False
+    assert effective["feature_gates"]["decisions"]["available"] is False

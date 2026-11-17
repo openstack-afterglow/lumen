@@ -16,3 +16,14 @@ Track officially published native model specifications and prices in reviewed so
 ## Evidence boundary
 
 Focused offline/source and synthetic fixture checks are required. No production, provider calls, publication or deployment belongs to this change. Catalog prices are not all-in claims for excluded provider request/search/storage/tool fees; entry notes retain these limits.
+
+## Verified follow-up scope
+
+Embedding entries additionally track officially published default dimensions, selection
+support, bounds and optional exhaustive allowed values. Compatible routes use only
+administrator embedding overrides. Unknown metadata permits the provider default but
+refuses explicit dimension selection.
+
+Capability overrides may remove catalog uncertainty but never grant an unimplemented
+protocol feature. Native search separates its transport ceiling from catalog flags;
+subscription search remains unavailable. Decisions remains OpenAI-protocol text-only.

@@ -201,15 +201,6 @@ def _native_web_search_available(model_name: str, provider_type: str | None, api
     ).get("supports_web_search") is True
 
 
-def _detected_native_web_search_available(detected: dict[str, Any]) -> bool:
-    """Return whether detected capabilities advertise this exact native transport."""
-    gate = (detected.get("feature_gates") or {}).get("web_search")
-    return (
-        bool(detected.get("web_search"))
-        and isinstance(gate, dict)
-        and gate.get("available") is True
-        and gate.get("mode") == "native"
-    )
 
 
 def _unavailable_reason(metadata: dict, key: str, *, transport_unsupported: bool = False) -> str:
@@ -266,10 +257,12 @@ def provider_capabilities(model_name: str, provider_type: str | None, api_base: 
         "parallel_function_calling": parallel_function_calling,
         "structured_output": structured_output,
         "web_search": supports_web_search,
+        "native_web_search_transport_supported": provider_type in _NATIVE_WEB_SEARCH_PROVIDERS,
         "web_search_required": web_search_required,
         "web_fetch": False,
         "advisor": False,
         "decisions": decisions,
+        "decisions_transport_supported": provider_type == "openai" and not is_chatgpt,
         "prompt_caching": prompt_caching,
         "responses_api": is_chatgpt,
         "mcp": False,
@@ -388,6 +381,7 @@ def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode
     normalized["web_search"] = False
     normalized["web_search_required"] = False
     gates = {name: dict(gate) for name, gate in (normalized.get("feature_gates") or {}).items()}
+    normalized["native_web_search_transport_supported"] = False
     gate = gates.get("web_search", {})
     gate.update(
         available=False,
@@ -397,6 +391,7 @@ def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode
     )
     gates["web_search"] = gate
     normalized["decisions"] = False
+    normalized["decisions_transport_supported"] = False
     gates["decisions"] = {
         "available": False, "mode": "none", "reason_code": "provider_unsupported", "pricing_available": False,
     }
@@ -451,6 +446,8 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
     normalized.update({key: value for key, value in stored.items() if key != "feature_gates"})
     # Executor parameter fidelity is not an administrator/model capability override.
     normalized["output_budget_enforced"] = detected.get("output_budget_enforced")
+    normalized["native_web_search_transport_supported"] = detected.get("native_web_search_transport_supported") is True
+    normalized["decisions_transport_supported"] = detected.get("decisions_transport_supported") is True
     # ``CapabilitiesInput`` always serializes context_limit, so a stored override that
     # only changed an unrelated flag carries context_limit=None. Never let that erase an
     # exact catalog window (for example the Perplexity Agent route perplexity/sonar);
@@ -533,7 +530,7 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
         isinstance(stored_web_search_gate, dict) and stored_web_search_gate.get("mode") == "native"
     )
     if legacy_web_search_specified or stored_native_web_search_gate:
-        native_available = _detected_native_web_search_available(detected)
+        native_available = detected.get("native_web_search_transport_supported") is True
         admin_disabled = (legacy_web_search_specified and not bool(stored["web_search"])) or (
             stored_native_web_search_gate and stored_web_search_gate.get("available") is False
         )
@@ -557,5 +554,11 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
         and web_search_gate.get("available") is True
         and web_search_gate.get("mode") == "native"
     )
+    if not normalized["decisions_transport_supported"]:
+        normalized["decisions"] = False
+        if "decisions" in gates:
+            gates["decisions"] = {
+                "available": False, "mode": "none", "reason_code": "provider_unsupported", "pricing_available": False,
+            }
     normalized["feature_gates"] = gates
     return normalized

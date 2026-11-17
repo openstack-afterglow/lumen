@@ -1471,6 +1471,13 @@
           "id": "text-embedding-3-small",
           "aliases": [],
           "kind": "embedding",
+          "embedding": {
+            "default_dimensions": 1536,
+            "supports_dimensions": true,
+            "min_dimensions": 1,
+            "max_dimensions": 1536,
+            "allowed_dimensions": null
+          },
           "display_name": "text-embedding-3-small",
           "status": "active",
           "context_window": null,
@@ -1490,6 +1497,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/embeddings.md",
+            "https://developers.openai.com/api/reference/resources/embeddings/methods/create.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/text-embedding-3-small.md"
           ],
@@ -1500,6 +1509,13 @@
           "id": "text-embedding-3-large",
           "aliases": [],
           "kind": "embedding",
+          "embedding": {
+            "default_dimensions": 3072,
+            "supports_dimensions": true,
+            "min_dimensions": 1,
+            "max_dimensions": 3072,
+            "allowed_dimensions": null
+          },
           "display_name": "text-embedding-3-large",
           "status": "active",
           "context_window": null,
@@ -1519,6 +1535,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/embeddings.md",
+            "https://developers.openai.com/api/reference/resources/embeddings/methods/create.md",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/text-embedding-3-large.md"
           ],
@@ -1529,6 +1547,13 @@
           "id": "text-embedding-ada-002",
           "aliases": [],
           "kind": "embedding",
+          "embedding": {
+            "default_dimensions": 1536,
+            "supports_dimensions": false,
+            "min_dimensions": null,
+            "max_dimensions": null,
+            "allowed_dimensions": null
+          },
           "display_name": "text-embedding-ada-002",
           "status": "active",
           "context_window": null,
@@ -1548,6 +1573,9 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://developers.openai.com/api/docs/guides/embeddings.md",
+            "https://developers.openai.com/api/reference/resources/embeddings/methods/create.md",
+            "https://openai.com/index/new-and-improved-embedding-model/",
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/text-embedding-ada-002.md"
           ],
@@ -2561,6 +2589,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2577,6 +2607,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/fable-5-2/overview.md",
@@ -2601,6 +2633,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2617,6 +2651,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/mythos-5-2/overview.md",
@@ -2641,6 +2677,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2657,6 +2695,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/fable-5-1/overview.md",
@@ -2681,6 +2721,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2697,6 +2739,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/mythos-5-1/overview.md",
@@ -2721,6 +2765,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2737,6 +2783,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/fable-5/overview.md",
@@ -2761,6 +2809,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2777,6 +2827,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/mythos-5/overview.md",
@@ -2801,6 +2853,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2817,6 +2871,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/opus-5-5/overview.md",
@@ -2841,6 +2897,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2857,6 +2915,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/opus-5/overview.md",
@@ -2881,6 +2941,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2897,6 +2959,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/opus-4-8/overview.md",
@@ -2921,6 +2985,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2937,6 +3003,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/opus-4-7/overview.md",
@@ -2961,6 +3029,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -2977,6 +3047,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/opus-4-6/overview.md",
@@ -3003,6 +3075,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -3019,6 +3093,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/opus-4-5/overview.md",
@@ -3043,6 +3119,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -3059,6 +3137,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/sonnet-5-5/overview.md",
@@ -3083,6 +3163,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -3099,6 +3181,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/sonnet-5/overview.md",
@@ -3123,6 +3207,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -3139,6 +3225,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/sonnet-4-6/overview.md",
@@ -3165,6 +3253,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -3181,6 +3271,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/sonnet-4-5/overview.md",
@@ -3205,6 +3297,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -3229,6 +3323,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/haiku-5-5/overview.md",
@@ -3255,6 +3351,8 @@
             "text"
           ],
           "capabilities": {
+            "structured_output": true,
+            "web_search": true,
             "vision": true,
             "tool_call": true,
             "reasoning": true,
@@ -3271,6 +3369,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://platform.claude.com/docs/en/build-with-claude/structured-outputs.md",
+            "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool.md",
             "https://platform.claude.com/docs/en/about-claude/pricing.md",
             "https://platform.claude.com/docs/en/models/overview.md",
             "https://platform.claude.com/docs/en/models/haiku-4-5/overview.md",
@@ -4452,7 +4552,7 @@
         {
           "id": "gemini-2.5-flash-native-audio-preview-12-2025",
           "aliases": [],
-          "kind": "text",
+          "kind": "realtime",
           "display_name": "Gemini 2.5 Flash live preview",
           "status": "preview",
           "context_window": 131072,
@@ -4478,13 +4578,7 @@
             "input": "0.50",
             "output": "2.00"
           },
-          "media_pricing": {
-            "token_rates": {
-              "audio": {
-                "input_per_million": "0.50"
-              }
-            }
-          },
+          "media_pricing": null,
           "source_urls": [
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-2.5-flash-native-audio-preview-12-2025"
@@ -4496,6 +4590,13 @@
           "id": "gemini-embedding-2",
           "aliases": [],
           "kind": "embedding",
+          "embedding": {
+            "default_dimensions": 3072,
+            "supports_dimensions": true,
+            "min_dimensions": 128,
+            "max_dimensions": 3072,
+            "allowed_dimensions": null
+          },
           "display_name": "Gemini Embedding 2 model",
           "status": "active",
           "context_window": 8192,
@@ -4518,6 +4619,7 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://aistudio.google.com/docs/embeddings",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-embedding-2"
           ],
@@ -4528,6 +4630,13 @@
           "id": "gemini-embedding-001",
           "aliases": [],
           "kind": "embedding",
+          "embedding": {
+            "default_dimensions": 3072,
+            "supports_dimensions": true,
+            "min_dimensions": 128,
+            "max_dimensions": 3072,
+            "allowed_dimensions": null
+          },
           "display_name": "Gemini Embedding model",
           "status": "active",
           "context_window": 2048,
@@ -4546,6 +4655,7 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://aistudio.google.com/docs/embeddings",
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-embedding-001"
           ],
@@ -4712,7 +4822,9 @@
           "max_output_tokens": null,
           "input_modalities": null,
           "output_modalities": null,
-          "capabilities": {},
+          "capabilities": {
+            "tool_call": true
+          },
           "token_pricing": {
             "input": "2.00",
             "output": "10.00",
@@ -4720,6 +4832,7 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://docs.perplexity.ai/docs/cookbook/articles/function-calling-e2e/README.md",
             "https://docs.perplexity.ai/docs/agent-api/models.md",
             "https://docs.perplexity.ai/docs/getting-started/pricing.md"
           ],
@@ -4886,7 +4999,10 @@
           "max_output_tokens": null,
           "input_modalities": null,
           "output_modalities": null,
-          "capabilities": {},
+          "capabilities": {
+            "tool_call": true,
+            "structured_output": true
+          },
           "token_pricing": {
             "input": "4.00",
             "output": "20.00",
@@ -4900,6 +5016,8 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://docs.perplexity.ai/docs/agent-api/tools/custom-functions.md",
+            "https://docs.perplexity.ai/docs/agent-api/building-agents/shape-output.md",
             "https://docs.perplexity.ai/docs/agent-api/models.md",
             "https://docs.perplexity.ai/docs/getting-started/pricing.md"
           ],
@@ -5321,6 +5439,13 @@
           "id": "pplx-embed-v1-0.6b",
           "aliases": [],
           "kind": "embedding",
+          "embedding": {
+            "default_dimensions": 1024,
+            "supports_dimensions": true,
+            "min_dimensions": 128,
+            "max_dimensions": 1024,
+            "allowed_dimensions": null
+          },
           "display_name": "pplx-embed-v1-0.6b",
           "status": "active",
           "context_window": null,
@@ -5335,6 +5460,7 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://docs.perplexity.ai/docs/embeddings/standard-embeddings.md",
             "https://docs.perplexity.ai/docs/getting-started/pricing.md"
           ],
           "verified_at": "2026-11-17",
@@ -5344,6 +5470,13 @@
           "id": "pplx-embed-v1-4b",
           "aliases": [],
           "kind": "embedding",
+          "embedding": {
+            "default_dimensions": 2560,
+            "supports_dimensions": true,
+            "min_dimensions": 128,
+            "max_dimensions": 2560,
+            "allowed_dimensions": null
+          },
           "display_name": "pplx-embed-v1-4b",
           "status": "active",
           "context_window": null,
@@ -5358,6 +5491,7 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://docs.perplexity.ai/docs/embeddings/standard-embeddings.md",
             "https://docs.perplexity.ai/docs/getting-started/pricing.md"
           ],
           "verified_at": "2026-11-17",
@@ -5367,6 +5501,13 @@
           "id": "pplx-embed-context-v1-0.6b",
           "aliases": [],
           "kind": "embedding",
+          "embedding": {
+            "default_dimensions": 1024,
+            "supports_dimensions": true,
+            "min_dimensions": 128,
+            "max_dimensions": 1024,
+            "allowed_dimensions": null
+          },
           "display_name": "pplx-embed-context-v1-0.6b",
           "status": "active",
           "context_window": null,
@@ -5381,6 +5522,7 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://docs.perplexity.ai/docs/embeddings/contextualized-embeddings.md",
             "https://docs.perplexity.ai/docs/getting-started/pricing.md"
           ],
           "verified_at": "2026-11-17",
@@ -5390,6 +5532,13 @@
           "id": "pplx-embed-context-v1-4b",
           "aliases": [],
           "kind": "embedding",
+          "embedding": {
+            "default_dimensions": 2560,
+            "supports_dimensions": true,
+            "min_dimensions": 128,
+            "max_dimensions": 2560,
+            "allowed_dimensions": null
+          },
           "display_name": "pplx-embed-context-v1-4b",
           "status": "active",
           "context_window": null,
@@ -5404,6 +5553,7 @@
           },
           "media_pricing": null,
           "source_urls": [
+            "https://docs.perplexity.ai/docs/embeddings/contextualized-embeddings.md",
             "https://docs.perplexity.ai/docs/getting-started/pricing.md"
           ],
           "verified_at": "2026-11-17",

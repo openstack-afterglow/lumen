@@ -397,3 +397,60 @@ async def test_text_capability_response_includes_endpoint_capabilities(monkeypat
     result = await conversations.get_chat_capabilities(model_id=1, model_kind="text", token_info={})
     assert result["model_kind"] == "text"
     assert result["model_capabilities"] == {"decisions": True}
+
+
+@pytest.mark.parametrize("api_base", [None, "https://compatible.invalid/v1"])
+async def test_embedding_capabilities_http_uses_resolved_override_without_catalog(client, monkeypatch, api_base):
+    from lumen.api import conversations
+    from lumen.services import provider_metadata
+
+    embedding = {
+        "default_dimensions": 512, "supports_dimensions": True,
+        "min_dimensions": 256, "max_dimensions": 1024, "allowed_dimensions": [256, 512, 1024],
+    }
+    caps = {"embedding": embedding, "context_limit": 4096}
+
+    async def resolve(model_id, *, model_kind):
+        assert (model_id, model_kind) == (7, "embedding")
+        return {"model_name": "text-embedding-3-large", "provider_type": "openai",
+                "api_base": api_base, "capabilities": caps}
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("capabilities HTTP must use the resolved embedding override, not the native catalog")
+
+    monkeypatch.setattr(conversations.routing, "resolve_model_by_id", resolve)
+    monkeypatch.setattr(provider_metadata, "catalog_model_metadata", forbidden)
+    response = await client.get("/v1/capabilities", params={"model_id": 7, "model_kind": "embedding"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["model_capabilities"] == caps
+    assert {key: body[key] for key in embedding} == embedding
+    assert body["max_input_tokens"] == 4096
+    assert body["max_inputs"] == 16
+
+
+async def test_available_embedding_models_preserve_effective_dimension_metadata(client, monkeypatch):
+    embedding = {
+        "default_dimensions": 3072, "supports_dimensions": True,
+        "min_dimensions": 128, "max_dimensions": 3072, "allowed_dimensions": None,
+    }
+    caps = {"embedding": embedding, "context_limit": 2048}
+
+    async def models(*, active_only):
+        assert active_only is True
+        return [{
+            "id": 7, "provider_id": 1, "model_name": "gemini-embedding-001",
+            "api_model_name": "gemini-embedding-001", "api_provider": "gemini",
+            "provider_type": "gemini", "model_kind": "embedding", "display_name": "Gemini Embedding",
+            "effective_capabilities": caps,
+        }]
+
+    async def providers():
+        return [{"id": 1, "name": "Gemini", "provider_type": "gemini", "has_api_key": True}]
+
+    monkeypatch.setattr(repository, "list_models", models)
+    monkeypatch.setattr(repository, "list_providers", providers)
+    response = await client.get("/v1/chat/models", params={"model_kind": "embedding"})
+    assert response.status_code == 200, response.text
+    assert response.json()[0]["capabilities"] == caps
+    assert response.json()[0]["context_limit"] == 2048

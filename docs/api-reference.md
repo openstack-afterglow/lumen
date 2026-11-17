@@ -485,3 +485,14 @@ Fresh provider credential 조회는 dispatch 경계보다 먼저 수행한다. �
 Migration **034**를 적용한 뒤 새 writer를 시작한다(동시 pending migration 033과 함께 사전 적용). Additive table이므로 old writer는 무시하지만 old writer는 stateless hold를 quota에 반영하지 않는다. 따라서 새 Decisions admission을 연 상태에서 quota를 공유하는 old/new writer를 혼용하지 않는다. Rollback은 새 admission 정지·in-flight drain 뒤 code rollback이며 hold table/ledger를 drop하지 않는다.
 
 공식 계약: [create reference](https://developers.openai.com/api/reference/resources/decisions/methods/create), [Decisions guide](https://developers.openai.com/api/docs/guides/decisions). 위 검증/transport/SQL 테스트는 source/local/synthetic 증거이며 production 또는 유료 provider 검증이 아니다.
+
+## Catalog-backed embedding dimensions
+
+Embedding model responses expose an `embedding` object with published default, caller
+selection support, minimum/maximum and optional exhaustive `allowed_dimensions` list.
+`effective_capabilities.embedding` reflects explicit administrator override before native
+catalog data; compatible routes accept only the override. `GET /v1/capabilities` for an
+embedding model exposes the same `default_dimensions`, `supports_dimensions`,
+`min_dimensions`, `max_dimensions` and `allowed_dimensions` values for Studio controls.
+Unknown metadata allows the provider default but rejects an explicit dimension request.
+Requests outside a published range or exhaustive list fail before provider I/O.
