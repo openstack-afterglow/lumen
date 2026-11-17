@@ -528,18 +528,8 @@ class _LumenApiMixin:
     def admin_delete_model(self, model_id):
         return self._json_request("DELETE", f"/v1/admin/models/{_segment(model_id)}")
 
-    def admin_models_dev_providers(self, **query):
-        return self._json_request("GET", "/v1/admin/models/pricing/models-dev/providers", params=_query(**query))
-
-    def admin_get_models_dev_provider(self, models_dev_provider_id, **query):
-        return self._json_request(
-            "GET",
-            f"/v1/admin/models/pricing/models-dev/providers/{_segment(models_dev_provider_id)}",
-            params=_query(**query),
-        )
-
-    def admin_import_models_dev_prices(self, **attrs):
-        return self._json_request("POST", "/v1/admin/models/pricing/models-dev/import", body=attrs)
+    def admin_native_catalog(self, *, provider_type=None):
+        return self._json_request("GET", "/v1/admin/models/native-catalog", params=_query(provider_type=provider_type))
 
     def admin_set_title_model(self, **attrs):
         return self._json_request("PUT", "/v1/admin/title-model", body=attrs)

@@ -23,6 +23,7 @@ from lumen.services import memory_store as ms
 from lumen.services.api_key_store import ApiKeyForbidden
 from lumen.services.inference_authority import authorize_run_generation_by_id
 from lumen.services.providers import routing as ps
+from lumen.services.providers.pricing import frozen_token_pricing
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,7 @@ async def generate_memory_if_applicable(
         # Optional post-response work must not retry forbidden inference or alter the completed chat.
         return None
     try:
+        token_pricing = frozen_token_pricing(resolved)
         response = await provider_client.acompletion(
             model,
             messages,
@@ -252,6 +254,9 @@ async def generate_memory_if_applicable(
             cache_price_sources=resolved.get("cache_price_sources"),
             allow_catalog_cache=False,
             allow_catalog_prices=False,
+            token_rates=token_pricing["token_rates"],
+            token_rates_above_200k=token_pricing.get("token_rates_above_200k"),
+            token_rates_follow_text=token_pricing.get("token_rates_follow_text") is True,
         )
         await credit.apply_usage(
             event_id=f"memory:{conversation_id}:{uuid.uuid4().hex}",

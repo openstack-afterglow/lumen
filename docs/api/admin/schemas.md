@@ -6,7 +6,7 @@ Each section lists the fields of one component schema referenced by this group's
 
 ### AvailableModelCandidate
 
-Additive discovery candidate — factual provider metadata only, never capability/price.
+Live provider IDs with reviewed native metadata, or unannotated compatible IDs.
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -16,7 +16,17 @@ Additive discovery candidate — factual provider metadata only, never capabilit
 | `generation_methods` | array of string | no | — | Generation Methods |
 | `input_token_limit` | integer \| null | no | — | Input Token Limit |
 | `output_token_limit` | integer \| null | no | — | Output Token Limit |
-| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime` \| null | no | — | Model Kind |
+| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding` \| null | no | — | Model Kind |
+| `provider_family` | enum: `native`, `compatible` | no | `"native"` | Provider Family |
+| `requires_manual_pricing` | boolean | no | `false` | Requires Manual Pricing |
+| `status` | string \| null | no | — | Status |
+| `token_pricing` | map of any \| null | no | — | Token Pricing |
+| `media_pricing` | map of any \| null | no | — | Media Pricing |
+| `capabilities` | map of any \| null | no | — | Capabilities |
+| `source_urls` | array of string | no | — | Source Urls |
+| `verified_at` | string \| null | no | — | Verified At |
+| `catalog_version` | string \| null | no | — | Catalog Version |
+| `catalog_entry` | map of any \| null | no | — | Catalog Entry |
 
 ### AvailableModelsError
 
@@ -38,6 +48,9 @@ Additive discovery candidate — factual provider metadata only, never capabilit
 | `error` | [AvailableModelsError](#availablemodelserror) \| null | no | — |  |
 | `models` | array of string | yes | — | Models |
 | `candidates` | array of [AvailableModelCandidate](#availablemodelcandidate) | yes | — | Candidates |
+| `provider_family` | enum: `native`, `compatible` | no | `"native"` | Provider Family |
+| `requires_manual_pricing` | boolean | no | `false` | Requires Manual Pricing |
+| `catalog_version` | string \| null | no | — | Catalog Version |
 
 ### CapabilitiesInput
 
@@ -49,9 +62,14 @@ Additive discovery candidate — factual provider metadata only, never capabilit
 | `reasoning` | boolean | no | `false` | Reasoning |
 | `tool_call` | boolean | no | `false` | Tool Call |
 | `attachment` | boolean | no | `false` | Attachment |
+| `decisions` | boolean | no | `false` | Decisions |
+| `prompt_caching` | boolean \| null | no | — | Prompt Caching |
+| `structured_output` | boolean \| null | no | — | Structured Output |
+| `web_search` | boolean \| null | no | — | Web Search |
 | `modalities` | map of any \| null | no | — | Modalities |
 | `reasoning_options` | array of any | no | — | Reasoning Options |
 | `context_limit` | integer \| null | no | — | Context Limit |
+| `embedding` | map of any \| null | no | — | Embedding |
 
 ### DeviceAuthStartResponse
 
@@ -95,7 +113,7 @@ Additive discovery candidate — factual provider metadata only, never capabilit
 | `model_name` | string | yes | — | Model Name (max 190 chars) |
 | `display_name` | string \| null | no | — | Display Name |
 | `sort_order` | integer | no | `0` | Sort Order (numeric lower bound) |
-| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime` | no | `"text"` | Model Kind |
+| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding` | no | `"text"` | Model Kind |
 | `media_pricing` | map of any \| null | no | — | Media Pricing |
 | `input_price_per_million` | number \| string \| null | no | — | Input Price Per Million |
 | `output_price_per_million` | number \| string \| null | no | — | Output Price Per Million |
@@ -120,11 +138,16 @@ Additive discovery candidate — factual provider metadata only, never capabilit
 | `id` | integer | yes | — | Id |
 | `provider_id` | integer | yes | — | Provider Id |
 | `model_name` | string | yes | — | Model Name |
-| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime` | no | `"text"` | Model Kind |
+| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding` | no | `"text"` | Model Kind |
 | `media_pricing` | map of any \| null | no | — | Media Pricing |
+| `effective_media_pricing` | map of any \| null | no | — | Effective Media Pricing |
 | `api_model_name` | string | yes | — | Api Model Name |
 | `api_provider` | string | yes | — | Api Provider |
 | `provider_type` | string \| null | no | — | Provider Type |
+| `provider_family` | enum: `native`, `compatible` | no | `"native"` | Provider Family |
+| `price_origin` | enum: `manual`, `native_catalog` \| null | no | — | Price Origin |
+| `catalog_version` | string \| null | no | — | Catalog Version |
+| `catalog_entry` | map of any \| null | no | — | Catalog Entry |
 | `provider_sort_order` | integer | no | `0` | Provider Sort Order |
 | `sort_order` | integer | no | `0` | Sort Order |
 | `display_name` | string \| null | yes | — | Display Name |
@@ -143,7 +166,6 @@ Additive discovery candidate — factual provider metadata only, never capabilit
 | `effective_cache_write_price_per_million` | string \| null | no | — | Effective Cache Write Price Per Million |
 | `effective_cache_write_1h_price_per_million` | string \| null | no | — | Effective Cache Write 1H Price Per Million |
 | `effective_cache_price_sources` | map of string \| null \| null | no | — | Effective Cache Price Sources |
-| `models_dev_model_id` | string \| null | no | — | Models Dev Model Id |
 | `price_source` | string \| null | no | — | Price Source |
 | `capabilities` | map of any \| null | no | — | Capabilities |
 | `capability_source` | string \| null | no | — | Capability Source |
@@ -159,7 +181,7 @@ Additive discovery candidate — factual provider metadata only, never capabilit
 | `model_name` | string \| null | no | — | Model Name |
 | `display_name` | string \| null | no | — | Display Name |
 | `sort_order` | integer \| null | no | — | Sort Order |
-| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime` \| null | no | — | Model Kind |
+| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding` \| null | no | — | Model Kind |
 | `media_pricing` | map of any \| null | no | — | Media Pricing |
 | `input_price_per_million` | number \| string \| null | no | — | Input Price Per Million |
 | `output_price_per_million` | number \| string \| null | no | — | Output Price Per Million |
@@ -169,20 +191,81 @@ Additive discovery candidate — factual provider metadata only, never capabilit
 | `capabilities` | [CapabilitiesInput](#capabilitiesinput) \| null | no | — |  |
 | `is_active` | boolean \| null | no | — | Is Active |
 
-### ModelsDevImportRequest
+### NativeCatalogEmbedding
+
+Published embedding dimensions; null means the provider did not publish a constraint.
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `local_provider_id` | integer | yes | — | Local Provider Id |
-| `models_dev_provider_id` | string | yes | — | Models Dev Provider Id (max 100 chars) |
-| `selections` | array of [ModelsDevImportSelection](#modelsdevimportselection) | yes | — | Selections (max 500 items) |
+| `default_dimensions` | integer \| null | yes | — | Default Dimensions |
+| `supports_dimensions` | boolean | yes | — | Supports Dimensions |
+| `min_dimensions` | integer \| null | yes | — | Min Dimensions |
+| `max_dimensions` | integer \| null | yes | — | Max Dimensions |
+| `allowed_dimensions` | array of integer \| null | yes | — | Allowed Dimensions |
 
-### ModelsDevImportSelection
+### NativeCatalogLongContextPrices
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `local_model_id` | integer | yes | — | Local Model Id |
-| `models_dev_model_id` | string | yes | — | Models Dev Model Id (max 190 chars) |
+| `input` | string \| null | no | — | Input |
+| `output` | string \| null | no | — | Output |
+| `cache_read` | string \| null | no | — | Cache Read |
+| `cache_write` | string \| null | no | — | Cache Write |
+| `cache_write_long` | string \| null | no | — | Cache Write Long |
+| `threshold_tokens` | integer | yes | — | Threshold Tokens |
+| `token_rates` | map of map of string \| null \| null | no | — | Token Rates |
+
+### NativeCatalogModel
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `id` | string | yes | — | Id |
+| `aliases` | array of string | yes | — | Aliases |
+| `kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding` | yes | — | Kind |
+| `display_name` | string | yes | — | Display Name |
+| `status` | enum: `active`, `preview`, `deprecated` | yes | — | Status |
+| `context_window` | integer \| null | yes | — | Context Window |
+| `max_output_tokens` | integer \| null | yes | — | Max Output Tokens |
+| `input_modalities` | array of string \| null | yes | — | Input Modalities |
+| `output_modalities` | array of string \| null | yes | — | Output Modalities |
+| `capabilities` | map of boolean | yes | — | Capabilities |
+| `reasoning_options` | array of map of any \| null | no | — | Reasoning Options |
+| `embedding` | [NativeCatalogEmbedding](#nativecatalogembedding) \| null | no | — |  |
+| `token_pricing` | [NativeCatalogTokenPricing](#nativecatalogtokenpricing) \| null | yes | — |  |
+| `media_pricing` | map of any \| null | yes | — | Media Pricing |
+| `source_urls` | array of string | yes | — | Source Urls |
+| `verified_at` | string | yes | — | Verified At |
+| `notes` | string \| null | yes | — | Notes |
+
+### NativeCatalogProvider
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `provider_type` | enum: `openai`, `anthropic`, `gemini`, `perplexity` | yes | — | Provider Type |
+| `display_name` | string | yes | — | Display Name |
+| `pricing_sources` | array of string | yes | — | Pricing Sources |
+| `models` | array of [NativeCatalogModel](#nativecatalogmodel) | yes | — | Models |
+
+### NativeCatalogResponse
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `schema_version` | const `1` | yes | — | Schema Version |
+| `catalog_version` | string | yes | — | Catalog Version |
+| `providers` | array of [NativeCatalogProvider](#nativecatalogprovider) | yes | — | Providers |
+
+### NativeCatalogTokenPricing
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `input` | string \| null | no | — | Input |
+| `output` | string \| null | no | — | Output |
+| `cache_read` | string \| null | no | — | Cache Read |
+| `cache_write` | string \| null | no | — | Cache Write |
+| `cache_write_long` | string \| null | no | — | Cache Write Long |
+| `cache_write_ttl` | string \| null | no | — | Cache Write Ttl |
+| `cache_write_long_ttl` | string \| null | no | — | Cache Write Long Ttl |
+| `long_context` | [NativeCatalogLongContextPrices](#nativecataloglongcontextprices) \| null | no | — |  |
 
 ### ProjectAgentQuotaBody
 
@@ -315,7 +398,7 @@ Additive discovery candidate — factual provider metadata only, never capabilit
 | `provider_id` | integer | yes | — | Provider Id |
 | `provider_name` | string | yes | — | Provider Name |
 | `provider_type` | string | yes | — | Provider Type |
-| `capability` | enum: `openrouter_key`, `deepseek_balance`, `openai_admin_usage`, `anthropic_admin_usage` \| null | yes | — | Capability |
+| `capability` | enum: `openai_admin_usage`, `anthropic_admin_usage` \| null | yes | — | Capability |
 | `status` | enum: `available`, `unavailable`, `unsupported` | yes | — | Status |
 | `reason` | enum: `billing_endpoint_unsupported`, `provider_console_only`, `provider_analytics_scope_mismatch`, `credential_unavailable`, `credential_not_configured`, `admin_credential_unavailable`, `admin_credential_not_configured`, `admin_credential_rejected`, `partial_provider_data`, `provider_authorization_failed`, `provider_request_failed`, `provider_unavailable` \| null | yes | — | Reason |
 | `fetched_at` | string (date-time) | yes | — | Fetched At |
@@ -475,6 +558,7 @@ Anthropic organization-report token categories; consistent rows sum to ``tokens`
 | `id` | integer | yes | — | Id |
 | `name` | string | yes | — | Name |
 | `provider_type` | string | yes | — | Provider Type |
+| `provider_family` | enum: `native`, `compatible` | no | `"native"` | Provider Family |
 | `api_provider` | string | yes | — | Api Provider |
 | `sort_order` | integer | no | `0` | Sort Order |
 | `api_base` | string \| null | yes | — | Api Base |
@@ -488,10 +572,9 @@ Anthropic organization-report token categories; consistent rows sum to ``tokens`
 | `has_billing_admin_key` | boolean | no | `false` | Has Billing Admin Key |
 | `is_active` | boolean | yes | — | Is Active |
 | `margin_multiplier` | number | yes | — | Margin Multiplier |
-| `billing_capability` | enum: `openrouter_key`, `deepseek_balance`, `openai_admin_usage`, `anthropic_admin_usage` \| null | no | — | Billing Capability |
+| `billing_capability` | enum: `openai_admin_usage`, `anthropic_admin_usage` \| null | no | — | Billing Capability |
 | `created_at` | string \| null | yes | — | Created At |
 | `updated_at` | string \| null | yes | — | Updated At |
-| `models_dev_provider_id` | string \| null | no | — | Models Dev Provider Id |
 | `selection_policy` | enum: `explicit`, `priority`, `weighted` | no | `"priority"` | Selection Policy |
 | `selected_credential_id` | integer \| null | no | — | Selected Credential Id |
 

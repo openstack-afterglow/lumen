@@ -9,9 +9,7 @@
 | PUT | `/v1/admin/memory-model` | Set Memory Model | Keystone (X-Auth-Token), Keystone (Bearer) | — | [MemoryModelRequest](schemas.md#memorymodelrequest) | 204 | `set_memory_model_v1_admin_memory_model_put` |
 | GET | `/v1/admin/models` | List Models | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `list_models_v1_admin_models_get` |
 | POST | `/v1/admin/models` | Create Model | Keystone (X-Auth-Token), Keystone (Bearer) | — | [ModelCreateRequest](schemas.md#modelcreaterequest) | 201 | `create_model_v1_admin_models_post` |
-| POST | `/v1/admin/models/pricing/models-dev/import` | Import Models Dev Prices | Keystone (X-Auth-Token), Keystone (Bearer) | — | [ModelsDevImportRequest](schemas.md#modelsdevimportrequest) | 200 | `import_models_dev_prices_v1_admin_models_pricing_models_dev_import_post` |
-| GET | `/v1/admin/models/pricing/models-dev/providers` | List Models Dev Providers | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `list_models_dev_providers_v1_admin_models_pricing_models_dev_providers_get` |
-| GET | `/v1/admin/models/pricing/models-dev/providers/{models_dev_provider_id}` | Get Models Dev Provider | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `get_models_dev_provider_v1_admin_models_pricing_models_dev_providers__models_dev_provider_id__get` |
+| GET | `/v1/admin/models/native-catalog` | Get Native Catalog | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `get_native_catalog_v1_admin_models_native_catalog_get` |
 | POST | `/v1/admin/models/reorder` | Reorder Models | Keystone (X-Auth-Token), Keystone (Bearer) | — | [ModelReorderRequest](schemas.md#modelreorderrequest) | 204 | `reorder_models_v1_admin_models_reorder_post` |
 | DELETE | `/v1/admin/models/{model_id}` | Delete Model | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 204 | `delete_model_v1_admin_models__model_id__delete` |
 | PATCH | `/v1/admin/models/{model_id}` | Update Model | Keystone (X-Auth-Token), Keystone (Bearer) | — | [ModelUpdateRequest](schemas.md#modelupdaterequest) | 200 | `update_model_v1_admin_models__model_id__patch` |

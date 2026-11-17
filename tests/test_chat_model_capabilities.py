@@ -214,13 +214,13 @@ class TestEffectiveCapabilities:
         assert capabilities["web_search"] is True
         assert capabilities["web_search_required"] is False
         assert capabilities["feature_gates"]["web_search"] == {
-            "available": True,
-            "mode": "native",
-            "reason_code": None,
-            "pricing_available": True,
+            "available": False,
+            "mode": "none",
+            "reason_code": "pricing_unavailable",
+            "pricing_available": False,
         }
 
-    @pytest.mark.parametrize(("transport_available", "expected_required"), ((False, False), (True, True)))
+    @pytest.mark.parametrize(("transport_available", "expected_required"), ((False, False), (True, False)))
     def test_sonar_requires_native_search_only_when_exact_transport_supports_it(
         self, monkeypatch, transport_available, expected_required
     ):

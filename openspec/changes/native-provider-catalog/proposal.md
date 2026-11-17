@@ -27,3 +27,21 @@ refuses explicit dimension selection.
 Capability overrides may remove catalog uncertainty but never grant an unimplemented
 protocol feature. Native search separates its transport ceiling from catalog flags;
 subscription search remains unavailable. Decisions remains OpenAI-protocol text-only.
+
+## Reviewed runtime invariants
+
+Unknown output limits are omitted and context/compaction endpoints use a safe existing
+fallback. PDF absence is unknown rather than an unsupported assertion; official reasoning
+options precede missing-field legacy imported options/windows. Other imported flags cannot
+override native/default capabilities or CLI tool eligibility.
+
+Managed search adapters remain independent of inference-provider restrictions. Native
+paid search stays unavailable until request fees are billable; token prices alone do not
+activate it. Catalog-origin text-equivalent modalities retain required observations and
+inherit text context tiers only at settlement; explicit administrator modality prices
+remain literal. Distinct native modality tiers must be represented explicitly.
+
+ChatGPT subscription catalog mapping is discovery-only, not an API tariff fallback.
+Retired provider rows can still be deactivated. SDK and generated admin documentation
+replace removed import surfaces with the read-only catalog method. Mixed-row price
+origins derive from the same base/media resolution as runtime pricing.

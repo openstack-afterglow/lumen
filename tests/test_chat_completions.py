@@ -1992,6 +1992,241 @@ class TestCompactionRoutes:
         assert resp.json()["detail"] == "conversation_run_active"
 
 
+class TestContextOutputLimitFallback:
+    @pytest.fixture(
+        params=[
+            pytest.param(("compatible", None), id="compatible-null"),
+            pytest.param(("compatible", "omitted"), id="compatible-omitted"),
+            pytest.param(("untracked_native", None), id="untracked-native-null"),
+            pytest.param(("untracked_native", "omitted"), id="untracked-native-omitted"),
+        ]
+    )
+    async def context_route(self, request, monkeypatch):
+        """Keep the real HTTP planner and budget checks; replace storage and model resolution only."""
+        await _patch_text_execution(monkeypatch)
+        family, output_limit = request.param
+        resolved = _resolved()
+        resolved.update(
+            model_name="operator-model" if family == "compatible" else "perplexity/untracked-model",
+            provider_type="openai" if family == "compatible" else "perplexity",
+            provider_family="compatible" if family == "compatible" else "native",
+            api_base="https://compatible.example/v1" if family == "compatible" else None,
+        )
+        if output_limit == "omitted":
+            resolved["capabilities"].pop("max_output_tokens")
+        else:
+            resolved["capabilities"]["max_output_tokens"] = output_limit
+        monkeypatch.setattr(ps, "resolve_model", lambda *_args, **_kwargs: _return(resolved))
+        source = {
+            "messages": [
+                {"role": role, "content": f"turn {index}"}
+                for index, role in enumerate(["user", "assistant"] * 3, start=1)
+            ],
+            "message_ids": ["1", "2", "3", "4", "5", "6"],
+            "source_hashes": ["h1", "h2", "h3", "h4", "h5", "h6"],
+            "active_leaf_id": "6",
+            "revision": "rev-output-limit",
+            "checkpoint_id": None,
+            "checkpoint": None,
+        }
+
+        async def load_source(**kwargs):
+            assert kwargs["user_id"] == "test-user-123"
+            assert kwargs["project_id"] == "test-project-123"
+            assert (kwargs["conversation_id"], kwargs["temp_thread_id"]) in {("c1", None), (None, "t1")}
+            return source
+
+        monkeypatch.setattr(context_store, "load_context_source", load_source)
+        return resolved, source
+
+    @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    async def test_preview_without_output_limit_is_readonly(self, client, monkeypatch, context_route, parent):
+        resolved, source = context_route
+
+        async def forbidden_write(*_args, **_kwargs):
+            raise AssertionError("context preview must not mutate history or admit a run")
+
+        monkeypatch.setattr(cs, "add_message", forbidden_write)
+        monkeypatch.setattr(admission, "create_compaction_run", forbidden_write)
+        monkeypatch.setattr(admission, "create_persistent_run", forbidden_write)
+        monkeypatch.setattr(admission, "create_run", forbidden_write)
+        monkeypatch.setattr(admission, "create_temp_run", forbidden_write)
+
+        response = await client.post(
+            f"/api/v1/chat/{parent}/context-preview",
+            json={"model_id": resolved["model_name"], "features": {}, "parts": []},
+        )
+
+        assert response.status_code == 200
+        state = response.json()
+        assert state["model_name"] == resolved["model_name"]
+        assert state["revision"] == source["revision"]
+        assert state["output_reserve"] == 4096
+        assert state["input_budget"] == 16_000 - 4096 - state["safety_reserve"]
+        assert state["can_compact"] is True
+
+    @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    async def test_compaction_without_output_limit_admits_owned_run(
+        self, client, monkeypatch, context_route, parent
+    ):
+        from lumen.services import context_manager
+
+        resolved, source = context_route
+        seen = {}
+        real_context_state = context_manager.context_state
+
+        def context_state(*args, **kwargs):
+            seen["output_reserve"] = kwargs["output_reserve"]
+            return real_context_state(*args, **kwargs)
+
+        async def create_run(**kwargs):
+            seen["run"] = kwargs
+            return ChatRunDescriptor(
+                run_id="run-output-limit",
+                run_kind="compaction",
+                status="queued",
+                events_url="/v1/runs/run-output-limit/events",
+                cancel_url="/v1/runs/run-output-limit/cancel",
+            )
+
+        monkeypatch.setattr(context_manager, "context_state", context_state)
+        monkeypatch.setattr(admission, "create_compaction_run", create_run)
+        response = await client.post(
+            f"/api/v1/chat/{parent}/compactions",
+            headers=_HEADERS,
+            json={
+                "model_id": resolved["model_name"],
+                "features": {},
+                "expected_context_revision": source["revision"],
+            },
+        )
+
+        assert response.status_code == 202
+        assert response.json()["run_kind"] == "compaction"
+        assert seen["output_reserve"] == 4096
+        run = seen["run"]
+        assert (run["user_id"], run["project_id"]) == ("test-user-123", "test-project-123")
+        assert (run["conversation_id"], run["temp_thread_id"]) == (
+            ("c1", None) if parent.startswith("conversations/") else (None, "t1")
+        )
+        assert run["expected_context_revision"] == source["revision"]
+        assert run["request_payload"]["context_source"] == source
+        assert run["request_payload"]["max_tokens"] == 4096
+
+    @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    @pytest.mark.parametrize(
+        ("guard", "status", "reason"),
+        [
+            ("revision", 409, "context_revision_changed"),
+            ("short_history", 422, "nothing_to_compact"),
+            ("unknown_context", 422, "context_window_unknown"),
+            ("retained_budget", 422, "context_limit_exceeded"),
+        ],
+    )
+    async def test_compaction_without_output_limit_keeps_safety_guards(
+        self, client, monkeypatch, context_route, parent, guard, status, reason
+    ):
+        resolved, source = context_route
+        revision = source["revision"]
+        if guard == "revision":
+            revision = "stale-revision"
+        elif guard == "short_history":
+            source["messages"] = [{"role": "user", "content": "only current turn"}]
+            source["message_ids"] = ["1"]
+            source["source_hashes"] = ["h1"]
+            source["active_leaf_id"] = "1"
+        elif guard == "unknown_context":
+            resolved["capabilities"].pop("context_limit")
+        elif guard == "retained_budget":
+            source["messages"][-1]["content"] = "required " * 16_000
+
+        async def forbidden_admission(**_kwargs):
+            raise AssertionError("unsafe compaction must not admit a run")
+
+        monkeypatch.setattr(admission, "create_compaction_run", forbidden_admission)
+        response = await client.post(
+            f"/api/v1/chat/{parent}/compactions",
+            headers=_HEADERS,
+            json={
+                "model_id": resolved["model_name"],
+                "features": {},
+                "expected_context_revision": revision,
+            },
+        )
+
+        assert response.status_code == status
+        assert response.json()["detail"] == reason
+
+    @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    @pytest.mark.parametrize("operation", ["context-preview", "compactions"])
+    async def test_context_without_output_limit_keeps_ownership_checks(
+        self, client, monkeypatch, context_route, parent, operation
+    ):
+        resolved, source = context_route
+
+        async def deny_conversation(_conversation_id, *, user_id, project_id):
+            assert (user_id, project_id) == ("test-user-123", "test-project-123")
+            raise cs.ConversationForbidden("conversation is not accessible")
+
+        async def deny_thread(**kwargs):
+            assert (kwargs["user_id"], kwargs["project_id"]) == ("test-user-123", "test-project-123")
+            raise LookupError("temporary chat thread was not found")
+
+        async def forbidden_admission(**_kwargs):
+            raise AssertionError("inaccessible history must not admit a run")
+
+        monkeypatch.setattr(cs, "get_conversation", deny_conversation)
+        monkeypatch.setattr(context_store, "load_context_source", deny_thread)
+        monkeypatch.setattr(admission, "create_compaction_run", forbidden_admission)
+        body = {"model_id": resolved["model_name"], "features": {}}
+        if operation == "compactions":
+            body["expected_context_revision"] = source["revision"]
+        response = await client.post(
+            f"/api/v1/chat/{parent}/{operation}", headers=_HEADERS, json=body
+        )
+
+        assert response.status_code == (403 if parent.startswith("conversations/") else 404)
+
+    @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    @pytest.mark.parametrize("operation", ["context-preview", "compactions"])
+    async def test_context_without_output_limit_keeps_required_scopes(
+        self, client, monkeypatch, context_route, parent, operation
+    ):
+        resolved, source = context_route
+
+        async def principal():
+            return {
+                "auth_type": "api_key",
+                "user_id": "test-user-123",
+                "project_id": "test-project-123",
+                "api_key_id": "limited-key",
+                "scopes": ("models:read",),
+                "source": "api",
+                "roles": ["member"],
+                "is_system_admin": False,
+            }
+
+        async def forbidden_prepare(**_kwargs):
+            raise AssertionError("scope denial must precede context planning")
+
+        monkeypatch.setattr(completions, "prepare_context_input", forbidden_prepare)
+        body = {"model_id": resolved["model_name"], "features": {}}
+        if operation == "compactions":
+            body["expected_context_revision"] = source["revision"]
+        previous = app.dependency_overrides.copy()
+        app.dependency_overrides[get_principal] = principal
+        try:
+            response = await client.post(
+                f"/api/v1/chat/{parent}/{operation}", headers=_HEADERS, json=body
+            )
+        finally:
+            app.dependency_overrides.clear()
+            app.dependency_overrides.update(previous)
+
+        assert response.status_code == 403
+        assert "Required service action denied" in response.json()["detail"]
+
+
 class TestStatelessModalityBilling:
     """Exercise real request → usage split → cost → ledger boundary, without provider I/O."""
 

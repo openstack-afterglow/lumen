@@ -42,6 +42,7 @@ from .pricing import (
     _resolved_cache_prices,
     _resolved_context_tiers,
 )
+from .search_transport import _ENDPOINTS as _SEARCH_ENDPOINTS
 
 # Catalog-issued exact route identity: ``lumen/<provider_id>/<model_id>``. Only the
 # canonical positive-integer form is reserved; every other string stays a public ID.
@@ -371,10 +372,11 @@ def _resolved_model(model: LlmModel, provider: LlmProvider, *, ref=None, require
 
 def _resolved_provider(provider: LlmProvider, *, ref=None, required_capabilities=()) -> dict:
     """Resolve one provider-only route without persisting its credential material."""
+    if provider.provider_type not in _SEARCH_ENDPOINTS:
+        _validate_provider_route(provider)
     if ref is not None:
         required_capabilities = ref.get("required_capabilities", ())
     account, credential = selected_credential(provider, required_capabilities=required_capabilities, ref=ref)
-    _validate_provider_route(provider)
     provider_auth = _provider_auth_ref(provider, account, credential, required_capabilities=required_capabilities)
     api_key = None
     api_base = provider.api_base if provider.auth_mode == "api_key" else None
@@ -644,9 +646,9 @@ def _cli_transport_protocols(model: LlmModel, provider: LlmProvider) -> tuple[st
     return ("messages", "responses")
 
 
-def _tools_explicitly_disabled(stored: object) -> bool:
-    """Only a stored override/models.dev flag is authoritative; a negative probe is not."""
-    if not isinstance(stored, dict):
+def _tools_explicitly_disabled(stored: object, source: str | None) -> bool:
+    """Only an administrator override can explicitly disable tools."""
+    if source != "override" or not isinstance(stored, dict):
         return False
     if "tool_call" in stored:
         return stored["tool_call"] is False
@@ -720,7 +722,7 @@ def _cli_model_row(model: LlmModel, provider: LlmProvider) -> dict:
         or (isinstance(output_modalities, list) and bool(output_modalities) and "text" not in output_modalities)
     ):
         reason = "text_unavailable"
-    elif _tools_explicitly_disabled(model.capabilities):
+    elif _tools_explicitly_disabled(model.capabilities, model.capability_source):
         reason = "tools_disabled"
     else:
         reason = None

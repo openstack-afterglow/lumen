@@ -40,6 +40,7 @@ from .pricing import (
     validate_media_pricing,
 )
 from .routing import _lock_mutable_route, _require_db
+from .search_transport import _ENDPOINTS as _SEARCH_ENDPOINTS
 
 _AUTH_MODES = frozenset({"api_key", "chatgpt_device", "anthropic_subscription"})
 _MEDIA_PROVIDERS = frozenset({"openai", "gemini"})
@@ -51,7 +52,7 @@ def validate_provider_type(value: str) -> str:
     if not isinstance(value, str):
         raise UnsupportedProviderTypeError()
     normalized = value.strip().lower()
-    if normalized not in NATIVE_PROVIDER_TYPES and normalized != "chatgpt":
+    if normalized not in NATIVE_PROVIDER_TYPES and normalized != "chatgpt" and normalized not in _SEARCH_ENDPOINTS:
         raise UnsupportedProviderTypeError()
     return normalized
 
@@ -149,8 +150,10 @@ def validate_provider_auth_configuration(
     api_key: str | None,
     api_key_env: str | None,
     billing_admin_key: str | None = None,
+    validate_endpoint: bool = True,
 ) -> None:
-    validate_provider_type(provider_type)
+    if validate_endpoint:
+        validate_provider_type(provider_type)
     if auth_mode not in _AUTH_MODES:
         raise ProviderValidationError("지원하지 않는 provider auth_mode 입니다")
     if provider_type == "chatgpt" and auth_mode != "chatgpt_device":
@@ -159,7 +162,7 @@ def validate_provider_auth_configuration(
         raise ProviderValidationError("ChatGPT 구독은 provider_type=chatgpt 이어야 합니다")
     if auth_mode == "anthropic_subscription" and provider_type != "anthropic":
         raise ProviderValidationError("Claude 구독은 provider_type=anthropic 이어야 합니다")
-    if auth_mode == "api_key" and provider_type in {"gemini", "perplexity"} and not direct_provider_route(
+    if validate_endpoint and auth_mode == "api_key" and provider_type in {"gemini", "perplexity"} and not direct_provider_route(
         provider_type, api_base,
     ):
         raise ProviderValidationError(
@@ -342,9 +345,10 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 api_key=patch.get("api_key"),
                 api_key_env=patch.get("api_key_env", (default_credential(row).api_key_env if default_credential(row) else None)),
                 billing_admin_key=patch.get("billing_admin_key"),
+                validate_endpoint=bool({"provider_type", "api_base"} & patch.keys()) or bool(patch.get("is_active")),
             )
             target_active = row.is_active if patch.get("is_active") is None else bool(patch["is_active"])
-            if target_active and provider_family(
+            if target_active and target_provider_type in {"openai", "anthropic"} and provider_family(
                 target_provider_type, patch.get("api_base", row.api_base), target_auth_mode,
             ) == "compatible":
                 active_models = (await session.execute(select(LlmModel).where(

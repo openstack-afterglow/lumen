@@ -28,10 +28,7 @@ from lumen.services.providers.errors import ProviderSubscriptionError
 
 _CONTRACT = "single-attempt-v1"
 _TIMEOUT = httpx.Timeout(90.0, connect=10.0, read=90.0, write=30.0, pool=10.0)
-_PROVIDERS = frozenset({
-    "openai", "anthropic", "gemini", "azure", "bedrock", "vertex", "ollama",
-    "openrouter", "deepseek", "xai", "perplexity", "chatgpt", "mistral", "cohere", "groq", "together",
-})
+_PROVIDERS = frozenset({"openai", "anthropic", "gemini", "perplexity", "chatgpt"})
 _PROVIDER_ALIASES = {"vertex_ai": "vertex", "azure_ai": "azure", "together_ai": "together"}
 _RESERVED = frozenset({
     "api_base", "api_key", "base_url", "custom_llm_provider", "provider_auth",

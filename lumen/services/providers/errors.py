@@ -24,8 +24,9 @@ class UnsupportedProviderTypeError(ProviderValidationError):
 
     def __init__(self):
         super().__init__(
-            "unsupported_provider_type: 지원하는 provider_type은 openai, anthropic, gemini, perplexity와 "
-            "기존 chatgpt device 인증입니다. 타사 API는 openai 또는 anthropic과 custom api_base로 등록하세요."
+            "unsupported_provider_type: 추론 provider_type은 openai, anthropic, gemini, perplexity와 "
+            "기존 chatgpt device 인증을 지원하며, 관리형 검색 유형도 지원합니다. "
+            "타사 추론 API는 openai 또는 anthropic과 custom api_base로 등록하세요."
         )
 
 

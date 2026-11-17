@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 import test_chat_api_model_routing
@@ -155,3 +156,16 @@ async def test_account_usage_allocates_advisor_without_a_second_customer_debit(p
     assert usage.status_code == 200
     assert {row["credential_id"]: Decimal(row["raw_cost"]) for row in usage.json()["credentials"]} == {
         key_a: Decimal("0.003"), key_b: Decimal("0.007")}
+
+
+@pytest.mark.parametrize("provider_type,api_base,allowed", [
+    ("ollama", None, False),
+    ("openai", None, False),
+    ("tavily", None, False),
+    ("duckduckgo", None, True),
+    ("searxng", "https://search.invalid", True),
+    ("openai", "https://compatible.invalid/v1", True),
+])
+def test_anonymous_routes_preserve_managed_search_and_compatible_endpoints(provider_type, api_base, allowed):
+    provider = SimpleNamespace(provider_type=provider_type, api_base=api_base)
+    assert accounts.anonymous_allowed(provider) is allowed

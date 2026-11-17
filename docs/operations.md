@@ -621,8 +621,10 @@ administrators register their IDs and required rates explicitly.
 
 Runtime prices use stored administrator rates first, then exact native catalog rates,
 then no rate. Stored historical `price_source` strings remain provenance only. Runtime
-capabilities use explicit administrator overrides, then catalog flags, then conservative
-defaults. Imported historical capability metadata no longer acts as an override.
+capabilities use explicit administrator overrides, then catalog fields. Only missing
+`reasoning_options` and `context_limit` may fall back to historical imported metadata;
+other imported flags never override catalog/default detection. Remaining unknowns use
+conservative defaults. A missing PDF declaration is unknown, not a provider denial.
 Catalog prices are never copied into model columns. To follow the catalog, PATCH the
 native model's input/output/cache prices and `media_pricing` to null; compatible models
 must retain administrator prices. Read responses distinguish stored `media_pricing`
@@ -651,7 +653,23 @@ dimension request. Compatible endpoints use only an administrator `capabilities.
 override; they never borrow native dimensions from a matching public model ID.
 
 An explicit capability override may remove catalog uncertainty only where Lumen implements
-that protocol feature. For example, native search can be enabled for an unknown model on
-an implemented search transport, while subscription search remains unavailable. Decisions
-can be enabled only for OpenAI-protocol text routes, including custom compatible endpoints;
-an Anthropic/Gemini/Perplexity or subscription override cannot enable that endpoint.
+that protocol feature. Published native-search support remains visible as metadata, but
+the native execution gate is unavailable and unpriced until provider per-search/request
+fees can be billed. Text token rates alone never activate a paid native search tool.
+Separately priced managed search providers remain supported for CRUD and search routing;
+the inference-only provider allowlist does not remove search adapters.
+Decisions can be enabled only for OpenAI-protocol text routes, including compatible
+endpoints; Anthropic/Gemini/Perplexity or subscription overrides cannot enable it.
+
+ChatGPT subscription discovery can show the OpenAI catalog list, but subscription routes
+never borrow API token/cache/media rates, context tiers or model capability metadata.
+Their existing authentication/transport limits remain; administrator rates are required.
+
+For tiered models, catalog modality rates identical to effective text categories retain
+their required provider observations but settle in the text residual, using that call's
+context tier. The frozen `token_rates_follow_text` provenance enables this inheritance
+only for catalog buckets, never coincidentally equal administrator media prices.
+Distinct catalog modality rates require corresponding explicit
+`token_pricing.long_context.token_rates` entries; a future mixed bucket freezes every
+effective tier field. Existing native tiered Gemini audio fields all equal their base
+text categories; no differing native modality tier was silently assumed.

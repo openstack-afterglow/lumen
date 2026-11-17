@@ -772,7 +772,7 @@ async def preview_conversation_context(
     resolved = planned["resolved"]
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
-    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens") or 4096)
     source = planned["source"]
     active_compaction_run_id = await _active_context_compaction_run_id(conversation_id=conversation_id)
 
@@ -827,7 +827,7 @@ async def preview_temp_context(
     resolved = planned["resolved"]
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
-    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens") or 4096)
     source = planned["source"]
     active_compaction_run_id = await _active_context_compaction_run_id(temp_thread_id=temp_thread_id)
 
@@ -922,7 +922,7 @@ async def compact_conversation(
     resolved = planned["resolved"]
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
-    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens") or 4096)
     source = planned["source"]
 
     if source.get("revision") != payload.expected_context_revision:
@@ -1063,7 +1063,7 @@ async def compact_temp_thread(
     resolved = planned["resolved"]
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
-    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens") or 4096)
     source = planned["source"]
 
     if source.get("revision") != payload.expected_context_revision:

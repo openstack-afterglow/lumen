@@ -662,6 +662,7 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
     prices = snapshot.get("component_prices") if isinstance(snapshot, dict) else None
     if not isinstance(prices, dict):
         raise DurableRunError("frozen tool pricing is unavailable")
+    rounding_cushion = Decimal("0.0000000002")
     if name == "managed_web_search":
         features = run.capability_snapshot.get("effective_features") or {}
         options = features.get("web_search") or {}
@@ -686,6 +687,14 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
             "advisor_cache_write_1h_price_per_token_above_200k",
         )
         rates = [Decimal(str(prices[key])) for key in keys if prices.get(key) is not None]
+        modality_pricing = {
+            "token_rates": snapshot.get("advisor_token_rates"),
+            "token_rates_above_200k": snapshot.get("advisor_token_rates_above_200k"),
+        }
+        modality_input, modality_output, modality_cushion = credit.worst_case_token_rates(modality_pricing)
+        if any(modality_pricing.values()):
+            rates.append(modality_input)
+            rounding_cushion = modality_cushion
         if not rates or (max(rates) > 0 and (type(limit) is not int or limit <= 0)):
             raise DurableRunError("bounded advisor input requires frozen context limit")
         output_rate = max(
@@ -693,6 +702,7 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
             for key in ("advisor_output_price_per_token", "advisor_output_price_per_token_above_200k")
             if prices.get(key) is not None
         )
+        output_rate = max(output_rate, modality_output)
         if route.get("output_budget_enforced") is False and output_rate > 0:
             raise DurableRunError("advisor does not enforce a bounded output budget")
         usd = (
@@ -704,7 +714,7 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
     multiplier = Decimal(str(snapshot["margin_multiplier"])) * Decimal(str(snapshot["chat_credit_per_usd"]))
     if not usd.is_finite() or usd < 0 or not multiplier.is_finite() or multiplier < 0:
         raise DurableRunError("frozen tool pricing is invalid")
-    return ((usd + (Decimal("0.0000000002") if usd else 0)) * multiplier).quantize(
+    return ((usd + (rounding_cushion if usd else 0)) * multiplier).quantize(
         Decimal("0.00000001"), rounding=ROUND_CEILING
     )
 
@@ -829,6 +839,8 @@ class _DurableExecutionHooks:
                 },
                 # Never inherit live modality edits, including on old snapshots.
                 "token_rates": summary_pricing.get("token_rates") or {},
+                "token_rates_above_200k": summary_pricing.get("token_rates_above_200k") or {},
+                "token_rates_follow_text": summary_pricing.get("token_rates_follow_text") is True,
             }
             if pricing["input_price_per_token"] is None or pricing["output_price_per_token"] is None:
                 raise DurableRunError("context compaction pricing is unavailable")

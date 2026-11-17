@@ -20,7 +20,7 @@ _OFFICIAL_HOSTS = {
     "perplexity": {"docs.perplexity.ai", "www.perplexity.ai", "perplexity.ai"},
 }
 _TOKEN_FIELDS = frozenset({"input", "output", "cache_read", "cache_write", "cache_write_long"})
-_ENTRY_FIELDS = frozenset({"id", "aliases", "kind", "display_name", "status", "context_window", "max_output_tokens", "input_modalities", "output_modalities", "capabilities", "token_pricing", "media_pricing", "source_urls", "verified_at", "notes", "embedding"})
+_ENTRY_FIELDS = frozenset({"id", "aliases", "kind", "display_name", "status", "context_window", "max_output_tokens", "input_modalities", "output_modalities", "capabilities", "token_pricing", "media_pricing", "source_urls", "verified_at", "notes", "embedding", "reasoning_options"})
 _EMBEDDING_FIELDS = frozenset({"default_dimensions", "supports_dimensions", "min_dimensions", "max_dimensions", "allowed_dimensions"})
 
 
@@ -102,6 +102,55 @@ def validate_embedding_metadata(value: object) -> dict | None:
     return copy.deepcopy(embedding)
 
 
+def validate_reasoning_options(value: object) -> list[dict] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("reasoning_options: list or null required")
+    seen = set()
+    for option in value:
+        if not isinstance(option, dict):
+            raise ValueError("reasoning_options: object required")
+        kind = option.get("type")
+        if kind not in {"effort", "budget_tokens", "toggle"} or kind in seen:
+            raise ValueError("reasoning_options: unknown or duplicate type")
+        seen.add(kind)
+        fields = {"type", "values"} if kind == "effort" else {"type", "min", "max"} if kind == "budget_tokens" else {"type"}
+        _object(option, fields, "reasoning_options", {"type", "values"} if kind == "effort" else {"type"})
+        if kind == "effort":
+            _strings(option["values"], "reasoning_options.values", nonempty=True)
+        if kind == "budget_tokens":
+            for field in ("min", "max"):
+                if field in option and (type(option[field]) is not int or option[field] < 0):
+                    raise ValueError("reasoning_options: nonnegative integer budget required")
+            if "min" in option and "max" in option and option["min"] > option["max"]:
+                raise ValueError("reasoning_options: minimum exceeds maximum")
+    return copy.deepcopy(value)
+
+
+def _validate_modality_tiers(entry: dict) -> None:
+    token = entry.get("token_pricing") or {}
+    tier = token.get("long_context") or {}
+    if not tier:
+        return
+    base_rates = (entry.get("media_pricing") or {}).get("token_rates") or {}
+    tier_rates = tier.get("token_rates") or {}
+    if tier_rates:
+        from lumen.services.providers.pricing import _validate_token_rates
+
+        _validate_token_rates(tier_rates)
+    for modality, rates in tier_rates.items():
+        if set(rates) - set(base_rates.get(modality) or {}):
+            raise ValueError("modality tier requires a corresponding base rate")
+    for modality, rates in base_rates.items():
+        for field, value in rates.items():
+            category = field.removesuffix("_per_million")
+            text_rate = token.get(category)
+            matches_text = text_rate is not None and Decimal(value) == Decimal(text_rate)
+            if not matches_text and field not in tier_rates.get(modality, {}):
+                raise ValueError("distinct tiered modality rate requires explicit long_context.token_rates")
+
+
 def validate_catalog(value: object) -> dict:
     """Reject malformed source data rather than silently changing billing or capabilities."""
     root = _object(value, {"schema_version", "catalog_version", "providers"}, "catalog", {"schema_version", "catalog_version", "providers"})
@@ -119,7 +168,7 @@ def validate_catalog(value: object) -> dict:
             raise ValueError(f"{provider}.models: list required")
         identities: set[str] = set()
         for entry in record["models"]:
-            entry = _object(entry, _ENTRY_FIELDS, f"{provider}.model", _ENTRY_FIELDS - {"embedding"})
+            entry = _object(entry, _ENTRY_FIELDS, f"{provider}.model", _ENTRY_FIELDS - {"embedding", "reasoning_options"})
             model_id = _string(entry["id"], "id")
             names = [model_id, *_strings(entry["aliases"], "aliases")]
             if len(names) != len(set(names)) or identities.intersection(names):
@@ -130,6 +179,7 @@ def validate_catalog(value: object) -> dict:
             if entry.get("embedding") is not None and entry["kind"] != "embedding":
                 raise ValueError("embedding metadata is only valid for kind=embedding")
             validate_embedding_metadata(entry.get("embedding"))
+            validate_reasoning_options(entry.get("reasoning_options"))
             _string(entry["display_name"], "display_name")
             _positive_integer(entry["context_window"], "context_window")
             _positive_integer(entry["max_output_tokens"], "max_output_tokens")
@@ -150,7 +200,7 @@ def validate_catalog(value: object) -> dict:
                         raise ValueError(f"{key}: invalid TTL")
                 tier = token.get("long_context")
                 if tier is not None:
-                    tier = _object(tier, _TOKEN_FIELDS | {"threshold_tokens"}, "long_context", {"threshold_tokens"})
+                    tier = _object(tier, _TOKEN_FIELDS | {"threshold_tokens", "token_rates"}, "long_context", {"threshold_tokens"})
                     _positive_integer(tier["threshold_tokens"], "threshold_tokens", nullable=False)
                     for key in _TOKEN_FIELDS:
                         _price(tier.get(key), f"long_context.{key}")
@@ -162,6 +212,7 @@ def validate_catalog(value: object) -> dict:
                     validate_media_pricing(entry["kind"], entry["media_pricing"])
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"{provider}/{model_id}: invalid media_pricing: {exc}") from exc
+            _validate_modality_tiers(entry)
             _sources(entry["source_urls"], provider, "source_urls")
             try:
                 verified = date.fromisoformat(entry["verified_at"])
