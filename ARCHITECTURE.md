@@ -560,9 +560,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1a1d55c949853fa50723f052a5495f56542657c08f8328f469567dd7e5e5aa56",
-  "reviewed_at": "2026-11-17T09:42:50Z",
-  "summary": "Embeddings: contract 6933, SDK 143, integration 519 (incl. DB-backed settlement), system 38 passed locally; no live provider call or deployment."
+  "source_sha256": "64db6078a99dff98a8c3510d8d62c8da4c941c8386cf109119f9328c0ef14b8a",
+  "reviewed_at": "2026-11-17T09:43:32Z",
+  "summary": "0.6.16 embeddings release candidate: contract 6933, SDK 143, integration 519, system 38 passed locally; no live provider call or deployment."
 }
 ```
 <!-- architecture-review:end -->

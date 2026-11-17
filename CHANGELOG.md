@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.16 — 2026-11-17 (prepared; not yet published or deployed)
 
 - **한국어 — 임베딩:** 등록된 OpenAI/Gemini 텍스트 임베딩 모델과 토큰 단가를 위한 별도 `embedding` 종류를 추가한다. API 키 호환 API는 OpenAI `POST /v1/embeddings`와 Gemini `/v1beta/models/{model}:embedContent`·`:batchEmbedContents`를 제공하고, Keystone 세션은 Afterglow Embedding Studio용 native `/v1/chat/embeddings`를 사용한다. 기존 Bifrost 단일 provider 경계·권한·quota·사용량 원장을 재사용한다. 아직 live provider 호출·배포를 검증하지 않았다.
 - **English — Embeddings:** Add a distinct `embedding` model kind for registered OpenAI/Gemini text embedding models and input-token pricing. API-key compatibility surfaces include OpenAI `POST /v1/embeddings` and Gemini `/v1beta/models/{model}:embedContent` / `:batchEmbedContents`; Keystone sessions use native `/v1/chat/embeddings` for Afterglow's Embedding Studio. Reuse the existing Bifrost single-provider boundary, authorization, quota and usage ledger. Live provider calls and deployment are not verified.
