@@ -12,15 +12,15 @@ from provider_fixtures import configured_provider
 from sqlalchemy import delete, func, select
 
 from lumen.db import close_db, get_session_factory, init_db
-from lumen.models.chat_db import ChatUsageLog, LlmModel, UserWallet
-from lumen.services import embeddings, provider_client
+from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider, UserWallet
+from lumen.services import credit, embeddings, provider_client
 
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
 
-async def _register(factory, nonce: str, *, provider_type: str, model_name: str):
+async def _register(factory, nonce: str, *, provider_type: str, model_name: str) -> int:
     async with factory() as session, session.begin():
-        provider = configured_provider(name=f"embedding-{nonce}", provider_type=provider_type,
+        provider = configured_provider(name=f"embedding-{nonce}", api_provider=f"emb-{nonce[:16]}", provider_type=provider_type,
                                        is_active=True, margin_multiplier=Decimal("2"))
         session.add(provider)
         await session.flush()
@@ -28,6 +28,7 @@ async def _register(factory, nonce: str, *, provider_type: str, model_name: str)
             provider_id=provider.id, model_name=model_name, model_kind="embedding",
             input_price=Decimal("0.0000002"), output_price=Decimal("0"), is_active=True,
         ))
+        return provider.id
 
 
 @pytest.mark.parametrize("provider_type, model_name, usage, estimated", [
@@ -42,6 +43,8 @@ async def test_embedding_call_persists_one_usage_row_and_wallet_charge(
     nonce = uuid.uuid4().hex
     user_id, project_id = f"embedding-user-{nonce}", f"embedding-project-{nonce}"
     provider_calls = []
+    provider_id = None
+    provider_name = f"emb-{nonce[:16]}"
 
     async def provider(**kwargs):
         provider_calls.append(kwargs)
@@ -49,8 +52,8 @@ async def test_embedding_call_persists_one_usage_row_and_wallet_charge(
 
     monkeypatch.setattr(provider_client, "aembedding", provider)
     try:
-        await _register(factory, nonce, provider_type=provider_type, model_name=model_name)
-        route = await embeddings.resolve(model_name, provider_type=provider_type)
+        provider_id = await _register(factory, nonce, provider_type=provider_type, model_name=model_name)
+        route = await embeddings.resolve(model_name, provider=provider_name)
         result = await embeddings.embed(
             route=route, inputs=["hello embeddings"], user_id=user_id, project_id=project_id,
             api_key_id=None, required_scopes=("native:runs:write",), dimensions=2,
@@ -70,13 +73,17 @@ async def test_embedding_call_persists_one_usage_row_and_wallet_charge(
         assert (row.model_name, row.prompt_tokens, row.completion_tokens, row.source) == (
             model_name, tokens, 0, "api")
         assert row.raw_cost == expected_raw
-        assert row.credited_cost == Decimal(str(result["credited_cost"]))
-        assert row.credited_cost > 0
+        # Independent expectation: the registered provider margin is 2x.
+        expected_credited = credit.credits_for_cost(expected_raw, Decimal("2"))
+        assert row.credited_cost == expected_credited > 0
+        assert Decimal(str(result["credited_cost"])) == expected_credited
         assert wallet is not None and wallet.used_quota_this_month == row.credited_cost
     finally:
         async with factory() as session, session.begin():
             await session.execute(delete(ChatUsageLog).where(ChatUsageLog.user_id == user_id))
             await session.execute(delete(UserWallet).where(UserWallet.user_id == user_id))
+            if provider_id is not None:
+                await session.execute(delete(LlmProvider).where(LlmProvider.id == provider_id))
             assert (await session.execute(select(func.count()).select_from(ChatUsageLog).where(
                 ChatUsageLog.user_id == user_id))).scalar_one() == 0
         await close_db()
