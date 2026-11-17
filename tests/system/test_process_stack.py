@@ -1180,6 +1180,7 @@ async def _register_discovered_system_model(fake_provider_url: str, model_name: 
     from lumen.models.chat_db import LlmModel
     from lumen.services import model_discovery
     from lumen.services.providers import repository
+    from lumen.services.providers.errors import ProviderValidationError
 
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     try:
@@ -1202,16 +1203,21 @@ async def _register_discovered_system_model(fake_provider_url: str, model_name: 
             after = await session.scalar(select(func.count(LlmModel.id)).where(LlmModel.provider_id == provider["id"]))
         assert before == after == 0, "Discovery must not register models"
 
-        unpriced = await repository.create_model(
-            provider_id=provider["id"], model_name="claude-system-unpriced-2099-01-01"
-        )
+        # A custom fake Anthropic base is compatible, so catalog prices cannot authorize registration.
+        with pytest.raises(ProviderValidationError, match="compatible_model_prices_required"):
+            await repository.create_model(
+                provider_id=provider["id"], model_name="claude-system-unpriced-2099-01-01"
+            )
+        async with factory() as session:
+            persisted = await session.scalar(select(func.count(LlmModel.id)).where(LlmModel.provider_id == provider["id"]))
+        assert persisted == 0, "Rejected unpriced registration must not persist a model"
         registered = await repository.create_model(
             provider_id=provider["id"],
             model_name=model_name,
             input_price_per_million="2",
             output_price_per_million="4",
         )
-        return {"provider": provider, "unpriced": unpriced, "registered": registered}
+        return {"provider": provider, "registered": registered}
     finally:
         await close_db()
 
@@ -1265,20 +1271,9 @@ def test_process_stack_discovers_and_routes_new_claude_without_restart() -> None
 
         active = client.get("/v1/models", headers=headers)
         assert active.status_code == 200, active.text
+        assert "claude-system-unpriced-2099-01-01" not in {item["id"] for item in active.json()["data"]}
         public = next(item for item in active.json()["data"] if item["id"] == model_name)
         assert "anthropic" in public["providers"]
-
-        denied = client.post(
-            "/v1/temp-completions",
-            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
-            json={
-                "parts": [{"type": "text", "text": "unpriced route must not run"}],
-                "model_id": rows["unpriced"]["model_name"],
-                "features": {"memory": False, "tool_policy": {"mode": "none"}},
-            },
-        )
-        assert denied.status_code == 422, denied.text
-        assert "text (pricing_unavailable)" in denied.json()["detail"]
 
         unsupported = client.post(
             "/v1/temp-completions",

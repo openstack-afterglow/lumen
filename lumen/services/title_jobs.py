@@ -486,6 +486,9 @@ async def _apply_result(job: dict[str, Any]) -> bool:
                 breakdown.output_tokens,
                 input_price_per_token=_decimal_or_none(pricing.get("input_price_per_token")),
                 output_price_per_token=_decimal_or_none(pricing.get("output_price_per_token")),
+                input_price_per_token_above_200k=_decimal_or_none(pricing.get("input_price_per_token_above_200k")),
+                output_price_per_token_above_200k=_decimal_or_none(pricing.get("output_price_per_token_above_200k")),
+                long_context_threshold_tokens=pricing.get("long_context_threshold_tokens", 200_000),
                 price_source=pricing.get("price_source"),
                 breakdown=breakdown,
                 cache_read_price_per_token=_decimal_or_none(pricing.get("cache_read_price_per_token")),
@@ -499,6 +502,9 @@ async def _apply_result(job: dict[str, Any]) -> bool:
                 allow_catalog_prices=False,
                 # Frozen title snapshots stay literal; new ones already carry admitted writes.
                 allow_cache_write_fallback=False,
+                token_rates=pricing.get("token_rates"),
+                token_rates_above_200k=pricing.get("token_rates_above_200k"),
+                token_rates_follow_text=pricing.get("token_rates_follow_text") is True,
             )
             await credit.apply_usage_in_transaction(
                 session,

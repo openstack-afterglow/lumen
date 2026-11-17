@@ -38,7 +38,7 @@ from lumen.services.message_graph import (
 )
 from lumen.services.message_parts import deserialize_parts, serialize_parts
 from lumen.services.message_timestamps import message_timestamps
-from lumen.services.run_store import NONTERMINAL, replay_events
+from lumen.services.run_store import NONTERMINAL, PublicActivityRead, read_public_activity_events
 from lumen.services.workspace_store import WorkspaceForbidden
 
 logger = logging.getLogger(__name__)
@@ -372,8 +372,68 @@ def _project_run_activity(events: list, *, durations_ms: dict[str, int]) -> list
     """Project durable, display-safe reasoning and tool events in journal order."""
     activity: list[dict] = []
     by_id: dict[str, dict] = {}
+    tool_started_at = {}
     for event in events:
         payload = event.payload.model_dump(mode="json")
+        base = {"seq": event.seq, "createdAt": _iso(event.created_at)}
+        if event.type == "run.stage.changed":
+            activity.append({
+                **base, "id": f"stage:{event.seq}", "kind": "stage",
+                "stage": payload["stage"], "toolName": payload.get("tool_name"),
+            })
+        elif event.type == "context.updated" and payload["phase"] in {"compacting", "compacted"}:
+            activity.append({
+                **base, "id": f"context:{event.seq}", "kind": "context",
+                "phase": payload["phase"], "cause": payload.get("cause"),
+                "beforeTokens": payload.get("before_tokens"), "afterTokens": payload.get("after_tokens"),
+            })
+        elif event.type == "tool.approval_required":
+            item = {
+                **base, "id": f"approval:{payload['call_id']}", "kind": "approval",
+                "callId": payload["call_id"], "name": payload["name"],
+                "arguments": payload["redacted_arguments"], "preview": payload["preview"],
+                "effect": payload["effect"], "destination": payload.get("destination"),
+                "expiresAt": payload["expires_at"], "decision": None, "decidedAt": None,
+            }
+            by_id[item["id"]] = item
+            activity.append(item)
+        elif event.type == "tool.approval_resolved":
+            item = by_id.get(f"approval:{payload['call_id']}")
+            if item is not None:
+                item["decision"] = payload["decision"]
+                item["decidedAt"] = payload["decided_at"]
+        elif event.type == "child.created":
+            item = {
+                **base, "id": f"child:{payload['child_run_id']}", "kind": "child",
+                "childRunId": payload["child_run_id"], "callId": payload["call_id"],
+                "waitGroupId": payload["wait_group_id"], "agentId": payload["agent_id"],
+                "access": payload["access"], "ordinal": payload["ordinal"],
+                "initialStatus": payload["status"], "status": "requested",
+                "errorCode": None, "summary": "", "artifacts": [],
+            }
+            by_id[item["id"]] = item
+            activity.append(item)
+        elif event.type == "child.completed":
+            key = f"child:{payload['child_run_id']}"
+            item = by_id.get(key)
+            if item is None:
+                item = {
+                    **base, "id": key, "kind": "child", "childRunId": payload["child_run_id"],
+                    "callId": payload["call_id"], "waitGroupId": payload["wait_group_id"],
+                    "agentId": None, "access": None, "ordinal": None, "initialStatus": None,
+                }
+                by_id[key] = item
+                activity.append(item)
+            item.update(
+                status=payload["status"], errorCode=payload.get("error_code"),
+                summary=payload.get("summary", ""), artifacts=payload.get("artifacts", []),
+            )
+        elif event.type in {"run.completed", "run.failed", "run.canceled"}:
+            activity.append({
+                **base, "id": f"terminal:{event.seq}", "kind": "terminal",
+                "status": payload["status"], "errorCode": payload.get("error_code"),
+                "message": payload.get("safe_message"),
+            })
         if event.type == "part.delta" and payload.get("part_type") == "reasoning":
             key = f"reasoning:{payload['message_id']}:{payload['part_index']}"
             item = by_id.get(key)
@@ -409,6 +469,7 @@ def _project_run_activity(events: list, *, durations_ms: dict[str, int]) -> list
             else:
                 item["text"] = part.get("text", item["text"])
         elif event.type == "tool.call.started":
+            tool_started_at[payload["call_id"]] = event.created_at
             source = payload.get("source")
             item = {
                 "id": f"tool:{payload['call_id']}",
@@ -455,8 +516,25 @@ def _project_run_activity(events: list, *, durations_ms: dict[str, int]) -> list
             item["status"] = payload["status"]
             item["content"] = payload["content"]
             item["errorCode"] = payload.get("error_code")
-            item["durationMs"] = durations_ms.get(payload["call_id"])
+            duration = durations_ms.get(payload["call_id"])
+            started = tool_started_at.get(payload["call_id"])
+            item["durationMs"] = duration if duration is not None else (
+                max(0, int((event.created_at - started).total_seconds() * 1000)) if started else None
+            )
     return sorted(activity, key=lambda item: int(item["seq"]))
+
+
+def project_public_execution(activity: PublicActivityRead, *, durations_ms: dict[str, int], last_seq: int) -> dict:
+    """One public execution shape shared by indexed, legacy and temporary readers."""
+    return {
+        "last_seq": max(last_seq, max((event.seq for event in activity.events), default=0)),
+        "started_at": next(
+            (_iso(event.created_at) for event in activity.events if event.type == "run.started"), None,
+        ),
+        "activity_status": "unavailable" if activity.unavailable_code else "available",
+        "activity_error_code": activity.unavailable_code,
+        "activity": None if activity.unavailable_code else _project_run_activity(activity.events, durations_ms=durations_ms),
+    }
 
 
 async def list_messages(
@@ -520,6 +598,7 @@ async def list_messages(
                     ]
                     execution_by_message[final_message_id] = {
                         "run_id": run.id,
+                        "status": run.status,
                         "agent_id": run.agent_id,
                         "skill_ids": skill_ids if isinstance(skill_ids, list) else [],
                         "skills": skills,
@@ -541,15 +620,15 @@ async def list_messages(
                         durations_by_run.setdefault(segment.run_id, {})[segment.call_id] = int(
                             max(0, (segment.completed_at - segment.created_at).total_seconds() * 1_000)
                         )
+                    activity_by_run = await read_public_activity_events(session, list(final_message_by_run))
                     for run_id, final_message_id in final_message_by_run.items():
                         execution = execution_by_message[final_message_id]
                         durations = durations_by_run.get(run_id, {})
                         if durations:
                             execution["tool_durations_ms"] = durations
-                        execution["activity"] = _project_run_activity(
-                            await replay_events(session, runs_by_id[run_id], after_seq=0),
-                            durations_ms=durations,
-                        )
+                        execution.update(project_public_execution(
+                            activity_by_run[run_id], durations_ms=durations, last_seq=runs_by_id[run_id].last_seq,
+                        ))
             return [_msg_public(row, execution=execution_by_message.get(row.id), conversation_id=conv_id) for row in rows]
     except OperationalError as exc:
         mark_db_unhealthy()
@@ -935,6 +1014,23 @@ async def list_message_page(
                         "run_id": run.id,
                         "status": run.status,
                         "retryable": run.status in {"failed", "canceled"},
+                    }
+
+            # The indexed history endpoint must retain the same journal as live SSE.
+            # Resolve only final assistant IDs in this bounded page, including owned forks.
+            assistant_ids = [row.ChatMessage.id for row in page if row.ChatMessage.role == "assistant"]
+            if assistant_ids:
+                runs = (await session.execute(select(ChatRun).where(
+                    ChatRun.assistant_message_id.in_(assistant_ids),
+                    ChatRun.user_id == user_id,
+                    ChatRun.project_id == project_id,
+                ))).scalars().all()
+                activity_by_run = await read_public_activity_events(session, [run.id for run in runs])
+                for run in runs:
+                    execution_by_message[run.assistant_message_id] = {
+                        "run_id": run.id,
+                        "status": run.status,
+                        **project_public_execution(activity_by_run[run.id], durations_ms={}, last_seq=run.last_seq),
                     }
 
             messages: list[dict] = []

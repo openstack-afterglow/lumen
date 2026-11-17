@@ -26,7 +26,8 @@ from sqlalchemy import select
 
 from lumen.db import get_session_factory
 from lumen.models.chat_infrastructure import ChatRuntimePool, ChatRuntimeResource
-from lumen.services.durable_runs import lifecycle
+from lumen.services import worker_routing
+from lumen.services.durable_runs import budgets, lifecycle
 from lumen.services.infrastructure import bootstrap, store
 from lumen.services.infrastructure._coordination import HEARTBEAT_SECONDS, PoolCoordinator
 from lumen.services.infrastructure.config import PoolConfig, RuntimeConfig
@@ -91,22 +92,33 @@ class ResourceController:
             return await self._settled(function, *args)
 
     async def _fenced_cloud(self, resource, fence: int, function, *args, action: str | None = None):
-        """Order non-conditional cloud writes with takeover using the pool row lock."""
+        """Retry only the DB prefix; native submission and its commit are never replayed."""
         factory = get_session_factory()
-        async with self.limiter, factory() as session, session.begin():
-            row, lease = await store._locked_resource(session, resource.id, resource.generation)
-            if row is None or not store._owns(lease, self.owner, fence):
-                raise PoolLeaseLost()
-            if action == "create" and row.desired_state != "requested":
-                raise PoolLeaseLost()
-            if action == "delete":
-                if row.desired_state != "deleting":
+        submitted = False
+
+        def submit():
+            nonlocal submitted
+            submitted = True
+            return function(*args)
+
+        async def transaction():
+            async with self.limiter, factory() as session, session.begin():
+                await worker_routing.use_read_committed(session)
+                row, lease = await store._locked_resource(session, resource.id, resource.generation)
+                if row is None or not store._owns(lease, self.owner, fence):
                     raise PoolLeaseLost()
-                if (row.role == "worker" and (row.ready_at is not None or row.drain_requested_at is not None
-                        or row.observed_state in {"ready", "draining"}) and row.drain_ack_at is None
-                        and row.failure_code != "resource_vanished"):
-                    raise store.ResourceUnavailable("drain_pending")
-            return await self._renewed_effect(lease, function, *args)
+                if action == "create" and row.desired_state != "requested":
+                    raise PoolLeaseLost()
+                if action == "delete":
+                    if row.desired_state != "deleting":
+                        raise PoolLeaseLost()
+                    if (row.role == "worker" and (row.ready_at is not None or row.drain_requested_at is not None
+                            or row.observed_state in {"ready", "draining"}) and row.drain_ack_at is None
+                            and row.failure_code != "resource_vanished"):
+                        raise store.ResourceUnavailable("drain_pending")
+                return await self._renewed_effect(lease, submit)
+
+        return await budgets.retry_deadlocks(transaction, retry_if=lambda: not submitted)
 
     async def _renewed_effect(self, lease, function, *args):
         await self._check_assignment()
@@ -361,7 +373,7 @@ class ResourceController:
         await self._check_assignment()
         resources = await self._resources(pool.id)
         if definition.role == "sandbox":
-            await self._fail_expired_waiters(resources)
+            await self._expire_sandboxes(resources, fence)
             await store.write_projection(pool.id, self.owner, fence, desired=len(resources),
                 ready=sum(r.observed_state == "ready" for r in resources),
                 provisioning=sum(r.observed_state in {"requested", "creating", "booting"} for r in resources),
@@ -530,6 +542,7 @@ class ResourceController:
         try:
             # Limiter first: a coroutine holding the pool row lock never waits on the limiter.
             async with self.limiter, factory() as session, session.begin():
+                await worker_routing.use_read_committed(session)
                 row, lease = await store._locked_resource(session, resource.id, resource.generation)
                 if (row is None or row.pool_id != pool.id or not store._owns(lease, self.owner, fence)
                         or row.drain_requested_at is not None or not row.accepting
@@ -667,6 +680,7 @@ class ResourceController:
             return
         factory = get_session_factory()
         async with factory() as session, session.begin():
+            await worker_routing.use_read_committed(session)
             row, lease = await store._locked_resource(session, resource.id, resource.generation)
             if row is None or not store._owns(lease, self.owner, fence) or row.drain_requested_at is None:
                 raise PoolLeaseLost()
@@ -691,15 +705,21 @@ class ResourceController:
                 resource.ingress_member_id, resource.id, resource.generation, resource.address)
 
 
-    async def _fail_expired_waiters(self, resources: list[ChatRuntimeResource]) -> None:
+    async def _expire_sandboxes(self, resources: list[ChatRuntimeResource], fence: int) -> None:
+        """Retire each bounded sandbox independently of its still-live root run."""
         now = datetime.now(UTC)
         for resource in resources:
-            if not resource.run_id or not resource.deadline_at or resource.observed_state in {"ready", "deleted"}:
+            if (not resource.run_id or not resource.deadline_at or resource.observed_state == "deleted"
+                    or store._utc(resource.deadline_at) > now):
                 continue
-            deadline = resource.deadline_at if resource.deadline_at.tzinfo else resource.deadline_at.replace(tzinfo=UTC)
-            if now >= deadline:
-                await lifecycle.fail_waiting_run(resource.run_id, error_code="resource_deadline_exceeded",
-                                                 safe_message="Sandbox provisioning deadline exceeded")
+            # Ready may commit before startup wakeup; queued may also mean a parent
+            # resuming after child work. Fail only never-claimed runs under its lock.
+            await lifecycle.fail_waiting_run(
+                resource.run_id, error_code="resource_deadline_exceeded",
+                safe_message="Sandbox lifetime expired before execution", require_unstarted=True,
+            )
+            if resource.desired_state != "deleting":
+                await store.request_delete(resource.id, self.owner, fence)
 
     async def _scale(self, pool: ChatRuntimePool, fence: int, definition: PoolConfig,
                      resources: list[ChatRuntimeResource], *, retirement_reason: str | None = None) -> None:
@@ -869,11 +889,14 @@ class ResourceController:
         if observation.state.lower() == "absent":
             await store.mark_failed_with_cleanup(resource.id, resource.generation, self.owner, fence,
                                                  "resource_vanished")
-            await store.claim_operation(resource.id, resource.generation, "delete", self.owner, fence)
-            await self._prove_deleted(resource, definition, fence)
             if resource.run_id:
                 await lifecycle.fail_waiting_run(resource.run_id, error_code="resource_unavailable",
                                                  safe_message="Assigned resource is no longer available")
+            if resource.backend == "kubernetes":
+                await self._reconcile_delete(resource, definition, fence, provider)
+            else:
+                await store.claim_operation(resource.id, resource.generation, "delete", self.owner, fence)
+                await self._prove_deleted(resource, definition, fence)
             return
         if not await store.record_observation(resource.id, resource.generation, self.owner, fence, observation):
             return
@@ -951,4 +974,11 @@ class ResourceController:
         # Explicit per-resource GET absence, never an empty list, releases occupancy.
         observation = await self._cloud(provider.observe, ref)
         if observation.state.lower() == "absent":
+            if resource.backend == "kubernetes":
+                # Pod absence does not prove that its UID-bound Secret, policy and
+                # Service are gone. Complete that provider-owned cleanup under the
+                # current deletion fence before releasing durable occupancy.
+                result = await self._fenced_cloud(resource, fence, provider.delete, ref, action="delete")
+                if not result.absent:
+                    return
             await self._prove_deleted(resource, definition, fence)

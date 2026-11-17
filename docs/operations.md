@@ -1,5 +1,16 @@
 # 운영 가이드
 
+## 0.6.17 롤아웃 메모
+
+- **Migration:** 033(MCP domain scope)과 034(`chat_stateless_call_reservations`)는 새 API/worker를 기동하기 전에 적용한다. 둘 다 additive이지만 기존 writer는 무상태 예약을 quota에 반영하지 않으므로, 새 Decisions admission과 기존 writer가 quota를 공유하며 함께 돌면 안 된다. 순서는 admission 중지·worker drain → 백업 → migrate → 새 cohort 기동이다.
+- **Protocol v2:** 같은 API·worker cohort에서 함께 켠다. Worker 등록은 {1,2}를 광고하므로 drain 없이 섞지 않는다. v2에서 대기 중인 승인이 있으면 v1로 되돌릴 수 없다.
+- **ClamAV:** `enable_lumen_clamav: true`, `lumen_clamav_host`는 비운다. Host network, `127.0.0.1:3310`, 서명 신선도·PING·VERSION 확인 전에는 API/worker가 기동하지 않는다.
+- **Kolla reconfigure:** 항상 `--skip-tags haproxy`를 붙인다.
+- **네이티브 카탈로그:** 공식 endpoint 모델 중 저장 단가가 없는 행은 배포 즉시 카탈로그 단가로 과금된다. 운영 전후 표(Gemini 이미지·일부 텍스트, `gpt-image-1.5`·`gpt-image-2`, Perplexity `glm-5.3-flash`·`kimi-k3` 등)를 확인한 뒤 배포한다. 현재 rate card에 없는 Perplexity 모델 5개는 계속 미가격이다. 사용자 지정 base의 호환 공급자는 관리자 단가가 필수다. Perplexity Sonar는 provider 내장 검색을 계속 수행하며 검색 수수료는 아직 청구하지 않는다(기존 한계). 공급자 기본 웹 검색 gate는 수수료를 청구할 수 있을 때까지 닫혀 있다.
+- **운영자 레지스트리 정리(명시적 편집):** `stt`로 잘못 저장된 OpenAI 실시간 전사 모델은 `realtime`으로 바꾸고 `realtime_input_per_minute` 단가를 넣은 뒤 활성화한다. 자동 SQL 변경은 하지 않는다.
+- **Decisions:** 공식 지원 모델은 `gpt-6-luna`(카탈로그 `decisions=true`). 불확실한 무상태 예약은 명시적 처분 전까지 quota에 남는다. 처분 API는 없으며 event UUID와 공급자 사용 증거를 대조한 뒤 유지보수 절차로만 정산·해제한다.
+- **Sandbox runtime:** 최종 0.6.17 sandbox 이미지·manifest digest와 mTLS 검증 전에는 `lumen_runtime_enabled: false`를 유지한다.
+
 ## 0.6.16 텍스트 임베딩 롤아웃 메모
 
 0.6.16에는 새 migration이 없다. `llm_models.model_kind`의 기존 `VARCHAR(16)`이 `embedding`을 저장한다. API/worker 이미지를 교체한 뒤 관리자 화면 또는 `python -m lumen.scripts.seed_providers`(`LUMEN_BOOTSTRAP_MODELS_JSON`에 정확한 입력 단가 제공)로 임베딩 모델을 등록해야 `/v1/embeddings`, `/v1beta/models/*:embedContent|batchEmbedContents`, `/v1/chat/embeddings`가 모델을 노출한다. 입력 단가가 없으면 해당 route는 가격 gate(`pricing_available=false`)로 닫힌다. Afterglow Embedding Studio는 이 Lumen이 먼저 배포된 뒤에만 `/chat/models?model_kind=embedding`을 호출할 수 있으므로 Lumen을 먼저 배포한다. 실제 공급자 호출, vendor 청구서 대조, 운영 롤아웃은 작성 시점에 검증하지 않았다.
@@ -208,11 +219,11 @@ Cloud profile은 project/region/interface/CA/Keystone application credential(env
 
 **Kubernetes sandbox prerequisite, controller-only credential과 manifest 사본:**
 
-- 운영자는 먼저 **`lumen-service`의 Drover-managed Kubernetes cluster**를 준비한다. Drover cluster 배포 경로는 별도 구현/운영 경계이며 Lumen/Kolla Ansible이 cluster·node를 생성/수정/삭제하지 않는다. Namespace 생성, runtime/RuntimeClass·CNI 설치, RBAC·baseline NetworkPolicy와 operator qualification도 이 prerequisite에 속한다. Lumen은 준비된 namespace 안의 **on-demand sandbox Pod·bootstrap Secret·per-resource NetworkPolicy·NodePort Service lifecycle만** 소유한다. Service는 해당 Pod UID에 결합하며 Pod 부재가 확인된 뒤에만 owned Service·Secret·NetworkPolicy를 정리한다. Namespace나 cluster의 lifecycle을 Lumen pool 생성/삭제에 연결하지 않는다.
-- `kubernetes_clusters[]`는 `id`, explicit HTTPS origin `server`, `ca_file`, `bearer_token`, `namespace`, `runtime_class_name`, `runtime_class_handler`, `cluster_cidrs`, `qualification_file`, `qualification_sha256`를 제공한다. Ambient kubeconfig/`KUBECONFIG`·cloud credential로 보충하지 않는다. RuntimeClass 이름은 명시적으로 선택하고 실제 handler는 `runsc` 또는 `kata`/`kata-…`여야 한다. `cluster_cidrs`에는 public egress에서 제외할 실제 cluster 범위를 제공한다.
+- 운영자는 먼저 명시적인 owner/project의 **기존 Drover-managed Kubernetes cluster**를 준비한다. Lumen/Kolla는 cluster·VM·node를 생성/변경/삭제하지 않는다. RuntimeClass·CNI 설치와 실제 runtime/network qualification은 별도 operator prerequisite다. 선택적 renewable source는 해당 기존 cluster의 Drover `sandbox-connection`만 호출하며, Drover가 deployment/pool 전용 namespace·최소 RBAC·baseline default deny를 멱등 준비한다. Lumen은 준비된 namespace 안의 **on-demand sandbox Pod·bootstrap Secret·per-resource NetworkPolicy·NodePort Service lifecycle만** 소유한다. Namespace나 cluster lifecycle을 Lumen pool 생성/삭제에 연결하지 않는다.
+- `kubernetes_clusters[]`는 `id`, explicit HTTPS origin `server`, `ca_file`, `namespace`, `runtime_class_name`, `runtime_class_handler`, `cluster_cidrs`, `qualification_file`, `qualification_sha256`와 **정확히 하나의** `bearer_token` 또는 `drover` source를 제공한다. 기존 static `bearer_token: {file: "/etc/lumen/controller/kubernetes/drover/token"}` 설정도 유효하다. 두 source를 함께 넣거나 모두 생략하면 typed validation이 거부한다. Ambient kubeconfig/`KUBECONFIG`, admin kubeconfig, 다른 cloud identity로 보충하지 않는다. RuntimeClass handler는 `runsc` 또는 `kata`/`kata-…`이며 실제 cluster CIDR을 제공한다.
 - Pool은 `backend="kubernetes"`, `role="sandbox"`, **`min_replicas=0`**, 유한한 양수 `max_replicas`, immutable `image="<registry>/<image>@sha256:<64 lowercase hex>"`, 명시적 sandbox workspace/memory/CPU/PID 한도와 lifetime을 사용한다. `profile.backend="kubernetes"`와 `profile.cluster_profile_id`로 cluster 항목을 참조하며 `cloud_profile_id`, `network_id`, `security_group_ids`, trusted `guest_profile_id`는 넣지 않는다. `profile.tool_manifest_file`/`tool_manifest_sha256`는 controller 입력의 실제 bytes를 pin하고, `tool_manifest_path`(기본 `/opt/lumen-tools/manifest.json`)는 immutable sandbox **image 내부** 경로다. Kubernetes-only + fixed-worker 배포에서는 Batch를 기본 비활성(`lumen_batch_enabled: false`)으로 유지한다. Batch opt-in은 별도의 managed `online_text`·`batch` worker pool과 `workload_pools` mapping을 요구하며 Kubernetes sandbox pool로 대체하지 않는다.
 
-Kolla의 canonical host root는 `lumen_controller_secrets_dir`(기본 `/etc/kolla/lumen/controller`), controller의 read-only container root는 `/etc/lumen/controller`다. 다음은 cluster ID `drover`의 구체적인 상대경로 배치 예시다. Typed field에는 host path가 아닌 container path를 넣으며 다른 cluster/pool도 같은 root 아래 canonical 상대경로로 구분한다. Kubernetes용 별도 kubeconfig 변수나 worker mount를 만들지 않는다. Manifest만 기존 worker mount에 같은 상대경로로 복제하고 credential/qualification은 controller에만 둔다.
+Kolla의 canonical host root는 `lumen_controller_secrets_dir`(기본 `/etc/kolla/lumen/controller`), controller의 read-only container root는 `/etc/lumen/controller`다. 다음은 cluster profile ID `drover`의 상대경로 배치 예시다. Typed field에는 host path가 아닌 container path를 넣는다. Manifest만 worker의 기존 제한 mount와 API의 별도 public-only mount에 같은 상대경로로 복제하고 credential/qualification은 controller에만 둔다.
 
 | Typed field | Operator host 파일 (기본 root) | Controller container path |
 | --- | --- | --- |
@@ -220,13 +231,29 @@ Kolla의 canonical host root는 `lumen_controller_secrets_dir`(기본 `/etc/koll
 | `kubernetes_clusters[].bearer_token.file` | `/etc/kolla/lumen/controller/kubernetes/drover/token` | `/etc/lumen/controller/kubernetes/drover/token` |
 | `kubernetes_clusters[].qualification_file` | `/etc/kolla/lumen/controller/kubernetes/drover/qualification.json` | `/etc/lumen/controller/kubernetes/drover/qualification.json` |
 | `pools[].profile.tool_manifest_file` | `/etc/kolla/lumen/controller/kubernetes/drover/tools.json` | `/etc/lumen/controller/kubernetes/drover/tools.json` |
+| `kubernetes_clusters[].drover.password.file` (renewable 전용) | `/etc/kolla/lumen/controller/drover/password` | `/etc/lumen/controller/drover/password` |
+| `kubernetes_clusters[].drover.ca_file` (Keystone/Drover HTTPS trust) | `/etc/kolla/lumen/controller/drover/ca.pem` | `/etc/lumen/controller/drover/ca.pem` |
 
-위 manifest의 worker host 사본은 `/etc/kolla/lumen/worker/kubernetes/drover/tools.json`이며, worker 안에서는 동일한 `/etc/lumen/controller/kubernetes/drover/tools.json`으로 보인다. `kubernetes/`와 `kubernetes/drover/`만 추가 directory로 허용하고 basename만 `worker/tools.json`으로 평탄화하지 않는다. Disabled pool의 manifest나 그 pool만을 위한 directory는 allowlist에 포함되지 않는다. Worker는 시작 시 enabled Kubernetes sandbox pool마다 공유 manifest parser로 pin·크기·schema를 검증하며 **DB/plugin 초기화·registration·새 claim 이전에 fail closed**한다. Worker graph도 sandbox lease가 있을 때 enabled pool의 pinned manifest를 다시 읽어 provider-safe tool 정의를 구성하고, 오류 시 tool을 조용히 생략하거나 다른 경로로 fallback하지 않는다. 현재 API admission은 protocol/checkpointer와 enabled sandbox pool의 설정상 가용성만 확인하고 Kubernetes tool manifest bytes를 검증하지 않는다. API tool preview도 platform/plugin/external MCP snapshot을 사용하므로 **API에 manifest mount나 manifest startup 검증을 요구하지 않는다**; API admission/readiness 성공은 worker manifest 검증의 증거가 아니다.
+위 manifest의 worker host 사본은 `/etc/kolla/lumen/worker/kubernetes/drover/tools.json`이며 worker 안에서는 동일한 `/etc/lumen/controller/kubernetes/drover/tools.json`으로 보인다. Basename만 `worker/tools.json`으로 평탄화하지 않는다. Kolla는 `lumen_public_manifest_source_dir`의 pinned manifest digest·schema를 먼저 검증한 뒤 승인된 public bytes만 `lumen_api_tools_dir`(기본 `/etc/kolla/lumen/api-tools`)의 같은 상대경로로 복제한다. Source directory 기본값은 controller가 활성인 host에서는 controller root, 나머지 host에서는 기존 worker directory다. API-only host는 public staging directory를 명시할 수 있다. API는 public-only directory를 `/etc/lumen/controller:ro`로 마운트하므로 manifest 설정 path를 바꾸지 않는다. API directory에는 활성 manifest와 정확한 ancestor directory만 허용한다; password·signing key·worker key·Kubernetes token·qualification은 거부한다. API selected-tool admission은 동일한 pinned public manifest를 읽고, worker도 DB/plugin 초기화·registration·새 claim 전에 manifest pin·크기·schema를 검증한다. Worker/controller는 실행 전에 frozen selection을 다시 검증하며 오류를 도구 누락이나 다른 실행 경로 fallback으로 숨기지 않는다.
 
 공유 loader는 최대 1 MiB의 pinned manifest bytes와 version 1, 중복 없는 profile/tool 이름, absolute command, JSON Schema object, 허용 effect를 검증한다. Pin으로 승인한 MCP 서버의 `input_schema`는 그대로 보존하며 builtin/plugin 전용 closed-object 규칙을 적용하거나 `additionalProperties: false`를 덧붙이지 않는다. 일반 plugin `ToolDefinition` 검증 정책은 바뀌지 않는다. 읽기·pin·schema 오류는 `runtime_kubernetes_manifest`로 드러난다.
 Graph binding 이름이 builtin/plugin/`run_code` 또는 앞서 주입한 다른 pool의 tool과 충돌해도 `runtime_kubernetes_manifest`로 실패하며, 먼저 있던 binding을 유지한 채 manifest tool을 조용히 누락하지 않는다.
 
-Kolla에서는 Kubernetes `bearer_token`을 **`{file = "/etc/lumen/controller/…"}`**로 제공한다. Provider 자체의 env reference 지원과 달리 role에서는 `bearer_token.env`나 mount 밖 경로를 `runtime_kubernetes_mount`로 거부한다. Nested 경로는 허용하지만 `.`/`..` traversal은 허용하지 않는다. 모든 경로 component에 symlink가 없어야 하며, host controller/worker mount root와 nested directory는 root-owned non-symlink directory여야 한다. Controller directory mode는 0700/0750, worker root와 정확한 manifest ancestor directory는 root:root 0750으로 준비한다. Controller의 root-owned regular CA 파일은 0400/0600/0440/0640/0444/0644, token·qualification·tool manifest 원본은 **0400/0600**으로 준비한다. Worker manifest 사본은 별도로 **root:root 0444/0644**여야 한다. Precheck helper는 controller 입력과 별도로 worker identity 세 파일과 manifest 사본/정확한 directory inventory를 `/etc/lumen/worker-precheck:ro`에서 검사하고 기존 offline crypto 검사를 유지한다; worker certificate/key를 controller host directory에도 복제할 필요가 없다.
+Static source의 Kolla `bearer_token`은 **`{file: "/etc/lumen/controller/…"}`**만 허용한다. Provider 자체의 기존 env reference 지원과 달리 role은 `bearer_token.env`와 mount 밖 경로를 거부한다. Renewable source에는 static token 파일이 필요 없다. 경로는 canonical이고 symlink가 없어야 한다. Controller root·nested directory는 root-owned 0700/0750, worker root·정확한 manifest ancestor는 root:root 0750으로 준비한다. Controller CA는 root-owned regular 0400/0600/0440/0640/0444/0644, static token·qualification·manifest 원본은 0400/0600이다. Worker manifest 사본은 root:root 0444/0644다. API public-only root·ancestor는 root:root 0755, manifest는 0444/0644로 non-root API가 읽는다. Operator precheck만 controller material을 검사하고, 별도의 API/worker role precheck는 각자의 mount만 받아 보호된 controller 참조를 열지 않는다. Worker key의 controller signing/listener/probe key 재사용 검사는 controller-side 검사에서 유지한다.
+
+**기존 cluster의 renewable Drover source:**
+
+`drover`는 다음 field만 허용한다. `endpoint`는 HTTPS Drover origin 또는 `/v1`, `auth_url`은 HTTPS Keystone `/v3`다. `user_id`와 `project_id`는 실제 native password identity의 명시적 ID다. `password`는 `ControllerSecretRef`인 `{file: "/etc/lumen/controller/drover/password"}`만 받고 env/inline password를 거부한다. `ca_file`은 `/etc/lumen/controller/drover/` 아래 canonical trust bundle path다. `cluster_id`는 기존 cluster의 canonical lowercase UUID다. `namespace_uid`와 `service_account`는 운영자가 실제 scoped connection에서 관측한 exact 값이다. `request_timeout_seconds`는 정수 1..300(기본 30), `refresh_margin_seconds`는 정수 30..120(기본 60)이다. Password 파일은 root:root regular **0600**, trust CA는 root:root regular 0400/0600/0444/0644이며 parent와 leaf symlink를 거부한다.
+
+Controller는 갱신마다 fresh Keystone password token을 발급받아 응답의 user/project, `methods=["password"]`, project scope와 남은 TTL ≥600초를 검증한다. 그 token만 사용해 명시적 `cluster_id`의 `POST /v1/clusters/{id}/sandbox-connection`에 `{deployment_id, pool_name, runtime_class_name}`을 보낸다. Deployment/pool은 현재 runtime/pool 설정에서 오며 다른 cluster나 권한을 선택하지 않는다. 응답 server·CA certificate identity·namespace·namespace UID·service account·RuntimeClass가 pin과 다르면 거부한다. Scoped token의 expiry는 미래이며 **응답 수신 시점의 남은 TTL이 900초 이하**, native token expiry 이하여야 한다. Drover가 요청 도착 후 발급하므로 outbound latency를 900초 한도에 잘못 더하지 않는다.
+
+동시 요청의 갱신은 mutex singleflight이고 wall/monotonic clock 양쪽으로 expiry 전에 갱신한다. HTTP client·pinned SSL context를 재사용하되 요청별 Authorization header를 따로 만든다. 401은 사용한 lease만 무효화하며 **그 요청을 재시도하지 않는다**. 특히 Pod/Secret/Service/NetworkPolicy POST·DELETE의 timeout/불확실한 응답은 재전송·자동 삭제 근거가 아니다. 실패한 갱신은 이전 token으로 fallback하지 않는다. IAM/Drover revocation은 다음 bounded renewal 또는 Kubernetes 401에서 차단되며 즉시 revocation oracle을 주장하지 않는다. Controller 종료는 in-flight 작업/stream을 drain한 뒤 credential/HTTP client를 닫는다. Token은 controller 메모리에서만 쓰며 SQL·API·worker·Pod에 전달하지 않는다.
+
+Operator는 production namespace의 실제 UID와 qualification을 pin해야 한다. 이전 throwaway qualification namespace, 과거 cluster endpoint/CA, broad admin kubeconfig를 runtime 입력으로 재사용하지 않는다. 위 계약과 synthetic 검증은 실제 native IAM·Drover·Kubernetes rollout 수용의 증거가 아니다.
+
+**한 controller와 여러 fixed API/worker host 배치:** `enable_lumen_controller`는 host별 bool template을 지원하므로, 예를 들어 `enable_lumen_controller: "{{ inventory_hostname == 'dms-controller1' }}"`로 한 host만 선택한다. 나머지 host는 typed config 검사와 각자의 public-manifest/worker-mTLS precheck만 수행하며 controller password·CA signing key·dispatch key를 요구하거나 마운트하지 않는다. Private dispatch 파일 stat도 enabled controller host에만 적용한다. 모든 host의 `runtime_config.controller_url`은 같은 명시적 HTTPS controller endpoint를 가리키며, `lumen_controller_listen_address`는 선택한 host의 실제 bind IP, `lumen_controller_listen_port`와 typed `listen_port` 기본값은 **8013**이다. 각 host에 controller service를 켜고 다른 host IP에 bind하는 방식으로 배치하지 않는다.
+
+Controller의 `tls`에는 `ca_file`, `ca_key_file`, `cert_file`, `key_file`, 전용 `operator_client_cert_file`/`operator_client_key_file`과 fixed worker용 `worker_client_cert_file`/`worker_client_key_file` 경로를 설정한다. Signing/listener/operator private material과 `dispatch_key.file`은 controller host에만 둔다. 각 worker host는 같은 public CA와 자기 전용 client leaf/key를 worker directory에 둔다; leaf의 URI SAN은 `spiffe://lumen/fixed-worker/<id>`, `fixed_workers`에는 모든 허용 worker의 `{id, certificate_fingerprint}`를 등록한다. Fingerprint는 각 leaf의 SHA-256 lowercase 64 hex이며 승인 목록과 실제 host leaf가 일치해야 한다. API는 이 worker key를 받지 않는다. 인증서 SAN·trust·native owner/project·namespace UID와 실제 routing은 operator가 별도로 검증하며 새 LB route를 만들지 않는다.
 
 **Namespace·network·qualification gate:**
 
@@ -457,6 +484,32 @@ Lumen의 root `lumen` wheel은 Kolla 역할을 shared data로 포함한다. Koll
 - **최초 배포 명령어**: 새 bootstrap CLI를 포함한 이미지/source pin을 준비한 뒤 `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 image pull/source build, precheck, config, database/Keystone preconditions, DB migration(`lumen_bootstrap`), provider 등록(`lumen_provider_bootstrap`), container startup을 순차 실행한다. Standalone `precheck`/`config`는 exact release image가 각 lumen host에 이미 있어야 하며 암묵적 registry pull을 하지 않는다.
 - **PostgreSQL 모드 선택**: 기본값 `lumen_postgres_mode="external"`은 `lumen_external_postgres_url`이 반드시 필요하다. 역할이 PostgreSQL을 관리하게 하려면 `/etc/kolla/config/afterglow/globals.yml`에서 `lumen_postgres_mode: "bundled"`를 선택하고 `secrets.yml`에 강한 `lumen_postgres_password`를 제공한다. 둘 중 하나를 명시하지 않은 stock defaults는 precheck에서 fail-closed 한다.
 
+### 선택적 컨트롤러별 ClamAV
+
+기본 `enable_lumen_clamav: false`는 기존 외부 검사기(`lumen_clamav_host`, `lumen_clamav_port`)를 그대로 사용한다. `true`로 켜면 `lumen` 그룹의 각 컨트롤러에 `lumen_clamav`를 생성하며, API/worker의 host network와 같은 호스트의 `127.0.0.1:3310`으로 연결한다. Stock Kolla는 Docker bridge/NAT를 끌 수 있으므로 검사기는 **host network**이고 clamd 자체의 `TCPAddr`를 loopback으로 제한한다. Docker bridge·포트 publication·HAProxy listener를 만들거나 Docker daemon의 iptables/forwarding을 변경하지 않는다. 원격 worker guest의 loopback은 다른 호스트이므로 별도의 외부 검사기 구성이 필요하다.
+
+```yaml
+enable_lumen_clamav: true
+lumen_clamav_host: ""  # managed mode에서는 외부 host override를 비운다
+lumen_clamav_bind_address: "127.0.0.1"
+lumen_clamav_port: 3310
+lumen_clamav_image_ref: "clamav/clamav-debian:1.4.6@sha256:806639a6e3a45ae1d6f3932722c3e016e5b93452f93d444538f697c39d6af16b"
+lumen_clamav_volume: "lumen_clamav_signatures"
+lumen_clamav_memory: "4g"
+lumen_clamav_cpus: 2
+lumen_clamav_pids_limit: 256
+lumen_clamav_ready_retries: 180
+lumen_clamav_signature_max_age_hours: 72
+```
+
+버전과 immutable digest를 함께 고정한다. 관리 모드의 port는 공식 image의 clamd 설정과 일치하는3310으로 고정한다(외부 검사기 모드의 custom port는 유지). Kolla precheck는 public bind·외부 host 충돌·다른 managed port·mutable image·무제한 자원 설정을 거부한다. 서명은 컨트롤러별 named volume에 영속하며 updater는 매시간 실행하고 clamd는30초마다 변경을 재확인한다. 검사기는 DB/Keystone/S3/provider credentials를 받지 않는다. 컨트롤러당4GiB/2CPU quota를 예약하고, signature reload 중 메모리 중복·cold download 지연을 고려한다.
+
+**Egress와 readiness:** 각 컨트롤러의 DNS 및 `database.clamav.net` HTTPS egress가 필요하다. 서명 CDN의 단순 `curl HEAD`403은 실제 Freshclam 성공도 실패도 확정하지 않으므로 updater의 실제 결과를 확인한다. 프로세스 또는 TCP port가 열렸다는 이유로 ready로 간주하지 않는다. `start.yml`은 API/worker 시작 전에 host-side `validate_clamav.py`로 PING/PONG, VERSION의 양수 서명 version과 build date를 확인한다. 서명은 기본72시간 이내여야 하며 미래5분 초과·누락·손상·truncated 응답은 실패한다. 최대 허용 age는 운영자가1–168시간 범위에서 정하며 기본 재시도는180회/5초 간격이다(각 socket 작업 timeout 별도). Stale bundled DB, 다운로드 실패 또는 미반영 reload는 배포를 차단한다. 가짜 signature 생성, age 완화나 scan 우회로 실패를 숨기지 않는다. 기존 실행 중인 앱을 자동 정지하지 않으므로 승인된 drain/cutover 절차는 별도로 수행한다.
+
+**승인된 rollout:** 기존 operator 설정·이미지·S3·schema·암호화/checkpointer identity를 보존하고 검토된 wheel/role을 같은 Kolla environment에 설치한다. `pull → prechecks → reconfigure --tags lumen --skip-tags haproxy`를 첫 컨트롤러에서 수행하고, scanner image/resource/listen 주소와 실제 Freshclam/PING/VERSION·렌더된 `chat_clamav_host`를 확인한 뒤 나머지 컨트롤러로 진행한다. 정상 media smoke는 별도 승인 예산을 따르며 EICAR는 운영으로 보내지 않는다.
+
+**Rollback:** 관리 모드를 유지할 때는 이전에 검증한 image digest와 설정을 복원해 같은 role로 reconfigure하고 서명 volume은 보존한다. 외부 검사기로 복원하려면 `enable_lumen_clamav:false`와 원래 private `lumen_clamav_host`를 설정한 뒤 앱을 reconfigure한다. 외부 host도 비우면 asset pipeline은 fail-closed다. 비활성화는 기존 scanner/서명을 암묵적으로 삭제하지 않는다. Scanner만 제거하려면 정확한 호스트에 `include_role: {name: lumen, tasks_from: destroy}`를 `lumen_services: {}`, `enable_lumen_clamav:true`와 함께 실행해 앱 loop를 비우고 named scanner만 제거한다. Volume은 유지된다. 일반 `kolla-ansible destroy --tags lumen`는 API/worker도 제거하므로 scanner-only 정리에 사용하지 않는다.
+
 ### 2. 독립 wheel/image release
 #### 0.6.8 published and deployed (2026-10-14)
 
@@ -540,3 +593,109 @@ The general Redis wakeup outage note above still applies to durable run workers:
 Coordinate a stop/drain and compatible controller restart using existing approved rollout procedures; mixed old/all-pool and new/assigned controllers are not qualified by these documents. Preserve SQL/cloud journals, encryption/CA/dispatch keys, Redis/DB endpoints, and unrelated WIP. Execute the [local real-Redis/SQL recipe](testing.md#balanced-infrastructure-controller-acceptance-test-passed) only in disposable fixtures. The linked parent receipt records source scope, commands, counts and real/synthetic boundaries; the architecture stamp is in the parent receipt (isolated clone, shared marker untouched). Local test evidence does not authorize promotion, production failover, live provider/cloud, release publication or deployment.
 
 Existing guest supervisor limitation: `lumen/services/infrastructure/guest_api.py` sends the service child SIGTERM, waits at most ten seconds, then sends SIGKILL during supervisor shutdown. Outer Docker/systemd stop timeouts alone do not guarantee active-call drain during stop/reboot. Complete and acknowledge service/run drain before stopping the guest supervisor; do not infer graceful provider completion from outer timeout configuration. This integration does not change that supervisor behavior.
+
+## Manually updating the native model catalog
+
+`lumen/data/native_model_catalog.json` is bundled package data, not a live price feed.
+It applies only to the official OpenAI, Anthropic, Gemini and Perplexity endpoints.
+OpenAI/Anthropic subscription authentication retains its separate transport limits.
+Third-party compatible endpoints receive no bundled models, prices or capabilities;
+administrators register their IDs and required rates explicitly.
+
+1. Re-read each affected provider's official pricing, model specification and lifecycle pages.
+   Record the exact official HTTPS URLs in `source_urls` and the provider's
+   `pricing_sources`. Never use aggregator estimates or infer a newer model's rates
+   from its family. Keep unknown published fields null or omitted where the schema permits.
+2. Edit the matching entry, preserving exact decimal-string USD prices per one million
+   tokens. Set `verified_at` to the review date and bump `catalog_version` for the reviewed
+   cohort. Keep deprecated products explicitly marked; do not alias a retired product to
+   a different paid product. Agent `perplexity/<id>` and legacy Sonar IDs are distinct.
+3. Preserve each model's exact `long_context.threshold_tokens`: billing selects its tier
+   only when total input tokens are greater than that integer. A published inclusive
+   threshold can be represented by the preceding integer, with the source condition
+   explained in `notes`. Never substitute a global 200K boundary.
+4. Use the existing media-pricing shape only when the published tariff fits it exactly.
+   Token-basis media requires a positive administrator funding reservation; a provider
+   tariff does not publish that envelope. Leave unsupported media prices null and explain
+   the missing shape in `notes`; never invent a reservation or approximate a unit tariff.
+   Additional provider search, storage, grounding or tool charges documented in notes are
+   not silently included in token prices.
+5. Run `pytest tests/test_provider_catalog.py tests/test_chat_native_catalog_admin.py`
+   in the service development environment, then the focused capability/pricing suites
+   for affected models. The loader rejects unknown fields, bad kinds, duplicate IDs or
+   aliases, missing/unofficial sources and negative/non-finite/non-string prices.
+6. Build a wheel and inspect that it contains `lumen/data/native_model_catalog.json`.
+   Review a secret-free before/after projection of registered routes, including manual
+   prices, capabilities, cache rates and media availability. Record intentional changes
+   and gaps in the change evidence. Source/local tests do not establish provider or
+   production acceptance, and a catalog edit does not authorize a deployment.
+
+Runtime prices use stored administrator rates first, then exact native catalog rates,
+then no rate. Stored historical `price_source` strings remain provenance only. Runtime
+capabilities use explicit administrator overrides, then catalog fields. On official native
+routes only, missing `reasoning_options` and `context_limit` may fall back to imported metadata;
+compatible endpoints remain explicit-override-or-defaults for those fields too.
+Other imported flags never override catalog/default detection. Remaining unknowns use
+conservative defaults. A missing PDF declaration is unknown, not a provider denial.
+Catalog prices are never copied into model columns. To follow the catalog, PATCH the
+native model's input/output/cache prices and `media_pricing` to null; compatible models
+must retain administrator prices. Read responses distinguish stored `media_pricing`
+from `effective_media_pricing`, expose `price_origin`, `catalog_version` and entry provenance.
+
+The existing cache slots are stable ledger vocabulary, not literal provider TTL claims.
+OpenAI's 30-minute write maps to `cache_write_price_per_million` / `cache_creation_5m`;
+its 12-hour write maps to `cache_write_1h_price_per_million` / `cache_creation_1h`.
+Anthropic retains its published 5-minute/1-hour mapping. The catalog records actual TTLs.
+Likewise `_above_200k` remains the legacy frozen tier-slot suffix; the admission snapshot's
+`long_context_threshold_tokens` controls the real boundary. Old snapshots without that
+field retain their historical 200000 boundary. New admissions freeze effective rates,
+threshold and capabilities; settlement never consults a later catalog revision.
+
+The removed models.dev import endpoints return 404. Historical nullable import-identity
+columns remain in SQL/schema snapshots for compatibility, but the ORM no longer maps
+them. `LICENSE.litellm` remains necessary for the existing search-transport mapping
+attribution; removal of the old catalog does not remove that independent attribution.
+
+Embedding entries may additionally carry `embedding` with `default_dimensions`,
+`supports_dimensions`, `min_dimensions`, `max_dimensions` and `allowed_dimensions`.
+Use null for unpublished bounds or a non-exhaustive recommendation list; recommendations
+must not become an exhaustive allowlist. Native requests enforce the exact published
+range/list. Unknown metadata permits the provider default but refuses an explicit
+dimension request. Compatible endpoints use only an administrator `capabilities.embedding`
+override; they never borrow native dimensions from a matching public model ID.
+
+An explicit capability override may remove catalog uncertainty only where Lumen implements
+that protocol feature. Published native-search support remains visible as metadata, but
+the native execution gate is unavailable and unpriced until provider per-search/request
+fees can be billed. Text token rates alone never activate a paid native search tool.
+Separately priced managed search providers remain supported for CRUD and search routing;
+the inference-only provider allowlist does not remove search adapters.
+Decisions can be enabled only for OpenAI-protocol text routes, including compatible
+endpoints; Anthropic/Gemini/Perplexity or subscription overrides cannot enable it.
+Perplexity Sonar's built-in search remains a separate, pre-existing behavior: its
+`web_search_required` authorization floor still requires `native:tools:execute`, even
+when the optional native-search gate is unavailable or an override disables that gate.
+Sonar remains admitted as before; its unbilled provider search fees are a documented
+known gap, not permission to drop the tools scope or claim complete fee accounting.
+The exact native Sonar product list controls this floor even when a variant is absent
+from the bundled catalog and is enabled through administrator-supplied prices.
+
+ChatGPT subscriptions use OpenAI catalog specifications for discovery, capabilities and
+context only, followed by the existing subscription transport limits. They never borrow
+API token/cache/media rates or price tiers; administrator subscription rates are required.
+
+For tiered models, catalog modality rates identical to effective text categories retain
+their required provider observations but settle in the text residual, using that call's
+context tier, only when both the modality and compared text rates are catalog-sourced.
+The frozen `token_rates_follow_text` provenance excludes manual media prices and manual
+text prices, even when their numbers happen to equal the published catalog rates.
+Distinct catalog modality rates require corresponding explicit
+`token_pricing.long_context.token_rates` entries; a future mixed bucket freezes every
+effective tier field. Existing native tiered Gemini audio fields all equal their base
+text categories; no differing native modality tier was silently assumed.
+
+An absent or empty administrator `reasoning_options` list is unspecified, like a null
+context limit: saving another capability toggle retains the detected catalog options.
+Use explicit capability controls rather than an empty list to disable reasoning.
+Live model-discovery display names are retained, including uncatalogued IDs and compatible
+endpoints; compatible IDs still receive no bundled kind, price or capability annotations.

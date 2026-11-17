@@ -19,6 +19,7 @@ from lumen.auth import require_scopes
 from lumen.config import get_settings
 from lumen.services import capabilities
 from lumen.services import conversation_store as cs
+from lumen.services.provider_metadata import provider_family
 from lumen.services.providers import audio_transport, errors, image_transport, realtime_transport, repository, routing
 
 router = APIRouter()
@@ -31,6 +32,10 @@ class AvailableModel(BaseModel):
     api_provider: str
     provider_id: int
     provider_type: str
+    provider_family: Literal["native", "compatible"]
+    price_origin: Literal["manual", "native_catalog"] | None = None
+    catalog_version: str | None = None
+    catalog_entry: dict | None = None
     provider_sort_order: int = 0
     sort_order: int = 0
     model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text"
@@ -74,6 +79,12 @@ async def list_available_models(
                 "api_provider": m["api_provider"],
                 "provider_id": m["provider_id"],
                 "provider_type": provider_type,
+                "provider_family": m.get("provider_family") or provider_family(
+                    provider_type, (provider or {}).get("api_base"), (provider or {}).get("auth_mode", "api_key"),
+                ),
+                "price_origin": m.get("price_origin"),
+                "catalog_version": m.get("catalog_version"),
+                "catalog_entry": m.get("catalog_entry"),
                 "provider_sort_order": m.get("provider_sort_order", 0),
                 "sort_order": m.get("sort_order", 0),
                 "display_name": m["display_name"],
@@ -113,10 +124,9 @@ async def get_chat_capabilities(
         "model_id": model_id,
         "model_name": resolved["model_name"],
         "runtime": effective,
+        "model_kind": model_kind,
+        "model_capabilities": resolved.get("capabilities"),
     }
-    if model_kind != "text":
-        result["model_kind"] = model_kind
-        result["model_capabilities"] = resolved.get("capabilities")
     if model_kind == "image":
         image_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("image_output") or {}
         routable = image_gate.get("available") is True
@@ -137,36 +147,20 @@ async def get_chat_capabilities(
         )
     if model_kind == "realtime":
         gates = (resolved.get("capabilities") or {}).get("feature_gates") or {}
-        # Transcription/translation/GPT-Live models speak only their compatible WebSocket
-        # wires; the native voice session cannot execute them, so it advertises no options.
-        if (all((gates.get(name) or {}).get("available") is True for name in ("audio_input", "audio_output"))
-                and realtime_transport.realtime_kind(resolved) == "conversation"):
+        kind = realtime_transport.realtime_kind(resolved) if realtime_transport.realtime_route_ready(resolved) else None
+        result["realtime_kind"] = kind
+        # Native transcription needs input only; translation/live keep their compatible wires.
+        if ((gates.get("audio_input") or {}).get("available") is True and (
+                kind == "transcription" or kind == "conversation"
+                and (gates.get("audio_output") or {}).get("available") is True)):
             result.update(realtime_transport.available_realtime_options(resolved))
         else:
             result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,
                           output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0)
     if model_kind == "embedding":
-        from lumen.services.provider_metadata import catalog_model_metadata
+        from lumen.services.embeddings import embedding_metadata
 
-        model_name = resolved["model_name"]
-        provider_type = resolved.get("provider_type")
-        metadata = catalog_model_metadata(model_name, provider_type or "")
-        default_dimensions = metadata.get("output_vector_size")
-        supports_dimensions = (
-            provider_type == "gemini" and "embedding" in model_name.lower()
-        ) or (
-            provider_type == "openai" and model_name.startswith("text-embedding-3-")
-        )
-        if default_dimensions is None and supports_dimensions:
-            default_dimensions = 3072 if provider_type == "gemini" or "large" in model_name else 1536
-        result.update(
-            default_dimensions=default_dimensions,
-            supports_dimensions=supports_dimensions,
-            min_dimensions=1 if supports_dimensions else None,
-            max_dimensions=default_dimensions if supports_dimensions else None,
-            max_input_tokens=metadata.get("max_input_tokens"),
-            max_inputs=16,
-        )
+        result.update(embedding_metadata(resolved), max_inputs=16)
     return result
 
 

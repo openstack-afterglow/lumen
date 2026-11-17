@@ -140,6 +140,12 @@ The shared `Client`/`AsyncClient`/Keystone proxy API mixin declares these method
 
 Existing `admin_update_provider(provider_id, **attrs)` sets endpoint `selection_policy="explicit"|"priority"|"weighted"` and `selected_credential_id`. Account/credential `allowed_model_ids` and `allowed_capabilities` preserve `None` (unrestricted) versus `[]` (deny all); operations are `chat,responses,messages,count_tokens,embeddings,search,image,tts,stt,realtime`, not model features. Only endpoint-owned model/credential IDs are valid. Expiry/cooldown and secret/restriction edits can invalidate frozen generations; they do not rotate in-flight requests. See [API reference](api-reference.md#provider-account-and-credential-administration) for fields and status semantics. Never log submitted secrets/device codes, and treat subscription authentication as separate from vendor permission for public multi-user pooling.
 
+### Native model catalog
+
+`admin_native_catalog(*, provider_type=None)` calls GET `/v1/admin/models/native-catalog` without changing provider configuration or importing prices. Omit `provider_type` to read all bundled providers, or select `openai`, `anthropic`, `gemini`, or `perplexity`. The result preserves `schema_version`, `catalog_version`, provider pricing sources, and each model's published prices, capabilities, reasoning controls, embedding dimensions, and source provenance. Unknown published values remain null; decimal prices remain strings.
+
+Use `conn.lumen.admin_native_catalog(provider_type="openai")` with an authenticated Keystone human system-admin. The shared sync and async clients declare the same method (`await client.admin_native_catalog(...)` for async), but an API key cannot call this administrator-only route. Compatible custom endpoints do not inherit this catalog; register their model metadata and prices manually.
+
 
 ## 이미지·유한 오디오·실시간 음성 SDK
 

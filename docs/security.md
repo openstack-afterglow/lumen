@@ -2,6 +2,12 @@
 
 > **0.6.10 candidate integration — unverified, not deployed.** These are source-defined security boundaries. Dated or passing receipts retained from the original account/private-runtime branch or published baseline apply only to those original sources, not this integrated candidate. No checks were run for this documentation integration.
 
+## Organization MCP and cloud-mutation consent
+
+Organization MCP secrets belong to an exact live Keystone domain. Only its legitimate manager (canonical Default-project or direct domain assignment, excluding derived Afterglow projection groups) or an unrestricted human system administrator may mutate them. Project admin/member privileges and client-supplied domain flags do not grant management. Domain members list secret-free metadata and explicitly activate an exact configuration. Frozen runs revalidate membership, configuration fingerprint, activation generation and current OAuth credential version before new I/O. OAuth callbacks recheck the manager before exchanging or saving a shared domain token.
+
+The managed Afterglow cloud bridge requires the user's existing project-bound manage consent and current native authority. Protocol v2 always interrupts for human approval before a managed external mutation, including internal automatic mode. Approval arguments remain redacted in the public event; the non-secret preview identifies actual VM choices including boot-volume deletion policy and availability zone. Original encrypted checkpoint keys/stores and owner/run decision fences remain mandatory. Protocol v1 is not made mutating as a fallback.
+
 ## Private converter and upstream account boundary
 
 Provider selection, caller/native authorization, price snapshots, durable provider-start/checkpoints and the one customer debit remain Lumen-owned. The pinned Apache-2.0 Go Bifrost dependency supplies converters, not a stock gateway authority. Its authenticated loopback `/v1/execute` receives only the selected request-local credential and payload; it is not a public customer API, credential database, independent quota ledger, retry/fallback/shadow engine or account rotator. Child environment excludes service/provider/cloud/database secrets and ambient proxies; explicit CA paths preserve TLS trust. Request envelopes, provider bodies and upstream secret-bearing errors must not be logged. Child failure/stream truncation cannot trigger replay or credential reselection.

@@ -739,7 +739,7 @@ class TestMcpTools:
     async def test_selected_mcp_tool_prefixed_schema(self, monkeypatch):
         import lumen.services.extensions_store as es
 
-        async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False):
+        async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False, **_options):
             if kind == "mcp":
                 return [{"id": 7, "name": "srv", "transport": "http", "url": "https://mcp.example/x",
                          "effect_overrides": {"search": "read"}}]
@@ -760,7 +760,7 @@ class TestMcpTools:
 
         captured = {}
 
-        async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False):
+        async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False, **_options):
             if kind == "mcp":
                 return [{"id": 7, "name": "srv", "transport": "http", "url": "https://mcp.example/x",
                          "effect_overrides": {"search": "read"}}]
@@ -781,7 +781,7 @@ class TestMcpTools:
     async def test_mcp_unknown_server_safe_string(self, monkeypatch):
         import lumen.services.extensions_store as es
 
-        async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False):
+        async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False, **_options):
             return []
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
@@ -845,7 +845,7 @@ class TestMcpTools:
     async def test_admin_approved_static_headers_reach_only_that_server(self, monkeypatch):
         import lumen.services.extensions_store as es
 
-        async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False):
+        async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False, **_options):
             if kind == "mcp":
                 return [
                     {

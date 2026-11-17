@@ -108,7 +108,8 @@ async def test_connection(provider_id: int, account_id: int, credential_id: int,
                     '{"request":"ping"}' if mode == "structured" else "ping"}],
                 api_base=route["api_base"], api_key=None, custom_llm_provider=route["provider_type"],
                 provider_auth=route["provider_auth"], max_tokens=_MAX_TOKENS,
-                extra={"response_format": _PONG_FORMAT} if mode == "structured" else None)
+                extra={"capabilities_override": route["capabilities"],
+                       **({"response_format": _PONG_FORMAT} if mode == "structured" else {})})
         text = _text(result, allow_length=mode == "plain")
         valid = bool(text)
         if mode == "structured":

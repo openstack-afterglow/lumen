@@ -368,9 +368,12 @@ def test_metadata_serializers_do_not_decrypt_private_configuration(monkeypatch):
 
 async def test_oauth_callback_accepts_current_project_member_owner(monkeypatch):
     row = SimpleNamespace(status="pending", expires_at=datetime.now(UTC) + timedelta(minutes=5),
-                          owner_user_id="owner", owner_project_id="project", encrypted_payload="encrypted")
+                          owner_user_id="owner", owner_project_id="project", encrypted_payload="encrypted",
+                          mcp_server_id=7)
     result = SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: row))
-    session = SimpleNamespace(execute=AsyncMock(return_value=result))
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=result), get=AsyncMock(return_value=SimpleNamespace(scope="global")),
+    )
 
     @asynccontextmanager
     async def connection():
@@ -574,3 +577,14 @@ async def test_retained_member_cannot_restore_operator_denied_callback_authority
     with pytest.raises(mcp_oauth.McpOAuthError, match="management authority"):
         await mcp_oauth.SqlMcpConnectionStore().consume_state("state-hash")
     authority.assert_awaited_once_with("owner", "project")
+
+
+@pytest.fixture(autouse=True)
+def _organization_row_precheck_needs_no_database(monkeypatch):
+    """These route tests run without SQL; the organization-row OAuth pre-check fails closed on purpose (tested in
+    tests/test_mcp_settings.py), so the route behaviour under test stubs only that lookup."""
+    from unittest.mock import AsyncMock
+
+    from lumen.services import mcp_settings
+
+    monkeypatch.setattr(mcp_settings, "check_oauth_management", AsyncMock(return_value=None))

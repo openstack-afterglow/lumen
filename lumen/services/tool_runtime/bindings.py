@@ -262,9 +262,17 @@ def _grant_bindings(snapshot, principal, *, multi: bool) -> list[ToolBinding]:
                 entry=registry_entry,
                 arguments=parsed,
             )
-            detail = f"{plan.intended_transition}: {plan.resource_identity}" + (
-                f" (current state: {plan.current_state})" if plan.current_state else ""
-            )
+            transition = plan["intended_transition"]
+            identity = plan["resource_identity"]
+            if not isinstance(transition, str) or not isinstance(identity, str):
+                raise ValueError("Cloud mutation preview is invalid")
+            detail = f"{transition}: {identity}"
+            if plan.get("current_state"):
+                detail += f" (current state: {plan['current_state']})"
+            if plan.get("estimated_effect"):
+                detail += f"\n{plan['estimated_effect']}"
+            for resource in plan.get("dependent_resources", []):
+                detail += f"\n{resource}"
             return {
                 "preview": [ToolTextPart(text=detail).model_dump(mode="json")],
                 "expected_state_revision": None,
@@ -318,6 +326,9 @@ _CATALOG_CAPABILITY_ALIASES = (
     ("컴퓨트", ("compute", "nova", "vm", "server", "servers", "instance", "instances")),
     ("컴퓨팅", ("compute", "nova", "vm", "server", "servers", "instance", "instances")),
     ("가상머신", ("vm", "nova", "server", "servers", "instance", "instances")),
+    ("인스턴스", ("vm", "nova", "server", "servers", "instance", "instances")),
+    ("생성", ("create",)),
+    ("만들", ("create",)),
     ("스토리지", ("storage", "cinder", "volume", "volumes", "swift", "manila")),
     ("볼륨", ("volume", "volumes", "cinder")),
     ("네트워크", ("network", "networks", "neutron", "subnet", "subnets")),
@@ -416,10 +427,49 @@ async def _search_and_load_bindings(
         }
         for binding in selected
     ]
+    payload: dict[str, object] = {"loaded_tools": [item["name"] for item in catalog], "tools": catalog}
+    if _catalog_terms(query.casefold()) & {"cloud", "nova", "vm", "instance", "instances", "cinder", "neutron"}:
+        managed_mutation_eligible = any(
+            binding.definition.source == "managed" and binding.definition.effect == "external_mutation"
+            for binding in deferred.values()
+        )
+        instructions = "Cloud writes require protocol v2 and explicit owner/project write consent. "
+        if not include_managed:
+            instructions += (
+                "An operator must qualify and enable protocol v2 on both API and workers first. "
+                "Changing consent alone cannot enable writes; inspect tools again after activation "
+                "to determine whether write consent is missing."
+            )
+        elif not managed_mutation_eligible:
+            instructions += (
+                "No managed cloud mutation is currently eligible. If access is read-only or disabled, "
+                "open Afterglow chat settings → MCP → Afterglow MCP, deactivate read-only access if active, "
+                "then activate, choose Read and manage, verify the current project and approve. "
+                "Current native role ceilings and service availability still apply."
+            )
+        else:
+            instructions += "Managed cloud mutations are already eligible; do not deactivate or re-consent."
+        payload["cloud_access"] = {
+            "mutation_protocol_version": 2,
+            "runtime_supports_mutations": include_managed,
+            "managed_mutation_eligible": managed_mutation_eligible,
+            "write_consent_required": not managed_mutation_eligible if include_managed else None,
+            "consent_url": "/dashboard/chat/settings?section=mcp",
+            "instructions": instructions,
+            "vm_creation": (
+                "Use image, flavor, network, keypair, security group and quota read tools to gather choices. "
+                "Ask the user for missing selections; never invent IDs or silently choose access settings. "
+                "Propose afterglow_vm_create with explicit image_id, flavor_id, network_id, "
+                "boot_volume_size_gb, user-owned key_name and project-owned security_group_ids. "
+                "Review the server-validated public preview of VM selections, boot-volume deletion policy, "
+                "availability zone and schedule before human approval. Raw argument values are redacted "
+                "in public approval events. Acceptance is not guest readiness."
+            ),
+        }
     return V2ToolExecutionResult(
         status="completed",
         model_content=json.dumps(
-            {"loaded_tools": [item["name"] for item in catalog], "tools": catalog},
+            payload,
             ensure_ascii=False,
             separators=(",", ":"),
         ),

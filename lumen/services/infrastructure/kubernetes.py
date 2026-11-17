@@ -15,6 +15,7 @@ import json
 import os
 import re
 import ssl
+import threading
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -40,6 +41,7 @@ from lumen.services.infrastructure.providers import (
     owned,
     ownership,
 )
+from lumen.services.infrastructure.sandbox_credentials import DroverSandboxCredentials
 
 
 def _quantity(value: str) -> Decimal:
@@ -194,18 +196,27 @@ class KubernetesProvider:
         self.deployment_id = deployment_id
         self.controller_url, self.controller_ca_pem = controller_url, controller_ca_pem
         self._bootstrap_port = urlsplit(controller_url).port or 443
-        secret = cluster.bearer_token
-        if secret.env:
-            token = os.environ[secret.env]
-        else:
-            with Path(secret.file).open("r", encoding="utf-8") as source:
-                token = source.read(16385).strip()
-        if not token or len(token) > 16384 or any(char.isspace() for char in token):
-            raise ValueError("Kubernetes bearer token must be a bounded single token")
         context = ssl.create_default_context(cafile=cluster.ca_file)
+        self._condition = threading.Condition()
+        self._active_requests = 0
+        self._closing = False
+        self._credentials = None
+        self._static_token = None
+        if cluster.drover is not None:
+            self._credentials = DroverSandboxCredentials(cluster, deployment_id, pool.name)
+        else:
+            secret = cluster.bearer_token
+            if secret.env:
+                token = os.environ[secret.env]
+            else:
+                with Path(secret.file).open("r", encoding="utf-8") as source:
+                    token = source.read(16385).strip()
+            if not token or len(token) > 16384 or any(char.isspace() for char in token):
+                raise ValueError("Kubernetes bearer token must be a bounded single token")
+            self._static_token = token
         self.client = httpx.Client(
             base_url=cluster.server.rstrip("/"), verify=context,
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            headers={"Accept": "application/json"},
             timeout=httpx.Timeout(10, connect=5, pool=5), follow_redirects=False, trust_env=False,
             transport=httpx.HTTPTransport(verify=context, retries=0, trust_env=False,
                                           limits=httpx.Limits(max_connections=4, max_keepalive_connections=2)),
@@ -213,12 +224,40 @@ class KubernetesProvider:
         self._core = f"/api/v1/namespaces/{quote(cluster.namespace, safe='')}"
         self._network = f"/apis/networking.k8s.io/v1/namespaces/{quote(cluster.namespace, safe='')}"
 
+    def close(self) -> None:
+        """Refuse new requests, drain in-flight streams, then release credentials."""
+        with self._condition:
+            self._closing = True
+            while self._active_requests:
+                self._condition.wait()
+        if self._credentials is not None:
+            self._credentials.close()
+        self._static_token = None
+        self.client.close()
+
     def _request(self, method: str, path: str, *, body: dict | None = None,
                  params: dict | None = None, missing: bool = False) -> dict | None:
+        with self._condition:
+            if self._closing:
+                raise RuntimeError("Kubernetes provider is closed")
+            self._active_requests += 1
+        try:
+            return self._send(method, path, body=body, params=params, missing=missing)
+        finally:
+            with self._condition:
+                self._active_requests -= 1
+                self._condition.notify_all()
+
+    def _send(self, method: str, path: str, *, body: dict | None = None,
+              params: dict | None = None, missing: bool = False) -> dict | None:
+        token = self._credentials.token() if self._credentials is not None else self._static_token
         started = time.monotonic()
         # Streaming places an actual bound on response bytes, not merely the
         # Content-Length supplied by a possibly faulty upstream. Each read is timed.
-        with self.client.stream(method, path, json=body, params=params) as response:
+        with self.client.stream(method, path, json=body, params=params,
+                                headers={"Authorization": f"Bearer {token}"}) as response:
+            if response.status_code == 401 and self._credentials is not None:
+                self._credentials.invalidate(token)
             if response.status_code == 404 and missing:
                 return None
             if not 200 <= response.status_code < 300:
@@ -299,6 +338,8 @@ class KubernetesProvider:
         namespace = self._request("GET", f"/api/v1/namespaces/{quote(self.cluster.namespace, safe='')}")
         labels = namespace.get("metadata", {}).get("labels", {})
         annotations = namespace.get("metadata", {}).get("annotations", {})
+        if self.cluster.drover is not None and namespace.get("metadata", {}).get("uid") != self.cluster.drover.namespace_uid:
+            raise ValueError("Kubernetes namespace UID differs from pinned credential scope")
         for key, value in ((OWNER_DEPLOYMENT, self.deployment_id), (OWNER_POOL, self.pool.name)):
             if labels.get(_KEYS[key]) != _label(value) or annotations.get(_KEYS[key]) != value:
                 raise ValueError("Kubernetes namespace is not explicitly owned by deployment/pool")

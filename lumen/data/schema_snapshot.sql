@@ -687,11 +687,15 @@ CREATE TABLE `chat_mcp_servers` (
   `tool_catalog` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`tool_catalog`)),
   `catalog_refreshed_at` datetime DEFAULT NULL,
   `catalog_error` varchar(300) DEFAULT NULL,
+  `owner_domain_id` varchar(64) DEFAULT NULL,
+  `connection_scope_key` varchar(200) NOT NULL DEFAULT 'global',
+  `implicit_selection` tinyint NOT NULL DEFAULT 1,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uq_chat_mcp_template_label` (`template_key`,`connection_label`),
+  UNIQUE KEY `uq_chat_mcp_scoped_template_label` (`connection_scope_key`,`template_key`,`connection_label`),
   KEY `idx_chat_mcp_owner` (`owner_user_id`),
   KEY `idx_chat_mcp_scope` (`scope`),
-  KEY `idx_chat_mcp_servers_project` (`project_id`)
+  KEY `idx_chat_mcp_servers_project` (`project_id`),
+  KEY `idx_chat_mcp_domain` (`owner_domain_id`,`scope`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_memories` (
@@ -1492,4 +1496,21 @@ CREATE TABLE `user_wallets` (
   `updated_at` datetime NOT NULL,
   `max_quota_weekly` decimal(18,8) DEFAULT NULL,
   PRIMARY KEY (`user_id`)
+) ENGINE=InnoDB;
+
+CREATE TABLE `chat_stateless_call_reservations` (
+  `event_id` char(36) NOT NULL,
+  `user_id` varchar(64) NOT NULL,
+  `project_id` varchar(64) NOT NULL,
+  `api_key_id` bigint DEFAULT NULL,
+  `bound_credits` decimal(18,8) NOT NULL,
+  `actual_credits` decimal(18,8) DEFAULT NULL,
+  `status` varchar(20) NOT NULL,
+  `created_at` datetime(6) NOT NULL,
+  `settled_at` datetime(6) DEFAULT NULL,
+  PRIMARY KEY (`event_id`),
+  KEY `idx_stateless_hold_owner` (`user_id`,`status`),
+  KEY `idx_stateless_hold_key` (`api_key_id`,`status`),
+  CONSTRAINT `ck_stateless_bound` CHECK (`bound_credits` >= 0),
+  CONSTRAINT `ck_stateless_actual` CHECK (`actual_credits` is null or `actual_credits` >= 0)
 ) ENGINE=InnoDB;

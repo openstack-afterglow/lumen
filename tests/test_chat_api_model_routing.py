@@ -16,7 +16,7 @@ from lumen.models.chat_db import (
     LlmProviderAccount,
     LlmProviderCredential,
 )
-from lumen.services.providers import pricing, repository, routing
+from lumen.services.providers import pricing, repository, routing, search_transport
 from lumen.services.providers.errors import ProviderValidationError
 
 
@@ -437,10 +437,10 @@ def test_capabilities_detect_exact_native_search_support():
     assert caps_sonar["web_search"] is True
     assert caps_sonar["web_search_required"] is True
     assert caps_sonar["feature_gates"]["web_search"] == {
-        "available": True,
-        "mode": "native",
-        "reason_code": None,
-        "pricing_available": True,
+        "available": False,
+        "mode": "none",
+        "reason_code": "pricing_unavailable",
+        "pricing_available": False,
     }
 
     caps_deepseek = provider_capabilities("perplexity/perplexity/deepseek-v4-flash-0731", "perplexity")
@@ -660,7 +660,7 @@ def test_admin_projection_exposes_effective_cache_without_overwriting_manual_fie
     assert projection["effective_cache_write_price_per_million"] == 2
     assert projection["effective_cache_write_1h_price_per_million"] == 3
     assert projection["effective_cache_price_sources"] == {
-        "cache_read": "manual", "cache_creation_5m": "fallback_input:manual", "cache_creation_1h": "litellm",
+        "cache_read": "manual", "cache_creation_5m": "fallback_input:manual", "cache_creation_1h": "native_catalog",
     }
 
 
@@ -1121,3 +1121,96 @@ async def test_kind_correction_cannot_move_designated_text_model_to_media(
     assert response.status_code == 400, response.text
     reloaded = await admin_client.get("/v1/admin/models")
     assert [(row["id"], row["model_kind"], row[designation], row["is_active"]) for row in reloaded.json()] == [(11, "text", True, True)]
+
+
+@pytest.mark.parametrize("provider_type", sorted(search_transport._ENDPOINTS))
+async def test_managed_search_provider_create_update_and_admission(
+    provider_db, admin_client, monkeypatch, provider_type,
+):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type="openai")
+    add_model("search-executor")
+    monkeypatch.setenv("MANAGED_SEARCH_TEST_KEY", "fixture-search-key")
+    api_base = "https://search.invalid" if provider_type == "searxng" else None
+    created = await admin_client.post("/v1/admin/providers", json={
+        "name": "managed-search",
+        "provider_type": provider_type,
+        "api_base": api_base,
+        "api_key_env": "MANAGED_SEARCH_TEST_KEY",
+    })
+    assert created.status_code == 201, created.text
+    provider_id = created.json()["id"]
+    updated = await admin_client.patch(f"/v1/admin/providers/{provider_id}", json={
+        "name": "renamed-search",
+        "provider_type": provider_type,
+        "api_base": api_base,
+    })
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["provider_type"] == provider_type
+
+    route = await routing.get_active_provider_route(provider_id)
+    assert route["provider_type"] == provider_type
+    assert route["provider_backend"] == "lumen-search-http"
+    assert route["provider_auth"]["required_capabilities"] == ["search"]
+    assert route["api_key"] is None
+    executor = await routing.resolve_model("search-executor")
+    async with repository._require_db()() as session:
+        await routing.lock_provider_config(session, route)
+        await routing.lock_execution_routes(session, executor=executor, search=route)
+        if provider_type != "perplexity":
+            provider = await session.get(LlmProvider, provider_id)
+            model = LlmModel(id=999, provider_id=provider_id, model_name="not-an-inference-model")
+            with pytest.raises(ProviderValidationError, match="unsupported_provider_type"):
+                routing._resolved_model(model, provider)
+
+
+@pytest.mark.parametrize("provider_type", [
+    "groq", "deepseek", "mistral", "together_ai", "openrouter", "xai", "ollama",
+    "azure", "bedrock", "vertex", "cohere", "gemini", "perplexity",
+])
+async def test_leftover_provider_allows_maintenance_but_not_inference_or_reactivation(
+    provider_db, admin_client, provider_type,
+):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type=provider_type)
+    add_model("leftover-model")
+    async with repository._require_db()() as session, session.begin():
+        provider = await session.get(LlmProvider, 1)
+        if provider_type in {"gemini", "perplexity"}:
+            provider.api_base = "https://retired-proxy.invalid"
+        model = await session.get(LlmModel, 10)
+        model.input_price = model.output_price = None
+        with pytest.raises(ProviderValidationError, match="unsupported_provider_type"):
+            routing._resolved_model(model, provider)
+        if provider_type != "perplexity":
+            with pytest.raises(ProviderValidationError, match="unsupported_provider_type"):
+                routing._resolved_provider(provider, required_capabilities=("search",))
+
+    for patch in (
+        {"name": "retired-provider"},
+        {"api_key_env": "RETIRED_PROVIDER_TEST_KEY"},
+        {"is_active": False},
+    ):
+        response = await admin_client.patch("/v1/admin/providers/1", json=patch)
+        assert response.status_code == 200, response.text
+    assert response.json()["is_active"] is False
+    assert await routing.get_active_provider_route(1) is None
+
+    with pytest.raises(ProviderValidationError, match="unsupported_provider_(type|api_base)"):
+        await repository.update_provider(1, {"is_active": True})
+    async with repository._require_db()() as session:
+        assert (await session.get(LlmProvider, 1)).is_active is False
+
+
+@pytest.mark.parametrize("provider_type", ["gemini", "perplexity"])
+async def test_leftover_non_protocol_base_can_be_repaired_then_activated(provider_db, provider_type):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type=provider_type, is_active=False)
+    async with repository._require_db()() as session, session.begin():
+        (await session.get(LlmProvider, 1)).api_base = "https://retired-proxy.invalid"
+
+    repaired = await repository.update_provider(1, {"api_base": None})
+    assert repaired["is_active"] is False
+    assert repaired["api_base"] is None
+    activated = await repository.update_provider(1, {"is_active": True})
+    assert activated["is_active"] is True

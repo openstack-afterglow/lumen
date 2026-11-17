@@ -52,25 +52,53 @@ def _values(response: Any) -> list[dict]:
     return result
 
 
+def embedding_metadata(route: dict) -> dict:
+    """Use resolved registry metadata; only bare native routes consult the catalog."""
+    caps = route.get("capabilities") or {}
+    metadata = {}
+    if "embedding" in caps:
+        embedding = caps["embedding"]
+    elif provider_metadata.direct_provider_route(route.get("provider_type"), route.get("api_base")):
+        metadata = provider_metadata.catalog_model_metadata(
+            route["model_name"], route.get("provider_type") or "", route.get("api_base"),
+        )
+        embedding = metadata.get("embedding")
+    else:
+        embedding = None
+    embedding = embedding if isinstance(embedding, dict) else {}
+    return {
+        "default_dimensions": embedding.get("default_dimensions"),
+        "supports_dimensions": embedding.get("supports_dimensions") is True,
+        "min_dimensions": embedding.get("min_dimensions"),
+        "max_dimensions": embedding.get("max_dimensions"),
+        "allowed_dimensions": embedding.get("allowed_dimensions"),
+        "max_input_tokens": caps.get("context_limit") or metadata.get("max_input_tokens"),
+    }
+
+
 def _limits(route: dict, inputs: list[str], dimensions: int | None) -> tuple[int, bool]:
-    metadata = provider_metadata.catalog_model_metadata(route["model_name"], route.get("provider_type") or "")
-    model = route["model_name"].lower()
-    provider = route.get("provider_type")
-    max_dimensions = metadata.get("output_vector_size")
-    supports_dimensions = (provider == "openai" and model.startswith("text-embedding-3-")) or (
-        provider == "gemini" and "embedding" in model
-    )
-    if max_dimensions is None and supports_dimensions:
-        max_dimensions = 3072 if provider == "gemini" or "large" in model else 1536
-    if dimensions is not None and (not supports_dimensions or dimensions > max_dimensions):
+    metadata = embedding_metadata(route)
+    supports_dimensions = metadata["supports_dimensions"]
+    minimum, maximum = metadata["min_dimensions"], metadata["max_dimensions"]
+    allowed = metadata["allowed_dimensions"]
+    if dimensions is not None and (
+        type(dimensions) is not int or dimensions < 1 or not supports_dimensions
+        or minimum is not None and dimensions < minimum
+        or maximum is not None and dimensions > maximum
+        or allowed is not None and dimensions not in allowed
+    ):
         raise EmbeddingError(400, "dimensions is unsupported or exceeds this model's output dimensions")
-    max_tokens = metadata.get("max_input_tokens") or (8191 if provider == "openai" else 2048)
+    max_tokens = metadata["max_input_tokens"]
     counts = [provider_metadata.count_tokens(route["model_name"], text=value) for value in inputs]
-    if any(count > max_tokens for count in counts):
+    if max_tokens is not None and any(count > max_tokens for count in counts):
         raise EmbeddingError(400, "input exceeds the model token limit")
-    if provider == "openai" and sum(counts) > 300000:
+    if (
+        route.get("provider_type") == "openai"
+        and provider_metadata.direct_provider_route("openai", route.get("api_base"))
+        and sum(counts) > 300000
+    ):
         raise EmbeddingError(400, "input exceeds the request token limit")
-    expected = dimensions or max_dimensions
+    expected = dimensions if dimensions is not None else metadata["default_dimensions"]
     return expected or 0, supports_dimensions
 
 

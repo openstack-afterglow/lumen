@@ -1380,23 +1380,26 @@ async def test_v2_on_demand_mcp_is_restored_before_approval_resume(monkeypatch, 
         assert tool_messages[-1]["content"] == "clicked"
 
 
-@pytest.mark.parametrize(("tools_enabled", "backend", "process_allowed", "lease", "expected"), [
-    (False, None, True, ("worker#1", 1), set()),
-    (False, "kubernetes", True, ("worker#1", 1), set()),
-    (False, "nova", True, ("worker#1", 1), set()),
-    (True, None, True, ("worker#1", 1), {"list_available_tools", "browser_click"}),
-    (True, "kubernetes", True, ("worker#1", 1), {"list_available_tools", "browser_click"}),
-    (True, "nova", True, ("worker#1", 1), {"list_available_tools", "browser_click", "run_code"}),
-    (True, "nova", False, ("worker#1", 1), {"list_available_tools", "browser_click"}),
-    (True, "nova", True, None, {"list_available_tools"}),
+@pytest.mark.parametrize(("tools_enabled", "backend", "process_allowed", "lease", "selected", "expected"), [
+    (False, None, True, ("worker#1", 1), False, set()),
+    (False, "kubernetes", True, ("worker#1", 1), False, set()),
+    (False, "nova", True, ("worker#1", 1), False, set()),
+    (True, None, True, ("worker#1", 1), False, {"list_available_tools"}),
+    (True, None, True, ("worker#1", 1), True, {"list_available_tools", "browser_click"}),
+    (True, "kubernetes", True, ("worker#1", 1), False, {"list_available_tools"}),
+    (True, "kubernetes", True, ("worker#1", 1), True, {"list_available_tools", "browser_click"}),
+    (True, "kubernetes", False, ("worker#1", 1), True, {"list_available_tools", "browser_click"}),
+    (True, "nova", True, ("worker#1", 1), False, {"list_available_tools", "run_code"}),
+    (True, "nova", False, ("worker#1", 1), False, {"list_available_tools"}),
+    (True, "nova", True, None, False, {"list_available_tools"}),
 ])
 async def test_v2_sandbox_tools_require_policy_and_compatible_assignment(
-    monkeypatch, tools_enabled, backend, process_allowed, lease, expected,
+    monkeypatch, tools_enabled, backend, process_allowed, lease, selected, expected,
 ):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
 
-    from lumen.services import sandbox_binding
+    from lumen.services import sandbox_binding, sandbox_selection
     from lumen.services.infrastructure import tool_manifest
 
     definition = ToolDefinition(
@@ -1406,8 +1409,10 @@ async def test_v2_sandbox_tools_require_policy_and_compatible_assignment(
     )
     pool = SimpleNamespace(
         enabled=True, role="sandbox", backend="kubernetes", name="browser",
+        image="registry.example/sandbox@sha256:" + "c" * 64, digest=lambda: "b" * 64,
         profile=SimpleNamespace(tool_manifest_file="pinned.json", tool_manifest_sha256="a" * 64),
     )
+    runtime = SimpleNamespace(enabled=True, pools=(pool,), pool=lambda _name: pool)
     manifest = Mock(return_value=(SimpleNamespace(id="browser", tools=(definition,)),))
     assigned = AsyncMock(return_value=SimpleNamespace(backend=backend) if backend is not None else None)
     observed_tools = []
@@ -1424,8 +1429,11 @@ async def test_v2_sandbox_tools_require_policy_and_compatible_assignment(
     monkeypatch.setattr(graph.bindings, "v2_builtin_tool_bindings", AsyncMock(return_value={}))
     monkeypatch.setattr(graph.bindings, "_load_custom", AsyncMock(return_value=[]))
     monkeypatch.setattr(graph.bindings, "_load_mcp", AsyncMock(return_value=[]))
-    monkeypatch.setattr("lumen.config.get_settings", lambda: SimpleNamespace(runtime_config=SimpleNamespace(pools=(pool,))))
+    settings = SimpleNamespace(runtime_config=runtime)
+    monkeypatch.setattr("lumen.config.get_settings", lambda: settings)
+    monkeypatch.setattr(sandbox_selection, "get_settings", lambda: settings)
     monkeypatch.setattr(tool_manifest, "load_tool_manifest", manifest)
+    monkeypatch.setattr(sandbox_selection, "load_tool_manifest", manifest)
     monkeypatch.setattr(sandbox_binding, "assigned_sandbox", assigned)
     monkeypatch.setattr(sandbox_binding, "kubernetes_mcp_binding", lambda *_args, **_kwargs: ToolBinding(
         definition=definition, execute=AsyncMock(return_value=ToolExecutionResult(status="completed")),
@@ -1433,15 +1441,21 @@ async def test_v2_sandbox_tools_require_policy_and_compatible_assignment(
     monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
     monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
+    frozen = sandbox_selection.freeze_selection(["browser_click"]) if selected else []
     events = [event async for event in graph.stream(
         model="test-model", messages=[{"role": "user", "content": "hello"}],
         project_id="project", user_id="user", run_id="sandbox-tool-policy",
         execution_protocol_version=2, tools_enabled=tools_enabled, sandbox_lease=lease,
+        sandbox_tools=frozen,
         allowed_direct_effects=("process",) if process_allowed else ("read",),
     )]
 
     assert observed_tools == [expected]
     assert any(event.get("type") == "token" for event in events)
+    if selected:
+        assert manifest.called
+    else:
+        manifest.assert_not_called()
     if not tools_enabled or lease is None:
         manifest.assert_not_called()
         assigned.assert_not_awaited()

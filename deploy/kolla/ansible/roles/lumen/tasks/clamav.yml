@@ -1,0 +1,45 @@
+---
+# Invoked before application containers are started/recreated. Keep the external
+# scanner path untouched when enable_lumen_clamav is false.
+- name: ClamAV | Start bounded per-controller scanner
+  become: true
+  community.docker.docker_container:
+    name: "{{ lumen_clamav_service.container_name }}"
+    image: "{{ lumen_clamav_service.image }}"
+    pull: never
+    state: started
+    restart_policy: unless-stopped
+    # Stock Kolla disables Docker bridge/NAT. Bind clamd itself to loopback;
+    # host mode needs neither a bridge nor Docker firewall/port publishing.
+    network_mode: host
+    volumes: "{{ lumen_clamav_service.volumes }}"
+    env: "{{ lumen_clamav_environment }}"
+    memory: "{{ lumen_clamav_memory }}"
+    memory_swap: "{{ lumen_clamav_memory }}"
+    cpus: "{{ lumen_clamav_cpus }}"
+    pids_limit: "{{ lumen_clamav_pids_limit }}"
+    healthcheck: "{{ lumen_clamav_service.healthcheck }}"
+    capabilities: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    cap_drop: [ALL]
+    security_opts: ["no-new-privileges:true"]
+    labels:
+      kolla_version: "2025.2"
+      service: lumen
+      component: clamav
+  when:
+    - inventory_hostname in groups['lumen']
+    - enable_lumen_clamav | bool
+
+- name: ClamAV | Require PING and loaded recent signatures before media startup
+  become: true
+  ansible.builtin.script:
+    cmd: "validate_clamav.py --host {{ lumen_clamav_bind_address }} --port {{ lumen_clamav_port }} --max-age-hours {{ lumen_clamav_signature_max_age_hours }}"
+    executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+  register: lumen_clamav_readiness
+  changed_when: false
+  until: lumen_clamav_readiness.rc == 0
+  retries: "{{ lumen_clamav_ready_retries }}"
+  delay: 5
+  when:
+    - inventory_hostname in groups['lumen']
+    - enable_lumen_clamav | bool

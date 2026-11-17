@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import copy
+import hashlib
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -358,3 +362,304 @@ async def test_dispatch_requires_exact_claiming_registration_even_when_worker_na
         (await session.get(ChatRun, run.id)).worker_registration_id = db.registration.id
     grant = await authorize_dispatch(config, **arguments)
     assert grant.address == sandbox.address and grant.capability
+
+
+@pytest.fixture
+async def selected_dispatch_db(identity_db, tmp_path, monkeypatch):
+    """Reuse real identity rows; exercise only controller capability authorization."""
+    from lumen.services.infrastructure import dispatch, transport
+    from lumen.services.infrastructure.config import KubernetesClusterProfile, PoolConfig, SecretRef
+    from lumen.services.sandbox_selection import freeze_selection
+
+    db = identity_db
+    now = db.now.replace(microsecond=0)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is not None else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(dispatch, "datetime", Clock)
+    monkeypatch.setattr(dispatch, "time", SimpleNamespace(time=lambda: now.timestamp()))
+    monkeypatch.setattr(transport, "time", SimpleNamespace(time=lambda: now.timestamp()))
+    monkeypatch.setenv("LUMEN_SELECTED_DISPATCH_KEY", "test-only-selected-dispatch-" + "x" * 32)
+    manifest = {"version": 1, "profiles": [{
+        "id": "playwright", "command": ["/usr/bin/node", "/srv/playwright.js"], "environment": {},
+        "tools": [{"name": name, "description": "Isolated browser fixture",
+                   "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+                   "effect": "external_mutation"} for name in ("browser_navigate", "browser_click")],
+    }]}
+    manifest_path = tmp_path / "dispatch-tools.json"
+    manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode()
+    manifest_path.write_bytes(manifest_bytes)
+    configured = PoolConfig.model_validate({
+        "name": "selected-browser", "role": "sandbox", "backend": "kubernetes", "enabled": True,
+        "image": "registry.example/sandbox@sha256:" + "a" * 64, "architecture": "x86_64",
+        "min_replicas": 0, "max_replicas": 2,
+        "sandbox": {"workspace_bytes": 128 * 1024**2, "memory_bytes": 1024**3,
+                    "cpu_millis": 1000, "pids_limit": 256},
+        "profile": {"backend": "kubernetes", "cluster_profile_id": "dispatch-cluster",
+                    "tool_manifest_file": str(manifest_path),
+                    "tool_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                    "controller_ingress_cidrs": ("192.0.2.11/32",),
+                    "bootstrap_egress_cidrs": ("192.0.2.11/32",)},
+    })
+    cluster = KubernetesClusterProfile(
+        id="dispatch-cluster", server="https://192.0.2.1:6443", ca_file="/test/ca.pem",
+        bearer_token=SecretRef(env="UNUSED_DISPATCH_CLUSTER_TOKEN"), namespace="dispatch-runs",
+        runtime_class_name="gvisor", runtime_class_handler="runsc", cluster_cidrs=("10.42.0.0/16",),
+        qualification_file="/test/qualification.json", qualification_sha256="b" * 64,
+    )
+    config = RuntimeConfig(
+        enabled=True, deployment_id=db.pool.deployment_id, controller_url="https://192.0.2.11:8013",
+        tls=db.config.tls.model_copy(update={"operator_client_cert_file": str(tmp_path / "dispatch-probe.pem"),
+                                          "operator_client_key_file": str(tmp_path / "dispatch-probe.key")}),
+        dispatch_key=SecretRef(env="LUMEN_SELECTED_DISPATCH_KEY"), managed_networks=("192.0.2.0/24",),
+        pools=(configured,), kubernetes_clusters=(cluster,),
+    )
+    selection = freeze_selection(["browser_navigate"], config=config)
+    pool = ChatRuntimePool(
+        id=str(uuid4()), deployment_id=config.deployment_id, name=configured.name, role="sandbox",
+        backend="kubernetes", enabled=True, cluster_profile_id=cluster.id, namespace=cluster.namespace,
+        image_ref=configured.image, profile_digest=configured.digest(), min_replicas=0, max_replicas=2,
+    )
+
+    def make_run(**values):
+        return ChatRun(
+            id=str(uuid4()), run_scope="temp", user_id="owner", project_id="identity-it",
+            model_name="fixture", capability_snapshot={"sandbox_tools": copy.deepcopy(selection)}, pricing_snapshot={},
+            client_request_id=str(uuid4()), request_fingerprint="f" * 64, fingerprint_version=1,
+            workload_class="online_text", worker_pool_id=db.pool.id,
+            deadline_at=now + timedelta(minutes=4), **values,
+        )
+
+    root = make_run(status="waiting_children")
+    run = make_run(
+        status="running", root_run_id=root.id, worker_registration_id=db.registration.id,
+        lease_owner=db.registration.worker_identity + "#1", lease_fence=1,
+        lease_expires_at=now + timedelta(minutes=3),
+    )
+    sandbox = ChatRuntimeResource(
+        id=str(uuid4()), pool_id=pool.id, generation=1, role="sandbox", backend="kubernetes", run_id=run.id,
+        desired_state="requested", observed_state="ready", request_fingerprint="c" * 64,
+        cluster_profile_id=cluster.id, namespace=cluster.namespace, image_ref=configured.image,
+        policy_digest=configured.digest(), certificate_fingerprint="c" * 64,
+        certificate_not_after=now + timedelta(minutes=5), deadline_at=now + timedelta(minutes=2),
+        address="10.42.0.10", port=8013,
+    )
+    async with db.factory() as session, session.begin():
+        session.add(pool)
+        session.add(root)
+        await session.flush()
+        session.add(run)
+        await session.flush()
+        session.add(sandbox)
+        run.assigned_resource_id = sandbox.id
+        (await session.get(ChatWorkerRegistration, db.registration.id)).heartbeat_at = now
+    body = {"run_id": run.id, "call_id": "selected-browser-call", "fence": 1,
+            "profile": "playwright", "tool": "browser_navigate", "arguments": {},
+            "timeout_seconds": 30, "workspace_revision": 0}
+    arguments = dict(
+        client_identity=db.peer, client_fingerprint="a" * 64, run_id=run.id, lease_owner=run.lease_owner,
+        resource_id=sandbox.id, generation=1, method="POST", path="/v1/mcp/executions",
+        call_id=body["call_id"], workspace_revision=0, body=body,
+    )
+    signed = []
+    sign = dispatch.sign_dispatch_capability
+
+    def tracked_sign(*args, **kwargs):
+        signed.append(copy.deepcopy(kwargs))
+        return sign(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch, "sign_dispatch_capability", tracked_sign)
+    try:
+        yield SimpleNamespace(
+            db=db, config=config, pool=pool, configured=configured, run=run, root=root, sandbox=sandbox,
+            arguments=arguments, body=body, signed=signed, now=now, manifest_path=manifest_path,
+            selection=selection,
+        )
+    finally:
+        async with db.factory() as session, session.begin():
+            await session.execute(delete(ChatRuntimeResource).where(ChatRuntimeResource.id == sandbox.id))
+            await session.execute(delete(ChatRun).where(ChatRun.id == run.id))
+            await session.execute(delete(ChatRun).where(ChatRun.id == root.id))
+            await session.execute(delete(ChatRuntimePool).where(ChatRuntimePool.id == pool.id))
+
+
+async def test_selected_dispatch_signs_only_frozen_tool_and_exact_body(selected_dispatch_db):
+    from lumen.services.infrastructure.dispatch import authorize_dispatch
+
+    d = selected_dispatch_db
+    grant = await authorize_dispatch(d.config, **d.arguments)
+    assert grant.address == d.sandbox.address and grant.exp == int(d.now.timestamp()) + 15
+    payload = json.loads(base64.urlsafe_b64decode(grant.capability.split(".")[0] + "==="))
+    canonical_body = json.dumps(d.body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    assert payload["fingerprint"] == hashlib.sha256(canonical_body.encode()).hexdigest()
+    assert payload["run_id"] == d.run.id and payload["resource_id"] == d.sandbox.id
+    assert payload["fence"] == 1 and payload["call_id"] == d.body["call_id"]
+    assert payload["workspace_revision"] == 0 and payload["exp"] == grant.exp
+    assert len(d.signed) == 1 and d.signed[0]["body"] == d.body
+
+
+@pytest.mark.parametrize("fault", [
+    "missing", "empty", "null", "malformed", "extra_field",
+    "name", "profile", "pool", "image", "pool_digest", "manifest_sha256",
+])
+async def test_selected_dispatch_rejects_missing_or_changed_snapshot(selected_dispatch_db, fault):
+    from lumen.services.infrastructure.dispatch import DispatchRejected, authorize_dispatch
+
+    d = selected_dispatch_db
+    snapshot = {"sandbox_tools": copy.deepcopy(d.selection)}
+    if fault == "missing":
+        snapshot = {}
+    elif fault in {"empty", "null", "malformed"}:
+        snapshot["sandbox_tools"] = {"empty": [], "null": None, "malformed": {}}[fault]
+    elif fault == "extra_field":
+        snapshot["sandbox_tools"][0]["command"] = ["/untrusted"]
+    else:
+        snapshot["sandbox_tools"][0][fault] = "changed"
+    async with d.db.factory() as session, session.begin():
+        (await session.get(ChatRun, d.run.id)).capability_snapshot = snapshot
+    with pytest.raises(DispatchRejected, match="^dispatch unavailable$"):
+        await authorize_dispatch(d.config, **d.arguments)
+    assert d.signed == []
+
+
+@pytest.mark.parametrize(("target", "field", "value"), [
+    ("pool", "name", "not-selected"),
+    ("pool", "deployment_id", "other-deployment"),
+    ("pool", "enabled", False),
+    ("pool", "role", "worker"),
+    ("pool", "backend", "nova"),
+    ("pool", "image_ref", "registry.example/changed@sha256:" + "d" * 64),
+    ("pool", "profile_digest", "d" * 64),
+    ("pool", "cluster_profile_id", "other-cluster"),
+    ("pool", "namespace", "other-namespace"),
+    ("sandbox", "backend", "nova"),
+    ("sandbox", "image_ref", "registry.example/changed@sha256:" + "d" * 64),
+    ("sandbox", "policy_digest", "d" * 64),
+    ("sandbox", "cluster_profile_id", "other-cluster"),
+    ("sandbox", "namespace", "other-namespace"),
+    ("sandbox", "pool_id", "worker-pool"),
+    ("root", "status", "completed"),
+])
+async def test_selected_dispatch_rejects_current_identity_drift(selected_dispatch_db, target, field, value):
+    from lumen.services.infrastructure.dispatch import DispatchRejected, authorize_dispatch
+
+    d = selected_dispatch_db
+    row = getattr(d, target)
+    if value == "worker-pool":
+        value = d.db.pool.id
+    async with d.db.factory() as session, session.begin():
+        setattr(await session.get(type(row), row.id), field, value)
+    with pytest.raises(DispatchRejected, match="^dispatch unavailable$"):
+        await authorize_dispatch(d.config, **d.arguments)
+    assert d.signed == []
+
+
+@pytest.mark.parametrize(("target", "field"), [
+    ("run", "lease_expires_at"), ("run", "deadline_at"), ("root", "deadline_at"),
+    ("sandbox", "deadline_at"), ("sandbox", "certificate_not_after"),
+])
+@pytest.mark.parametrize("remaining", [None, 0, -1, 3])
+async def test_selected_dispatch_enforces_and_caps_every_deadline(selected_dispatch_db, target, field, remaining):
+    from lumen.services.infrastructure.dispatch import DispatchRejected, authorize_dispatch
+
+    d = selected_dispatch_db
+    row = getattr(d, target)
+    deadline = d.now + timedelta(seconds=remaining) if remaining is not None else None
+    async with d.db.factory() as session, session.begin():
+        setattr(await session.get(type(row), row.id), field, deadline)
+    if remaining == 3:
+        grant = await authorize_dispatch(d.config, **d.arguments)
+        assert grant.exp == int(deadline.timestamp())
+        assert d.signed[0]["ttl_seconds"] == 3
+    else:
+        with pytest.raises(DispatchRejected, match="^dispatch unavailable$"):
+            await authorize_dispatch(d.config, **d.arguments)
+        assert d.signed == []
+
+
+@pytest.mark.parametrize("fault", [
+    "unselected_tool", "profile", "manifest", "manifest_missing", "current_manifest",
+    "current_profile", "current_name", "disabled", "current_image", "raw_code",
+])
+async def test_selected_dispatch_rejects_ungranted_execution(selected_dispatch_db, fault):
+    from lumen.services.infrastructure.dispatch import DispatchRejected, authorize_dispatch
+
+    d = selected_dispatch_db
+    config = d.config
+    if fault == "unselected_tool":
+        d.body["tool"] = "browser_click"
+    elif fault == "profile":
+        d.body["profile"] = "not-selected"
+    elif fault == "manifest":
+        d.manifest_path.write_bytes(b'{"version":1,"profiles":[]}')
+    elif fault == "manifest_missing":
+        d.manifest_path.unlink()
+    elif fault in {"current_manifest", "current_profile", "current_name"}:
+        manifest = json.loads(d.manifest_path.read_bytes())
+        profile = manifest["profiles"][0]
+        if fault == "current_manifest":
+            profile["command"] = ["/usr/bin/node", "/srv/changed.js"]
+        elif fault == "current_profile":
+            profile["id"] = "changed-profile"
+        else:
+            profile["tools"][0]["name"] = "changed_tool"
+        manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode()
+        d.manifest_path.write_bytes(manifest_bytes)
+        updated_profile = d.configured.profile.model_copy(update={
+            "tool_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        })
+        config = config.model_copy(update={
+            "pools": (d.configured.model_copy(update={"profile": updated_profile}),),
+        })
+    elif fault in {"disabled", "current_image"}:
+        change = {"enabled": False} if fault == "disabled" else {
+            "image": "registry.example/changed@sha256:" + "d" * 64,
+        }
+        config = config.model_copy(update={"pools": (d.configured.model_copy(update=change),)})
+    else:
+        d.arguments["path"] = "/v1/executions"
+        d.arguments["body"] = {
+            key: value for key, value in d.body.items() if key not in {"profile", "tool", "arguments"}
+        } | {"language": "python", "source": "print(1)"}
+    with pytest.raises(DispatchRejected, match="^dispatch unavailable$"):
+        await authorize_dispatch(config, **d.arguments)
+    assert d.signed == []
+
+
+@pytest.mark.parametrize("path", ["/v1/workspace", "/v1/executions/", "/v1/artifacts/"])
+async def test_selected_dispatch_reads_do_not_need_tool_selection(selected_dispatch_db, path):
+    from lumen.services.infrastructure.dispatch import authorize_dispatch
+
+    d = selected_dispatch_db
+    async with d.db.factory() as session, session.begin():
+        (await session.get(ChatRun, d.run.id)).capability_snapshot = {}
+    arguments = d.arguments | {
+        "method": "GET", "path": path + str(uuid4()) if path.endswith("/") else path,
+        "body": None, "call_id": None, "workspace_revision": None,
+    }
+    grant = await authorize_dispatch(d.config, **arguments)
+    assert grant.capability and len(d.signed) == 1
+
+
+async def test_selected_dispatch_rejects_a_deadline_crossed_during_signing(selected_dispatch_db, monkeypatch):
+    from lumen.services.infrastructure import dispatch, transport
+
+    d = selected_dispatch_db
+    async with d.db.factory() as session, session.begin():
+        (await session.get(ChatRuntimeResource, d.sandbox.id)).deadline_at = d.now + timedelta(seconds=3)
+    clock = [d.now.timestamp()]
+    monkeypatch.setattr(dispatch, "time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(transport, "time", SimpleNamespace(time=lambda: clock[0]))
+    sign = dispatch.sign_dispatch_capability
+
+    def delayed_sign(*args, **kwargs):
+        clock[0] += 1
+        return sign(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch, "sign_dispatch_capability", delayed_sign)
+    with pytest.raises(dispatch.DispatchRejected, match="^dispatch unavailable$"):
+        await dispatch.authorize_dispatch(d.config, **d.arguments)
+    assert len(d.signed) == 1

@@ -23,6 +23,7 @@ from lumen.services import memory_store as ms
 from lumen.services.api_key_store import ApiKeyForbidden
 from lumen.services.inference_authority import authorize_run_generation_by_id
 from lumen.services.providers import routing as ps
+from lumen.services.providers.pricing import frozen_token_pricing
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,7 @@ async def generate_memory_if_applicable(
         # Optional post-response work must not retry forbidden inference or alter the completed chat.
         return None
     try:
+        token_pricing = frozen_token_pricing(resolved)
         response = await provider_client.acompletion(
             model,
             messages,
@@ -214,6 +216,7 @@ async def generate_memory_if_applicable(
             provider_auth=resolved.get("provider_auth"),
             max_tokens=None if resolved.get("provider_type") == "chatgpt" else _MAX_TOKENS,
             temperature=None if resolved.get("provider_type") == "chatgpt" else 0.2,
+            extra={"capabilities_override": resolved.get("capabilities") or {}},
         )
     except Exception as exc:
         raise MemoryExtractionRetryable("memory model request failed") from exc
@@ -235,6 +238,9 @@ async def generate_memory_if_applicable(
             completion_tokens,
             input_price_per_token=resolved.get("input_price_per_token"),
             output_price_per_token=resolved.get("output_price_per_token"),
+            input_price_per_token_above_200k=resolved.get("input_price_per_token_above_200k"),
+            output_price_per_token_above_200k=resolved.get("output_price_per_token_above_200k"),
+            long_context_threshold_tokens=resolved.get("long_context_threshold_tokens", 200_000),
             price_source=resolved.get("price_source"),
             provider_type=resolved.get("provider_type"),
             api_base=resolved.get("api_base"),
@@ -246,6 +252,11 @@ async def generate_memory_if_applicable(
             cache_write_price_per_token_above_200k=resolved.get("cache_write_price_per_token_above_200k"),
             cache_write_1h_price_per_token_above_200k=resolved.get("cache_write_1h_price_per_token_above_200k"),
             cache_price_sources=resolved.get("cache_price_sources"),
+            allow_catalog_cache=False,
+            allow_catalog_prices=False,
+            token_rates=token_pricing["token_rates"],
+            token_rates_above_200k=token_pricing.get("token_rates_above_200k"),
+            token_rates_follow_text=token_pricing.get("token_rates_follow_text") is True,
         )
         await credit.apply_usage(
             event_id=f"memory:{conversation_id}:{uuid.uuid4().hex}",

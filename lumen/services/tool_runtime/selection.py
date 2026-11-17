@@ -60,7 +60,8 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
     try:
         # reveal_secrets=True: 실행에는 복호화된 실제 인증 헤더가 필요(API 응답용 마스킹 dict 아님).
         items = await es.list_for_user(
-            "mcp", user_id=ctx.user_id, project_id=ctx.project_id, active_only=True, reveal_secrets=True
+            "mcp", user_id=ctx.user_id, project_id=ctx.project_id, active_only=True, reveal_secrets=True,
+            include_domain=tuple(ctx.selected_mcp_ids) if ctx.selected_mcp_ids else False,
         )
         # An OAuth execution needs admission's exact epoch before refresh/discovery.
         items = [
@@ -114,6 +115,8 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
             logger.info("MCP 서버 %s: 실행 중 인증 값이 변경되었거나 폐기됨 — 노출 스킵", server_id)
             continue
         usable.append(server)
+    if ctx.selected_mcp_ids is None:
+        usable = [server for server in usable if server.get("implicit_selection", True)]
     return _frozen_selection(_selected(usable, ctx.selected_mcp_ids), ctx, "mcp")
 
 

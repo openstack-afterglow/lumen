@@ -267,7 +267,8 @@ def test_modality_only_prices_still_require_provider_capacity(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_frozen_main_summary_modality_rates_survive_edits_and_reach_ledger(monkeypatch):
+@pytest.mark.parametrize("tiered", [False, True])
+async def test_frozen_main_summary_modality_rates_survive_edits_and_reach_ledger(monkeypatch, tiered):
     from lumen.services import chat_admission, provider_metadata
     from lumen.services.durable_runs import execution
 
@@ -277,24 +278,42 @@ async def test_frozen_main_summary_modality_rates_survive_edits_and_reach_ledger
              "media_pricing": {"token_rates": {"audio": {"input_per_million": "100000"}}}}
     summary = {**route, "model_name": "summary", "media_pricing": {
         "token_rates": {"audio": {"input_per_million": "200000"}}}}
+    if tiered:
+        route.update(long_context_threshold_tokens=9, token_rates_above_200k={
+            "audio": {"input_per_million": "300000"},
+        })
+        summary.update(long_context_threshold_tokens=9, token_rates_above_200k={
+            "audio": {"input_per_million": "400000"},
+        })
     capabilities, pricing = chat_admission._run_snapshots(route, {}, summary_route=summary)
     pricing["chat_credit_per_usd"] = "1"
     run = SimpleNamespace(id="root", user_id="user", project_id="project", conversation_id=None, api_key_id=None,
                           model_name="main", pricing_snapshot=pricing, capability_snapshot=capabilities)
     route["media_pricing"]["token_rates"]["audio"]["input_per_million"] = "9000000"
     summary["media_pricing"]["token_rates"]["audio"]["input_per_million"] = "9000000"
+    if tiered:
+        route["token_rates_above_200k"]["audio"]["input_per_million"] = "9000000"
+        summary["token_rates_above_200k"]["audio"]["input_per_million"] = "9000000"
+    expected_main = Decimal("3.002" if tiered else "1.002")
+    expected_summary = Decimal("4.002" if tiered else "2.002")
+
+    def forbid_catalog(*_args, **_kwargs):
+        raise AssertionError("frozen settlement must not read the catalog")
+
+    monkeypatch.setattr(provider_metadata, "native_catalog_entry", forbid_catalog)
+    monkeypatch.setattr(provider_metadata, "bundled_cache_rates", forbid_catalog)
     usage = {"prompt_tokens": 10, "completion_tokens": 1, "required_token_modalities": ["audio_input"],
              "modality_tokens": {"audio": {"input_tokens": 10, "output_tokens": 0, "cache_read_input_tokens": 0}}}
     hooks = _DurableExecutionHooks(run_id="root", owner="worker")
-    assert hooks._actual_credit(run, "chat_completions", usage, None) == Decimal("1.002")
-    assert hooks._actual_credit(run, "context_compaction", usage, None) == Decimal("2.002")
+    assert hooks._actual_credit(run, "chat_completions", usage, None) == expected_main
+    assert hooks._actual_credit(run, "context_compaction", usage, None) == expected_summary
     # Optional summary rates do not require an absent audio split.
     assert hooks._actual_credit(run, "context_compaction", {
         "prompt_tokens": 10, "completion_tokens": 1, "required_token_modalities": []}, None) == Decimal("0.012")
     monkeypatch.setattr(provider_metadata, "count_context_tokens", lambda *_args:
                         provider_metadata.ContextTokenCount(tokens=10, measurement="estimated"))
-    assert _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=1) == Decimal("1.00200001")
-    assert _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=1, summary=True) == Decimal("2.00200001")
+    assert _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=1) == expected_main + Decimal("0.00000001")
+    assert _provider_credit_bound(run, messages=[], tool_schemas=[], max_tokens=1, summary=True) == expected_summary + Decimal("0.00000001")
 
     class Result:
         def __init__(self, value):
@@ -321,8 +340,8 @@ async def test_frozen_main_summary_modality_rates_survive_edits_and_reach_ledger
     monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *_args: None)
     monkeypatch.setattr(execution.credit, "apply_usage_in_transaction", apply_usage)
     await hooks._record_summary_usage(segment_id="context:0:0:map", usage_payload=usage, route=summary)
-    assert recorded[0]["usage_cost"].raw_cost == Decimal("2.002")
-    assert sum(Decimal(item["cost_usd"]) for item in recorded[0]["usage_components"]) == Decimal("2.002")
+    assert recorded[0]["usage_cost"].raw_cost == expected_summary
+    assert sum(Decimal(item["cost_usd"]) for item in recorded[0]["usage_components"]) == expected_summary
 
 
 def test_credit_hold_covers_rounding_of_all_text_and_modality_categories(monkeypatch):

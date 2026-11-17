@@ -156,3 +156,25 @@ def test_claude_gateway_migration_reuses_expiring_api_keys():
     assert "client_id_hash CHAR(64) NOT NULL" in statements[1]
     assert "refresh_token" not in statements[1]
     assert "raw" not in statements[1]
+
+
+def test_domain_mcp_migration_is_registered_and_preserves_existing_scope_defaults():
+    migration = next(item for item in load_manifest() if item.logical_id == "033-mcp-domain-connections")
+    statements = _statements(MIGRATIONS / migration.relative_path)
+    assert "ADD COLUMN owner_domain_id VARCHAR(64) NULL" in statements[0]
+    assert "ADD COLUMN implicit_selection BOOLEAN NOT NULL DEFAULT TRUE" in statements[0]
+    assert "WHERE scope = 'user'" in statements[1]
+    assert "uq_chat_mcp_scoped_template_label (connection_scope_key, template_key, connection_label)" in statements[2]
+    assert "ADD INDEX idx_chat_mcp_domain (owner_domain_id, scope)" in statements[2]
+
+
+def test_stateless_hold_migration_is_additive_content_free_and_registered():
+    migration = next(item for item in load_manifest() if item.logical_id == "034-stateless-call-reservations")
+    statements = _statements(MIGRATIONS / migration.relative_path)
+    assert len(statements) == 1
+    ddl = statements[0]
+    assert ddl.startswith("CREATE TABLE chat_stateless_call_reservations")
+    assert "expires_at" not in ddl
+    assert "idx_stateless_hold_owner (user_id, status)" in ddl
+    assert "idx_stateless_hold_key (api_key_id, status)" in ddl
+    assert all(word not in ddl.lower() for word in ("prompt", "content", "answer", "alter table", "drop table"))

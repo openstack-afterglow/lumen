@@ -87,6 +87,11 @@ async def _visible_server(session, server_id: int, namespace: Namespace) -> Chat
     if server.scope == "global":
         if not server.is_active:
             raise ExtensionForbidden("비활성 MCP 서버입니다")
+    elif server.scope == "domain":
+        from lumen.services.extensions_store import _domain_access
+        await _domain_access(namespace.user_id, namespace.project_id, server.owner_domain_id)
+        if not server.is_active:
+            raise ExtensionForbidden("비활성 MCP 서버입니다")
     elif server.owner_user_id != namespace.user_id or server.owner_project_id != namespace.project_id:
         raise ExtensionForbidden("소유자가 아닙니다")
     if not server.url:
@@ -132,6 +137,9 @@ def _connection(row: ChatMcpOAuthConnection) -> McpConnection:
 
 
 async def _connection_row(session, server_id: int, namespace: Namespace, *, lock: bool = False):
+    server = await session.get(ChatMcpServer, server_id)
+    if server is not None and server.scope == "domain":
+        namespace = Namespace(user_id=server.owner_domain_id, project_id=server.owner_domain_id)
     query = select(ChatMcpOAuthConnection).where(
         ChatMcpOAuthConnection.mcp_server_id == server_id,
         ChatMcpOAuthConnection.owner_user_id == namespace.user_id,
@@ -195,6 +203,9 @@ class SqlMcpConnectionStore(McpConnectionStore):
     ) -> None:
         async with _session() as session:
             row = await _visible_server(session, server_id, namespace)
+            if row.scope == "domain":
+                from lumen.services.extensions_store import _domain_access
+                await _domain_access(namespace.user_id, namespace.project_id, row.owner_domain_id, manage=True)
             if not row.is_active or row.auth_mode != "oauth":
                 raise McpOAuthError("This MCP server is not configured for OAuth")
             session.add(ChatMcpOAuthRequest(
@@ -237,7 +248,14 @@ class SqlMcpConnectionStore(McpConnectionStore):
                         "project_id": request.owner_project_id,
                         **authority,
                     }, "native:mcp:write")
-                except HTTPException as exc:
+                    server = await session.get(ChatMcpServer, request.mcp_server_id)
+                    if server is not None and server.scope == "domain":
+                        from lumen.services.extensions_store import _domain_access
+                        await _domain_access(
+                            request.owner_user_id, request.owner_project_id, server.owner_domain_id,
+                            manage=True, human=True,  # the owner already passed the unrestricted-human start
+                        )
+                except (HTTPException, ExtensionForbidden) as exc:
                     raise McpOAuthError("MCP OAuth management authority is no longer available") from exc
                 payload = _decrypt(request.encrypted_payload)
                 request.status = "processing"
@@ -280,13 +298,20 @@ class SqlMcpConnectionStore(McpConnectionStore):
                 failed_reason = "MCP server configuration changed; start OAuth again"
             else:
                 namespace = Namespace(user_id=request.owner_user_id, project_id=request.owner_project_id)
+                if server.scope == "domain":
+                    from lumen.services.extensions_store import _domain_access
+                    await _domain_access(
+                        request.owner_user_id, request.owner_project_id, server.owner_domain_id,
+                        manage=True, human=True,
+                    )
+                    namespace = Namespace(user_id=server.owner_domain_id, project_id=server.owner_domain_id)
                 connection = await _connection_row(session, request.mcp_server_id, namespace, lock=True)
                 if connection is None:
                     connection = ChatMcpOAuthConnection(
                         id=str(uuid.uuid4()),
                         mcp_server_id=request.mcp_server_id,
-                        owner_user_id=request.owner_user_id,
-                        owner_project_id=request.owner_project_id,
+                        owner_user_id=namespace.user_id,
+                        owner_project_id=namespace.project_id,
                         encrypted_tokens=_encrypt(token),
                         credential_version=1,
                         server_config_version=server.config_version,
@@ -325,6 +350,38 @@ class SqlMcpConnectionStore(McpConnectionStore):
                     ChatMcpOAuthConnection.status == "active",
                 )
             )).scalars().all()
+            # Organization tokens live under owner id = domain id. Only when an active shared token exists is the
+            # caller's domain located (one directory read, done with no SQL session open); membership is enforced by
+            # the visible-row listing and by the member's own activation, so a failed lookup only leaves them out.
+            shared_servers = {
+                server.id: server.owner_domain_id for server in (await session.execute(
+                    select(ChatMcpServer).join(
+                        ChatMcpOAuthConnection, ChatMcpOAuthConnection.mcp_server_id == ChatMcpServer.id
+                    ).where(
+                        ChatMcpServer.scope == "domain", ChatMcpServer.auth_mode == "oauth",
+                        ChatMcpServer.is_active.is_(True), ChatMcpOAuthConnection.status == "active",
+                        ChatMcpOAuthConnection.owner_user_id == ChatMcpServer.owner_domain_id,
+                        ChatMcpOAuthConnection.owner_project_id == ChatMcpServer.owner_domain_id,
+                    )
+                )).scalars().all()
+            }
+        domain_id = None
+        if shared_servers:
+            from lumen.services.mcp_domain_authority import project_domain_id
+
+            try:
+                domain_id = await project_domain_id(namespace.project_id)
+            except Exception:
+                logger.warning("organization MCP tokens skipped: project domain unavailable", exc_info=True)
+        domain_ids = [server_id for server_id, owner in shared_servers.items() if owner == domain_id]
+        async with _session() as session:
+            if domain_ids:
+                rows.extend((await session.execute(select(ChatMcpOAuthConnection).where(
+                    ChatMcpOAuthConnection.mcp_server_id.in_(domain_ids),
+                    ChatMcpOAuthConnection.owner_user_id == domain_id,
+                    ChatMcpOAuthConnection.owner_project_id == domain_id,
+                    ChatMcpOAuthConnection.status == "active",
+                ))).scalars().all())
             if not rows:
                 return ()
             activations = await _owner_activations(session, namespace.user_id, namespace.project_id)
@@ -344,7 +401,10 @@ class SqlMcpConnectionStore(McpConnectionStore):
 
     async def disconnect(self, server_id: int, namespace: Namespace) -> None:
         async with _session() as session:
-            await _visible_server(session, server_id, namespace)
+            server = await _visible_server(session, server_id, namespace)
+            if server.scope == "domain":
+                from lumen.services.extensions_store import _domain_access
+                await _domain_access(namespace.user_id, namespace.project_id, server.owner_domain_id, manage=True)
             row = await _connection_row(session, server_id, namespace, lock=True)
             if row is not None:
                 await _RefreshLease(row).revoke()
@@ -362,9 +422,10 @@ class SqlMcpConnectionStore(McpConnectionStore):
                 raise McpOAuthError("OAuth connection is no longer active")
             if not _oauth_configuration_matches(server, row.server_config_version):
                 raise McpOAuthError("OAuth connection configuration changed")
-            activations = await _owner_activations(session, row.owner_user_id, row.owner_project_id)
-            if not _mcp_effectively_active(server, activations.get(row.mcp_server_id)):
-                raise McpOAuthError("MCP activation was disabled or changed")
+            if server.scope != "domain":
+                activations = await _owner_activations(session, row.owner_user_id, row.owner_project_id)
+                if not _mcp_effectively_active(server, activations.get(row.mcp_server_id)):
+                    raise McpOAuthError("MCP activation was disabled or changed")
             yield _RefreshLease(row)
 
 

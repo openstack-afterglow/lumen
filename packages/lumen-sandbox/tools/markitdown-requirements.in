@@ -1,0 +1,4 @@
+# Upstream publishes only prereleases of markitdown-mcp; this exact release is approved.
+markitdown-mcp==0.0.1a8
+# Required by markitdown[all]; opt in only this transitive prerelease, not all packages.
+azure-ai-contentunderstanding==1.2.0b3

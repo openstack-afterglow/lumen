@@ -1,16 +1,9 @@
 Local provider metadata and tokenization assets
 
-provider_catalog.json is an unmodified byte-for-byte copy of
-litellm 1.93.0 / litellm/model_prices_and_context_window_backup.json from
-PyPI wheel installation. Original project: https://github.com/BerriAI/litellm
-Source package: https://pypi.org/project/litellm/1.93.0/
-License: MIT, Copyright (c) 2023 Berri AI; full text in LICENSE.litellm.
-SHA256: cc1955f7f1cdc2cdd9ebf216e7eebbc90bbb3528b62439327f7e8b893eda7c12
-Reproduction: extract that exact installed wheel member without reserializing JSON.
-The catalog is frozen historical metadata, not live provider discovery or a price
-observation by Bifrost. Existing ledger price source 'litellm' is retained solely
-to identify original data; version litellm-1.93.0 is recorded independently.
-Manual and stored models.dev prices/capabilities retain precedence.
+native_model_catalog.json records manually verified official-provider specifications
+and prices. Every entry carries source URLs and a verification date; the catalog
+version identifies the reviewed source cohort. Administrator overrides take
+precedence. Compatible API endpoints never borrow native catalog metadata.
 
 Local BPE ranks (unmodified):
 https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken

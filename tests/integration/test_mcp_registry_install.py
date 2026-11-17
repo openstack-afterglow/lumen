@@ -79,4 +79,14 @@ async def test_registry_source_runs_only_after_owner_activation(database, monkey
     after = await chat_admission._resolve_extension_selection(
         None, ChatFeatureOptions(), user_id=user, project_id=project
     )
-    assert server["id"] in {item["id"] for item in after["mcp"]}
+    assert server["id"] not in {item["id"] for item in after["mcp"]}, (
+        "a catalog-installed global must stay out of implicit selection even after owner activation"
+    )
+    assert installed["server"]["implicit_selection"] is False
+    explicit = await chat_admission._resolve_extension_selection(
+        None,
+        ChatFeatureOptions(tool_policy={"enabled_mcp_ids": [server["id"]]}),
+        user_id=user,
+        project_id=project,
+    )
+    assert [item["id"] for item in explicit["mcp"]] == [server["id"]]

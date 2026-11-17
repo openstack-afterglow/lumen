@@ -64,6 +64,7 @@ def _resource(state="requested", provider_id=None, *, desired="requested"):
         id="resource-1", generation=1, observed_state=state, desired_state=desired,
         provider_id=provider_id, request_fingerprint="fp-1", policy_digest="policy-1",
         role="worker", run_id=None, address=None, certificate_fingerprint=None,
+        backend="nova",
         certificate_not_after=datetime.now(UTC) + timedelta(hours=1),
         image_ref="worker-image", deadline_at=None, logical_project_id=None,
         logical_user_id=None, ingress_member_id=None,
@@ -194,6 +195,39 @@ async def test_asynchronous_delete_waits_for_explicit_absence(monkeypatch):
         provider.response = Observation("cloud-1", "absent", None, None, {})
         await reconciler._reconcile_resource(resource, _pool(), _definition(), 3, provider, None)
         assert released == ["resource-1"] and claims == 3
+    finally:
+        reconciler.executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_pod_absence_waits_for_positive_auxiliary_absence(monkeypatch):
+    reconciler = _controller()
+    provider = FakeProvider(response=Observation("pod-1", "absent", None, None, {}))
+    released, cleanup = [], []
+    auxiliaries_absent = False
+
+    async def claimed(*_args):
+        return None
+
+    async def prove(*args):
+        released.append(args[0])
+
+    def delete(ref):
+        cleanup.append(ref.provider_id)
+        return DeleteResult(absent=auxiliaries_absent)
+
+    provider.delete = delete
+    monkeypatch.setattr(controller_module.store, "claim_operation", claimed)
+    monkeypatch.setattr(controller_module.store, "prove_absent", prove)
+    resource = _resource("deleting", "pod-1", desired="deleting")
+    resource.role, resource.backend = "sandbox", "kubernetes"
+    try:
+        await reconciler._reconcile_resource(resource, _pool(), _definition(), 1, provider, None)
+        assert released == [] and cleanup == ["pod-1"]
+        auxiliaries_absent = True
+        await reconciler._reconcile_resource(resource, _pool(), _definition(), 2, provider, None)
+        assert released == ["resource-1"] and cleanup == ["pod-1", "pod-1"]
+        assert provider.creates == 0
     finally:
         reconciler.executor.shutdown(wait=True)
 

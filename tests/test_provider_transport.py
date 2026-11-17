@@ -339,7 +339,8 @@ def test_explicit_reasoning_is_preserved_for_runtime_conversion(provider, effort
 
 
 def test_stable_anthropic_cache_marker_is_nonmutating_and_respects_all_explicit_breakpoints(monkeypatch):
-    monkeypatch.setattr(client, "catalog_model_metadata", lambda *args: {"supports_prompt_caching": True})
+    monkeypatch.setattr(client, "catalog_model_metadata",
+                        lambda model, provider, api_base: {"supports_prompt_caching": api_base is None})
     messages = [{"role": "system", "content": [{"type": "text", "text": "stable"}]},
                 {"role": "user", "content": "volatile"}]
     original = json.dumps(messages)
@@ -353,6 +354,49 @@ def test_stable_anthropic_cache_marker_is_nonmutating_and_respects_all_explicit_
     assert client._anthropic_cached_messages("claude", explicit, "anthropic", None) is explicit
     assert client._anthropic_cached_messages("claude", messages, "anthropic", "https://custom.example") is messages
     assert client._anthropic_cached_messages("gemini", messages, "gemini", None) is messages
+
+
+@pytest.mark.parametrize("api_base", [None, "https://compatible.example/v1"])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_anthropic_cache_marker_obeys_effective_override_before_catalog(monkeypatch, api_base, enabled):
+    def forbidden(*_):
+        raise AssertionError("explicit prompt caching capability must win without catalog access")
+
+    monkeypatch.setattr(client, "catalog_model_metadata", forbidden)
+    messages = [{"role": "system", "content": "stable"}]
+    result = client._anthropic_cached_messages(
+        "opaque", messages, "anthropic", api_base, extra={"capabilities_override": {"prompt_caching": enabled}},
+    )
+    if enabled:
+        assert result[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    else:
+        assert result is messages
+
+
+def test_anthropic_cache_catalog_lookup_receives_actual_endpoint(monkeypatch):
+    seen = []
+    def metadata(model, provider, api_base):
+        seen.append((model, provider, api_base))
+        return {}
+
+    monkeypatch.setattr(client, "catalog_model_metadata", metadata)
+    messages = [{"role": "system", "content": "stable"}]
+    assert client._anthropic_cached_messages("opaque", messages, "anthropic", "https://custom.example") is messages
+    assert seen == [("opaque", "anthropic", "https://custom.example")]
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_override_is_local_policy_not_provider_wire_option(monkeypatch):
+    async with http_fixture({"body": {"choices": [{"message": {"content": "ok"}}], "usage": {}}}) as fixture:
+        await connect_runtime(monkeypatch, fixture)
+        await client.acompletion(
+            "opaque", [{"role": "system", "content": "stable"}], custom_llm_provider="anthropic",
+            extra={"capabilities_override": {"prompt_caching": True}, "temperature": 0.5},
+        )
+        body = fixture.requests[0]["body"]["body"]
+        assert "capabilities_override" not in body
+        assert body["temperature"] == 0.5
+        assert body["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
 
 
 @pytest.mark.asyncio
@@ -430,7 +474,12 @@ async def test_chatgpt_stream_bridges_tool_delta_citations_and_reasoning_native_
 
 @pytest.mark.parametrize("provider", ["azure", "bedrock", "vertex", "ollama", "openrouter", "deepseek", "xai",
                                       "vertex_ai", "azure_ai", "mistral", "cohere", "groq", "together", "together_ai"])
-def test_all_owned_runtime_adapters_admit_single_attempt(provider):
+def test_removed_inference_adapters_reject_single_attempt(provider):
+    assert not client.provider_once_supported(provider)
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "gemini", "perplexity"])
+def test_native_runtime_adapters_admit_single_attempt(provider):
     assert client.provider_once_supported(provider)
 
 

@@ -133,7 +133,10 @@ def billing_route(
 
     route = deepcopy(resolved)
     try:
-        route["token_rates"] = frozen_token_pricing(route)["token_rates"]
+        token_pricing = frozen_token_pricing(route)
+        route["token_rates"] = token_pricing["token_rates"]
+        route["token_rates_above_200k"] = token_pricing.get("token_rates_above_200k") or {}
+        route["token_rates_follow_text"] = token_pricing.get("token_rates_follow_text") is True
     except errors.ProviderValidationError as exc:
         raise CompletionError(422, "model token pricing is invalid") from exc
     output_modalities = list((options or {}).get("modalities") or [])
@@ -215,8 +218,13 @@ async def _bill(
     """
     model_name = resolved["model_name"]
     token_rates = resolved.get("token_rates")
+    token_rates_above_200k = resolved.get("token_rates_above_200k")
+    token_rates_follow_text = resolved.get("token_rates_follow_text") is True
     if token_rates is None:
-        token_rates = frozen_token_pricing(resolved)["token_rates"]
+        token_pricing = frozen_token_pricing(resolved)
+        token_rates = token_pricing["token_rates"]
+        token_rates_above_200k = token_pricing.get("token_rates_above_200k")
+        token_rates_follow_text = token_pricing.get("token_rates_follow_text") is True
     required = resolved.get("required_token_modalities")
     if required is None:
         required = required_modalities_for_request(token_rates, messages=messages)
@@ -232,6 +240,9 @@ async def _bill(
             ct,
             input_price_per_token=resolved.get("input_price_per_token"),
             output_price_per_token=resolved.get("output_price_per_token"),
+            input_price_per_token_above_200k=resolved.get("input_price_per_token_above_200k"),
+            output_price_per_token_above_200k=resolved.get("output_price_per_token_above_200k"),
+            long_context_threshold_tokens=resolved.get("long_context_threshold_tokens", 200_000),
             price_source=resolved.get("price_source"),
             provider_type=resolved.get("provider_type"),
             api_base=resolved.get("api_base"),
@@ -243,7 +254,11 @@ async def _bill(
             cache_write_price_per_token_above_200k=resolved.get("cache_write_price_per_token_above_200k"),
             cache_write_1h_price_per_token_above_200k=resolved.get("cache_write_1h_price_per_token_above_200k"),
             cache_price_sources=resolved.get("cache_price_sources"),
+            allow_catalog_cache=False,
+            allow_catalog_prices=False,
             token_rates=token_rates,
+            token_rates_above_200k=token_rates_above_200k,
+            token_rates_follow_text=token_rates_follow_text,
             required_modalities=required,
         )
     except ValueError as exc:
@@ -336,7 +351,7 @@ async def invoke_chat_once(
     Provider exceptions propagate unchanged so each caller keeps its own error
     contract. ``provider_once`` disables every transport retry/re-send layer.
     """
-    extra_kwargs: dict[str, Any] = {}
+    extra_kwargs: dict[str, Any] = {"capabilities_override": resolved.get("capabilities") or {}}
     if tool_choice is not None:
         extra_kwargs["tool_choice"] = tool_choice
     resp = await provider_client.acompletion(
@@ -463,7 +478,7 @@ async def _complete_stream(
     charged = False
     gen = None
     event_id = str(uuid.uuid4())  # 요청당 1개 — 정상/finally 재과금 모두 재사용(멱등, 이중과금 방지)
-    extra_kwargs: dict[str, Any] = {}
+    extra_kwargs: dict[str, Any] = {"capabilities_override": resolved.get("capabilities") or {}}
     if tool_choice is not None:
         extra_kwargs["tool_choice"] = tool_choice
     # One finally owns the provider stream and partial billing: a consumer close

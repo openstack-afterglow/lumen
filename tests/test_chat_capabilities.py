@@ -12,6 +12,56 @@ from lumen.services.providers.pricing import _effective_capabilities, _model_pub
 from lumen.services.providers.routing import _resolved_model, _resolved_provider
 
 
+@pytest.fixture
+def native_catalog(monkeypatch):
+    from lumen.services import provider_metadata
+
+    def install(provider_type=None, model_name="example-model", **fields):
+        providers = {}
+        if provider_type is not None:
+            source_url = {
+                "openai": "https://developers.openai.com/api/docs/pricing",
+                "anthropic": "https://docs.anthropic.com/en/docs/about-claude/pricing",
+                "gemini": "https://ai.google.dev/gemini-api/docs/pricing",
+                "perplexity": "https://docs.perplexity.ai/guides/pricing",
+            }[provider_type]
+            flags = fields.pop("capabilities", {})
+            entry = {
+                "id": model_name,
+                "aliases": [],
+                "kind": "text",
+                "display_name": model_name,
+                "status": "active",
+                "context_window": None,
+                "max_output_tokens": None,
+                "input_modalities": ["text"],
+                "output_modalities": ["text"],
+                "capabilities": {
+                    flag: flags.get(flag, False)
+                    for flag in (
+                        "vision", "tool_call", "reasoning", "prompt_caching",
+                        "structured_output", "web_search", "decisions",
+                    )
+                },
+                "token_pricing": None,
+                "media_pricing": None,
+                "source_urls": [source_url],
+                "verified_at": "2026-11-17",
+                "notes": None,
+                **fields,
+            }
+            providers[provider_type] = {
+                "display_name": provider_type,
+                "pricing_sources": [source_url],
+                "models": [entry],
+            }
+        catalog = {"schema_version": 1, "catalog_version": "2099-01-01", "providers": providers}
+        monkeypatch.setattr(provider_metadata, "native_catalog", lambda: catalog)
+        return catalog
+
+    return install
+
+
 def _attach_credentials(provider):
     credential = SimpleNamespace(
         id=11, account_id=9, auth_mode="api_key", generation=0, is_active=True,
@@ -37,7 +87,7 @@ def _capabilities():
         "feature_gates": {
             "text": {"available": True, "pricing_available": True},
             "structured_output": {"available": True, "pricing_available": True},
-            "web_search": {"available": True, "pricing_available": True},
+            "web_search": {"available": True, "mode": "managed", "pricing_available": True},
             "web_fetch": {"available": True, "pricing_available": True},
             "image_output": {"available": True, "pricing_available": True},
         }
@@ -48,6 +98,7 @@ def _detected_native_search_capabilities(*, available: bool, required: bool = Fa
     return {
         "web_search": available,
         "web_search_required": required,
+        "native_web_search_transport_supported": available,
         "feature_gates": {
             "web_search": {
                 "available": available,
@@ -59,34 +110,25 @@ def _detected_native_search_capabilities(*, available: bool, required: bool = Fa
     }
 
 
-def test_perplexity_catalog_context_limit_uses_canonical_agent_identifier(monkeypatch):
-    from lumen.services import provider_metadata
-
-    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {"perplexity/sonar": {"litellm_provider": "perplexity", "max_input_tokens": 128_000}})
-    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
+def test_perplexity_catalog_context_limit_uses_canonical_agent_identifier(native_catalog):
+    native_catalog("perplexity", "perplexity/sonar", context_window=128_000)
 
     capabilities = provider_capabilities("perplexity/perplexity/sonar", "perplexity")
 
     assert capabilities["context_limit"] == 128_000
 
 
-def test_unknown_perplexity_catalog_context_limit_remains_unknown(monkeypatch):
-    from lumen.services import provider_metadata
-
-    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {})
-    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
+def test_unknown_perplexity_catalog_context_limit_remains_unknown(native_catalog):
+    native_catalog()
 
     capabilities = provider_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
 
     assert capabilities["context_limit"] is None
 
 
-def test_admin_override_without_a_window_keeps_the_exact_catalog_limit(monkeypatch):
+def test_admin_override_without_a_window_keeps_the_exact_catalog_limit(native_catalog):
     """CapabilitiesInput always serializes context_limit, so null must not erase detection."""
-    from lumen.services import provider_metadata
-
-    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {"perplexity/sonar": {"litellm_provider": "perplexity", "max_input_tokens": 128_000}})
-    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
+    native_catalog("perplexity", "perplexity/sonar", context_window=128_000)
     detected = provider_capabilities("perplexity/perplexity/sonar", "perplexity")
 
     stored_flag_only = normalize_capabilities({"tool_call": False, "context_limit": None}, detected)
@@ -98,14 +140,103 @@ def test_admin_override_without_a_window_keeps_the_exact_catalog_limit(monkeypat
     assert normalize_capabilities({"context_limit": 64_000}, detected)["context_limit"] == 64_000
 
 
-def test_admin_override_cannot_invent_a_window_for_an_uncatalogued_model(monkeypatch):
-    from lumen.services import provider_metadata
-
-    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {})
-    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
+def test_admin_override_cannot_invent_a_window_for_an_uncatalogued_model(native_catalog):
+    native_catalog()
     detected = provider_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
 
     assert normalize_capabilities({"tool_call": True, "context_limit": None}, detected)["context_limit"] is None
+
+
+@pytest.mark.parametrize("available", (False, True))
+def test_native_catalog_flags_map_to_canonical_capabilities_and_gates(native_catalog, available):
+    flags = {
+        flag: available
+        for flag in (
+            "vision", "tool_call", "reasoning", "prompt_caching",
+            "structured_output", "web_search", "decisions",
+        )
+    }
+    native_catalog(
+        "openai", "catalog-model", capabilities=flags,
+        context_window=128_000, max_output_tokens=16_000,
+        input_modalities=["text", "image"] if available else ["text"],
+    )
+
+    capabilities = provider_capabilities("catalog-model", "openai", "https://api.openai.com/v1")
+
+    for flag in flags:
+        assert capabilities[flag] is available
+    assert capabilities["function_calling"] is available
+    assert capabilities["attachment"] is available
+    assert capabilities["context_limit"] == 128_000
+    assert capabilities["max_output_tokens"] == 16_000
+    assert capabilities["metadata_source"] == "catalog"
+    assert capabilities["metadata_status"] == "observed"
+    assert capabilities["metadata_version"] == "2099-01-01"
+    for feature in ("image_input", "structured_output", "decisions"):
+        assert capabilities["feature_gates"][feature] == {
+            "available": available,
+            "mode": "native" if available else "none",
+            "reason_code": None if available else "provider_unsupported",
+            "pricing_available": available,
+        }
+    assert capabilities["feature_gates"]["web_search"] == {
+        "available": False, "mode": "none",
+        "reason_code": "pricing_unavailable" if available else "provider_unsupported",
+        "pricing_available": False,
+    }
+
+
+@pytest.mark.parametrize("provider_type", ("openai", "anthropic"))
+def test_compatible_capabilities_never_read_native_catalog(monkeypatch, provider_type):
+    from lumen.services import provider_metadata
+
+    def forbidden_catalog():
+        raise AssertionError("compatible routes must not read native catalog")
+
+    monkeypatch.setattr(provider_metadata, "native_catalog", forbidden_catalog)
+
+    capabilities = provider_capabilities("gpt-6-luna", provider_type, "https://compatible.example.test/v1")
+
+    for flag in (
+        "vision", "tool_call", "function_calling", "reasoning", "prompt_caching",
+        "structured_output", "web_search", "decisions",
+    ):
+        assert capabilities[flag] is False
+    assert capabilities["context_limit"] is None
+    assert capabilities["metadata_source"] is None
+    assert capabilities["metadata_status"] == "missing"
+    assert capabilities["metadata_version"] is None
+
+
+@pytest.mark.parametrize("available", (False, True))
+def test_decisions_override_updates_boolean_and_gate(native_catalog, available):
+    native_catalog("openai", "decision-model", capabilities={"decisions": not available})
+    detected = provider_capabilities("decision-model", "openai")
+
+    normalized = normalize_capabilities({"decisions": available}, detected)
+
+    assert normalized["decisions"] is available
+    assert normalized["feature_gates"]["decisions"] == {
+        "available": available,
+        "mode": "native" if available else "none",
+        "reason_code": None if available else "provider_unsupported",
+        "pricing_available": available,
+    }
+
+
+@pytest.mark.parametrize("input_price", (None, "0.000001"))
+def test_decisions_pricing_requires_only_input_rate(native_catalog, input_price):
+    native_catalog("openai", "decision-model", capabilities={"decisions": True})
+    detected = provider_capabilities("decision-model", "openai")
+
+    capabilities = _pricing_aware_capabilities(
+        _model(metadata={}, input_price=input_price, output_price=None), detected,
+    )
+
+    assert capabilities["decisions"] is True
+    assert capabilities["feature_gates"]["decisions"]["available"] is True
+    assert capabilities["feature_gates"]["decisions"]["pricing_available"] is (input_price is not None)
 
 
 def test_feature_gate_pricing_is_derived_from_model_prices_and_components():
@@ -129,13 +260,15 @@ def test_feature_gate_pricing_is_derived_from_model_prices_and_components():
     assert gates["image_output"]["pricing_available"] is False
 
 
-def test_native_search_uses_selected_model_price_not_managed_component_prices():
+def test_native_search_remains_unpriced_until_search_fees_are_billable():
     caps = _capabilities()
     caps["feature_gates"]["web_search"]["mode"] = "native"
 
     gated = _pricing_aware_capabilities(_model(metadata={}), caps)
 
-    assert gated["feature_gates"]["web_search"]["pricing_available"] is True
+    assert gated["feature_gates"]["web_search"]["pricing_available"] is False
+    assert gated["feature_gates"]["web_search"]["available"] is False
+    assert gated["feature_gates"]["web_search"]["reason_code"] == "pricing_unavailable"
 
     unpriced = _pricing_aware_capabilities(_model(metadata={}, input_price=None, output_price=None), caps)
     assert unpriced["feature_gates"]["web_search"]["pricing_available"] is False
@@ -277,7 +410,7 @@ def test_stored_canonical_gates_and_detected_modalities_are_preserved():
     assert normalized["output_modalities"] == ["text"]
 
 
-def test_managed_search_does_not_retain_native_sonar_requirement():
+def test_managed_search_does_not_remove_intrinsic_sonar_scope_floor():
     normalized = normalize_capabilities(
         {
             "feature_gates": {
@@ -293,7 +426,7 @@ def test_managed_search_does_not_retain_native_sonar_requirement():
     )
 
     assert normalized["feature_gates"]["web_search"]["mode"] == "managed"
-    assert normalized["web_search_required"] is False
+    assert normalized["web_search_required"] is True
 
 
 def test_stored_native_search_gate_cannot_enable_unsupported_transport():
@@ -353,10 +486,10 @@ def test_legacy_native_search_enable_preserves_detected_api_support():
 
     assert normalized["web_search"] is True
     assert normalized["feature_gates"]["web_search"] == {
-        "available": True,
-        "mode": "native",
-        "reason_code": None,
-        "pricing_available": True,
+        "available": False,
+        "mode": "none",
+        "reason_code": "pricing_unavailable",
+        "pricing_available": False,
     }
 
 
@@ -417,7 +550,7 @@ def test_resolved_provider_fences_selected_credential_generation_without_decrypt
         id=3,
         name="search-provider",
         provider_type="perplexity",
-        api_base="https://search.example.test",
+        api_base="https://api.perplexity.ai",
         selection_policy="priority",
         is_active=True,
         margin_multiplier="1.25",
@@ -462,13 +595,17 @@ def test_resolved_model_gates_frozen_catalog_prices(monkeypatch):
 
     resolved = _resolved_model(model, provider)
 
-    assert resolved["price_source"] == "litellm"
+    assert resolved["price_source"] == "native_catalog"
     assert resolved["input_price_per_token"] == Decimal("0.0000010000")
     assert resolved["output_price_per_token"] == Decimal("0.0000020000")
     assert resolved["capabilities"]["feature_gates"]["text"]["pricing_available"] is True
 
 
-def test_perplexity_agent_prices_resolve_from_canonical_or_documented_exact_routes():
+def test_perplexity_agent_prices_resolve_from_canonical_native_catalog(native_catalog):
+    native_catalog(
+        "perplexity", "perplexity/sonar",
+        token_pricing={"input": "0.25", "output": "2.50"},
+    )
     provider = SimpleNamespace(provider_type="perplexity", api_base="https://api.perplexity.ai/v1")
     sonar = SimpleNamespace(
         model_name="perplexity/perplexity/sonar",
@@ -490,12 +627,16 @@ def test_perplexity_agent_prices_resolve_from_canonical_or_documented_exact_rout
     assert provider_pricing._resolved_base_prices(sonar, provider)[:3] == (
         Decimal("0.0000002500"),
         Decimal("0.0000025000"),
-        "perplexity_agent_api_2026-09",
+        "native_catalog",
+    )
+    native_catalog(
+        "perplexity", "perplexity/glm-5.3",
+        token_pricing={"input": "1.40", "output": "4.40"},
     )
     assert provider_pricing._resolved_base_prices(glm, provider)[:3] == (
         Decimal("0.0000014000"),
         Decimal("0.0000044000"),
-        "perplexity_agent_api_2026-09",
+        "native_catalog",
     )
 
 
@@ -525,14 +666,22 @@ def test_public_model_marks_unpriced_text_route_unavailable():
     assert public["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is False
 
 
-def test_chatgpt_subscription_capabilities_use_static_metadata_without_provider_probe(monkeypatch):
-    monkeypatch.setattr(
-        capability_service,
-        "_probe",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("provider probe is forbidden")),
-    )
+def test_chatgpt_subscription_uses_catalog_capabilities_without_api_prices(monkeypatch):
+    original = capability_service.catalog_model_metadata
+    observed = []
 
-    capabilities = provider_capabilities("chatgpt/gpt-5.2-codex", "chatgpt")
+    def metadata(model_name, provider_type, api_base=None):
+        observed.append((model_name, provider_type))
+        return original(model_name, provider_type, api_base)
+
+    monkeypatch.setattr(capability_service, "catalog_model_metadata", metadata)
+    capabilities = provider_capabilities("chatgpt/gpt-5.5", "chatgpt")
+    assert observed == [("gpt-5.5", "openai")]
+    assert capabilities["vision"] is True
+    assert capabilities["function_calling"] is True
+    assert capabilities["reasoning"] is True
+    assert capabilities["context_limit"] == 1050000
+    assert capabilities["max_output_tokens"] == 128000
 
     assert capabilities["responses_api"] is True
     assert capabilities["endpoints"] == ["responses"]

@@ -6,11 +6,70 @@ missing catalog prices must remain unknown rather than silently free.
 
 from decimal import Decimal
 
+import pytest
+
 from lumen.services import provider_metadata
+from lumen.services.native_catalog import validate_catalog
 from lumen.services.provider_client import ProviderObject
 
 _MODEL = "gpt-3.5-turbo"
 _MESSAGES = [{"role": "user", "content": "안녕하세요, 오늘 날씨 어때요?"}]
+
+_PRICING_SOURCES = {
+    "openai": "https://developers.openai.com/api/docs/pricing",
+    "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "gemini": "https://ai.google.dev/gemini-api/docs/pricing",
+    "perplexity": "https://docs.perplexity.ai/getting-started/pricing",
+}
+
+
+def _catalog_model(provider, model_id, token_pricing=None):
+    return {
+        "id": model_id,
+        "aliases": [],
+        "kind": "text",
+        "display_name": model_id,
+        "status": "active",
+        "context_window": 8192,
+        "max_output_tokens": 1024,
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+        "capabilities": {
+            "vision": False,
+            "tool_call": True,
+            "reasoning": False,
+            "prompt_caching": False,
+            "structured_output": True,
+            "web_search": False,
+            "decisions": False,
+        },
+        "token_pricing": token_pricing,
+        "media_pricing": None,
+        "source_urls": [_PRICING_SOURCES[provider]],
+        "verified_at": "2026-11-17",
+        "notes": "Synthetic accounting fixture; rates are not published provider prices.",
+    }
+
+
+@pytest.fixture(autouse=True)
+def native_catalog(monkeypatch):
+    def install(**providers):
+        catalog = validate_catalog({
+            "schema_version": 1,
+            "catalog_version": "synthetic-accounting-v1",
+            "providers": {
+                provider: {
+                    "display_name": provider,
+                    "pricing_sources": [_PRICING_SOURCES[provider]],
+                    "models": models,
+                }
+                for provider, models in providers.items()
+            },
+        })
+        monkeypatch.setattr(provider_metadata, "native_catalog", lambda: catalog)
+
+    install(openai=[_catalog_model("openai", _MODEL, {"input": "2", "output": "8"})])
+    return install
 
 
 class TestExtractUsage:
@@ -37,7 +96,7 @@ class TestExtractUsage:
 
 
 class TestCostFromUsage:
-    def test_imported_prices_win_and_snapshot_is_exact(self, monkeypatch):
+    def test_legacy_stored_prices_win_and_snapshot_is_exact(self, monkeypatch):
         monkeypatch.setattr(
             provider_metadata,
             "_catalog_component_rates",
@@ -56,7 +115,8 @@ class TestCostFromUsage:
         assert cost.output_cost == Decimal("0.0040000000")
         assert cost.pricing_status == "priced"
         assert cost.pricing_snapshot["input"]["effective_price_per_million"] == "2.000000"
-        assert cost.pricing_snapshot["output"]["source"] == "models.dev"
+        assert cost.pricing_snapshot["input"]["source"] == "manual"
+        assert cost.pricing_snapshot["output"]["source"] == "manual"
 
     def test_manual_free_rate_is_priced(self, monkeypatch):
         monkeypatch.setattr(
@@ -75,12 +135,8 @@ class TestCostFromUsage:
         assert cost.raw_cost == Decimal("0")
         assert cost.pricing_status == "priced"
 
-    def test_legacy_partial_stored_price_uses_component_fallback(self, monkeypatch):
-        monkeypatch.setattr(
-            provider_metadata,
-            "_catalog_component_rates",
-            lambda *_: (Decimal("0.000001"), Decimal("0.000004")),
-        )
+    def test_legacy_partial_stored_price_uses_component_fallback(self, native_catalog):
+        native_catalog(openai=[_catalog_model("openai", _MODEL, {"input": "1", "output": "4"})])
         cost = provider_metadata.cost_from_usage(
             _MODEL,
             prompt_tokens=100,
@@ -88,14 +144,16 @@ class TestCostFromUsage:
             input_price_per_token=Decimal("0.000003"),
             output_price_per_token=None,
             price_source="manual",
+            provider_type="openai",
         )
         assert cost.raw_cost == Decimal("0.0005000000")
         assert cost.pricing_status == "priced"
         assert cost.pricing_snapshot["input"]["source"] == "manual"
-        assert cost.pricing_snapshot["output"]["source"] == "litellm"
+        assert cost.pricing_snapshot["output"]["source"] == "native_catalog"
 
-    def test_fallback_failure_is_partial_or_unpriced(self, monkeypatch):
-        monkeypatch.setattr(provider_metadata, "_catalog_component_rates", lambda *_: (Decimal("0.000001"), None))
+    @pytest.mark.parametrize("direction", ["input", "output"])
+    def test_fallback_failure_is_partial_or_unpriced(self, native_catalog, direction):
+        native_catalog(openai=[_catalog_model("openai", _MODEL, {direction: "1"})])
         partial = provider_metadata.cost_from_usage(
             _MODEL,
             prompt_tokens=10,
@@ -103,10 +161,15 @@ class TestCostFromUsage:
             input_price_per_token=None,
             output_price_per_token=None,
             price_source=None,
+            provider_type="openai",
         )
         assert partial.pricing_status == "partial"
+        assert partial.raw_cost == Decimal("0.0000100000")
+        assert partial.pricing_snapshot[direction]["source"] == "native_catalog"
+        missing_direction = "output" if direction == "input" else "input"
+        assert partial.pricing_snapshot[missing_direction]["source"] is None
 
-        monkeypatch.setattr(provider_metadata, "_catalog_component_rates", lambda *_: (None, None))
+        native_catalog(openai=[_catalog_model("openai", _MODEL)])
         unpriced = provider_metadata.cost_from_usage(
             _MODEL,
             prompt_tokens=0,
@@ -114,6 +177,7 @@ class TestCostFromUsage:
             input_price_per_token=None,
             output_price_per_token=None,
             price_source=None,
+            provider_type="openai",
         )
         assert unpriced.raw_cost == Decimal("0")
         assert unpriced.pricing_status == "unpriced"
@@ -126,28 +190,28 @@ class TestCountTokens:
     def test_text_positive(self):
         assert provider_metadata.count_tokens(_MODEL, text="hello world") > 0
 
-    def test_catalog_prices_are_scoped_to_resolved_provider_type(self, monkeypatch):
-        monkeypatch.setattr(provider_metadata, "_catalog", lambda: {
-            "anthropic/shared-model": {
-                "litellm_provider": "anthropic", "input_cost_per_token": "0.000009",
-                "output_cost_per_token": "0.000009",
-            },
-            "bedrock/shared-model": {
-                "litellm_provider": "bedrock", "input_cost_per_token": "0.000001",
-                "output_cost_per_token": "0.000002",
-            },
-        })
+    def test_catalog_prices_are_scoped_to_resolved_provider_type(self, native_catalog):
+        native_catalog(
+            anthropic=[_catalog_model("anthropic", "shared-model", {"input": "9", "output": "9"})],
+            gemini=[_catalog_model("gemini", "shared-model", {"input": "1", "output": "2"})],
+        )
         cost = provider_metadata.cost_from_usage(
             "shared-model", prompt_tokens=1, completion_tokens=1,
             input_price_per_token=None, output_price_per_token=None,
-            price_source=None, provider_type="bedrock",
+            price_source=None, provider_type="gemini",
         )
         assert cost.raw_cost == Decimal("0.0000030000")
         assert cost.pricing_status == "priced"
+        assert cost.pricing_snapshot["input"]["source"] == "native_catalog"
+        assert cost.pricing_snapshot["output"]["source"] == "native_catalog"
+        assert provider_metadata.effective_prices_per_million("shared-model") == (None, None)
 
 
 class TestEffectiveDisplayPrices:
-    def test_unknown_anthropic_id_is_unpriced_not_implicitly_free(self):
+    def test_unknown_anthropic_id_is_unpriced_not_implicitly_free(self, native_catalog):
+        native_catalog(anthropic=[
+            _catalog_model("anthropic", "claude-onboarding", {"input": "29", "output": "31"}),
+        ])
         model = "claude-onboarding-unlisted-2099-01-01"
         assert provider_metadata.effective_prices_per_million(model, "anthropic") == (None, None)
         usage = provider_metadata.cost_from_usage(
@@ -161,53 +225,57 @@ class TestEffectiveDisplayPrices:
         )
         assert usage.pricing_status == "unpriced"
 
-    def test_exact_free_catalog_entry_is_distinct_from_missing_price(self, monkeypatch):
-        monkeypatch.setattr(provider_metadata, "_catalog", lambda: {
-            "anthropic/explicit-free": {
-                "litellm_provider": "anthropic", "input_cost_per_token": 0, "output_cost_per_token": 0,
-            },
-            "anthropic/missing-output": {
-                "litellm_provider": "anthropic", "input_cost_per_token": "0.000002",
-            },
-        })
+    def test_exact_free_catalog_entry_is_distinct_from_missing_price(self, native_catalog):
+        native_catalog(anthropic=[
+            _catalog_model("anthropic", "explicit-free", {"input": "0", "output": "0"}),
+            _catalog_model("anthropic", "missing-output", {"input": "2"}),
+            _catalog_model("anthropic", "missing-input", {"output": "3"}),
+        ])
         assert provider_metadata.effective_prices_per_million("explicit-free", "anthropic") == (0, 0)
         assert provider_metadata.effective_prices_per_million("missing-output", "anthropic") == (Decimal("2"), None)
+        assert provider_metadata.effective_prices_per_million("missing-input", "anthropic") == (None, Decimal("3"))
 
-    def test_reads_bundled_deepseek_price_table_without_network(self):
-        assert provider_metadata.effective_prices_per_million("deepseek-chat", "deepseek") == (
-            Decimal("0.28"),
-            Decimal("0.42"),
-        )
-        assert provider_metadata.effective_prices_per_million("deepseek-reasoner", "deepseek") == (
-            Decimal("0.28"),
-            Decimal("0.42"),
-        )
+    @pytest.mark.parametrize(
+        "provider_type",
+        ["groq", "deepseek", "mistral", "together_ai", "openrouter", "xai", "ollama", "azure", "bedrock", "vertex", "cohere"],
+    )
+    @pytest.mark.parametrize("model", ["deepseek-chat", "deepseek-reasoner"])
+    def test_removed_provider_metadata_and_prices_are_unavailable(self, native_catalog, provider_type, model):
+        native_catalog(openai=[_catalog_model("openai", model, {"input": "7", "output": "11"})])
+        assert provider_metadata.catalog_model_metadata(model, provider_type) == {}
+        assert provider_metadata.native_catalog_entry(model, provider_type) == {}
+        assert provider_metadata.effective_prices_per_million(model, provider_type) == (None, None)
 
-    def test_resolves_canonical_perplexity_agent_prices_without_model_family_fallback(self):
+    def test_resolves_canonical_perplexity_agent_prices_without_model_family_fallback(self, native_catalog):
+        native_catalog(perplexity=[
+            _catalog_model("perplexity", "sonar", {"input": "17", "output": "19"}),
+            _catalog_model("perplexity", "perplexity/sonar", {"input": "3", "output": "13"}),
+            _catalog_model("perplexity", "perplexity/glm-5.3", {"input": "5", "output": "23"}),
+        ])
         assert provider_metadata.effective_prices_per_million("perplexity/perplexity/sonar", "perplexity") == (
-            Decimal("0.250000"),
-            Decimal("2.500000"),
+            Decimal("3"),
+            Decimal("13"),
         )
         assert provider_metadata.effective_prices_per_million("perplexity/perplexity/glm-5.3", "perplexity") == (
-            Decimal("1.400000"),
-            Decimal("4.400000"),
+            Decimal("5"),
+            Decimal("23"),
         )
         assert provider_metadata.effective_prices_per_million("perplexity/perplexity/glm-5.3-unlisted", "perplexity") == (
             None,
             None,
         )
 
-    def test_sonar_agent_and_legacy_api_prices_do_not_alias(self):
+    def test_sonar_agent_and_legacy_api_prices_do_not_alias(self, native_catalog):
+        native_catalog(perplexity=[
+            _catalog_model("perplexity", "sonar", {"input": "17", "output": "19"}),
+            _catalog_model("perplexity", "perplexity/sonar", {"input": "3", "output": "13"}),
+        ])
         assert provider_metadata.effective_prices_per_million(
             "perplexity/sonar", "perplexity", api_base="https://api.perplexity.ai/v1"
-        ) == (Decimal("0.250000"), Decimal("2.500000"))
+        ) == (Decimal("3"), Decimal("13"))
         assert provider_metadata.effective_prices_per_million(
             "perplexity/sonar", "perplexity", api_base="https://api.perplexity.ai"
-        ) == (Decimal("1.000000"), Decimal("1.000000"))
-        assert (
-            provider_metadata.official_price_source("perplexity/sonar", "perplexity", api_base="https://api.perplexity.ai")
-            is None
-        )
+        ) == (Decimal("17"), Decimal("19"))
 
 
 def test_chatgpt_subscription_token_count_matches_bare_model():
@@ -217,14 +285,20 @@ def test_chatgpt_subscription_token_count_matches_bare_model():
     )
 
 
-def test_chatgpt_subscription_missing_static_prices_remains_unpriced(monkeypatch):
-    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {
-        "chatgpt/gpt-5.2-codex": {"litellm_provider": "chatgpt", "mode": "responses"},
-    })
+def test_chatgpt_subscription_missing_static_prices_remains_unpriced(native_catalog):
+    native_catalog(openai=[_catalog_model("openai", "gpt-5.2-codex", {
+        "input": "9", "output": "11", "cache_read": "1", "cache_write": "3",
+        "long_context": {"threshold_tokens": 272000, "input": "18", "output": "22"},
+    })])
 
     assert provider_metadata.effective_prices_per_million(
         "chatgpt/gpt-5.2-codex",
         "chatgpt",
     ) == (None, None)
+    assert provider_metadata.bundled_cache_rates("chatgpt/gpt-5.2-codex", "chatgpt", None) == {
+        "cache_read_price_per_token": None, "cache_read_price_per_token_above_200k": None,
+        "cache_write_price_per_token": None, "cache_write_price_per_token_above_200k": None,
+        "cache_write_1h_price_per_token": None, "cache_write_1h_price_per_token_above_200k": None,
+    }
 
 

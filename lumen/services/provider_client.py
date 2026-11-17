@@ -22,17 +22,13 @@ from lumen.services.provider_errors import (
     Timeout,
     error_for_status,
 )
-from lumen.services.provider_metadata import catalog_model_metadata, direct_provider_route
+from lumen.services.provider_metadata import catalog_model_metadata
 from lumen.services.providers.credentials import ProviderAuthRef, api_model_name, transport_model_name
 from lumen.services.providers.errors import ProviderSubscriptionError
 
 _CONTRACT = "single-attempt-v1"
 _TIMEOUT = httpx.Timeout(90.0, connect=10.0, read=90.0, write=30.0, pool=10.0)
-_PROVIDERS = frozenset({
-    "openai", "anthropic", "gemini", "azure", "bedrock", "vertex", "ollama",
-    "openrouter", "deepseek", "xai", "perplexity", "chatgpt", "mistral", "cohere", "groq", "together",
-})
-_PROVIDER_ALIASES = {"vertex_ai": "vertex", "azure_ai": "azure", "together_ai": "together"}
+_PROVIDERS = frozenset({"openai", "anthropic", "gemini", "perplexity", "chatgpt"})
 _RESERVED = frozenset({
     "api_base", "api_key", "base_url", "custom_llm_provider", "provider_auth",
     "model", "messages", "provider", "stream", "headers", "extra_headers",
@@ -74,7 +70,7 @@ def provider_object(value: Any) -> Any:
 
 
 def provider_once_supported(provider_type: str | None) -> bool:
-    return _PROVIDER_ALIASES.get(provider_type, provider_type) in _PROVIDERS - {"chatgpt"}
+    return provider_type in _PROVIDERS - {"chatgpt"}
 
 
 def direct_openai_stream_completed(stream: Any) -> bool:
@@ -101,11 +97,15 @@ def _anthropic_cached_messages(
     model: str, messages: list[dict], provider_type: str | None, api_base: str | None,
     *, tools: list[dict] | None = None, extra: dict | None = None,
 ) -> list[dict]:
-    if provider_type != "anthropic" or not direct_provider_route(provider_type, api_base):
+    if provider_type != "anthropic":
         return messages
     if _cache_marker_present(messages) or _cache_marker_present(tools) or _cache_marker_present(extra):
         return messages
-    if not catalog_model_metadata(model, provider_type).get("supports_prompt_caching"):
+    override = (extra or {}).get("capabilities_override")
+    enabled = override.get("prompt_caching") if isinstance(override, Mapping) else None
+    if enabled is None:
+        enabled = catalog_model_metadata(model, provider_type, api_base).get("supports_prompt_caching")
+    if enabled is not True:
         return messages
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
@@ -371,7 +371,6 @@ async def _execute(
 
 def _provider(model: str, provider: str | None) -> str:
     selected = provider or model.partition("/")[0]
-    selected = _PROVIDER_ALIASES.get(selected, selected)
     return selected if provider or selected in _PROVIDERS else "openai"
 
 
@@ -379,9 +378,6 @@ def _model(model: str, provider: str) -> str:
     name = api_model_name(transport_model_name(model), provider)
     if provider != "perplexity":
         name = name.removeprefix(f"{provider}/")
-        for alias, canonical in _PROVIDER_ALIASES.items():
-            if canonical == provider:
-                name = name.removeprefix(f"{alias}/")
     return name.removeprefix("responses/")
 
 
@@ -394,6 +390,8 @@ async def _completion(
 ) -> Any:
     provider = _provider(model, custom_llm_provider)
     options = dict(extra or {})
+    # Runtime capability metadata controls local policy, never provider wire options.
+    options.pop("capabilities_override", None)
     collision = _RESERVED.intersection(options)
     if collision:
         raise ValueError("provider_transport_options_reserved")

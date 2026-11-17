@@ -151,6 +151,8 @@ def _require_execution_capability(
 
     capabilities = resolved.get("capabilities") or {}
     allowed_combinations = capabilities.get("allowed_output_combinations")
+    if features.tool_policy.enabled_sandbox_tools and not capabilities.get("function_calling"):
+        raise HTTPException(status_code=422, detail="sandbox_tools_function_calling_required")
     if allowed_combinations and list(features.output_modalities) not in allowed_combinations:
         raise HTTPException(status_code=422, detail="requested chat output combination is not available")
     if features.tool_policy.mode == "none" and (
@@ -203,14 +205,17 @@ _CACHE_PRICE_KEYS = (
     "cache_read_price_per_token_above_200k",
     "cache_write_price_per_token_above_200k",
     "cache_write_1h_price_per_token_above_200k",
+    "input_price_per_token_above_200k",
+    "output_price_per_token_above_200k",
 )
 
 
 def _cache_price_snapshot(route: dict[str, Any]) -> dict[str, Any]:
-    """Freeze resolved direct-provider or manual cache prices and provenance."""
+    """Freeze resolved cache/base tiers and their per-model token threshold."""
     return {
         **{key: str(route[key]) if route.get(key) is not None else None for key in _CACHE_PRICE_KEYS},
         "cache_price_sources": dict(route.get("cache_price_sources") or {}),
+        "long_context_threshold_tokens": route.get("long_context_threshold_tokens", 200_000),
     }
 
 
@@ -321,6 +326,8 @@ def _run_snapshots(
         for price_key, route_key in (
             ("advisor_input_price_per_token", "input_price_per_token"),
             ("advisor_output_price_per_token", "output_price_per_token"),
+            ("advisor_input_price_per_token_above_200k", "input_price_per_token_above_200k"),
+            ("advisor_output_price_per_token_above_200k", "output_price_per_token_above_200k"),
             # Advisor prices use the same resolved manual or direct-provider rates.
             ("advisor_cache_read_price_per_token", "cache_read_price_per_token"),
             ("advisor_cache_write_price_per_token", "cache_write_price_per_token"),
@@ -351,6 +358,7 @@ def _run_snapshots(
         "output_price_per_token": str(resolved["output_price_per_token"]),
         "component_prices": component_prices,
         "advisor_cache_price_sources": dict((advisor_route or {}).get("cache_price_sources") or {}),
+        "advisor_long_context_threshold_tokens": (advisor_route or {}).get("long_context_threshold_tokens", 200_000),
         "price_source": resolved.get("price_source"),
         "price_version": resolved.get("price_version"),
         "provider_name": resolved["provider_name"],
@@ -362,10 +370,19 @@ def _run_snapshots(
     }
     try:
         token_pricing = frozen_token_pricing(resolved)
+        advisor_token_pricing = frozen_token_pricing(advisor_route) if isinstance(advisor_route, dict) else None
         summary_token_pricing = frozen_token_pricing(summary_route) if summary_route is not None else None
         token_rates = token_pricing["token_rates"]
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=422, detail="model token pricing is invalid") from exc
+    pricing_snapshot["token_rates_follow_text"] = token_pricing.get("token_rates_follow_text") is True
+    if token_pricing.get("token_rates_above_200k"):
+        pricing_snapshot["token_rates_above_200k"] = token_pricing["token_rates_above_200k"]
+    if advisor_token_pricing is not None:
+        pricing_snapshot["advisor_token_rates_follow_text"] = advisor_token_pricing.get("token_rates_follow_text") is True
+        for key in ("token_rates", "token_rates_above_200k"):
+            if advisor_token_pricing.get(key):
+                pricing_snapshot[f"advisor_{key}"] = advisor_token_pricing[key]
     if token_rates:
         # Frozen with the run: later model price edits never reprice it.
         pricing_snapshot["token_rates"] = token_rates
@@ -431,9 +448,16 @@ async def _resolve_extension_selection(
         # OAuth connector must not be frozen into such a selection.
         implicit_selection = selected_ids is None
         try:
-            visible = await es.list_for_user(kind, user_id=user_id, project_id=project_id, active_only=True)
+            visible = await es.list_for_user(
+                kind, user_id=user_id, project_id=project_id, active_only=True,
+                # Organization rows are never implicit: resolve the domain only for explicitly selected ids.
+                include_domain=tuple(selected_ids) if selected_ids else False,
+            )
             if selected_ids is None:
-                selected_ids = [item["id"] for item in visible if isinstance(item.get("id"), int)]
+                selected_ids = [
+                    item["id"] for item in visible
+                    if isinstance(item.get("id"), int) and (kind != "mcp" or item.get("implicit_selection", True))
+                ]
             credential_versions = (
                 await es.mcp_credential_versions(selected_ids, user_id=user_id, project_id=project_id)
                 if kind == "mcp"
@@ -995,6 +1019,22 @@ async def _project_agent_quota(project_id: str) -> dict[str, Any]:
         "max_credit_reservation": Decimal(str(row.max_credit_reservation)),
     }
 
+def _freeze_sandbox_tools(features: ChatFeatureOptions) -> list[dict[str, str]]:
+    """Freeze explicitly selected local tools without creating runtime resources."""
+    if not features.tool_policy.enabled_sandbox_tools:
+        return []
+    from lumen.services.checkpointer import chat_checkpointer
+    from lumen.services.sandbox_selection import SandboxSelectionError, freeze_selection
+
+    if get_settings().chat_execution_protocol_version != 2 or not chat_checkpointer.available:
+        raise HTTPException(status_code=503, detail="sandbox_tool_unavailable")
+    try:
+        return freeze_selection(features.tool_policy.enabled_sandbox_tools)
+    except SandboxSelectionError as exc:
+        status = 503 if exc.code == "sandbox_tool_unavailable" else 422
+        raise HTTPException(status_code=status, detail=exc.code) from exc
+
+
 
 def _agent_runtime_prerequisites(execution_mode: str) -> None:
     """`plan`/`code` need protocol v2 + checkpointer; `code` additionally needs an enabled sandbox pool."""
@@ -1077,8 +1117,11 @@ async def prepare_context_input(
             raise HTTPException(status_code=422, detail="temporary chats do not support agents or code workspaces")
         if execution_mode != "chat":
             raise HTTPException(status_code=422, detail="requested chat execution mode is not available")
+    if execution_mode == "code" and features.tool_policy.enabled_sandbox_tools:
+        raise HTTPException(status_code=422, detail="sandbox_code_combination_unsupported")
     if execution_mode != "chat":
         _agent_runtime_prerequisites(execution_mode)
+    sandbox_tools = _freeze_sandbox_tools(features)
 
     conv = None
     if conversation_id is not None:
@@ -1222,6 +1265,7 @@ async def prepare_context_input(
         parts=parts,
     )
     capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
+    capability_snapshot["sandbox_tools"] = sandbox_tools
     credential_authority = credential_authority_snapshot(token_info) if token_info is not None else None
     if credential_authority is not None:
         capability_snapshot["credential_authority"] = credential_authority
@@ -1247,6 +1291,20 @@ async def prepare_context_input(
         project_id=project_id,
         plugin_tool_snapshots=plugin_tool_snapshots,
     )
+    if sandbox_tools:
+        from lumen.services.infrastructure.tool_manifest import load_tool_manifest
+
+        pool = get_settings().runtime_config.pool(sandbox_tools[0]["pool"])
+        selected_names = {item["name"] for item in sandbox_tools}
+        for profile in load_tool_manifest(pool.profile.tool_manifest_file, pool.profile.tool_manifest_sha256):
+            for definition in profile.tools:
+                if definition.name in selected_names:
+                    if any(schema["function"]["name"] == definition.name for schema in tool_schemas):
+                        raise HTTPException(status_code=422, detail="sandbox_tool_name_collision")
+                    tool_schemas.append({"type": "function", "function": {
+                        "name": definition.name, "description": definition.description,
+                        "parameters": definition.input_schema,
+                    }})
     context_plan = _context_plan(
         features,
         extension_selection,

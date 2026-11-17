@@ -417,13 +417,13 @@ async def test_subscription_model_namespace_is_unique_under_concurrent_registrat
 
 
 async def test_second_page_claude_requires_explicit_pricing_before_native_admission(monkeypatch):
-    """Discovery is read-only; explicit registration becomes routable and billable without a flush."""
+    """Compatible discovery is read-only; explicit kind and prices become routable without a flush."""
     import json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from threading import Thread
     from urllib.parse import parse_qs, urlsplit
 
-    from lumen.models.chat_db import ChatUsageLog
+    from lumen.models.chat_db import ChatUsageLog, UserWallet
     from lumen.models.chat_runs import ChatRunProvider
 
     nonce = uuid.uuid4().hex
@@ -459,6 +459,13 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
         monkeypatch.setattr("lumen.auth.validate_token", validate_admin)
         admin_headers = {"X-Auth-Token": "onboarding-admin-token"}
         requested_pages: list[str | None] = []
+        provider_calls: list[str] = []
+
+        async def forbid_provider_io(**kwargs):
+            provider_calls.append(kwargs["model"])
+            raise AssertionError("Admission must not perform provider I/O")
+
+        monkeypatch.setattr(graph.provider_client, "acompletion_stream", forbid_provider_io)
 
         class FakeClaudeCatalog(BaseHTTPRequestHandler):
             def log_message(self, format: str, *args: object) -> None:
@@ -534,8 +541,17 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             assert catalog["source"] == "api" and catalog["live_status"] == "success"
             assert catalog["complete"] is True and catalog["error"] is None
             assert catalog["models"] == ["claude-sonnet-4-6", model_name, unpriced_name]
+            assert catalog["provider_family"] == "compatible"
+            assert catalog["requires_manual_pricing"] is True
+            assert catalog["catalog_version"] is None
             candidate = next(item for item in catalog["candidates"] if item["id"] == model_name)
-            assert candidate["display_name"] == "Unlisted Claude" and candidate["purpose"] == "chat"
+            assert candidate["display_name"] == "Unlisted Claude"
+            assert candidate["provider_family"] == "compatible"
+            assert candidate["purpose"] == "unknown" and candidate["model_kind"] is None
+            assert candidate["requires_manual_pricing"] is True
+            assert candidate["catalog_entry"] is None
+            assert candidate["token_pricing"] is None
+            assert candidate["capabilities"] is None
             assert requested_pages == [None, "claude-sonnet-4-6"]
             async with factory() as session:
                 count = await session.scalar(select(func.count(LlmModel.id)).where(LlmModel.provider_id == provider_id))
@@ -544,15 +560,24 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             unpriced = await client.post(
                 "/v1/admin/models",
                 headers=admin_headers,
-                json={"provider_id": provider_id, "model_name": unpriced_name},
+                json={"provider_id": provider_id, "model_name": unpriced_name, "model_kind": "text"},
             )
-            assert unpriced.status_code == 201, unpriced.text
+            assert unpriced.status_code == 400, unpriced.text
+            assert unpriced.json()["detail"].startswith("compatible_model_prices_required:")
+            async with factory() as session:
+                unpriced_count = await session.scalar(
+                    select(func.count(LlmModel.id)).where(
+                        LlmModel.provider_id == provider_id, LlmModel.model_name == unpriced_name
+                    )
+                )
+            assert unpriced_count == 0, "Rejected compatible registration must not persist a model"
             registered = await client.post(
                 "/v1/admin/models",
                 headers=admin_headers,
                 json={
                     "provider_id": provider_id,
                     "model_name": model_name,
+                    "model_kind": "text",
                     "input_price_per_million": "2",
                     "output_price_per_million": "4",
                 },
@@ -562,18 +587,18 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             assert model["provider_id"] == provider_id
             assert model["api_model_name"] == model_name and model["api_provider"] == "anthropic"
             assert model["price_source"] == "manual"
+            assert model["provider_family"] == "compatible"
+            assert model["model_kind"] == "text"
             assert model["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is True
 
             active = await client.get("/v1/admin/models?active_only=true", headers=admin_headers)
             assert active.status_code == 200, active.text
             assert any(item["id"] == model["id"] for item in active.json())
-            unpriced_projection = next(item for item in active.json() if item["id"] == unpriced.json()["id"])
-            assert unpriced_projection["effective_price_source"] == "unpriced", unpriced_projection
-            assert unpriced_projection["effective_input_price_per_million"] is None
-            assert unpriced_projection["effective_output_price_per_million"] is None
+            assert not any(item["model_name"] == unpriced_name for item in active.json())
             public = await client.get("/v1/models", headers=key_headers)
             assert public.status_code == 200, public.text
             assert "anthropic" in next(item for item in public.json()["data"] if item["id"] == model_name)["providers"]
+            assert not any(item["id"] == unpriced_name for item in public.json()["data"])
 
             def native_request(selected_model: str, text: str, *, search: bool = False) -> dict:
                 return {
@@ -591,10 +616,10 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             denied = await client.post(
                 "/v1/temp-completions",
                 headers={**key_headers, "Idempotency-Key": str(uuid.uuid4())},
-                json=native_request(unpriced_name, "no price must deny"),
+                json=native_request(unpriced_name, "unregistered model must deny"),
             )
-            assert denied.status_code == 422, denied.text
-            assert "text (pricing_unavailable)" in denied.json()["detail"]
+            assert denied.status_code == 400, denied.text
+            assert denied.json()["detail"] == f"허용되지 않은 모델입니다: {unpriced_name}"
 
             advanced = await client.post(
                 "/v1/temp-completions",
@@ -606,6 +631,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             assert before_denial == after_denial == 0
             assert advanced.status_code == 422, advanced.text
             assert "web_search" in advanced.json()["detail"]
+            assert provider_calls == []
 
             admitted = await client.post(
                 "/v1/temp-completions",
@@ -624,10 +650,18 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                 assert Decimal(run.pricing_snapshot["input_price_per_token"]) == Decimal("0.000002")
                 assert Decimal(run.pricing_snapshot["output_price_per_token"]) == Decimal("0.000004")
                 admitted_pricing = dict(run.pricing_snapshot)
+                expected_credited = (
+                    Decimal("0.0000400000")
+                    * Decimal(admitted_pricing["margin_multiplier"])
+                    * Decimal(admitted_pricing["chat_credit_per_usd"])
+                ).quantize(Decimal("0.00000001"))
+                assert expected_credited > 0
+            assert provider_calls == []
 
             async def fake_stream(**kwargs):
                 assert kwargs["model"] == model_name
                 assert kwargs["custom_llm_provider"] == "anthropic"
+                provider_calls.append(kwargs["model"])
 
                 async def chunks():
                     yield SimpleNamespace(
@@ -647,19 +681,33 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             assert await execution.execute_queued_run(
                 run_id, owner=worker_identity, registration_id=registration_id
             ) is True
+            assert provider_calls == [model_name]
             async with factory() as session:
                 stored = await session.get(ChatRun, run_id)
                 ledger = (await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))).scalar_one()
+                wallet = await session.get(UserWallet, user_id)
                 assert stored.status == "completed"
+                assert stored.pricing_snapshot == admitted_pricing
                 assert ledger.provider == f"onboarding-provider-{nonce}"
                 assert (ledger.prompt_tokens, ledger.completion_tokens) == (10, 5)
                 assert ledger.raw_cost == Decimal("0.0000400000")
+                assert ledger.credited_cost == expected_credited
                 assert ledger.pricing_status == "priced"
+                assert ledger.model_name == model_name
+                assert ledger.provider_id == provider_id
+                assert ledger.source == "api" and ledger.api_key_id == key["id"]
+                for field in ("input_price_per_token", "output_price_per_token", "price_source"):
+                    assert ledger.pricing_snapshot[field] == admitted_pricing[field]
+                settled_pricing = dict(ledger.pricing_snapshot)
+                assert wallet is not None
+                assert wallet.used_quota_this_month == expected_credited
+                assert wallet.balance_credits == wallet.reserved_credits == Decimal("0")
             usage = await client.get("/v1/usage/records", headers=key_headers)
             assert usage.status_code == 200, usage.text
             record = next(item for item in usage.json()["records"] if item["run_id"] == run_id)
             assert record["source"] == "api" and record["api_key_id"] == key["id"]
             assert record["total_tokens"] == 15
+            assert Decimal(str(record["credited_cost"])) == expected_credited
 
             repriced = await client.patch(
                 f"/v1/admin/models/{model['id']}",
@@ -667,13 +715,21 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                 json={"input_price_per_million": "6", "output_price_per_million": "8"},
             )
             assert repriced.status_code == 200, repriced.text
+            assert Decimal(str(repriced.json()["effective_input_price_per_million"])) == Decimal("6")
+            assert Decimal(str(repriced.json()["effective_output_price_per_million"])) == Decimal("8")
             async with factory() as session:
                 unchanged_run = await session.get(ChatRun, run_id)
                 unchanged_ledger = (
                     await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))
                 ).scalar_one()
+                unchanged_wallet = await session.get(UserWallet, user_id)
                 assert unchanged_run.pricing_snapshot == admitted_pricing
                 assert unchanged_ledger.raw_cost == Decimal("0.0000400000")
+                assert unchanged_ledger.credited_cost == expected_credited
+                assert unchanged_ledger.pricing_snapshot == settled_pricing
+                assert unchanged_wallet is not None
+                assert unchanged_wallet.used_quota_this_month == expected_credited
+                assert unchanged_wallet.balance_credits == unchanged_wallet.reserved_credits == Decimal("0")
     finally:
         if fake_provider is not None:
             fake_provider.shutdown()

@@ -63,6 +63,7 @@ from lumen.models.chat_runs import (
     ChatTempThread,
     ChatToolApproval,
 )
+from lumen.models.stateless_reservations import StatelessCallReservation
 
 __all__ = [
     "LlmProvider",
@@ -77,6 +78,7 @@ __all__ = [
     "ChatUsageLog",
     "ChatProviderUsage",
     "ChatQuotaPolicy",
+    "StatelessCallReservation",
     "UserWallet",
     "ChatMcpServer",
     "ChatMcpActivation",

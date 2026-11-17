@@ -38,6 +38,52 @@ class SecretRef(_Frozen):
         return self
 
 
+
+class ControllerSecretRef(_Frozen):
+    """Dedicated Drover password file, never an environment or guest reference."""
+
+    file: str = Field(pattern=r"^/etc/lumen/controller/drover/[A-Za-z0-9_./-]+$", max_length=1024)
+
+    @model_validator(mode="after")
+    def protected_path(self) -> ControllerSecretRef:
+        if any(part in {"", ".", ".."} for part in self.file.removeprefix(
+                "/etc/lumen/controller/drover/").split("/")):
+            raise ValueError("Drover password requires a canonical controller-only file")
+        return self
+
+
+class DroverSandboxCredentialSource(_Frozen):
+    """Renewable least-privilege credentials for one explicitly selected existing cluster."""
+
+    endpoint: str = Field(max_length=2048)
+    auth_url: str = Field(max_length=2048)
+    user_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,189}$")
+    project_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,189}$")
+    password: ControllerSecretRef
+    ca_file: str = Field(pattern=r"^/etc/lumen/controller/drover/[A-Za-z0-9_./-]+$", max_length=1024)
+    cluster_id: str = Field(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+    namespace_uid: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{0,127}$")
+    service_account: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
+    request_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    refresh_margin_seconds: int = Field(default=60, ge=30, le=120)
+
+    @model_validator(mode="after")
+    def scoped_identity(self) -> DroverSandboxCredentialSource:
+        for value, paths in ((self.endpoint, {"", "/", "/v1", "/v1/"}),
+                             (self.auth_url, {"/v3", "/v3/"})):
+            url = urlsplit(value)
+            if (url.scheme != "https" or not url.hostname or url.username or url.password
+                    or url.path not in paths or url.query or url.fragment or "\\" in value
+                    or any(char.isspace() or ord(char) < 32 for char in value)
+                    or (url.port is not None and not 1 <= url.port <= 65535)):
+                raise ValueError("Drover endpoints require explicit clean HTTPS URLs")
+        if any(part in {"", ".", ".."} for part in self.ca_file.removeprefix(
+                "/etc/lumen/controller/drover/").split("/")):
+            raise ValueError("Drover CA requires a canonical controller-only file")
+        if self.password.file == self.ca_file:
+            raise ValueError("Drover password and CA must use separate files")
+        return self
+
 class RenewalPolicy(_Frozen):
     """Trusted leaf rotation; resource lifetime is a separate drain trigger."""
 
@@ -159,7 +205,8 @@ class KubernetesClusterProfile(_Frozen):
     id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
     server: str = Field(max_length=2048)
     ca_file: str = Field(pattern=r"^/", max_length=1024)
-    bearer_token: SecretRef
+    bearer_token: SecretRef | None = None
+    drover: DroverSandboxCredentialSource | None = None
     namespace: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
     runtime_class_name: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
     runtime_class_handler: str = Field(pattern=r"^(?:runsc|kata(?:-[a-z0-9]+)*)$", max_length=63)
@@ -169,6 +216,8 @@ class KubernetesClusterProfile(_Frozen):
 
     @model_validator(mode="after")
     def explicit_endpoint(self) -> KubernetesClusterProfile:
+        if (self.bearer_token is None) == (self.drover is None):
+            raise ValueError("Kubernetes cluster requires exactly one credential source")
         url = urlsplit(self.server)
         if (url.scheme != "https" or not url.hostname or url.username or url.password
                 or url.path not in {"", "/"} or url.query or url.fragment
@@ -552,7 +601,7 @@ class RuntimeConfig(_Frozen):
                 for profile in self.cloud_profiles
             ],
             "kubernetes_clusters": [
-                profile.model_dump(mode="json", exclude={"bearer_token", "ca_file", "qualification_file"})
+                profile.model_dump(mode="json", exclude={"bearer_token", "drover", "ca_file", "qualification_file"})
                 for profile in self.kubernetes_clusters
             ],
         }

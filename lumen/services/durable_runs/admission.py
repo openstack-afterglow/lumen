@@ -45,6 +45,26 @@ from .common import (
 from .errors import DurableRunConflict, DurableRunError, DurableRunInputError, DurableRunNotFound
 
 
+def _validate_sandbox_snapshot(
+    request_payload: dict[str, Any], capability_snapshot: dict[str, Any], protocol: int,
+    *, execution_mode: str = "chat",
+) -> None:
+    from lumen.models.chat_contracts import ToolPolicy
+    from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
+
+    try:
+        policy = ToolPolicy.model_validate((request_payload.get("features") or {}).get("tool_policy") or {})
+        if execution_mode == "code" and policy.enabled_sandbox_tools:
+            raise SandboxSelectionError("sandbox_code_combination_unsupported")
+        selected = validate_selection(capability_snapshot.get("sandbox_tools", []))
+        if policy.enabled_sandbox_tools != [item["name"] for item in selected]:
+            raise SandboxSelectionError("sandbox_selection_invalid")
+        if selected and protocol != 2:
+            raise SandboxSelectionError("sandbox_tool_unavailable")
+    except (SandboxSelectionError, ValueError) as exc:
+        raise DurableRunInputError(str(exc)) from exc
+
+
 async def _apply_root_budget(
     session,
     run: ChatRun,
@@ -54,52 +74,69 @@ async def _apply_root_budget(
     quota,
     order,
 ) -> bool:
-    """Freeze explicit root ceilings; a ``code`` root also takes its sandbox intent now.
-
-    Returns True when the run must start in ``waiting_resource`` instead of ``queued``.
-    Ceilings are never inferred from NULL, and the sandbox slot/seconds are reserved
-    against the project caps before the run becomes runnable.
-    """
+    """Freeze root ceilings and reserve selected tools before any worker can claim."""
     from lumen.config import get_settings
     from lumen.services.infrastructure import store as infra_store
+    from lumen.services.sandbox_selection import SandboxSelectionError, selected_pool
 
     from . import budgets
 
+    if execution_mode == "code" and (run.capability_snapshot or {}).get("sandbox_tools"):
+        raise DurableRunInputError("sandbox_code_combination_unsupported")
+    try:
+        pool_name = selected_pool((run.capability_snapshot or {}).get("sandbox_tools", []))
+    except SandboxSelectionError as exc:
+        raise DurableRunInputError(exc.code) from exc
     if agent_budget is None:
         if execution_mode != "chat":
             raise DurableRunInputError("agent_budget is required for plan and code execution modes")
-        return False
-    credit = Decimal(str(agent_budget["credit_ceiling"]))
-    sandbox_seconds = int(agent_budget["sandbox_seconds_ceiling"])
-    wall_time = int(agent_budget["wall_time_seconds"])
-    if credit <= 0 or sandbox_seconds <= 0 or wall_time <= 0:
-        raise DurableRunInputError("agent_budget values must be positive")
-    run.credit_ceiling = credit
-    # Existing descendant ceiling stays a separate, never-wider cap.
-    run.descendant_credit_ceiling = credit if run.descendant_credit_ceiling is None else min(
-        Decimal(str(run.descendant_credit_ceiling)), credit
-    )
-    run.sandbox_seconds_ceiling = sandbox_seconds
-    run.wall_time_seconds = wall_time
-    run.deadline_at = _now() + timedelta(seconds=wall_time)
-    if execution_mode != "code":
-        return False
+        if pool_name is None:
+            return False
+    else:
+        credit = Decimal(str(agent_budget["credit_ceiling"]))
+        sandbox_seconds = int(agent_budget["sandbox_seconds_ceiling"])
+        wall_time = int(agent_budget["wall_time_seconds"])
+        if credit <= 0 or sandbox_seconds <= 0 or wall_time <= 0:
+            raise DurableRunInputError("agent_budget values must be positive")
+        run.credit_ceiling = credit
+        run.descendant_credit_ceiling = credit if run.descendant_credit_ceiling is None else min(
+            Decimal(str(run.descendant_credit_ceiling)), credit
+        )
+        run.sandbox_seconds_ceiling = sandbox_seconds
+        run.wall_time_seconds = wall_time
+        run.deadline_at = _now() + timedelta(seconds=wall_time)
+        if execution_mode != "code" and pool_name is None:
+            return False
+    config = get_settings().runtime_config
+    seconds = run.sandbox_seconds_ceiling
+    if pool_name is not None:
+        pool_limit = config.pool(pool_name).max_lifetime_seconds
+        if agent_budget is None:
+            seconds = min(1800, pool_limit)
+        else:
+            # The ceiling covers the entire lineage, not just the root Pod.
+            # Reserve at most half (capped at five minutes) for root tools.
+            seconds = min(300, max(1, int(seconds) // 2), pool_limit, run.wall_time_seconds)
+    deadline = _now() + timedelta(seconds=seconds)
+    if run.deadline_at is not None:
+        deadline = min(deadline, run.deadline_at)
     try:
         await budgets.reserve(session, quota=quota, root=run, run_id=run.id, kind="sandbox_slot", amount=1, order=order)
         await budgets.reserve(
-            session, quota=quota, root=run, run_id=run.id, kind="sandbox_seconds", amount=sandbox_seconds, order=order
+            session, quota=quota, root=run, run_id=run.id, kind="sandbox_seconds", amount=seconds,
+            order=order, allow_unbudgeted_chat=agent_budget is None,
         )
-        await infra_store.assign_sandbox(
-            session,
-            run=run,
-            config=get_settings().runtime_config,
-            deadline_at=_now() + timedelta(seconds=min(sandbox_seconds, wall_time)),
-            order=order,
+        resource = await infra_store.assign_sandbox(
+            session, run=run, config=config, deadline_at=deadline, order=order, pool_name=pool_name,
         )
+        if pool_name is not None:
+            pool = config.pool(pool_name)
+            if resource.image_ref != pool.image or resource.policy_digest != pool.digest():
+                raise DurableRunInputError("sandbox_configuration_changed")
     except budgets.BudgetExceeded as exc:
-        raise DurableRunInputError(str(exc)) from exc
+        raise DurableRunInputError(exc.code) from exc
     except infra_store.ResourceUnavailable as exc:
-        raise DurableRunInputError(f"sandbox is unavailable ({exc.code})") from exc
+        raise DurableRunInputError(exc.code) from exc
     return True
 
 
@@ -383,6 +420,9 @@ async def create_persistent_run(
     except ValueError as exc:
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
+    _validate_sandbox_snapshot(
+        request_payload, capability_snapshot, execution_protocol_version, execution_mode=execution_mode,
+    )
     request_payload = {
         **request_payload,
         "client_timezone": client_timezone,
@@ -407,7 +447,7 @@ async def create_persistent_run(
 
         order = budgets.LockOrder()
         quota = None
-        if agent_budget is not None or execution_mode != "chat":
+        if agent_budget is not None or execution_mode != "chat" or capability_snapshot.get("sandbox_tools"):
             quota = await budgets.lock_project_quota(session, project_id, order=order)
         order.take("conversation")
         conversation = (
@@ -584,6 +624,9 @@ async def create_run(
     except ValueError as exc:
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
+    _validate_sandbox_snapshot(
+        request_payload, capability_snapshot, execution_protocol_version, execution_mode=execution_mode,
+    )
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
     request_payload["required_scopes"] = list(native_run_scopes({
         **request_payload, "execution_mode": execution_mode,
@@ -604,7 +647,7 @@ async def create_run(
 
         order = budgets.LockOrder()
         quota = None
-        if agent_budget is not None or execution_mode != "chat":
+        if agent_budget is not None or execution_mode != "chat" or capability_snapshot.get("sandbox_tools"):
             quota = await budgets.lock_project_quota(session, project_id, order=order)
         order.take("conversation")
         conv = None
@@ -782,6 +825,7 @@ async def create_temp_run(
     except ValueError as exc:
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
+    _validate_sandbox_snapshot(request_payload, capability_snapshot, execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
     request_payload["required_scopes"] = list(native_run_scopes({
         **request_payload, "required_scopes": capability_snapshot.get("required_scopes", ()),
@@ -797,6 +841,13 @@ async def create_temp_run(
     factory = _factory()
     async with factory() as session, session.begin():
         await _read_committed(session)
+        from . import budgets
+
+        order = budgets.LockOrder()
+        quota = None
+        if capability_snapshot.get("sandbox_tools"):
+            quota = await budgets.lock_project_quota(session, project_id, order=order)
+        order.take("conversation")
         existing = (
             await session.execute(
                 select(ChatRun)
@@ -887,6 +938,12 @@ async def create_temp_run(
             project_id=project_id,
         )
         thread.active_run_id = run.id
+        await session.flush()
+        order.take("root")
+        if await _apply_root_budget(
+            session, run, agent_budget=None, execution_mode="chat", quota=quota, order=order,
+        ):
+            run.status = "waiting_resource"
         _add_run_providers(session, run, capability_snapshot)
         await append_event(
             session,
@@ -903,9 +960,10 @@ async def create_temp_run(
                 },
             ),
         )
-        await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+        await append_event(session, run, _event(run, "run.stage.changed", {"stage": run.status}))
         created = descriptor(run)
-    await wake_run(created.run_id)
+    if created.status == "queued":
+        await wake_run(created.run_id)
     return created
 
 

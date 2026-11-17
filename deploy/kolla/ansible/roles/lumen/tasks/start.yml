@@ -1,4 +1,10 @@
 ---
+- name: Start | Require managed scanner readiness before API and worker
+  ansible.builtin.include_tasks: clamav.yml
+  when:
+    - inventory_hostname in groups['lumen']
+    - enable_lumen_clamav | bool
+
 - name: Start | Stat Lumen config file
   become: true
   ansible.builtin.stat:

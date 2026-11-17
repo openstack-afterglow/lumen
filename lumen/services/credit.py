@@ -90,6 +90,14 @@ def _snapshot_price(pricing_snapshot: dict, key: str, *, required: bool) -> Deci
     return price
 
 
+def long_context_threshold_tokens(pricing_snapshot: dict) -> int:
+    """Read the frozen threshold, retaining the legacy tier boundary when absent."""
+    threshold = pricing_snapshot.get("long_context_threshold_tokens", 200_000)
+    if type(threshold) is not int or threshold <= 0:
+        raise ValueError("durable pricing snapshot is invalid")
+    return threshold
+
+
 def usage_cost_from_pricing_snapshot(
     pricing_snapshot: dict,
     *,
@@ -103,10 +111,10 @@ def usage_cost_from_pricing_snapshot(
     ``prompt_tokens`` is total input; the input rate applies to its uncached
     share. A cache category without a frozen rate — including every snapshot
     frozen before cache rates existed — bills 0 and marks the usage partial.
-    Frozen ``token_rates`` bill reported image/audio shares at their own rates
-    and the text rates apply only to the residual. The text input/output keys
-    must be frozen; a ``None`` text rate is allowed only while its residual is
-    zero (media models price only the applicable text directions).
+    Frozen ``token_rates`` bill image/audio shares at their own rates. Catalog
+    buckets marked ``token_rates_follow_text`` retain text's context tier when
+    equivalent; manual rates remain literal. Explicit modality tiers use the
+    same threshold. A ``None`` text rate requires a zero text residual.
 
     ``required_modalities`` describes this actual provider call. An explicit
     empty iterable permits a genuinely text-only segment after media was
@@ -115,6 +123,9 @@ def usage_cost_from_pricing_snapshot(
     try:
         input_price = _snapshot_price(pricing_snapshot, "input_price_per_token", required=True)
         output_price = _snapshot_price(pricing_snapshot, "output_price_per_token", required=True)
+        input_tier = _snapshot_price(pricing_snapshot, "input_price_per_token_above_200k", required=False)
+        output_tier = _snapshot_price(pricing_snapshot, "output_price_per_token_above_200k", required=False)
+        threshold = long_context_threshold_tokens(pricing_snapshot)
         cache_prices = {
             name: (_snapshot_price(pricing_snapshot, key, required=False),
                    _snapshot_price(pricing_snapshot, tier_key, required=False))
@@ -129,6 +140,16 @@ def usage_cost_from_pricing_snapshot(
         max(0, int(completion_tokens)),
     ):
         raise ValueError("usage breakdown totals do not match prompt/completion tokens")
+    base_text_rates = {
+        "input": input_price,
+        "output": output_price,
+        "cache_read": cache_prices["cache_read"][0],
+    }
+    if breakdown.input_tokens > threshold:
+        if input_tier is not None:
+            input_price = input_tier
+        if output_tier is not None:
+            output_price = output_tier
     frozen_required = pricing_snapshot.get("required_token_modalities") or ()
     if not isinstance(frozen_required, (list, tuple)):
         raise ValueError("durable pricing snapshot is invalid")
@@ -136,6 +157,10 @@ def usage_cost_from_pricing_snapshot(
         breakdown,
         pricing_snapshot.get("token_rates"),
         frozen_required if required_modalities is None else required_modalities,
+        base_text_rates=base_text_rates,
+        token_rates_above_200k=pricing_snapshot.get("token_rates_above_200k"),
+        token_rates_follow_text=pricing_snapshot.get("token_rates_follow_text") is True,
+        above_threshold=breakdown.input_tokens > threshold,
     )
     uncached_tokens = text.uncached_input_tokens
     for price, tokens in ((input_price, uncached_tokens), (output_price, text.output_tokens)):
@@ -165,7 +190,7 @@ def usage_cost_from_pricing_snapshot(
         rate, tier_rate = cache_prices[name]
         source = sources.get(name, "manual")
         # Frozen tiers exist only for real catalog rates (own or inherited by a fallback write).
-        if breakdown.input_tokens > 200_000 and source != "manual" and tier_rate is not None:
+        if breakdown.input_tokens > threshold and source != "manual" and tier_rate is not None:
             rate = tier_rate
             # A fallback base and its real catalog tier carry separate provenance.
             source = sources.get(f"{name}_above_200k") or source
@@ -283,22 +308,27 @@ def worst_case_token_rates(pricing_snapshot: dict) -> tuple[Decimal, Decimal, De
     inputs: list[Decimal] = []
     outputs: list[Decimal] = []
     categories = 5
+    modalities: set[str] = set()
     try:
-        for key in ("input_price_per_token", *_WORST_CASE_INPUT_KEYS):
+        for key in ("input_price_per_token", "input_price_per_token_above_200k", *_WORST_CASE_INPUT_KEYS):
             if pricing_snapshot.get(key) is not None:
                 inputs.append(Decimal(str(pricing_snapshot[key])))
-        if pricing_snapshot.get("output_price_per_token") is not None:
-            outputs.append(Decimal(str(pricing_snapshot["output_price_per_token"])))
-        token_rates = pricing_snapshot.get("token_rates") or {}
-        if not isinstance(token_rates, dict):
-            raise ValueError("durable pricing snapshot is invalid")
-        for fields in token_rates.values():
-            if not isinstance(fields, dict):
+        for key in ("output_price_per_token", "output_price_per_token_above_200k"):
+            if pricing_snapshot.get(key) is not None:
+                outputs.append(Decimal(str(pricing_snapshot[key])))
+        for rates_key in ("token_rates", "token_rates_above_200k"):
+            token_rates = pricing_snapshot.get(rates_key) or {}
+            if not isinstance(token_rates, dict):
                 raise ValueError("durable pricing snapshot is invalid")
-            categories += 3
-            for key, value in fields.items():
-                rate = Decimal(str(value)) / Decimal("1000000")
-                (outputs if key == "output_per_million" else inputs).append(rate)
+            for modality, fields in token_rates.items():
+                if not isinstance(fields, dict):
+                    raise ValueError("durable pricing snapshot is invalid")
+                if modality not in modalities:
+                    modalities.add(modality)
+                    categories += 3
+                for key, value in fields.items():
+                    rate = Decimal(str(value)) / Decimal("1000000")
+                    (outputs if key == "output_per_million" else inputs).append(rate)
     except (InvalidOperation, TypeError) as exc:
         raise ValueError("durable pricing snapshot is invalid") from exc
     if any(not rate.is_finite() or rate < 0 for rate in (*inputs, *outputs)):
@@ -391,6 +421,7 @@ async def reserve_call_credit_in_transaction(session, *, user_id: str, project_i
     wallet/key gate. No remote I/O runs under this row lock.
     """
     from lumen.models.chat_runs import ChatModelCallReservation, ChatRun
+    from lumen.models.stateless_reservations import StatelessCallReservation
 
     if not bound.is_finite() or bound < 0:
         raise QuotaExceeded("호출 사용 한도가 올바르지 않습니다")
@@ -407,7 +438,12 @@ async def reserve_call_credit_in_transaction(session, *, user_id: str, project_i
         ChatRun, ChatRun.id == ChatModelCallReservation.run_id).where(
         ChatRun.user_id == user_id, ChatModelCallReservation.status.in_(("reserved", "unknown"))
     )
+    stateless_held = select(func.coalesce(func.sum(StatelessCallReservation.bound_credits), Decimal("0"))).where(
+        StatelessCallReservation.user_id == user_id,
+        StatelessCallReservation.status.in_(("reserved", "unknown")),
+    )
     pending = Decimal(str((await session.execute(held)).scalar_one()))
+    pending += Decimal(str((await session.execute(stateless_held)).scalar_one()))
     system = await quota_policy.get_system_quota(session, user_id)
     if system.monthly > 0 and wallet.used_quota_this_month + pending + bound > system.monthly:
         raise QuotaExceeded("월 사용 한도를 초과했습니다")
@@ -422,6 +458,9 @@ async def reserve_call_credit_in_transaction(session, *, user_id: str, project_i
             raise ChatStorageUnavailable("chat DB 오류")
         held_key = held.where(ChatRun.api_key_id == api_key_id)
         key_pending = Decimal(str((await session.execute(held_key)).scalar_one()))
+        key_pending += Decimal(str((await session.execute(
+            stateless_held.where(StatelessCallReservation.api_key_id == api_key_id)
+        )).scalar_one()))
         monthly = calculate_effective_limit(key.owner_monthly_credit_limit,
                                             key.admin_monthly_credit_limit, system.monthly)
         if monthly is not None:

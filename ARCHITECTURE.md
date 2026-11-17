@@ -6,10 +6,34 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: `0.6.15` was published on annotated tag `0.6.15` at dev merge `9f2d4e5431f00583f4053c7c8b7d4e5fc22435de` and deployed on all three production API/worker controllers on 2026-11-13 KST. Package/runtime/lock/Kolla image default are `0.6.15`; SDK `0.2.1`, plugin API/default plugins `0.1.1`, database plugin `0.1.2`, sandbox and public API `1.0.0` remain independent. No migration was added. Real cloud-tool acceptance and grant reissuance are unverified.
+- 버전: package/runtime/lock/Kolla image default `0.6.17`은 통합 검증 중인 미발행 후보이다. 직전 운영 버전은 `0.6.16`이며 immutable tag와 배포 기록은 CHANGELOG의 해당 절에 보존한다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 새 schema 033과 034는 서비스 전환 전에 적용해야 하며 새 writer와 기존 writer의 혼합 실행을 승인하지 않는다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
+
+### Dashboard MCP and cloud-approval integration
+
+`mcp_domain_authority` resolves exact current project-domain membership and legitimate canonical-Default/direct-domain manager grants through native Keystone. It rejects reduced/API-key management and ignores Afterglow-derived manager projection grants. `ChatMcpServer` gains domain ownership and a scope-keyed uniqueness boundary in migration 033; the unmerged Drover migration 032 is independent and the loader permits the gap. Domain credentials are encrypted, shared only at execution, and absent from member responses. Personal activation, config fingerprint, credential version and current native membership are rechecked before frozen connections run.
+
+`GET /v1/mcp-settings` combines registry entries, personal/global/domain connection states and managed sandbox availability. Personal `/v1/mcp-connections` and exact-domain `/v1/domains/{id}/mcp-connections` reuse the existing OAuth/activation lifecycle. Featured installation uses the admin route and never makes a catalog connection implicitly selected. Playwright and Markitdown require real sandbox manifest/image qualification; their catalog presence does not enable execution.
+
+Protocol-v2 cloud bindings consume the bridge's JSON preview and require human approval for every managed external mutation, even under internal automatic mode. Discovery explains project-bound manage consent and explicit VM parameters without fabricating native identifiers. Protocol v1 intentionally retains its read-only tool set. Isolated encrypted-PostgreSQL approval/recovery checks are local evidence, not production VM acceptance.
+
+The selected sandbox path uses `features.tool_policy.enabled_sandbox_tools` (default `[]`) rather than implicit bindings from every configured manifest. Admission freezes approved names and pool/image/manifest identity before resource holds or provider I/O. A selected run waits for the existing controller-owned resource, reuses that Pod, and releases it through the durable terminal/cancel/expiry lifecycle. Empty selection and history browsing create no resource. Pod disappearance does not prove full resource deletion: exact owned Service/Secret/NetworkPolicy absence must also be confirmed before occupancy is released.
+
+Selected sandboxes have their own `resource.deadline_at`, separate from the run's wall-clock deadline. A budgeted root reserves at most `min(300 s, ceiling/2, pool lifetime, wall time)` so children keep budget. On expiry the controller deletes the Pod with a fenced intent. Only never-started runs (`lease_fence == 0`) fail, and later sandbox calls or new delegations return `sandbox_expired` without reallocation. An already-settled delegation group still replays its joined child results. Code-mode runs with a sandbox-tool selection are refused with 422 `sandbox_code_combination_unsupported` before any hold or provider I/O.
+
+`lumen/services/native_catalog.py` strictly validates the bundled `native_model_catalog.json` for official OpenAI, Anthropic, Gemini and Perplexity routes. Developers update it manually from official pages (procedure in docs). Compatible OpenAI/Anthropic custom endpoints use only administrator model IDs, prices and capability overrides. Stored rates override catalog token and media rates; explicit capability overrides override catalog observations, with conservative defaults otherwise. Admission freezes the effective base, cache and context tiers and the per-model threshold. Legacy `_above_200k` fields remain storage slots, and old snapshots keep their 200000 default. Native discovery annotates authoritative live IDs; subscription modes read the bundled list. Historical models.dev SQL columns stay nullable and are no longer mapped.
+
+OpenAI Decisions is an endpoint capability, not a model kind, because the same model ID is a registered text model. `lumen/models/decision_contracts.py` owns the bounded request contract. `services/decisions.py` resolves an active OpenAI-protocol model with effective `decisions`, rechecks caller authority, resolves the provider credential at transport time, sends once and validates typed answers and usage. `services/stateless_credit.py` owns content-free persistent holds (`chat_stateless_call_reservations`, migration 034) and atomic ledger/wallet settlement. The shared wallet admission counts durable and stateless reserved/unknown holds for user and API-key ceilings.
+
+Kolla optionally manages ClamAV with `enable_lumen_clamav`. The pinned official image uses host networking with clamd bound only to `127.0.0.1:3310`, finite memory/CPU/PID limits and persistent signature storage. Loaded-signature freshness plus PING/VERSION gates API/worker startup. The external-scanner path remains supported. This host-network choice is required by the observed production Docker configuration (`bridge=none`, iptables and forwarding disabled); a Docker bridge recipe is not a qualified production path.
+
+Public chat history reads use `run_store.read_public_activity_events`: authorized final-assistant run IDs are batched, consumed activity types are SQL-filtered with per-run row limits, and only consumed rows are decrypted and strictly validated. `_project_run_activity` is the single formatter for indexed, legacy and temporary reads. Invalid consumed activity yields `activity_status=unavailable` rather than a synthetic empty log. `execution.started_at` and `last_seq` are additive metadata; persistence stays the existing encrypted journal.
+
+Realtime sessions carry an explicit `kind`. Transcription sessions reuse signed-ticket admission, current authority/price checks and durable settlement, with input-only PCM and correlated transcript item events; a committed turn without a terminal item fails the session.
+
+Kubernetes sandbox credentials may come from a controller-only Drover renewal source. Renewal is single-flight with a bounded refresh margin and pins exact identity/TLS/namespace; the provider injects the current bearer per request and drains on shutdown. API and worker hosts receive only digest-pinned public manifests; signing, password and dispatch material stay on the controller host.
 
 ### 0.6.12 cooperative title scheduling stop
 
@@ -560,9 +584,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "64db6078a99dff98a8c3510d8d62c8da4c941c8386cf109119f9328c0ef14b8a",
-  "reviewed_at": "2026-11-17T09:43:32Z",
-  "summary": "0.6.16 embeddings release candidate: contract 6933, SDK 143, integration 519, system 38 passed locally; no live provider call or deployment."
+  "source_sha256": "c9c18c6b2565d97f7ba5ea65ba3bbbdd932b1784277a9062ec4e35ab354ad325",
+  "reviewed_at": "2026-11-17T19:48:20Z",
+  "summary": "0.6.17 candidate: MCP domain connections, selected sandbox lifecycle and credential renewal, managed ClamAV, chat work log, realtime transcription, native provider catalog with compatible APIs, OpenAI Decisions with stateless holds (033+034), controller READ COMMITTED pool locking reviewed"
 }
 ```
 <!-- architecture-review:end -->

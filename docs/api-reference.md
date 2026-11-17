@@ -4,6 +4,23 @@
 
 > **0.6.10 candidate integration — unverified, not deployed.** Account/private-converter/probe/settled-relay contracts below describe the integrated source, not an accepted release. Any dated test, CLI or provider receipt retained here belongs only to its original source/runtime; it does not validate this candidate. No checks were run for this documentation integration.
 
+## MCP registry and organization connections
+
+Service-native paths use `/v1/*`; the Afterglow browser uses `/api/v1/chat/*` through its authenticated BFF.
+
+| Route | Contract |
+| --- | --- |
+| `GET /v1/mcp-settings` | Search/filter/paginate templates and current user's connection states; response includes server-derived `domain_id` and `can_manage_domain`. |
+| `POST /v1/mcp-connections` | Create a personal catalog connection with `{template_id, label?, variables?, auth_mode?, headers?}`; returns `{created, server}`. |
+| `PATCH /v1/mcp-connections/{id}` | Owner changes credentials/publication; changed authority invalidates prior selections. |
+| `DELETE /v1/mcp-connections/{id}` | Delete the caller's personal connection. |
+| `GET /v1/domains/{id}/mcp-connections` | Exact-domain members receive secret-free, paginated connection state. |
+| `POST`, `PATCH`, `DELETE /v1/domains/{id}/mcp-connections[/connection_id]` | Exact-domain managers or unrestricted human system admins manage the organization's connection. |
+| `PATCH /v1/domains/{id}/mcp-connections/{connection_id}/activation` | Member activates only their own view for an exact `config_version`. |
+| `POST /v1/admin/mcp-registry/install-featured` | System-admin idempotent seed of credential-free featured remote templates; never implicitly selected. |
+
+Domain identity and management authority come from current native Keystone, not request-body roles. Reduced credentials and API keys cannot manage organization connections. Organization OAuth stores a shared encrypted domain-owned credential; only managers may start/disconnect it. Ordinary member responses expose presence/status, never headers or tokens. Existing personal/global OAuth endpoints remain in use. Unavailable managed Playwright/Markitdown entries are not remote-server connections.
+
 ## 인증과 scope
 
 Keystone/API key는 fresh enabled owner/project, exact native effective roles와 service-local oslo.policy를 요구한다. Standard project admin/manager/member는 owned resource를 관리하고 reader는 nonsecret read만 한다. Dedicated Lumen grades/leaves와 personal-project marker는 필요하지 않다. Custom/group/domain/inherited 및 retained legacy native implication은 exact standard role에 도달하면 그대로 유효하다. API key는 `X-API-Key`/Bearer로 전송하며 stored scope는 추가 ceiling이다. Compat text/model route는 API-key-only다. Original source/issued-ID, foreign target, ownership와 downstream credential 경계는 policy override와 독립적이다.
@@ -222,7 +239,7 @@ Provider→model ID 순서 잠금과 기존 provider 전체 active-run fence 아
 
 각 행은 `id`(`lumen/<provider_id>/<model_id>` route token), `api_model_name`(공개 model ID), `display_name`, `provider`(`api_provider` 선택자), `provider_name`(표시 이름), `provider_type`(transport), `protocols`(`messages`/`responses`의 부분집합), `usable`, `disabled_reason`, `capabilities`, `input_price_per_million`·`output_price_per_million`(USD/1M token의 정확한 Decimal 문자열 또는 `null`)이다. `capabilities`는 effective capability에서 `context_limit`, `max_output_tokens`, `input_modalities`, `output_modalities`, `function_calling`, `tool_call`, `parallel_function_calling`, `reasoning`, `reasoning_options`, `vision`, `streaming` 중 서버가 가진 key만 그대로 복사하고 없는 값을 만들지 않는다. 카탈로그에 없는 모델의 `function_calling=false`는 LiteLLM probe 결과일 수 있으므로 선택 가능 여부는 `usable`과 `protocols`로 판단한다. API base, credential, 내부 route key는 응답에 없고 credential은 복호화하지 않는다.
 
-API-key route의 공개 catalog는 `messages`/`responses`를 지원하되 custom OpenAI-compatible `api_base`는 native Responses endpoint가 확인되지 않으므로 `['messages']`만 광고한다. OpenAI 공식 direct base(없음 또는 `https://api.openai.com[/v1]`, trailing slash 허용)는 `['messages','responses']`다. 이 보수적 catalog 제한은 기존 `/v1/responses`나 Batch Responses transport를 변경하지 않으며 custom base의 native Responses 호출을 Chat Completions로 강제 변환하거나 retry/probe하지 않는다. Claude 구독(`anthropic_subscription`)은 `['messages']`만 광고하고 ChatGPT device 구독은 두 endpoint 모두 지원하지 않는다. 사용할 수 없는 행은 `usable=false`, `protocols=[]`이고 첫 번째 해당 사유를 `disabled_reason`에 넣는다: `subscription_protocol_unsupported`, `provider_credentials_missing`(API-key route에 configured key도 운영자 지정 API base도 없음, 구독은 저장 token이 없거나 configured 상태가 아니거나 Claude 구독의 알려진 만료 시각이 지남), `pricing_unavailable`(effective input/output 가격 중 하나 없음), `text_unavailable`(effective text gate가 비활성, `streaming=false`, 또는 비어 있지 않은 `input_modalities`/`output_modalities` 목록에 `text`가 없음), `tools_disabled`(저장된 override/models.dev `tool_call`/`function_calling=false`만 해당). Modality 목록이 없거나 `null`/빈 목록이면 unknown 그대로이며 이름으로 종류를 추론하거나 사용 불가로 바꾸지 않는다. Route token은 서버의 role preference가 아니며 migration도 추가하지 않는다.
+API-key route의 공개 catalog는 `messages`/`responses`를 지원하되 custom OpenAI-compatible `api_base`는 native Responses endpoint가 확인되지 않으므로 `['messages']`만 광고한다. OpenAI 공식 direct base(없음 또는 `https://api.openai.com[/v1]`, trailing slash 허용)는 `['messages','responses']`다. 이 보수적 catalog 제한은 기존 `/v1/responses`나 Batch Responses transport를 변경하지 않으며 custom base의 native Responses 호출을 Chat Completions로 강제 변환하거나 retry/probe하지 않는다. Claude 구독(`anthropic_subscription`)은 `['messages']`만 광고하고 ChatGPT device 구독은 두 endpoint 모두 지원하지 않는다. 사용할 수 없는 행은 `usable=false`, `protocols=[]`이고 첫 번째 해당 사유를 `disabled_reason`에 넣는다: `subscription_protocol_unsupported`, `provider_credentials_missing`(API-key route에 configured key도 운영자 지정 API base도 없음, 구독은 저장 token이 없거나 configured 상태가 아니거나 Claude 구독의 알려진 만료 시각이 지남), `pricing_unavailable`(effective input/output 가격 중 하나 없음), `text_unavailable`(effective text gate가 비활성, `streaming=false`, 또는 비어 있지 않은 `input_modalities`/`output_modalities` 목록에 `text`가 없음), `tools_disabled`(관리자 override의 `tool_call`/`function_calling=false`만 해당). Modality 목록이 없거나 `null`/빈 목록이면 unknown 그대로이며 이름으로 종류를 추론하거나 사용 불가로 바꾸지 않는다. Route token은 서버의 role preference가 아니며 migration도 추가하지 않는다.
 
 This published catalog is a secret-free configuration/metadata projection, not credential probing, per-account eligibility or a provider-readiness guarantee. `usable=true` does not bypass the current admission and exact send-time account/credential checks. The private converter replaces runtime LiteLLM without replacing this public schema, exact-token resolution or disabled-reason ordering. Neither catalog presence nor an absent account/probe/relay API permits a legacy-pool fallback.
 
@@ -235,6 +252,8 @@ This published catalog is a secret-free configuration/metadata projection, not c
 `GET /v1/chat/models`의 각 모델은 공개 `api_model_name`/`api_provider`, 운영용 내부 `model_name`, secret 없는 `provider_api_key_configured`, admission과 같은 규칙으로 계산한 `reasoning_none_supported`(명시 `reasoning_effort="none"` 허용 여부)를 반환한다. 클라이언트는 공개 필드만 SDK의 `model`/`provider`로 사용한다. `provider_api_key_configured=true`는 암호화 DB key 또는 `api_key_env`가 가리키는 비어 있지 않은 환경 변수 중 하나가 현재 API process에 있음을 뜻한다. `false`는 Lumen에 명시적 provider API key가 없다는 뜻이며 provider 도달 가능성이나 keyless provider의 실행 가능성까지 판정하지는 않는다.
 
 관리자 `GET /v1/admin/providers` 응답은 `has_api_key`, `api_key_source`(`database`/`environment`/`null`), `api_key_env`, `has_billing_admin_key`를 반환한다. `api_key_env` 이름만 설정하고 실제 환경 변수가 비어 있으면 `has_api_key=false`, `api_key_source=null`이다. `POST /v1/admin/providers`와 `PATCH /v1/admin/providers/{provider_id}`의 선택적 `billing_admin_key`는 direct OpenAI API 또는 Anthropic API provider의 조직 보고서 조회용 별도 관리자 키다. 빈 문자열/`null` PATCH는 기존 관리자 키를 제거한다. Subscription auth, Gemini, Perplexity, custom OpenAI-compatible/Anthropic base에는 이 키를 설정할 수 없다. 평문 key와 암호문은 어떤 응답에도 포함되지 않는다.
+
+관리자 provider 생성·수정은 `provider_type=openai|anthropic|gemini|perplexity`와 기존 `chatgpt` + `auth_mode=chatgpt_device`만 허용한다. 기존 `anthropic_subscription`도 유지한다. 그 외 유형은 HTTP 422 `unsupported_provider_type`과 OpenAI/Anthropic 호환 custom base 등록 안내를 반환한다. `api_provider`는 공개 route selector이며 provider adapter 제한과 별개다. 공식 endpoint와 구독은 `provider_family=native`, OpenAI/Anthropic custom `api_base`는 `provider_family=compatible`이다. Compatible은 API protocol만 지원하며 bundled 모델·가격·capability를 상속하지 않는다.
 
 `OPENAI_API_KEY`/`GEMINI_API_KEY`를 bootstrap/API/worker process에 전달하면 migration 이후 공식 direct provider `openai`/`gemini`가 환경 변수 **이름만** DB에 자동 등록된다. 기존 관리자 DB key가 있으면 DB source가 우선하며 기존 provider·model 설정을 덮어쓰지 않는다. `LUMEN_BOOTSTRAP_MODELS_JSON`은 명시한 지원 model kind와 정확한 가격만 새로 등록한다. 환경 키만으로 media 모델·요율 또는 실제 provider 권한을 추론하지 않는다. 모델이 없는 provider는 API route 선택 대상이 아니다.
 
@@ -249,30 +268,40 @@ Anthropic direct provider의 `provider_usage.token_breakdown`과 모든 provider
 `GET /v1/admin/providers/{provider_id}/available-models`는 Keystone admin만 사용하며 모델·가격·capability를 저장하지 않는다. 응답은 `Cache-Control: no-store`와 다음 필드를 제공한다.
 
 - `provider_id`, `fetched_at`: 요청 provider 및 서버 UTC 조회 시각.
-- `source`: `api`(계정 live 결과), `litellm`(미지원 설정의 정적 참고), `none`.
+- `source`: `api`(계정 live 결과), `catalog`(구독의 bundled native 목록), `none`.
 - `live_status`: `success`, `empty`, `unsupported`, `error`; `complete`는 성공적으로 종료한 live 목록만 참이다.
 - `error`: `null` 또는 `{code, message, retryable}`. Provider key 401은 `discovery_invalid_key`, 권한 403은 `discovery_permission_denied`이며 둘 다 HTTP 200 discovery envelope 안에서 보고한다. Caller 인증/인가 401/403과 구별한다. Store unavailable은 기존 503 계약이며 원문 body/key/URL을 노출하지 않는다.
-- `models`: exact ID 목록; `candidates`: 같은 순서의 `{id, display_name, purpose, generation_methods, input_token_limit, output_token_limit}`. `purpose`는 `chat|non_chat|unknown`이며 metadata 미제공은 null/empty/unknown으로 남긴다.
+- `models`: exact ID 목록; `candidates`: 같은 순서의 `{id, display_name, purpose, generation_methods, input_token_limit, output_token_limit, model_kind}`. `purpose`는 `chat|non_chat|unknown`이다. Native exact match에는 `status`, `token_pricing`, `media_pricing`, `capabilities`, `source_urls`, `verified_at`, `catalog_version`을 추가한다. Provider envelope와 후보 모두 `provider_family`, `requires_manual_pricing`을 제공한다. Compatible은 live ID만 제공하고 `requires_manual_pricing=true`이며 catalog metadata는 null/empty다.
 
 Anthropic은 `GET /v1/models?limit=200&after_id=...`, Gemini는 `GET /v1beta/models?pageSize=200&pageToken=...`, OpenAI-compatible은 `/models`를 사용한다. Gemini의 `models/` resource prefix만 제거하고 opaque ID의 punctuation/case는 보존한다. Subscription credential은 이 live 경로에 전달하지 않는다. Custom `api_base`는 관리자가 지정한 trust boundary이며 redirect/environment proxy는 사용하지 않는다.
 
-한 조회는 20초, 25페이지, 2,000 unique 모델, 누적 5MB identity-encoded response로 제한한다. 정상 200 empty는 fallback 없이 `source=api, live_status=empty, complete=true`다. 중간 페이지 오류, 반복/누락 cursor, malformed ID/body, timeout 또는 한도 초과는 `source=none, live_status=error, complete=false, models=[], candidates=[]`다. 정적 fallback이나 부분 목록을 성공처럼 제공하지 않는다. `unsupported` 정적 참고는 account entitlement의 증거가 아니다.
+한 조회는 20초, 25페이지, 2,000 unique 모델, 누적 5MB identity-encoded response로 제한한다. 정상 200 empty는 fallback 없이 `source=api, live_status=empty, complete=true`다. 중간 페이지 오류, 반복/누락 cursor, malformed ID/body, timeout 또는 한도 초과는 `source=none, live_status=error, complete=false, models=[], candidates=[]`다. 정적 fallback이나 부분 목록을 성공처럼 제공하지 않는다. 구독의 bundled 목록은 account entitlement의 증거가 아니다.
 
-후보 조회 뒤 기존 모델 POST/PATCH로 표시명·정확한 입력/출력 가격·명시 capability override·활성 상태를 저장한다. 정적 레지스트리 밖 ID도 등록할 수 있으나 native text admission에는 실제 가격 쌍이 필요하다. Exact historical catalog entry에 명시된 가격이 없으면 미확인이며0USD로 간주하지 않는다. API가 반환한 context/token limit은 참고값이며 자동으로 vision/tools/reasoning/compaction을 활성화하지 않는다.
+후보 조회 뒤 기존 모델 POST/PATCH로 표시명·정확한 입력/출력 가격·명시 capability override·활성 상태를 저장한다. Compatible 모델은 비활성 생성 때도 관리자 입력·출력 가격을 모두 요구하며, embedding은 입력 가격만 요구한다. 활성화나 활성 상태의 가격 수정도 이 조건을 지켜야 한다(`compatible_model_prices_required`). Provider를 compatible base로 바꾸거나 다시 활성화할 때도 활성 모델의 저장 가격을 검사한다. Native는 등록되지 않은 public ID도 수동 추가할 수 있으나 실행에는 필요한 effective 가격이 있어야 한다. 빈 값은 무료가 아니다. Live context/token limit은 참고값이며 자동으로 capability를 활성화하지 않는다.
+
+## Bundled native model catalog
+
+`GET /v1/admin/models/native-catalog`는 system admin 전용 read-only endpoint다. 선택적 `provider_type=openai|anthropic|gemini|perplexity`로 범위를 제한한다. 응답은 `{schema_version, catalog_version, providers: [{provider_type, display_name, pricing_sources, models: [entry...]}]}`다. Entry는 공식 ID/aliases, kind/status, 공시 가격·capability, `verified_at`, `source_urls`를 포함한다. 네트워크 요청이나 provider/model 저장을 수행하지 않는다. 모델·provider key와 무관한 repository-bundled JSON만 반환한다.
+
+기존 models.dev client·import endpoint·request/response mapping은 제거되었다. Physical nullable `models_dev_*` 열과 과거 schema/migration은 보존하지만 ORM은 해당 열을 읽거나 쓰지 않는다. 기존 `price_source`/`price_metadata`는 저장된 가격의 이력이며 자동 갱신 지시가 아니다.
+
+관리자 모델 read/list 응답은 `provider_family`, `price_origin=manual|native_catalog|null`, `catalog_version`, `catalog_entry={id, status, verified_at, source_urls}|null`을 추가한다. 저장 가격이 우선하며 빈 방향은 official native exact catalog를 따른다. Catalog 가격은 저장하지 않는다. Capability는 관리자 `override`만 우선하며 그 외에는 native exact catalog 또는 conservative default를 사용한다. Compatible은 과거 imported capability를 포함해 catalog metadata를 사용하지 않는다. `capabilities.decisions`도 명시적으로 override할 수 있다.
+
+`prompt_caching`, `structured_output`, `web_search`는 선택적 nullable capability override다. 생략/null은 저장 override에서 제외하며 명시적 false는 보존한다. 기존 vision/reasoning/tool_call/attachment/decisions 등 전체 dict override 의미는 유지한다. Media의 저장 `media_pricing`과 별개로 `effective_media_pricing`을 반환해 공시 catalog fallback과 수동 편집값을 구별한다.
 
 ## 모델 단가와 prompt-cache 단가
 
-관리자 `POST /v1/admin/models`와 `PATCH /v1/admin/models/{model_id}`는 모든 모델 종류에서 `input_price_per_million`/`output_price_per_million`을 독립적인 nullable 단가로 받는다. 기존 text-kind 이미지·음성 모델도 한 방향만 저장할 수 있으며 모델명으로 종류를 추정하지 않는다. PATCH에서 key가 있으면 그 항목을 설정하고 `null`은 해당 수동 단가만 제거하며, key가 없으면 기존 값을 유지한다. 수동 텍스트 단가가 하나라도 남은 text 모델은 `price_source=manual`, 둘 다 없으면 미설정이며, 텍스트 key를 수정할 때 models.dev metadata를 해제한다. 캐시·미디어만 수정하면 텍스트 단가·출처·metadata를 보존한다. 저장 허용과 실행 허용은 별개다. Native text admission은 fallback을 포함한 실제 입력·출력 가격을 모두 요구하고 media admission은 적용 텍스트 방향·모달리티 단가를 검사한다. 빈 값은 무료가 아니고 명시적인 `0`은 보존한다. 기존 nullable 열을 쓰므로 새 migration은 없다.
+관리자 `POST /v1/admin/models`와 `PATCH /v1/admin/models/{model_id}`는 nullable `input_price_per_million`/`output_price_per_million`을 받는다. Native의 기존 text-kind 이미지·음성 모델은 한 방향만 저장할 수 있으며 모델명으로 종류를 추정하지 않는다. PATCH에서 key가 있으면 그 항목을 설정하고 `null`은 해당 수동 단가만 제거하며, key가 없으면 기존 값을 유지한다. 수동 텍스트 단가가 하나라도 남은 text 모델은 `price_source=manual`, 둘 다 없으면 미설정이며, 텍스트 key를 수정할 때 과거 import metadata를 해제한다. 캐시·미디어만 수정하면 텍스트 단가·출처·metadata를 보존한다. Native 모델의 모든 저장 단가를 null로 지우면 공시 catalog 가격을 따른다. Compatible의 필수 단가는 활성 상태에서 지울 수 없으며 비활성 모델은 null로 지운 뒤 가격을 채워야 재활성화할 수 있다. Native text admission은 fallback을 포함한 실제 입력·출력 가격을 모두 요구하고 media admission은 적용 텍스트 방향·모달리티 단가를 검사한다. 빈 값은 무료가 아니고 명시적인 `0`은 보존한다. 기존 nullable 열을 쓰므로 새 migration은 없다.
 
-선택적 `cache_read_price_per_million`, `cache_write_price_per_million`(5분 TTL cache write), `cache_write_1h_price_per_million`도 서로 및 텍스트 단가와 독립이다. 유한한 0 이상 값만 허용하고 저장 정밀도(토큰당 10자리)보다 작은 0 아닌 값은 422/400으로 거부한다. 응답 projection은 per-million Decimal 문자열 또는 `null`로 반환한다. 실행 중인 run이 쓰는 모델의 cache 단가 변경도 다른 가격 변경과 같은 active-run lock(409)을 거친다.
+선택적 `cache_read_price_per_million`, `cache_write_price_per_million`(short-TTL cache write), `cache_write_1h_price_per_million`(long-TTL 호환 field)도 서로 및 텍스트 단가와 독립이다. 유한한 0 이상 값만 허용하고 저장 정밀도(토큰당 10자리)보다 작은 0 아닌 값은 422/400으로 거부한다. 응답 projection은 per-million Decimal 문자열 또는 `null`로 반환한다. 실행 중인 run이 쓰는 모델의 cache 단가 변경도 다른 가격 변경과 같은 active-run lock(409)을 거친다.
 
-모델의 수동 cache 단가는 항상 우선하며 명시적 `0`도 보존한다. 미설정 범주는 **정확한 ID의 LiteLLM bundled 가격이 있는 direct provider**(기본/공식 `api_base`)의 cache-read/5분 write/1시간 write 가격을 사용한다. Custom `api_base`는 catalog 가격을 상속하지 않는다. Text 모델의 5분 write가 이후에도 없으면 effective input 단가, 1시간 write가 없으면 effective 5분 단가를 상속한다. Direct Anthropic의 별도 1시간 가격은 cascade보다 우선한다. Cache-read에는 input fallback이 없으며 미확인 rate는 0 USD와 `pricing_status="partial"`을 기록한다. Media 모델에는 text cache-write cascade를 적용하지 않는다. 비용 = `uncached_input × input + cache_read × cache_read + cache_creation_5m × cache_write + cache_creation_1h × cache_write_1h + output × output`이다. 직접 출처는 `manual`/`litellm`/`null`이고 fallback은 `fallback_input:manual`, `fallback_5m:litellm`, `fallback_5m:fallback_input:manual`처럼 원래 출처를 보존한다. Inherited 1h 고문맥 tier는 실제 catalog 5m tier가 존재할 때만 적용하며 수동 override에는 적용하지 않는다. 새로운 admission만 resolved 가격을 고정하며 기존 durable/advisor/title snapshot의 누락 가격은 재가격하지 않는다. Catalog는 실제 provider invoice가 아니다.
+모델의 수동 cache 단가는 항상 우선하며 명시적 `0`도 보존한다. 미설정 범주는 **정확한 ID의 공식 native catalog 가격이 있는 direct provider**(기본/공식 `api_base`)의 cache-read/write 가격을 사용한다. Custom `api_base`는 catalog 가격을 상속하지 않는다. Text 모델의 기본 write가 이후에도 없으면 effective input 단가, long-write가 없으면 effective 기본 write 단가를 상속한다. Catalog의 별도 long-write 가격은 cascade보다 우선한다. Cache-read에는 input fallback이 없으며 미확인 rate는 기존 partial usage 계약을 따른다. Media 모델에는 text cache-write cascade를 적용하지 않는다. 비용 = `uncached_input × input + cache_read × cache_read + cache_creation_5m × cache_write + cache_creation_1h × cache_write_1h + output × output`이다. 저장 cache field명과 usage field명은 기존 호환 이름이며, 실제 catalog TTL은 `cache_write_ttl`/`cache_write_long_ttl`에 명시한다. 직접 출처는 `manual`/`native_catalog`/`null`이고 fallback 출처는 원래 출처를 보존한다. 새로운 admission만 resolved 가격을 고정하며 기존 durable/advisor/title snapshot의 누락 가격은 재가격하지 않는다. Catalog는 실제 provider invoice가 아니다.
 
 관리자 `ModelResponse`는 `effective_cache_read_price_per_million`, `effective_cache_write_price_per_million`, `effective_cache_write_1h_price_per_million`, `effective_cache_price_sources`를 별도로 반환한다. Effective 값은 일반 문맥의 resolved 단가이며 고문맥 catalog tier는 호출별로 적용된다. 기존 `cache_*_price_per_million`은 저장된 수동값으로서 비어 있으면 계속 null이며 수정 modal prefill에 사용한다. 목록은 effective 값을 표시하고 미확인 null을 무료/0으로 간주하지 않는다.
 
-Direct Gemini/Anthropic exact LiteLLM catalog에 `above_200k_tokens` cache-read/write 가격이 있으면 provider가 보고한 **호출별 총 prompt token이 200,000을 초과할 때** 그 tier를 사용한다(200,000 이하는 기본 tier). 세 cache 종류의 기본/고문맥 가격과 출처를 admission 시 각각 고정하며 이후 catalog 변경은 기존 run에 영향을 주지 않는다. 수동 설정 cache 가격은 고문맥에서도 우선하고 catalog tier를 사용하지 않는다. Advisor는 여러 호출의 prompt를 합산하지 않고 각 호출별 tier를 선택한다. Frozen title job은 저장된 가격만 사용하며 누락된 입력·출력 가격을 public catalog의 동명 모델에서 조회하지 않는다.
+Native exact catalog의 `token_pricing.long_context.threshold_tokens`가 있으면 provider가 보고한 **호출별 총 input token이 해당 threshold를 초과할 때** 공시 long-context tier를 사용한다. 경계 이하에는 기본 tier를 쓴다. 기본/고문맥 가격과 출처를 admission 시 고정하며 이후 catalog 변경은 기존 run에 영향을 주지 않는다. 수동 설정은 고문맥에서도 우선하고 catalog tier를 사용하지 않는다. Advisor는 여러 호출의 prompt를 합산하지 않고 각 호출별 tier를 선택한다. Frozen title job은 저장 snapshot 가격만 사용하며 누락된 입력·출력 가격을 현재 public catalog에서 조회하지 않는다.
 
-Fallback 기본값과 실제 catalog `above_200k` tier가 함께 있는 범주는 tier 출처를 frozen `cache_price_sources`의 `<category>_above_200k`(예: `cache_creation_5m_above_200k: "litellm"`, 상속 1h tier는 `fallback_5m:litellm`)에 따로 고정한다. 200,000 초과 호출의 usage component `source`는 실제로 청구한 tier의 출처를 기록하며 관리자 `effective_cache_price_sources`는 일반 문맥의 세 범주만 반환한다. 이 key가 없는 기존 snapshot은 범주 출처를 그대로 사용한다.
+Fallback 기본값과 실제 catalog 고문맥 tier가 함께 있는 범주는 tier 출처를 frozen `cache_price_sources`의 기존 `<category>_above_200k` 호환 key(예: `cache_creation_5m_above_200k: "native_catalog"`, 상속 long-write tier는 `fallback_5m:native_catalog`)에 따로 고정한다. Key 이름과 무관하게 적용 경계는 모델의 공시 `threshold_tokens`다. Usage component `source`는 실제로 청구한 tier의 출처를 기록하며 관리자 `effective_cache_price_sources`는 일반 문맥의 세 범주만 반환한다. 이 key가 없는 기존 snapshot은 범주 출처를 그대로 사용한다.
 
 Provider-native compaction이 한 응답에 여러 내부 iteration을 합쳐 보고하고 iteration별 5분/1시간 생성 split을 제공하지 않으면, 이 tier 판정은 합산된 보고 입력에 적용된다. 내부 호출별 청구 tier를 복원할 수 없으므로 실제 조직 청구서와 대조해야 한다.
 
@@ -354,7 +383,7 @@ OAuth는 opt-in과 별개다. 승인 후 기존 Keystone-only `POST /v1/mcp-serv
 
 `CompletionRequest`/`TempCompletionRequest`는 text/asset `parts`, `model_id`, `features`, `reasoning_effort`, `skill_ids`, execution 설정을 받는다. 기본값은 보안 계약이다. `features.memory=true`, `tool_policy.mode="agent_default"`이므로 해당 scope가 없는 least-privilege key는 `{"memory": false, "tool_policy": {"mode": "none"}}`을 명시해야 한다. Provider 출력 `max_tokens`는 최대 4096으로 제한된다.
 
-`reasoning_effort`는 `auto`(기본, provider 기본값에 맡기고 파라미터를 보내지 않음), `none`, 또는 모델 `reasoning_options`의 `{"type":"effort","values":[...]}`에 나열된 이름(`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`)이다. `reasoning`이 false인 모델에서 `auto` 외 값은 422다. `none`은 추론을 끄라는 명시 요청이므로 provider 기본값으로 대체하지 않는다. 모델 capability가 끄기를 광고할 때만 허용한다. 즉 effort 목록에 `none`이 있거나(예: gpt-5.1 이상), `toggle` 옵션이 있거나, `budget_tokens`의 `min`이 0이거나(예: gemini-2.5-flash), provider가 thinking이 opt-in인 `anthropic`이어야 한다. 그 외(예: gpt-5는 minimal부터, o3는 low부터, gemini-2.5-pro는 budget 최소 128, capability 미확인·빈 `reasoning_options`)에는 422를 반환한다. models.dev 동기화는 `budget_tokens`의 정수 `min`/`max`를 보존한다. 이전에 저장된 `min` 없는 항목은 재동기화 전까지 끄기 불가로 본다. OpenAI `gpt-5*`에서 도구가 켜진 요청은 추가로 `auto`와 (모델이 지원하면) `none`만 받는다. `GET /v1/chat/models`의 `reasoning_none_supported`는 같은 판정(`capabilities.reasoning_can_be_disabled`)의 결과이므로, client는 규칙을 복제하지 말고 이 값이 true일 때만 `none` 선택지를 노출한다.
+`reasoning_effort`는 `auto`(기본, provider 기본값에 맡기고 파라미터를 보내지 않음), `none`, 또는 모델 `reasoning_options`의 `{"type":"effort","values":[...]}`에 나열된 이름(`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`)이다. `reasoning`이 false인 모델에서 `auto` 외 값은 422다. `none`은 추론을 끄라는 명시 요청이므로 provider 기본값으로 대체하지 않는다. 모델 capability가 끄기를 광고할 때만 허용한다. 즉 effort 목록에 `none`이 있거나, `toggle` 옵션이 있거나, `budget_tokens`의 `min`이 0이거나, provider가 thinking이 opt-in인 `anthropic`이어야 한다. Capability 미확인·빈 `reasoning_options`에는 임의의 model-name 기반 옵션을 추가하지 않는다. 관리자 override가 budget을 지정할 때는 정확한 정수 `min`/`max`를 사용하며 `min` 없는 항목은 끄기 불가로 본다. OpenAI `gpt-5*`에서 도구가 켜진 요청은 추가로 `auto`와 (모델이 지원하면) `none`만 받는다. `GET /v1/chat/models`의 `reasoning_none_supported`는 같은 판정(`capabilities.reasoning_can_be_disabled`)의 결과이므로, client는 규칙을 복제하지 말고 이 값이 true일 때만 `none` 선택지를 노출한다.
 
 ### Plugin binding과 agent/child 실행
 
@@ -386,3 +415,88 @@ Individual cancel은 미시작 run을 취소하지만 이미 provider 결과가 
 
 
 주요 오류는 unauthenticated/invalid key 401, project mismatch 또는 scope denial 403, invalid request 422(Anthropic Messages 계열은 400 `invalid_request_error`), quota 402(native) / 429(compat), idempotency conflict 409, store/config unavailable 503, expired event cursor 410이다. OpenAI route가 생성하는 HTTP 오류는 최상위 `{ "error": { "message": ..., "type": ..., "code": ... } }`, Anthropic route가 생성하는 오류는 최상위 `{ "type": "error", "error": { "type": ..., "message": ... } }` 구조를 사용한다. 인증·admission 경계 오류는 `{ "detail": ... }`일 수 있다. 호환 스트리밍 failure는 in-band SSE error, Native 스트리밍 실패는 `run.failed` 이벤트로 전달된다.
+
+## OpenAI Decisions
+
+- `POST /v1/decisions`: API-key 인증, `compat:completions:write`, 기존 compat host gate. OpenAI wire shape를 사용한다.
+- `POST /v1/chat/decisions`: 세션/BFF 인증 경로, `native:runs:write`. 같은 body를 받고 `cost_usd`, `credited_cost`, `usage_log_id`(immutable usage event UUID)를 추가한다. 기존 native 모델 사용과 같은 scope/현재 principal 검사를 적용한다.
+- `model`은 활성 등록 text 모델 이름이다. OpenAI 프로토콜/API-key provider와 effective `capabilities.decisions=true`가 필요하다. 공식 endpoint와 관리자 custom `api_base` 모두 지원한다. 공식 지원 모델은 현재 `gpt-6-luna`이며, compatible endpoint는 관리자가 capability와 가격을 명시해야 한다. 미등록/비활성 모델 404, ambiguous name 409, capability/protocol/입력 가격 누락 422다.
+
+```json
+{
+  "model": "gpt-6-luna",
+  "input": [
+    {"role": "user", "content": [
+      {"type": "input_text", "text": "Evaluate this order."},
+      {"type": "input_json", "data": {"order": {"damaged": true}}},
+      {"type": "input_image", "image_url": "https://example.test/product.png", "detail": "auto"}
+    ]}
+  ],
+  "questions": [
+    {"type": "predicate", "name": "damaged", "instructions": "Is the product damaged?"},
+    {"type": "choice", "instructions": "Route the request.", "choices": [
+      {"value": "refund", "description": "Refund requests"},
+      {"value": "other", "description": "Other requests"}
+    ]},
+    {"type": "score", "instructions": "Rate severity.", "levels": [
+      {"label": "low"}, {"label": "high"}
+    ]}
+  ],
+  "prompt_cache_options": {"mode": "implicit", "ttl": "30m"}
+}
+```
+
+### 입력 제한
+
+Raw JSON body는 최대 **16 MiB**다(전체 서비스의 더 작은 receive 상한은 그대로 적용). 모델 이름은 등록 column과 같은 190자 이하다. `questions`는 1–400개, 지정된 `name`은 string이며 중복을 거절한다. `choice.choices`는 2–255개이고 `value`는 string 또는 boolean이며 type을 구별해 유일해야 한다. `score.levels`는 2–10개이며 각 항목에 string `label`이 필요하다. `instructions`는 최대 1,048,576자 string 또는 비어 있지 않은 text/image/JSON part 배열이다.
+
+공유 `input`은 최대 10,485,760자 string 또는 최대 131,072개 message/tool item 배열이다. User content는 `input_text`, `input_image`, `input_json`; developer/system은 input text만, assistant는 `output_text`/`refusal`만 받는다. Function/custom call과 text/image output은 앞선 같은 종류 call의 `call_id`와 일치해야 한다. Content part 배열 상한은 16,384개다. Files/file IDs, audio, item references 및 알 수 없는 필드는 거절한다.
+
+Input item은 `type`(생략 시 message)으로 한 번만 분기한다. Decisions 422 응답은 최대 20개 오류의 bounded `type`/`loc`/`msg`만 반환하며 원본 input/body를 echo하지 않는다.
+
+모든 request list(input/message·tool content/instructions/questions/choices/levels/JSON object 배열)는 첫 invalid item에서 validation을 중단한다(`fail_fast=True`). `input_json.data`의 object 배열은 구조 검증 단계에서도 최대 10,000개로 제한하며, nested JSON 값 계산은 child 전체를 별도 배열로 만들지 않는 depth-first iterator를 쓴다. 따라서 bounded 422 rendering 전에 오류 목록을 대량으로 만드는 경로도 차단한다.
+
+Protocol object는 Pydantic의 `extra="forbid"` 오류를 key마다 만들기 전에 첫 unknown key에서 고정 오류 하나로 거절한다. 이 guard는 request/message/part/question 같은 protocol model에만 적용하며 `input_json.data` 내부의 arbitrary key를 제한하지 않는다.
+
+`input_json.data`는 object 또는 object 배열이다. Root를 포함한 container 깊이 32, root/container를 포함한 값 10,000개, compact UTF-8 JSON 256 KiB가 상한이며 NaN/Infinity는 거절한다. Data 내부 `role`, `type`, `image_url` 등은 일반 JSON 값이지 protocol part가 아니다. `input_image.image_url`은 `data:`, `http://`, `https://`로 시작해야 하며 detail은 `low|high|auto|original` 또는 null이다. 공유 input과 질문 instructions 전체 image 합계는 최대 16개다. **Lumen은 image URL을 직접 fetch하지 않는다.** `prompt_cache_key`는 최대 64자, `safety_identifier`는 최대 128자, `prompt_cache_options.ttl`은 `"30m"`만 받는다.
+
+### 응답과 정산
+
+응답은 `{model, answers, usage}`다. `model`은 upstream alias가 아니라 등록 모델 이름이다. `answers`는 질문 순서대로 predicate `{type,name,probability}`, choice `{type,name,choice,confidence,probabilities:[{value,probability}]}`, score `{type,name,score,confidence,probabilities:[{value,label,probability}]}` 또는 refusal `{type:"refusal",name}`다. 지정하지 않은 name은 null이며 score index는 0부터 시작한다.
+
+Usage의 input/output/total과 cached/cache-write/reasoning count는 필수인 유한한 비음수 정수이며 합계/부분집합 관계를 엄격히 검사한다. Output/reasoning은 사용량에 기록하되 **비용은 0**이다. USD 비용은 다음과 같다.
+
+`(input_tokens - cached_tokens - cache_write_tokens) * input_rate + cached_tokens * cache_read_rate + cache_write_tokens * cache_write_30m_rate`
+
+모델의 effective manual/catalog rate를 사용한다. `input_tokens > long_context_threshold_tokens`이고 해당 tier rate가 있을 때 그 rate를 사용한다. 입력 가격이 없으면 upstream 전에 거절한다. Cached/cache-write usage가 보고되었으나 해당 가격이 없으면 502로 fail closed하며 quota hold는 unknown으로 보존한다. 모델의 다른 endpoint output 가격은 Decisions에 적용하지 않는다. Cache write는 기존 ledger의 `cache_creation_5m_input_tokens` 저장 slot에 매핑하지만 pricing snapshot에는 실제 `"30m"` TTL을 명시한다.
+
+다른 chat endpoint의 `fallback_input:*` 등 추정 cache 가격은 Decisions의 공시/수동 가격으로 인정하지 않는다. 검증된 usage와 가격은 answer 형식 검사보다 먼저 정산한다. 따라서 answer만 잘못된 응답은 502여도 실제 비용 원장/settled hold를 유지하며 full-bound unknown으로 남기지 않는다. 공식 schema의 빈 probability 배열과 반올림된 분포를 허용하고 probability 합계의 임의 허용오차로 거절하지 않는다.
+
+MariaDB wallet lock과 READ COMMITTED transaction 안에서 upper-bound credit hold를 먼저 등록한다. User 월·주간 한도와 API-key 월·주간 한도 모두 durable + stateless active hold를 합산한다. 정산은 hold→settled와 immutable usage/wallet debit을 같은 transaction에서 적용하고 event UUID로 정확히 한 번 debit한다. Usage component category/kind는 `decision`이며 counts/cost만 남기고 prompt/JSON/image URL/question/answer content는 저장하지 않는다.
+
+Upper bound는 전체 text/JSON/tool/choice wire skeleton의 **UTF-8 byte 수 + 4,096 framing tokens + image당 1,000,000 tokens**다. Byte-level tokenizer는 UTF-8 byte 수보다 많은 토큰을 만들지 않으므로 같은 큰 body를 다시 tokenize하지 않는다. 전체 상한은 32,000,000 tokens이고 cache-write/long-context를 포함한 가장 높은 effective input rate로 예약한다. [공식 vision 규칙](https://developers.openai.com/api/docs/guides/images-vision#calculating-costs)은 patch limit 30,000과 모델별 multiplier를 설명하지만 현재 표에는 `gpt-6-luna` profile/multiplier가 없다. 따라서 image당 1,000,000은 공식 견적이 아닌 보수적인 **로컬 admission ceiling**이다. 실제 usage가 입장 시 token ceiling을 넘으면 502 및 unknown hold로 처리한다.
+
+Upstream은 `{api_base or https://api.openai.com/v1}/decisions`에 single attempt로 전송하며 redirects/environment proxies/retries를 쓰지 않는다. 전체 120초, connect 10초, write 30초, response 8 MiB 상한이다. 명확한 connection-before-send 실패와 provider rejection은 hold를 release한다. Send 이후 timeout/cancel/불명확한 응답/정산 실패는 `unknown`, process crash는 `reserved`를 유지한다. **두 상태는 시간이 지나도 quota에서 제외하지 않는다.** 자동 재전송/자동 만료/자동 재정산은 없다.
+
+Durable provider 경계와 같은 명확한 rejection status(400/401/403/404/413/415/422/429)만 hold를 release한다. 그 외 non-200 응답(redirect, 다른 success status, 408/409/499 등)은 unknown이다. Cleanup DB failure는 event UUID로 기록하며 원래의 API 오류를 raw 500으로 바꾸지 않는다.
+
+공식 OpenAI root(`https://api.openai.com` 및 trailing slash 포함)는 기존 direct-provider base 판별을 재사용해 `/v1/decisions`로 정규화한다. 공식 `/v1` base와 미지정 base도 같은 URL을 쓴다. Third-party custom root/prefix에는 `/v1`을 임의로 추가하지 않고 저장된 prefix 뒤 `/decisions`만 붙인다.
+
+Fresh provider credential 조회는 dispatch 경계보다 먼저 수행한다. 해당 DB 조회의 cancellation/storage failure는 provider I/O가 없으므로 hold를 release한다. 실제 HTTP dispatch 직전에만 possible-send 상태로 바뀌며 이후 cancellation은 unknown hold로 남는다.
+
+운영자는 unknown/crashed reservation의 event UUID와 provider의 사용 증거를 대조한 뒤 유지·정산·release disposition을 검토해야 한다. 이 변경은 operator disposition API/CLI를 추가하지 않는다. 승인된 유지보수에서만 내부 서비스의 `stateless_credit.settle`(동일 event, 검증된 usage) 또는 **definite-no-charge 확인 뒤** `stateless_credit.finish(event_id, uncertain=False)`를 명시적으로 사용한다. 불명확한 hold를 삭제하거나 clock/TTL로 quota를 복원하면 안 된다. Settled/released row는 감사 보존 정책에 따라, immutable usage event와의 연결을 보존한 별도 유지보수에서만 정리한다.
+
+Migration **034**를 적용한 뒤 새 writer를 시작한다(동시 pending migration 033과 함께 사전 적용). Additive table이므로 old writer는 무시하지만 old writer는 stateless hold를 quota에 반영하지 않는다. 따라서 새 Decisions admission을 연 상태에서 quota를 공유하는 old/new writer를 혼용하지 않는다. Rollback은 새 admission 정지·in-flight drain 뒤 code rollback이며 hold table/ledger를 drop하지 않는다.
+
+공식 계약: [create reference](https://developers.openai.com/api/reference/resources/decisions/methods/create), [Decisions guide](https://developers.openai.com/api/docs/guides/decisions). 위 검증/transport/SQL 테스트는 source/local/synthetic 증거이며 production 또는 유료 provider 검증이 아니다.
+
+## Catalog-backed embedding dimensions
+
+Embedding model responses expose an `embedding` object with published default, caller
+selection support, minimum/maximum and optional exhaustive `allowed_dimensions` list.
+`effective_capabilities.embedding` reflects explicit administrator override before native
+catalog data; compatible routes accept only the override. `GET /v1/capabilities` for an
+embedding model exposes the same `default_dimensions`, `supports_dimensions`,
+`min_dimensions`, `max_dimensions` and `allowed_dimensions` values for Studio controls.
+Unknown metadata allows the provider default but rejects an explicit dimension request.
+Requests outside a published range or exhaustive list fail before provider I/O.

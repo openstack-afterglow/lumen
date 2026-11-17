@@ -662,6 +662,7 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
     prices = snapshot.get("component_prices") if isinstance(snapshot, dict) else None
     if not isinstance(prices, dict):
         raise DurableRunError("frozen tool pricing is unavailable")
+    rounding_cushion = Decimal("0.0000000002")
     if name == "managed_web_search":
         features = run.capability_snapshot.get("effective_features") or {}
         options = features.get("web_search") or {}
@@ -677,6 +678,7 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
         limit = route.get("context_limit")
         keys = (
             "advisor_input_price_per_token",
+            "advisor_input_price_per_token_above_200k",
             "advisor_cache_read_price_per_token",
             "advisor_cache_write_price_per_token",
             "advisor_cache_write_1h_price_per_token",
@@ -685,20 +687,34 @@ def _tool_credit_bound(run: ChatRun, name: str) -> Decimal:
             "advisor_cache_write_1h_price_per_token_above_200k",
         )
         rates = [Decimal(str(prices[key])) for key in keys if prices.get(key) is not None]
+        modality_pricing = {
+            "token_rates": snapshot.get("advisor_token_rates"),
+            "token_rates_above_200k": snapshot.get("advisor_token_rates_above_200k"),
+        }
+        modality_input, modality_output, modality_cushion = credit.worst_case_token_rates(modality_pricing)
+        if any(modality_pricing.values()):
+            rates.append(modality_input)
+            rounding_cushion = modality_cushion
         if not rates or (max(rates) > 0 and (type(limit) is not int or limit <= 0)):
             raise DurableRunError("bounded advisor input requires frozen context limit")
-        if route.get("output_budget_enforced") is False and Decimal(str(prices["advisor_output_price_per_token"])) > 0:
+        output_rate = max(
+            Decimal(str(prices[key]))
+            for key in ("advisor_output_price_per_token", "advisor_output_price_per_token_above_200k")
+            if prices.get(key) is not None
+        )
+        output_rate = max(output_rate, modality_output)
+        if route.get("output_budget_enforced") is False and output_rate > 0:
             raise DurableRunError("advisor does not enforce a bounded output budget")
         usd = (
             max(rates) * (limit if type(limit) is int else 0)
-            + Decimal(str(prices["advisor_output_price_per_token"])) * advisor._MAX_ADVISOR_TOKENS
+            + output_rate * advisor._MAX_ADVISOR_TOKENS
         )
     else:
         return Decimal("0")
     multiplier = Decimal(str(snapshot["margin_multiplier"])) * Decimal(str(snapshot["chat_credit_per_usd"]))
     if not usd.is_finite() or usd < 0 or not multiplier.is_finite() or multiplier < 0:
         raise DurableRunError("frozen tool pricing is invalid")
-    return ((usd + (Decimal("0.0000000002") if usd else 0)) * multiplier).quantize(
+    return ((usd + (rounding_cushion if usd else 0)) * multiplier).quantize(
         Decimal("0.00000001"), rounding=ROUND_CEILING
     )
 
@@ -803,6 +819,7 @@ class _DurableExecutionHooks:
                 "price_source": summary_pricing.get("price_source"),
                 "price_version": summary_pricing.get("price_version"),
                 "cache_price_sources": summary_pricing.get("cache_price_sources") or {},
+                "long_context_threshold_tokens": summary_pricing.get("long_context_threshold_tokens", 200_000),
                 # Snapshots frozen before cache rates existed carry no cache keys;
                 # those categories bill 0 (partial). Never read the live route:
                 # a hash-matching route may now carry inherited write rates that
@@ -810,6 +827,8 @@ class _DurableExecutionHooks:
                 **{
                     key: summary_pricing.get(key)
                     for key in (
+                        "input_price_per_token_above_200k",
+                        "output_price_per_token_above_200k",
                         "cache_read_price_per_token",
                         "cache_write_price_per_token",
                         "cache_write_1h_price_per_token",
@@ -820,6 +839,8 @@ class _DurableExecutionHooks:
                 },
                 # Never inherit live modality edits, including on old snapshots.
                 "token_rates": summary_pricing.get("token_rates") or {},
+                "token_rates_above_200k": summary_pricing.get("token_rates_above_200k") or {},
+                "token_rates_follow_text": summary_pricing.get("token_rates_follow_text") is True,
             }
             if pricing["input_price_per_token"] is None or pricing["output_price_per_token"] is None:
                 raise DurableRunError("context compaction pricing is unavailable")
@@ -957,7 +978,10 @@ class _DurableExecutionHooks:
                 provider_auth=resolved_route.get("provider_auth"),
                 max_tokens=None if resolved_route.get("provider_type") == "chatgpt" else output_bound,
                 temperature=None if resolved_route.get("provider_type") == "chatgpt" else 0,
-                extra={"response_format": {"type": "json_object"}},
+                extra={
+                    "response_format": {"type": "json_object"},
+                    "capabilities_override": resolved_route.get("capabilities") or {},
+                },
             )
             choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
             first = choices[0] if choices else None
@@ -1901,6 +1925,88 @@ def _usage_payload_breakdown(value: dict[str, Any]) -> UsageBreakdown:
     return breakdown
 
 
+async def _completed_provider_usage(run_id: str) -> list[tuple[str, dict[str, Any]]]:
+    """Read committed call receipts, including rounds preceding a checkpoint resume."""
+    factory = _factory()
+    async with factory() as session:
+        rows = (await session.execute(
+            select(ChatRunSegment.segment_id, ChatRunSegment.usage_payload, ChatRunSegment.result_payload)
+            .where(
+                ChatRunSegment.run_id == run_id,
+                ChatRunSegment.endpoint == "chat_completions",
+                ChatRunSegment.status == "completed",
+            )
+            .order_by(ChatRunSegment.ordinal.asc(), ChatRunSegment.segment_id.asc())
+        )).all()
+    receipts = []
+    for segment_id, usage_payload, result_payload in rows:
+        usage = load_segment_payload(usage_payload)
+        if not isinstance(usage, dict):
+            result = load_segment_payload(result_payload)
+            usage = result.get("usage") if isinstance(result, dict) else None
+        if not isinstance(usage, dict):
+            raise DurableRunError("completed provider usage receipt is unavailable")
+        receipts.append((segment_id, usage))
+    return receipts
+
+
+def _provider_usage_cost_from_receipts(
+    receipts: list[tuple[str, dict[str, Any]]],
+    *,
+    pricing_snapshot: dict[str, Any],
+    expected_usage: UsageBreakdown,
+    model_name: str,
+    metadata: dict[str, Any],
+) -> tuple[provider_metadata.UsageCost, list[dict[str, Any]]]:
+    """Select each call's frozen tier before summing costs and ledger components."""
+    total_usage = UsageBreakdown.from_totals(0, 0)
+    totals = dict.fromkeys((
+        "raw_cost", "input_cost", "output_cost", "cache_read_cost",
+        "cache_creation_5m_cost", "cache_creation_1h_cost",
+    ), Decimal("0"))
+    token_components: dict[str, dict[str, Any]] = {}
+    components: list[dict[str, Any]] = []
+    partial = False
+    for segment_id, usage in receipts:
+        breakdown = _usage_payload_breakdown(usage)
+        total_usage += breakdown
+        cost = credit.usage_cost_from_pricing_snapshot(
+            pricing_snapshot,
+            prompt_tokens=breakdown.input_tokens,
+            completion_tokens=breakdown.output_tokens,
+            breakdown=breakdown,
+            required_modalities=usage.get("required_token_modalities"),
+        )
+        partial = partial or cost.pricing_status != "priced"
+        for key in totals:
+            totals[key] += getattr(cost, key)
+        components.extend(credit.token_usage_components(
+            cost, segment_id=segment_id, source="executor", model_name=model_name, metadata=metadata,
+        ))
+        for key, item in cost.pricing_snapshot["token_components"].items():
+            if key not in token_components:
+                token_components[key] = dict(item)
+                continue
+            aggregate = token_components[key]
+            aggregate["tokens"] += item["tokens"]
+            aggregate["cost"] = format(Decimal(aggregate["cost"]) + Decimal(item["cost"]), "f")
+            if aggregate.get("price_per_token") != item.get("price_per_token"):
+                aggregate["price_per_token"] = None
+            if aggregate.get("source") != item.get("source"):
+                aggregate["source"] = "mixed"
+    if (
+        total_usage.input_tokens != expected_usage.input_tokens
+        or total_usage.output_tokens != expected_usage.output_tokens
+        or total_usage.cache_fields() != expected_usage.cache_fields()
+    ):
+        raise DurableRunError("provider usage receipts do not match aggregate usage")
+    return provider_metadata.UsageCost(
+        **totals,
+        pricing_status="partial" if partial else "priced",
+        pricing_snapshot={**pricing_snapshot, "token_components": token_components},
+    ), components
+
+
 _MANAGED_USAGE_KEYS = {
     ("web_search_requests", "web_search_request_per_unit", "request", "search"),
     ("web_search_context", "web_search_context_low_per_unit", "context", "search"),
@@ -1951,11 +2057,19 @@ def _managed_usage_components(
         except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
             raise DurableRunError("managed tool pricing snapshot is invalid") from exc
         above_price_key = f"{price_key}_above_200k"
-        if price_key in _OPTIONAL_MANAGED_PRICE_KEYS and prices.get(above_price_key) is not None:
+        if source == "advisor" and prices.get(above_price_key) is not None:
             prompt_tokens = record.get("prompt_tokens")
             if type(prompt_tokens) is not int or prompt_tokens < 0 or prompt_tokens > 10_000_000:
-                raise DurableRunError("managed advisor cache prompt size is invalid")
-            if prompt_tokens > 200_000 and not unpriced:
+                raise DurableRunError("managed advisor prompt size is invalid")
+            try:
+                threshold = credit.long_context_threshold_tokens({
+                    "long_context_threshold_tokens": pricing_snapshot.get(
+                        "advisor_long_context_threshold_tokens", 200_000
+                    ),
+                })
+            except ValueError as exc:
+                raise DurableRunError("managed tool pricing snapshot is invalid") from exc
+            if prompt_tokens > threshold and not unpriced:
                 try:
                     unit_price = Decimal(str(prices[above_price_key]))
                 except (InvalidOperation, TypeError, ValueError) as exc:
@@ -2521,6 +2635,15 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         )
         feature_options = payload.get("features")
         tool_policy = feature_options.get("tool_policy") if isinstance(feature_options, dict) else None
+        from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
+
+        try:
+            sandbox_tools = validate_selection(capability_snapshot.get("sandbox_tools", []))
+        except SandboxSelectionError as exc:
+            raise DurableRunInputError(exc.code) from exc
+        selected_names = tool_policy.get("enabled_sandbox_tools", []) if isinstance(tool_policy, dict) else []
+        if selected_names != [item["name"] for item in sandbox_tools]:
+            raise DurableRunInputError("sandbox_selection_invalid")
         approval_mode = tool_policy.get("approval_mode") if isinstance(tool_policy, dict) else None
         workspace_write_mode = (
             tool_policy.get("workspace_write_mode")
@@ -2562,6 +2685,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             api_key=resolved.get("api_key"),
             provider_auth=resolved.get("provider_auth"),
             token_rates=pricing_snapshot.get("token_rates") or {},
+            capabilities_override=capability_snapshot.get("capabilities") or {},
             max_tokens=(
                 None
                 if (capability_snapshot.get("provider_request_defaults") or {}).get("omit_output_budget")
@@ -2597,6 +2721,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             plugin_tool_snapshots=tuple(plugin_tool_snapshots),
             delegation_enabled=delegation_enabled,
             sandbox_lease=sandbox_lease,
+            sandbox_tools=sandbox_tools,
         ).__aiter__()
         next_event_task = asyncio.create_task(anext(engine_iterator))
         lease_lost_wait_task = asyncio.create_task(lease_lost.wait())
@@ -2935,12 +3060,15 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         parts.extend(citations)
         completed_parts = list(enumerate(parts, start=1 if parts and parts[0]["type"] == "reasoning" else 0))
         ensure_lease()
-        usage_cost = credit.usage_cost_from_pricing_snapshot(
-            pricing_snapshot,
-            prompt_tokens=usage["prompt_tokens"],
-            completion_tokens=usage["completion_tokens"],
-            breakdown=usage_breakdown,
-            required_modalities=usage.get("required_token_modalities"),
+        usage_cost, usage_components = _provider_usage_cost_from_receipts(
+            await _completed_provider_usage(run_id),
+            pricing_snapshot=pricing_snapshot,
+            expected_usage=usage_breakdown,
+            model_name=resolved["model_name"],
+            metadata={
+                **{key: value for key, value in execution_identity(resolved).items() if key != "provider_auth"},
+                "provider_id": resolved.get("provider_id"),
+            },
         )
         managed_cost, managed_components = _managed_usage_components(
             managed_tool_usage,
@@ -2959,16 +3087,6 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             and usage_cost.pricing_status == "priced"
         ):
             usage_cost = replace(usage_cost, pricing_status="partial")
-        usage_components = credit.token_usage_components(
-            usage_cost,
-            segment_id="executor:aggregate",
-            source="executor",
-            model_name=resolved["model_name"],
-            metadata={
-                **{key: value for key, value in execution_identity(resolved).items() if key != "provider_auth"},
-                "provider_id": resolved.get("provider_id"),
-            },
-        )
         usage_components.extend(managed_components)
         usage_record = {
             "usage_cost": usage_cost,

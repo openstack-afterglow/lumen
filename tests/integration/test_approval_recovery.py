@@ -1,12 +1,15 @@
-"""Checkpoint/approval-ledger recovery with MariaDB and an in-memory LangGraph saver."""
+"""Approval recovery with MariaDB and optional real encrypted PostgreSQL checkpoints."""
 
+import asyncio
 import copy
 import json
 import os
+import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from lumen_plugin_api.tools import ToolBinding, ToolDefinition, ToolExecutionResult
@@ -40,6 +43,7 @@ async def approval_recovery(monkeypatch):
         factory=factory, run_id=run_id, user=f"approval-user-{nonce}", project=f"approval-project-{nonce}",
         identity=identity, registration_id=registration_id, rounds=[["call-1", "call-2"]],
         provider_calls=0, tool_calls=[],
+        tool_arguments=None, stream_kwargs={},
     )
 
     async def execute_tool(arguments, _context):
@@ -55,9 +59,10 @@ async def approval_recovery(monkeypatch):
         ), execute=execute_tool, config_fingerprint="a" * 64,
         destination_origin="https://playwright.example",
     )
+    state.binding = binding
 
     async def bindings(_context):
-        return {"mcp_23_mutate": binding}
+        return {state.binding.definition.name: state.binding}
 
     async def completion_stream(**_kwargs):
         ordinal = state.provider_calls
@@ -67,7 +72,8 @@ async def approval_recovery(monkeypatch):
             if ordinal < len(state.rounds):
                 yield {"choices": [{"delta": {"tool_calls": [
                     {"index": index, "id": call_id, "function": {
-                        "name": "mcp_23_mutate", "arguments": json.dumps({"target": call_id}),
+                        "name": state.binding.definition.name,
+                        "arguments": json.dumps(state.tool_arguments or {"target": call_id}),
                     }} for index, call_id in enumerate(state.rounds[ordinal])
                 ]}}]}
             else:
@@ -123,7 +129,7 @@ async def _stream(state, resume=None):
     return [event async for event in graph.stream(
         model="scripted-approval", messages=[{"role": "user", "content": "mutate"}],
         project_id=state.project, user_id=state.user, execution_protocol_version=2,
-        approval_mode="required_for_mutations", run_id=state.run_id, resume=resume,
+        approval_mode="required_for_mutations", run_id=state.run_id, resume=resume, **state.stream_kwargs,
     )]
 
 
@@ -138,6 +144,10 @@ async def _snapshot(state):
             status=run.status, owner=run.lease_owner, lease_expires_at=run.lease_expires_at,
             approvals={row.call_id: row for row in approvals},
             requests=[event.payload.call_id for event in events if event.type == "tool.approval_required"],
+            approval_payloads={
+                event.payload.call_id: event.payload.model_dump(mode="json")
+                for event in events if event.type == "tool.approval_required"
+            },
             events=len(events),
         )
 
@@ -291,3 +301,204 @@ async def test_recovery_requires_current_owned_lease(approval_recovery, invalid_
     snapshot = await _snapshot(state)
     assert snapshot.approvals == {} and snapshot.requests == []
     assert state.provider_calls == 1 and state.tool_calls == []
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny", "revoked"])
+async def test_encrypted_postgres_vm_approval_survives_fresh_process(
+    approval_recovery, monkeypatch, decision,
+):
+    """Real MariaDB/PostgreSQL; only model and remote cloud authority are synthetic."""
+    from lumen.services import mcp_adapter
+    from lumen.services.checkpointer import ChatCheckpointer
+    from lumen.services.tool_runtime import bindings as tool_bindings
+    from lumen.services.tools import ToolContext
+
+    dsn = os.environ.get("LUMEN_TEST_CHECKPOINTER_POSTGRES_URL")
+    if not dsn:
+        pytest.skip("set LUMEN_TEST_CHECKPOINTER_POSTGRES_URL to a disposable PostgreSQL store")
+    state = approval_recovery
+    state.rounds = [["create-vm"]]
+    arguments = {
+        "name": "encrypted-chat-vm",
+        "image_id": "11111111-1111-4111-8111-111111111111",
+        "flavor_id": "small",
+        "network_id": "22222222-2222-4222-8222-222222222222",
+        "boot_volume_size_gb": 24,
+        "key_name": "owned-key",
+        "security_group_ids": ["33333333-3333-4333-8333-333333333333"],
+        "delete_boot_volume_on_termination": True,
+        "availability_zone": "zone-b",
+    }
+    state.tool_arguments = arguments
+    snapshot = {
+        "grant_id": "synthetic-vm-grant", "user_id": state.user, "project_id": state.project,
+        "credential_epoch": 3, "selection_generation": 7,
+    }
+    entry = {
+        "name": "afterglow_vm_create", "description": "Create one explicitly configured VM.",
+        "effect": "external_mutation",
+        "input_schema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                name: {"type": "integer", "minimum": 1} if name == "boot_volume_size_gb"
+                else {"type": "boolean"} if name == "delete_boot_volume_on_termination"
+                else {"type": "array", "items": {"type": "string"}, "minItems": 1}
+                if name == "security_group_ids" else {"type": "string", "minLength": 1}
+                for name in arguments
+            },
+            "required": list(arguments),
+        },
+    }
+    authority = SimpleNamespace(active=True, previews=[], mutations=[])
+
+    def bridge(request):
+        payload = json.loads(request.content)
+        if not authority.active:
+            return httpx.Response(403, json={"detail": "grant revoked"})
+        if request.url.path.endswith("/snapshot"):
+            assert payload == {"user_id": state.user, "project_id": state.project}
+            return httpx.Response(200, json={
+                "snapshot": snapshot, "entries": [entry], "service_fingerprint": "a" * 64,
+            })
+        assert payload["snapshot"] == snapshot
+        assert payload["arguments"] == arguments
+        if request.url.path.endswith("/preview"):
+            authority.previews.append(payload)
+            return httpx.Response(200, json={
+                "resource_identity": f"nova-server:new:{state.project}:{arguments['name']}",
+                "current_state": None, "intended_transition": "create",
+                "dependent_resources": [
+                    f"glance-image:{arguments['image_id']}", f"nova-flavor:{arguments['flavor_id']}",
+                    f"neutron-network:{arguments['network_id']}",
+                    f"nova-keypair:{state.user}:{arguments['key_name']}",
+                    f"neutron-security-group:{arguments['security_group_ids'][0]}",
+                ],
+                "destructive": False,
+                "estimated_effect": (
+                    "create VM with 24 GiB boot volume"
+                    "; delete_boot_volume_on_termination=true; availability_zone=zone-b"
+                ),
+                "fingerprint": "b" * 64,
+            })
+        assert request.url.path.endswith("/execute")
+        assert payload["idempotency_key"]
+        authority.mutations.append(payload)
+        return httpx.Response(200, json={"id": "synthetic-server", "status": "BUILD", "requested_action": "create"})
+
+    original_client = httpx.AsyncClient
+    transport = httpx.MockTransport(bridge)
+    monkeypatch.setattr(mcp_adapter.httpx, "AsyncClient", lambda **kwargs: original_client(
+        transport=transport, **kwargs,
+    ))
+    monkeypatch.setattr(mcp_adapter, "get_settings", lambda: SimpleNamespace(
+        mcp_control_plane_url="https://authority.example.test",
+        lumen_mcp_service_token="synthetic-service-token", verify=True,
+    ))
+    context = ToolContext(
+        user_id=state.user, project_id=state.project, run_id=state.run_id,
+        lumen_snapshot=[snapshot], lumen_snapshot_frozen=True,
+    )
+    state.binding, = await tool_bindings._lumen_registry_bindings(context)
+    state.stream_kwargs = {"lumen_snapshot": [snapshot], "lumen_snapshot_frozen": True}
+    checkpoint = ChatCheckpointer()
+    monkeypatch.setattr(graph, "chat_checkpointer", checkpoint)
+    assert await checkpoint.start(dsn)
+    reconnect_script = """
+import asyncio, json, os, sys
+from lumen.services import graph
+from lumen.services.checkpointer import ChatCheckpointer
+async def main():
+    checkpoint = ChatCheckpointer()
+    assert await checkpoint.start(os.environ["LUMEN_TEST_CHECKPOINTER_POSTGRES_URL"])
+    graph.chat_checkpointer = checkpoint
+    try:
+        print(json.dumps(await graph.pending_interrupt(sys.argv[1]), sort_keys=True))
+    finally:
+        await checkpoint.close()
+asyncio.run(main())
+"""
+
+    async def inspect_from_fresh_process(*, wrong_key=False):
+        environment = os.environ.copy()
+        if wrong_key:
+            environment["LUMEN_ENCRYPTION_KEY"] = "ab" * 32
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", reconnect_script, state.run_id,
+            env=environment, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+        if wrong_key:
+            assert process.returncode != 0
+            assert b"InvalidTag" in stderr
+            return None
+        assert process.returncode == 0, stderr.decode()
+        return json.loads(stdout)
+
+    try:
+        events = await _stream(state)
+        assert events[-1]["type"] == "input.interrupted"
+        pending = await graph.pending_interrupt(state.run_id)
+        call, = pending["calls"]
+        assert call["name"] == "afterglow_vm_create"
+        assert json.loads(call["arguments"]) == arguments
+        assert "24 GiB" in call["preview"][0]["text"]
+        assert len(authority.previews) == 1 and authority.mutations == []
+        async with checkpoint._pool.connection() as connection:
+            rows = await (await connection.execute(
+                "SELECT type, blob FROM checkpoint_blobs WHERE thread_id = %s",
+                (state.run_id,),
+            )).fetchall()
+        assert rows
+        assert any("afterglow-aesgcm-v1" in row["type"] for row in rows)
+        assert all(arguments["name"].encode() not in bytes(row["blob"] or b"") for row in rows)
+        await interactions._persist_v2_approval_interrupt(
+            run_id=state.run_id, owner=state.owner, calls=pending["calls"],
+        )
+        before = await _snapshot(state)
+        assert before.status == "awaiting_input" and before.requests == ["create-vm"]
+        public = before.approval_payloads["create-vm"]
+        assert public["redacted_arguments"] == {name: "[REDACTED]" for name in arguments}
+        public_text = "\n".join(part["text"] for part in public["preview"])
+        for field in ("name", "image_id", "flavor_id", "network_id", "key_name", "availability_zone"):
+            assert arguments[field] in public_text
+        assert arguments["security_group_ids"][0] in public_text
+        assert "24 GiB" in public_text
+        assert "delete_boot_volume_on_termination=true" in public_text
+        assert authority.mutations == []
+        await checkpoint.close()
+
+        # No parent saver connection/state survives. Another interpreter reads the
+        # encrypted approval with the original key; a different key cannot.
+        restored = await inspect_from_fresh_process()
+        assert restored == pending
+        await inspect_from_fresh_process(wrong_key=True)
+        assert await inspect_from_fresh_process() == pending
+        checkpoint = ChatCheckpointer()
+        monkeypatch.setattr(graph, "chat_checkpointer", checkpoint)
+        assert await checkpoint.start(dsn)
+        assert await graph.pending_interrupt(state.run_id) == pending
+        after = await _snapshot(state)
+        assert after.requests == before.requests
+        assert after.approvals["create-vm"].expires_at == before.approvals["create-vm"].expires_at
+        await _decide(state, "create-vm", "deny" if decision == "deny" else "approve")
+        state.owner = await _claim(state)
+        resume = await execution._v2_resume(run_id=state.run_id, owner=state.owner)
+        assert authority.mutations == []
+        if decision == "revoked":
+            authority.active = False
+        resumed = await _stream(state, resume)
+        result = next(event for event in resumed if event.get("type") == "tool_result")
+        assert result["status"] == ("completed" if decision == "approve" else "failed")
+        assert len(authority.mutations) == (1 if decision == "approve" else 0)
+        if authority.mutations:
+            assert authority.mutations[0]["arguments"] == arguments
+            assert authority.mutations[0]["snapshot"] == snapshot
+        resolved = await _snapshot(state)
+        assert resolved.requests == ["create-vm"]
+        assert resolved.approvals["create-vm"].status == ("denied" if decision == "deny" else "approved")
+    finally:
+        if not checkpoint.available:
+            await checkpoint.start(dsn)
+        if checkpoint.saver is not None:
+            await checkpoint.saver.adelete_thread(state.run_id)
+        await checkpoint.close()

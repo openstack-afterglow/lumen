@@ -22,6 +22,7 @@ async def stream(
     api_base: str | None = None,
     api_key: str | None = None,
     provider_auth: dict | None = None,
+    capabilities_override: dict | None = None,
     token_rates: dict | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
@@ -51,6 +52,7 @@ async def stream(
     plugin_tool_snapshots: tuple[dict, ...] = (),
     delegation_enabled: bool = False,
     sandbox_lease: tuple[str, int] | None = None,
+    sandbox_tools: list[dict[str, str]] | None = None,
 ) -> AsyncIterator[dict]:
     async for ev in graph.stream(
         model=model,
@@ -62,6 +64,7 @@ async def stream(
         api_base=api_base,
         api_key=api_key,
         provider_auth=provider_auth,
+        capabilities_override=capabilities_override,
         token_rates=token_rates,
         max_tokens=max_tokens,
         temperature=temperature,
@@ -90,5 +93,6 @@ async def stream(
         plugin_tool_snapshots=plugin_tool_snapshots,
         delegation_enabled=delegation_enabled,
         sandbox_lease=sandbox_lease,
+        sandbox_tools=sandbox_tools,
     ):
         yield ev

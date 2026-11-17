@@ -147,6 +147,16 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.18@sha256:3adc3706091ce7c2fe595e669628caed
 COPY packages/lumen-sandbox/ ./packages/lumen-sandbox/
 RUN uv build --wheel --out-dir /wheels ./packages/lumen-sandbox
 
+FROM python:3.12-slim AS lumen-sandbox-python-tools
+
+COPY packages/lumen-sandbox/tools/markitdown-requirements.lock /opt/lumen-tools/markitdown-requirements.lock
+RUN python3.12 -m venv /opt/lumen-tools/markitdown \
+    && /opt/lumen-tools/markitdown/bin/python -m pip install \
+       --no-cache-dir --require-hashes --only-binary=:all: \
+       -r /opt/lumen-tools/markitdown-requirements.lock \
+    && chmod -R a+rX,go-w /opt/lumen-tools
+COPY packages/lumen-sandbox/tools/markitdown_server.py /opt/lumen-tools/markitdown_server.py
+
 FROM python:3.12-slim AS lumen-sandbox
 ARG TARGETARCH
 ARG NODE_VERSION=24.21.0
@@ -186,6 +196,7 @@ RUN set -eu; \
     /usr/bin/python3.12 --version
 
 COPY packages/lumen-sandbox/tools/ /opt/lumen-tools/
+COPY --from=lumen-sandbox-python-tools /opt/lumen-tools/markitdown /opt/lumen-tools/markitdown
 RUN set -eu; \
     case "$PLAYWRIGHT_CHROMIUM_SANDBOX" in true|false) ;; \
       *) echo "PLAYWRIGHT_CHROMIUM_SANDBOX must be true or false" >&2; exit 1 ;; \

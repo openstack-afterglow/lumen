@@ -3,17 +3,101 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Select, select
+from cryptography.exceptions import InvalidTag
+from sqlalchemy import Select, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_contracts import ChatRunEvent, validate_chat_run_event
 from lumen.models.chat_runs import ChatRun, ChatRunEventRow, ChatRunSegment
 from lumen.services import worker_routing
+
+logger = logging.getLogger(__name__)
+
+_PUBLIC_ACTIVITY_TYPES = frozenset({
+    "run.started", "run.stage.changed", "context.updated", "part.completed",
+    "tool.call.started", "tool.call.completed", "tool.approval_required", "tool.approval_resolved",
+    "child.created", "child.completed", "run.completed", "run.failed", "run.canceled",
+})
+_MAX_PUBLIC_ACTIVITY_EVENTS = 1024
+_MAX_PUBLIC_ACTIVITY_CIPHERTEXT = 8 * 1024 * 1024
+
+
+@dataclass
+class PublicActivityRead:
+    events: list[ChatRunEvent] = field(default_factory=list)
+    unavailable_code: str | None = None
+
+
+async def read_public_activity_events(
+    session: AsyncSession, run_ids: list[str],
+) -> dict[str, PublicActivityRead]:
+    """Read bounded public history for already-authorized runs, never text-token replay.
+
+    Completed user-visible reasoning is the durable summary boundary. Delta events
+    are intentionally not selected, decrypted or treated as completed reasoning.
+    """
+    results = {run_id: PublicActivityRead() for run_id in run_ids}
+    if not results:
+        return results
+    # Bound each run in SQL, including one sentinel row proving an exceeded limit.
+    ranked = select(
+        ChatRunEventRow.run_id, ChatRunEventRow.seq,
+        func.row_number().over(
+            partition_by=ChatRunEventRow.run_id, order_by=ChatRunEventRow.seq,
+        ).label("activity_ordinal"),
+    ).where(
+        ChatRunEventRow.run_id.in_(run_ids), ChatRunEventRow.event_type.in_(_PUBLIC_ACTIVITY_TYPES),
+    ).subquery()
+    statement = select(ChatRunEventRow).join(ranked, and_(
+        ChatRunEventRow.run_id == ranked.c.run_id, ChatRunEventRow.seq == ranked.c.seq,
+    )).where(
+        ranked.c.activity_ordinal <= _MAX_PUBLIC_ACTIVITY_EVENTS + 1,
+    ).order_by(ChatRunEventRow.run_id, ChatRunEventRow.seq).execution_options(yield_per=64)
+    counts: dict[str, int] = {}
+    sizes: dict[str, int] = {}
+    rows = await session.stream_scalars(statement)
+    try:
+        async for row in rows:
+            result = results[row.run_id]
+            if result.unavailable_code is not None:
+                continue
+            counts[row.run_id] = counts.get(row.run_id, 0) + 1
+            sizes[row.run_id] = sizes.get(row.run_id, 0) + len(row.payload)
+            if counts[row.run_id] > _MAX_PUBLIC_ACTIVITY_EVENTS or sizes[row.run_id] > _MAX_PUBLIC_ACTIVITY_CIPHERTEXT:
+                result.events.clear()
+                result.unavailable_code = "history_activity_limit"
+                logger.warning("Public activity unavailable: run=%s reason=limit", row.run_id)
+                continue
+            try:
+                payload = _normalize_replayed_payload(row, json.loads(decrypt_chat_content(row.payload)))
+                if row.event_type == "part.completed":
+                    if not isinstance(payload, dict) or not isinstance(payload.get("part"), dict):
+                        raise ValueError("invalid completed activity part")
+                    part = payload["part"]
+                    if part.get("type") != "reasoning" or part.get("visibility") != "user":
+                        continue
+                result.events.append(validate_chat_run_event({
+                    "event_id": f"{row.run_id}:{row.seq}", "run_id": row.run_id, "seq": row.seq,
+                    "type": row.event_type, "created_at": _as_utc(row.created_at).isoformat(), "payload": payload,
+                }))
+            except (ValueError, TypeError, InvalidTag):
+                # Never log raw validation/decryption errors: they may include private payloads.
+                result.events.clear()
+                result.unavailable_code = "history_activity_invalid"
+                logger.warning("Public activity unavailable: run=%s reason=invalid", row.run_id)
+    finally:
+        await rows.close()
+    for result in results.values():
+        if not result.events and result.unavailable_code is None:
+            result.unavailable_code = "history_activity_missing"
+    return results
 
 
 class RunStoreError(RuntimeError):

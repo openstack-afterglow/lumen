@@ -80,6 +80,9 @@ class DirectoryState:
             self.system_revocation = "grant"
             self.user_domain_id = "default"
             self.project_domain_id = "default"
+            # Domain-manager fixture: the domain's canonical Default project and which users manage it.
+            self.default_project_id = "synthetic-default-project"
+            self.default_managers = set()
             self.domains = {"default": {"id": "default", "name": "Default", "enabled": True}}
             self.user_overrides = {}
             self.project_overrides = {}
@@ -106,7 +109,7 @@ class DirectoryState:
             if set(payload) - {"owner_roles", "directory_target_roles", "directory_system_admin",
                                "revoke_system_admin_after_checks", "remove_edges", "unavailable",
                                "authority_unavailable", "owner_enabled", "project_enabled", "project_exists",
-                               "system_admin_mode", "system_group_members", "system_revocation", "domains",
+                               "system_admin_mode", "system_group_members", "system_revocation", "domains", "default_managers",
                                "user_domain_id", "project_domain_id", "user_overrides", "project_overrides",
                                "token_overrides", "collection_overrides"}:
                 raise ValueError("Unknown synthetic directory control field")
@@ -176,9 +179,13 @@ class DirectoryState:
             for field in ("user_domain_id", "project_domain_id"):
                 if field in payload and not isinstance(payload[field], str):
                     raise ValueError(field + " must be a string")
+            managers = payload.get("default_managers", sorted(self.default_managers))
+            if not isinstance(managers, list) or any(m not in {OWNER_ID, DIRECTORY_ID, PROJECTLESS_ADMIN_ID} for m in managers):
+                raise ValueError("Unknown synthetic default manager")
             self.system_admin_mode = mode
             self.system_revocation = revocation
             self.system_group_members = set(members)
+            self.default_managers = set(managers)
             for field in ("domains", "user_domain_id", "project_domain_id", "user_overrides", "project_overrides", "token_overrides"):
                 if field in payload:
                     setattr(self, field, payload[field])
@@ -209,6 +216,9 @@ class DirectoryState:
             {"user": {"id": DIRECTORY_ID}, "role": {"id": role_id("admin")}, "scope": {"project": {"id": DIRECTORY_PROJECT_ID}}},
             {"user": {"id": DIRECTORY_ID}, "role": {"id": role_id("member")}, "scope": {"project": {"id": DIRECTORY_PROJECT_ID}}},
         ]
+        rows.extend({"user": {"id": subject}, "role": {"id": role_id("manager")},
+                     "scope": {"project": {"id": self.default_project_id}}}
+                    for subject in sorted(self.default_managers))
         group_mode = self.system_admin_mode in {"group", "group-inferred"}
         if self.directory_system_admin and not effective:
             rid = role_id(SYSTEM_PARENT if self.system_admin_mode in {"inferred", "group-inferred"} else "admin")
@@ -334,6 +344,16 @@ class KeystoneHandler(BaseHTTPRequestHandler):
                 self.respond(503, {"error": {"code": 503, "message": "Synthetic directory unavailable"}})
             elif overrides:
                 self.respond(200, overrides[0]["payload"])
+            elif path == "/v3/projects" and query.get("domain_id") == [state.project_domain_id]:
+                self.respond(200, {"projects": [{
+                    "id": state.default_project_id, "name": "Default", "domain_id": state.project_domain_id,
+                    "enabled": True, "parent_id": state.project_domain_id,
+                }], "links": {"next": None, "previous": None}})
+            elif path == "/v3/projects/" + state.default_project_id:
+                self.respond(200, {"project": {
+                    "id": state.default_project_id, "name": "Default", "domain_id": state.project_domain_id,
+                    "enabled": True, "parent_id": state.project_domain_id,
+                }})
             elif path == "/v3/roles":
                 self.respond(200, {"roles": list(state.roles.values()), "links": {"next": None, "previous": None}})
             elif path == "/v3/role_inferences":
@@ -373,6 +393,19 @@ class KeystoneHandler(BaseHTTPRequestHandler):
                     self.respond(404, {"error": {"code": 404, "message": "Unknown synthetic domain"}})
                 else:
                     self.respond(200, {"domain": domain})
+            elif (path.startswith("/v3/system/users/") or path.startswith("/v3/system/groups/")) and path.endswith("/roles"):
+                # Keystone's direct system role listing (``ks.roles.list(user|group=..., system='all')``): the raw
+                # system grants of this subject, same rows as the role_assignments view, 404 for unknown subjects.
+                kind = "user" if path.startswith("/v3/system/users/") else "group"
+                subject = path.split("/")[-2]
+                known = {OWNER_ID, DIRECTORY_ID, PROJECTLESS_ADMIN_ID} if kind == "user" else {SYSTEM_GROUP_ID}
+                if subject not in known:
+                    self.respond(404, {"error": {"code": 404, "message": "Unknown synthetic subject"}})
+                else:
+                    rows = state.assignments({f"{kind}.id": [subject], "scope.system": ["all"]})
+                    self.respond(200, {"roles": [{"id": row["role"]["id"], "name": state.roles[row["role"]["id"]]["name"],
+                                                  "domain_id": None} for row in rows],
+                                       "links": {"next": None, "previous": None}})
             elif path.startswith("/v3/users/") and path.endswith("/groups"):
                 subject = path.split("/")[-2]
                 groups = [{"id": SYSTEM_GROUP_ID, "name": SYSTEM_GROUP_ID, "domain_id": "default"}]

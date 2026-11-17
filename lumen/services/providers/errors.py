@@ -9,16 +9,25 @@ class ProviderNotFoundError(LookupError):
     """프로바이더/모델 미존재 — 404."""
 
 
-class ModelsDevImportConflictError(RuntimeError):
-    """models.dev provider mapping would orphan imported local prices."""
-
-
 class ModelOrderConflictError(RuntimeError):
     """Provider model membership or display order changed before a reorder."""
 
 
 class ProviderValidationError(ValueError):
     """입력 검증 실패/제약 위반 — 400."""
+
+
+class UnsupportedProviderTypeError(ProviderValidationError):
+    """Unsupported provider adapter — 422 with compatible-API registration guidance."""
+
+    code = "unsupported_provider_type"
+
+    def __init__(self):
+        super().__init__(
+            "unsupported_provider_type: 추론 provider_type은 openai, anthropic, gemini, perplexity와 "
+            "기존 chatgpt device 인증을 지원하며, 관리형 검색 유형도 지원합니다. "
+            "타사 추론 API는 openai 또는 anthropic과 custom api_base로 등록하세요."
+        )
 
 
 class AmbiguousModelRouteError(RuntimeError):

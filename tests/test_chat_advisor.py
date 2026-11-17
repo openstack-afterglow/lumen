@@ -21,6 +21,7 @@ async def test_advisor_uses_only_selected_model_and_bounded_visible_history(monk
             "provider_type": "openai",
             "api_base": "https://api.example",
             "api_key": "secret",
+            "capabilities": {"prompt_caching": False},
         }
 
     captured: dict = {}
@@ -57,6 +58,7 @@ async def test_advisor_uses_only_selected_model_and_bounded_visible_history(monk
     assert result.prompt_tokens == 12 and result.completion_tokens == 4
     assert [message["role"] for message in captured["messages"]] == ["system", "user", "assistant", "user"]
     assert captured["messages"][-1]["content"] == "Current goal:\nAnswer the question"
+    assert "capabilities_override" not in captured
 
 
 async def test_advisor_does_not_fallback_when_selected_model_is_unavailable(monkeypatch):
@@ -79,3 +81,20 @@ async def test_advisor_rejects_empty_provider_response(monkeypatch):
     monkeypatch.setattr(provider_client, "acompletion", fake_completion)
     with pytest.raises(AdvisorError, match="no text"):
         await ask_selected_advisor(model_id=9, goal="goal", visible_messages=[])
+
+
+async def test_advisor_passes_effective_cache_capability_to_client(monkeypatch):
+    from lumen.services.advisor import ask_with_route
+
+    observed = {}
+    async def completion(**kwargs):
+        observed.update(kwargs)
+        return ProviderObject(choices=[{"message": {"content": "advice"}}],
+                              usage={"prompt_tokens": 2, "completion_tokens": 1})
+
+    monkeypatch.setattr(provider_client, "acompletion", completion)
+    await ask_with_route(
+        route={"model_name": "opaque", "provider_type": "anthropic", "capabilities": {"prompt_caching": False}},
+        goal="review", visible_messages=[],
+    )
+    assert observed["extra"] == {"capabilities_override": {"prompt_caching": False}}
