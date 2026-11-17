@@ -147,7 +147,7 @@ class TestEffectiveCapabilities:
         assert eff["vision"] is False and eff["reasoning"] is False and eff["tool_call"] is False
 
     @pytest.mark.parametrize("provider_type", ("openai", "anthropic"))
-    @pytest.mark.parametrize("stored_source", (None, "models_dev", "override"))
+    @pytest.mark.parametrize("stored_source", (None, "models_dev", "models.dev", "override"))
     def test_compatible_route_uses_only_explicit_overrides(self, monkeypatch, provider_type, stored_source):
         from lumen.services import provider_metadata
 
@@ -160,6 +160,8 @@ class TestEffectiveCapabilities:
             capabilities={
                 "vision": True, "tool_call": True, "reasoning": True,
                 "structured_output": True, "prompt_caching": True, "decisions": True,
+                "reasoning_options": [{"type": "effort", "values": ["low", "high"]}],
+                "context_limit": 128000,
             },
             capability_source=stored_source,
         )
@@ -180,7 +182,8 @@ class TestEffectiveCapabilities:
         assert eff["decisions"] is (overridden and provider_type == "openai")
         assert eff["feature_gates"]["decisions"]["available"] is (overridden and provider_type == "openai")
         assert eff["web_search"] is False
-        assert eff["context_limit"] is None
+        assert eff["context_limit"] == (128000 if overridden else None)
+        assert eff["reasoning_options"] == (row.capabilities["reasoning_options"] if overridden else [])
         assert eff["metadata_version"] is None
 
     @pytest.mark.parametrize("available", (False, True))

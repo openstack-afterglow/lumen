@@ -621,9 +621,10 @@ administrators register their IDs and required rates explicitly.
 
 Runtime prices use stored administrator rates first, then exact native catalog rates,
 then no rate. Stored historical `price_source` strings remain provenance only. Runtime
-capabilities use explicit administrator overrides, then catalog fields. Only missing
-`reasoning_options` and `context_limit` may fall back to historical imported metadata;
-other imported flags never override catalog/default detection. Remaining unknowns use
+capabilities use explicit administrator overrides, then catalog fields. On official native
+routes only, missing `reasoning_options` and `context_limit` may fall back to imported metadata;
+compatible endpoints remain explicit-override-or-defaults for those fields too.
+Other imported flags never override catalog/default detection. Remaining unknowns use
 conservative defaults. A missing PDF declaration is unknown, not a provider denial.
 Catalog prices are never copied into model columns. To follow the catalog, PATCH the
 native model's input/output/cache prices and `media_pricing` to null; compatible models

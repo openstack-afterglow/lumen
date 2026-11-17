@@ -32,8 +32,8 @@ subscription search remains unavailable. Decisions remains OpenAI-protocol text-
 
 Unknown output limits are omitted and context/compaction endpoints use a safe existing
 fallback. PDF absence is unknown rather than an unsupported assertion; official reasoning
-options precede missing-field legacy imported options/windows. Other imported flags cannot
-override native/default capabilities or CLI tool eligibility.
+options precede missing-field legacy imported options/windows on native direct routes only.
+Other imported flags cannot override native/default capabilities or CLI tool eligibility.
 
 Managed search adapters remain independent of inference-provider restrictions. Native
 paid search stays unavailable until request fees are billable; token prices alone do not

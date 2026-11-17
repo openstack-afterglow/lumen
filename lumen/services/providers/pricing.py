@@ -623,7 +623,11 @@ def _effective_capabilities(
             }
         }, "registry"
     detected = provider_capabilities(row.model_name, provider_type, api_base)
-    legacy = row.capabilities if row.capability_source in {"models_dev", "models.dev"} and isinstance(row.capabilities, dict) else {}
+    legacy = row.capabilities if (
+        direct_provider_route(provider_type, api_base)
+        and row.capability_source in {"models_dev", "models.dev"}
+        and isinstance(row.capabilities, dict)
+    ) else {}
     if not detected.get("reasoning_options") and isinstance(legacy.get("reasoning_options"), list):
         detected["reasoning_options"] = legacy["reasoning_options"]
     legacy_limit = legacy.get("context_limit")
