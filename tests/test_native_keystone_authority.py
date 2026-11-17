@@ -1696,3 +1696,14 @@ async def test_native_member_authority_ignores_irrelevant_personal_domain_kind(n
     native_directory.state.domains["personal"]["afterglow_domain_kind"] = kind
     current = await auth.resolve_project_authority(OWNER_ID, PROJECT_ID)
     assert capabilities({"user_id": OWNER_ID, "project_id": PROJECT_ID, **current}) == SERVICE_CAPABILITIES
+
+
+@pytest.fixture(autouse=True)
+def _organization_row_precheck_needs_no_database(monkeypatch):
+    """These route tests run without SQL; the organization-row OAuth pre-check fails closed on purpose (tested in
+    tests/test_mcp_settings.py), so the route behaviour under test stubs only that lookup."""
+    from unittest.mock import AsyncMock
+
+    from lumen.services import mcp_settings
+
+    monkeypatch.setattr(mcp_settings, "check_oauth_management", AsyncMock(return_value=None))

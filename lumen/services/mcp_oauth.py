@@ -252,9 +252,10 @@ class SqlMcpConnectionStore(McpConnectionStore):
                     if server is not None and server.scope == "domain":
                         from lumen.services.extensions_store import _domain_access
                         await _domain_access(
-                            request.owner_user_id, request.owner_project_id, server.owner_domain_id, manage=True
+                            request.owner_user_id, request.owner_project_id, server.owner_domain_id,
+                            manage=True, human=True,  # the owner already passed the unrestricted-human start
                         )
-                except HTTPException as exc:
+                except (HTTPException, ExtensionForbidden) as exc:
                     raise McpOAuthError("MCP OAuth management authority is no longer available") from exc
                 payload = _decrypt(request.encrypted_payload)
                 request.status = "processing"
@@ -300,7 +301,8 @@ class SqlMcpConnectionStore(McpConnectionStore):
                 if server.scope == "domain":
                     from lumen.services.extensions_store import _domain_access
                     await _domain_access(
-                        request.owner_user_id, request.owner_project_id, server.owner_domain_id, manage=True
+                        request.owner_user_id, request.owner_project_id, server.owner_domain_id,
+                        manage=True, human=True,
                     )
                     namespace = Namespace(user_id=server.owner_domain_id, project_id=server.owner_domain_id)
                 connection = await _connection_row(session, request.mcp_server_id, namespace, lock=True)
@@ -348,21 +350,38 @@ class SqlMcpConnectionStore(McpConnectionStore):
                     ChatMcpOAuthConnection.status == "active",
                 )
             )).scalars().all()
-            domain_servers = (await session.execute(select(ChatMcpServer).where(
-                ChatMcpServer.scope == "domain", ChatMcpServer.auth_mode == "oauth",
-                ChatMcpServer.is_active.is_(True),
-            ))).scalars().all()
-            if domain_servers:
-                from lumen.services.extensions_store import _domain_access
-                domain_id = (await _domain_access(namespace.user_id, namespace.project_id))["domain_id"]
-                domain_ids = [server.id for server in domain_servers if server.owner_domain_id == domain_id]
-                if domain_ids:
-                    rows.extend((await session.execute(select(ChatMcpOAuthConnection).where(
-                        ChatMcpOAuthConnection.mcp_server_id.in_(domain_ids),
-                        ChatMcpOAuthConnection.owner_user_id == domain_id,
-                        ChatMcpOAuthConnection.owner_project_id == domain_id,
-                        ChatMcpOAuthConnection.status == "active",
-                    ))).scalars().all())
+            # Organization tokens live under owner id = domain id. Only when an active shared token exists is the
+            # caller's domain located (one directory read, done with no SQL session open); membership is enforced by
+            # the visible-row listing and by the member's own activation, so a failed lookup only leaves them out.
+            shared_servers = {
+                server.id: server.owner_domain_id for server in (await session.execute(
+                    select(ChatMcpServer).join(
+                        ChatMcpOAuthConnection, ChatMcpOAuthConnection.mcp_server_id == ChatMcpServer.id
+                    ).where(
+                        ChatMcpServer.scope == "domain", ChatMcpServer.auth_mode == "oauth",
+                        ChatMcpServer.is_active.is_(True), ChatMcpOAuthConnection.status == "active",
+                        ChatMcpOAuthConnection.owner_user_id == ChatMcpServer.owner_domain_id,
+                        ChatMcpOAuthConnection.owner_project_id == ChatMcpServer.owner_domain_id,
+                    )
+                )).scalars().all()
+            }
+        domain_id = None
+        if shared_servers:
+            from lumen.services.mcp_domain_authority import project_domain_id
+
+            try:
+                domain_id = await project_domain_id(namespace.project_id)
+            except Exception:
+                logger.warning("organization MCP tokens skipped: project domain unavailable", exc_info=True)
+        domain_ids = [server_id for server_id, owner in shared_servers.items() if owner == domain_id]
+        async with _session() as session:
+            if domain_ids:
+                rows.extend((await session.execute(select(ChatMcpOAuthConnection).where(
+                    ChatMcpOAuthConnection.mcp_server_id.in_(domain_ids),
+                    ChatMcpOAuthConnection.owner_user_id == domain_id,
+                    ChatMcpOAuthConnection.owner_project_id == domain_id,
+                    ChatMcpOAuthConnection.status == "active",
+                ))).scalars().all())
             if not rows:
                 return ()
             activations = await _owner_activations(session, namespace.user_id, namespace.project_id)

@@ -1,6 +1,11 @@
 """Catalog-backed personal and exact-domain MCP settings; public views contain no secrets."""
 from __future__ import annotations
 
+import functools
+from collections.abc import Iterator
+from contextlib import contextmanager
+
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
@@ -40,15 +45,42 @@ def managed_profiles() -> dict[str, dict]:
     return result
 
 
-async def authority(principal: dict, domain_id: str | None = None, *, manage: bool = False) -> dict:
+def human(principal: dict) -> bool:
+    """Unrestricted human Keystone session: the only actor that may manage organization state or reach other domains."""
+    return principal.get("auth_type") == "keystone" and not principal.get("credential_restricted")
+
+
+@contextmanager
+def actor(principal: dict) -> Iterator[None]:
+    """Bind the request's humanness for every store/OAuth domain check beneath it."""
+    with es.actor_scope(human=human(principal)):
+        yield
+
+
+def _as_actor(func):
+    @functools.wraps(func)
+    async def wrapper(principal, *args, **kwargs):
+        with actor(principal):
+            return await func(principal, *args, **kwargs)
+
+    return wrapper
+
+
+async def authority(
+    principal: dict, domain_id: str | None = None, *, manage: bool = False, hint: bool = False,
+) -> dict:
+    """Membership always; the (expensive) manager evaluation only when mutating or when a UI hint is requested.
+
+    System-admin cross-domain reach and the manager flag exist only for unrestricted human sessions; API keys and
+    reduced credentials get plain exact-domain membership of their own project's domain.
+    """
+    is_human = human(principal)
     result = await resolve_domain_authority(
         principal["user_id"], principal["project_id"], domain_id,
         credential_authority=credential_authority_snapshot(principal),
+        compute_manage=(manage or hint) and is_human, unrestricted_human=is_human,
     )
-    if not result["is_member"] or (manage and (
-        not result["can_manage"] or principal.get("auth_type") != "keystone"
-        or principal.get("credential_restricted")
-    )):
+    if not result["is_member"] or (manage and (not result["can_manage"] or not is_human)):
         raise es.ExtensionForbidden("Exact domain manager authority required" if manage else "Domain membership required")
     return result
 
@@ -85,11 +117,13 @@ async def _caller_effective(principal: dict, domain_id: str, item_id: int | None
         raise es.ChatStorageUnavailable("chat DB 오류") from exc
 
 
+@_as_actor
 async def domain_connections(principal: dict, domain_id: str) -> list[dict]:
     await authority(principal, domain_id)
     return await _caller_effective(principal, domain_id)
 
 
+@_as_actor
 async def scoped_connection(principal: dict, item_id: int, domain_id: str | None = None, *, manage: bool = False) -> dict:
     if domain_id is not None:
         await authority(principal, domain_id, manage=manage)
@@ -110,6 +144,7 @@ async def scoped_connection(principal: dict, item_id: int, domain_id: str | None
         raise es.ChatStorageUnavailable("chat DB 오류") from exc
 
 
+@_as_actor
 async def create(principal: dict, template_id: str, *, domain_id: str | None = None,
                  label: str | None = None, variables: dict[str, str] | None = None,
                  auth_mode: str | None = None, headers: dict[str, str] | None = None) -> dict:
@@ -124,6 +159,7 @@ async def create(principal: dict, template_id: str, *, domain_id: str | None = N
         raise McpRegistryError("auth_mode does not match the template")
     if (mode == "admin") != bool(headers):
         raise McpRegistryError("Static credentials are required only for auth_mode=admin")
+    _check_header_names(candidate, headers)
     url = catalog._fill_url(candidate, variables)
     connection_label = mcp_connections._label(label, candidate["name"])
     scope = "domain" if domain_id is not None else "user"
@@ -148,8 +184,19 @@ async def create(principal: dict, template_id: str, *, domain_id: str | None = N
         raise es.ChatStorageUnavailable("chat DB 오류") from exc
 
 
+def _check_header_names(candidate: dict, headers: dict[str, str] | None) -> None:
+    """Static credentials may only use header names the registry declares for the template (when it names any)."""
+    allowed = {str(hint["name"]).casefold() for hint in candidate.get("header_hints") or [] if hint.get("name")}
+    unknown = sorted(name for name in (headers or {}) if allowed and name.casefold() not in allowed)
+    if unknown:
+        raise McpRegistryError("이 템플릿이 선언한 헤더 이름만 사용할 수 있습니다: " + ", ".join(sorted(allowed)))
+
+
+@_as_actor
 async def update(principal: dict, item_id: int, patch: dict, *, domain_id: str | None = None) -> dict:
     row = await scoped_connection(principal, item_id, domain_id, manage=True)
+    if patch.get("headers") and row.get("template_key"):
+        _check_header_names(catalog.entry(row["template_key"]), patch["headers"])
     if domain_id is None:
         # Personal static credentials are accepted only for the selected catalog template.
         candidate = catalog.entry(row["template_key"])
@@ -171,26 +218,36 @@ async def _view(principal: dict, item_id: int, domain_id: str | None, fallback: 
     return rows[0] if rows else fallback
 
 
+@_as_actor
 async def delete(principal: dict, item_id: int, *, domain_id: str | None = None) -> None:
     await scoped_connection(principal, item_id, domain_id, manage=True)
     await es.delete("mcp", item_id, requester_user_id=principal["user_id"],
                     requester_project_id=principal["project_id"], domain_id=domain_id)
 
 
+@_as_actor
 async def view(
     principal: dict, *, offset: int = 0, limit: int = 50, q: str | None = None,
     featured: bool | None = None, access: str | None = None, state: str | None = None,
 ) -> dict:
     """Per-user catalog view. Filters apply before pagination: ``q`` matches name/registry_name/description
     case-insensitively; ``state`` filters the computed per-user state."""
-    owner = await authority(principal)
+    try:
+        owner = await authority(principal, hint=True)
+        organization_available = True
+    except (HTTPException, es.ExtensionForbidden):
+        # Personal and global entries stay usable; organization rows are omitted by list_for_user the same way.
+        owner = {"domain_id": None, "can_manage": False}
+        organization_available = False
     rows = await es.list_for_user("mcp", user_id=principal["user_id"], project_id=principal["project_id"])
     linked: dict[str, list[dict]] = {}
     for row in rows:
         connected = row.get("auth_connected", row["auth_mode"] != "oauth")
+        # Connected only counts once the row is also effectively usable by this caller (published + activated).
         row_state = "needs_auth" if not connected else (
-            "personal_connected" if row["scope"] == "user" else "org_connected" if row["scope"] == "domain"
-            else "global_connected" if row["is_active"] else "not_connected"
+            "not_connected" if not row["is_active"]
+            else "personal_connected" if row["scope"] == "user"
+            else "org_connected" if row["scope"] == "domain" else "global_connected"
         )
         linked.setdefault(row.get("template_key") or "", []).append({**row, "state": row_state})
     needle = (q or "").strip().casefold()
@@ -227,14 +284,16 @@ async def view(
     return {"entries": page, "total": len(selected), "offset": offset, "limit": limit,
             "next_offset": offset + limit if offset + limit < len(selected) else None,
             "domain_id": owner["domain_id"], "can_manage_domain": owner["can_manage"],
+            "organization_available": organization_available,
             "custom_connections": linked.get("", [])}
 
 
+@_as_actor
 async def check_oauth_management(principal: dict, item_id: int) -> None:
-    """Keep legacy OAuth routes from granting reduced callers organization management.
+    """Keep legacy OAuth routes from granting reduced callers (or API keys) organization management.
 
-    A storage outage skips this pre-check only: the SQL OAuth store re-checks domain manager authority on the
-    same database before any state, token or revocation is written, so the request still fails closed.
+    Fails closed: a storage outage answers 503 instead of skipping the check, and the SQL OAuth store re-checks with
+    the same request actor (not human => no management), so no path reaches a revocation without both.
     """
     try:
         async with es._require_db()() as session:
@@ -242,7 +301,5 @@ async def check_oauth_management(principal: dict, item_id: int) -> None:
             domain_id = row.owner_domain_id if row is not None and row.scope == "domain" else None
         if domain_id is not None:
             await authority(principal, domain_id, manage=True)
-    except es.ChatStorageUnavailable:
-        return
     except OperationalError as exc:
         raise es.ChatStorageUnavailable("chat DB 오류") from exc

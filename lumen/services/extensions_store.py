@@ -13,6 +13,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -254,6 +257,8 @@ async def mcp_credential_versions(
         return {}
     factory = _require_db()
     try:
+        # Directory read happens with no SQL connection checked out (only a short probe session precedes it).
+        caller_domain = await _caller_domain(factory, user_id, project_id, ids)
         async with factory() as session:
             servers = {
                 row.id: row
@@ -273,13 +278,15 @@ async def mcp_credential_versions(
             }
             for server in servers.values():
                 if server.scope == "domain" and server.auth_mode == "oauth":
-                    await _domain_access(user_id, project_id, server.owner_domain_id)
-                    connection = (await session.execute(select(ChatMcpOAuthConnection).where(
-                        ChatMcpOAuthConnection.mcp_server_id == server.id,
-                        ChatMcpOAuthConnection.owner_user_id == server.owner_domain_id,
-                        ChatMcpOAuthConnection.owner_project_id == server.owner_domain_id,
-                    ))).scalar_one_or_none()
-                    oauth[server.id] = connection
+                    # A member of another domain (or a failed authority read) gets no credential epoch.
+                    shared = None
+                    if caller_domain is not None and caller_domain == server.owner_domain_id:
+                        shared = (await session.execute(select(ChatMcpOAuthConnection).where(
+                            ChatMcpOAuthConnection.mcp_server_id == server.id,
+                            ChatMcpOAuthConnection.owner_user_id == server.owner_domain_id,
+                            ChatMcpOAuthConnection.owner_project_id == server.owner_domain_id,
+                        ))).scalar_one_or_none()
+                    oauth[server.id] = shared
             return {
                 server_id: (
                     connection.credential_version
@@ -319,7 +326,10 @@ async def validated_frozen_selection(
         if not isinstance(selected, list):
             warnings.append(f"run {kind} selection is invalid")
             continue
-        visible = await list_for_user(kind, user_id=user_id, project_id=project_id, active_only=True)
+        visible = await list_for_user(
+            kind, user_id=user_id, project_id=project_id, active_only=True,
+            include_domain=tuple(mcp_ids) if kind == "mcp" else False,
+        )
         current = {item["id"]: item for item in visible if isinstance(item.get("id"), int)}
         ids: list[int] = []
         for item in selected:
@@ -621,6 +631,7 @@ async def list_for_user(
     active_only: bool = False,
     reveal_secrets: bool = False,
     include_private: bool = True,
+    include_domain: bool | Collection[int] = True,
 ) -> list[dict]:
     """사용자용 — MCP catalogue + 본인 user 스코프; 실행은 유효한 소유자 승인만.
 
@@ -631,14 +642,9 @@ async def list_for_user(
     factory = _require_db()
     serialize = _reveal_mcp if (reveal_secrets and kind == "mcp") else _PUBLIC[kind]
     domain_id = None
-    if kind == "mcp":
-        async with factory() as session:
-            has_domain = (await session.execute(
-                select(ChatMcpServer.id).where(ChatMcpServer.scope == "domain").limit(1)
-            )).first()
-        if has_domain:
-            domain_id = (await _domain_access(user_id, project_id))["domain_id"]
     try:
+        if kind == "mcp":
+            domain_id = await _caller_domain(factory, user_id, project_id, include_domain)
         async with factory() as session:
             global_visible = model.scope == "global"
             if kind != "mcp":
@@ -861,6 +867,8 @@ async def update(
             )
             if kind == "mcp" and row.scope == "user" and not catalog_authorized:
                 _ensure_user_mcp_policy(patch)
+                if row.template_key and ({"url", "transport"} & patch.keys()):
+                    raise ExtensionValidationError("Catalog connections cannot be repointed; delete and recreate")
             _apply_fields(kind, row, patch)
             if kind in {"mcp", "tool"}:
                 row.config_version += 1
@@ -903,10 +911,63 @@ async def delete(
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def _domain_access(user_id: str, project_id: str, domain_id: str | None = None, *, manage: bool = False) -> dict:
+# Whether the current request is an unrestricted human Keystone session. API keys, reduced credentials and background
+# work are never human here, so they cannot use system-admin cross-domain reach or manage organization state.
+_actor_human: ContextVar[bool] = ContextVar("mcp_actor_human", default=False)
+
+
+@contextmanager
+def actor_scope(*, human: bool) -> Iterator[None]:
+    token = _actor_human.set(bool(human))
+    try:
+        yield
+    finally:
+        _actor_human.reset(token)
+
+
+async def _domain_access(
+    user_id: str, project_id: str, domain_id: str | None = None, *, manage: bool = False, human: bool | None = None,
+) -> dict:
+    """Exact domain membership (or manager authority). ``human`` defaults to the request actor, i.e. not human."""
     from lumen.services.mcp_domain_authority import resolve_domain_authority
 
-    authority = await resolve_domain_authority(user_id, project_id, domain_id)
+    is_human = _actor_human.get() if human is None else human
+    if manage and not is_human:
+        raise ExtensionForbidden("Exact domain manager authority required")
+    authority = await resolve_domain_authority(
+        user_id, project_id, domain_id, compute_manage=manage, unrestricted_human=is_human,
+    )
     if not authority["is_member"] or (manage and not authority["can_manage"]):
         raise ExtensionForbidden("Exact domain manager authority required" if manage else "Domain membership required")
     return authority
+
+
+async def _caller_domain(factory, user_id: str, project_id: str, include: bool | Collection[int]) -> str | None:
+    """The caller's organization domain, resolved only when organization rows can matter and tolerant of failure.
+
+    Organization rows are never implicit, so hot paths pass ``False`` or the explicitly selected ids and pay for the
+    Keystone read only when one of those ids is an organization row. Membership only (no manager evaluation).
+    An authority failure hides organization rows; it never fails an unrelated listing or run. The probe uses its own
+    short session that is closed before the directory is read, so a slow Keystone never pins a pool connection.
+    """
+    if include is False:
+        return None
+    probe = select(ChatMcpServer.id).where(ChatMcpServer.scope == "domain")
+    if include is not True:
+        ids = [item for item in include if isinstance(item, int)]
+        if not ids:
+            return None
+        probe = probe.where(ChatMcpServer.id.in_(ids))
+    async with factory() as session:
+        present = (await session.execute(probe.limit(1))).first() is not None
+    if not present:
+        return None
+    from fastapi import HTTPException
+
+    try:
+        return (await _domain_access(user_id, project_id))["domain_id"]
+    except (HTTPException, ExtensionForbidden) as exc:
+        logger.warning(
+            "organization MCP rows hidden: domain authority unavailable (%s)", getattr(exc, "status_code", "denied")
+        )
+        return None

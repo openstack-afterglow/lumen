@@ -577,3 +577,14 @@ async def test_retained_member_cannot_restore_operator_denied_callback_authority
     with pytest.raises(mcp_oauth.McpOAuthError, match="management authority"):
         await mcp_oauth.SqlMcpConnectionStore().consume_state("state-hash")
     authority.assert_awaited_once_with("owner", "project")
+
+
+@pytest.fixture(autouse=True)
+def _organization_row_precheck_needs_no_database(monkeypatch):
+    """These route tests run without SQL; the organization-row OAuth pre-check fails closed on purpose (tested in
+    tests/test_mcp_settings.py), so the route behaviour under test stubs only that lookup."""
+    from unittest.mock import AsyncMock
+
+    from lumen.services import mcp_settings
+
+    monkeypatch.setattr(mcp_settings, "check_oauth_management", AsyncMock(return_value=None))
