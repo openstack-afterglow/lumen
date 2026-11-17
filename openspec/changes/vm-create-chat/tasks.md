@@ -13,5 +13,8 @@
 - [x] Hand shared architecture/changelog/API/operator documentation to coordinator in local://vm-create-chat-notes.md.
 - [x] Run existing Afterglow explicit read/manage consent component tests: 12 passed. No frontend source or rendering changes.
 - [x] Recheck final model-instruction wording with discovery suite: 40 passed; touched-file Ruff passed.
+- [x] Qualify real encrypted PostgreSQL checkpoint recovery with the canonical disposable integration runner: 18 passed (15 existing recovery cases plus approve/deny/revoked VM cases), 7487 deselected, 9.79s. Each new case verifies ciphertext, closes the pool, restores exact pending arguments in fresh interpreters, rejects a different encryption key and resumes only after ledger approval.
+- [x] Check all three production API/worker configurations read-only: six protocol1 settings, configured saver URLs and matching valid key fingerprints; all three API readiness responses report checkpointer=true, and bounded worker logs show saver initialization.
+- [x] Document historical-v1 compatibility and coordinated admission/worker-drain requirements without changing production.
 
-Production protocol-v2 activation, encrypted PostgreSQL-saver/cohort qualification, actual user-grant inspection, real provider execution and live VM/guest readiness are explicitly outside this read-only slice. They are not claimed by these synthetic tests.
+Production protocol-v2 activation, identical production saver-store identity/cohort qualification, actual user-grant inspection, real provider execution and live VM/guest readiness remain unverified. Disposable encrypted PostgreSQL and MariaDB recovery is qualified; it is not production acceptance.
