@@ -9,8 +9,9 @@
     pull: never
     state: started
     restart_policy: unless-stopped
-    network_mode: bridge
-    published_ports: "{{ lumen_clamav_service.ports }}"
+    # Stock Kolla disables Docker bridge/NAT. Bind clamd itself to loopback;
+    # host mode needs neither a bridge nor Docker firewall/port publishing.
+    network_mode: host
     volumes: "{{ lumen_clamav_service.volumes }}"
     env: "{{ lumen_clamav_environment }}"
     memory: "{{ lumen_clamav_memory }}"

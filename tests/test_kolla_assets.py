@@ -1036,7 +1036,7 @@ def test_optional_managed_clamav_preserves_external_configuration():
     managed = _resolved_kolla_defaults(["lumen_clamav_effective_host", "lumen_clamav_service"], {"enable_lumen_clamav": True})
     assert managed["lumen_clamav_effective_host"] == "127.0.0.1"
     service = managed["lumen_clamav_service"]
-    assert service["ports"] == ["127.0.0.1:3310:3310"]
+    assert "ports" not in service
     assert service["volumes"] == ["lumen_clamav_signatures:/var/lib/clamav"]
     assert re.fullmatch(r"clamav/clamav-debian@sha256:[0-9a-f]{64}", service["image"])
     from jinja2 import meta
@@ -1056,7 +1056,8 @@ def test_managed_clamav_is_ready_before_application_start_and_retains_data():
     scanner = yaml.safe_load((ROLE_DIR / "tasks/clamav.yml").read_text())
     container = scanner[0]["community.docker.docker_container"]
     assert container["pull"] == "never"
-    assert container["network_mode"] == "bridge"
+    assert container["network_mode"] == "host"
+    assert "published_ports" not in container
     for setting in ("memory", "memory_swap", "cpus", "pids_limit"):
         assert container[setting].startswith("{{ lumen_clamav_")
     assert container["cap_drop"] == ["ALL"]
@@ -1073,12 +1074,15 @@ def test_managed_clamav_is_ready_before_application_start_and_retains_data():
     assert environment["CLAMAV_NO_FRESHCLAMD"] == "false"
     assert environment["CLAMD_CONF_AlertExceedsMax"] == "yes"
     assert not set(environment) & {"DATABASE_URL", "REDIS_URL", "LUMEN_ENCRYPTION_KEY", "CHAT_ASSET_S3_SECRET_KEY"}
+    assert environment["CLAMD_CONF_TCPAddr"] == "127.0.0.1"
+    assert str(environment["CLAMD_CONF_TCPSocket"]) == "3310"
 
 
 @pytest.mark.parametrize("overrides, accepted", [
     ({}, True),
     ({"lumen_clamav_bind_address": "0.0.0.0"}, False),
     ({"lumen_clamav_host": "external.invalid"}, False),
+    ({"lumen_clamav_port": 13310}, False),
     ({"lumen_clamav_image_ref": "clamav/clamav-debian:latest@sha256:" + "a" * 64}, False),
     ({"lumen_clamav_image_ref": "clamav/clamav-debian:latest"}, False),
     ({"lumen_clamav_port": 0}, False),

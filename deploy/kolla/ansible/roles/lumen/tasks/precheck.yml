@@ -66,7 +66,7 @@
     that:
       - lumen_clamav_bind_address == '127.0.0.1'
       - lumen_clamav_host in ['', lumen_clamav_bind_address]
-      - lumen_clamav_port | int > 0 and lumen_clamav_port | int <= 65535
+      - lumen_clamav_port | int == 3310
       - lumen_clamav_image_ref is match('^[^\\s@]+:[0-9]+\\.[0-9]+\\.[0-9]+@sha256:[0-9a-f]{64}$')
       - lumen_clamav_volume is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
       - lumen_clamav_memory is match('^[1-9][0-9]*[mg]$')
