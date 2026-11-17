@@ -372,8 +372,70 @@ def _project_run_activity(events: list, *, durations_ms: dict[str, int]) -> list
     """Project durable, display-safe reasoning and tool events in journal order."""
     activity: list[dict] = []
     by_id: dict[str, dict] = {}
+    tool_started_at = {}
     for event in events:
         payload = event.payload.model_dump(mode="json")
+        base = {"seq": event.seq, "createdAt": _iso(event.created_at)}
+        if event.type == "run.started":
+            activity.append({**base, "id": f"started:{event.seq}", "kind": "started"})
+        elif event.type == "run.stage.changed":
+            activity.append({
+                **base, "id": f"stage:{event.seq}", "kind": "stage",
+                "stage": payload["stage"], "toolName": payload.get("tool_name"),
+            })
+        elif event.type == "context.updated" and payload["phase"] in {"compacting", "compacted"}:
+            activity.append({
+                **base, "id": f"context:{event.seq}", "kind": "context",
+                "phase": payload["phase"], "cause": payload.get("cause"),
+                "beforeTokens": payload.get("before_tokens"), "afterTokens": payload.get("after_tokens"),
+            })
+        elif event.type == "tool.approval_required":
+            item = {
+                **base, "id": f"approval:{payload['call_id']}", "kind": "approval",
+                "callId": payload["call_id"], "name": payload["name"],
+                "arguments": payload["redacted_arguments"], "preview": payload["preview"],
+                "effect": payload["effect"], "destination": payload.get("destination"),
+                "expiresAt": payload["expires_at"], "decision": None, "decidedAt": None,
+            }
+            by_id[item["id"]] = item
+            activity.append(item)
+        elif event.type == "tool.approval_resolved":
+            item = by_id.get(f"approval:{payload['call_id']}")
+            if item is not None:
+                item["decision"] = payload["decision"]
+                item["decidedAt"] = payload["decided_at"]
+        elif event.type == "child.created":
+            item = {
+                **base, "id": f"child:{payload['child_run_id']}", "kind": "child",
+                "childRunId": payload["child_run_id"], "callId": payload["call_id"],
+                "waitGroupId": payload["wait_group_id"], "agentId": payload["agent_id"],
+                "access": payload["access"], "ordinal": payload["ordinal"],
+                "initialStatus": payload["status"], "status": "requested",
+                "errorCode": None, "summary": "", "artifacts": [],
+            }
+            by_id[item["id"]] = item
+            activity.append(item)
+        elif event.type == "child.completed":
+            key = f"child:{payload['child_run_id']}"
+            item = by_id.get(key)
+            if item is None:
+                item = {
+                    **base, "id": key, "kind": "child", "childRunId": payload["child_run_id"],
+                    "callId": payload["call_id"], "waitGroupId": payload["wait_group_id"],
+                    "agentId": None, "access": None, "ordinal": None, "initialStatus": None,
+                }
+                by_id[key] = item
+                activity.append(item)
+            item.update(
+                status=payload["status"], errorCode=payload.get("error_code"),
+                summary=payload.get("summary", ""), artifacts=payload.get("artifacts", []),
+            )
+        elif event.type in {"run.completed", "run.failed", "run.canceled"}:
+            activity.append({
+                **base, "id": f"terminal:{event.seq}", "kind": "terminal",
+                "status": payload["status"], "errorCode": payload.get("error_code"),
+                "message": payload.get("safe_message"),
+            })
         if event.type == "part.delta" and payload.get("part_type") == "reasoning":
             key = f"reasoning:{payload['message_id']}:{payload['part_index']}"
             item = by_id.get(key)
@@ -409,6 +471,7 @@ def _project_run_activity(events: list, *, durations_ms: dict[str, int]) -> list
             else:
                 item["text"] = part.get("text", item["text"])
         elif event.type == "tool.call.started":
+            tool_started_at[payload["call_id"]] = event.created_at
             source = payload.get("source")
             item = {
                 "id": f"tool:{payload['call_id']}",
@@ -455,7 +518,11 @@ def _project_run_activity(events: list, *, durations_ms: dict[str, int]) -> list
             item["status"] = payload["status"]
             item["content"] = payload["content"]
             item["errorCode"] = payload.get("error_code")
-            item["durationMs"] = durations_ms.get(payload["call_id"])
+            duration = durations_ms.get(payload["call_id"])
+            started = tool_started_at.get(payload["call_id"])
+            item["durationMs"] = duration if duration is not None else (
+                max(0, int((event.created_at - started).total_seconds() * 1000)) if started else None
+            )
     return sorted(activity, key=lambda item: int(item["seq"]))
 
 
@@ -935,6 +1002,24 @@ async def list_message_page(
                         "run_id": run.id,
                         "status": run.status,
                         "retryable": run.status in {"failed", "canceled"},
+                    }
+
+            # The indexed history endpoint must retain the same journal as live SSE.
+            # Resolve only final assistant IDs in this bounded page, including owned forks.
+            assistant_ids = [row.ChatMessage.id for row in page if row.ChatMessage.role == "assistant"]
+            if assistant_ids:
+                runs = (await session.execute(select(ChatRun).where(
+                    ChatRun.assistant_message_id.in_(assistant_ids),
+                    ChatRun.user_id == user_id,
+                    ChatRun.project_id == project_id,
+                ))).scalars()
+                for run in runs:
+                    execution_by_message[run.assistant_message_id] = {
+                        "run_id": run.id,
+                        "status": run.status,
+                        "activity": _project_run_activity(
+                            await replay_events(session, run, after_seq=0), durations_ms={},
+                        ),
                     }
 
             messages: list[dict] = []
