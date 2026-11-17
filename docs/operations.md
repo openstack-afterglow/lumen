@@ -457,6 +457,32 @@ Lumen의 root `lumen` wheel은 Kolla 역할을 shared data로 포함한다. Koll
 - **최초 배포 명령어**: 새 bootstrap CLI를 포함한 이미지/source pin을 준비한 뒤 `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 image pull/source build, precheck, config, database/Keystone preconditions, DB migration(`lumen_bootstrap`), provider 등록(`lumen_provider_bootstrap`), container startup을 순차 실행한다. Standalone `precheck`/`config`는 exact release image가 각 lumen host에 이미 있어야 하며 암묵적 registry pull을 하지 않는다.
 - **PostgreSQL 모드 선택**: 기본값 `lumen_postgres_mode="external"`은 `lumen_external_postgres_url`이 반드시 필요하다. 역할이 PostgreSQL을 관리하게 하려면 `/etc/kolla/config/afterglow/globals.yml`에서 `lumen_postgres_mode: "bundled"`를 선택하고 `secrets.yml`에 강한 `lumen_postgres_password`를 제공한다. 둘 중 하나를 명시하지 않은 stock defaults는 precheck에서 fail-closed 한다.
 
+### 선택적 컨트롤러별 ClamAV
+
+기본 `enable_lumen_clamav: false`는 기존 외부 검사기(`lumen_clamav_host`, `lumen_clamav_port`)를 그대로 사용한다. `true`로 켜면 `lumen` 그룹의 각 컨트롤러에 `lumen_clamav`를 생성하며, API/worker의 host network와 같은 호스트의 `127.0.0.1:3310`으로 연결한다. Stock Kolla는 Docker bridge/NAT를 끌 수 있으므로 검사기는 **host network**이고 clamd 자체의 `TCPAddr`를 loopback으로 제한한다. Docker bridge·포트 publication·HAProxy listener를 만들거나 Docker daemon의 iptables/forwarding을 변경하지 않는다. 원격 worker guest의 loopback은 다른 호스트이므로 별도의 외부 검사기 구성이 필요하다.
+
+```yaml
+enable_lumen_clamav: true
+lumen_clamav_host: ""  # managed mode에서는 외부 host override를 비운다
+lumen_clamav_bind_address: "127.0.0.1"
+lumen_clamav_port: 3310
+lumen_clamav_image_ref: "clamav/clamav-debian:1.4.6@sha256:806639a6e3a45ae1d6f3932722c3e016e5b93452f93d444538f697c39d6af16b"
+lumen_clamav_volume: "lumen_clamav_signatures"
+lumen_clamav_memory: "4g"
+lumen_clamav_cpus: 2
+lumen_clamav_pids_limit: 256
+lumen_clamav_ready_retries: 180
+lumen_clamav_signature_max_age_hours: 72
+```
+
+버전과 immutable digest를 함께 고정한다. 관리 모드의 port는 공식 image의 clamd 설정과 일치하는3310으로 고정한다(외부 검사기 모드의 custom port는 유지). Kolla precheck는 public bind·외부 host 충돌·다른 managed port·mutable image·무제한 자원 설정을 거부한다. 서명은 컨트롤러별 named volume에 영속하며 updater는 매시간 실행하고 clamd는30초마다 변경을 재확인한다. 검사기는 DB/Keystone/S3/provider credentials를 받지 않는다. 컨트롤러당4GiB/2CPU quota를 예약하고, signature reload 중 메모리 중복·cold download 지연을 고려한다.
+
+**Egress와 readiness:** 각 컨트롤러의 DNS 및 `database.clamav.net` HTTPS egress가 필요하다. 서명 CDN의 단순 `curl HEAD`403은 실제 Freshclam 성공도 실패도 확정하지 않으므로 updater의 실제 결과를 확인한다. 프로세스 또는 TCP port가 열렸다는 이유로 ready로 간주하지 않는다. `start.yml`은 API/worker 시작 전에 host-side `validate_clamav.py`로 PING/PONG, VERSION의 양수 서명 version과 build date를 확인한다. 서명은 기본72시간 이내여야 하며 미래5분 초과·누락·손상·truncated 응답은 실패한다. 최대 허용 age는 운영자가1–168시간 범위에서 정하며 기본 재시도는180회/5초 간격이다(각 socket 작업 timeout 별도). Stale bundled DB, 다운로드 실패 또는 미반영 reload는 배포를 차단한다. 가짜 signature 생성, age 완화나 scan 우회로 실패를 숨기지 않는다. 기존 실행 중인 앱을 자동 정지하지 않으므로 승인된 drain/cutover 절차는 별도로 수행한다.
+
+**승인된 rollout:** 기존 operator 설정·이미지·S3·schema·암호화/checkpointer identity를 보존하고 검토된 wheel/role을 같은 Kolla environment에 설치한다. `pull → prechecks → reconfigure --tags lumen --skip-tags haproxy`를 첫 컨트롤러에서 수행하고, scanner image/resource/listen 주소와 실제 Freshclam/PING/VERSION·렌더된 `chat_clamav_host`를 확인한 뒤 나머지 컨트롤러로 진행한다. 정상 media smoke는 별도 승인 예산을 따르며 EICAR는 운영으로 보내지 않는다.
+
+**Rollback:** 관리 모드를 유지할 때는 이전에 검증한 image digest와 설정을 복원해 같은 role로 reconfigure하고 서명 volume은 보존한다. 외부 검사기로 복원하려면 `enable_lumen_clamav:false`와 원래 private `lumen_clamav_host`를 설정한 뒤 앱을 reconfigure한다. 외부 host도 비우면 asset pipeline은 fail-closed다. 비활성화는 기존 scanner/서명을 암묵적으로 삭제하지 않는다. Scanner만 제거하려면 정확한 호스트에 `include_role: {name: lumen, tasks_from: destroy}`를 `lumen_services: {}`, `enable_lumen_clamav:true`와 함께 실행해 앱 loop를 비우고 named scanner만 제거한다. Volume은 유지된다. 일반 `kolla-ansible destroy --tags lumen`는 API/worker도 제거하므로 scanner-only 정리에 사용하지 않는다.
+
 ### 2. 독립 wheel/image release
 #### 0.6.8 published and deployed (2026-10-14)
 

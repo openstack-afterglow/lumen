@@ -24,6 +24,7 @@ from lumen.services.providers.credentials import (
     api_model_name,
     canonical_subscription_model_name,
 )
+from lumen.services.providers.realtime_transport import _GEMINI_REALTIME_MODELS, _OPENAI_REALTIME_KINDS
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +349,13 @@ def _gemini_parse_page(payload: Any) -> _PageResult:
 
 def _catalog_kind(provider_type: str, model_id: str) -> Literal["text", "image", "tts", "stt", "realtime", "embedding"] | None:
     """Exact catalog operation hint, never an execution or price guarantee."""
+    # The frozen catalog calls realtime transcription audio_transcription (or
+    # omits it). Our exact executable transport families determine the UI kind,
+    # not a name heuristic and never an inferred execution/price guarantee.
+    api_name = api_model_name(model_id, provider_type)
+    if ((provider_type == "openai" and api_name in _OPENAI_REALTIME_KINDS)
+            or (provider_type == "gemini" and api_name in _GEMINI_REALTIME_MODELS)):
+        return "realtime"
     return _MODEL_MODES.get(catalog_model_metadata(model_id, provider_type).get("mode"))
 
 

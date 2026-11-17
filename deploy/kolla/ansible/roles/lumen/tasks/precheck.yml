@@ -61,6 +61,24 @@
     - enable_lumen | bool
     - lumen_public_haproxy_enabled | bool
 
+- name: Precheck | Validate optional per-controller ClamAV isolation and immutable image
+  ansible.builtin.assert:
+    that:
+      - lumen_clamav_bind_address == '127.0.0.1'
+      - lumen_clamav_host in ['', lumen_clamav_bind_address]
+      - lumen_clamav_port | int == 3310
+      - lumen_clamav_image_ref is match('^[^\\s@]+:[0-9]+\\.[0-9]+\\.[0-9]+@sha256:[0-9a-f]{64}$')
+      - lumen_clamav_volume is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+      - lumen_clamav_memory is match('^[1-9][0-9]*[mg]$')
+      - lumen_clamav_cpus | float > 0 and lumen_clamav_cpus | float <= 64
+      - lumen_clamav_pids_limit | int >= 64 and lumen_clamav_pids_limit | int <= 1024
+      - lumen_clamav_ready_retries | int >= 1 and lumen_clamav_ready_retries | int <= 360
+      - lumen_clamav_signature_max_age_hours | int >= 1 and lumen_clamav_signature_max_age_hours | int <= 168
+    fail_msg: "Managed ClamAV requires a loopback-only listener, no conflicting external scanner, a version+SHA256 image, resource limits and bounded fresh-signature readiness"
+  when:
+    - enable_lumen | bool
+    - enable_lumen_clamav | bool
+
 - name: Precheck | Verify Lumen PostgreSQL mode
   ansible.builtin.assert:
     that:
@@ -152,7 +170,7 @@
             server_side_encryption: "{{ lumen_s3_server_side_encryption }}"
             kms_key_id: "{{ lumen_s3_kms_key_id }}"
           scanner:
-            host: "{{ lumen_clamav_host }}"
+            host: "{{ lumen_clamav_effective_host }}"
             port: "{{ lumen_clamav_port }}"
       register: lumen_runtime_precheck_result
       changed_when: false

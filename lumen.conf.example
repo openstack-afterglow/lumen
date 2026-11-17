@@ -281,6 +281,12 @@ chat_asset_s3_region = "default"
 chat_asset_s3_server_side_encryption = ""
 chat_asset_s3_kms_key_id = ""
 chat_asset_signed_url_ttl_seconds = 300
+# External scanner: supply its private reachable host below. For Kolla's optional
+# per-controller scanner set enable_lumen_clamav=true in inventory instead;
+# leave lumen_clamav_host empty there. The role publishes clamd only on loopback
+# and waits for PING plus loaded signatures <=72 hours old before starting apps.
+# Kolla pins lumen_clamav_image_ref by version+digest; freshclam needs HTTPS/DNS
+# egress to the signature mirrors. Do not bypass scanning if it cannot update.
 chat_clamav_host = ""
 chat_clamav_port = 3310
 chat_sandbox_workspace_url = ""

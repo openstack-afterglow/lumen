@@ -600,3 +600,30 @@ async def test_gemini_image_generation_and_bidi_are_not_registered_as_text(monke
     assert [(candidate["model_kind"], candidate["purpose"]) for candidate in result["candidates"]] == [
         ("image", "non_chat"), ("realtime", "non_chat"),
     ]
+
+
+async def test_exact_realtime_transcription_routes_override_file_stt_catalog_hints(monkeypatch):
+    from lumen.services import provider_metadata
+    from lumen.services.providers import realtime_transport
+
+    _provider(monkeypatch, provider_type="openai")
+    _no_static(monkeypatch)
+    # The real frozen catalog misclassifies whisper and omits live-transcribe.
+    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {
+        "gpt-realtime-whisper": {"mode": "audio_transcription", "litellm_provider": "openai"},
+    })
+    names = ["gpt-realtime-whisper", "gpt-live-transcribe"]
+    _transport(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": name} for name in names]}))
+    result = await model_discovery.discover_models(1)
+    assert [(candidate["id"], candidate["model_kind"], candidate["purpose"]) for candidate in result["candidates"]] == [
+        (name, "realtime", "non_chat") for name in names
+    ]
+    for name in names:
+        route = {"model_kind": "realtime", "provider_type": "openai", "api_model_name": name,
+                 "api_base": None, "api_key": "fixture", "provider_auth": None,
+                 "media_pricing": {"billing_basis": "duration", "realtime_input_per_minute": "0.017"}}
+        assert realtime_transport.realtime_kind(route) == "transcription"
+        assert realtime_transport.realtime_route_ready(route)
+        assert realtime_transport.upstream_connection_spec(route)[0] == "wss://api.openai.com/v1/realtime?intent=transcription"
+    assert model_discovery._catalog_candidate("gemini", "gpt-live-transcribe").model_kind is None
+    assert model_discovery._catalog_candidate("openai", "gpt-live-transcribe-unverified").model_kind is None

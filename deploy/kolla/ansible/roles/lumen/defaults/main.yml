@@ -144,6 +144,46 @@ lumen_s3_kms_key_id: ""
 lumen_clamav_host: ""
 lumen_clamav_port: 3310
 
+# Optional per-controller scanner. External lumen_clamav_host remains unchanged
+# when disabled. Never publish the unauthenticated clamd protocol on an API/VIP.
+enable_lumen_clamav: false
+lumen_clamav_image_ref: "clamav/clamav-debian:1.4.6@sha256:806639a6e3a45ae1d6f3932722c3e016e5b93452f93d444538f697c39d6af16b"
+lumen_clamav_bind_address: "127.0.0.1"
+lumen_clamav_effective_host: "{{ lumen_clamav_bind_address if enable_lumen_clamav | bool else lumen_clamav_host }}"
+lumen_clamav_volume: "lumen_clamav_signatures"
+lumen_clamav_memory: "4g"
+lumen_clamav_cpus: 2
+lumen_clamav_pids_limit: 256
+lumen_clamav_ready_retries: 180
+lumen_clamav_signature_max_age_hours: 72
+lumen_clamav_service:
+  container_name: lumen_clamav
+  # Docker modules require repository@digest, not repository:tag@digest. Keep
+  # the explicit release version in the operator pin above, execute by digest.
+  image: "{{ lumen_clamav_image_ref | regex_replace(':[^/:@]+@', '@') }}"
+  volumes: ["{{ lumen_clamav_volume }}:/var/lib/clamav"]
+  healthcheck:
+    test: ["CMD-SHELL", "test \"$(printf 'PING\\n' | nc -w 5 127.0.0.1 {{ lumen_clamav_port }})\" = PONG"]
+    interval: 30s
+    timeout: 10s
+    start_period: 10m
+    retries: 3
+lumen_clamav_environment:
+  # Keep the updater enabled; the cold image's bundled databases are not fresh.
+  CLAMAV_NO_FRESHCLAMD: "false"
+  FRESHCLAM_CHECKS: "24"
+  CLAMD_CONF_TCPAddr: "{{ lumen_clamav_bind_address }}"
+  CLAMD_CONF_TCPSocket: "{{ lumen_clamav_port | string }}"
+  # The updater can finish before clamd's initial load and miss NotifyClamd.
+  # Recheck on disk promptly instead of waiting the upstream 600 seconds.
+  CLAMD_CONF_SelfCheck: "30"
+  CLAMD_CONF_MaxThreads: "2"
+  CLAMD_CONF_MaxQueue: "8"
+  CLAMD_CONF_StreamMaxLength: "512M"
+  CLAMD_CONF_MaxFileSize: "512M"
+  CLAMD_CONF_MaxScanSize: "512M"
+  CLAMD_CONF_AlertExceedsMax: "yes"
+
 # Lumen Sandbox & External Chat API Hosts
 lumen_sandbox_api_key: ""
 lumen_chat_api_hosts: ""
