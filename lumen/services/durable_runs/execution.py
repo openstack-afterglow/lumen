@@ -2521,6 +2521,15 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         )
         feature_options = payload.get("features")
         tool_policy = feature_options.get("tool_policy") if isinstance(feature_options, dict) else None
+        from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
+
+        try:
+            sandbox_tools = validate_selection(capability_snapshot.get("sandbox_tools", []))
+        except SandboxSelectionError as exc:
+            raise DurableRunInputError(exc.code) from exc
+        selected_names = tool_policy.get("enabled_sandbox_tools", []) if isinstance(tool_policy, dict) else []
+        if selected_names != [item["name"] for item in sandbox_tools]:
+            raise DurableRunInputError("sandbox_selection_invalid")
         approval_mode = tool_policy.get("approval_mode") if isinstance(tool_policy, dict) else None
         workspace_write_mode = (
             tool_policy.get("workspace_write_mode")
@@ -2597,6 +2606,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             plugin_tool_snapshots=tuple(plugin_tool_snapshots),
             delegation_enabled=delegation_enabled,
             sandbox_lease=sandbox_lease,
+            sandbox_tools=sandbox_tools,
         ).__aiter__()
         next_event_task = asyncio.create_task(anext(engine_iterator))
         lease_lost_wait_task = asyncio.create_task(lease_lost.wait())

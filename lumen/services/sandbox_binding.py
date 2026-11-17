@@ -302,6 +302,7 @@ async def ensure_sandbox_for_run(
     from lumen.db import get_session_factory
     from lumen.services.durable_runs.budgets import BudgetExceeded, LockOrder, lock_project_quota, reserve
     from lumen.services.infrastructure.store import ResourceUnavailable, assign_sandbox
+    from lumen.services.sandbox_selection import SandboxSelectionError, selected_pool
 
     factory = get_session_factory()
     if factory is None:
@@ -342,6 +343,13 @@ async def ensure_sandbox_for_run(
                 or any(value is not None and value.replace(tzinfo=UTC) <= now
                        for value in (run.deadline_at, root.deadline_at))):
             raise SandboxDispatchError("run_lease_invalid", "run lease is no longer active")
+        try:
+            selected = selected_pool((run.capability_snapshot or {}).get("sandbox_tools", []),
+                                     config=settings.runtime_config)
+        except SandboxSelectionError as exc:
+            raise SandboxDispatchError(exc.code, "sandbox selection is no longer valid") from exc
+        if (selected != pool_name or root.project_id != run.project_id or root.user_id != run.user_id):
+            raise SandboxDispatchError("sandbox_tool_unselected", "sandbox pool was not selected for this run")
         deadline = min(
             run.deadline_at.replace(tzinfo=UTC) if run.deadline_at is not None else now + timedelta(seconds=1800),
             now + timedelta(seconds=pool.max_lifetime_seconds),
@@ -530,7 +538,7 @@ def _kubernetes_binding_fingerprint(pool_name: str, profile_id: str) -> str:
     identity = {
         "enabled": config.enabled, "deployment_id": config.deployment_id, "controller_url": config.controller_url,
         "pool_digest": pool.digest(), "profile_id": profile_id,
-        "cluster": cluster.model_dump(mode="json", exclude={"bearer_token", "ca_file", "qualification_file"}),
+        "cluster": cluster.model_dump(mode="json", exclude={"bearer_token", "drover", "ca_file", "qualification_file"}),
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -630,11 +638,16 @@ def kubernetes_mcp_binding(
     profile_id: str,
     tool_def: ToolDefinition,
     pool_name: str,
+    sandbox_tools: list[dict[str, str]] | None = None,
 ) -> ToolBinding:
     fingerprint = _kubernetes_binding_fingerprint(pool_name, profile_id)
+    from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
+
+    frozen_selection = [dict(item) for item in sandbox_tools] if sandbox_tools is not None else []
 
     async def execute(arguments: dict[str, Any], context: object) -> ToolExecutionResult:
-        if (not isinstance(context, ToolContext) or context.run_id != ctx.run_id or context.run_id is None
+        if (not isinstance(context, ToolContext) or not context.tools_enabled
+                or context.run_id != ctx.run_id or context.run_id is None
                 or context.project_id != ctx.project_id or context.user_id != ctx.user_id):
             return ToolExecutionResult(
                 status="failed",
@@ -645,6 +658,13 @@ def kubernetes_mcp_binding(
         try:
             if _kubernetes_binding_fingerprint(pool_name, profile_id) != fingerprint:
                 raise SandboxDispatchError("sandbox_configuration_changed", "sandbox execution identity changed")
+            try:
+                selected = validate_selection(frozen_selection)
+            except SandboxSelectionError as exc:
+                raise SandboxDispatchError(exc.code, "sandbox selection is no longer valid") from exc
+            if not any(item["name"] == tool_def.name and item["pool"] == pool_name
+                       and item["profile"] == profile_id for item in selected):
+                raise SandboxDispatchError("sandbox_tool_unselected", "sandbox tool was not selected for this run")
             status = await execute_mcp_in_sandbox(
                 run_id=context.run_id,
                 lease_owner=lease_owner,

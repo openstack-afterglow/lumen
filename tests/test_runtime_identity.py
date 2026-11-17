@@ -297,10 +297,12 @@ async def test_fixed_worker_dispatch_authorization_and_rejection(monkeypatch):
         id=run_id, lease_owner="worker1#1", lease_fence=1, status="running",
         cancel_requested_at=None, lease_expires_at=now + timedelta(minutes=5),
         assigned_resource_id=resource_id, root_run_id=None, worker_registration_id="reg-1",
+        deadline_at=None,
     )
     resource = SimpleNamespace(
         id=resource_id, generation=1, run_id=run_id, role="sandbox", observed_state="ready",
         desired_state="requested", address="10.0.0.5", port=8013, certificate_fingerprint="s" * 64,
+        backend="nova", deadline_at=None, certificate_not_after=None,
     )
     registration = SimpleNamespace(
         id="reg-1", resource_id=None, certificate_fingerprint="f" * 64,
@@ -340,6 +342,16 @@ async def test_fixed_worker_dispatch_authorization_and_rejection(monkeypatch):
     assert grant.address == "10.0.0.5"
     assert grant.certificate_fingerprint == "s" * 64
     assert grant.capability
+    code_body = {
+        "run_id": run_id, "call_id": "nova-code", "fence": 1, "language": "python",
+        "source": "print(1)", "timeout_seconds": 10, "workspace_revision": 0,
+    }
+    code_grant = await dispatch.authorize_dispatch(
+        config, client_identity="spiffe://lumen/fixed-worker/worker1", client_fingerprint="f" * 64,
+        run_id=run_id, lease_owner="worker1#1", resource_id=resource_id, generation=1,
+        method="POST", path="/v1/executions", call_id="nova-code", workspace_revision=0, body=code_body,
+    )
+    assert code_grant.capability
 
     with pytest.raises(DispatchRejected, match="dispatch unavailable"):
         await dispatch.authorize_dispatch(

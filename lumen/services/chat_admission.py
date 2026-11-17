@@ -151,6 +151,8 @@ def _require_execution_capability(
 
     capabilities = resolved.get("capabilities") or {}
     allowed_combinations = capabilities.get("allowed_output_combinations")
+    if features.tool_policy.enabled_sandbox_tools and not capabilities.get("function_calling"):
+        raise HTTPException(status_code=422, detail="sandbox_tools_function_calling_required")
     if allowed_combinations and list(features.output_modalities) not in allowed_combinations:
         raise HTTPException(status_code=422, detail="requested chat output combination is not available")
     if features.tool_policy.mode == "none" and (
@@ -1002,6 +1004,22 @@ async def _project_agent_quota(project_id: str) -> dict[str, Any]:
         "max_credit_reservation": Decimal(str(row.max_credit_reservation)),
     }
 
+def _freeze_sandbox_tools(features: ChatFeatureOptions) -> list[dict[str, str]]:
+    """Freeze explicitly selected local tools without creating runtime resources."""
+    if not features.tool_policy.enabled_sandbox_tools:
+        return []
+    from lumen.services.checkpointer import chat_checkpointer
+    from lumen.services.sandbox_selection import SandboxSelectionError, freeze_selection
+
+    if get_settings().chat_execution_protocol_version != 2 or not chat_checkpointer.available:
+        raise HTTPException(status_code=503, detail="sandbox_tool_unavailable")
+    try:
+        return freeze_selection(features.tool_policy.enabled_sandbox_tools)
+    except SandboxSelectionError as exc:
+        status = 503 if exc.code == "sandbox_tool_unavailable" else 422
+        raise HTTPException(status_code=status, detail=exc.code) from exc
+
+
 
 def _agent_runtime_prerequisites(execution_mode: str) -> None:
     """`plan`/`code` need protocol v2 + checkpointer; `code` additionally needs an enabled sandbox pool."""
@@ -1086,6 +1104,7 @@ async def prepare_context_input(
             raise HTTPException(status_code=422, detail="requested chat execution mode is not available")
     if execution_mode != "chat":
         _agent_runtime_prerequisites(execution_mode)
+    sandbox_tools = _freeze_sandbox_tools(features)
 
     conv = None
     if conversation_id is not None:
@@ -1229,6 +1248,7 @@ async def prepare_context_input(
         parts=parts,
     )
     capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
+    capability_snapshot["sandbox_tools"] = sandbox_tools
     credential_authority = credential_authority_snapshot(token_info) if token_info is not None else None
     if credential_authority is not None:
         capability_snapshot["credential_authority"] = credential_authority
@@ -1254,6 +1274,20 @@ async def prepare_context_input(
         project_id=project_id,
         plugin_tool_snapshots=plugin_tool_snapshots,
     )
+    if sandbox_tools:
+        from lumen.services.infrastructure.tool_manifest import load_tool_manifest
+
+        pool = get_settings().runtime_config.pool(sandbox_tools[0]["pool"])
+        selected_names = {item["name"] for item in sandbox_tools}
+        for profile in load_tool_manifest(pool.profile.tool_manifest_file, pool.profile.tool_manifest_sha256):
+            for definition in profile.tools:
+                if definition.name in selected_names:
+                    if any(schema["function"]["name"] == definition.name for schema in tool_schemas):
+                        raise HTTPException(status_code=422, detail="sandbox_tool_name_collision")
+                    tool_schemas.append({"type": "function", "function": {
+                        "name": definition.name, "description": definition.description,
+                        "parameters": definition.input_schema,
+                    }})
     context_plan = _context_plan(
         features,
         extension_selection,
