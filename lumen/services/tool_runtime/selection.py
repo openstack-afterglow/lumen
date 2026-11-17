@@ -60,7 +60,8 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
     try:
         # reveal_secrets=True: 실행에는 복호화된 실제 인증 헤더가 필요(API 응답용 마스킹 dict 아님).
         items = await es.list_for_user(
-            "mcp", user_id=ctx.user_id, project_id=ctx.project_id, active_only=True, reveal_secrets=True
+            "mcp", user_id=ctx.user_id, project_id=ctx.project_id, active_only=True, reveal_secrets=True,
+            include_domain=tuple(ctx.selected_mcp_ids) if ctx.selected_mcp_ids else False,
         )
         # An OAuth execution needs admission's exact epoch before refresh/discovery.
         items = [

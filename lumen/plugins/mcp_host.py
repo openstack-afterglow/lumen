@@ -46,9 +46,13 @@ class McpExtensions:
         return await extensions_store.list_for_user("mcp", user_id=namespace.user_id, project_id=namespace.project_id, active_only=True, reveal_secrets=True)
 
     async def resolve(self, kind: str, identifier: int | str, namespace: Namespace) -> dict[str, Any]:
-        if kind != "mcp" or type(identifier) is not int:
+        if kind != "mcp" or type(identifier) is not int or not namespace.project_id:
             raise PermissionError("MCP server identifier is invalid")
-        row = next((row for row in await self.list(kind, namespace) if row["id"] == identifier), None)
+        rows = await extensions_store.list_for_user(
+            "mcp", user_id=namespace.user_id, project_id=namespace.project_id, active_only=True,
+            reveal_secrets=True, include_domain=(identifier,),
+        )
+        row = next((row for row in rows if row["id"] == identifier), None)
         if row is None:
             raise PermissionError("MCP server is unavailable")
         return row

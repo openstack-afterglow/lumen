@@ -40,10 +40,13 @@ def managed_profiles() -> dict[str, dict]:
     return result
 
 
-async def authority(principal: dict, domain_id: str | None = None, *, manage: bool = False) -> dict:
+async def authority(
+    principal: dict, domain_id: str | None = None, *, manage: bool = False, hint: bool = False,
+) -> dict:
+    """Membership always; the (expensive) manager evaluation only when mutating or when a UI hint is requested."""
     result = await resolve_domain_authority(
         principal["user_id"], principal["project_id"], domain_id,
-        credential_authority=credential_authority_snapshot(principal),
+        credential_authority=credential_authority_snapshot(principal), compute_manage=manage or hint,
     )
     if not result["is_member"] or (manage and (
         not result["can_manage"] or principal.get("auth_type") != "keystone"
@@ -124,6 +127,7 @@ async def create(principal: dict, template_id: str, *, domain_id: str | None = N
         raise McpRegistryError("auth_mode does not match the template")
     if (mode == "admin") != bool(headers):
         raise McpRegistryError("Static credentials are required only for auth_mode=admin")
+    _check_header_names(candidate, headers)
     url = catalog._fill_url(candidate, variables)
     connection_label = mcp_connections._label(label, candidate["name"])
     scope = "domain" if domain_id is not None else "user"
@@ -148,8 +152,18 @@ async def create(principal: dict, template_id: str, *, domain_id: str | None = N
         raise es.ChatStorageUnavailable("chat DB 오류") from exc
 
 
+def _check_header_names(candidate: dict, headers: dict[str, str] | None) -> None:
+    """Static credentials may only use header names the registry declares for the template (when it names any)."""
+    allowed = {str(hint["name"]).casefold() for hint in candidate.get("header_hints") or [] if hint.get("name")}
+    unknown = sorted(name for name in (headers or {}) if allowed and name.casefold() not in allowed)
+    if unknown:
+        raise McpRegistryError("이 템플릿이 선언한 헤더 이름만 사용할 수 있습니다: " + ", ".join(sorted(allowed)))
+
+
 async def update(principal: dict, item_id: int, patch: dict, *, domain_id: str | None = None) -> dict:
     row = await scoped_connection(principal, item_id, domain_id, manage=True)
+    if patch.get("headers") and row.get("template_key"):
+        _check_header_names(catalog.entry(row["template_key"]), patch["headers"])
     if domain_id is None:
         # Personal static credentials are accepted only for the selected catalog template.
         candidate = catalog.entry(row["template_key"])
@@ -183,7 +197,7 @@ async def view(
 ) -> dict:
     """Per-user catalog view. Filters apply before pagination: ``q`` matches name/registry_name/description
     case-insensitively; ``state`` filters the computed per-user state."""
-    owner = await authority(principal)
+    owner = await authority(principal, hint=True)
     rows = await es.list_for_user("mcp", user_id=principal["user_id"], project_id=principal["project_id"])
     linked: dict[str, list[dict]] = {}
     for row in rows:

@@ -185,7 +185,7 @@ def _manager(ks, user_id: str, domain_id: str, graph: dict[str, set[str]], globa
 
 def _resolve_domain_authority(
     user_id: str, project_id: str, domain_id: str | None, *, is_system_admin: bool,
-    issued_role_ids: tuple[str, ...] | None,
+    issued_role_ids: tuple[str, ...] | None, compute_manage: bool = True,
 ) -> DomainAuthority:
     try:
         ks = auth._get_admin_ks_client()
@@ -220,7 +220,7 @@ def _resolve_domain_authority(
             "domain_id": target,
             "is_member": True,
             "can_manage": (
-                issued_role_ids is None and not restricted_domain
+                compute_manage and issued_role_ids is None and not restricted_domain
                 and _manager(ks, user_id, target, graph, global_ids)
             ),
         }
@@ -233,6 +233,7 @@ def _resolve_domain_authority(
 
 async def resolve_domain_authority(
     user_id: str, project_id: str, domain_id: str | None = None, *, credential_authority: dict | None = None,
+    compute_manage: bool = True,
 ) -> DomainAuthority:
     """Resolve exact domain access using fresh identity and native role provenance.
 
@@ -248,5 +249,21 @@ async def resolve_domain_authority(
     return await run_in_threadpool(
         _resolve_domain_authority, user_id, project_id, domain_id,
         is_system_admin=credential_authority is None and current["is_system_admin"] is True,
-        issued_role_ids=issued,
+        issued_role_ids=issued, compute_manage=compute_manage,
     )
+
+
+async def project_domain_id(project_id: str) -> str:
+    """The enabled project's live Keystone domain id: one directory read, no membership or role evaluation.
+
+    For callers that already verified membership elsewhere and only need to locate shared domain state.
+    """
+    def read() -> str:
+        ks = auth._get_admin_ks_client()
+        project = _enabled_exact(ks.projects, project_id)
+        domain_id = getattr(project, "domain_id", None)
+        if not isinstance(domain_id, str) or not domain_id:
+            raise ValueError("Current Keystone native domain identity unavailable")
+        return domain_id
+
+    return await run_in_threadpool(read)

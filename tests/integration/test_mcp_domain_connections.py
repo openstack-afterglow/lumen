@@ -36,12 +36,17 @@ async def domain_db(monkeypatch):
     foreign = {"user_id": f"foreign-{suffix}", "project_id": f"pb-{suffix}", "auth_type": "keystone"}
     ids = []
 
-    async def resolve(user_id, project_id, domain_id=None, *, credential_authority=None):
+    async def resolve(user_id, project_id, domain_id=None, *, credential_authority=None, compute_manage=True):
         target = domain_a if project_id == manager["project_id"] else domain_b
         if domain_id is not None and domain_id != target:
             raise HTTPException(403, "wrong domain")
         return {"domain_id": target, "is_member": True,
                 "can_manage": user_id in {manager["user_id"], manager_b["user_id"]} and credential_authority is None}
+
+    async def project_domain(project_id):
+        return domain_a if project_id == manager["project_id"] else domain_b
+
+    monkeypatch.setattr("lumen.services.mcp_domain_authority.project_domain_id", project_domain)
 
     async def access(user_id, project_id, domain_id=None, *, manage=False):
         result = await resolve(user_id, project_id, domain_id)
@@ -240,3 +245,48 @@ async def test_domain_list_and_mutations_report_caller_effective_activation(doma
     assert patched["is_active"] is False and patched["server_is_active"] is False
     again = await mcp_settings.domain_connections(db["member"], db["a"])
     assert again[0]["is_active"] is False, "disable propagates to members on the next read"
+
+
+async def test_authority_outage_never_fails_unrelated_listing_or_implicit_runs(domain_db, monkeypatch):
+    db = domain_db
+    _, created = await create_domain(db)
+    server = created["server"]
+    calls = []
+
+    async def broken(user_id, project_id, domain_id=None, *, manage=False):
+        calls.append((user_id, manage))
+        raise HTTPException(503, "Current Keystone domain authority unavailable")
+
+    monkeypatch.setattr(es, "_domain_access", broken)
+    # Implicit admission (hot path) never asks for the domain: organization rows are never implicit.
+    implicit = await chat_admission._resolve_extension_selection(None, ChatFeatureOptions(), **owner(db["foreign"]))
+    assert server["id"] not in {item["id"] for item in implicit["mcp"]} and calls == []
+    # Explicitly selecting only non-organization ids does not ask either.
+    assert await es.list_for_user("mcp", **owner(db["foreign"]), active_only=True, include_domain=(10**9,)) is not None
+    assert calls == []
+    # The settings list hides organization rows instead of failing with 503.
+    rows = await es.list_for_user("mcp", **owner(db["foreign"]))
+    assert server["id"] not in {row["id"] for row in rows} and len(calls) == 1
+    # An explicit selection of the organization row fails closed (unavailable), not with a stack of Keystone errors.
+    with pytest.raises(HTTPException) as unavailable:
+        await chat_admission._resolve_extension_selection(
+            None, ChatFeatureOptions(tool_policy={"enabled_mcp_ids": [server["id"]]}), **owner(db["member"])
+        )
+    assert unavailable.value.status_code == 404
+    versions = await es.mcp_credential_versions([server["id"]], **owner(db["member"]))
+    assert versions in ({}, {server["id"]: None})
+
+
+async def test_legacy_route_cannot_repoint_a_catalog_connection(domain_db):
+    db = domain_db
+    candidate = template("open")
+    personal = await mcp_settings.create(db["member"], candidate["id"], label=db["suffix"])
+    db["ids"].append(personal["server"]["id"])
+    with pytest.raises(es.ExtensionValidationError):
+        await es.update("mcp", personal["server"]["id"], {"url": "https://attacker.invalid/mcp"},
+                        requester_user_id=db["member"]["user_id"], requester_project_id=db["member"]["project_id"])
+    with pytest.raises(es.ExtensionValidationError):
+        await es.update("mcp", personal["server"]["id"], {"transport": "sse"},
+                        requester_user_id=db["member"]["user_id"], requester_project_id=db["member"]["project_id"])
+    async with db["factory"]() as session:
+        assert (await session.get(ChatMcpServer, personal["server"]["id"])).url == candidate["url"]

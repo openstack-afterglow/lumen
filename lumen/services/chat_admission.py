@@ -431,7 +431,11 @@ async def _resolve_extension_selection(
         # OAuth connector must not be frozen into such a selection.
         implicit_selection = selected_ids is None
         try:
-            visible = await es.list_for_user(kind, user_id=user_id, project_id=project_id, active_only=True)
+            visible = await es.list_for_user(
+                kind, user_id=user_id, project_id=project_id, active_only=True,
+                # Organization rows are never implicit: resolve the domain only for explicitly selected ids.
+                include_domain=tuple(selected_ids) if selected_ids else False,
+            )
             if selected_ids is None:
                 selected_ids = [
                     item["id"] for item in visible

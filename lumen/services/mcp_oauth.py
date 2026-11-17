@@ -348,14 +348,28 @@ class SqlMcpConnectionStore(McpConnectionStore):
                     ChatMcpOAuthConnection.status == "active",
                 )
             )).scalars().all()
-            domain_servers = (await session.execute(select(ChatMcpServer).where(
-                ChatMcpServer.scope == "domain", ChatMcpServer.auth_mode == "oauth",
-                ChatMcpServer.is_active.is_(True),
-            ))).scalars().all()
-            if domain_servers:
-                from lumen.services.extensions_store import _domain_access
-                domain_id = (await _domain_access(namespace.user_id, namespace.project_id))["domain_id"]
-                domain_ids = [server.id for server in domain_servers if server.owner_domain_id == domain_id]
+            # Organization tokens live under owner id = domain id. Locate the caller's domain with one directory read,
+            # and only when an active shared token exists; membership is enforced by the visible-row listing and by the
+            # member's own activation, so this lookup failing merely leaves organization tokens out.
+            shared_servers = (await session.execute(
+                select(ChatMcpServer).join(
+                    ChatMcpOAuthConnection, ChatMcpOAuthConnection.mcp_server_id == ChatMcpServer.id
+                ).where(
+                    ChatMcpServer.scope == "domain", ChatMcpServer.auth_mode == "oauth",
+                    ChatMcpServer.is_active.is_(True), ChatMcpOAuthConnection.status == "active",
+                    ChatMcpOAuthConnection.owner_user_id == ChatMcpServer.owner_domain_id,
+                    ChatMcpOAuthConnection.owner_project_id == ChatMcpServer.owner_domain_id,
+                )
+            )).scalars().all()
+            if shared_servers:
+                from lumen.services.mcp_domain_authority import project_domain_id
+
+                try:
+                    domain_id = await project_domain_id(namespace.project_id)
+                except Exception:
+                    logger.warning("organization MCP tokens skipped: project domain unavailable", exc_info=True)
+                    domain_id = None
+                domain_ids = [server.id for server in shared_servers if server.owner_domain_id == domain_id]
                 if domain_ids:
                     rows.extend((await session.execute(select(ChatMcpOAuthConnection).where(
                         ChatMcpOAuthConnection.mcp_server_id.in_(domain_ids),

@@ -6,6 +6,7 @@ import pytest
 
 from lumen.services import extensions_store as es
 from lumen.services import mcp_settings
+from lumen.services.mcp_registry_model import McpRegistryError
 
 
 def principal(**changes):
@@ -25,7 +26,7 @@ async def test_exact_domain_authority_matrix(monkeypatch, member, manager, manag
     else:
         with pytest.raises(es.ExtensionForbidden):
             await mcp_settings.authority(principal(), "a", manage=manage)
-    lookup.assert_awaited_once_with("user", "project", "a", credential_authority=None)
+    lookup.assert_awaited_once_with("user", "project", "a", credential_authority=None, compute_manage=manage)
 
 
 @pytest.mark.parametrize("kind", ["api_key", "restricted"])
@@ -43,3 +44,11 @@ async def test_only_unrestricted_human_can_manage_even_if_resolver_claims_manage
             "credential_restricted": True, "user_id": "user", "source_project_id": "project",
             "source_system_scope": "", "issued_role_ids": ["r"],
         }
+
+
+def test_credential_header_names_are_bound_to_the_catalog_declaration():
+    entry = {"header_hints": [{"name": "X-Api-Key", "secret": True}, {"description": "unnamed", "secret": True}]}
+    mcp_settings._check_header_names(entry, {"x-api-key": "value"})
+    with pytest.raises(McpRegistryError):
+        mcp_settings._check_header_names(entry, {"Authorization": "Bearer value"})
+    mcp_settings._check_header_names({"header_hints": [{"description": "unnamed", "secret": True}]}, {"Anything": "v"})
