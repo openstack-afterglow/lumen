@@ -38,7 +38,7 @@ from lumen.services.message_graph import (
 )
 from lumen.services.message_parts import deserialize_parts, serialize_parts
 from lumen.services.message_timestamps import message_timestamps
-from lumen.services.run_store import NONTERMINAL, replay_events
+from lumen.services.run_store import NONTERMINAL, PublicActivityRead, read_public_activity_events
 from lumen.services.workspace_store import WorkspaceForbidden
 
 logger = logging.getLogger(__name__)
@@ -376,9 +376,7 @@ def _project_run_activity(events: list, *, durations_ms: dict[str, int]) -> list
     for event in events:
         payload = event.payload.model_dump(mode="json")
         base = {"seq": event.seq, "createdAt": _iso(event.created_at)}
-        if event.type == "run.started":
-            activity.append({**base, "id": f"started:{event.seq}", "kind": "started"})
-        elif event.type == "run.stage.changed":
+        if event.type == "run.stage.changed":
             activity.append({
                 **base, "id": f"stage:{event.seq}", "kind": "stage",
                 "stage": payload["stage"], "toolName": payload.get("tool_name"),
@@ -526,6 +524,19 @@ def _project_run_activity(events: list, *, durations_ms: dict[str, int]) -> list
     return sorted(activity, key=lambda item: int(item["seq"]))
 
 
+def project_public_execution(activity: PublicActivityRead, *, durations_ms: dict[str, int], last_seq: int) -> dict:
+    """One public execution shape shared by indexed, legacy and temporary readers."""
+    return {
+        "last_seq": max(last_seq, max((event.seq for event in activity.events), default=0)),
+        "started_at": next(
+            (_iso(event.created_at) for event in activity.events if event.type == "run.started"), None,
+        ),
+        "activity_status": "unavailable" if activity.unavailable_code else "available",
+        "activity_error_code": activity.unavailable_code,
+        "activity": None if activity.unavailable_code else _project_run_activity(activity.events, durations_ms=durations_ms),
+    }
+
+
 async def list_messages(
     conv_id: str, *, user_id: str, project_id: str, limit: int = 200, offset: int = 0
 ) -> list[dict]:
@@ -587,6 +598,7 @@ async def list_messages(
                     ]
                     execution_by_message[final_message_id] = {
                         "run_id": run.id,
+                        "status": run.status,
                         "agent_id": run.agent_id,
                         "skill_ids": skill_ids if isinstance(skill_ids, list) else [],
                         "skills": skills,
@@ -608,15 +620,15 @@ async def list_messages(
                         durations_by_run.setdefault(segment.run_id, {})[segment.call_id] = int(
                             max(0, (segment.completed_at - segment.created_at).total_seconds() * 1_000)
                         )
+                    activity_by_run = await read_public_activity_events(session, list(final_message_by_run))
                     for run_id, final_message_id in final_message_by_run.items():
                         execution = execution_by_message[final_message_id]
                         durations = durations_by_run.get(run_id, {})
                         if durations:
                             execution["tool_durations_ms"] = durations
-                        execution["activity"] = _project_run_activity(
-                            await replay_events(session, runs_by_id[run_id], after_seq=0),
-                            durations_ms=durations,
-                        )
+                        execution.update(project_public_execution(
+                            activity_by_run[run_id], durations_ms=durations, last_seq=runs_by_id[run_id].last_seq,
+                        ))
             return [_msg_public(row, execution=execution_by_message.get(row.id), conversation_id=conv_id) for row in rows]
     except OperationalError as exc:
         mark_db_unhealthy()
@@ -1012,14 +1024,13 @@ async def list_message_page(
                     ChatRun.assistant_message_id.in_(assistant_ids),
                     ChatRun.user_id == user_id,
                     ChatRun.project_id == project_id,
-                ))).scalars()
+                ))).scalars().all()
+                activity_by_run = await read_public_activity_events(session, [run.id for run in runs])
                 for run in runs:
                     execution_by_message[run.assistant_message_id] = {
                         "run_id": run.id,
                         "status": run.status,
-                        "activity": _project_run_activity(
-                            await replay_events(session, run, after_seq=0), durations_ms={},
-                        ),
+                        **project_public_execution(activity_by_run[run.id], durations_ms={}, last_seq=run.last_seq),
                     }
 
             messages: list[dict] = []

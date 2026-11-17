@@ -25,14 +25,14 @@ def test_work_log_preserves_lifecycle_permission_failure_and_observed_time():
         event(7, "run.completed", status="completed"),
     ]
     activity = _project_run_activity(events, durations_ms={})
-    assert [item["kind"] for item in activity] == ["started", "stage", "approval", "tool", "terminal"]
-    assert activity[0]["createdAt"] == "2026-11-17T00:00:01Z"
+    assert [item["kind"] for item in activity] == ["stage", "approval", "tool", "terminal"]
+    assert activity[0]["createdAt"] == "2026-11-17T00:00:02Z"
     assert activity[-1]["createdAt"] == "2026-11-17T00:00:07Z"
-    assert activity[2]["decision"] == "approve"
-    assert activity[2]["arguments"] == {"target": "safe"}
-    assert activity[3]["status"] == "failed"
-    assert activity[3]["durationMs"] == 1000
-    assert activity[3]["content"][0]["text"] == "Permission denied"
+    assert activity[1]["decision"] == "approve"
+    assert activity[1]["arguments"] == {"target": "safe"}
+    assert activity[2]["status"] == "failed"
+    assert activity[2]["durationMs"] == 1000
+    assert activity[2]["content"][0]["text"] == "Permission denied"
 
 
 def test_work_log_preserves_child_outcome_and_public_reasoning_only():
@@ -51,3 +51,7 @@ def test_work_log_preserves_child_outcome_and_public_reasoning_only():
     assert activity[0]["summary"] == "Safe child failure"
     assert activity[1]["text"] == "Public summary"
     assert "private" not in str(activity)
+
+
+def test_run_start_is_metadata_not_a_new_activity_enum_for_deployed_readers():
+    assert _project_run_activity([event(1, "run.started")], durations_ms={}) == []
