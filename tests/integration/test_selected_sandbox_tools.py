@@ -6,29 +6,37 @@ lookup use their real implementations.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import test_infrastructure_store as infrastructure_fixtures
 import test_kubernetes_provider as kubernetes_fixtures
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
+from lumen.crypto import encrypt_chat_content
 from lumen.models.chat_contracts import ToolPolicy
+from lumen.models.chat_db import ChatAgent
 from lumen.models.chat_infrastructure import (
     ChatAgentReservation,
+    ChatDelegationCall,
+    ChatDelegationGroup,
     ChatProjectAgentQuota,
     ChatResourceOperation,
     ChatRuntimePool,
     ChatRuntimeResource,
 )
 from lumen.models.chat_runs import ChatRun, ChatRunEventRow
-from lumen.services import sandbox_binding, sandbox_selection
-from lumen.services.durable_runs import admission, budgets, lifecycle
+from lumen.services import chat_admission, sandbox_binding, sandbox_selection
+from lumen.services.agent_policy import default_execution_policy
+from lumen.services.durable_runs import admission, budgets, children, lifecycle
 from lumen.services.durable_runs.errors import DurableRunInputError
 from lumen.services.durable_runs.execution import _finish
 from lumen.services.infrastructure import bootstrap, kubernetes, store
@@ -45,14 +53,14 @@ _controller_config = infrastructure_fixtures._controller_config
 _BUDGET = {"credit_ceiling": "1", "sandbox_seconds_ceiling": 30, "wall_time_seconds": 90}
 
 
-async def _apply(fixture, run_id, *, agent_budget=None):
+async def _apply(fixture, run_id, *, agent_budget=None, execution_mode="chat"):
     """Exercise the actual admission transaction without provider/model setup."""
     async with fixture.factory() as session, session.begin():
         order = budgets.LockOrder()
         quota = await budgets.lock_project_quota(session, fixture.project, order=order)
         run = await budgets.lock_run(session, run_id, order=order, lock_class="root")
         waiting = await admission._apply_root_budget(
-            session, run, agent_budget=agent_budget, execution_mode="chat", quota=quota, order=order,
+            session, run, agent_budget=agent_budget, execution_mode=execution_mode, quota=quota, order=order,
         )
         run.status = "waiting_resource" if waiting else "queued"
         return waiting
@@ -279,7 +287,7 @@ async def test_selected_quota_denial_rolls_back_all_new_holds(lazy_chat_sandbox,
         quota = await session.get(ChatProjectAgentQuota, f.project)
         if denial == "seconds":
             quota.max_active_sandboxes = 2
-            quota.max_sandbox_seconds = 30
+            quota.max_sandbox_seconds = 15
         elif denial == "pool-full":
             quota.max_active_sandboxes = 2
             row = await session.get(ChatRuntimePool, f.pool_id)
@@ -291,11 +299,260 @@ async def test_selected_quota_denial_rolls_back_all_new_holds(lazy_chat_sandbox,
     assert run.status == "queued" and run.assigned_resource_id is None and run.runtime_pool_id is None
     assert run.credit_ceiling is None and run.sandbox_seconds_ceiling is None
     assert holds == [] and len(resources) == 1 and resources[0].run_id == first
-    assert (quota.active_sandboxes, quota.sandbox_seconds_reserved) == (1, 30)
+    assert (quota.active_sandboxes, quota.sandbox_seconds_reserved) == (1, 15)
     async with f.factory() as session:
         assert list((await session.scalars(select(ChatResourceOperation.resource_id).where(
             ChatResourceOperation.resource_id == resources[0].id,
         ))).all()) == [resources[0].id]
+
+
+@pytest.fixture
+async def selected_delegation(lazy_chat_sandbox, monkeypatch, current_project_authority):
+    """Keep agent lookup, child preparation and every reservation on the real SQL path."""
+    f = lazy_chat_sandbox
+    policy = default_execution_policy().model_copy(update={
+        "can_delegate_read": True, "can_delegate_write": True,
+        "max_children": 2, "max_parallel_children": 2,
+    })
+    async with f.factory() as session, session.begin():
+        parent_agent = ChatAgent(owner_user_id=f.project, project_id=f.project, name="Selected parent", is_active=True)
+        child_agent = ChatAgent(owner_user_id=f.project, project_id=f.project, name="Selected child", is_active=True)
+        session.add_all([parent_agent, child_agent])
+        await session.flush()
+        parent_agent.delegable_agent_ids = [child_agent.id]
+        parent_agent_id, child_agent_id = parent_agent.id, child_agent.id
+    root_id = await _new_run(
+        f, scope="persistent", agent_id=parent_agent_id, execution_mode="plan",
+        request_payload=encrypt_chat_content(json.dumps({
+            "features": {"memory": False, "tool_policy": {
+                "enabled_sandbox_tools": ["sandbox_echo", "sandbox_status"],
+            }},
+            "required_scopes": ["native:runs:write", "native:agents:use", "native:tools:execute"],
+        })),
+    )
+    async with f.factory() as session, session.begin():
+        root = await session.get(ChatRun, root_id)
+        root.capability_snapshot = {
+            **root.capability_snapshot, "execution_policy": policy.model_dump(mode="json"),
+        }
+        quota = ChatProjectAgentQuota(
+            project_id=f.project, max_active_children=2, max_active_sandboxes=3,
+            max_sandbox_seconds=3600, max_credit_reservation=Decimal("2"),
+        )
+        session.add(quota)
+    route = AsyncMock(return_value={
+        "provider_id": 1, "model_id": 1, "provider_name": "synthetic", "model_name": "fixture-child",
+        "config_version_hash": "d" * 64, "input_price_per_token": "0", "output_price_per_token": "0",
+    })
+    monkeypatch.setattr("lumen.services.providers.routing.resolve_model_snapshot", route)
+    settings = SimpleNamespace(runtime_config=f.config, chat_credit_per_usd=Decimal("1"))
+    monkeypatch.setattr(children, "get_settings", lambda: settings)
+    monkeypatch.setattr(chat_admission, "get_settings", lambda: settings)
+    try:
+        yield SimpleNamespace(f=f, root_id=root_id, child_agent_id=child_agent_id, route=route)
+    finally:
+        async with f.factory() as session, session.begin():
+            child_ids = list((await session.scalars(select(ChatRun.id).where(
+                ChatRun.root_run_id == root_id,
+            ))).all())
+            resource_ids = select(ChatRuntimeResource.id).where(ChatRuntimeResource.run_id.in_(child_ids))
+            await session.execute(delete(ChatResourceOperation).where(ChatResourceOperation.resource_id.in_(resource_ids)))
+            await session.execute(delete(ChatRuntimeResource).where(ChatRuntimeResource.run_id.in_(child_ids)))
+            await session.execute(delete(ChatAgentReservation).where(ChatAgentReservation.run_id.in_(child_ids)))
+            await session.execute(delete(ChatRunEventRow).where(ChatRunEventRow.run_id.in_(child_ids)))
+            group_ids = select(ChatDelegationGroup.id).where(ChatDelegationGroup.parent_run_id == root_id)
+            await session.execute(delete(ChatDelegationCall).where(ChatDelegationCall.group_id.in_(group_ids)))
+            await session.execute(delete(ChatDelegationGroup).where(ChatDelegationGroup.parent_run_id == root_id))
+            await session.execute(delete(ChatRun).where(ChatRun.id.in_(child_ids)))
+            root = await session.get(ChatRun, root_id)
+            root.agent_id = None
+            await session.flush()
+            await session.execute(delete(ChatAgent).where(ChatAgent.project_id == f.project))
+
+
+def _delegation_call(fixture, *, seconds, access="read"):
+    return children.DelegationCall(
+        call_id="selected-child", agent_id=fixture.child_agent_id, task="Inspect the selected workspace",
+        access=access, credit_budget=Decimal("0.5"), sandbox_seconds=seconds,
+    )
+
+
+@pytest.mark.parametrize(("total_seconds", "wall_seconds"), [(60, 120), (120, 180)])
+async def test_selected_plan_root_tools_leave_budget_for_read_child(
+    selected_controller, selected_delegation, monkeypatch, total_seconds, wall_seconds,
+):
+    c, d = selected_controller, selected_delegation
+    f, root_id = d.f, d.root_id
+    budget = {"credit_ceiling": "1", "sandbox_seconds_ceiling": total_seconds, "wall_time_seconds": wall_seconds}
+    started = datetime.now(UTC)
+    assert await _apply(f, root_id, agent_budget=budget, execution_mode="plan")
+    admitted = datetime.now(UTC)
+    root, quota, [root_resource], holds = await _state(f, root_id)
+    root_wall = root.deadline_at.replace(tzinfo=UTC)
+    root_share = min(300, max(1, total_seconds // 2), f.pool.max_lifetime_seconds, wall_seconds)
+    assert root.execution_mode == "plan" and root.wall_time_seconds == wall_seconds
+    assert started + timedelta(seconds=wall_seconds - 1) <= root_wall <= admitted + timedelta(seconds=wall_seconds)
+    assert root.sandbox_seconds_ceiling == total_seconds
+    assert root.sandbox_seconds_reserved == root_share
+    assert next(hold.amount for hold in holds if hold.kind == "sandbox_seconds") == root_share
+    assert root_resource.deadline_at.replace(tzinfo=UTC) <= admitted + timedelta(seconds=root_share)
+    assert root_resource.deadline_at.replace(tzinfo=UTC) < root_wall
+    assert quota.active_sandboxes == 1
+    await c.provision(root_id)
+    ready = await c.ready(root_id)
+    await _running(f, root_id)
+    submissions = []
+
+    async def daemon_request(_transport, target, **request):
+        assert target.resource_id == ready.id
+        if request["path"] == "/v1/workspace":
+            return b'{"workspace_revision":7}'
+        assert request["path"] == "/v1/mcp/executions"
+        submissions.append(request["body"])
+        return json.dumps({"id": request["body"]["call_id"], "state": "succeeded"}).encode()
+
+    monkeypatch.setattr(sandbox_binding, "InternalTransport", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(sandbox_binding, "_authorized_request", daemon_request)
+    result = await sandbox_binding.execute_mcp_in_sandbox(
+        run_id=root_id, lease_owner="worker#1", fence=1, call_id="root-tool",
+        profile="local", tool="sandbox_echo", arguments={}, timeout_seconds=5, pool_name=f.pool.name,
+    )
+    assert result["state"] == "succeeded" and len(submissions) == 1
+    remaining_seconds = total_seconds - root_share
+    assert remaining_seconds > 0
+    before_child = datetime.now(UTC)
+    created = await children.prepare_delegations(
+        parent_run_id=root_id, owner="worker#1", model_segment_id="selected-turn",
+        calls=[_delegation_call(d, seconds=remaining_seconds)],
+    )
+    after_child = datetime.now(UTC)
+    [created_child] = created["children"]
+    child_id = created_child["child_run_id"]
+    child, quota, resources, child_holds = await _state(f, child_id)
+    root, _, _, root_holds = await _state(f, root_id)
+    child_resource = next(resource for resource in resources if resource.run_id == child_id)
+    assert root.deadline_at.replace(tzinfo=UTC) == root_wall
+    assert child.execution_mode == "plan" and child.status == "waiting_resource"
+    assert child.capability_snapshot["sandbox_tools"] == root.capability_snapshot["sandbox_tools"]
+    assert child.wall_time_seconds == wall_seconds
+    assert child.deadline_at.replace(tzinfo=UTC) == root_wall
+    expiry = child_resource.deadline_at.replace(tzinfo=UTC)
+    resource_seconds = min(remaining_seconds, f.pool.max_lifetime_seconds)
+    assert before_child + timedelta(seconds=resource_seconds - 1) <= expiry
+    assert expiry <= min(after_child + timedelta(seconds=resource_seconds), root_wall)
+    assert expiry < child.deadline_at.replace(tzinfo=UTC)
+    assert child_resource.backend == "kubernetes" and child_resource.pool_id == f.pool_id
+    assert child_resource.image_ref == f.pool.image and child_resource.policy_digest == f.pool.digest()
+    assert {hold.kind for hold in child_holds} == {"child_slot", "sandbox_slot", "credit", "sandbox_seconds"}
+    assert all(hold.status == "reserved" for hold in child_holds)
+    assert next(hold.amount for hold in child_holds if hold.kind == "sandbox_seconds") == remaining_seconds
+    assert len(root_holds) == 2 and all(hold.status == "reserved" for hold in root_holds)
+    assert root.sandbox_seconds_reserved == total_seconds
+    assert (quota.active_children, quota.active_sandboxes, quota.sandbox_seconds_reserved) == (1, 2, total_seconds)
+    assert quota.credits_reserved == Decimal("0.5")
+    d.route.assert_awaited_once()
+    async with f.factory() as session:
+        operations = list((await session.scalars(select(ChatResourceOperation).where(
+            ChatResourceOperation.resource_id == child_resource.id,
+        ))).all())
+        assert len(operations) == 1 and operations[0].action == "create"
+    await c.reconcile()
+    child, _, resources, _ = await _state(f, child_id)
+    child_resource = next(resource for resource in resources if resource.run_id == child_id)
+    assert child.status == "waiting_resource" and child_resource.observed_state == "booting"
+    assert len([key for key in c.api.objects if key[0] == "pods"]) == 2
+    await c.ready(child_id)
+    child, _, _, _ = await _state(f, child_id)
+    assert child.status == "queued" and child.deadline_at.replace(tzinfo=UTC) == root_wall
+    await _running(f, child_id)
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with f.factory() as session, session.begin():
+        child_resource = await session.get(ChatRuntimeResource, child_resource.id)
+        child_resource.ready_at = now - timedelta(seconds=remaining_seconds + 300)
+        child_resource.deadline_at = now - timedelta(seconds=300)
+    await c.reconcile()
+    await c.reconcile()
+    await c.reconcile()
+    child, _, resources, _ = await _state(f, child_id)
+    child_resource = next(resource for resource in resources if resource.run_id == child_id)
+    assert child.status == "running" and child.deadline_at.replace(tzinfo=UTC) == root_wall
+    assert child_resource.observed_state == "deleted" and child_resource.deleted_at is not None
+    assert child_resource.deadline_at < child_resource.deleted_at
+    await _finish(child_id, status="completed", message_id=None, owner="worker#1")
+    child, quota, _, child_holds = await _state(f, child_id)
+    root, _, _, root_holds = await _state(f, root_id)
+    seconds_hold = next(hold for hold in child_holds if hold.kind == "sandbox_seconds")
+    assert child.status == "completed" and child.deadline_at.replace(tzinfo=UTC) == root_wall
+    assert seconds_hold.status == "settled" and seconds_hold.settled_amount == remaining_seconds
+    assert next(hold.status for hold in child_holds if hold.kind == "child_slot") == "released"
+    assert next(hold.status for hold in child_holds if hold.kind == "sandbox_slot") == "released"
+    assert quota.active_children == 0 and quota.active_sandboxes == 1
+    assert root.status == "running" and root.deadline_at.replace(tzinfo=UTC) == root_wall
+    assert all(hold.status == "reserved" for hold in root_holds)
+
+
+@pytest.mark.parametrize("failure", ["stale-image", "stale-digest", "selected-write"])
+async def test_selected_child_failure_preserves_root_holds_without_sql_leaks(
+    selected_delegation, monkeypatch, failure,
+):
+    d = selected_delegation
+    f, root_id = d.f, d.root_id
+    budget = {"credit_ceiling": "1", "sandbox_seconds_ceiling": 60, "wall_time_seconds": 120}
+    assert await _apply(f, root_id, agent_budget=budget, execution_mode="plan")
+    async with f.factory() as session, session.begin():
+        root = await session.get(ChatRun, root_id)
+        root.status, root.lease_owner = "running", "worker#1"
+        root.lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+        row = await session.get(ChatRuntimePool, f.pool_id)
+        if failure == "stale-image":
+            row.image_ref = "registry.example/sandbox@sha256:" + "e" * 64
+        elif failure == "stale-digest":
+            row.profile_digest = "f" * 64
+    root, quota, [resource], holds = await _state(f, root_id)
+    root_state = (root.deadline_at, root.sandbox_seconds_reserved, root.descendant_credits_reserved)
+    quota_state = (quota.active_children, quota.active_sandboxes, quota.credits_reserved, quota.sandbox_seconds_reserved)
+    hold_state = {(hold.id, hold.kind, hold.amount, hold.status) for hold in holds}
+    async with f.factory() as session:
+        operation_ids = set((await session.scalars(select(ChatResourceOperation.id).where(
+            ChatResourceOperation.resource_id == resource.id,
+        ))).all())
+    if failure == "selected-write":
+        d.route.side_effect = AssertionError("selected write child must fail before route resolution")
+        provider = AsyncMock(side_effect=AssertionError("selected write child must not contact a provider"))
+        monkeypatch.setattr("lumen.services.provider_client.acompletion", provider)
+        monkeypatch.setattr(budgets, "reserve", AsyncMock(
+            side_effect=AssertionError("selected write child must fail before reservations"),
+        ))
+    with pytest.raises(children.ChildFailure) as error:
+        await children.prepare_delegations(
+            parent_run_id=root_id, owner="worker#1", model_segment_id="rejected-turn",
+            calls=[_delegation_call(d, seconds=30, access="write" if failure == "selected-write" else "read")],
+        )
+    expected = "sandbox_code_combination_unsupported" if failure == "selected-write" else "sandbox_configuration_changed"
+    assert error.value.code == expected
+    root, quota, resources, holds = await _state(f, root_id)
+    assert (root.deadline_at, root.sandbox_seconds_reserved, root.descendant_credits_reserved) == root_state
+    assert (quota.active_children, quota.active_sandboxes, quota.credits_reserved, quota.sandbox_seconds_reserved) == quota_state
+    assert {(hold.id, hold.kind, hold.amount, hold.status) for hold in holds} == hold_state
+    assert [row.id for row in resources] == [resource.id]
+    async with f.factory() as session:
+        assert list((await session.scalars(select(ChatRun.id).where(ChatRun.parent_run_id == root_id))).all()) == []
+        assert list((await session.scalars(select(ChatDelegationGroup.id).where(
+            ChatDelegationGroup.parent_run_id == root_id,
+        ))).all()) == []
+        assert list((await session.scalars(select(ChatDelegationCall.id).where(
+            ChatDelegationCall.parent_run_id == root_id,
+        ))).all()) == []
+        assert set((await session.scalars(select(ChatAgentReservation.id).where(
+            ChatAgentReservation.root_run_id == root_id,
+        ))).all()) == {hold.id for hold in holds}
+        pool_resources = select(ChatRuntimeResource.id).where(ChatRuntimeResource.pool_id == f.pool_id)
+        assert set((await session.scalars(select(ChatResourceOperation.id).where(
+            ChatResourceOperation.resource_id.in_(pool_resources),
+        ))).all()) == operation_ids
+    if failure == "selected-write":
+        d.route.assert_not_awaited()
+        provider.assert_not_awaited()
 
 
 @pytest.mark.parametrize("foreign_field", ["run_id", "logical_project_id", "logical_user_id"])
@@ -420,6 +677,106 @@ async def test_selected_terminal_cleanup_survives_restart_and_releases_project_s
     assert replacement_run.assigned_resource_id != provisioned.id
     assert quota.active_sandboxes == 1 and len(replacement_holds) == 2
     assert len(resources) == 2
+
+
+async def test_selected_ready_resource_expires_without_shortening_root_wall(
+    selected_controller, selected_delegation, monkeypatch,
+):
+    c, d = selected_controller, selected_delegation
+    f, root_id = d.f, d.root_id
+    budget = {"credit_ceiling": "1", "sandbox_seconds_ceiling": 600, "wall_time_seconds": 1200}
+    assert await _apply(f, root_id, agent_budget=budget, execution_mode="plan")
+    await c.provision(root_id)
+    await c.ready(root_id)
+    await _running(f, root_id)
+    now = datetime.now(UTC).replace(microsecond=0)
+    root_wall = now + timedelta(seconds=1200)
+    async with f.factory() as session, session.begin():
+        root = await session.get(ChatRun, root_id)
+        resource = await session.get(ChatRuntimeResource, root.assigned_resource_id)
+        root.deadline_at = root_wall
+        resource.ready_at = now - timedelta(seconds=600)
+        resource.deadline_at = now - timedelta(seconds=300)
+        resource_id = resource.id
+    await c.reconcile()
+    root, _, [resource], holds = await _state(f, root_id)
+    assert root.status == "running" and root.deadline_at.replace(tzinfo=UTC) == root_wall
+    assert root.reservation_released_at is None
+    assert resource.desired_state == "deleting"
+    assert all(hold.status == "reserved" for hold in holds)
+    async with f.factory() as session:
+        deletes = list((await session.scalars(select(ChatResourceOperation).where(
+            ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.action == "delete",
+        ))).all())
+        assert len(deletes) == 1
+        # Intent is persisted under the live pool fence; I/O claims it next cycle.
+        assert deletes[0].owner == "__unclaimed__" and deletes[0].fence == 0 and deletes[0].attempts == 0
+    await c.reconcile()
+    await c.reconcile()
+    root, _, [resource], _ = await _state(f, root_id)
+    assert root.status == "running" and root.deadline_at.replace(tzinfo=UTC) == root_wall
+    assert resource.observed_state == "deleted" and resource.deleted_at is not None
+    assert set(c.api.objects) == {("networkpolicies", "lumen-default-deny")}
+    assert await store.occupancy(f.pool_id) == 0
+    async with f.factory() as session:
+        delete = await session.scalar(select(ChatResourceOperation).where(
+            ChatResourceOperation.resource_id == resource_id, ChatResourceOperation.action == "delete",
+        ))
+        assert delete.owner == c.controller.owner and delete.fence == c.fence
+        assert delete.attempts == 1 and delete.request_status == "succeeded"
+    _, _, _, holds = await _state(f, root_id)
+    hold_ids = {hold.id for hold in holds}
+    api_calls = list(c.api.calls)
+    daemon = AsyncMock(side_effect=AssertionError("expired resource must not reach the sandbox daemon"))
+    monkeypatch.setattr(sandbox_binding, "_authorized_request", daemon)
+    async with f.factory() as session:
+        operation_ids = set((await session.scalars(select(ChatResourceOperation.id).where(
+            ChatResourceOperation.resource_id == resource_id,
+        ))).all())
+    with pytest.raises(sandbox_binding.SandboxDispatchError) as error:
+        await asyncio.wait_for(sandbox_binding.ensure_sandbox_for_run(
+            root_id, lease_owner="worker#1", fence=1, pool_name=f.pool.name, wait_timeout=0,
+        ), timeout=2)
+    assert error.value.code == "sandbox_expired"
+    with pytest.raises(sandbox_binding.SandboxDispatchError) as error:
+        await asyncio.wait_for(sandbox_binding.execute_mcp_in_sandbox(
+            run_id=root_id, lease_owner="worker#1", fence=1, call_id="expired-root-tool",
+            profile="local", tool="sandbox_echo", arguments={}, timeout_seconds=1, pool_name=f.pool.name,
+        ), timeout=2)
+    assert error.value.code == "sandbox_expired"
+    with pytest.raises(children.ChildFailure) as child_error:
+        await children.prepare_delegations(
+            parent_run_id=root_id, owner="worker#1", model_segment_id="expired-root-turn",
+            calls=[_delegation_call(d, seconds=300)],
+        )
+    assert child_error.value.code == "sandbox_expired"
+    daemon.assert_not_awaited()
+    assert c.api.calls == api_calls
+    root, _, resources, holds = await _state(f, root_id)
+    assert root.status == "running" and root.deadline_at.replace(tzinfo=UTC) == root_wall
+    assert root.assigned_resource_id == resource_id and [row.id for row in resources] == [resource_id]
+    assert {hold.id for hold in holds} == hold_ids and all(hold.status == "reserved" for hold in holds)
+    async with f.factory() as session:
+        assert list((await session.scalars(select(ChatRun.id).where(ChatRun.parent_run_id == root_id))).all()) == []
+        assert list((await session.scalars(select(ChatDelegationGroup.id).where(
+            ChatDelegationGroup.parent_run_id == root_id,
+        ))).all()) == []
+        assert set((await session.scalars(select(ChatAgentReservation.id).where(
+            ChatAgentReservation.root_run_id == root_id,
+        ))).all()) == hold_ids
+        pool_resources = select(ChatRuntimeResource.id).where(ChatRuntimeResource.pool_id == f.pool_id)
+        assert set((await session.scalars(select(ChatResourceOperation.id).where(
+            ChatResourceOperation.resource_id.in_(pool_resources),
+        ))).all()) == operation_ids
+    await _finish(root_id, status="completed", message_id=None, owner="worker#1")
+    root, quota, _, holds = await _state(f, root_id)
+    assert root.status == "completed" and root.deadline_at.replace(tzinfo=UTC) == root_wall
+    assert root.reservation_released_at is not None
+    seconds_hold = next(hold for hold in holds if hold.kind == "sandbox_seconds")
+    assert seconds_hold.amount == 300 and seconds_hold.status == "settled"
+    assert seconds_hold.settled_amount == 300
+    assert next(hold.status for hold in holds if hold.kind == "sandbox_slot") == "released"
+    assert (quota.active_sandboxes, quota.sandbox_seconds_reserved) == (0, 0)
 
 
 async def test_selected_auxiliary_cleanup_holds_occupancy_until_service_absence(selected_controller):

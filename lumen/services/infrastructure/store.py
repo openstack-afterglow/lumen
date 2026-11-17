@@ -544,7 +544,8 @@ async def assign_sandbox(session: AsyncSession, *, run: ChatRun, config: Runtime
                                           logical_project_id=run.project_id, logical_user_id=run.user_id)
         run.assigned_resource_id = resource.id
         run.runtime_pool_id = pool.id
-        run.deadline_at = deadline_at
+        if run.deadline_at is None:
+            run.deadline_at = deadline_at
         await session.flush()
         return resource
     raise ResourceUnavailable("sandbox_pool_full")

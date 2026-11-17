@@ -113,24 +113,33 @@ async def lock_project_quota(session: AsyncSession, project_id: str, *, order: L
         ).scalar_one()
     return row
 
+async def sandbox_seconds_used(session: AsyncSession, resource_id: str | None, *, now: datetime) -> int:
+    """Count only the admitted ready lifetime, not later parent orchestration time."""
+    from lumen.models.chat_infrastructure import ChatRuntimeResource
+
+    if resource_id is None:
+        return 0
+    lifetime = (await session.execute(
+        select(ChatRuntimeResource.ready_at, ChatRuntimeResource.deadline_at, ChatRuntimeResource.deleted_at)
+        .where(ChatRuntimeResource.id == resource_id)
+    )).one_or_none()
+    if lifetime is None or lifetime.ready_at is None:
+        return 0
+    ready_at = lifetime.ready_at.replace(tzinfo=UTC) if lifetime.ready_at.tzinfo is None else lifetime.ready_at
+    ends = [now]
+    for value in (lifetime.deadline_at, lifetime.deleted_at):
+        if value is not None:
+            ends.append(value.replace(tzinfo=UTC) if value.tzinfo is None else value)
+    return max(0, int((min(ends) - ready_at).total_seconds()))
+
+
 async def settle_root_sandbox(session: AsyncSession, *, quota: ChatProjectAgentQuota, root: ChatRun, order: LockOrder) -> None:
-    """Release the code root's slot and settle only time since its sandbox became ready.
+    """Release the root's slot and settle only its bounded ready sandbox lifetime.
 
     Call after locking quota and root, before locking any resource for deletion.
     Reservation status makes repeated terminal attempts harmless.
     """
-    from lumen.models.chat_infrastructure import ChatRuntimeResource
-
-    ready_at = None
-    if root.assigned_resource_id is not None:
-        ready_at = (
-            await session.execute(
-                select(ChatRuntimeResource.ready_at).where(ChatRuntimeResource.id == root.assigned_resource_id)
-            )
-        ).scalar_one_or_none()
-    if ready_at is not None and ready_at.tzinfo is None:
-        ready_at = ready_at.replace(tzinfo=UTC)
-    used = max(0, int((datetime.now(UTC) - ready_at).total_seconds())) if ready_at else 0
+    used = await sandbox_seconds_used(session, root.assigned_resource_id, now=datetime.now(UTC))
     await release(session, quota=quota, root=root, run_id=root.id, kind="sandbox_slot", order=order)
     await settle(session, quota=quota, root=root, run_id=root.id, kind="sandbox_seconds", actual=used, order=order)
 

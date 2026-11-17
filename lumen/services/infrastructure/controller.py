@@ -361,7 +361,7 @@ class ResourceController:
         await self._check_assignment()
         resources = await self._resources(pool.id)
         if definition.role == "sandbox":
-            await self._fail_expired_waiters(resources)
+            await self._expire_sandboxes(resources, fence)
             await store.write_projection(pool.id, self.owner, fence, desired=len(resources),
                 ready=sum(r.observed_state == "ready" for r in resources),
                 provisioning=sum(r.observed_state in {"requested", "creating", "booting"} for r in resources),
@@ -691,15 +691,18 @@ class ResourceController:
                 resource.ingress_member_id, resource.id, resource.generation, resource.address)
 
 
-    async def _fail_expired_waiters(self, resources: list[ChatRuntimeResource]) -> None:
+    async def _expire_sandboxes(self, resources: list[ChatRuntimeResource], fence: int) -> None:
+        """Retire each bounded sandbox independently of its still-live root run."""
         now = datetime.now(UTC)
         for resource in resources:
-            if not resource.run_id or not resource.deadline_at or resource.observed_state in {"ready", "deleted"}:
+            if (not resource.run_id or not resource.deadline_at or resource.observed_state == "deleted"
+                    or store._utc(resource.deadline_at) > now):
                 continue
-            deadline = resource.deadline_at if resource.deadline_at.tzinfo else resource.deadline_at.replace(tzinfo=UTC)
-            if now >= deadline:
+            if resource.ready_at is None:
                 await lifecycle.fail_waiting_run(resource.run_id, error_code="resource_deadline_exceeded",
                                                  safe_message="Sandbox provisioning deadline exceeded")
+            if resource.desired_state != "deleting":
+                await store.request_delete(resource.id, self.owner, fence)
 
     async def _scale(self, pool: ChatRuntimePool, fence: int, definition: PoolConfig,
                      resources: list[ChatRuntimeResource], *, retirement_reason: str | None = None) -> None:
