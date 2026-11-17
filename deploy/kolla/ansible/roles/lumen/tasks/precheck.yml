@@ -192,7 +192,7 @@
 
     - name: Precheck | Validate pinned public source bytes before API distribution
       ansible.builtin.command:
-        argv: "{{ ['docker', 'run', '--rm', '-i', '--pull=never', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--volume', lumen_precheck_script.path ~ ':/precheck.py:ro', '--volume', lumen_public_manifest_source_dir ~ ':/etc/lumen/public-source:ro', '--entrypoint', 'python', lumen_controller_image_ref if enable_lumen_controller | bool else lumen_worker_image_ref, '/precheck.py', 'material'] }}"
+        argv: "{{ ['docker', 'run', '--rm', '-i', '--pull=never', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--volume', lumen_precheck_script.path ~ ':/precheck.py:ro', '--volume', lumen_public_manifest_source_dir ~ ':/etc/lumen/public-source:ro', '--entrypoint', 'python', lumen_controller_image_ref if enable_lumen_controller | bool else (lumen_worker_image_ref if enable_lumen_worker | bool else lumen_api_image_ref), '/precheck.py', 'material'] }}"
         stdin: "{{ lumen_precheck_input | combine({'material_role': 'public_source'}) | to_json }}"
       register: lumen_public_source_precheck_result
       changed_when: false
