@@ -96,6 +96,7 @@ def _kolla_environment(inventory, *, native=False):
         to_json=json.dumps,
         from_json=json.loads,
         basename=lambda value: Path(value).name,
+        regex_replace=lambda value, pattern, replacement: re.sub(pattern, replacement, value),
         kolla_address=lambda network, host: inventory["hostvars"][host][f"{network}_address"],
     )
     return environment
@@ -318,6 +319,7 @@ def test_kolla_required_assets_exist():
         "defaults/main.yml",
         "files/render_postgres_service.py",
         "files/validate_runtime_precheck.py",
+        "files/validate_clamav.py",
         "handlers/main.yml",
         "meta/main.yml",
         "templates/lumen.conf.j2",
@@ -331,6 +333,7 @@ def test_kolla_required_assets_exist():
         "tasks/config.yml",
         "tasks/bootstrap_service.yml",
         "tasks/start.yml",
+        "tasks/clamav.yml",
         "tasks/destroy.yml",
         "tasks/loadbalancer.yml",
         "tasks/source_build.yml",
@@ -1023,3 +1026,79 @@ def test_worker_directory_rejects_manifest_and_nested_inventory_faults(fault):
         }[fault.split("-", 1)[1]]
         entry[field] = value
     assert not _rendered_assertions_accept(material, context)
+
+
+def test_optional_managed_clamav_preserves_external_configuration():
+    default = _resolved_kolla_defaults(["enable_lumen_clamav", "lumen_clamav_effective_host"])
+    assert default == {"enable_lumen_clamav": False, "lumen_clamav_effective_host": ""}
+    external = _resolved_kolla_defaults(["lumen_clamav_effective_host"], {"lumen_clamav_host": "scanner.internal"})
+    assert external["lumen_clamav_effective_host"] == "scanner.internal"
+    managed = _resolved_kolla_defaults(["lumen_clamav_effective_host", "lumen_clamav_service"], {"enable_lumen_clamav": True})
+    assert managed["lumen_clamav_effective_host"] == "127.0.0.1"
+    service = managed["lumen_clamav_service"]
+    assert service["ports"] == ["127.0.0.1:3310:3310"]
+    assert service["volumes"] == ["lumen_clamav_signatures:/var/lib/clamav"]
+    assert re.fullmatch(r"clamav/clamav-debian@sha256:[0-9a-f]{64}", service["image"])
+    from jinja2 import meta
+
+    template = (ROLE_DIR / "templates/lumen.conf.j2").read_text()
+    environment = _kolla_environment(_kolla_inventory())
+    names = meta.find_undeclared_variables(environment.parse(template))
+    values = _resolved_kolla_defaults(names, {"enable_lumen_clamav": True})
+    config = tomllib.loads(environment.from_string(template).render(**values))
+    assert config["chat"]["chat_clamav_host"] == "127.0.0.1"
+    assert config["chat"]["chat_clamav_port"] == 3310
+
+
+def test_managed_clamav_is_ready_before_application_start_and_retains_data():
+    tasks = yaml.safe_load((ROLE_DIR / "tasks/start.yml").read_text())
+    assert tasks[0]["ansible.builtin.include_tasks"] == "clamav.yml"
+    scanner = yaml.safe_load((ROLE_DIR / "tasks/clamav.yml").read_text())
+    container = scanner[0]["community.docker.docker_container"]
+    assert container["pull"] == "never"
+    assert container["network_mode"] == "bridge"
+    for setting in ("memory", "memory_swap", "cpus", "pids_limit"):
+        assert container[setting].startswith("{{ lumen_clamav_")
+    assert container["cap_drop"] == ["ALL"]
+    assert container["security_opts"] == ["no-new-privileges:true"]
+    assert scanner[1]["ansible.builtin.script"]["cmd"].startswith("validate_clamav.py --host")
+    assert scanner[1]["until"] == "lumen_clamav_readiness.rc == 0"
+    assert scanner[1]["changed_when"] is False
+    pull = yaml.safe_load((ROLE_DIR / "tasks/pull.yml").read_text())
+    assert pull[-1]["community.docker.docker_image"]["name"] == "{{ lumen_clamav_service.image }}"
+    assert "lumen_source_mode" not in str(pull[-1]["when"])
+    destroy = yaml.safe_load((ROLE_DIR / "tasks/destroy.yml").read_text())[-1]
+    assert destroy["community.docker.docker_container"]["keep_volumes"] is True
+    environment = _resolved_kolla_defaults(["lumen_clamav_environment"])["lumen_clamav_environment"]
+    assert environment["CLAMAV_NO_FRESHCLAMD"] == "false"
+    assert environment["CLAMD_CONF_AlertExceedsMax"] == "yes"
+    assert not set(environment) & {"DATABASE_URL", "REDIS_URL", "LUMEN_ENCRYPTION_KEY", "CHAT_ASSET_S3_SECRET_KEY"}
+
+
+@pytest.mark.parametrize("overrides, accepted", [
+    ({}, True),
+    ({"lumen_clamav_bind_address": "0.0.0.0"}, False),
+    ({"lumen_clamav_host": "external.invalid"}, False),
+    ({"lumen_clamav_image_ref": "clamav/clamav-debian:latest@sha256:" + "a" * 64}, False),
+    ({"lumen_clamav_image_ref": "clamav/clamav-debian:latest"}, False),
+    ({"lumen_clamav_port": 0}, False),
+    ({"lumen_clamav_cpus": 0}, False),
+    ({"lumen_clamav_memory": "0"}, False),
+    ({"lumen_clamav_memory": "unlimited"}, False),
+    ({"lumen_clamav_volume": "/etc"}, False),
+    ({"lumen_clamav_pids_limit": 0}, False),
+    ({"lumen_clamav_cpus": "inf"}, False),
+    ({"lumen_clamav_signature_max_age_hours": 0}, False),
+    ({"lumen_clamav_signature_max_age_hours": 169}, False),
+])
+def test_managed_clamav_precheck_rejects_public_unpinned_or_unbounded_inputs(overrides, accepted):
+    task = next(task for task in yaml.safe_load((ROLE_DIR / "tasks/precheck.yml").read_text())
+                if task["name"].startswith("Precheck | Validate optional per-controller ClamAV"))
+    names = ["lumen_clamav_" + suffix for suffix in ("bind_address", "host", "port", "image_ref", "volume", "memory",
+             "cpus", "pids_limit", "ready_retries", "signature_max_age_hours")]
+    values = _resolved_kolla_defaults(names, overrides)
+    environment = _kolla_environment(_kolla_inventory(), native=True)
+    environment.tests["match"] = lambda value, pattern: bool(re.match(pattern, value))
+    results = [environment.from_string("{{ " + expression + " }}").render(**values)
+               for expression in task["ansible.builtin.assert"]["that"]]
+    assert all(results) is accepted
