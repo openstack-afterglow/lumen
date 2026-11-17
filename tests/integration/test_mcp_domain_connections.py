@@ -4,6 +4,7 @@ Run only against a disposable migrated test database. Synthetic credentials neve
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -24,8 +25,8 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-async def domain_db(monkeypatch):
-    init_db(os.environ["DATABASE_URL"], pool_size=3, max_overflow=0)
+async def domain_db(monkeypatch, request):
+    init_db(os.environ["DATABASE_URL"], pool_size=getattr(request, "param", 3), max_overflow=0, pool_timeout=1)
     factory = get_session_factory()
     assert factory is not None
     suffix = uuid.uuid4().hex
@@ -292,3 +293,18 @@ async def test_legacy_route_cannot_repoint_a_catalog_connection(domain_db):
                         requester_user_id=db["member"]["user_id"], requester_project_id=db["member"]["project_id"])
     async with db["factory"]() as session:
         assert (await session.get(ChatMcpServer, personal["server"]["id"])).url == candidate["url"]
+
+
+@pytest.mark.parametrize("domain_db", [1], indirect=True)
+async def test_idempotent_org_install_releases_lookup_connection_before_effective_view(domain_db):
+    db = domain_db
+    candidate, created = await asyncio.wait_for(create_domain(db), timeout=3)
+    first = created["server"]
+    again = await asyncio.wait_for(
+        mcp_settings.create(db["manager"], candidate["id"], domain_id=db["a"], label=db["suffix"]),
+        timeout=3,
+    )
+    assert again["created"] is False
+    assert again["server"]["id"] == first["id"]
+    assert again["server"]["is_active"] is False
+    assert again["server"]["server_is_active"] is True

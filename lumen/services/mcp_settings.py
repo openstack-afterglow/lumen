@@ -171,8 +171,13 @@ async def create(principal: dict, template_id: str, *, domain_id: str | None = N
                 ChatMcpServer.connection_scope_key == scope_key,
                 ChatMcpServer.template_key == template_id, ChatMcpServer.connection_label == connection_label,
             ))).scalar_one_or_none()
-            if existing is not None:
-                return {"created": False, "server": await _view(principal, existing.id, domain_id, es._public_mcp(existing))}
+            existing_view = es._public_mcp(existing) if existing is not None else None
+        # _view opens a session of its own; release the lookup connection before re-reading effective activation.
+        if existing_view is not None:
+            return {
+                "created": False,
+                "server": await _view(principal, existing_view["id"], domain_id, existing_view),
+            }
         server = await es.create("mcp", {
             "name": candidate["name"], "url": url, "transport": candidate["transport"],
             "auth_mode": mode, **({"headers": headers} if headers else {}),
