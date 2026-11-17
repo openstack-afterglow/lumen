@@ -368,9 +368,12 @@ def test_metadata_serializers_do_not_decrypt_private_configuration(monkeypatch):
 
 async def test_oauth_callback_accepts_current_project_member_owner(monkeypatch):
     row = SimpleNamespace(status="pending", expires_at=datetime.now(UTC) + timedelta(minutes=5),
-                          owner_user_id="owner", owner_project_id="project", encrypted_payload="encrypted")
+                          owner_user_id="owner", owner_project_id="project", encrypted_payload="encrypted",
+                          mcp_server_id=7)
     result = SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: row))
-    session = SimpleNamespace(execute=AsyncMock(return_value=result))
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=result), get=AsyncMock(return_value=SimpleNamespace(scope="global")),
+    )
 
     @asynccontextmanager
     async def connection():

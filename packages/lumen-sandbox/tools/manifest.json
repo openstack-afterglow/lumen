@@ -1057,6 +1057,38 @@
           "effect": "read"
         }
       ]
+    },
+    {
+      "id": "markitdown",
+      "command": [
+        "/opt/lumen-tools/markitdown/bin/python",
+        "-I",
+        "/opt/lumen-tools/markitdown_server.py"
+      ],
+      "environment": {
+        "MARKITDOWN_ENABLE_PLUGINS": "false",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      },
+      "tools": [
+        {
+          "name": "convert_to_markdown",
+          "description": "Convert a resource described by an http:, https:, file: or data: URI to markdown",
+          "input_schema": {
+            "properties": {
+              "uri": {
+                "title": "Uri",
+                "type": "string"
+              }
+            },
+            "required": [
+              "uri"
+            ],
+            "type": "object",
+            "title": "convert_to_markdownArguments"
+          },
+          "effect": "external_mutation"
+        }
+      ]
     }
   ]
 }

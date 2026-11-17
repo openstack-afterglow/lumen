@@ -4,7 +4,7 @@ Properties:
 - one template yields as many connections as there are distinct labels, each with its own credentials;
 - an existing ``(template, label)`` pair is returned unchanged, never rewritten;
 - a pre-template row is recognised by URL only for an unlabeled request;
-- SSE and streamable HTTP are catalogued; stdio packages are not;
+- SSE and streamable HTTP are installable; local-only packages remain visible but unavailable;
 - a failed discovery keeps the last good tool catalog and records only the error;
 - an OAuth connection is discovered only with the requesting user's token.
 """
@@ -206,9 +206,12 @@ class TestRegistryTransports:
         entry = model.build_entry(item, "open")
         assert (entry["transport"], entry["url"]) == ("http", "https://b.example.com/mcp")
 
-    def test_local_package_is_not_catalogued(self):
+    def test_local_package_is_visible_but_not_installable(self):
         item = {"server": {"id": "p", "name": "p", "remotes": [], "packages": [{"registry_name": "npm"}]}}
-        assert model.build_entry(item, "open") is None
+        entry = model.build_entry(item, "open")
+        assert entry["access"] == "unavailable"
+        assert entry["url"] == ""
+        assert entry["unavailable_reason"] == "stdio_only"
 
     def test_probe_targets_carry_the_transport_for_each_url(self):
         items = [

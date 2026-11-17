@@ -687,11 +687,15 @@ CREATE TABLE `chat_mcp_servers` (
   `tool_catalog` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`tool_catalog`)),
   `catalog_refreshed_at` datetime DEFAULT NULL,
   `catalog_error` varchar(300) DEFAULT NULL,
+  `owner_domain_id` varchar(64) DEFAULT NULL,
+  `connection_scope_key` varchar(200) NOT NULL DEFAULT 'global',
+  `implicit_selection` tinyint NOT NULL DEFAULT 1,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uq_chat_mcp_template_label` (`template_key`,`connection_label`),
+  UNIQUE KEY `uq_chat_mcp_scoped_template_label` (`connection_scope_key`,`template_key`,`connection_label`),
   KEY `idx_chat_mcp_owner` (`owner_user_id`),
   KEY `idx_chat_mcp_scope` (`scope`),
-  KEY `idx_chat_mcp_servers_project` (`project_id`)
+  KEY `idx_chat_mcp_servers_project` (`project_id`),
+  KEY `idx_chat_mcp_domain` (`owner_domain_id`,`scope`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_memories` (

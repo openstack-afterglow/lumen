@@ -1,9 +1,9 @@
 """Pure model of the GitHub MCP Registry snapshot. No database and no network.
 
-The registry (https://github.com/mcp, API ``https://api.mcp.github.com/v0/servers``) lists local ``packages``
-(npm/pypi/oci, launched over stdio) and hosted ``remotes``. Lumen never launches local processes, because a
-stdio server runs inside the worker with unbounded size and no recoverable failure boundary. Only hosted
-remotes are catalogued, over two transports: ``streamable-http`` (stored as ``http``) and ``sse``.
+The registry (https://github.com/mcp, API ``https://api.mcp.github.com/v0/servers``) lists local packages and remotes.
+Multiple registry names may share one hosted endpoint; each keeps its registry ID. Local ``packages`` remain
+visible with an explicit unavailable reason. Lumen never launches them from this catalog. Hosted remotes use
+``streamable-http`` (stored as ``http``) or ``sse``.
 
 ``scripts/sync_mcp_registry.py`` builds the snapshot ``mcp_registry_catalog.json`` and probes each literal remote
 once without credentials. Each entry then gets one ``access`` value that decides how it may be installed:
@@ -16,6 +16,10 @@ once without credentials. Each entry then gets one ``access`` value that decides
 ``configure``    the URL is a template such as ``https://{tenant}.example.com/mcp``. The administrator supplies
                  the variables and the ``auth_mode``; the probe never runs against a template.
 ``unreachable``  the probe got no usable answer. Listed for visibility, never installed.
+``unavailable``  no supported, safe hosted HTTPS remote exists; shown without an installable URL. Its
+                 ``unavailable_reason`` is a code: ``stdio_only``, ``no_supported_remote`` or ``no_remote``.
+``managed``      an exact official repository that Lumen runs itself as a sandbox-hosted stdio profile
+                 (``managed_profile``). It needs no connection and is never installed from this catalog.
 
 Registry text is third-party data. It is never executed. Every URL is re-validated by the connection service and
 ``extensions_store`` (https only, public address) when a row is created, so the snapshot is not a security boundary.
@@ -23,15 +27,27 @@ Registry text is third-party data. It is never executed. Every URL is re-validat
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 ACCESS_OPEN = "open"
 ACCESS_OAUTH = "oauth"
 ACCESS_CREDENTIALS = "credentials"
 ACCESS_CONFIGURE = "configure"
 ACCESS_UNREACHABLE = "unreachable"
-ACCESS_STATES = (ACCESS_OPEN, ACCESS_OAUTH, ACCESS_CREDENTIALS, ACCESS_CONFIGURE, ACCESS_UNREACHABLE)
+ACCESS_UNAVAILABLE = "unavailable"
+ACCESS_MANAGED = "managed"
+ACCESS_STATES = (
+    ACCESS_OPEN,
+    ACCESS_OAUTH,
+    ACCESS_CREDENTIALS,
+    ACCESS_CONFIGURE,
+    ACCESS_UNREACHABLE,
+    ACCESS_UNAVAILABLE,
+    ACCESS_MANAGED,
+)
 # The only outcomes a credential-free probe can establish for a literal URL.
 PROBE_RESULTS = (ACCESS_OPEN, ACCESS_OAUTH, ACCESS_CREDENTIALS, ACCESS_UNREACHABLE)
 # Entries an administrator can install in bulk with no value of their own to supply.
@@ -43,6 +59,23 @@ REMOTE_TRANSPORTS = {"streamable-http": "http", "sse": "sse"}
 _VARIABLE = re.compile(r"\{([A-Za-z0-9_-]+)\}")
 _NAME_MAX = 100  # chat_mcp_servers.name is VARCHAR(100)
 _DESCRIPTION_MAX = 300
+_HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_CREDENTIAL_QUERY_KEY = re.compile(
+    r"token|secret|passw|auth|credential|signature|session|bearer|api[-_]?key|access[-_]?key|(?:^|[-_])(?:key|sig|pwd)(?:$|[-_])",
+    re.IGNORECASE,
+)
+# Exact official repositories/endpoints only. Popularity alone does not establish publisher identity.
+_FEATURED = {
+    "https://github.com/github/github-mcp-server": {"https://api.githubcopilot.com/mcp"},
+    "https://github.com/makenotion/notion-mcp-server": {"https://mcp.notion.com/mcp", "https://mcp.notion.com/sse"},
+    "https://github.com/stripe/agent-toolkit": {"https://mcp.stripe.com"},
+    "https://github.com/getsentry/toolkit": {"https://mcp.sentry.dev/mcp"},
+}
+# Exact official repository -> sandbox tool profile in packages/lumen-sandbox/tools/manifest.json.
+_MANAGED_PROFILES = {
+    "https://github.com/microsoft/playwright-mcp": "playwright",
+    "https://github.com/microsoft/markitdown": "markitdown",
+}
 
 
 class McpRegistryError(ValueError):
@@ -64,11 +97,57 @@ def url_variables(url: str) -> list[str]:
     return list(dict.fromkeys(_VARIABLE.findall(url)))
 
 
+def safe_catalog_url(value: object, *, templates: bool = True) -> str:
+    """Keep public HTTPS URLs without userinfo, fragments, or literal query credentials.
+
+    DNS/public-address validation still belongs to the connection service before installation and I/O.
+    A URL template must remain HTTPS even before its variables are filled.
+    """
+    if not isinstance(value, str):
+        return ""
+    url = value.strip()
+    if not url or any(ch.isspace() or ord(ch) < 32 for ch in unquote(url)) or "\\" in url:
+        return ""
+    if not templates and url_variables(url):
+        return ""
+    # A dotted placeholder keeps whole-host templates such as https://{host}/mcp valid before they are filled.
+    concrete = _VARIABLE.sub("example.com", url) if templates else url
+    if "{" in concrete or "}" in concrete:
+        return ""
+    try:
+        parts = urlsplit(concrete)
+        host = parts.hostname or ""
+        if parts.scheme != "https" or not host or parts.username or parts.password or parts.fragment:
+            return ""
+        if parts.port is not None and not 1 <= parts.port <= 65535:
+            return ""
+        if "%" in parts.netloc or host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+            return ""
+        try:
+            if not ipaddress.ip_address(host).is_global:
+                return ""
+        except ValueError:
+            if "." not in host or any(not label for label in host.split(".")):
+                return ""
+        # Non-secret selectors (?apis=google_serp) are fine. A literal value under a credential-like key is not.
+        for pair in urlsplit(url).query.split("&"):
+            key, _, query_value = pair.partition("=")
+            if (
+                query_value
+                and _CREDENTIAL_QUERY_KEY.search(unquote(key))
+                and not _VARIABLE.fullmatch(unquote(query_value))
+            ):
+                return ""
+    except ValueError:
+        return ""
+    return url
+
+
 def _supported_remote(server: dict[str, Any]) -> tuple[dict[str, Any], str] | None:
     """The preferred supported remote and its Lumen transport, or ``None`` when there is none."""
     candidates: list[tuple[int, dict[str, Any], str]] = []
     for remote in server.get("remotes") or []:
-        if not isinstance(remote, dict) or not isinstance(remote.get("url"), str):
+        if not isinstance(remote, dict) or not safe_catalog_url(remote.get("url")):
             continue
         transport = REMOTE_TRANSPORTS.get(remote.get("transport_type") or "")
         if transport is None:
@@ -77,19 +156,26 @@ def _supported_remote(server: dict[str, Any]) -> tuple[dict[str, Any], str] | No
         candidates.append((rank, remote, transport))
     if not candidates:
         return None
-    _, remote, transport = min(candidates, key=lambda item: item[0])
+    _, remote, transport = min(candidates, key=lambda item: (item[0], item[1]["url"]))
     return remote, transport
 
 
 def header_hints(remote: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "description": str(header.get("description") or "")[:_DESCRIPTION_MAX],
-            "secret": bool(header.get("is_secret")),
-        }
-        for header in remote.get("headers") or []
-        if isinstance(header, dict)
-    ]
+    """Keep declared names and requirement flags, never values, defaults, examples or variables."""
+    hints = []
+    for header in remote.get("headers") or []:
+        if not isinstance(header, dict):
+            continue
+        name = header.get("name")
+        hints.append(
+            {
+                "name": name if isinstance(name, str) and _HEADER_NAME.fullmatch(name) else None,
+                "description": str(header.get("description") or "")[:_DESCRIPTION_MAX],
+                "required": header.get("is_required") if isinstance(header.get("is_required"), bool) else None,
+                "secret": header.get("is_secret") if isinstance(header.get("is_secret"), bool) else None,
+            }
+        )
+    return sorted(hints, key=lambda hint: (hint["name"] or "", hint["description"]))
 
 
 def probe_targets(items: list[dict[str, Any]]) -> dict[str, str]:
@@ -102,7 +188,7 @@ def probe_targets(items: list[dict[str, Any]]) -> dict[str, str]:
             continue
         remote, transport = supported
         url = remote["url"].strip()
-        if url_variables(url) or header_hints(remote) or not url.lower().startswith("https://"):
+        if url_variables(url) or any(hint["required"] is not False for hint in header_hints(remote)):
             continue
         targets.setdefault(url, transport)
     return dict(sorted(targets.items()))
@@ -111,7 +197,7 @@ def probe_targets(items: list[dict[str, Any]]) -> dict[str, str]:
 def classify(url: str, hints: list[dict[str, Any]], probe: str | None) -> str:
     if url_variables(url):
         return ACCESS_CONFIGURE
-    if hints:
+    if any(hint.get("required") is not False for hint in hints):
         return ACCESS_CREDENTIALS
     if probe not in PROBE_RESULTS:
         raise McpRegistryError(f"probe result missing for {url}")
@@ -119,22 +205,41 @@ def classify(url: str, hints: list[dict[str, Any]], probe: str | None) -> str:
 
 
 def build_entry(item: dict[str, Any], probe: str | None) -> dict[str, Any] | None:
-    """Project one registry list item onto a catalog entry, or ``None`` when it has no usable remote."""
+    """Keep every identified registry server, including packages with no hosted remote."""
     server = item.get("server")
     if not isinstance(server, dict) or not server.get("name") or not server.get("id"):
         return None
     supported = _supported_remote(server)
-    if supported is None:
-        return None
-    remote, transport = supported
-    url = remote["url"].strip()
-    if not url_variables(url) and not url.lower().startswith("https://"):
-        return None
-    hints = header_hints(remote)
     github = item.get("x-github") if isinstance(item.get("x-github"), dict) else {}
     repository = server.get("repository") if isinstance(server.get("repository"), dict) else {}
+    repository_url = safe_catalog_url(repository.get("url"), templates=False)
     registry_name = str(server["name"])
     title = str(github.get("display_name") or registry_name).strip() or registry_name
+    url, transport, hints, variables = "", None, [], []
+    reason = None
+    managed_profile = _MANAGED_PROFILES.get(normalized_url(repository_url))
+    if managed_profile is not None:
+        access = ACCESS_MANAGED
+    elif supported is None:
+        access = ACCESS_UNAVAILABLE
+        if server.get("remotes"):
+            reason = "no_supported_remote"
+        elif server.get("packages"):
+            reason = "stdio_only"
+        else:
+            reason = "no_remote"
+    else:
+        remote, transport = supported
+        url = safe_catalog_url(remote["url"])
+        hints = header_hints(remote)
+        variables = url_variables(url)
+        access = classify(url, hints, probe)
+        if access == ACCESS_UNREACHABLE:
+            reason = "unverified_response"
+    featured_urls = _FEATURED.get(normalized_url(repository_url))
+    featured = managed_profile is not None or (
+        featured_urls is not None and (not featured_urls or normalized_url(url) in featured_urls)
+    )
     return {
         "id": str(server["id"]),
         "registry_name": registry_name,
@@ -142,26 +247,37 @@ def build_entry(item: dict[str, Any], probe: str | None) -> dict[str, Any] | Non
         "description": str(server.get("description") or "")[:_DESCRIPTION_MAX],
         "url": url,
         "transport": transport,
-        "variables": url_variables(url),
+        "variables": variables,
         "header_hints": hints,
-        "docs_url": str(repository.get("url") or f"https://github.com/mcp/{registry_name}"),
-        "access": classify(url, hints, probe),
+        "docs_url": repository_url or "https://github.com/mcp",
+        "access": access,
+        "featured": featured,
+        "unavailable_reason": reason,
+        "managed_profile": managed_profile,
     }
 
 
 def build_catalog(items: list[dict[str, Any]], probes: dict[str, str]) -> list[dict[str, Any]]:
-    """Deterministic catalog: sorted by registry name, one entry per destination URL.
-
-    ``probes`` maps each URL from :func:`probe_targets` to its probe result.
-    """
+    """Deterministic complete registry projection, one entry per stable registry ID."""
     entries: dict[str, dict[str, Any]] = {}
     for item in sorted(items, key=lambda it: str((it.get("server") or {}).get("name", ""))):
         server = item.get("server") if isinstance(item.get("server"), dict) else {}
         supported = _supported_remote(server)
         probe = probes.get(supported[0]["url"].strip()) if supported is not None else None
-        entry = build_entry(item, probe)
-        if entry is None:
-            continue
-        # Two registry names can front one endpoint; keep the first in name order.
-        entries.setdefault(normalized_url(entry["url"]), entry)
-    return sorted(entries.values(), key=lambda entry: (entry["registry_name"], entry["id"]))
+        candidate = build_entry(item, probe)
+        if candidate is not None:
+            entries.setdefault(candidate["id"], candidate)
+    return sorted(entries.values(), key=lambda candidate: (candidate["registry_name"], candidate["id"]))
+
+
+def coverage_counts(candidates: list[dict[str, Any]], registry_total: int) -> dict[str, Any]:
+    """Counts describe snapshot coverage, not authenticated tool execution acceptance."""
+    return {
+        "registry_total": registry_total,
+        "catalogued": len(candidates),
+        "remote": sum(candidate["access"] not in (ACCESS_UNAVAILABLE, ACCESS_MANAGED) for candidate in candidates),
+        "unavailable": sum(candidate["access"] == ACCESS_UNAVAILABLE for candidate in candidates),
+        "managed": sum(candidate["access"] == ACCESS_MANAGED for candidate in candidates),
+        "featured": sum(bool(candidate.get("featured")) for candidate in candidates),
+        "by_access": {access: sum(candidate["access"] == access for candidate in candidates) for access in ACCESS_STATES},
+    }

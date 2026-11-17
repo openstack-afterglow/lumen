@@ -441,6 +441,9 @@ class ChatMcpServer(Base):
     owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     owner_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    connection_scope_key: Mapped[str] = mapped_column(VARCHAR(200), nullable=False, default="global", server_default="global")
+    implicit_selection: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True, server_default="1")
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
     transport: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="http")  # HTTPS streamable HTTP only
     url: Mapped[str | None] = mapped_column(VARCHAR(500))
@@ -479,7 +482,8 @@ class ChatMcpServer(Base):
         Index("idx_chat_mcp_scope", "scope"),
         Index("idx_chat_mcp_owner", "owner_user_id"),
         Index("idx_chat_mcp_servers_project", "project_id"),
-        UniqueConstraint("template_key", "connection_label", name="uq_chat_mcp_template_label"),
+        Index("idx_chat_mcp_domain", "owner_domain_id", "scope"),
+        UniqueConstraint("connection_scope_key", "template_key", "connection_label", name="uq_chat_mcp_scoped_template_label"),
     )
 
 

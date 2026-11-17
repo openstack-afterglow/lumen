@@ -12,12 +12,19 @@ from __future__ import annotations
 import secrets
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from lumen.auth import ensure_scopes, require_admin, require_scopes
 from lumen.services import extensions_store as es
-from lumen.services import mcp_bundles, mcp_connections, mcp_oauth, mcp_registry_catalog, mcp_registry_model
+from lumen.services import (
+    mcp_bundles,
+    mcp_connections,
+    mcp_oauth,
+    mcp_registry_catalog,
+    mcp_registry_model,
+    mcp_settings,
+)
 
 admin_router = APIRouter(dependencies=[Depends(require_admin)])
 user_router = APIRouter()
@@ -123,6 +130,10 @@ def _http(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, es.ExtensionForbidden):
         return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, mcp_registry_model.McpRegistryNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, mcp_registry_model.McpRegistryError):
+        return HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, es.ExtensionValidationError):
         return HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, mcp_oauth.McpOAuthError):
@@ -136,6 +147,8 @@ _EXC = (
     es.ExtensionValidationError,
     es.ExtensionSecretUnavailable,
     es.ChatStorageUnavailable,
+    mcp_registry_model.McpRegistryError,
+    mcp_registry_model.McpRegistryNotFound,
 )
 
 
@@ -184,6 +197,15 @@ async def admin_install_mcp_registry_all():
     """
     try:
         return await mcp_registry_catalog.install_all()
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@admin_router.post("/admin/mcp-registry/install-featured")
+async def admin_install_featured_mcp_registry():
+    """Idempotently publish credential-free featured templates; never implicitly select them."""
+    try:
+        return await mcp_registry_catalog.install_featured()
     except _EXC as exc:
         raise _http(exc) from exc
 
@@ -453,6 +475,7 @@ async def user_start_mcp_oauth(
     uid, pid = _owner(token_info)
     initiator_nonce = secrets.token_urlsafe(32)
     try:
+        await mcp_settings.check_oauth_management(token_info, item_id)
         result = await mcp_oauth.begin(
             item_id,
             user_id=uid,
@@ -480,6 +503,7 @@ async def user_disconnect_mcp_oauth(
 ):
     uid, pid = _owner(token_info)
     try:
+        await mcp_settings.check_oauth_management(token_info, item_id)
         await mcp_oauth.disconnect(item_id, user_id=uid, project_id=pid)
     except _EXC + (mcp_oauth.McpOAuthError,) as exc:
         raise _http(exc) from exc
@@ -574,5 +598,126 @@ async def user_delete_skill(item_id: int, token_info: dict = Depends(require_sco
     uid, pid = _owner(token_info)
     try:
         await es.delete("skill", item_id, requester_user_id=uid, requester_project_id=pid)
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+class McpTemplateConnectionBody(AdminMcpRegistryInstallBody):
+    template_id: str = Field(min_length=1, max_length=100)
+
+
+@user_router.get("/mcp-settings")
+async def user_mcp_settings(
+    offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100),
+    q: str | None = Query(default=None, max_length=100), featured: bool | None = None,
+    access: Literal["open", "oauth", "credentials", "configure", "unreachable", "unavailable", "managed"] | None = None,
+    state: Literal[
+        "not_connected", "needs_auth", "personal_connected", "org_connected", "global_connected",
+        "managed_available", "managed_unavailable",
+    ] | None = None,
+    token_info: dict = Depends(require_scopes("native:extensions:read")),
+):
+    try:
+        return await mcp_settings.view(
+            token_info, offset=offset, limit=limit, q=q, featured=featured, access=access, state=state
+        )
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@user_router.post("/mcp-connections", status_code=201)
+async def user_create_template_connection(
+    body: McpTemplateConnectionBody, token_info: dict = Depends(require_scopes("native:mcp:write")),
+):
+    try:
+        return await mcp_settings.create(token_info, **body.model_dump())
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@user_router.patch("/mcp-connections/{item_id}")
+async def user_patch_template_connection(
+    item_id: int, body: AdminMcpConnectionPatchBody,
+    token_info: dict = Depends(require_scopes("native:mcp:write")),
+):
+    try:
+        return await mcp_settings.update(token_info, item_id, body.model_dump(exclude_unset=True))
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@user_router.delete("/mcp-connections/{item_id}", status_code=204)
+async def user_delete_template_connection(
+    item_id: int, token_info: dict = Depends(require_scopes("native:extensions:delete")),
+):
+    try:
+        await mcp_settings.delete(token_info, item_id)
+    except _EXC as exc:
+        raise _http(exc) from exc
+    return Response(status_code=204)
+
+
+@user_router.get("/domains/{domain_id}/mcp-connections")
+async def user_list_domain_connections(
+    domain_id: str, offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100),
+    token_info: dict = Depends(require_scopes("native:extensions:read")),
+):
+    try:
+        rows = await mcp_settings.domain_connections(token_info, domain_id)
+        return {"connections": rows[offset:offset + limit], "total": len(rows), "offset": offset, "limit": limit,
+                "next_offset": offset + limit if offset + limit < len(rows) else None}
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@user_router.post("/domains/{domain_id}/mcp-connections", status_code=201)
+async def user_create_domain_connection(
+    domain_id: str, body: McpTemplateConnectionBody,
+    token_info: dict = Depends(require_scopes("native:mcp:write")),
+):
+    try:
+        return await mcp_settings.create(token_info, domain_id=domain_id, **body.model_dump())
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@user_router.patch("/domains/{domain_id}/mcp-connections/{item_id}")
+async def user_update_domain_connection(
+    domain_id: str, item_id: int, body: AdminMcpServerBody,
+    token_info: dict = Depends(require_scopes("native:mcp:write")),
+):
+    try:
+        patch = body.model_dump(exclude_unset=True)
+        if "load_policy" in patch:
+            raise es.ExtensionValidationError("Domain connections always use on_demand loading")
+        return await mcp_settings.update(token_info, item_id, patch, domain_id=domain_id)
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@user_router.delete("/domains/{domain_id}/mcp-connections/{item_id}", status_code=204)
+async def user_delete_domain_connection(
+    domain_id: str, item_id: int,
+    token_info: dict = Depends(require_scopes("native:extensions:delete")),
+):
+    try:
+        await mcp_settings.delete(token_info, item_id, domain_id=domain_id)
+    except _EXC as exc:
+        raise _http(exc) from exc
+    return Response(status_code=204)
+
+
+@user_router.patch("/domains/{domain_id}/mcp-connections/{item_id}/activation")
+async def user_activate_domain_connection(
+    domain_id: str, item_id: int, body: McpActivationBody,
+    token_info: dict = Depends(require_scopes("native:mcp:write")),
+):
+    """Member's personal consent to an exact organization revision; not organization mutation."""
+    try:
+        await mcp_settings.scoped_connection(token_info, item_id, domain_id)
+        return await es.set_mcp_activation(
+            item_id, user_id=token_info["user_id"], project_id=token_info["project_id"],
+            is_active=body.is_active, config_version=body.config_version,
+        )
     except _EXC as exc:
         raise _http(exc) from exc
