@@ -25,6 +25,17 @@ CallId = Annotated[StrictStr, Field(min_length=1, max_length=64)]
 class WireModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unknown_protocol_fields(cls, value):
+        if isinstance(value, dict):
+            for key in value:
+                if key not in cls.model_fields:
+                    # One fixed error, not one error per attacker-controlled key.
+                    # Plain dictionaries inside input_json.data are not WireModels.
+                    raise ValueError("unknown protocol field")
+        return value
+
 
 class CacheBreakpoint(WireModel):
     mode: Literal["explicit"] = "explicit"

@@ -456,6 +456,8 @@ Input item은 `type`(생략 시 message)으로 한 번만 분기한다. Decision
 
 모든 request list(input/message·tool content/instructions/questions/choices/levels/JSON object 배열)는 첫 invalid item에서 validation을 중단한다(`fail_fast=True`). `input_json.data`의 object 배열은 구조 검증 단계에서도 최대 10,000개로 제한하며, nested JSON 값 계산은 child 전체를 별도 배열로 만들지 않는 depth-first iterator를 쓴다. 따라서 bounded 422 rendering 전에 오류 목록을 대량으로 만드는 경로도 차단한다.
 
+Protocol object는 Pydantic의 `extra="forbid"` 오류를 key마다 만들기 전에 첫 unknown key에서 고정 오류 하나로 거절한다. 이 guard는 request/message/part/question 같은 protocol model에만 적용하며 `input_json.data` 내부의 arbitrary key를 제한하지 않는다.
+
 `input_json.data`는 object 또는 object 배열이다. Root를 포함한 container 깊이 32, root/container를 포함한 값 10,000개, compact UTF-8 JSON 256 KiB가 상한이며 NaN/Infinity는 거절한다. Data 내부 `role`, `type`, `image_url` 등은 일반 JSON 값이지 protocol part가 아니다. `input_image.image_url`은 `data:`, `http://`, `https://`로 시작해야 하며 detail은 `low|high|auto|original` 또는 null이다. 공유 input과 질문 instructions 전체 image 합계는 최대 16개다. **Lumen은 image URL을 직접 fetch하지 않는다.** `prompt_cache_key`는 최대 64자, `safety_identifier`는 최대 128자, `prompt_cache_options.ttl`은 `"30m"`만 받는다.
 
 ### 응답과 정산
