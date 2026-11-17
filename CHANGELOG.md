@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.6.17 — release preparation (not published or deployed)
+## 0.6.17 — 2026-11-18 (published and deployed; OpenAI paid paths unverified)
+
+- **배포:** tag `0.6.17`(`c5b020be`)을 2026-11-17 20:34–20:36 UTC에 DMS Lab 세 컨트롤러에 반영했다. Migration 033·034, 관리형 ClamAV, protocol 2를 같은 drain된 cohort에서 켰다. 수신증은 `docs/testing.md`와 `docs/operations.md`에 있다.
 
 - **한국어 — 클라우드 승인:** 프로토콜 v2의 Afterglow 변경 미리보기 JSON 처리를 수정하고 VM 생성의 명시적 이미지·flavor·네트워크·부팅 볼륨·키·보안그룹 선택과 관리 권한 동의 경로를 안내한다. 클라우드 변경은 내부 자동 승인 설정에서도 사용자의 승인을 요구한다. 프로토콜 v1의 조회 전용 경계는 유지하며 실제 VM을 생성하지 않았다.
 - **English — Cloud approval:** Correct protocol-v2 JSON mutation previews and explain explicit VM resource choices and manage consent. Cloud mutations always require human approval, including internal automatic mode. Protocol v1 remains read-only; no live VM creation was performed.

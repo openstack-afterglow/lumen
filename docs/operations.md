@@ -7,9 +7,17 @@
 - **ClamAV:** `enable_lumen_clamav: true`, `lumen_clamav_host`는 비운다. Host network, `127.0.0.1:3310`, 서명 신선도·PING·VERSION 확인 전에는 API/worker가 기동하지 않는다.
 - **Kolla reconfigure:** 항상 `--skip-tags haproxy`를 붙인다.
 - **네이티브 카탈로그:** 공식 endpoint 모델 중 저장 단가가 없는 행은 배포 즉시 카탈로그 단가로 과금된다. 운영 전후 표(Gemini 이미지·일부 텍스트, `gpt-image-1.5`·`gpt-image-2`, Perplexity `glm-5.3-flash`·`kimi-k3` 등)를 확인한 뒤 배포한다. 현재 rate card에 없는 Perplexity 모델 5개는 계속 미가격이다. 사용자 지정 base의 호환 공급자는 관리자 단가가 필수다. Perplexity Sonar는 provider 내장 검색을 계속 수행하며 검색 수수료는 아직 청구하지 않는다(기존 한계). 공급자 기본 웹 검색 gate는 수수료를 청구할 수 있을 때까지 닫혀 있다.
-- **운영자 레지스트리 정리(명시적 편집):** `stt`로 잘못 저장된 OpenAI 실시간 전사 모델은 `realtime`으로 바꾸고 `realtime_input_per_minute` 단가를 넣은 뒤 활성화한다. 자동 SQL 변경은 하지 않는다.
+- **운영자 레지스트리 정리(명시적 편집):** `stt`로 잘못 저장된 OpenAI 실시간 전사 모델은 `realtime`으로 바꾸고 잘못된 수동 단가를 지워 카탈로그 `realtime_input_per_minute`가 적용되게 한 뒤, 공급자 계정이 호출 가능할 때 활성화한다. 자동 SQL 변경은 하지 않는다.
 - **Decisions:** 공식 지원 모델은 `gpt-6-luna`(카탈로그 `decisions=true`). 불확실한 무상태 예약은 명시적 처분 전까지 quota에 남는다. 처분 API는 없으며 event UUID와 공급자 사용 증거를 대조한 뒤 유지보수 절차로만 정산·해제한다.
 - **Sandbox runtime:** 최종 0.6.17 sandbox 이미지·manifest digest와 mTLS 검증 전에는 `lumen_runtime_enabled: false`를 유지한다.
+- **ClamAV 포트:** 고정 이미지의 기본 `clamd.conf`에 `TCPSocket 3310`이 이미 활성이어서 `CLAMD_CONF_TCPSocket`은 중복 줄로만 붙고 clamd는 첫 값(3310)을 쓴다. 그래서 관리형 모드의 precheck는 `lumen_clamav_port == 3310`을 강제한다. 다른 포트가 필요하면 외부 검사기를 쓴다.
+
+### 0.6.17 운영 반영 기록 (2026-11-17 UTC)
+
+- 사전 검증: 세 컨트롤러에 고정 ClamAV 이미지를 받고 `lumen_clamav_signatures` 볼륨을 freshclam으로 채운 뒤(daily 28186), 역할과 같은 설정의 임시 컨테이너가 약 20초 안에 `127.0.0.1:3310`에서 PONG·VERSION을 반환함을 확인하고 정리했다(약 957MiB/4GiB).
+- 전환: `/etc/kolla/pyproject.toml`의 `lumen` tag만 0.6.17로 바꾸고 `uv lock --upgrade-package lumen`, `uv sync --inexact --no-install-package waygate`. `globals.d/zzz-lumen-0.6.17.yml`(세 digest, `enable_lumen_clamav: true`, `lumen_media_enabled: true`, protocol 2). `pull`·`prechecks` rc0 → API 정지 → 실행 59건 종료·예약 0 → worker 정지 → 암호화 백업 `/var/backups/lumen/pre-v0.6.17-20261117T194444Z` → `kolla-ansible reconfigure -i /etc/kolla/multinode --tags lumen --skip-tags haproxy` rc0(약 83초).
+- 결과: API/worker 새 digest·restarts 0·protocol 2, `lumen_clamav` healthy, 직접·공개 ready 200, census 차이는 Lumen 컨테이너뿐. 운영 스모크와 OpenAI 크레딧 소진 진단은 `docs/testing.md`의 같은 날짜 절에 있다.
+- 롤백 자료: 설정 백업과 전후 census는 `/etc/kolla/.afterglow-rollout-backups/lumen-0.6.17-20261117T194444Z`. 033·034는 additive이며, v2 대기 승인이 생긴 뒤에는 v1로 되돌리지 않는다.
 
 ## 0.6.16 텍스트 임베딩 롤아웃 메모
 
