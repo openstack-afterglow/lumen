@@ -458,6 +458,10 @@ Upper bound는 전체 text/JSON/tool/choice wire skeleton의 기존 tokenizer es
 
 Upstream은 `{api_base or https://api.openai.com/v1}/decisions`에 single attempt로 전송하며 redirects/environment proxies/retries를 쓰지 않는다. 전체 120초, connect 10초, write 30초, response 8 MiB 상한이다. 명확한 connection-before-send 실패와 provider rejection은 hold를 release한다. Send 이후 timeout/cancel/불명확한 응답/정산 실패는 `unknown`, process crash는 `reserved`를 유지한다. **두 상태는 시간이 지나도 quota에서 제외하지 않는다.** 자동 재전송/자동 만료/자동 재정산은 없다.
 
+공식 OpenAI root(`https://api.openai.com` 및 trailing slash 포함)는 기존 direct-provider base 판별을 재사용해 `/v1/decisions`로 정규화한다. 공식 `/v1` base와 미지정 base도 같은 URL을 쓴다. Third-party custom root/prefix에는 `/v1`을 임의로 추가하지 않고 저장된 prefix 뒤 `/decisions`만 붙인다.
+
+Fresh provider credential 조회는 dispatch 경계보다 먼저 수행한다. 해당 DB 조회의 cancellation/storage failure는 provider I/O가 없으므로 hold를 release한다. 실제 HTTP dispatch 직전에만 possible-send 상태로 바뀌며 이후 cancellation은 unknown hold로 남는다.
+
 운영자는 unknown/crashed reservation의 event UUID와 provider의 사용 증거를 대조한 뒤 유지·정산·release disposition을 검토해야 한다. 이 변경은 operator disposition API/CLI를 추가하지 않는다. 승인된 유지보수에서만 내부 서비스의 `stateless_credit.settle`(동일 event, 검증된 usage) 또는 **definite-no-charge 확인 뒤** `stateless_credit.finish(event_id, uncertain=False)`를 명시적으로 사용한다. 불명확한 hold를 삭제하거나 clock/TTL로 quota를 복원하면 안 된다. Settled/released row는 감사 보존 정책에 따라, immutable usage event와의 연결을 보존한 별도 유지보수에서만 정리한다.
 
 Migration **034**를 적용한 뒤 새 writer를 시작한다(동시 pending migration 033과 함께 사전 적용). Additive table이므로 old writer는 무시하지만 old writer는 stateless hold를 quota에 반영하지 않는다. 따라서 새 Decisions admission을 연 상태에서 quota를 공유하는 old/new writer를 혼용하지 않는다. Rollback은 새 admission 정지·in-flight drain 뒤 code rollback이며 hold table/ledger를 drop하지 않는다.

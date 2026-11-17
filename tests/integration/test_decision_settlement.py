@@ -79,9 +79,10 @@ async def test_concurrent_decisions_only_one_fitting_request_enters_upstream(sql
     release = asyncio.Event()
     count = 0
 
-    async def upstream(*_args):
+    async def upstream(*_args, on_dispatch):
         nonlocal count
         count += 1
+        on_dispatch()
         entered.set()
         await release.wait()
         return _response()

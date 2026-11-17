@@ -8,6 +8,7 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -276,7 +277,11 @@ async def test_failure_releases_or_retains_unknown(lifecycle, monkeypatch, uncer
 
 
 async def test_cancel_after_send_retains_unknown(lifecycle, monkeypatch):
-    monkeypatch.setattr(decisions, "transport", AsyncMock(side_effect=asyncio.CancelledError()))
+    async def cancel_after_dispatch(*_args, on_dispatch):
+        on_dispatch()
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(decisions, "transport", cancel_after_dispatch)
     with pytest.raises(asyncio.CancelledError):
         await run()
     assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
@@ -467,3 +472,44 @@ async def test_oversized_upstream_response_keeps_unknown_hold(lifecycle, monkeyp
             await run(selected_route=route(api_base=base))
     assert len(calls) == 1
     assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
+
+
+@pytest.mark.parametrize("base,expected", [
+    (None, "https://api.openai.com/v1/decisions"),
+    ("https://api.openai.com", "https://api.openai.com/v1/decisions"),
+    ("https://api.openai.com/", "https://api.openai.com/v1/decisions"),
+    ("https://api.openai.com/v1", "https://api.openai.com/v1/decisions"),
+    ("https://example.test/openai/v1", "https://example.test/openai/v1/decisions"),
+    ("https://example.test", "https://example.test/decisions"),
+])
+async def test_transport_normalizes_only_official_openai_bases(monkeypatch, base, expected):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json=response())
+
+    def transport(**kwargs):
+        assert kwargs == {"retries": 0, "trust_env": False}
+        return httpx.MockTransport(handler)
+
+    monkeypatch.setattr(decisions.httpx, "AsyncHTTPTransport", transport)
+    await decisions.transport(route(api_base=base), DecisionRequest.model_validate(request()))
+    assert len(calls) == 1
+    assert calls[0].method == "POST"
+    assert str(calls[0].url) == expected
+
+
+@pytest.mark.parametrize("failure", ["cancel", "storage"])
+async def test_credential_resolution_failure_releases_before_dispatch(lifecycle, monkeypatch, failure):
+    error = asyncio.CancelledError() if failure == "cancel" else credit.ChatStorageUnavailable("synthetic store outage")
+    monkeypatch.setattr(decisions, "resolve_route_api_key", AsyncMock(side_effect=error))
+    transport = AsyncMock()
+    monkeypatch.setattr(decisions.httpx, "AsyncHTTPTransport", transport)
+    expected = asyncio.CancelledError if failure == "cancel" else decisions.DecisionError
+    with pytest.raises(expected):
+        await run()
+    lifecycle["reserve"].assert_awaited_once()
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": False}
+    transport.assert_not_called()
+    lifecycle["settle"].assert_not_called()

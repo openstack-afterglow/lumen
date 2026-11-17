@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 import uuid
+from collections.abc import Callable
 from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 
 import httpx
@@ -230,19 +231,26 @@ def validate_answers(raw: object, body: DecisionRequest) -> list[dict]:
         raise DecisionError(502, "invalid decision answers", uncertain=True) from exc
 
 
-async def transport(route: dict, body: DecisionRequest) -> dict:
+async def transport(route: dict, body: DecisionRequest, *, on_dispatch: Callable[[], None] | None = None) -> dict:
     key = await resolve_route_api_key(route)
-    url = (route.get("api_base") or "https://api.openai.com/v1").rstrip("/") + "/decisions"
+    base = route.get("api_base")
+    if provider_metadata.direct_provider_route("openai", base):
+        base = "https://api.openai.com/v1"
+    url = base.rstrip("/") + "/decisions"
     payload = body.model_dump(exclude_none=True, exclude_unset=True)
     payload["model"] = route["api_model_name"]
     try:
-        async with asyncio.timeout(120):
-            async with (
-                httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False,
-                                  transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False)) as client,
-                client.stream("POST", url, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                              json=payload) as response,
-            ):
+        async with (
+            asyncio.timeout(120),
+            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False,
+                              transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False)) as client,
+        ):
+            if on_dispatch is not None:
+                on_dispatch()
+            async with client.stream(
+                "POST", url, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+            ) as response:
                 if response.status_code != 200:
                     status = 429 if response.status_code == 429 else 502
                     raise DecisionError(status, "upstream decision request rejected", uncertain=response.status_code >= 500)
@@ -271,14 +279,18 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
     bound = credit_bound(route, tokens)
     event_id = str(uuid.uuid4())
     reserved = sent = False
+
+    def mark_dispatched() -> None:
+        nonlocal sent
+        sent = True
+
     try:
         await authorize_new_io(user_id=user_id, project_id=project_id, api_key_id=api_key_id,
                                required_scopes=required_scopes)
         await stateless_credit.reserve(event_id=event_id, user_id=user_id, project_id=project_id,
                                        api_key_id=api_key_id, bound=bound)
         reserved = True
-        sent = True
-        response = await transport(route, body)
+        response = await transport(route, body, on_dispatch=mark_dispatched)
         usage, breakdown = validate_usage(response.get("usage"))
         if usage["input_tokens"] > tokens:
             raise DecisionError(502, "decision usage exceeds admitted input ceiling", uncertain=True)
