@@ -38,6 +38,7 @@ def test_default_feature_options_preserve_manual_memory_without_tools():
             "approval_mode": "required_for_mutations",
             "enabled_tool_ids": None,
             "enabled_mcp_ids": None,
+            "enabled_sandbox_tools": [],
             "workspace_write_mode": "ask",
         },
         "output_modalities": ["text"],
