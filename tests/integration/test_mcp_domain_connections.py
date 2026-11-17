@@ -215,3 +215,28 @@ async def test_shared_oauth_canonical_owner_and_revocation_invalidate_frozen_run
             ChatMcpOAuthConnection.mcp_server_id == server_id))).scalar_one()
         assert connection.status == "revoked" and connection.credential_version == 2
     assert await store.connections(foreign) == ()
+
+
+async def test_domain_list_and_mutations_report_caller_effective_activation(domain_db):
+    db = domain_db
+    _, created = await create_domain(db)
+    server = created["server"]
+    # The manager has not activated its own organization connection: publication is not caller consent.
+    assert server["is_active"] is False and server["server_is_active"] is True
+    assert server["activation_is_active"] is False
+
+    before = await mcp_settings.domain_connections(db["member"], db["a"])
+    assert [(row["id"], row["is_active"]) for row in before] == [(server["id"], False)]
+
+    await es.set_mcp_activation(
+        server["id"], **owner(db["member"]), is_active=True, config_version=server["config_version"]
+    )
+    member_view = await mcp_settings.domain_connections(db["member"], db["a"])
+    manager_view = await mcp_settings.domain_connections(db["manager"], db["a"])
+    assert member_view[0]["is_active"] is True and member_view[0]["activation_is_active"] is True
+    assert manager_view[0]["is_active"] is False, "another member's activation is not the manager's"
+
+    patched = await mcp_settings.update(db["manager"], server["id"], {"is_active": False}, domain_id=db["a"])
+    assert patched["is_active"] is False and patched["server_is_active"] is False
+    again = await mcp_settings.domain_connections(db["member"], db["a"])
+    assert again[0]["is_active"] is False, "disable propagates to members on the next read"

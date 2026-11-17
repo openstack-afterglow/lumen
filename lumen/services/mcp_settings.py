@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.auth import credential_authority_snapshot
-from lumen.models.chat_db import ChatMcpServer
+from lumen.models.chat_db import ChatMcpOAuthConnection, ChatMcpServer
 from lumen.services import extensions_store as es
 from lumen.services import mcp_connections
 from lumen.services import mcp_registry_catalog as catalog
@@ -53,16 +53,41 @@ async def authority(principal: dict, domain_id: str | None = None, *, manage: bo
     return result
 
 
-async def domain_connections(principal: dict, domain_id: str) -> list[dict]:
-    await authority(principal, domain_id)
+async def _caller_effective(principal: dict, domain_id: str, item_id: int | None = None) -> list[dict]:
+    """Organization rows as the caller sees them: ``is_active`` needs publication + the caller's own activation of
+    the exact config_version + a connected shared credential (same rule as ``list_for_user``)."""
     try:
         async with es._require_db()() as session:
-            rows = (await session.execute(select(ChatMcpServer).where(
+            query = select(ChatMcpServer).where(
                 ChatMcpServer.scope == "domain", ChatMcpServer.owner_domain_id == domain_id,
-            ).order_by(ChatMcpServer.id))).scalars()
-            return [es._public_mcp(row) for row in rows]
+            ).order_by(ChatMcpServer.id)
+            if item_id is not None:
+                query = query.where(ChatMcpServer.id == item_id)
+            rows = (await session.execute(query)).scalars().all()
+            activations = await es._owner_activations(session, principal["user_id"], principal["project_id"])
+            shared = {
+                row.mcp_server_id: row for row in (await session.execute(select(ChatMcpOAuthConnection).where(
+                    ChatMcpOAuthConnection.owner_user_id == domain_id,
+                    ChatMcpOAuthConnection.owner_project_id == domain_id,
+                ))).scalars()
+            }
+            result = []
+            for row in rows:
+                activation = activations.get(row.id)
+                connected = es._mcp_connected(row, shared.get(row.id))
+                item = es._public_mcp(row)
+                item.update(es._activation_metadata(row, activation))
+                item["is_active"] = es._mcp_effectively_active(row, activation) and connected
+                item["auth_connected"] = connected
+                result.append(item)
+            return result
     except OperationalError as exc:
         raise es.ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def domain_connections(principal: dict, domain_id: str) -> list[dict]:
+    await authority(principal, domain_id)
+    return await _caller_effective(principal, domain_id)
 
 
 async def scoped_connection(principal: dict, item_id: int, domain_id: str | None = None, *, manage: bool = False) -> dict:
@@ -111,14 +136,14 @@ async def create(principal: dict, template_id: str, *, domain_id: str | None = N
                 ChatMcpServer.template_key == template_id, ChatMcpServer.connection_label == connection_label,
             ))).scalar_one_or_none()
             if existing is not None:
-                return {"created": False, "server": es._public_mcp(existing)}
+                return {"created": False, "server": await _view(principal, existing.id, domain_id, es._public_mcp(existing))}
         server = await es.create("mcp", {
             "name": candidate["name"], "url": url, "transport": candidate["transport"],
             "auth_mode": mode, **({"headers": headers} if headers else {}),
             "template_key": template_id, "connection_label": connection_label, "implicit_selection": False,
         }, scope=scope, owner_user_id=principal["user_id"], owner_project_id=principal["project_id"],
             owner_domain_id=domain_id, catalog_authorized=True)
-        return {"created": True, "server": server}
+        return {"created": True, "server": await _view(principal, server["id"], domain_id, server)}
     except (OperationalError, IntegrityError) as exc:
         raise es.ChatStorageUnavailable("chat DB 오류") from exc
 
@@ -132,8 +157,18 @@ async def update(principal: dict, item_id: int, patch: dict, *, domain_id: str |
             raise McpRegistryError("This template does not accept static credentials")
         if set(patch) - {"headers", "is_active"}:
             raise es.ExtensionValidationError("Personal connection patch accepts headers and is_active only")
-    return await es.update("mcp", item_id, patch, requester_user_id=principal["user_id"],
-                           requester_project_id=principal["project_id"], domain_id=domain_id, catalog_authorized=True)
+    updated = await es.update("mcp", item_id, patch, requester_user_id=principal["user_id"],
+                              requester_project_id=principal["project_id"], domain_id=domain_id,
+                              catalog_authorized=True)
+    return await _view(principal, item_id, domain_id, updated)
+
+
+async def _view(principal: dict, item_id: int, domain_id: str | None, fallback: dict) -> dict:
+    """Organization mutations answer with the caller-effective row, like the list."""
+    if domain_id is None:
+        return fallback
+    rows = await _caller_effective(principal, domain_id, item_id)
+    return rows[0] if rows else fallback
 
 
 async def delete(principal: dict, item_id: int, *, domain_id: str | None = None) -> None:
