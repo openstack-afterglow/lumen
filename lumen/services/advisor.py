@@ -79,6 +79,7 @@ async def ask_with_route(
             api_key=route.get("api_key"),
             provider_auth=route.get("provider_auth"),
             max_tokens=None if route.get("provider_type") == "chatgpt" else _MAX_ADVISOR_TOKENS,
+            extra={"capabilities_override": route.get("capabilities") or {}},
         )
     except Exception as exc:
         raise AdvisorError("selected advisor request failed") from exc

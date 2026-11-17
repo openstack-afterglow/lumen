@@ -582,6 +582,10 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
     monkeypatch.setattr(execution, "_renew_lease", lambda *_args, **_kwargs: _return(True))
     monkeypatch.setattr(execution.credit, "precheck", lambda *_args, **_kwargs: _return(None))
     monkeypatch.setattr(execution, "_append_temp_history", lambda *_args, **_kwargs: _return(None))
+    monkeypatch.setattr(
+        execution, "_completed_provider_usage",
+        lambda _run_id: _return([("provider:0:0", {"prompt_tokens": 1, "completion_tokens": 1})]),
+    )
 
     assert await execution.execute_queued_run("run-1", owner="worker-1", registration_id="registration-1") is True
     assert [payload["delta"] for event_type, payload in journal if event_type == "part.delta"] == ["small"]
@@ -1389,6 +1393,9 @@ def tool_result_worker(monkeypatch):
     monkeypatch.setattr(execution, "_renew_lease", AsyncMock(return_value=True))
     monkeypatch.setattr(execution.credit, "precheck", AsyncMock())
     monkeypatch.setattr(execution, "_append_temp_history", AsyncMock())
+    monkeypatch.setattr(execution, "_completed_provider_usage", AsyncMock(return_value=[
+        ("provider:0:0", {"prompt_tokens": 1, "completion_tokens": 1}),
+    ]))
     return SimpleNamespace(run=run, journal=journal, finished=finished, append=append)
 
 

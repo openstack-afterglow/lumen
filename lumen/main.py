@@ -196,6 +196,19 @@ _ANTHROPIC_MESSAGE_PATHS = frozenset(
 @app.exception_handler(RequestValidationError)
 async def request_validation_handler(request: Request, exc: RequestValidationError):
     if request.url.path == "/v1/admin/providers" or request.url.path.startswith("/v1/admin/providers/"):
+        if any(error.get("type") == "unsupported_provider_type" for error in exc.errors()):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": {
+                    "code": "unsupported_provider_type",
+                    "message": (
+                        "Supported provider_type values are openai, anthropic, gemini, perplexity "
+                        "and existing chatgpt device authentication. Register third-party APIs "
+                        "as openai or anthropic with a custom api_base."
+                    ),
+                }},
+                headers={"Cache-Control": "no-store"},
+            )
         return JSONResponse(
             status_code=422,
             content={"detail": "프로바이더 요청 형식이 올바르지 않습니다"},

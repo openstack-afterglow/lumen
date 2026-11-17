@@ -13,10 +13,11 @@ from lumen.services.capabilities import (
     provider_capabilities,
 )
 from lumen.services.provider_metadata import (
-    CATALOG_VERSION,
     bundled_cache_rates,
+    catalog_version,
     effective_prices_per_million,
-    official_price_source,
+    native_catalog_entry,
+    provider_family,
 )
 
 from .billing import billing_capability_for
@@ -233,6 +234,9 @@ def frozen_token_pricing(route: dict) -> dict:
         "model_kind": route.get("model_kind") or "text",
         "input_price_per_token": text(route.get("input_price_per_token")),
         "output_price_per_token": text(route.get("output_price_per_token")),
+        "long_context_threshold_tokens": route.get("long_context_threshold_tokens", 200_000),
+        "input_price_per_token_above_200k": text(route.get("input_price_per_token_above_200k")),
+        "output_price_per_token_above_200k": text(route.get("output_price_per_token_above_200k")),
         **{key: text(route.get(key)) for _, _, resolved in CACHE_PRICE_FIELDS
            for key in (resolved, f"{resolved}_above_200k")},
         "cache_price_sources": dict(route.get("cache_price_sources") or {}),
@@ -413,13 +417,6 @@ def _resolved_cache_prices(
         key: None for _, _, resolved in CACHE_PRICE_FIELDS for key in (resolved, f"{resolved}_above_200k")
     }
     sources: dict[str, str | None] = dict.fromkeys(_CACHE_CATEGORIES)
-    if _kind(model) != "text":
-        # Media models carry only a manual cache-read rate; no catalog fallback.
-        value = getattr(model, "cache_read_price", None)
-        if value is not None:
-            prices["cache_read_price_per_token"] = Decimal(value).quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP)
-            sources["cache_read"] = "manual"
-        return prices, sources
     catalog = bundled_cache_rates(model.model_name, provider_type, api_base)
     for category, (_, column, key) in zip(_CACHE_CATEGORIES, CACHE_PRICE_FIELDS, strict=True):
         manual = getattr(model, column, None)
@@ -430,7 +427,7 @@ def _resolved_cache_prices(
         prices[f"{key}_above_200k"] = (
             tier.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if tier is not None else None
         )
-        sources[category] = "manual" if manual is not None else "litellm" if rate is not None or tier is not None else None
+        sources[category] = "manual" if manual is not None else "native_catalog" if rate is not None or tier is not None else None
     return prices, sources
 
 
@@ -516,6 +513,7 @@ def _provider_public(row: LlmProvider) -> dict:
         "id": row.id,
         "name": row.name,
         "provider_type": row.provider_type,
+        "provider_family": provider_family(row.provider_type, row.api_base, auth_mode),
         "api_provider": row.api_provider,
         "sort_order": row.sort_order,
         "api_base": row.api_base,
@@ -532,7 +530,6 @@ def _provider_public(row: LlmProvider) -> dict:
         "billing_capability": billing_capability_for(row.provider_type, auth_mode, row.api_base),
         "is_active": row.is_active,
         "margin_multiplier": float(row.margin_multiplier),
-        "models_dev_provider_id": row.models_dev_provider_id,
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
     }
@@ -546,7 +543,7 @@ def _effective_capabilities(
     api_key_configured: bool = False,
     api_base: str | None = None,
 ) -> tuple[dict, str]:
-    """Stored override/models.dev data wins before transport limits are applied."""
+    """Administrator overrides win; imported historical metadata is provenance only."""
     if _kind(row) == "embedding":
         ready = auth_mode == "api_key" and api_key_configured and provider_type not in {"anthropic", "chatgpt"}
         gates = {
@@ -568,10 +565,10 @@ def _effective_capabilities(
                 "model_kind": kind, "provider_type": provider_type,
                 "api_model_name": api_model_name(row.model_name, provider_type or ""),
                 "api_base": api_base, "api_key": "configured",
-                "media_pricing": getattr(row, "media_pricing", None),
-                "input_price_per_token": getattr(row, "input_price", None),
-                "output_price_per_token": getattr(row, "output_price", None),
-                "cache_read_price_per_token": getattr(row, "cache_read_price", None),
+                "media_pricing": _effective_media_pricing(row, provider_type, api_base),
+                "input_price_per_token": _effective_model_rates(row, provider_type, api_base)[0],
+                "output_price_per_token": _effective_model_rates(row, provider_type, api_base)[1],
+                "cache_read_price_per_token": _resolved_cache_prices(row, provider_type, api_base)[0]["cache_read_price_per_token"],
                 "provider_auth": None,
             }
             if kind == "image":
@@ -612,11 +609,12 @@ def _effective_capabilities(
                 for name in ("text", "image_output", "audio_input", "audio_output")
             }
         }, "registry"
-    detected = provider_capabilities(row.model_name, provider_type)
-    if row.capabilities:
+    detected = provider_capabilities(row.model_name, provider_type, api_base)
+    if row.capabilities and row.capability_source == "override":
         effective = normalize_capabilities(row.capabilities, detected)
-        return apply_subscription_capability_limits(effective, auth_mode), (row.capability_source or "override")
-    return apply_subscription_capability_limits(detected, auth_mode), "catalog"
+        return apply_subscription_capability_limits(effective, auth_mode), "override"
+    source = "native_catalog" if detected.get("metadata_status") == "observed" else "defaults"
+    return apply_subscription_capability_limits(detected, auth_mode), source
 
 
 def _model_public(
@@ -661,8 +659,12 @@ def _model_public(
         input_price=effective_input,
         output_price=effective_output,
     )
-    if _kind(row) not in {"text", "embedding"}:
-        effective_price_source = "manual" if model_media_pricing_available(row) else "unpriced"
+    entry = native_catalog_entry(row.model_name, provider_type, api_base)
+    has_manual = any(getattr(row, field, None) is not None for field in (
+        "input_price", "output_price", "cache_read_price", "cache_write_price", "cache_write_1h_price", "media_pricing",
+    ))
+    catalog_priced = bool(entry.get("token_pricing") or entry.get("media_pricing"))
+    price_origin = "manual" if has_manual else "native_catalog" if catalog_priced else None
     # Stored manual cache columns stay nullable; effective rates are projected separately.
     effective_cache, effective_cache_sources = _effective_cache_prices(
         row, _resolved_cache_prices(row, provider_type, api_base), effective_input, effective_price_source or row.price_source
@@ -674,10 +676,15 @@ def _model_public(
         "api_model_name": public_model_name,
         "api_provider": api_provider,
         "provider_type": provider_type,
+        "provider_family": provider_family(provider_type, api_base, auth_mode),
+        "price_origin": price_origin,
+        "catalog_version": catalog_version() if entry else None,
+        "catalog_entry": {key: entry[key] for key in ("id", "status", "verified_at", "source_urls")} if entry else None,
         "provider_sort_order": provider_sort_order,
         "sort_order": row.sort_order,
         "model_kind": _kind(row),
         "media_pricing": getattr(row, "media_pricing", None),
+        "effective_media_pricing": _effective_media_pricing(row, provider_type, api_base),
         "display_name": display_name,
         "is_active": row.is_active,
         "is_title_model": row.is_title_model,
@@ -696,7 +703,6 @@ def _model_public(
         "effective_cache_price_sources": {
             category: effective_cache_sources[category] for category in _CACHE_CATEGORIES
         },
-        "models_dev_model_id": row.models_dev_model_id,
         "price_source": row.price_source,
         "capabilities": row.capabilities,
         "capability_source": row.capability_source,
@@ -761,6 +767,7 @@ def _pricing_aware_capabilities(
     requirements = {
         "text": base_priced,
         "structured_output": base_priced,
+        "decisions": (model.input_price if input_price is None else input_price) is not None,
         "memory": True,
         # Native providers report their own search work. Price the selected
         # model's text usage, but never fabricate a managed-search component.
@@ -813,52 +820,56 @@ def _pricing_aware_capabilities(
     return normalized
 
 
+def _effective_model_rates(
+    model: LlmModel, provider_type: str | None, api_base: str | None,
+) -> tuple[Decimal | None, Decimal | None]:
+    fallback_input, fallback_output = effective_prices_per_million(model.model_name, provider_type, api_base=api_base)
+    return (
+        Decimal(model.input_price) if model.input_price is not None else fallback_input / _TOKENS_PER_MILLION if fallback_input is not None else None,
+        Decimal(model.output_price) if model.output_price is not None else fallback_output / _TOKENS_PER_MILLION if fallback_output is not None else None,
+    )
+
+
+def _effective_media_pricing(model: LlmModel, provider_type: str | None, api_base: str | None) -> dict | None:
+    manual = getattr(model, "media_pricing", None)
+    if manual is not None:
+        return manual
+    entry = native_catalog_entry(model.model_name, provider_type, api_base)
+    return entry.get("media_pricing") if entry.get("kind") == _kind(model) else None
+
+
+def _resolved_context_tiers(model: LlmModel, provider_type: str | None, api_base: str | None) -> dict:
+    token = native_catalog_entry(model.model_name, provider_type, api_base).get("token_pricing") or {}
+    tier = token.get("long_context") or {}
+    return {
+        "long_context_threshold_tokens": tier.get("threshold_tokens", 200_000),
+        **{
+            f"{direction}_price_per_token_above_200k": (
+                Decimal(tier[direction]) / _TOKENS_PER_MILLION
+                if getattr(model, f"{direction}_price", None) is None and tier.get(direction) is not None else None
+            )
+            for direction in ("input", "output")
+        },
+    }
+
+
 def _resolved_base_prices(
-    model: LlmModel, provider: LlmProvider
+    model: LlmModel, provider: LlmProvider,
 ) -> tuple[Decimal | None, Decimal | None, str, str | None]:
+    input_price, output_price = _effective_model_rates(model, provider.provider_type, provider.api_base)
     if _kind(model) == "embedding":
-        input_price = Decimal(model.input_price) if model.input_price is not None else None
-        fallback_input = effective_prices_per_million(model.model_name, provider.provider_type, api_base=provider.api_base)[0] if input_price is None else None
-        if input_price is None and fallback_input is not None:
-            input_price = _per_token_price(fallback_input, "litellm_input_price_per_million")
-        source = model.price_source or official_price_source(model.model_name, provider.provider_type, api_base=provider.api_base) or "litellm"
-        return input_price, Decimal(0), source if input_price is not None else "unpriced", CATALOG_VERSION if input_price is not None else None
-    if _kind(model) != "text":
-        # Manual text rates only price a token basis; media never borrows catalog prices.
-        priced = model_media_pricing_available(model)
-        return (
-            Decimal(model.input_price) if model.input_price is not None else None,
-            Decimal(model.output_price) if model.output_price is not None else None,
-            "manual" if priced else "unpriced",
-            str(getattr(model, "updated_at", None)) if priced else None,
+        output_price = Decimal(0)
+    media = _effective_media_pricing(model, provider.provider_type, provider.api_base)
+    priced = input_price is not None and output_price is not None
+    if _kind(model) not in {"text", "embedding"}:
+        priced = media_pricing_available(
+            _kind(model), media, text_input_priced=input_price is not None, text_output_priced=output_price is not None,
+            duration_families=_realtime_duration_families(_kind(model), model.model_name),
         )
-    input_price = Decimal(model.input_price) if model.input_price is not None else None
-    output_price = Decimal(model.output_price) if model.output_price is not None else None
-    fallback_input, fallback_output = (
-        effective_prices_per_million(model.model_name, provider.provider_type, api_base=provider.api_base)
-        if input_price is None or output_price is None
-        else (None, None)
-    )
-    fallback_source = (
-        official_price_source(model.model_name, provider.provider_type, api_base=provider.api_base) or "litellm"
-    )
-    if input_price is None and fallback_input is not None:
-        input_price = _per_token_price(fallback_input, "litellm_input_price_per_million")
-    if output_price is None and fallback_output is not None:
-        output_price = _per_token_price(fallback_output, "litellm_output_price_per_million")
-    if input_price is not None and output_price is not None:
-        price_source = model.price_source or fallback_source
-    elif input_price is not None or output_price is not None:
-        price_source = "partial"
+    manual = model.input_price is not None or model.output_price is not None or getattr(model, "media_pricing", None) is not None
+    if priced:
+        source = "manual" if manual else "native_catalog"
     else:
-        price_source = "unpriced"
-    metadata = model.price_metadata if isinstance(model.price_metadata, dict) else {}
-    if price_source == "models.dev":
-        price_version = str(metadata.get("fetched_at") or metadata.get("last_updated") or "models.dev")
-    elif price_source == "litellm":
-        price_version = CATALOG_VERSION
-    elif price_source == "manual":
-        price_version = str(getattr(model, "updated_at", None) or "manual")
-    else:
-        price_version = None
-    return input_price, output_price, price_source, price_version
+        source = "partial" if input_price is not None or output_price is not None else "unpriced"
+    version = str(getattr(model, "updated_at", None) or "manual") if source == "manual" else catalog_version() if source == "native_catalog" else None
+    return input_price, output_price, source, version

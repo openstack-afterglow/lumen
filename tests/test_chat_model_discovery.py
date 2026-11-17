@@ -1,4 +1,4 @@
-"""Model discovery uses bounded live listings; only unsupported modes show static references."""
+"""Discovery keeps live IDs authoritative and annotates only native provider routes."""
 
 import asyncio
 import json
@@ -8,6 +8,25 @@ import pytest
 
 from lumen.services import model_discovery
 from lumen.services.providers import errors
+
+
+@pytest.fixture(autouse=True)
+def _empty_native_catalog(monkeypatch):
+    monkeypatch.setattr(model_discovery, "native_catalog", lambda: {
+        "catalog_version": "2026-11-17",
+        "providers": {provider: {"models": []} for provider in ("openai", "anthropic", "gemini", "perplexity")},
+    })
+    monkeypatch.setattr(model_discovery, "native_catalog_entry", lambda *_: {})
+
+
+def _entries(monkeypatch, provider_type, entries):
+    from lumen.services.providers.credentials import api_model_name, transport_model_name
+
+    monkeypatch.setattr(
+        model_discovery, "native_catalog_entry",
+        lambda model, provider, _base: entries.get(api_model_name(transport_model_name(model), provider), {})
+        if provider == provider_type else {},
+    )
 
 
 def _provider(monkeypatch, provider_type="anthropic", api_base=None, api_key="secret-key", auth_mode="api_key"):
@@ -119,6 +138,16 @@ async def test_anthropic_second_page_unknown_id_exact_headers_and_metadata(monke
         "input_token_limit": 123456,
         "output_token_limit": 9876,
         "model_kind": "text",
+        "provider_family": "native",
+        "requires_manual_pricing": False,
+        "status": None,
+        "token_pricing": None,
+        "media_pricing": None,
+        "capabilities": None,
+        "source_urls": [],
+        "verified_at": None,
+        "catalog_version": None,
+        "catalog_entry": None,
     }
 
 
@@ -451,7 +480,7 @@ async def test_total_deadline_cancels_continuously_dripping_stream(monkeypatch):
     _failed(await model_discovery.discover_models(1), "discovery_timeout", retryable=True)
 
 
-async def test_subscription_and_unknown_providers_never_send_credentials(monkeypatch):
+async def test_subscription_and_removed_providers_never_send_credentials(monkeypatch):
     def forbidden(**kwargs):
         raise AssertionError("unsupported mode must not construct HTTP client")
 
@@ -466,13 +495,18 @@ async def test_subscription_and_unknown_providers_never_send_credentials(monkeyp
     assert subscription["complete"] is False
     _provider(monkeypatch, provider_type="azure")
     unsupported = await model_discovery.discover_models(2)
-    assert unsupported["source"] == "catalog" and unsupported["live_status"] == "unsupported"
-    assert unsupported["models"] == ["command-r"]
+    assert unsupported["source"] == "none" and unsupported["live_status"] == "error"
+    assert unsupported["models"] == []
+    assert unsupported["error"]["code"] == "unsupported_provider_type"
 
 
 async def test_chatgpt_subscription_normalizes_namespace_without_http(monkeypatch):
     _provider(monkeypatch, provider_type="chatgpt", auth_mode="chatgpt_device", api_key=None)
-    monkeypatch.setattr(model_discovery, "_catalog_static", lambda pt: ["gpt-5.3-codex", "chatgpt/gpt-5.2-codex"])
+    def catalog(provider_type):
+        assert provider_type == "openai"
+        return ["gpt-5.3-codex", "chatgpt/gpt-5.2-codex"]
+
+    monkeypatch.setattr(model_discovery, "_catalog_static", catalog)
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: (_ for _ in ()).throw(AssertionError("unexpected HTTP")))
     result = await model_discovery.discover_models(7)
     assert result["models"] == ["chatgpt/gpt-5.2-codex", "chatgpt/gpt-5.3-codex"]
@@ -484,6 +518,9 @@ class TestDiscoveryEndpoint:
         async def available(_provider_id):
             return {
                 "provider_id": 7,
+                "provider_family": "native",
+                "requires_manual_pricing": False,
+                "catalog_version": "2026-11-17",
                 "fetched_at": "2026-09-23T00:00:00Z",
                 "source": "api",
                 "live_status": "success",
@@ -498,6 +535,7 @@ class TestDiscoveryEndpoint:
                         "generation_methods": [],
                         "input_token_limit": 123,
                         "output_token_limit": 456,
+                        "catalog_entry": {"id": "claude-Future_X", "kind": "text", "status": "preview"},
                     }
                 ],
             }
@@ -509,12 +547,18 @@ class TestDiscoveryEndpoint:
         body = response.json()
         assert body["models"] == ["claude-Future_X"]
         assert body["candidates"][0]["input_token_limit"] == 123
+        assert body["candidates"][0]["catalog_entry"] == {
+            "id": "claude-Future_X", "kind": "text", "status": "preview",
+        }
         assert body["error"] is None
 
     async def test_upstream_401_is_structured_200_not_session_401(self, admin_client, monkeypatch):
         async def available(_provider_id):
             return {
                 "provider_id": 7,
+                "provider_family": "native",
+                "requires_manual_pricing": False,
+                "catalog_version": "2026-11-17",
                 "fetched_at": "2026-09-23T00:00:00Z",
                 "source": "none",
                 "live_status": "error",
@@ -562,16 +606,14 @@ class TestDiscoveryEndpoint:
 
 
 async def test_live_openai_discovery_separates_operations_without_name_guesses(monkeypatch):
-    from lumen.services import provider_metadata
+    """Only exact tracked native entries classify live model IDs."""
 
     _provider(monkeypatch, provider_type="openai")
     _no_static(monkeypatch)
-    modes = {"renderer": "image_generation", "speaker": "audio_speech",
-             "listener": "audio_transcription", "voice": "realtime", "assistant": "chat"}
-    catalog = {name: {"mode": mode, "litellm_provider": "openai"} for name, mode in modes.items()}
-    catalog["wrong-provider"] = {"mode": "image_generation", "litellm_provider": "gemini"}
-    monkeypatch.setattr(provider_metadata, "_catalog", lambda: catalog)
-    ids = [*catalog, "unknown-image-looking"]
+    kinds = {"renderer": "image", "speaker": "tts", "listener": "stt", "voice": "realtime", "assistant": "text"}
+    entries = {name: {"id": name, "kind": kind} for name, kind in kinds.items()}
+    _entries(monkeypatch, "openai", entries)
+    ids = [*entries, "wrong-provider", "unknown-image-looking"]
     _transport(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": name} for name in ids]}))
     result = await model_discovery.discover_models(1)
     assert result["models"] == ids
@@ -585,13 +627,9 @@ async def test_live_openai_discovery_separates_operations_without_name_guesses(m
 
 
 async def test_gemini_image_generation_and_bidi_are_not_registered_as_text(monkeypatch):
-    from lumen.services import provider_metadata
-
     _provider(monkeypatch, provider_type="gemini")
     _no_static(monkeypatch)
-    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {
-        "gemini/opaque-renderer": {"mode": "image_generation", "litellm_provider": "gemini"},
-    })
+    _entries(monkeypatch, "gemini", {"opaque-renderer": {"id": "opaque-renderer", "kind": "image"}})
     _transport(monkeypatch, lambda request: httpx.Response(200, json={"models": [
         {"name": "models/opaque-renderer", "supportedGenerationMethods": ["generateContent"]},
         {"name": "models/opaque-voice", "supportedGenerationMethods": ["bidiGenerateContent"]},
@@ -602,17 +640,13 @@ async def test_gemini_image_generation_and_bidi_are_not_registered_as_text(monke
     ]
 
 
-async def test_exact_realtime_transcription_routes_override_file_stt_catalog_hints(monkeypatch):
-    from lumen.services import provider_metadata
+async def test_realtime_transcription_discovery_uses_tracked_native_kind(monkeypatch):
     from lumen.services.providers import realtime_transport
 
     _provider(monkeypatch, provider_type="openai")
     _no_static(monkeypatch)
-    # The real frozen catalog misclassifies whisper and omits live-transcribe.
-    monkeypatch.setattr(provider_metadata, "_catalog", lambda: {
-        "gpt-realtime-whisper": {"mode": "audio_transcription", "litellm_provider": "openai"},
-    })
     names = ["gpt-realtime-whisper", "gpt-live-transcribe"]
+    _entries(monkeypatch, "openai", {name: {"id": name, "kind": "realtime"} for name in names})
     _transport(monkeypatch, lambda request: httpx.Response(200, json={"data": [{"id": name} for name in names]}))
     result = await model_discovery.discover_models(1)
     assert [(candidate["id"], candidate["model_kind"], candidate["purpose"]) for candidate in result["candidates"]] == [
@@ -625,5 +659,109 @@ async def test_exact_realtime_transcription_routes_override_file_stt_catalog_hin
         assert realtime_transport.realtime_kind(route) == "transcription"
         assert realtime_transport.realtime_route_ready(route)
         assert realtime_transport.upstream_connection_spec(route)[0] == "wss://api.openai.com/v1/realtime?intent=transcription"
-    assert model_discovery._catalog_candidate("gemini", "gpt-live-transcribe").model_kind is None
-    assert model_discovery._catalog_candidate("openai", "gpt-live-transcribe-unverified").model_kind is None
+    assert model_discovery._serialize_candidate(
+        model_discovery.DiscoveredCandidate("gpt-live-transcribe"), "gemini", None, "native", "2026-11-17",
+    )["model_kind"] is None
+    assert model_discovery._serialize_candidate(
+        model_discovery.DiscoveredCandidate("gpt-live-transcribe-unverified"), "openai", None, "native", "2026-11-17",
+    )["model_kind"] is None
+
+
+async def test_native_live_ids_get_exact_catalog_prices_capabilities_and_provenance(monkeypatch):
+    _provider(monkeypatch, provider_type="openai")
+    entry = {
+        "id": "tracked",
+        "kind": "text",
+        "status": "preview",
+        "display_name": "Tracked",
+        "context_window": 272000,
+        "max_output_tokens": 8192,
+        "token_pricing": {"input": "0.10", "output": "0.50"},
+        "media_pricing": None,
+        "capabilities": {"decisions": True, "prompt_caching": True},
+        "source_urls": ["https://developers.openai.com/api/docs/pricing"],
+        "verified_at": "2026-11-17",
+    }
+    _entries(monkeypatch, "openai", {"tracked": entry, "catalog-only": {"id": "catalog-only", "kind": "image"}})
+    _transport(monkeypatch, lambda _: httpx.Response(200, json={"data": [{"id": "tracked"}, {"id": "unknown"}]}))
+    result = await model_discovery.discover_models(1)
+    assert result["models"] == ["tracked", "unknown"]
+    assert result["provider_family"] == "native"
+    assert result["catalog_version"] == "2026-11-17"
+    candidate = result["candidates"][0]
+    for key in ("status", "token_pricing", "media_pricing", "capabilities", "source_urls", "verified_at"):
+        assert candidate[key] == entry[key]
+    assert candidate["model_kind"] == "text"
+    assert candidate["input_token_limit"] == 272000
+    assert candidate["output_token_limit"] == 8192
+    assert candidate["catalog_version"] == "2026-11-17"
+    assert candidate["catalog_entry"] == entry
+    assert result["candidates"][1]["model_kind"] is None
+    assert result["candidates"][1]["token_pricing"] is None
+
+
+@pytest.mark.parametrize("provider_type", ["openai", "anthropic"])
+async def test_compatible_discovery_never_accesses_catalog_or_guesses_kind(monkeypatch, provider_type):
+    _provider(monkeypatch, provider_type=provider_type, api_base="https://compatible.example/v1")
+
+    def forbidden(*_):
+        raise AssertionError("compatible discovery cannot read native catalog")
+
+    monkeypatch.setattr(model_discovery, "native_catalog", forbidden)
+    monkeypatch.setattr(model_discovery, "native_catalog_entry", forbidden)
+    item = {"id": "text-embedding-3-small", "display_name": "Untrusted", "max_input_tokens": 1000}
+    payload = _page([item]) if provider_type == "anthropic" else {"data": [item]}
+    _transport(monkeypatch, lambda _: httpx.Response(200, json=payload))
+    result = await model_discovery.discover_models(1)
+    assert result["models"] == ["text-embedding-3-small"]
+    assert result["provider_family"] == "compatible"
+    assert result["requires_manual_pricing"] is True
+    assert result["catalog_version"] is None
+    candidate = result["candidates"][0]
+    assert candidate["requires_manual_pricing"] is True
+    assert candidate["purpose"] == "unknown"
+    assert candidate["model_kind"] is None
+    assert candidate["display_name"] is None
+    assert candidate["input_token_limit"] is None
+    assert candidate["capabilities"] is None
+    assert candidate["token_pricing"] is None
+    assert candidate["source_urls"] == []
+    assert candidate["catalog_entry"] is None
+
+
+@pytest.mark.parametrize(
+    "provider_type", ["groq", "deepseek", "mistral", "together_ai", "openrouter", "xai",
+                      "ollama", "azure", "bedrock", "vertex", "cohere", "unknown"],
+)
+async def test_removed_provider_discovery_is_explicit_without_defaults_or_credentials(monkeypatch, provider_type):
+    _provider(monkeypatch, provider_type=provider_type, api_base="https://custom.example")
+
+    async def forbidden(*_):
+        raise AssertionError("removed providers cannot resolve inference credentials")
+
+    from lumen.services.providers import credentials
+    monkeypatch.setattr(credentials, "resolve_inference_credential", forbidden)
+    _no_static(monkeypatch)
+    _failed(await model_discovery.discover_models(1), "unsupported_provider_type")
+
+
+async def test_subscription_reads_and_annotates_native_catalog_without_live_fetch(monkeypatch):
+    _provider(monkeypatch, provider_type="chatgpt", auth_mode="chatgpt_device", api_key=None)
+    entry = {"id": "gpt-tracked", "kind": "text", "status": "active", "capabilities": {"reasoning": True}}
+    monkeypatch.setattr(model_discovery, "native_catalog", lambda: {
+        "catalog_version": "2026-11-17", "providers": {"openai": {"models": [entry]}},
+    })
+    _entries(monkeypatch, "openai", {entry["id"]: entry})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_: pytest.fail("subscription must not perform live fetch"))
+    result = await model_discovery.discover_models(1)
+    assert result["models"] == ["chatgpt/gpt-tracked"]
+    assert result["candidates"][0]["capabilities"] == {"reasoning": True}
+    assert result["candidates"][0]["model_kind"] == "text"
+
+
+async def test_compatible_discovery_preserves_opaque_preset_namespace_ids(monkeypatch):
+    _provider(monkeypatch, provider_type="openai", api_base="https://compatible.example/v1")
+    _transport(monkeypatch, lambda _: httpx.Response(200, json={"data": [{"id": "preset/research"}]}))
+    result = await model_discovery.discover_models(1)
+    assert result["models"] == ["preset/research"]
+    assert result["candidates"][0]["model_kind"] is None

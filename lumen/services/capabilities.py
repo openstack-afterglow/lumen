@@ -9,8 +9,8 @@ from urllib.parse import urlsplit
 
 from lumen.services.execution_protocol import v2_runtime_ready
 from lumen.services.provider_metadata import (
-    CATALOG_VERSION,
     catalog_model_metadata,
+    catalog_version,
     chatgpt_model_metadata,
     provider_output_budget_enforced,
 )
@@ -166,15 +166,16 @@ def effective_runtime_capabilities(
     }
 
 
-def _probe(name: str, *, model_name: str, provider_type: str | None) -> bool:
-    return catalog_model_metadata(model_name, provider_type).get(name) is True
 
 
-def reasoning_explicitly_unsupported(model_name: str, source: str | None, overrides: dict | None) -> bool:
+def reasoning_explicitly_unsupported(
+    model_name: str, source: str | None, overrides: dict | None,
+    provider_type: str | None = None, api_base: str | None = None,
+) -> bool:
     """Only an explicit administrator/catalog denial can discard caller input."""
-    if source == "override" and isinstance(overrides, dict) and overrides.get("reasoning") is False:
-        return True
-    return catalog_model_metadata(model_name).get("supports_reasoning") is False
+    if source == "override" and isinstance(overrides, dict) and type(overrides.get("reasoning")) is bool:
+        return not overrides["reasoning"]
+    return catalog_model_metadata(model_name, provider_type, api_base).get("supports_reasoning") is False
 
 
 _NATIVE_WEB_SEARCH_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "perplexity"})
@@ -193,11 +194,11 @@ def _is_perplexity_sonar(model_name: str, provider_type: str | None) -> bool:
     }
 
 
-def _native_web_search_available(model_name: str, provider_type: str | None) -> bool:
+def _native_web_search_available(model_name: str, provider_type: str | None, api_base: str | None = None) -> bool:
     """Exact catalog observation intersected with native transport support."""
-    return provider_type in _NATIVE_WEB_SEARCH_PROVIDERS and _probe(
-        "supports_web_search", model_name=model_name, provider_type=provider_type
-    )
+    return provider_type in _NATIVE_WEB_SEARCH_PROVIDERS and catalog_model_metadata(
+        model_name, provider_type, api_base,
+    ).get("supports_web_search") is True
 
 
 def _detected_native_web_search_available(detected: dict[str, Any]) -> bool:
@@ -215,44 +216,22 @@ def _unavailable_reason(metadata: dict, key: str, *, transport_unsupported: bool
     return "provider_unsupported" if transport_unsupported or metadata.get(key) is False else "metadata_unknown"
 
 
-def _catalog_context_limit(model_name: str, provider_type: str | None) -> int | None:
-    """Only an exact input window counts; max_tokens is not an input limit."""
-    value = catalog_model_metadata(model_name, provider_type).get("max_input_tokens")
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def provider_capabilities(model_name: str, provider_type: str | None) -> dict[str, Any]:
+def provider_capabilities(model_name: str, provider_type: str | None, api_base: str | None = None) -> dict[str, Any]:
     """Fail-closed availability, retaining observed/unknown metadata provenance."""
     normalized_model = transport_model_name(model_name)
     is_chatgpt = provider_type == "chatgpt" or model_name.startswith("chatgpt/")
-    metadata = chatgpt_model_metadata(model_name) if is_chatgpt else catalog_model_metadata(model_name, provider_type)
-    vision = (
-        bool(metadata.get("supports_vision"))
-        if is_chatgpt
-        else _probe("supports_vision", model_name=normalized_model, provider_type=provider_type)
-    )
-    pdf_input = (
-        bool(metadata.get("supports_pdf_input"))
-        if is_chatgpt
-        else _probe("supports_pdf_input", model_name=normalized_model, provider_type=provider_type)
-    )
-    reasoning = (
-        bool(metadata.get("supports_reasoning"))
-        if is_chatgpt
-        else _probe("supports_reasoning", model_name=normalized_model, provider_type=provider_type)
-    )
-    function_calling = (
-        bool(metadata.get("supports_function_calling"))
-        if is_chatgpt
-        else _probe("supports_function_calling", model_name=normalized_model, provider_type=provider_type)
-    )
-    structured_output = (
-        False
-        if is_chatgpt
-        else _probe("supports_response_schema", model_name=normalized_model, provider_type=provider_type)
-    )
+    metadata = chatgpt_model_metadata(model_name) if is_chatgpt else catalog_model_metadata(model_name, provider_type, api_base)
+    vision = metadata.get("supports_vision") is True
+    pdf_input = metadata.get("supports_pdf_input") is True
+    reasoning = metadata.get("supports_reasoning") is True
+    function_calling = metadata.get("supports_function_calling") is True
+    structured_output = not is_chatgpt and metadata.get("supports_response_schema") is True
+    decisions = provider_type == "openai" and metadata.get("supports_decisions") is True
+    prompt_caching = metadata.get("supports_prompt_caching") is True
     parallel_function_calling = bool(metadata.get("supports_parallel_function_calling")) if is_chatgpt else False
-    supports_web_search = _native_web_search_available(normalized_model, provider_type)
+    supports_web_search = _native_web_search_available(normalized_model, provider_type, api_base)
     web_search_required = supports_web_search and _is_perplexity_sonar(normalized_model, provider_type)
     configured_context_limit = metadata.get("max_input_tokens")
     context_limit = (
@@ -260,7 +239,7 @@ def provider_capabilities(model_name: str, provider_type: str | None) -> dict[st
         if isinstance(configured_context_limit, int)
         and not isinstance(configured_context_limit, bool)
         and configured_context_limit > 0
-        else _catalog_context_limit(normalized_model, provider_type)
+        else None
     )
     return {
         # Existing model-admin/UI fields retained until the capability API is cut over.
@@ -269,11 +248,12 @@ def provider_capabilities(model_name: str, provider_type: str | None) -> dict[st
         "tool_call": function_calling,
         "attachment": vision or pdf_input,
         "modalities": None,
+        "max_output_tokens": metadata.get("max_output_tokens"),
         "reasoning_options": [],
         "context_limit": context_limit,
         "metadata_source": "catalog" if metadata else None,
         "metadata_status": "observed" if metadata else "missing",
-        "metadata_version": CATALOG_VERSION if metadata else None,
+        "metadata_version": catalog_version() if metadata else None,
         "capability_observations": {
             key: metadata.get(key) if isinstance(metadata.get(key), bool) else None
             for key in ("supports_vision", "supports_pdf_input", "supports_reasoning",
@@ -289,6 +269,8 @@ def provider_capabilities(model_name: str, provider_type: str | None) -> dict[st
         "web_search_required": web_search_required,
         "web_fetch": False,
         "advisor": False,
+        "decisions": decisions,
+        "prompt_caching": prompt_caching,
         "responses_api": is_chatgpt,
         "mcp": False,
         "code_interpreter": False,
@@ -307,6 +289,12 @@ def provider_capabilities(model_name: str, provider_type: str | None) -> dict[st
                     metadata, "supports_response_schema", transport_unsupported=is_chatgpt
                 ),
                 "pricing_available": structured_output,
+            },
+            "decisions": {
+                "available": decisions,
+                "mode": "native" if decisions else "none",
+                "reason_code": None if decisions else _unavailable_reason(metadata, "supports_decisions"),
+                "pricing_available": decisions,
             },
             "web_search": {
                 "available": supports_web_search,
@@ -408,6 +396,10 @@ def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode
         pricing_available=False,
     )
     gates["web_search"] = gate
+    normalized["decisions"] = False
+    gates["decisions"] = {
+        "available": False, "mode": "none", "reason_code": "provider_unsupported", "pricing_available": False,
+    }
     if auth_mode == "chatgpt_device":
         normalized["output_budget_enforced"] = False
         normalized["structured_output"] = False
@@ -452,7 +444,7 @@ def reasoning_can_be_disabled(capabilities: dict[str, Any] | None, provider_type
 
 
 def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, Any]) -> dict[str, Any]:
-    """Upgrade legacy models.dev/override shapes to canonical feature gates."""
+    """Normalize stored administrator overrides into canonical feature gates."""
     if not stored:
         return detected
     normalized = dict(detected)
@@ -482,7 +474,7 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
         inputs = normalized.get("input_modalities") or []
     legacy_vision_specified = "vision" in stored or isinstance(legacy_modalities, dict)
     if legacy_vision_specified:
-        vision = bool(stored.get("vision", normalized.get("vision"))) or "image" in inputs
+        vision = bool(stored["vision"]) if "vision" in stored else "image" in inputs
         normalized["vision"] = vision
         gates["image_input"] = {
             **gates["image_input"],
@@ -491,6 +483,18 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
             "reason_code": None if vision else "provider_unsupported",
         }
     legacy_pdf_specified = isinstance(legacy_modalities, dict)
+    for feature in ("decisions", "structured_output", "prompt_caching"):
+        if feature in stored:
+            available = stored[feature] is True
+            normalized[feature] = available
+            if feature != "prompt_caching":
+                gates[feature] = {
+                    **gates.get(feature, {}),
+                    "available": available,
+                    "mode": "native" if available else "none",
+                    "reason_code": None if available else "provider_unsupported",
+                    "pricing_available": available,
+                }
     if legacy_pdf_specified:
         pdf_input = "pdf" in inputs
         gates["document_input"] = {

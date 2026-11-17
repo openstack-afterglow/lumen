@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from lumen.services import credit
+from lumen.services.usage_breakdown import UsageBreakdown
 
 
 class TestCreditsForCost:
@@ -60,6 +61,89 @@ class TestSnapshotUsageCost:
                 prompt_tokens=1,
                 completion_tokens=1,
             )
+
+    @pytest.mark.parametrize(
+        ("prompt_tokens", "tier"),
+        [(200_001, False), (272_000, False), (272_001, True)],
+    )
+    def test_frozen_model_threshold_selects_base_and_all_cache_tiers(self, prompt_tokens, tier):
+        pricing = {
+            "input_price_per_token": "0.000001",
+            "output_price_per_token": "0.000002",
+            "input_price_per_token_above_200k": "0.000003",
+            "output_price_per_token_above_200k": "0.000004",
+            "long_context_threshold_tokens": 272_000,
+            "cache_read_price_per_token": "0.000005",
+            "cache_read_price_per_token_above_200k": "0.000006",
+            "cache_write_price_per_token": "0.000007",
+            "cache_write_price_per_token_above_200k": "0.000008",
+            "cache_write_1h_price_per_token": "0.000009",
+            "cache_write_1h_price_per_token_above_200k": "0.000010",
+            "cache_price_sources": {
+                "cache_read": "native_catalog",
+                "cache_creation_5m": "native_catalog",
+                "cache_creation_1h": "native_catalog",
+            },
+        }
+        breakdown = UsageBreakdown.from_totals(
+            prompt_tokens, 3, cache_read_input_tokens=10,
+            cache_creation_5m_input_tokens=10, cache_creation_1h_input_tokens=10,
+        )
+        cost = credit.usage_cost_from_pricing_snapshot(
+            pricing, prompt_tokens=prompt_tokens, completion_tokens=3, breakdown=breakdown,
+        )
+        assert cost.input_cost == (prompt_tokens - 30) * Decimal("0.000003" if tier else "0.000001")
+        assert cost.output_cost == 3 * Decimal("0.000004" if tier else "0.000002")
+        assert cost.cache_read_cost == 10 * Decimal("0.000006" if tier else "0.000005")
+        assert cost.cache_creation_5m_cost == 10 * Decimal("0.000008" if tier else "0.000007")
+        assert cost.cache_creation_1h_cost == 10 * Decimal("0.000010" if tier else "0.000009")
+        assert cost.pricing_status == "priced"
+
+    @pytest.mark.parametrize(("prompt_tokens", "tier"), [(200_000, False), (200_001, True)])
+    def test_legacy_snapshot_threshold_and_manual_cache_price_stay_literal(self, prompt_tokens, tier):
+        cost = credit.usage_cost_from_pricing_snapshot(
+            {
+                "input_price_per_token": "0.000001",
+                "output_price_per_token": "0.000002",
+                "input_price_per_token_above_200k": "0.000003",
+                "output_price_per_token_above_200k": "0.000004",
+                "cache_read_price_per_token": "0",
+                "cache_read_price_per_token_above_200k": "0.000006",
+                "cache_price_sources": {"cache_read": "manual"},
+            },
+            prompt_tokens=prompt_tokens,
+            completion_tokens=1,
+            breakdown=UsageBreakdown.from_totals(prompt_tokens, 1, cache_read_input_tokens=10),
+        )
+        assert cost.input_cost == (prompt_tokens - 10) * Decimal("0.000003" if tier else "0.000001")
+        assert cost.output_cost == Decimal("0.000004" if tier else "0.000002")
+        assert cost.cache_read_cost == 0
+
+    @pytest.mark.parametrize("threshold", [None, True, 0, -1, "272000", 272000.5])
+    def test_invalid_frozen_threshold_fails_closed(self, threshold):
+        with pytest.raises(ValueError, match="durable pricing snapshot is invalid"):
+            credit.usage_cost_from_pricing_snapshot(
+                {
+                    "input_price_per_token": "0",
+                    "output_price_per_token": "0",
+                    "long_context_threshold_tokens": threshold,
+                },
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    def test_reservation_bounds_include_frozen_base_tiers(self):
+        pricing = {
+            "input_price_per_token": "0",
+            "output_price_per_token": "0",
+            "input_price_per_token_above_200k": "0.000003",
+            "output_price_per_token_above_200k": "0.000004",
+            "long_context_threshold_tokens": 272_000,
+            "margin_multiplier": "1",
+            "chat_credit_per_usd": "1",
+        }
+        assert credit.worst_case_token_rates(pricing)[:2] == (Decimal("0.000003"), Decimal("0.000004"))
+        assert credit.call_credit_bound(pricing, input_tokens=300_000, output_tokens=10) == Decimal("0.90004001")
 
 
 class TestPrecheckFailClosed:

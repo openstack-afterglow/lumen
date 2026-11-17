@@ -10,8 +10,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from lumen.crypto import encrypt_llm_provider_billing_admin_key, encrypt_llm_provider_key
 from lumen.db import mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
-from lumen.services.models_dev import ModelsDevCatalog
-from lumen.services.provider_metadata import direct_provider_route
+from lumen.services.provider_metadata import NATIVE_PROVIDER_TYPES, direct_provider_route, provider_family
 
 from .accounts import _provider, create_default, default_credential, validate_selection_policy
 from .billing import billing_admin_key_supported, billing_capability_for
@@ -25,13 +24,12 @@ from .credentials import (
 from .errors import (
     ChatStorageUnavailable,
     ModelOrderConflictError,
-    ModelsDevImportConflictError,
     ProviderNotFoundError,
     ProviderValidationError,
+    UnsupportedProviderTypeError,
 )
 from .pricing import (
     MODEL_KINDS,
-    _json_decimal_strings,
     _model_public,
     _per_million_price,
     _per_token_price,
@@ -46,6 +44,16 @@ from .routing import _lock_mutable_route, _require_db
 _AUTH_MODES = frozenset({"api_key", "chatgpt_device", "anthropic_subscription"})
 _MEDIA_PROVIDERS = frozenset({"openai", "gemini"})
 _DEFAULT_API_PROVIDER = object()
+_OPTIONAL_CAPABILITY_FLAGS = frozenset({"prompt_caching", "structured_output", "web_search"})
+
+
+def validate_provider_type(value: str) -> str:
+    if not isinstance(value, str):
+        raise UnsupportedProviderTypeError()
+    normalized = value.strip().lower()
+    if normalized not in NATIVE_PROVIDER_TYPES and normalized != "chatgpt":
+        raise UnsupportedProviderTypeError()
+    return normalized
 
 
 def validate_api_provider(value: str) -> str:
@@ -82,8 +90,17 @@ def validate_provider_name(value: str) -> str:
 def _validate_model_kind(provider: LlmProvider, kind: str) -> None:
     if kind not in MODEL_KINDS:
         raise ProviderValidationError("지원하지 않는 model_kind 입니다")
-    if kind != "text" and (provider.provider_type not in _MEDIA_PROVIDERS or provider.auth_mode != "api_key" or not direct_provider_route(provider.provider_type, provider.api_base)):
-        raise ProviderValidationError("media and embedding models require supported direct API-key provider routes")
+    compatible_embedding = (
+        kind == "embedding"
+        and provider.provider_type == "openai"
+        and provider_family(provider.provider_type, provider.api_base, provider.auth_mode) == "compatible"
+    )
+    if kind != "text" and not compatible_embedding and (
+        provider.provider_type not in _MEDIA_PROVIDERS
+        or provider.auth_mode != "api_key"
+        or not direct_provider_route(provider.provider_type, provider.api_base)
+    ):
+        raise ProviderValidationError("media models require supported direct API-key provider routes")
 
 
 def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: tuple) -> dict | None:
@@ -103,6 +120,27 @@ def _validate_text_prices(input_price_per_million, output_price_per_million):
     )
 
 
+def _capability_override(value: dict | None) -> dict | None:
+    if not value:
+        return None
+    return {
+        key: flag for key, flag in value.items()
+        if key not in _OPTIONAL_CAPABILITY_FLAGS or flag is not None
+    } or None
+
+
+def _validate_compatible_prices(
+    provider_type: str, api_base: str | None, auth_mode: str, kind: str, input_price, output_price,
+) -> None:
+    if provider_family(provider_type, api_base, auth_mode) != "compatible":
+        return
+    if input_price is None or (kind != "embedding" and output_price is None):
+        raise ProviderValidationError(
+            "compatible_model_prices_required: 호환 API 모델에는 관리자가 입력·출력 가격을 모두 설정해야 합니다 "
+            "(embedding은 입력 가격만 필요합니다)."
+        )
+
+
 def validate_provider_auth_configuration(
     *,
     provider_type: str,
@@ -112,6 +150,7 @@ def validate_provider_auth_configuration(
     api_key_env: str | None,
     billing_admin_key: str | None = None,
 ) -> None:
+    validate_provider_type(provider_type)
     if auth_mode not in _AUTH_MODES:
         raise ProviderValidationError("지원하지 않는 provider auth_mode 입니다")
     if provider_type == "chatgpt" and auth_mode != "chatgpt_device":
@@ -120,6 +159,13 @@ def validate_provider_auth_configuration(
         raise ProviderValidationError("ChatGPT 구독은 provider_type=chatgpt 이어야 합니다")
     if auth_mode == "anthropic_subscription" and provider_type != "anthropic":
         raise ProviderValidationError("Claude 구독은 provider_type=anthropic 이어야 합니다")
+    if auth_mode == "api_key" and provider_type in {"gemini", "perplexity"} and not direct_provider_route(
+        provider_type, api_base,
+    ):
+        raise ProviderValidationError(
+            "unsupported_provider_api_base: Gemini와 Perplexity는 공식 endpoint만 지원합니다. "
+            "호환 API는 openai 또는 anthropic과 custom api_base로 등록하세요."
+        )
     if auth_mode != "api_key" and any(
         isinstance(value, str) and value.strip() for value in (api_base, api_key, api_key_env)
     ):
@@ -183,15 +229,13 @@ async def create_provider(
     auth_mode: str = "api_key",
     billing_admin_key: str | None = None,
     margin_multiplier=1.0,
-    models_dev_provider_id: str | None = None,
     is_active: bool = True,
     selection_policy: str = "priority",
 ) -> dict:
-    factory = _require_db()
     validate_selection_policy(selection_policy)
     name = validate_provider_name(name)
     sort_order = validate_sort_order(sort_order)
-    normalized_provider_type = (provider_type or "openai").strip()
+    normalized_provider_type = validate_provider_type(provider_type)
     api_provider = validate_api_provider(
         normalized_provider_type if api_provider is _DEFAULT_API_PROVIDER else api_provider
     )
@@ -204,6 +248,7 @@ async def create_provider(
         api_key_env=api_key_env,
         billing_admin_key=billing_admin_key,
     )
+    factory = _require_db()
     row = LlmProvider(
         name=name.strip(),
         provider_type=normalized_provider_type,
@@ -219,7 +264,6 @@ async def create_provider(
         ),
         auth_mode=normalized_auth_mode,
         margin_multiplier=_to_decimal(margin_multiplier, "margin_multiplier"),
-        models_dev_provider_id=(models_dev_provider_id or None),
         selection_policy=selection_policy,
         is_active=is_active,
     )
@@ -251,8 +295,10 @@ async def list_providers() -> list[dict]:
 
 
 async def update_provider(provider_id: int, patch: dict) -> dict:
-    factory = _require_db()
     patch = dict(patch)
+    if "provider_type" in patch:
+        patch["provider_type"] = validate_provider_type(patch["provider_type"])
+    factory = _require_db()
     if "name" in patch:
         patch["name"] = validate_provider_name(patch["name"])
     if "api_provider" in patch:
@@ -279,7 +325,15 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                     LlmModel.provider_id == provider_id, LlmModel.model_kind != "text"
                 ))).scalars().all()
                 for kind in media_kinds:
-                    if kind not in MODEL_KINDS or target_provider_type not in _MEDIA_PROVIDERS or target_auth_mode != "api_key" or not direct_provider_route(target_provider_type, patch.get("api_base", row.api_base)):
+                    compatible_embedding = (
+                        kind == "embedding" and target_provider_type == "openai"
+                        and provider_family(target_provider_type, patch.get("api_base", row.api_base), target_auth_mode) == "compatible"
+                    )
+                    if not compatible_embedding and (
+                        kind not in MODEL_KINDS or target_provider_type not in _MEDIA_PROVIDERS
+                        or target_auth_mode != "api_key"
+                        or not direct_provider_route(target_provider_type, patch.get("api_base", row.api_base))
+                    ):
                         raise ProviderValidationError("media 모델이 있는 프로바이더는 지원하지 않는 인증/유형/base로 전환할 수 없습니다")
             validate_provider_auth_configuration(
                 provider_type=target_provider_type,
@@ -289,6 +343,18 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 api_key_env=patch.get("api_key_env", (default_credential(row).api_key_env if default_credential(row) else None)),
                 billing_admin_key=patch.get("billing_admin_key"),
             )
+            target_active = row.is_active if patch.get("is_active") is None else bool(patch["is_active"])
+            if target_active and provider_family(
+                target_provider_type, patch.get("api_base", row.api_base), target_auth_mode,
+            ) == "compatible":
+                active_models = (await session.execute(select(LlmModel).where(
+                    LlmModel.provider_id == provider_id, LlmModel.is_active.is_(True),
+                ))).scalars().all()
+                for model in active_models:
+                    _validate_compatible_prices(
+                        target_provider_type, patch.get("api_base", row.api_base), target_auth_mode,
+                        model.model_kind, model.input_price, model.output_price,
+                    )
             current_billing_capability = billing_capability_for(row.provider_type, current_auth_mode, row.api_base)
             target_billing_capability = billing_capability_for(
                 target_provider_type,
@@ -335,8 +401,6 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
                 row.selected_credential_id = selected
             if patch.get("margin_multiplier") is not None:
                 row.margin_multiplier = _to_decimal(patch["margin_multiplier"], "margin_multiplier")
-            if "models_dev_provider_id" in patch:
-                row.models_dev_provider_id = patch["models_dev_provider_id"] or None
             if patch.get("is_active") is not None:
                 row.is_active = bool(patch["is_active"])
             await session.flush()
@@ -381,6 +445,7 @@ async def create_model(
     is_active: bool = True,
 ) -> dict:
     factory = _require_db()
+    capabilities = _capability_override(capabilities)
     if not model_name or not model_name.strip():
         raise ProviderValidationError("model_name 은 필수입니다")
     sort_order = validate_sort_order(sort_order)
@@ -400,19 +465,18 @@ async def create_model(
     try:
         async with factory() as session, session.begin():
             subscription_providers = await _lock_subscription_namespaces(session)
-            provider = subscription_providers.get(provider_id) or await session.get(LlmProvider, provider_id)
+            provider = subscription_providers.get(provider_id)
             if provider is None:
-                raise ProviderValidationError(f"프로바이더 {provider_id} 가 존재하지 않습니다")
-            if model_kind != "text":
                 provider = (await session.execute(
                     select(LlmProvider).where(LlmProvider.id == provider_id).with_for_update()
                     .execution_options(populate_existing=True)
-                )).scalar_one()
+                )).scalar_one_or_none()
+            if provider is None:
+                raise ProviderValidationError(f"프로바이더 {provider_id} 가 존재하지 않습니다")
             _validate_model_kind(provider, model_kind)
-            if provider.provider_type == "perplexity" and getattr(provider, "auth_mode", "api_key") == "api_key":
-                provider = (
-                    await session.execute(select(LlmProvider).where(LlmProvider.id == provider_id).with_for_update())
-                ).scalar_one()
+            _validate_compatible_prices(
+                provider.provider_type, provider.api_base, provider.auth_mode, model_kind, input_price, output_price,
+            )
             auth_mode = getattr(provider, "auth_mode", "api_key")
             namespace_provider_ids = tuple(
                 candidate.id for candidate in subscription_providers.values() if candidate.auth_mode == auth_mode
@@ -580,11 +644,15 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 )),
             )
             media_pricing = _validate_kind_prices(target_kind, media_pricing, token_prices)
+            target_active = row.is_active if patch.get("is_active") is None else bool(patch["is_active"])
+            if target_active:
+                _validate_compatible_prices(
+                    provider.provider_type, provider.api_base, auth_mode, target_kind, token_prices[0], token_prices[1],
+                )
             if target_kind != getattr(row, "model_kind", "text"):
                 if row.is_title_model or row.is_memory_model:
                     raise ProviderValidationError("title/memory 모델은 text 종류만 허용합니다")
                 row.model_kind = target_kind
-                row.models_dev_model_id = None
                 row.price_metadata = None
                 row.price_source = None
             if "media_pricing" in patch:
@@ -636,8 +704,8 @@ async def update_model(model_id: int, patch: dict) -> dict:
             for column, price in cache_prices.items():
                 setattr(row, column, price)
             if "capabilities" in patch:
-                row.capabilities = patch["capabilities"] or None
-                row.capability_source = "override" if patch["capabilities"] else None
+                row.capabilities = _capability_override(patch["capabilities"])
+                row.capability_source = "override" if row.capabilities else None
             if patch.get("is_active") is not None:
                 row.is_active = bool(patch["is_active"])
             await session.flush()
@@ -656,118 +724,6 @@ async def update_model(model_id: int, patch: dict) -> dict:
             )
     except IntegrityError as exc:
         raise ProviderValidationError("프로바이더 내 model_name 이 중복됩니다") from exc
-    except OperationalError as exc:
-        mark_db_unhealthy()
-        raise ChatStorageUnavailable("chat DB 오류") from exc
-
-
-async def import_models_dev_prices(
-    *,
-    local_provider_id: int,
-    models_dev_provider_id: str,
-    selections: list[dict[str, object]],
-    catalog: ModelsDevCatalog,
-) -> list[dict]:
-    """Atomically apply administrator-selected exact models.dev price pairs."""
-    if not 1 <= len(selections) <= 500:
-        raise ProviderValidationError("selections는 1개 이상 500개 이하여야 합니다")
-    external_provider = catalog.providers.get(models_dev_provider_id)
-    if external_provider is None:
-        raise ProviderValidationError("models.dev provider를 찾을 수 없습니다")
-
-    selected_external: dict[int, str] = {}
-    for selection in selections:
-        local_model_id = selection.get("local_model_id")
-        external_model_id = selection.get("models_dev_model_id")
-        if not isinstance(local_model_id, int) or not isinstance(external_model_id, str) or not external_model_id:
-            raise ProviderValidationError("models.dev import selection 형식이 올바르지 않습니다")
-        if local_model_id in selected_external:
-            raise ProviderValidationError("같은 local_model_id를 중복 선택할 수 없습니다")
-        external_model = external_provider.models.get(external_model_id)
-        if external_model is None or not external_model.price_available:
-            raise ProviderValidationError("선택한 models.dev 모델에 완전한 input/output 가격이 없습니다")
-        selected_external[local_model_id] = external_model_id
-
-    factory = _require_db()
-    try:
-        async with factory() as session, session.begin():
-            provider, local_models = await _lock_mutable_route(
-                session,
-                provider_id=local_provider_id,
-                model_ids=set(selected_external),
-            )
-            if provider is None:
-                raise ProviderNotFoundError(f"프로바이더 {local_provider_id} 를 찾을 수 없습니다")
-            if any(getattr(model, "model_kind", "text") != "text" for model in local_models):
-                raise ProviderValidationError("models.dev 가격 import는 text 모델만 지원합니다")
-            if any(model.price_source == "manual" for model in local_models):
-                raise ModelsDevImportConflictError("수동 확정 가격 모델은 models.dev import로 덮어쓸 수 없습니다")
-
-            if provider.models_dev_provider_id and provider.models_dev_provider_id != models_dev_provider_id:
-                existing_imports = (
-                    (
-                        await session.execute(
-                            select(LlmModel.id).where(
-                                LlmModel.provider_id == local_provider_id,
-                                LlmModel.price_source == "models.dev",
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                if set(existing_imports) - set(selected_external):
-                    raise ModelsDevImportConflictError(
-                        "다른 models.dev provider로 변경하려면 기존 imported model을 모두 선택해야 합니다"
-                    )
-                provider_models = (
-                    (await session.execute(select(LlmModel).where(LlmModel.provider_id == local_provider_id)))
-                    .scalars()
-                    .all()
-                )
-                for model in provider_models:
-                    if model.id not in selected_external and model.price_source != "models.dev":
-                        model.models_dev_model_id = None
-
-            provider.models_dev_provider_id = models_dev_provider_id
-            rows_by_id = {model.id: model for model in local_models}
-            for local_model_id, external_model_id in selected_external.items():
-                external_model = external_provider.models[external_model_id]
-                row = rows_by_id[local_model_id]
-                row.models_dev_model_id = external_model_id
-                row.input_price = _per_token_price(external_model.input_price_per_million, "input_price_per_million")
-                row.output_price = _per_token_price(external_model.output_price_per_million, "output_price_per_million")
-                row.price_source = "models.dev"
-                if row.capability_source != "override" and external_model.capabilities is not None:
-                    row.capabilities = external_model.capabilities
-                    row.capability_source = "models_dev"
-                row.price_metadata = {
-                    "source_url": catalog.source_url,
-                    "fetched_at": catalog.fetched_at,
-                    "last_updated": external_model.last_updated,
-                    "cost": _json_decimal_strings(external_model.cost),
-                    "unsupported_price_fields": external_model.unsupported_price_fields,
-                }
-            await session.flush()
-            public_models: list[dict] = []
-            for local_model_id in selected_external:
-                row = rows_by_id[local_model_id]
-                effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
-                public_models.append(_model_public(
-                    row,
-                    effective_input_price_per_million=_per_million_price(effective_input),
-                    effective_output_price_per_million=_per_million_price(effective_output),
-                    effective_price_source=effective_source,
-                    provider_type=provider.provider_type,
-                    api_provider=provider.api_provider,
-                    provider_sort_order=provider.sort_order,
-                    auth_mode=getattr(provider, "auth_mode", "api_key"),
-                    api_key_configured=any(api_key_source(credential) is not None for account in provider.accounts for credential in account.credentials),
-                    api_base=provider.api_base,
-                ))
-            return public_models
-    except IntegrityError as exc:
-        raise ModelsDevImportConflictError("models.dev 가격 import 저장 충돌") from exc
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc

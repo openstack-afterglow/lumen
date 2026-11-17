@@ -55,8 +55,6 @@ class LlmProvider(Base):
     auth_mode: Mapped[str] = mapped_column(VARCHAR(32), nullable=False, default="api_key")
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     margin_multiplier: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False, default=Decimal("1.0"))
-    # models.dev provider key. Display names are never used for catalog matching.
-    models_dev_provider_id: Mapped[str | None] = mapped_column(VARCHAR(100))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
@@ -152,20 +150,19 @@ class LlmModel(Base):
     is_title_model: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
     # 채팅 완료 후 사용자 메모리 자동 추출에 쓸 초소형 모델. 최대 1개만 True(set_memory_model).
     is_memory_model: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
-    # 미지정 시 litellm 내장 단가 사용 (override용). 토큰당 USD 단가.
+    # Stored administrator rates override the native catalog fallback. USD per token.
     input_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     output_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     # 관리자가 저장한 프롬프트 캐시 토큰당 USD 단가(nullable). 적용 단가는 routing이
     # 수동값→direct provider exact catalog→text write cascade 순으로 해석하며 저장값을 채우지 않는다.
     cache_read_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
-    cache_write_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # 5분 TTL cache write
+    cache_write_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # Provider's short-TTL cache write.
     cache_write_1h_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
-    # models.dev catalog mapping and the immutable provenance of the last import.
-    models_dev_model_id: Mapped[str | None] = mapped_column(VARCHAR(190))
+    # Historical stored price provenance remains readable; catalog rates are never stored.
     price_source: Mapped[str | None] = mapped_column(VARCHAR(20))
     price_metadata: Mapped[dict | None] = mapped_column(JSON)
-    # 능력(vision/reasoning/tool_call/attachment/modalities/reasoning_options/context_limit) 저장.
-    # None 이면 런타임 litellm 판별로 fallback. capability_source: override|models_dev|None.
+    # Stored administrator capability overrides, including endpoint capability decisions.
+    # Only capability_source=override is authoritative; otherwise use native catalog or conservative defaults.
     capabilities: Mapped[dict | None] = mapped_column(JSON)
     capability_source: Mapped[str | None] = mapped_column(VARCHAR(20))
 
