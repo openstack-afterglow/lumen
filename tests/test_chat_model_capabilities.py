@@ -215,7 +215,7 @@ class TestEffectiveCapabilities:
 
         assert source == "override"
         assert capabilities["web_search"] is True
-        assert capabilities["web_search_required"] is False
+        assert capabilities["web_search_required"] is (model_name == "perplexity/sonar")
         assert capabilities["feature_gates"]["web_search"] == {
             "available": False,
             "mode": "none",
@@ -223,14 +223,14 @@ class TestEffectiveCapabilities:
             "pricing_available": False,
         }
 
-    @pytest.mark.parametrize(("transport_available", "expected_required"), ((False, False), (True, True)))
-    def test_sonar_requires_native_search_only_when_exact_transport_supports_it(
-        self, monkeypatch, transport_available, expected_required
+    @pytest.mark.parametrize("catalog_support", (False, True))
+    def test_sonar_scope_follows_exact_product_not_catalog_observation(
+        self, monkeypatch, catalog_support
     ):
         monkeypatch.setattr(
             capability_service,
             "_native_web_search_available",
-            lambda _model, _provider, _base: transport_available,
+            lambda _model, _provider, _base: catalog_support,
         )
 
         capabilities, _ = ps._effective_capabilities(
@@ -243,4 +243,4 @@ class TestEffectiveCapabilities:
         )
 
         assert capabilities["web_search"] is True
-        assert capabilities["web_search_required"] is expected_required
+        assert capabilities["web_search_required"] is True

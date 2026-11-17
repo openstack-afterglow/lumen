@@ -828,8 +828,13 @@ async def test_api_generation_segment_keeps_ceiling_before_hold_without_reauthor
     assert segment.status == segment_state
 
 
+@pytest.mark.parametrize("model_name", [
+    "perplexity/perplexity/sonar", "perplexity/perplexity/sonar-pro",
+    "perplexity/perplexity/sonar-reasoning", "perplexity/perplexity/sonar-reasoning-pro",
+    "perplexity/perplexity/sonar-deep-research",
+])
 @pytest.mark.parametrize("search_override", [None, False, True])
-def test_real_catalog_sonar_route_retains_intrinsic_search_scope(search_override):
+def test_real_catalog_sonar_route_retains_intrinsic_search_scope(search_override, model_name):
     from lumen.models.chat_db import LlmModel
     from lumen.services.providers import routing
 
@@ -848,11 +853,13 @@ def test_real_catalog_sonar_route_retains_intrinsic_search_scope(search_override
         selection_policy="priority", selected_credential_id=None, accounts=[account],
     )
     model = LlmModel(
-        id=94, provider_id=91, model_name="perplexity/perplexity/sonar", model_kind="text",
+        id=94, provider_id=91, model_name=model_name, model_kind="text",
+        input_price=Decimal("0.000001"), output_price=Decimal("0.000002"),
         is_active=True, capabilities=None if search_override is None else {"web_search": search_override},
         capability_source=None if search_override is None else "override",
     )
     resolved = routing._resolved_model(model, provider)
+    assert resolved["price_source"] == "manual"
     assert resolved["capabilities"]["web_search_required"] is True
     assert resolved["capabilities"]["feature_gates"]["web_search"]["available"] is False
     assert inference_authority.model_required_scopes(resolved) == ("native:tools:execute",)

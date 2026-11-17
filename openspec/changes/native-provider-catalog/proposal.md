@@ -37,7 +37,7 @@ Other imported flags cannot override native/default capabilities or CLI tool eli
 
 Managed search adapters remain independent of inference-provider restrictions. Native
 paid optional search stays unavailable until request fees are billable; intrinsic Sonar
-search independently retains its tools-scope authorization floor and existing admission.
+search retains its exact-product tools-scope floor even for admin-priced uncatalogued variants.
 Text-equivalent modalities inherit tiers only when both compared categories are catalog
 sourced, while required observations and literal administrator prices remain preserved.
 Distinct native modality tiers must be represented explicitly.
