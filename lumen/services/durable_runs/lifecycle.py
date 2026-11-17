@@ -300,12 +300,16 @@ async def _cancel_requested(run_id: str) -> bool:
 
 
 
-async def fail_waiting_run(run_id: str, *, error_code: str, safe_message: str) -> bool:
+async def fail_waiting_run(
+    run_id: str, *, error_code: str, safe_message: str, require_unstarted: bool = False,
+) -> bool:
     """Fail a run parked in ``waiting_resource``/``queued`` without a worker lease.
 
     Used by the resource controller when provisioning fails or the deadline passes.
     Lineage locks are taken in the global order so child reservations settle exactly once;
     running runs are left to their lease owner's cancellation path.
+    Resource expiry can require an unclaimed run (lease_fence == 0), so a queued
+    parent resuming orchestration after a child join is not failed by Pod expiry.
     """
     from . import budgets, children
 
@@ -313,7 +317,8 @@ async def fail_waiting_run(run_id: str, *, error_code: str, safe_message: str) -
         order = budgets.LockOrder()
         async with _factory()() as session, session.begin():
             identity = (await session.execute(select(ChatRun).where(ChatRun.id == run_id))).scalar_one_or_none()
-            if identity is None or identity.status not in {"waiting_resource", "queued"}:
+            if (identity is None or identity.status not in {"waiting_resource", "queued"}
+                    or (require_unstarted and int(identity.lease_fence or 0) != 0)):
                 return False, None
             quota = None
             root = None
@@ -331,7 +336,8 @@ async def fail_waiting_run(run_id: str, *, error_code: str, safe_message: str) -
                     quota = await budgets.lock_project_quota(session, identity.project_id, order=order)
                 run = await budgets.lock_run(session, run_id, order=order, lock_class="root")
                 root = run
-            if run.status not in {"waiting_resource", "queued"}:
+            if (run.status not in {"waiting_resource", "queued"}
+                    or (require_unstarted and int(run.lease_fence or 0) != 0)):
                 return False, None
             if not transition_allowed(run.status, "finalizing", cancel_or_failure=True):
                 raise DurableRunConflict("waiting run cannot be finalized")

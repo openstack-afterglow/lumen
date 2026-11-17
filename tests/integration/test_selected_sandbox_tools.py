@@ -21,7 +21,7 @@ import test_infrastructure_store as infrastructure_fixtures
 import test_kubernetes_provider as kubernetes_fixtures
 from sqlalchemy import delete, select
 
-from lumen.crypto import encrypt_chat_content
+from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_contracts import ToolPolicy
 from lumen.models.chat_db import ChatAgent
 from lumen.models.chat_infrastructure import (
@@ -72,7 +72,7 @@ async def _new_run(fixture, *, scope="temp", selected=True, **values):
         policy.enabled_sandbox_tools, config=fixture.config,
     )}
     return await fixture.create_run(
-        run_scope=scope, status="queued", lease_owner=None, lease_expires_at=None,
+        run_scope=scope, status="queued", lease_owner=None, lease_expires_at=None, lease_fence=0,
         capability_snapshot=snapshot, **values,
     )
 
@@ -852,3 +852,181 @@ async def test_selected_vanished_pod_cleans_auxiliaries_before_releasing_occupan
     assert resources[0].observed_state == "deleted" and await store.occupancy(f.pool_id) == 0
     assert set(c.api.objects) == {("networkpolicies", "lumen-default-deny")}
     assert not any(call[0] == "DELETE" and call[1].endswith("/pods/" + name) for call in c.api.calls)
+
+
+@pytest.mark.parametrize("boundary", ["delayed-readyz", "ready-commit-before-wake", "queued-before-first-claim"])
+async def test_selected_readiness_expiry_cannot_queue_parked_run(selected_controller, monkeypatch, boundary):
+    c, f = selected_controller, selected_controller.f
+    run_id = await _new_run(f)
+    assert await _apply(f, run_id)
+    allocated = await c.provision(run_id)
+    root_wall = datetime.now(UTC) + timedelta(minutes=20)
+    async with f.factory() as session, session.begin():
+        run = await session.get(ChatRun, run_id)
+        resource = await session.get(ChatRuntimeResource, allocated.id)
+        run.deadline_at = root_wall
+        resource.bootstrap_token_hash = None
+        resource.certificate_fingerprint = "c" * 64
+        resource.certificate_not_after = datetime.now(UTC) + timedelta(hours=1)
+    actual_wake = store.wake_ready_runs
+    if boundary == "delayed-readyz":
+        ready_outcomes = []
+        actual_ready = store.mark_ready
+
+        async def tracked_ready(*args, **kwargs):
+            result = await actual_ready(*args, **kwargs)
+            ready_outcomes.append(result)
+            return result
+
+        class DelayedReadiness:
+            async def request(self, **request):
+                assert request["path"] == "/readyz"
+                # The request began before expiry; its successful response arrives after it.
+                async with f.factory() as session, session.begin():
+                    resource = await session.get(ChatRuntimeResource, allocated.id)
+                    resource.deadline_at = datetime.now(UTC) - timedelta(seconds=1)
+                return b"{}"
+
+        monkeypatch.setattr(store, "mark_ready", tracked_ready)
+        c.controller.transport = DelayedReadiness()
+        await c.reconcile()
+        assert ready_outcomes == [False]
+    else:
+        async def interrupted_wake(_resource_id):
+            return []
+
+        with monkeypatch.context() as patch:
+            if boundary == "ready-commit-before-wake":
+                patch.setattr(store, "wake_ready_runs", interrupted_wake)
+            assert await store.mark_ready(
+                allocated.id, allocated.generation, c.controller.owner, c.fence, policy_verified=True,
+            )
+        run, _, [resource], _ = await _state(f, run_id)
+        assert run.status == ("queued" if boundary == "queued-before-first-claim" else "waiting_resource")
+        assert run.lease_fence == 0 and resource.ready_at is not None
+        async with f.factory() as session, session.begin():
+            resource = await session.get(ChatRuntimeResource, allocated.id)
+            resource.deadline_at = datetime.now(UTC) - timedelta(seconds=1)
+        await c.restart()
+        assert await actual_wake(allocated.id) == []
+        await c.reconcile()
+    run, quota, [resource], holds = await _state(f, run_id)
+    assert run.status == "failed" and run.deadline_at.replace(tzinfo=UTC) == root_wall
+    assert run.reservation_released_at is not None
+    assert (quota.active_sandboxes, quota.sandbox_seconds_reserved) == (0, 0)
+    assert resource.desired_state == "deleting"
+    assert (resource.ready_at is None) == (boundary == "delayed-readyz")
+    assert {hold.kind: hold.status for hold in holds} == {"sandbox_slot": "released", "sandbox_seconds": "settled"}
+    async with f.factory() as session:
+        events = list((await session.scalars(select(ChatRunEventRow).where(
+            ChatRunEventRow.run_id == run_id,
+        ))).all())
+        decoded = [(event.event_type, json.loads(decrypt_chat_content(event.payload))) for event in events]
+        queued = [payload for kind, payload in decoded
+                  if kind == "run.stage.changed" and payload.get("stage") == "queued"]
+        assert len(queued) == (1 if boundary == "queued-before-first-claim" else 0)
+        failures = [payload for kind, payload in decoded if kind == "run.failed"]
+        assert len(failures) == 1 and failures[0]["error_code"] == "resource_deadline_exceeded"
+    await c.reconcile()
+    await c.reconcile()
+    run, _, [resource], _ = await _state(f, run_id)
+    assert run.status == "failed" and resource.observed_state == "deleted"
+    assert await actual_wake(allocated.id) == []
+    assert set(c.api.objects) == {("networkpolicies", "lumen-default-deny")}
+    assert len([call for call in c.api.calls if call[0] == "POST" and call[1].endswith("/pods")]) == 1
+
+
+async def test_selected_expired_root_replays_settled_child_group_after_join_requeue(
+    selected_controller, selected_delegation,
+):
+    c, d = selected_controller, selected_delegation
+    f, root_id = d.f, d.root_id
+    assert await _apply(f, root_id, agent_budget={
+        "credit_ceiling": "1", "sandbox_seconds_ceiling": 120, "wall_time_seconds": 180,
+    }, execution_mode="plan")
+    await c.provision(root_id)
+    root_resource = await c.ready(root_id)
+    await _running(f, root_id)
+    calls = [_delegation_call(d, seconds=60)]
+    group = await children.prepare_delegations(
+        parent_run_id=root_id, owner="worker#1", model_segment_id="durable-replayed-turn", calls=calls,
+    )
+    child_id = group["children"][0]["child_run_id"]
+    await c.reconcile()
+    await c.ready(child_id)
+    await _running(f, child_id)
+    assert await children.mark_waiting_children(
+        parent_run_id=root_id, owner="worker#1", wait_group_id=group["wait_group_id"], checkpoint_id="saved-children",
+    ) == "waiting_children"
+    async with f.factory() as session, session.begin():
+        resource = await session.get(ChatRuntimeResource, root_resource.id)
+        resource.deadline_at = datetime.now(UTC) - timedelta(seconds=1)
+    c.api.delay_delete_kind = "services"
+    await c.reconcile()
+    await c.reconcile()
+    await c.reconcile()
+    root, _, _, _ = await _state(f, root_id)
+    assert root.status == "waiting_children"
+    name = c.provider._name(root_resource.id, root_resource.generation)
+    assert ("pods", name) not in c.api.objects and ("services", name) in c.api.objects
+    # Child completion requeues already-started orchestration after the root Pod is gone.
+    await _finish(child_id, status="completed", message_id=None, owner="worker#1")
+    root, _, _, _ = await _state(f, root_id)
+    assert root.status == "queued" and root.lease_fence == 1
+    await c.reconcile()
+    root, _, _, _ = await _state(f, root_id)
+    assert root.status == "queued" and root.reservation_released_at is None
+    c.api.delay_delete_kind = None
+    await c.restart()
+    await c.reconcile()
+    await c.reconcile()
+    root, _, resources, _ = await _state(f, root_id)
+    assert root.status == "queued"
+    assert next(resource for resource in resources if resource.id == root_resource.id).observed_state == "deleted"
+    await _running(f, root_id)
+    async with f.factory() as session:
+        resource_ids = set((await session.scalars(select(ChatRuntimeResource.id).where(
+            ChatRuntimeResource.pool_id == f.pool_id,
+        ))).all())
+        reservation_ids = set((await session.scalars(select(ChatAgentReservation.id).where(
+            ChatAgentReservation.root_run_id == root_id,
+        ))).all())
+        operation_ids = set((await session.scalars(select(ChatResourceOperation.id).where(
+            ChatResourceOperation.resource_id.in_(resource_ids),
+        ))).all())
+    native_calls = list(c.api.calls)
+    replayed = await children.prepare_delegations(
+        parent_run_id=root_id, owner="worker#1", model_segment_id="durable-replayed-turn", calls=calls,
+    )
+    assert replayed["wait_group_id"] == group["wait_group_id"]
+    assert [item["child_run_id"] for item in replayed["children"]] == [child_id]
+    results = await children.delegation_results(
+        parent_run_id=root_id, owner="worker#1", wait_group_id=group["wait_group_id"],
+    )
+    assert [(item["child_run_id"], item["status"]) for item in results["results"]] == [(child_id, "completed")]
+    joined = await children.prepare_delegations(
+        parent_run_id=root_id, owner="worker#1", model_segment_id="durable-replayed-turn", calls=calls,
+    )
+    assert joined["state"] == "joined"
+    assert await children.delegation_results(
+        parent_run_id=root_id, owner="worker#1", wait_group_id=group["wait_group_id"],
+    ) == results
+    with pytest.raises(children.ChildFailure) as error:
+        await children.prepare_delegations(
+            parent_run_id=root_id, owner="worker#1", model_segment_id="new-group-after-expiry", calls=calls,
+        )
+    assert error.value.code == "sandbox_expired"
+    assert c.api.calls == native_calls
+    async with f.factory() as session:
+        assert set((await session.scalars(select(ChatRuntimeResource.id).where(
+            ChatRuntimeResource.pool_id == f.pool_id,
+        ))).all()) == resource_ids
+        assert set((await session.scalars(select(ChatAgentReservation.id).where(
+            ChatAgentReservation.root_run_id == root_id,
+        ))).all()) == reservation_ids
+        assert set((await session.scalars(select(ChatResourceOperation.id).where(
+            ChatResourceOperation.resource_id.in_(resource_ids),
+        ))).all()) == operation_ids
+        assert len(list((await session.scalars(select(ChatDelegationGroup.id).where(
+            ChatDelegationGroup.parent_run_id == root_id,
+        ))).all())) == 1

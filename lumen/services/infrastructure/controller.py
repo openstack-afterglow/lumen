@@ -698,9 +698,12 @@ class ResourceController:
             if (not resource.run_id or not resource.deadline_at or resource.observed_state == "deleted"
                     or store._utc(resource.deadline_at) > now):
                 continue
-            if resource.ready_at is None:
-                await lifecycle.fail_waiting_run(resource.run_id, error_code="resource_deadline_exceeded",
-                                                 safe_message="Sandbox provisioning deadline exceeded")
+            # Ready may commit before startup wakeup; queued may also mean a parent
+            # resuming after child work. Fail only never-claimed runs under its lock.
+            await lifecycle.fail_waiting_run(
+                resource.run_id, error_code="resource_deadline_exceeded",
+                safe_message="Sandbox lifetime expired before execution", require_unstarted=True,
+            )
             if resource.desired_state != "deleting":
                 await store.request_delete(resource.id, self.owner, fence)
 
