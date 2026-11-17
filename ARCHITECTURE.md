@@ -584,9 +584,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "61fb088ec3cc8913306371a993bf41026ddeae57f3f9fedf2da6c93b81878994",
-  "reviewed_at": "2026-11-17T21:12:48Z",
-  "summary": "Integrate missed 0.6.17 slices: MCP activation directory read outside row lock, idempotent install session release, tool.call.progress history projection"
+  "source_sha256": "5f7ab2ed68d10493f8e7ffe72f6387c06b5be608781700068a637640219f798a",
+  "reviewed_at": "2026-11-17T21:27:07Z",
+  "summary": "Integrate missed 0.6.17 slices; MCP activation fails closed for domain rows without owner domain"
 }
 ```
 <!-- architecture-review:end -->

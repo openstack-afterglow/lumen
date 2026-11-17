@@ -2,7 +2,7 @@
 
 ## Missed 0.6.17 slices (2026-11-18, source/local, not released)
 
-Cherry-picked `feat/mcp-catalog` `f6fc308`/`171d6c5` and `feat/chat-work-log` `9e22746` (completed after their 0.6.17 integration merge points) onto `c5b020be`. `test-passed`: `uv run --frozen lumen-test contract` 7,973 passed + 145 SDK, configured Ruff clean; `lumen-test integration` 748 passed / 4 skipped (real MariaDB/Redis, includes `test_mcp_domain_connections.py` and `test_chat_work_log_progress_db.py`). The branch was then rebased onto the docs-only `89275f05`. Not deployed: production 0.6.17 lacks these fixes.
+Cherry-picked `feat/mcp-catalog` `f6fc308`/`171d6c5` and `feat/chat-work-log` `9e22746` (completed after their 0.6.17 integration merge points) onto `c5b020be`, then rebased onto the docs-only `89275f05`. Review follow-up: activation now fails closed for a `scope='domain'` row whose `owner_domain_id` is NULL (the peek path skipped the membership read and `None != None` passed inside the lock; migration 033 has no CHECK), with a real-SQL regression test. `test-passed` on the final tree: `uv run --frozen lumen-test contract` 7,973 passed + 145 SDK, configured Ruff clean; `lumen-test integration` 749 passed / 4 skipped (real MariaDB/Redis, includes `test_mcp_domain_connections.py` and `test_chat_work_log_progress_db.py`). Not deployed: production 0.6.17 lacks these fixes.
 
 ## 0.6.17 production rollout and smoke (2026-11-17 UTC / 2026-11-18 KST)
 

@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi import HTTPException
 from lumen_plugin_api.contracts import Namespace
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_contracts import ChatFeatureOptions
@@ -175,6 +175,16 @@ async def test_activation_freezes_explicit_selection_and_invalidates_on_changes(
         await es.set_mcp_activation(server_id, **owner(db["member"]), is_active=True, config_version=1)
     await es.set_mcp_activation(server_id, **owner(db["member"]), is_active=True, config_version=2)
     assert (await selected(db, server_id))["mcp"][0]["id"] == server_id
+
+
+async def test_activation_rejects_domain_row_without_owner_domain(domain_db):
+    db = domain_db
+    _, created = await create_domain(db)
+    server_id = created["server"]["id"]
+    async with db["factory"]() as session, session.begin():
+        await session.execute(update(ChatMcpServer).where(ChatMcpServer.id == server_id).values(owner_domain_id=None))
+    with pytest.raises(es.ExtensionForbidden):
+        await es.set_mcp_activation(server_id, **owner(db["member"]), is_active=True, config_version=1)
 
 
 async def test_shared_oauth_canonical_owner_and_revocation_invalidate_frozen_run(domain_db):

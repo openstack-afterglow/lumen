@@ -604,7 +604,7 @@ async def set_mcp_activation(
                 raise ExtensionNotFound(f"MCP 서버 {item_id} 를 찾을 수 없습니다")
             if server.scope not in {"global", "domain"}:
                 raise ExtensionForbidden("Only published MCP servers support activation")
-            if server.scope == "domain" and server.owner_domain_id != authorized_domain:
+            if server.scope == "domain" and (authorized_domain is None or server.owner_domain_id != authorized_domain):
                 raise ExtensionForbidden("Organization connection changed; retry the activation")
             if not server.is_active:
                 raise ExtensionValidationError("MCP server is unavailable")
