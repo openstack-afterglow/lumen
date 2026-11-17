@@ -16,7 +16,7 @@
 - [x] Add accessible translations and meaningful UI/API regression tests.
 
 ## 4. Verification and documentation
-- [x] Verify catalog/pricing, fake-upstream OpenAI/Gemini route behavior, auth/scope, dimensions/base64 and ledger settlement.
+- [x] Verify catalog/pricing, fake-upstream routes, auth/scope, limits and wire formats; settlement call is unit-tested, but persisted usage rows and exact billed cost are not integration-verified.
 - [x] Exercise OpenAI and Google SDKs against a local fake-upstream service when installed; report live providers separately.
 - [x] Run scoped tests, canonical gates and architecture freshness checks; document exact commands/results/limits.
 - [x] Archive this change only after the required checks and evidence are complete.
