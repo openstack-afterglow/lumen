@@ -490,6 +490,14 @@ def _project_run_activity(events: list, *, durations_ms: dict[str, int]) -> list
             }
             by_id[item["id"]] = item
             activity.append(item)
+        elif event.type == "tool.call.progress":
+            item = by_id.get(f"tool:{payload['call_id']}")
+            if item is None or item["name"] != payload["name"] or item["status"] != "running":
+                raise ValueError("tool progress has no active matching call")
+            progress = item.setdefault("progress", [])
+            if not progress or progress[-1] != payload["text"]:
+                progress.append(payload["text"])
+                del progress[:-32]
         elif event.type == "tool.call.completed":
             item = by_id.get(f"tool:{payload['call_id']}")
             if item is None:

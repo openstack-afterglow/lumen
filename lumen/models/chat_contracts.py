@@ -944,6 +944,16 @@ class ToolCallStartedPayload(_StrictModel):
     category: str = Field(default="기본 도구", min_length=1, max_length=100)
 
 
+class ToolCallProgressPayload(_StrictModel):
+    """Already-public progress text, never provider-private execution state."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=False, protected_namespaces=())
+
+    call_id: str = Field(min_length=1, max_length=190)
+    name: str = Field(min_length=1, max_length=190)
+    text: str = Field(min_length=1, max_length=4_000)
+
+
 class ToolCallCompletedPayload(_StrictModel):
     call_id: str = Field(min_length=1, max_length=190)
     name: str = Field(min_length=1, max_length=190)
@@ -1103,6 +1113,11 @@ class ToolCallStartedEvent(_RunEvent):
     payload: ToolCallStartedPayload
 
 
+class ToolCallProgressEvent(_RunEvent):
+    type: Literal["tool.call.progress"]
+    payload: ToolCallProgressPayload
+
+
 class ToolCallCompletedEvent(_RunEvent):
     type: Literal["tool.call.completed"]
     payload: ToolCallCompletedPayload
@@ -1162,6 +1177,7 @@ ChatRunEvent = Annotated[
     | PartDeltaEvent
     | PartCompletedEvent
     | ToolCallStartedEvent
+    | ToolCallProgressEvent
     | ToolCallCompletedEvent
     | ToolApprovalRequiredEvent
     | ToolApprovalResolvedEvent
