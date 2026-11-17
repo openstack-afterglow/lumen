@@ -1063,12 +1063,23 @@ async def test_known_boot_timeout_reclaim_requires_full_owned_observation(pool):
 
 
 @pytest.fixture
-async def lazy_chat_sandbox(pool, monkeypatch):
+async def lazy_chat_sandbox(pool, monkeypatch, tmp_path):
+    import hashlib
+
     from lumen.models.chat_infrastructure import ChatAgentReservation, ChatProjectAgentQuota
-    from lumen.services import sandbox_binding
+    from lumen.services import sandbox_binding, sandbox_selection
     from lumen.services.infrastructure.config import PoolConfig, ProjectQuotaDefaults
 
     factory = get_session_factory()
+    manifest = json.dumps({"version": 1, "profiles": [{
+        "id": "local", "command": ["/usr/bin/test-mcp"], "tools": [{
+            "name": name, "description": f"Fixture {name}",
+            "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "effect": "read",
+        } for name in ("sandbox_echo", "sandbox_status", "sandbox_unselected")],
+    }]}).encode()
+    manifest_file = tmp_path / "selected-tools.json"
+    manifest_file.write_bytes(manifest)
     definition = PoolConfig.model_validate_json(json.dumps({
         "name": pool.name, "role": "sandbox", "backend": "kubernetes", "enabled": True,
         "image": "registry.example/sandbox@sha256:" + "a" * 64, "architecture": "x86_64",
@@ -1076,7 +1087,7 @@ async def lazy_chat_sandbox(pool, monkeypatch):
         "sandbox": {"workspace_bytes": 128 * 1024**2, "memory_bytes": 1024**3,
                     "cpu_millis": 1000, "pids_limit": 256},
         "profile": {"backend": "kubernetes", "cluster_profile_id": "cluster",
-                    "tool_manifest_file": "/test/tools.json", "tool_manifest_sha256": "b" * 64,
+                    "tool_manifest_file": str(manifest_file), "tool_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
                     "controller_ingress_cidrs": ["192.0.2.11/32"], "bootstrap_egress_cidrs": ["192.0.2.11/32"]},
     }))
     runtime = SimpleNamespace(
@@ -1085,6 +1096,7 @@ async def lazy_chat_sandbox(pool, monkeypatch):
     )
     settings = SimpleNamespace(runtime_config=runtime)
     monkeypatch.setattr(sandbox_binding, "get_settings", lambda: settings)
+    monkeypatch.setattr(sandbox_selection, "get_settings", lambda: settings)
     monkeypatch.setattr("lumen.config.get_settings", lambda: settings)
     async with factory() as session, session.begin():
         row = await session.get(ChatRuntimePool, pool.id)
@@ -1100,7 +1112,10 @@ async def lazy_chat_sandbox(pool, monkeypatch):
         run_ids.append(run_id)
         run = ChatRun(
             id=run_id, run_scope="temp", run_kind="completion", execution_mode="chat",
-            project_id=project, user_id=project, model_name="fixture-model", capability_snapshot={}, pricing_snapshot={},
+            project_id=project, user_id=project, model_name="fixture-model",
+            capability_snapshot={"sandbox_tools": sandbox_selection.freeze_selection(
+                ["sandbox_echo", "sandbox_status"], config=runtime,
+            )}, pricing_snapshot={},
             client_request_id=str(uuid.uuid4()), request_fingerprint=uuid.uuid4().hex,
             fingerprint_version=1, execution_protocol_version=2, status="running",
             lease_owner="worker#1", lease_fence=1, lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -1112,7 +1127,8 @@ async def lazy_chat_sandbox(pool, monkeypatch):
         return run_id
 
     try:
-        yield SimpleNamespace(factory=factory, create_run=create_run, project=project, pool=definition)
+        yield SimpleNamespace(factory=factory, create_run=create_run, project=project, pool=definition,
+                              config=runtime, pool_id=pool.id, manifest_file=manifest_file)
     finally:
         async with factory() as session, session.begin():
             resource_ids = list((await session.scalars(select(ChatRuntimeResource.id).where(

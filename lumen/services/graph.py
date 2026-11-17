@@ -1676,9 +1676,15 @@ async def stream(
     resume: dict[str, Any] | None = None,
     delegation_enabled: bool = False,
     sandbox_lease: tuple[str, int] | None = None,
+    sandbox_tools: list[dict[str, str]] | None = None,
     plugin_tool_snapshots: tuple[dict[str, Any], ...] = (),
 ) -> AsyncIterator[dict]:
     """Stream chat events while awaiting durable execution-boundary hooks."""
+    from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
+
+    selected_sandbox_tools = validate_selection(sandbox_tools or [])
+    if selected_sandbox_tools and (execution_protocol_version != 2 or not tools_enabled or sandbox_lease is None):
+        raise SandboxSelectionError("sandbox_tool_unavailable")
     params = {
         "model": model,
         "native_compaction": native_compaction_options,
@@ -1747,22 +1753,22 @@ async def stream(
 
             from lumen.config import get_settings
             from lumen.services.infrastructure.tool_manifest import ToolManifestError, load_tool_manifest
-
-            for pool in get_settings().runtime_config.pools:
-                if pool.enabled and pool.role == "sandbox" and pool.backend == "kubernetes":
-                    profiles = load_tool_manifest(pool.profile.tool_manifest_file, pool.profile.tool_manifest_sha256)
-                    for profile in profiles:
-                        for definition in profile.tools:
-                            if definition.name in params["v2_bindings"]:
-                                raise ToolManifestError()
-                            params["v2_bindings"][definition.name] = sandbox_binding.kubernetes_mcp_binding(
-                                ctx,
-                                lease_owner=sandbox_lease[0],
-                                fence=sandbox_lease[1],
-                                profile_id=profile.id,
-                                tool_def=definition,
-                                pool_name=pool.name,
-                            )
+            if selected_sandbox_tools:
+                selected = selected_sandbox_tools
+                pool = get_settings().runtime_config.pool(selected[0]["pool"])
+                names = {item["name"] for item in selected}
+                profiles = load_tool_manifest(pool.profile.tool_manifest_file, pool.profile.tool_manifest_sha256)
+                for profile in profiles:
+                    for definition in profile.tools:
+                        if definition.name not in names:
+                            continue
+                        if definition.name in params["v2_bindings"]:
+                            raise ToolManifestError()
+                        params["v2_bindings"][definition.name] = sandbox_binding.kubernetes_mcp_binding(
+                            ctx, lease_owner=sandbox_lease[0], fence=sandbox_lease[1],
+                            profile_id=profile.id, tool_def=definition, pool_name=pool.name,
+                            sandbox_tools=selected,
+                        )
     graph = _build_graph(params, ctx)
     config = {"configurable": {"thread_id": run_id}} if run_id else None
     graph_input: dict[str, list[dict]] | Command = (

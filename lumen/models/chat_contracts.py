@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter, field_validator, model_validator
 
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_PROVIDER_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -446,6 +446,10 @@ class ToolPolicy(_StrictModel):
     approval_mode: Literal["required_for_mutations", "always"] = "required_for_mutations"
     enabled_tool_ids: list[int] | None = Field(default=None, max_length=100)
     enabled_mcp_ids: list[int] | None = Field(default=None, max_length=100)
+    enabled_sandbox_tools: list[
+        Annotated[str, StringConstraints(strict=True, strip_whitespace=False, min_length=1, max_length=128,
+                                        pattern=r"^[A-Za-z][A-Za-z0-9_]{0,127}$")]
+    ] = Field(default_factory=list, max_length=100)
     workspace_write_mode: Literal["ask", "auto_edit"] = "ask"
 
     @field_validator("enabled_tool_ids", "enabled_mcp_ids")
@@ -456,6 +460,19 @@ class ToolPolicy(_StrictModel):
         if len(set(value)) != len(value) or any(item < 1 for item in value):
             raise ValueError("enabled extension IDs must be unique positive ids")
         return value
+
+    @field_validator("enabled_sandbox_tools")
+    @classmethod
+    def validate_sandbox_names(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("enabled sandbox tool names must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def validate_sandbox_mode(self) -> ToolPolicy:
+        if self.mode == "none" and self.enabled_sandbox_tools:
+            raise ValueError("sandbox tools require tool execution")
+        return self
 
 
 class ImageOutputOptions(_StrictModel):

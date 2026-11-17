@@ -869,11 +869,14 @@ class ResourceController:
         if observation.state.lower() == "absent":
             await store.mark_failed_with_cleanup(resource.id, resource.generation, self.owner, fence,
                                                  "resource_vanished")
-            await store.claim_operation(resource.id, resource.generation, "delete", self.owner, fence)
-            await self._prove_deleted(resource, definition, fence)
             if resource.run_id:
                 await lifecycle.fail_waiting_run(resource.run_id, error_code="resource_unavailable",
                                                  safe_message="Assigned resource is no longer available")
+            if resource.backend == "kubernetes":
+                await self._reconcile_delete(resource, definition, fence, provider)
+            else:
+                await store.claim_operation(resource.id, resource.generation, "delete", self.owner, fence)
+                await self._prove_deleted(resource, definition, fence)
             return
         if not await store.record_observation(resource.id, resource.generation, self.owner, fence, observation):
             return
@@ -951,4 +954,11 @@ class ResourceController:
         # Explicit per-resource GET absence, never an empty list, releases occupancy.
         observation = await self._cloud(provider.observe, ref)
         if observation.state.lower() == "absent":
+            if resource.backend == "kubernetes":
+                # Pod absence does not prove that its UID-bound Secret, policy and
+                # Service are gone. Complete that provider-owned cleanup under the
+                # current deletion fence before releasing durable occupancy.
+                result = await self._fenced_cloud(resource, fence, provider.delete, ref, action="delete")
+                if not result.absent:
+                    return
             await self._prove_deleted(resource, definition, fence)

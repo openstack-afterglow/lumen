@@ -309,6 +309,15 @@ async def _prepare_child_inputs(
     capability_snapshot["execution_policy"] = child_policy.model_dump(mode="json")
     capability_snapshot["direct_effects"] = sorted(direct_effects)
     capability_snapshot["execution_protocol_version"] = 2
+    from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
+
+    try:
+        sandbox_tools = validate_selection((parent.capability_snapshot or {}).get("sandbox_tools", []))
+    except SandboxSelectionError as exc:
+        raise ChildFailure(exc.code, "parent sandbox selection is no longer valid") from exc
+    if features.tool_policy.enabled_sandbox_tools != [item["name"] for item in sandbox_tools]:
+        raise ChildFailure("child_policy_denied", "child sandbox selection exceeds frozen parent authority")
+    capability_snapshot["sandbox_tools"] = sandbox_tools
     capability_snapshot["extensions"] = chat_admission._capability_extension_snapshot(extension_selection)
     if plugin_tool_snapshots or plugin_skill_snapshots:
         capability_snapshot["required_plugin_digest"] = get_registry().digest
@@ -548,6 +557,14 @@ async def prepare_delegations(
                 active_children += 1
                 pending_resources.append((child, call.sandbox_seconds))
             for child, seconds in pending_resources:
+                from lumen.services.sandbox_selection import SandboxSelectionError, selected_pool
+
+                try:
+                    pool_name = selected_pool((child.capability_snapshot or {}).get("sandbox_tools", []))
+                except SandboxSelectionError as exc:
+                    raise ChildFailure(exc.code, "child sandbox selection is no longer valid") from exc
+                if pool_name is not None:
+                    seconds = min(seconds, settings.runtime_config.pool(pool_name).max_lifetime_seconds)
                 allocation_deadline = _now() + timedelta(seconds=seconds)
                 if deadline is not None:
                     allocation_deadline = min(allocation_deadline, deadline)
@@ -558,6 +575,7 @@ async def prepare_delegations(
                         config=settings.runtime_config,
                         deadline_at=allocation_deadline,
                         order=order,
+                        pool_name=pool_name,
                     )
                 except infra_store.ResourceUnavailable as exc:
                     raise ChildFailure(exc.code, str(exc)) from exc

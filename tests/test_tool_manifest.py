@@ -18,6 +18,7 @@ from lumen.services.infrastructure.tool_manifest import (
     parse_tool_manifest,
     validate_worker_tool_manifests,
 )
+from lumen.services.sandbox_selection import SandboxSelectionError, freeze_selection
 
 
 @pytest.fixture
@@ -182,13 +183,16 @@ async def test_pinned_binding_rejects_execution_destination_drift(tmp_path, monk
     from lumen.services.tools import ToolContext
 
     data = _bytes(manifest)
+    (tmp_path / "tools.json").write_bytes(data)
     runtime = _sandbox_runtime(tmp_path / "tools.json", _pin(data))
     settings = SimpleNamespace(runtime_config=runtime)
     monkeypatch.setattr(sandbox_binding, "get_settings", lambda: settings)
+    monkeypatch.setattr("lumen.services.sandbox_selection.get_settings", lambda: settings)
     context = ToolContext(project_id="project", user_id="user", run_id="run", tool_call_id="call")
     definition = parse_tool_manifest(data, _pin(data))[0].tools[0]
     binding = sandbox_binding.kubernetes_mcp_binding(
         context, lease_owner="worker#1", fence=1, profile_id="playwright", tool_def=definition, pool_name="browser",
+        sandbox_tools=freeze_selection([definition.name], config=runtime),
     )
     revised = runtime.model_dump(mode="json")
     if change == "image":
@@ -382,6 +386,10 @@ async def test_graph_rejects_untrusted_or_ambiguous_pinned_tools(tmp_path, monke
     runtime = runtime.model_copy(update={"pools": pools})
     monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(runtime_config=runtime))
     monkeypatch.setattr(sandbox_binding, "get_settings", lambda: SimpleNamespace(runtime_config=runtime))
+    monkeypatch.setattr("lumen.services.sandbox_selection.get_settings",
+                        lambda: SimpleNamespace(runtime_config=runtime))
+    selection = [{"name": "browser_navigate", "pool": pool.name, "profile": "playwright",
+                  "image": pool.image, "pool_digest": pool.digest(), "manifest_sha256": pin}]
 
     async def bindings(_ctx):
         return {"browser_navigate": object()} if fault == "bound_name" else {}
@@ -393,9 +401,11 @@ async def test_graph_rejects_untrusted_or_ambiguous_pinned_tools(tmp_path, monke
         return [event async for event in graph.stream(
             model="test-model", messages=[], run_id="run", execution_protocol_version=2,
             sandbox_lease=("worker#1", 1),
+            sandbox_tools=selection,
         )]
 
-    with pytest.raises(ToolManifestError, match="^runtime_kubernetes_manifest$"):
+    expected_error = ToolManifestError if fault == "bound_name" else SandboxSelectionError
+    with pytest.raises(expected_error):
         await collect()
 
 
@@ -445,6 +455,8 @@ async def test_markitdown_binding_uses_existing_fenced_sandbox_dispatch(monkeypa
     path, data = _image_manifest()
     runtime = _sandbox_runtime(path, _pin(data))
     monkeypatch.setattr(sandbox_binding, "get_settings", lambda: SimpleNamespace(runtime_config=runtime))
+    monkeypatch.setattr("lumen.services.sandbox_selection.get_settings",
+                        lambda: SimpleNamespace(runtime_config=runtime))
     context = ToolContext(project_id="project", user_id="user", run_id="run", tool_call_id="call")
     definition = load_tool_manifest(path, _pin(data))[2].tools[0]
     calls = []
@@ -459,6 +471,7 @@ async def test_markitdown_binding_uses_existing_fenced_sandbox_dispatch(monkeypa
     monkeypatch.setattr(sandbox_binding, "execute_mcp_in_sandbox", dispatch)
     binding = sandbox_binding.kubernetes_mcp_binding(
         context, lease_owner="worker#1", fence=7, profile_id="markitdown", tool_def=definition, pool_name="browser",
+        sandbox_tools=freeze_selection([definition.name], config=runtime),
     )
     assert binding.definition.effect == "external_mutation"
     assert binding.config_fingerprint
@@ -482,6 +495,8 @@ async def test_graph_rejects_markitdown_binding_name_collision(monkeypatch):
     runtime = _sandbox_runtime(path, _pin(data))
     monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(runtime_config=runtime))
     monkeypatch.setattr(sandbox_binding, "get_settings", lambda: SimpleNamespace(runtime_config=runtime))
+    monkeypatch.setattr("lumen.services.sandbox_selection.get_settings",
+                        lambda: SimpleNamespace(runtime_config=runtime))
 
     async def bindings(_ctx):
         return {"convert_to_markdown": object()}
@@ -491,5 +506,6 @@ async def test_graph_rejects_markitdown_binding_name_collision(monkeypatch):
         async for _event in graph.stream(
             model="test-model", messages=[], run_id="run", execution_protocol_version=2,
             sandbox_lease=("worker#1", 1),
+            sandbox_tools=freeze_selection(["convert_to_markdown"], config=runtime),
         ):
             pass
