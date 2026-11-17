@@ -6,7 +6,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: package/runtime/lock/Kolla image default `0.6.17`은 통합 검증 중인 미발행 후보이다. 직전 운영 버전은 `0.6.16`이며 immutable tag와 배포 기록은 CHANGELOG의 해당 절에 보존한다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 새 schema 033과 034는 서비스 전환 전에 적용해야 하며 새 writer와 기존 writer의 혼합 실행을 승인하지 않는다.
+- 버전: package/runtime/lock/Kolla image default `0.6.17`은 불변 tag `0.6.17`(`c5b020be`)로 발행되어 2026-11-17 UTC에 DMS Lab 운영에 배포됐다(033·034 적용, 관리형 ClamAV, protocol 2; 수신증은 `docs/testing.md`). 직전 운영 버전은 `0.6.16`이며 immutable tag와 배포 기록은 CHANGELOG의 해당 절에 보존한다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. Schema 033과 034는 서비스 전환 전에 적용해야 하며 새 writer와 기존 writer의 혼합 실행을 승인하지 않는다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
@@ -585,8 +585,8 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 {
   "schema_version": 1,
   "source_sha256": "c9c18c6b2565d97f7ba5ea65ba3bbbdd932b1784277a9062ec4e35ab354ad325",
-  "reviewed_at": "2026-11-17T19:48:20Z",
-  "summary": "0.6.17 candidate: MCP domain connections, selected sandbox lifecycle and credential renewal, managed ClamAV, chat work log, realtime transcription, native provider catalog with compatible APIs, OpenAI Decisions with stateless holds (033+034), controller READ COMMITTED pool locking reviewed"
+  "reviewed_at": "2026-11-17T20:57:32Z",
+  "summary": "0.6.17 published and deployed (033+034, managed ClamAV, protocol v2); rollout receipts and OpenSpec archive"
 }
 ```
 <!-- architecture-review:end -->

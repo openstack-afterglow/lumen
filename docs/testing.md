@@ -1,5 +1,17 @@
 # 테스트
 
+## 0.6.17 production rollout and smoke (2026-11-17 UTC / 2026-11-18 KST)
+
+Deployed tag `0.6.17` (`c5b020be`) to the three DMS Lab controllers with `--skip-tags haproxy` after a drained cutover (59 runs terminal, 0 holds) and an encrypted backup. Observed after rollout: API/worker on the pinned digests, `lumen.__version__` 0.6.17, `chat_execution_protocol_version` 2 on every API and worker, restarts 0, migrate status rc0, direct `/v1/ready` 200 on each host, public `https://lumen.dmslab.re.kr` health/ready/openapi 200, `lumen_clamav` healthy and listening only on `127.0.0.1:3310` (VERSION `ClamAV 1.4.6/28186`). The full container census changed only `lumen_api`/`lumen_worker` (replaced) and `lumen_clamav` (added) per controller; haproxy/proxysql/keepalived, the VIP and protected-setting hashes were unchanged.
+
+Production smoke with disposable API keys (revoked afterwards, 401 confirmed):
+- Protocol v2 durable run: `/v1/temp-completions` on `gemini/gemini-3.5-flash-lite` (tools and memory off) was claimed by worker .12 and `completed`; one `priced` usage row (8/1 tokens, raw `$0.0000049`, catalog price), zero open reservations. An earlier attempt failed with `inference_authority_revoked` because the key lacked `native:runs:read`, the poll ended on 403 and the key was revoked mid-run; it recorded no usage (correct fail-closed behavior, test-design error).
+- Media pipeline: a 1x1 PNG uploaded directly to each API host returned status `clean` (ClamAV INSTREAM `OK`), matching SHA-256 and download bytes; the three assets were deleted.
+- OpenAI: `gpt-6-luna` compat chat returned 502 and `/v1/decisions` 429. A direct provider probe showed `GET /models` 200 but `POST /responses` 429 `insufficient_quota`/`credit_balance_exhausted`. The Decisions stateless hold was `released`. OpenAI image/realtime/Decisions paid smoke is blocked until the account is funded; no embedding model is registered. Total paid spend about `$0.000005`.
+- Operator edits: models 119/122 (`gpt-realtime-whisper`, `gpt-live-transcribe`) re-kinded `stt`→`realtime` with the stale manual price cleared; effective catalog `realtime_input_per_minute` 0.017; left inactive. Featured MCP install: 4 created, 2 skipped (sandbox-managed), 0 failed.
+
+Not verified: a human-session BFF chat run (Chrome relay extension not connected), OpenAI provider calls, embeddings, managed sandbox tools (runtime remains off).
+
 ## 0.6.17 integrated candidate (2026-11-18, source/local + synthetic)
 
 Integration branch `feat/dashboard-consolidate` (`b90eb129`). `test-passed` on the integrated tree with `__pycache__` cleared: `uv run --frozen lumen-test contract` 7,946 service + 145 SDK passed, Ruff clean on both; `lumen-test integration` 735 passed / 4 skipped and `lumen-test system` 38 passed (both on `44abab8`, before the final one-line Sonar scope fix `0988a2fb`, which only the contract lane re-covered). Each layer used a unique compose project and was torn down.
