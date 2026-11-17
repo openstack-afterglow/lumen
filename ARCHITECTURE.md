@@ -584,9 +584,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6778f1a93698a8078e30105a4e6fe6d57f466238ae9be4e18d3d31e3abd33330",
-  "reviewed_at": "2026-11-17T19:13:05Z",
-  "summary": "0.6.17 candidate: MCP domain connections, selected sandbox lifecycle and credential renewal, managed ClamAV, chat work log, realtime transcription, native provider catalog with compatible APIs, OpenAI Decisions with stateless holds (033+034) reviewed"
+  "source_sha256": "53b857920d48bdfcbe9198709bd48aed271faafec73e851783597c8309f27dac",
+  "reviewed_at": "2026-11-17T19:41:16Z",
+  "summary": "0.6.17 candidate: MCP domain connections, selected sandbox lifecycle and credential renewal, managed ClamAV, chat work log, realtime transcription, native provider catalog with compatible APIs, OpenAI Decisions with stateless holds (033+034), controller READ COMMITTED pool locking reviewed"
 }
 ```
 <!-- architecture-review:end -->
