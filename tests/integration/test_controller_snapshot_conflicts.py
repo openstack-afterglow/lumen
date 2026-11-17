@@ -126,3 +126,70 @@ async def test_fenced_cloud_reads_committed_before_concurrent_pool_renewal(owned
         if not renewal.done():
             renewal.cancel()
         await asyncio.gather(renewal, return_exceptions=True)
+
+
+async def _ready_api_effect(fixture):
+    async with fixture.factory() as session, session.begin():
+        pool = await session.get(ChatRuntimePool, fixture.pool.id)
+        resource = await session.get(ChatRuntimeResource, fixture.resource.id)
+        pool.role, resource.role, resource.observed_state = "api", "api", "ready"
+
+
+async def test_mark_api_unavailable_reads_committed_across_pool_renewal(owned_effect, monkeypatch):
+    f = owned_effect
+    await _ready_api_effect(f)
+    original_execute = AsyncSession.execute
+    lookup = str(select(ChatRuntimeResource.pool_id).where(
+        ChatRuntimeResource.id == f.resource.id,
+    ).compile(compile_kwargs={"literal_binds": True}))
+    renewed = False
+
+    async def execute(session, statement, *args, **kwargs):
+        nonlocal renewed
+        sql = str(statement.compile(compile_kwargs={"literal_binds": True})) if isinstance(statement, Select) else None
+        if not renewed and sql == lookup:
+            renewed = True
+            result = await original_execute(session, statement, *args, **kwargs)
+            connection = await session.connection()
+            assert await connection.get_isolation_level() == "READ COMMITTED"
+            assert await store.renew_pool_lease(f.pool.id, f.controller.owner, f.fence, 300)
+            return result
+        return await original_execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", execute)
+    assert await store.mark_api_unavailable(f.resource.id, f.resource.generation, f.controller.owner, f.fence)
+    assert renewed
+    async with f.factory() as session:
+        resource = await session.get(ChatRuntimeResource, f.resource.id)
+        assert resource.observed_state == "unavailable" and resource.failure_code is None
+
+
+@pytest.mark.parametrize("code", [1020, 1205, 1213])
+async def test_mark_api_unavailable_retries_fresh_sql_transaction(owned_effect, monkeypatch, code):
+    from pymysql.err import OperationalError as MariaDBOperationalError
+    from sqlalchemy.exc import OperationalError
+
+    f = owned_effect
+    await _ready_api_effect(f)
+    original_lock = store._locked_resource
+    sessions = []
+
+    async def lock(session, *args, **kwargs):
+        connection = await session.connection()
+        assert await connection.get_isolation_level() == "READ COMMITTED"
+        sessions.append(session)
+        resource, pool = await original_lock(session, *args, **kwargs)
+        if len(sessions) == 1:
+            resource.failure_code = "must-rollback"
+            await session.flush()
+            raise OperationalError("synthetic pool lock conflict", {}, MariaDBOperationalError(code, "synthetic"))
+        assert resource.failure_code is None
+        return resource, pool
+
+    monkeypatch.setattr(store, "_locked_resource", lock)
+    assert await store.mark_api_unavailable(f.resource.id, f.resource.generation, f.controller.owner, f.fence)
+    assert len(sessions) == 2 and sessions[0] is not sessions[1]
+    assert all(not session.in_transaction() for session in sessions)
+    async with f.factory() as session:
+        resource = await session.get(ChatRuntimeResource, f.resource.id)
+        assert resource.observed_state == "unavailable" and resource.failure_code is None

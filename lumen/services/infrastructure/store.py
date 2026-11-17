@@ -897,13 +897,17 @@ async def record_api_load(resource_id: str, generation: int, owner: str, fence: 
 
 
 async def mark_api_unavailable(resource_id: str, generation: int, owner: str, fence: int) -> bool:
-    async with _factory()() as session, session.begin():
-        resource, pool = await _locked_resource(session, resource_id, generation)
-        if (not resource or not _owns(pool, owner, fence) or resource.role != "api"
-                or resource.observed_state != "ready" or resource.desired_state == "deleting"):
-            return False
-        resource.observed_state = "unavailable"
-        return True
+    async def transaction():
+        async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            resource, pool = await _locked_resource(session, resource_id, generation)
+            if (not resource or not _owns(pool, owner, fence) or resource.role != "api"
+                    or resource.observed_state != "ready" or resource.desired_state == "deleting"):
+                return False
+            resource.observed_state = "unavailable"
+            return True
+
+    return await retry_deadlocks(transaction)
 
 
 async def wake_ready_runs(resource_id: str) -> list[str]:
