@@ -711,15 +711,15 @@ def test_native_transcription_requires_current_audio_permission_and_valid_kind(m
     app = FastAPI()
     app.include_router(native_api.router, prefix="/v1")
     principal = {"user_id": "owner", "project_id": "project", "auth_type": "keystone",
-                 "source": "web", "roles": ["member"], "is_system_admin": False}
+                 "source": "web", "roles": ["reader"], "is_system_admin": False}
     app.dependency_overrides[get_principal] = lambda: principal
-    admitted = AsyncMock()
+    admitted = AsyncMock(return_value={"session_id": str(uuid4())})
     monkeypatch.setattr(native_api, "admit_realtime_session", admitted)
     with TestClient(app) as client:
         response = client.post("/v1/chat/realtime/sessions", json={"model_id": "selected", "kind": "transcription"},
             headers={"Idempotency-Key": str(uuid4())})
         assert response.status_code == 403
-        principal["roles"].append("lumen-audio_user")
+        principal["roles"] = ["member"]
         for kind in ("translation", "live", "", None):
             response = client.post("/v1/chat/realtime/sessions", json={"model_id": "selected", "kind": kind},
                 headers={"Idempotency-Key": str(uuid4())})
