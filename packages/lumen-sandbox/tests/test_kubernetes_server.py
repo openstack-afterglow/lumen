@@ -3,7 +3,9 @@
 import asyncio
 import base64
 import hashlib
+import importlib.util
 import json
+import os
 import signal
 import sys
 import time
@@ -193,6 +195,103 @@ def test_manifest_validation(tmp_path: Path):
     bad_path.write_bytes(bad_raw)
     with pytest.raises(PreflightError, match="command binary must be absolute"):
         load_manifest(bad_path, hashlib.sha256(bad_raw).hexdigest())
+
+
+def test_baked_manifest_has_markitdown_with_exact_approved_effect():
+    path = Path(__file__).resolve().parents[1] / "tools/manifest.json"
+    sha = "3055fcb865df3696a055019da9492f2dff00e4e1c072b64c5555b7100409992c"
+    profiles = load_manifest(path, sha)
+    assert list(profiles) == ["playwright", "filesystem", "markitdown"]
+    profile = profiles["markitdown"]
+    assert profile.command == (
+        "/opt/lumen-tools/markitdown/bin/python", "-I", "/opt/lumen-tools/markitdown_server.py",
+    )
+    assert len(profile.tools) == 1
+    tool = profile.tool("convert_to_markdown")
+    assert tool is not None
+    assert tool.effect == "external_mutation"
+    assert tool.input_schema == {
+        "properties": {"uri": {"title": "Uri", "type": "string"}},
+        "required": ["uri"], "type": "object", "title": "convert_to_markdownArguments",
+    }
+
+
+@pytest.mark.parametrize("fault", ["duplicate_profile", "cross_profile_name", "effect", "effect_type"])
+def test_markitdown_manifest_rejects_ambiguous_names_and_invalid_effect(tmp_path, fault):
+    source = Path(__file__).resolve().parents[1] / "tools/manifest.json"
+    data = json.loads(source.read_bytes())
+    profile = data["profiles"][2]
+    if fault == "duplicate_profile":
+        profile["id"] = "playwright"
+    elif fault == "cross_profile_name":
+        profile["tools"][0]["name"] = data["profiles"][0]["tools"][0]["name"]
+    else:
+        profile["tools"][0]["effect"] = "egress" if fault == "effect" else {}
+    raw = json.dumps(data).encode()
+    path = tmp_path / "manifest.json"
+    path.write_bytes(raw)
+    with pytest.raises(PreflightError, match="duplicate|invalid tool effect"):
+        load_manifest(path, hashlib.sha256(raw).hexdigest())
+
+
+@pytest.fixture
+def markitdown_launcher(tmp_path, monkeypatch):
+    path = Path(__file__).resolve().parents[1] / "tools/markitdown_server.py"
+    spec = importlib.util.spec_from_file_location("markitdown_sandbox_launcher", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    monkeypatch.setattr(module, "WORKSPACE", str(workspace))
+    return module, workspace
+
+
+def test_markitdown_local_read_uses_open_workspace_descriptor(markitdown_launcher):
+    launcher, workspace = markitdown_launcher
+    path = workspace / "document with spaces.html"
+    path.write_bytes(b"<h1>Local document</h1>")
+    with launcher.workspace_file(path.as_uri()) as (stream, extension):
+        assert stream.read() == b"<h1>Local document</h1>"
+        assert extension == ".html"
+    assert stream.closed
+
+
+@pytest.mark.parametrize("fault", [
+    "outside", "encoded_traversal", "file_symlink", "directory_symlink", "workspace_symlink",
+    "directory", "fifo", "authority", "query", "fragment", "non_file",
+])
+def test_markitdown_local_read_cannot_escape_workspace(markitdown_launcher, tmp_path, fault):
+    launcher, workspace = markitdown_launcher
+    secret = tmp_path / "secret.html"
+    secret.write_text("outside workspace")
+    uri = (workspace / "document.html").as_uri()
+    if fault == "outside":
+        uri = secret.as_uri()
+    elif fault == "encoded_traversal":
+        uri = workspace.as_uri() + "/%2e%2e/secret.html"
+    elif fault == "file_symlink":
+        link = workspace / "document.html"
+        link.symlink_to(secret)
+    elif fault == "directory_symlink":
+        (workspace / "linked").symlink_to(tmp_path, target_is_directory=True)
+        uri = (workspace / "linked/secret.html").as_uri()
+    elif fault == "workspace_symlink":
+        workspace.rmdir()
+        workspace.symlink_to(tmp_path, target_is_directory=True)
+    elif fault == "directory":
+        uri = workspace.as_uri()
+    elif fault == "fifo":
+        os.mkfifo(workspace / "document.html")
+    elif fault == "authority":
+        uri = "file://localhost" + str(workspace / "document.html")
+    elif fault == "query":
+        uri += "?path=/etc/passwd"
+    elif fault == "fragment":
+        uri += "#/etc/passwd"
+    else:
+        uri = "https://example.com"
+    with pytest.raises((ValueError, OSError)), launcher.workspace_file(uri):
+        pytest.fail("escaped local file must never be opened")
 
 
 def auth_header(config: SandboxConfig, method: str, path: str, body: dict | None = None, fence: int = 1) -> str:

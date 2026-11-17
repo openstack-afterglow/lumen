@@ -433,7 +433,10 @@ async def _resolve_extension_selection(
         try:
             visible = await es.list_for_user(kind, user_id=user_id, project_id=project_id, active_only=True)
             if selected_ids is None:
-                selected_ids = [item["id"] for item in visible if isinstance(item.get("id"), int)]
+                selected_ids = [
+                    item["id"] for item in visible
+                    if isinstance(item.get("id"), int) and (kind != "mcp" or item.get("implicit_selection", True))
+                ]
             credential_versions = (
                 await es.mcp_credential_versions(selected_ids, user_id=user_id, project_id=project_id)
                 if kind == "mcp"

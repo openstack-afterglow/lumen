@@ -88,12 +88,13 @@ def load_manifest(path: Path, expected_sha256: str) -> dict[str, ProfileDefiniti
         raise PreflightError("manifest invalid structure")
 
     profiles: dict[str, ProfileDefinition] = {}
+    manifest_tool_names: set[str] = set()
     for p in data["profiles"]:
         if not isinstance(p, dict):
             raise PreflightError("invalid profile item")
         pid = p.get("id")
-        if not isinstance(pid, str) or not _PROFILE_ID.fullmatch(pid):
-            raise PreflightError("invalid profile id")
+        if not isinstance(pid, str) or not _PROFILE_ID.fullmatch(pid) or pid in profiles:
+            raise PreflightError("invalid or duplicate profile id")
         cmd = p.get("command")
         if not isinstance(cmd, list) or not cmd or not all(isinstance(c, str) and c for c in cmd):
             raise PreflightError("invalid profile command")
@@ -108,14 +109,18 @@ def load_manifest(path: Path, expected_sha256: str) -> dict[str, ProfileDefiniti
             if not isinstance(t, dict):
                 raise PreflightError("invalid tool item")
             tname = t.get("name")
-            if not isinstance(tname, str) or not 0 < len(tname) <= 128 or tname in tool_names:
+            if (not isinstance(tname, str) or not 0 < len(tname) <= 128
+                    or tname in tool_names or tname in manifest_tool_names):
                 raise PreflightError("invalid or duplicate tool name")
             tool_names.add(tname)
+            manifest_tool_names.add(tname)
             tdesc = str(t.get("description", ""))
             tschema = t.get("input_schema")
             if not isinstance(tschema, dict):
                 raise PreflightError("tool input_schema must be dict")
             teffect = t.get("effect", "external_mutation")
+            if not isinstance(teffect, str) or teffect not in {"read", "workspace_write", "process", "external_mutation"}:
+                raise PreflightError("invalid tool effect")
             parsed_tools.append(ToolDefinition(tname, tdesc, tschema, teffect))
         raw_env = p.get("environment") or {}
         if not isinstance(raw_env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in raw_env.items()):

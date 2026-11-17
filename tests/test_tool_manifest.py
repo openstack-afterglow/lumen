@@ -397,3 +397,99 @@ async def test_graph_rejects_untrusted_or_ambiguous_pinned_tools(tmp_path, monke
 
     with pytest.raises(ToolManifestError, match="^runtime_kubernetes_manifest$"):
         await collect()
+
+
+def _image_manifest():
+    path = Path(__file__).resolve().parents[1] / "packages/lumen-sandbox/tools/manifest.json"
+    return path, path.read_bytes()
+
+
+def test_image_manifest_pins_three_profiles_and_markitdown_schema():
+    path, data = _image_manifest()
+    assert _pin(data) == "3055fcb865df3696a055019da9492f2dff00e4e1c072b64c5555b7100409992c"
+    profiles = load_tool_manifest(path, _pin(data))
+    assert [profile.id for profile in profiles] == ["playwright", "filesystem", "markitdown"]
+    profile = profiles[2]
+    assert profile.command == (
+        "/opt/lumen-tools/markitdown/bin/python", "-I", "/opt/lumen-tools/markitdown_server.py",
+    )
+    assert profile.environment["MARKITDOWN_ENABLE_PLUGINS"] == "false"
+    assert len(profile.tools) == 1
+    definition = profile.tools[0]
+    assert definition.name == "convert_to_markdown"
+    assert definition.description == "Convert a resource described by an http:, https:, file: or data: URI to markdown"
+    assert definition.effect == "external_mutation"
+    assert definition.source == "workspace"
+    assert _pin(json.dumps(definition.input_schema, sort_keys=True, separators=(",", ":")).encode()) == (
+        "ea4528d50c66f089b232b2a5cc831bf62f86ae01a71bdc8d2537dfca4e3235e6"
+    )
+    definition.validate_arguments({"uri": "file:///work/document.html"})
+    with pytest.raises(ValueError):
+        definition.validate_arguments({"uri": 1})
+
+
+def test_markitdown_name_collision_fails_closed():
+    _, data = _image_manifest()
+    manifest = json.loads(data)
+    manifest["profiles"][0]["tools"].append(copy.deepcopy(manifest["profiles"][2]["tools"][0]))
+    collision = _bytes(manifest)
+    with pytest.raises(ToolManifestError):
+        parse_tool_manifest(collision, _pin(collision))
+
+
+@pytest.mark.asyncio
+async def test_markitdown_binding_uses_existing_fenced_sandbox_dispatch(monkeypatch):
+    from lumen.services import sandbox_binding
+    from lumen.services.tools import ToolContext
+
+    path, data = _image_manifest()
+    runtime = _sandbox_runtime(path, _pin(data))
+    monkeypatch.setattr(sandbox_binding, "get_settings", lambda: SimpleNamespace(runtime_config=runtime))
+    context = ToolContext(project_id="project", user_id="user", run_id="run", tool_call_id="call")
+    definition = load_tool_manifest(path, _pin(data))[2].tools[0]
+    calls = []
+
+    async def dispatch(**kwargs):
+        calls.append(kwargs)
+        return {"state": "succeeded", "mcp_result": {
+            "content": [{"type": "text", "text": "# Converted document"}], "isError": False,
+            "structuredContent": {"result": "# Converted document"},
+        }}
+
+    monkeypatch.setattr(sandbox_binding, "execute_mcp_in_sandbox", dispatch)
+    binding = sandbox_binding.kubernetes_mcp_binding(
+        context, lease_owner="worker#1", fence=7, profile_id="markitdown", tool_def=definition, pool_name="browser",
+    )
+    assert binding.definition.effect == "external_mutation"
+    assert binding.config_fingerprint
+    result = await binding.execute({"uri": "https://example.com"}, context)
+    assert result.status == "completed"
+    # Real upstream MCP 2.x returns both representations; shared projection retains both.
+    assert result.model_content == '# Converted document\n{"result": "# Converted document"}'
+    assert calls == [{
+        "run_id": "run", "lease_owner": "worker#1", "call_id": "call", "fence": 7,
+        "profile": "markitdown", "tool": "convert_to_markdown",
+        "arguments": {"uri": "https://example.com"}, "timeout_seconds": 60, "pool_name": "browser",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_graph_rejects_markitdown_binding_name_collision(monkeypatch):
+    from lumen import config
+    from lumen.services import graph, sandbox_binding
+
+    path, data = _image_manifest()
+    runtime = _sandbox_runtime(path, _pin(data))
+    monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(runtime_config=runtime))
+    monkeypatch.setattr(sandbox_binding, "get_settings", lambda: SimpleNamespace(runtime_config=runtime))
+
+    async def bindings(_ctx):
+        return {"convert_to_markdown": object()}
+
+    monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
+    with pytest.raises(ToolManifestError, match="^runtime_kubernetes_manifest$"):
+        async for _event in graph.stream(
+            model="test-model", messages=[], run_id="run", execution_protocol_version=2,
+            sandbox_lease=("worker#1", 1),
+        ):
+            pass

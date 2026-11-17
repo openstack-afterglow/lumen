@@ -114,6 +114,8 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
             logger.info("MCP 서버 %s: 실행 중 인증 값이 변경되었거나 폐기됨 — 노출 스킵", server_id)
             continue
         usable.append(server)
+    if ctx.selected_mcp_ids is None:
+        usable = [server for server in usable if server.get("implicit_selection", True)]
     return _frozen_selection(_selected(usable, ctx.selected_mcp_ids), ctx, "mcp")
 
 

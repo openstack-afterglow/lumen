@@ -17,13 +17,18 @@ from lumen.services import mcp_connections
 from lumen.services.mcp_registry_model import (
     ACCESS_CONFIGURE,
     ACCESS_CREDENTIALS,
+    ACCESS_MANAGED,
     ACCESS_OAUTH,
     ACCESS_OPEN,
+    ACCESS_UNAVAILABLE,
     ACCESS_UNREACHABLE,
     AUTH_MODES,
     BULK_ACCESS,
     McpRegistryError,
     McpRegistryNotFound,
+    coverage_counts,
+    normalized_url,
+    safe_catalog_url,
 )
 
 CATALOG_PATH = Path(__file__).with_name("mcp_registry_catalog.json")
@@ -41,6 +46,18 @@ def _load() -> tuple[dict[str, Any], ...]:
 
 def entries() -> list[dict[str, Any]]:
     return [dict(item) for item in _load()]
+
+
+def coverage() -> dict[str, Any]:
+    """Return complete registry coverage without exposing source payloads or credentials."""
+    document = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+    return {
+        "source_url": document.get("source_url", "https://api.mcp.github.com/v0/servers"),
+        "auth_observation": document.get("auth_observation"),
+        "header_metadata_source_url": document.get("header_metadata_source_url"),
+        "header_metadata": document.get("header_metadata", {}),
+        **coverage_counts(list(_load()), int(document["registry_total"])),
+    }
 
 
 def entry(entry_id: str) -> dict[str, Any]:
@@ -62,9 +79,11 @@ def _fill_url(candidate: dict[str, Any], variables: dict[str, str] | None) -> st
     url = candidate["url"]
     for name in required:
         value = str(provided[name]).strip()
-        if any(ch.isspace() or ch in "{}/?#@" or ord(ch) < 32 for ch in value):
+        if any(ch.isspace() or ch in "{}/?#@:%&=+\\" or ord(ch) < 32 for ch in value):
             raise McpRegistryError(f"URL 변수 {name} 에 사용할 수 없는 문자가 있습니다")
         url = url.replace("{" + name + "}", value)
+    if not safe_catalog_url(url, templates=False):
+        raise McpRegistryError("공개 HTTPS URL만 사용할 수 있으며 인증 정보가 포함된 URL은 허용하지 않습니다")
     return url
 
 
@@ -100,22 +119,25 @@ async def install(
 ) -> dict[str, Any]:
     """Create one connection of a template, or return the matching existing one unchanged.
 
-    ``auth_mode`` is required for ``configure`` entries and must match the derived mode for every other entry.
-    ``headers`` is accepted only with ``admin`` mode. ``label`` distinguishes several connections of one template.
+    ``auth_mode`` is required for ``configure`` entries and defaults to the probe-derived mode for every other entry.
+    An entry that declares header hints also accepts ``admin`` with ``headers``, so an administrator can supply an
+    optional key. ``label`` distinguishes several connections of one template.
     """
     candidate = entry(entry_id)
     access = candidate["access"]
-    if access == ACCESS_UNREACHABLE:
-        raise McpRegistryError("이 서버는 인증 없이 MCP 응답을 확인하지 못해 설치할 수 없습니다")
+    if access == ACCESS_MANAGED:
+        raise McpRegistryError(f"이 항목은 Lumen 샌드박스가 실행하는 관리형 도구({candidate['managed_profile']})라 연결을 만들지 않습니다")
+    if access in (ACCESS_UNREACHABLE, ACCESS_UNAVAILABLE):
+        raise McpRegistryError(f"이 서버는 설치할 수 없습니다: {candidate.get('unavailable_reason') or access}")
     if access == ACCESS_CONFIGURE:
         if auth_mode not in AUTH_MODES:
             raise McpRegistryError("URL 템플릿 서버는 auth_mode(none|oauth|admin) 를 지정해야 합니다")
         mode = auth_mode
     else:
         derived = _CONCRETE_AUTH[access]
-        if auth_mode is not None and auth_mode != derived:
+        if auth_mode is not None and auth_mode != derived and not (auth_mode == "admin" and candidate["header_hints"]):
             raise McpRegistryError(f"이 서버의 auth_mode 는 {derived} 입니다")
-        mode = derived
+        mode = auth_mode or derived
     url = _fill_url(candidate, variables)
     return await mcp_connections.create_connection(
         name=candidate["name"],
@@ -126,24 +148,40 @@ async def install(
         template_key=entry_id,
         default_label=candidate["name"],
         label=label,
+        implicit_selection=False,
     )
 
 
 async def install_all() -> dict[str, Any]:
-    """Create one default connection for every entry that needs no administrator-supplied value.
+    """Publish every credential-free template; publication never selects it for an owner."""
+    return await _install_many(featured_only=False)
 
-    Entries needing a URL variable or a credential, and unreachable entries, are reported as skipped with their
-    access state. A repeat run reports existing connections and creates nothing.
-    """
+
+async def install_featured() -> dict[str, Any]:
+    """Publish curated usable templates without supplying credentials or owner consent."""
+    return await _install_many(featured_only=True)
+
+
+async def _install_many(*, featured_only: bool) -> dict[str, Any]:
+    """Reuse the single-install idempotency boundary and report configuration requirements."""
     created: list[str] = []
     existing: list[str] = []
     skipped: list[dict[str, str]] = []
     failed: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
     for candidate in _load():
+        if featured_only and not candidate.get("featured"):
+            continue
         identity = {"id": candidate["id"], "name": candidate["registry_name"]}
         if candidate["access"] not in BULK_ACCESS:
-            skipped.append({**identity, "reason": candidate["access"]})
+            skipped.append({**identity, "reason": candidate.get("unavailable_reason") or candidate["access"]})
             continue
+        # Template installs match existing rows only by (template, label): one endpoint must not become two rows.
+        endpoint = normalized_url(candidate["url"])
+        if endpoint in seen_urls:
+            skipped.append({**identity, "reason": "duplicate_endpoint"})
+            continue
+        seen_urls.add(endpoint)
         try:
             result = await install(candidate["id"])
         except ValueError as exc:

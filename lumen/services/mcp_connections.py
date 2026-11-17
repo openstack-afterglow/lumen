@@ -98,6 +98,7 @@ async def create_connection(
     default_label: str | None = None,
     label: str | None = None,
     load_policy: str = "on_demand",
+    implicit_selection: bool = True,
 ) -> dict[str, Any]:
     """Create one global connection, or return the matching existing one unchanged."""
     if transport not in TRANSPORTS:
@@ -126,6 +127,7 @@ async def create_connection(
         "is_active": True,
         "template_key": template_key,
         "connection_label": resolved_label,
+        "implicit_selection": implicit_selection,
     }
     if headers:
         fields["headers"] = dict(headers)

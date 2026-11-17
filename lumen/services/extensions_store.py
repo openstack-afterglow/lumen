@@ -125,6 +125,10 @@ def _public_mcp(row: ChatMcpServer) -> dict:
     return {
         "id": row.id,
         "scope": row.scope,
+        "owner_domain_id": getattr(row, "owner_domain_id", None),
+        "owner_user_id": getattr(row, "owner_user_id", None),
+        "owner_project_id": getattr(row, "owner_project_id", None),
+        "implicit_selection": bool(getattr(row, "implicit_selection", True)),
         "name": row.name,
         "transport": row.transport,
         "url": row.url,
@@ -152,11 +156,17 @@ def _reveal_mcp(row: ChatMcpServer) -> dict:
     auth_mode = _mcp_auth_mode(row)
     return {
         "id": row.id,
+        "scope": row.scope,
+        "owner_domain_id": getattr(row, "owner_domain_id", None),
+        "implicit_selection": bool(getattr(row, "implicit_selection", True)),
         "name": row.name,
         "transport": row.transport,
         "url": row.url,
         "headers": _decrypt_headers(row, fail_closed=True)
-        if auth_mode == "admin" and getattr(row, "scope", None) == "global" and bool(row.encrypted_headers)
+        if auth_mode == "admin" and (
+            getattr(row, "scope", None) in {"global", "domain"}
+            or (getattr(row, "scope", None) == "user" and bool(getattr(row, "template_key", None)))
+        ) and bool(row.encrypted_headers)
         else {},
         "auth_mode": auth_mode,
         "oauth_scopes": _clean_oauth_scopes(getattr(row, "oauth_scopes", None)),
@@ -228,6 +238,8 @@ def selection_fingerprint(item: dict) -> str:
             "load_policy",
         )
     }
+    if item.get("scope") == "domain":
+        material["owner_domain_id"] = item.get("owner_domain_id")
     if item.get("activation_generation"):
         material["activation_generation"] = item["activation_generation"]
     return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -259,6 +271,15 @@ async def mcp_credential_versions(
                     )
                 ).scalars()
             }
+            for server in servers.values():
+                if server.scope == "domain" and server.auth_mode == "oauth":
+                    await _domain_access(user_id, project_id, server.owner_domain_id)
+                    connection = (await session.execute(select(ChatMcpOAuthConnection).where(
+                        ChatMcpOAuthConnection.mcp_server_id == server.id,
+                        ChatMcpOAuthConnection.owner_user_id == server.owner_domain_id,
+                        ChatMcpOAuthConnection.owner_project_id == server.owner_domain_id,
+                    ))).scalar_one_or_none()
+                    oauth[server.id] = connection
             return {
                 server_id: (
                     connection.credential_version
@@ -526,6 +547,8 @@ def _mcp_effectively_active(row: ChatMcpServer, activation: ChatMcpActivation | 
 
 
 def _mcp_connected(row: ChatMcpServer, connection: ChatMcpOAuthConnection | None) -> bool:
+    if _mcp_auth_mode(row) == "admin":
+        return bool(row.encrypted_headers)
     return _mcp_auth_mode(row) != "oauth" or bool(
         connection and connection.status == "active" and connection.encrypted_tokens
         and connection.server_config_version == row.config_version
@@ -536,7 +559,7 @@ def _activation_metadata(row: ChatMcpServer, activation: ChatMcpActivation | Non
     return {
         "is_active": _mcp_effectively_active(row, activation),
         "server_is_active": bool(row.is_active),
-        "activation_is_active": bool(activation and activation.is_active) if row.scope == "global" else bool(row.is_active),
+        "activation_is_active": bool(activation and activation.is_active) if row.scope in {"global", "domain"} else bool(row.is_active),
         "activation_config_version": activation.config_version if activation else None,
         "activation_generation": activation.generation if activation else 0,
     }
@@ -557,8 +580,10 @@ async def set_mcp_activation(
             server = await session.get(ChatMcpServer, item_id, with_for_update=True)
             if server is None:
                 raise ExtensionNotFound(f"MCP 서버 {item_id} 를 찾을 수 없습니다")
-            if server.scope != "global":
-                raise ExtensionForbidden("Only administrator-published MCP servers support activation")
+            if server.scope not in {"global", "domain"}:
+                raise ExtensionForbidden("Only published MCP servers support activation")
+            if server.scope == "domain":
+                await _domain_access(user_id, project_id, server.owner_domain_id)
             if not server.is_active:
                 raise ExtensionValidationError("MCP server is unavailable")
             if server.config_version != config_version:
@@ -578,8 +603,8 @@ async def set_mcp_activation(
             await session.flush()
             connection = (await session.execute(select(ChatMcpOAuthConnection).where(
                 ChatMcpOAuthConnection.mcp_server_id == item_id,
-                ChatMcpOAuthConnection.owner_user_id == user_id,
-                ChatMcpOAuthConnection.owner_project_id == project_id,
+                ChatMcpOAuthConnection.owner_user_id == (server.owner_domain_id if server.scope == "domain" else user_id),
+                ChatMcpOAuthConnection.owner_project_id == (server.owner_domain_id if server.scope == "domain" else project_id),
             ))).scalar_one_or_none()
             metadata = _activation_metadata(server, activation)
             metadata["is_active"] = metadata["is_active"] and _mcp_connected(server, connection)
@@ -605,11 +630,21 @@ async def list_for_user(
     model = _model(kind)
     factory = _require_db()
     serialize = _reveal_mcp if (reveal_secrets and kind == "mcp") else _PUBLIC[kind]
+    domain_id = None
+    if kind == "mcp":
+        async with factory() as session:
+            has_domain = (await session.execute(
+                select(ChatMcpServer.id).where(ChatMcpServer.scope == "domain").limit(1)
+            )).first()
+        if has_domain:
+            domain_id = (await _domain_access(user_id, project_id))["domain_id"]
     try:
         async with factory() as session:
             global_visible = model.scope == "global"
             if kind != "mcp":
                 global_visible = global_visible & model.is_active.is_(True)
+            if kind == "mcp" and domain_id:
+                global_visible = global_visible | ((model.scope == "domain") & (model.owner_domain_id == domain_id))
             stmt = select(model).where(
                 global_visible
                 | ((model.scope == "user") & (model.owner_user_id == user_id) & (model.owner_project_id == project_id))
@@ -630,6 +665,17 @@ async def list_for_user(
                     ChatMcpOAuthConnection.owner_project_id == project_id,
                 ))).scalars()
             }
+            if domain_id:
+                shared = (await session.execute(
+                    select(ChatMcpOAuthConnection).join(
+                        ChatMcpServer, ChatMcpServer.id == ChatMcpOAuthConnection.mcp_server_id
+                    ).where(
+                        ChatMcpServer.scope == "domain", ChatMcpServer.owner_domain_id == domain_id,
+                        ChatMcpOAuthConnection.owner_user_id == domain_id,
+                        ChatMcpOAuthConnection.owner_project_id == domain_id,
+                    )
+                )).scalars()
+                connections.update({row.mcp_server_id: row for row in shared})
             result = []
             for row in rows:
                 activation = activations.get(row.id)
@@ -639,6 +685,7 @@ async def list_for_user(
                 item = serialize(row)
                 item.update(_activation_metadata(row, activation))
                 item["is_active"] = active
+                item["auth_connected"] = _mcp_connected(row, connections.get(row.id))
                 result.append(item)
             return result
     except OperationalError as exc:
@@ -654,10 +701,16 @@ async def create(
     scope: str,
     owner_user_id: str | None = None,
     owner_project_id: str | None = None,
+    owner_domain_id: str | None = None,
+    catalog_authorized: bool = False,
 ) -> dict:
     model = _model(kind)
-    if scope not in ("global", "user"):
-        raise ExtensionValidationError("scope 는 global|user 여야 합니다")
+    if scope not in ("global", "user", "domain") or (scope == "domain" and kind != "mcp"):
+        raise ExtensionValidationError("scope 는 global|user|domain(MCP) 여야 합니다")
+    if scope == "domain":
+        if not owner_domain_id or not owner_user_id or not owner_project_id:
+            raise ExtensionValidationError("domain 스코프는 도메인과 관리 소유자 정보가 필요합니다")
+        await _domain_access(owner_user_id, owner_project_id, owner_domain_id, manage=True)
     if scope == "user" and (not owner_user_id or not owner_project_id):
         raise ExtensionValidationError("user 스코프는 소유자 정보가 필요합니다")
     if not fields.get("name"):
@@ -667,7 +720,7 @@ async def create(
     if kind == "mcp":
         if not (fields.get("url") or "").strip():
             raise ExtensionValidationError("원격 MCP 서버는 url 이 필수입니다")
-        if scope == "user":
+        if scope == "user" and not catalog_authorized:
             _ensure_user_mcp_policy(fields)
     if kind == "skill" and not (fields.get("instructions") or "").strip():
         raise ExtensionValidationError("스킬은 지침(instructions)이 필수입니다")
@@ -679,14 +732,20 @@ async def create(
     }
     row = model(
         scope=scope,
-        owner_user_id=(owner_user_id if scope == "user" else None),
-        owner_project_id=(owner_project_id if scope == "user" else None),
+        owner_user_id=(owner_user_id if scope in {"user", "domain"} else None),
+        owner_project_id=(owner_project_id if scope in {"user", "domain"} else None),
         **_required_defaults.get(kind, {}),
     )
     _apply_fields(kind, row, fields)
     if kind == "mcp":
         row.template_key = fields.get("template_key")
         row.connection_label = fields.get("connection_label")
+        row.owner_domain_id = owner_domain_id if scope == "domain" else None
+        row.connection_scope_key = (
+            f"domain:{owner_domain_id}" if scope == "domain"
+            else f"user:{owner_user_id}:{owner_project_id}" if scope == "user" else "global"
+        )
+        row.implicit_selection = False if scope == "domain" else bool(fields.get("implicit_selection", True))
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
@@ -740,7 +799,8 @@ async def record_catalog(item_id: int, *, tools: list[dict] | None, error: str |
 
 
 async def _load_authorized(
-    session, model, item_id: int, *, requester_user_id: str | None, requester_project_id: str | None, admin: bool
+    session, model, item_id: int, *, requester_user_id: str | None, requester_project_id: str | None, admin: bool,
+    domain_id: str | None = None,
 ):
     row = await session.get(model, item_id)
     if row is None:
@@ -748,6 +808,11 @@ async def _load_authorized(
     if row.scope == "global":
         if not admin:
             raise ExtensionForbidden("global 확장은 관리자만 변경할 수 있습니다")
+    elif row.scope == "domain":
+        if not admin:
+            if domain_id != row.owner_domain_id:
+                raise ExtensionForbidden("Use the domain connection management endpoint")
+            await _domain_access(requester_user_id, requester_project_id, row.owner_domain_id, manage=True)
     else:  # user
         if admin:
             pass  # 관리자는 열람/변경 허용
@@ -778,6 +843,8 @@ async def update(
     requester_user_id: str | None = None,
     requester_project_id: str | None = None,
     admin: bool = False,
+    domain_id: str | None = None,
+    catalog_authorized: bool = False,
 ) -> dict:
     model = _model(kind)
     factory = _require_db()
@@ -790,8 +857,9 @@ async def update(
                 requester_user_id=requester_user_id,
                 requester_project_id=requester_project_id,
                 admin=admin,
+                domain_id=domain_id,
             )
-            if kind == "mcp" and row.scope == "user":
+            if kind == "mcp" and row.scope == "user" and not catalog_authorized:
                 _ensure_user_mcp_policy(patch)
             _apply_fields(kind, row, patch)
             if kind in {"mcp", "tool"}:
@@ -814,6 +882,7 @@ async def delete(
     requester_user_id: str | None = None,
     requester_project_id: str | None = None,
     admin: bool = False,
+    domain_id: str | None = None,
 ) -> None:
     model = _model(kind)
     factory = _require_db()
@@ -826,8 +895,18 @@ async def delete(
                 requester_user_id=requester_user_id,
                 requester_project_id=requester_project_id,
                 admin=admin,
+                domain_id=domain_id,
             )
             await session.delete(row)
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def _domain_access(user_id: str, project_id: str, domain_id: str | None = None, *, manage: bool = False) -> dict:
+    from lumen.services.mcp_domain_authority import resolve_domain_authority
+
+    authority = await resolve_domain_authority(user_id, project_id, domain_id)
+    if not authority["is_member"] or (manage and not authority["can_manage"]):
+        raise ExtensionForbidden("Exact domain manager authority required" if manage else "Domain membership required")
+    return authority
