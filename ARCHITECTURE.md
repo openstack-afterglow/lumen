@@ -13,7 +13,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 ### Dashboard MCP and cloud-approval integration
 
-`mcp_domain_authority` resolves exact current project-domain membership and legitimate canonical-Default/direct-domain manager grants through native Keystone. It rejects reduced/API-key management and ignores Afterglow-derived manager projection grants. `ChatMcpServer` gains domain ownership and a scope-keyed uniqueness boundary in migration 033; the unmerged Drover migration 032 is independent and the loader permits the gap. Domain credentials are encrypted, shared only at execution, and absent from member responses. Personal activation, config fingerprint, credential version and current native membership are rechecked before frozen connections run.
+`mcp_domain_authority` resolves exact current project-domain membership and legitimate canonical-Default/direct-domain manager grants through native Keystone. It rejects reduced/API-key management and ignores Afterglow-derived manager projection grants. `ChatMcpServer` gains domain ownership and a scope-keyed uniqueness boundary in migration 033; the unmerged Drover migration 032 is independent and the loader permits the gap. Domain credentials are encrypted, shared only at execution, and absent from member responses. Personal activation, config fingerprint, credential version and current native membership are rechecked before frozen connections run. Activation reads Keystone membership before taking the published row lock (token refresh shares that lock) and fails closed inside the lock if the row's domain/scope changed; idempotent template install releases its lookup session before re-reading the effective view.
 
 `GET /v1/mcp-settings` combines registry entries, personal/global/domain connection states and managed sandbox availability. Personal `/v1/mcp-connections` and exact-domain `/v1/domains/{id}/mcp-connections` reuse the existing OAuth/activation lifecycle. Featured installation uses the admin route and never makes a catalog connection implicitly selected. Playwright and Markitdown require real sandbox manifest/image qualification; their catalog presence does not enable execution.
 
@@ -584,9 +584,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c9c18c6b2565d97f7ba5ea65ba3bbbdd932b1784277a9062ec4e35ab354ad325",
-  "reviewed_at": "2026-11-17T20:57:32Z",
-  "summary": "0.6.17 published and deployed (033+034, managed ClamAV, protocol v2); rollout receipts and OpenSpec archive"
+  "source_sha256": "5f7ab2ed68d10493f8e7ffe72f6387c06b5be608781700068a637640219f798a",
+  "reviewed_at": "2026-11-17T21:27:07Z",
+  "summary": "Integrate missed 0.6.17 slices; MCP activation fails closed for domain rows without owner domain"
 }
 ```
 <!-- architecture-review:end -->

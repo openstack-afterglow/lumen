@@ -119,3 +119,39 @@ async def test_undecryptable_activity_is_unavailable_not_a_body_failure(monkeypa
     result = (await run_store.read_public_activity_events(session, ["run"]))["run"]
     assert result.events == []
     assert result.unavailable_code == "history_activity_invalid"
+
+
+@pytest.mark.parametrize("case", ["orphan", "wrong-name", "settled"])
+async def test_invalid_progress_lifecycle_is_explicitly_unavailable(case):
+    values = []
+    if case != "orphan":
+        values.append(row("run", 1, "tool.call.started", {"call_id": "call", "name": "inspect", "arguments": {}}))
+    if case == "settled":
+        values.append(row("run", 2, "tool.call.completed", {
+            "call_id": "call", "name": "inspect", "status": "failed",
+            "content": [{"type": "text", "text": "Safe failure"}],
+        }))
+    values.append(row("run", len(values) + 1, "tool.call.progress", {
+        "call_id": "call", "name": "other" if case == "wrong-name" else "inspect", "text": "Public progress",
+    }))
+    result = (await run_store.read_public_activity_events(Session(values), ["run"]))["run"]
+    assert result.events == []
+    assert result.unavailable_code == "history_activity_invalid"
+
+
+async def test_public_reader_selects_and_retains_valid_progress_before_failure():
+    session = Session([
+        row("run", 1, "tool.call.started", {"call_id": "call", "name": "inspect", "arguments": {}}),
+        row("run", 2, "tool.call.progress", {"call_id": "call", "name": "inspect", "text": "  downloaded\\n"}),
+        row("run", 3, "tool.call.completed", {
+            "call_id": "call", "name": "inspect", "status": "failed",
+            "content": [{"type": "text", "text": "Safe failure"}],
+        }),
+    ])
+    result = (await run_store.read_public_activity_events(session, ["run"]))["run"]
+    assert result.unavailable_code is None
+    assert [event.type for event in result.events] == ["tool.call.started", "tool.call.progress", "tool.call.completed"]
+    assert result.events[1].payload.text == "  downloaded\\n"
+    compiled = str(session.calls[0].compile(dialect=mysql.dialect(), compile_kwargs={"literal_binds": True}))
+    assert "'tool.call.progress'" in compiled
+    assert "'part.delta'" not in compiled

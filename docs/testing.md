@@ -1,5 +1,9 @@
 # 테스트
 
+## Missed 0.6.17 slices (2026-11-18, source/local, not released)
+
+Cherry-picked `feat/mcp-catalog` `f6fc308`/`171d6c5` and `feat/chat-work-log` `9e22746` (completed after their 0.6.17 integration merge points) onto `c5b020be`, then rebased onto the docs-only `89275f05`. Review follow-up: activation now fails closed for a `scope='domain'` row whose `owner_domain_id` is NULL (the peek path skipped the membership read and `None != None` passed inside the lock; migration 033 has no CHECK), with a real-SQL regression test. `test-passed` on the final tree: `uv run --frozen lumen-test contract` 7,973 passed + 145 SDK, configured Ruff clean; `lumen-test integration` 749 passed / 4 skipped (real MariaDB/Redis, includes `test_mcp_domain_connections.py` and `test_chat_work_log_progress_db.py`). Not deployed: production 0.6.17 lacks these fixes.
+
 ## 0.6.17 production rollout and smoke (2026-11-17 UTC / 2026-11-18 KST)
 
 Deployed tag `0.6.17` (`c5b020be`) to the three DMS Lab controllers with `--skip-tags haproxy` after a drained cutover (59 runs terminal, 0 holds) and an encrypted backup. Observed after rollout: API/worker on the pinned digests, `lumen.__version__` 0.6.17, `chat_execution_protocol_version` 2 on every API and worker, restarts 0, migrate status rc0, direct `/v1/ready` 200 on each host, public `https://lumen.dmslab.re.kr` health/ready/openapi 200, `lumen_clamav` healthy and listening only on `127.0.0.1:3310` (VERSION `ClamAV 1.4.6/28186`). The full container census changed only `lumen_api`/`lumen_worker` (replaced) and `lumen_clamav` (added) per controller; haproxy/proxysql/keepalived, the VIP and protected-setting hashes were unchanged.

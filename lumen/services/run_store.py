@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 _PUBLIC_ACTIVITY_TYPES = frozenset({
     "run.started", "run.stage.changed", "context.updated", "part.completed",
-    "tool.call.started", "tool.call.completed", "tool.approval_required", "tool.approval_resolved",
+    "tool.call.started", "tool.call.progress", "tool.call.completed", "tool.approval_required", "tool.approval_resolved",
     "child.created", "child.completed", "run.completed", "run.failed", "run.canceled",
 })
 _MAX_PUBLIC_ACTIVITY_EVENTS = 1024
@@ -62,6 +62,7 @@ async def read_public_activity_events(
     ).order_by(ChatRunEventRow.run_id, ChatRunEventRow.seq).execution_options(yield_per=64)
     counts: dict[str, int] = {}
     sizes: dict[str, int] = {}
+    tools_by_run: dict[str, dict[str, tuple[str, bool]]] = {}
     rows = await session.stream_scalars(statement)
     try:
         async for row in rows:
@@ -83,10 +84,19 @@ async def read_public_activity_events(
                     part = payload["part"]
                     if part.get("type") != "reasoning" or part.get("visibility") != "user":
                         continue
-                result.events.append(validate_chat_run_event({
+                event = validate_chat_run_event({
                     "event_id": f"{row.run_id}:{row.seq}", "run_id": row.run_id, "seq": row.seq,
                     "type": row.event_type, "created_at": _as_utc(row.created_at).isoformat(), "payload": payload,
-                }))
+                })
+                if event.type == "tool.call.started":
+                    tools_by_run.setdefault(row.run_id, {})[event.payload.call_id] = (event.payload.name, True)
+                elif event.type == "tool.call.progress":
+                    tool = tools_by_run.get(row.run_id, {}).get(event.payload.call_id)
+                    if tool != (event.payload.name, True):
+                        raise ValueError("tool progress has no active matching call")
+                elif event.type == "tool.call.completed":
+                    tools_by_run.setdefault(row.run_id, {})[event.payload.call_id] = (event.payload.name, False)
+                result.events.append(event)
             except (ValueError, TypeError, InvalidTag):
                 # Never log raw validation/decryption errors: they may include private payloads.
                 result.events.clear()

@@ -584,6 +584,18 @@ async def set_mcp_activation(
     if type(is_active) is not bool or type(config_version) is not int or config_version < 1:
         raise ExtensionValidationError("is_active and positive config_version are required")
     factory = _require_db()
+    # Organization membership is read from Keystone BEFORE the row lock: token refresh takes the same lock, so a slow
+    # directory must never stall every run that uses this server. The locked section re-verifies the row's domain.
+    authorized_domain: str | None = None
+    try:
+        async with factory() as probe:
+            peek = await probe.get(ChatMcpServer, item_id)
+            peek_domain = peek.owner_domain_id if peek is not None and peek.scope == "domain" else None
+    except OperationalError as exc:
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+    if peek_domain is not None:
+        await _domain_access(user_id, project_id, peek_domain)
+        authorized_domain = peek_domain
     try:
         async with factory() as session, session.begin():
             # Serialize first activation and every epoch transition on the published row.
@@ -592,8 +604,8 @@ async def set_mcp_activation(
                 raise ExtensionNotFound(f"MCP 서버 {item_id} 를 찾을 수 없습니다")
             if server.scope not in {"global", "domain"}:
                 raise ExtensionForbidden("Only published MCP servers support activation")
-            if server.scope == "domain":
-                await _domain_access(user_id, project_id, server.owner_domain_id)
+            if server.scope == "domain" and (authorized_domain is None or server.owner_domain_id != authorized_domain):
+                raise ExtensionForbidden("Organization connection changed; retry the activation")
             if not server.is_active:
                 raise ExtensionValidationError("MCP server is unavailable")
             if server.config_version != config_version:

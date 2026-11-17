@@ -4,6 +4,7 @@ Run only against a disposable migrated test database. Synthetic credentials neve
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -11,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi import HTTPException
 from lumen_plugin_api.contracts import Namespace
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_contracts import ChatFeatureOptions
@@ -24,8 +25,8 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-async def domain_db(monkeypatch):
-    init_db(os.environ["DATABASE_URL"], pool_size=3, max_overflow=0)
+async def domain_db(monkeypatch, request):
+    init_db(os.environ["DATABASE_URL"], pool_size=getattr(request, "param", 3), max_overflow=0, pool_timeout=1)
     factory = get_session_factory()
     assert factory is not None
     suffix = uuid.uuid4().hex
@@ -176,6 +177,16 @@ async def test_activation_freezes_explicit_selection_and_invalidates_on_changes(
     assert (await selected(db, server_id))["mcp"][0]["id"] == server_id
 
 
+async def test_activation_rejects_domain_row_without_owner_domain(domain_db):
+    db = domain_db
+    _, created = await create_domain(db)
+    server_id = created["server"]["id"]
+    async with db["factory"]() as session, session.begin():
+        await session.execute(update(ChatMcpServer).where(ChatMcpServer.id == server_id).values(owner_domain_id=None))
+    with pytest.raises(es.ExtensionForbidden):
+        await es.set_mcp_activation(server_id, **owner(db["member"]), is_active=True, config_version=1)
+
+
 async def test_shared_oauth_canonical_owner_and_revocation_invalidate_frozen_run(domain_db):
     db = domain_db
     _, created = await create_domain(db, "oauth")
@@ -292,3 +303,18 @@ async def test_legacy_route_cannot_repoint_a_catalog_connection(domain_db):
                         requester_user_id=db["member"]["user_id"], requester_project_id=db["member"]["project_id"])
     async with db["factory"]() as session:
         assert (await session.get(ChatMcpServer, personal["server"]["id"])).url == candidate["url"]
+
+
+@pytest.mark.parametrize("domain_db", [1], indirect=True)
+async def test_idempotent_org_install_releases_lookup_connection_before_effective_view(domain_db):
+    db = domain_db
+    candidate, created = await asyncio.wait_for(create_domain(db), timeout=3)
+    first = created["server"]
+    again = await asyncio.wait_for(
+        mcp_settings.create(db["manager"], candidate["id"], domain_id=db["a"], label=db["suffix"]),
+        timeout=3,
+    )
+    assert again["created"] is False
+    assert again["server"]["id"] == first["id"]
+    assert again["server"]["is_active"] is False
+    assert again["server"]["server_is_active"] is True

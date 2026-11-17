@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **한국어 — 0.6.17 통합 누락분:** 0.6.17 통합 시점 뒤에 완료된 세 수정을 반영한다. 조직 MCP 활성화는 Keystone 구성원 조회를 행 잠금 밖에서 먼저 수행하고 잠금 안에서 도메인 변경을 재확인한다(토큰 갱신과 같은 잠금을 느린 디렉터리가 붙잡지 않음). 소유 도메인이 비어 있는 조직 행은 활성화를 거부한다. 멱등 템플릿 설치는 조회 연결을 놓은 뒤 유효 상태를 다시 읽는다. 기록 투영은 소비자 호환 `tool.call.progress`(최대 4,000자, 최근 32줄)를 활성 호출에만 보존한다. Emitter·프로토콜·스키마 변경은 없다. 운영 0.6.17에는 포함되지 않았다.
+- **English — Missed 0.6.17 slices:** Integrate three fixes completed after the 0.6.17 integration point. Organization MCP activation reads Keystone membership before the row lock and rechecks the domain inside it, so a slow directory no longer holds the lock shared with token refresh; a domain-scoped row without an owner domain is rejected. Idempotent template install releases its lookup connection before reading the effective view. History projection keeps consumer-compatible `tool.call.progress` (≤4,000 chars, newest 32 lines) only for an active matching call. No emitter, protocol or schema change. Not in the deployed 0.6.17.
+
 ## 0.6.17 — 2026-11-18 (published and deployed; OpenAI paid paths unverified)
 
 - **배포:** tag `0.6.17`(`c5b020be`)을 2026-11-17 20:34–20:36 UTC에 DMS Lab 세 컨트롤러에 반영했다. Migration 033·034, 관리형 ClamAV, protocol 2를 같은 drain된 cohort에서 켰다. 수신증은 `docs/testing.md`와 `docs/operations.md`에 있다.
