@@ -1,5 +1,13 @@
 # 테스트
 
+## 0.6.17 integrated candidate (2026-11-18, source/local + synthetic)
+
+Integration branch `feat/dashboard-consolidate` (`b90eb129`). `test-passed` on the integrated tree with `__pycache__` cleared: `uv run --frozen lumen-test contract` 7,946 service + 145 SDK passed, Ruff clean on both; `lumen-test integration` 735 passed / 4 skipped and `lumen-test system` 38 passed (both on `44abab8`, before the final one-line Sonar scope fix `0988a2fb`, which only the contract lane re-covered). Each layer used a unique compose project and was torn down.
+
+Reviews closed before integration: selected sandbox (code-mode refusal, root/child budget split, child frozen identity, expiry fence, replay after expiry), Decisions (bounded validation incl. fail-fast lists and unknown keys, stateless holds counted in the shared wallet admission, rejection-status release set, settle-before-validate, catalog cache/long-context rates), native catalog (search providers preserved, PDF/reasoning from official data, ChatGPT unpriced, native paid search gate unavailable, Sonar tools scope, override reasoning precedence, audio tier fold).
+
+Real local BFF→Lumen HTTP acceptance (synthetic Keystone directory, disposable MariaDB/Redis, fake OpenAI `/v1/decisions` upstream) passed 21 MCP behavioral + 20 added cases; see Afterglow `docs/testing.md`. No production, paid provider call, release or deployment is claimed here.
+
 ## Text embeddings qualification (2026-11-17)
 
 Worktree from `origin/dev` b129ec05 (0.6.15), Python 3.12 via `uv`. `test-passed`: `uv run lumen-test contract` 6,933 service tests passed/556 deselected plus 143 SDK tests; `uv run ruff check lumen tests` clean; `uv run lumen-test integration` on disposable MariaDB/Redis 519 passed/1 skipped, including `tests/integration/test_embedding_settlement.py` (OpenAI and Gemini embedding rows: one `chat_usage_logs` row, input-token raw cost, credited cost and wallet charge; provider transport faked at `provider_client.aembedding`); `uv run lumen-test system` 38 passed; `tests/test_kolla_assets.py` and `tests/test_migrations.py` 113 passed; `uv build --wheel` built and contains the embedding modules. No migration is added (`model_kind` is `VARCHAR(16)`). OpenAI SDK and google-genai 3.4.0 were exercised against a local synthetic service. Not verified: live OpenAI/Gemini calls, vendor invoice accuracy, Kolla/production rollout. Deploy Lumen before the Afterglow release that exposes Embedding Studio.
