@@ -28,6 +28,7 @@ from .credentials import (
 )
 from .errors import (
     ChatStorageUnavailable,
+    ImagePricingNotReady,
     ModelOrderConflictError,
     ProviderNotFoundError,
     ProviderValidationError,
@@ -37,6 +38,7 @@ from .pricing import (
     MODEL_KINDS,
     _effective_model_rates,
     _has_manual_media_prices,
+    _image_pricing_readiness,
     _model_public,
     _per_million_price,
     _per_token_price,
@@ -158,6 +160,12 @@ def _validate_text_prices(input_price_per_million, output_price_per_million):
         _per_token_price(input_price_per_million, "input_price_per_million"),
         _per_token_price(output_price_per_million, "output_price_per_million"),
     )
+
+
+def _require_image_pricing_ready(row: LlmModel, provider: LlmProvider) -> None:
+    readiness = _image_pricing_readiness(row, provider.provider_type, provider.api_base)
+    if not readiness["ready"]:
+        raise ImagePricingNotReady(readiness)
 
 
 def _capability_override(value: dict | None) -> dict | None:
@@ -568,6 +576,9 @@ async def create_model(
                 capability_source=("override" if capabilities else None),
                 is_active=is_active,
             )
+            if model_kind == "image" and is_active:
+                # A default-active create is rejected outright; callers opt into an inactive draft.
+                _require_image_pricing_ready(row, provider)
             session.add(row)
             await session.flush()
             effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
@@ -684,6 +695,11 @@ async def update_model(model_id: int, patch: dict) -> dict:
             if provider is None:
                 raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
             row = models[0]
+            was_active = row.is_active
+            # Legacy rows already active without executable pricing stay editable; only
+            # activation and breaking a ready active row are refused.
+            was_ready = getattr(row, "model_kind", "text") != "image" or _image_pricing_readiness(
+                row, provider.provider_type, provider.api_base)["ready"]
             target_kind = patch.get("model_kind", getattr(row, "model_kind", "text"))
             _validate_model_kind(provider, target_kind)
             media_pricing = patch.get("media_pricing", getattr(row, "media_pricing", None))
@@ -769,6 +785,8 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 row.capability_source = "override" if row.capabilities else None
             if patch.get("is_active") is not None:
                 row.is_active = bool(patch["is_active"])
+            if row.model_kind == "image" and row.is_active and (not was_active or was_ready):
+                _require_image_pricing_ready(row, provider)
             await session.flush()
             effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
             return _model_public(

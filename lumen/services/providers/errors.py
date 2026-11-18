@@ -30,6 +30,21 @@ class UnsupportedProviderTypeError(ProviderValidationError):
         )
 
 
+class ImagePricingNotReady(ProviderValidationError):
+    """An active image model needs a priced, executable choice — 409 with the readiness detail."""
+
+    code = "image_pricing_not_ready"
+
+    def __init__(self, readiness: dict):
+        self.reason = readiness["reason"]
+        self.unsupported_variants = list(readiness["unsupported_variants"])
+        super().__init__(f"image_pricing_not_ready: {self.reason}")
+
+    def detail(self) -> dict:
+        return {"code": self.code, "reason": self.reason, "unsupported_variants": self.unsupported_variants,
+                "message": "활성 이미지 모델에는 실행 가능한 가격 variant가 필요합니다"}
+
+
 class AmbiguousModelRouteError(RuntimeError):
     """More than one active route exposes the requested public model/provider pair."""
 

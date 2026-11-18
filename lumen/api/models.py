@@ -904,6 +904,8 @@ async def set_memory_model(payload: MemoryModelRequest):
 async def create_model(payload: ModelCreateRequest):
     try:
         return await repository.create_model(**payload.model_dump())
+    except errors.ImagePricingNotReady as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
@@ -933,6 +935,8 @@ async def update_model(model_id: int, payload: ModelUpdateRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except errors.ImagePricingNotReady as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
