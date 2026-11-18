@@ -18,7 +18,7 @@ from lumen.models.billing import Payer
 from lumen.service_authority import SERVICE_CAPABILITIES
 
 
-def _principal(scopes=("compat:completions:write", "native:runs:write", "models:read")):
+def _principal(scopes=("embeddings:write", "models:read")):
     return {
         "auth_type": "api_key", "user_id": "user-1", "project_id": "project-1", "api_key_id": 4,
         "source": "api", "scopes": scopes, "roles": ["member", *SERVICE_CAPABILITIES],
@@ -115,7 +115,7 @@ def test_native_embedding_route_uses_session_authority_and_ephemeral_result(monk
     assert resolved == [(42, "embedding")]
     assert embedded[0]["user_id"] == "user-1"
     assert embedded[0]["project_id"] == "project-1"
-    assert embedded[0]["required_scopes"] == ("native:runs:write",)
+    assert embedded[0]["required_scopes"] == ("embeddings:write",)
 
 
 def test_gemini_routes_preserve_wire_options_and_model_scope(monkeypatch):

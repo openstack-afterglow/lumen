@@ -261,10 +261,14 @@ async def test_admission_rejects_unbounded_or_unsupported_requests(
         )
 
 
+_KEY_PROJECT = "lumen:key:7"  # A personal key's storage identity, never an owner project.
+
+
 def _key(**overrides):
     row = SimpleNamespace(
-        id=7, owner_user_id="u", owner_project_id="p", is_active=True, revoked_at=None,
-        expires_at=None, scopes=["models:read", "compat:completions:write"],
+        id=7, key_kind="personal", credential_kind="api_key", owner_user_id="u", owner_project_id=None,
+        owner_domain_id=None, is_active=True, revoked_at=None, expires_at=None,
+        scopes=["models:read", "compat:completions:write"],
     )
     for key, value in overrides.items():
         setattr(row, key, value)
@@ -288,18 +292,15 @@ class _KeySession:
         _key(revoked_at=datetime.now(UTC)),
         _key(is_active=False),
         _key(expires_at=datetime.now(UTC) - timedelta(seconds=1)),
-        _key(owner_project_id="other"),
+        _key(owner_user_id="other"),
         _key(scopes=["models:read"]),
     ],
 )
 async def test_run_key_reauthorization_fails_closed(row, monkeypatch):
-    async def current_authority(user_id, project_id):
-        return {"roles": ["member", "lumen-chat_user"], "is_system_admin": False}
-
-    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
+    monkeypatch.setattr(api_key_store, "_verify_model_key_owner", lambda **_kwargs: None)
     with pytest.raises(api_key_store.ApiKeyForbidden):
         await api_key_store.authorize_api_key_in_transaction(
-            _KeySession(row), api_key_id=7, user_id="u", project_id="p",
+            _KeySession(row), api_key_id=7, user_id="u", project_id=_KEY_PROJECT,
             required_scopes=("compat:completions:write",),
         )
 
@@ -309,9 +310,10 @@ async def test_run_key_reauthorization_accepts_live_scoped_key_and_keystone_runs
         return {"roles": ["member", "lumen-chat_user"], "is_system_admin": False}
 
     monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
+    monkeypatch.setattr(api_key_store, "_verify_model_key_owner", lambda **_kwargs: None)
     session = _KeySession(_key())
     await api_key_store.authorize_api_key_in_transaction(
-        session, api_key_id=7, user_id="u", project_id="p", required_scopes=("compat:completions:write",),
+        session, api_key_id=7, user_id="u", project_id=_KEY_PROJECT, required_scopes=("compat:completions:write",),
     )
     keystone = _KeySession(None)
     await api_key_store.authorize_api_key_in_transaction(
