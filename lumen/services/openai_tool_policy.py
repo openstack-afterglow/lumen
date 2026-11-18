@@ -69,7 +69,7 @@ def validate_input(source: str | list[dict], *, tool_search: bool = False) -> No
         if implicit_reference or kind in (
             "item_reference", "container_reference", "code_interpreter_call", "mcp_approval_response", "skill_reference",
         ) or any(
-            name in item for name in (
+            item.get(name) is not None for name in (
                 "container_id", "file_id", "file_ids", "vector_store_id", "vector_store_ids",
                 "response_id", "previous_response_id", "comparison_response_id", "conversation",
                 "approval_request_id", "skill_id", "connector_id", "tunnel_id",

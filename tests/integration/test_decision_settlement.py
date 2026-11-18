@@ -128,27 +128,44 @@ async def test_openai_hosted_text_stateless_hold_and_atomic_ledger(sql_owner, mo
                 assert hold.status == "unknown" and ledger is None and wallet.used_quota_this_month == 0
 
 
-async def test_small_openai_text_prompt_fits_low_credit_wallet(sql_owner, monkeypatch):
+@pytest.mark.parametrize("provider_input_tokens", [20, 5_000])
+async def test_small_openai_text_prompt_fits_low_credit_wallet(sql_owner, monkeypatch, provider_input_tokens):
     from test_openai_text_protocol import route_for
 
     factory, user, project = sql_owner
     monkeypatch.setattr(completion_api.get_settings(), "chat_credit_per_usd", 1.0)
     monkeypatch.setattr(completion_api, "_authorize_completion", AsyncMock())
-    reply = {"status": "completed", "output": [], "usage": {"input_tokens": 20, "output_tokens": 10}}
+    reply = {"status": "completed", "output": [], "usage": {"input_tokens": provider_input_tokens, "output_tokens": 10}}
     upstream = AsyncMock(return_value=reply)
     monkeypatch.setattr(completion_api.provider_client, "aresponses", upstream)
     async with factory() as session, session.begin():
         (await session.get(UserWallet, user)).max_quota_monthly = Decimal("0.02")
-    assert await completion_api.complete_responses(
-        resolved=route_for(), input="test", stream=False, user_id=user, project_id=project,
-        api_key_id=None, options={"max_output_tokens": 128},
-    ) == reply
+
+    async def dispatch():
+        return await completion_api.complete_responses(
+            resolved=route_for(), input="test", stream=False, user_id=user, project_id=project,
+            api_key_id=None, options={"max_output_tokens": 128},
+        )
+
+    if provider_input_tokens == 20:
+        assert await dispatch() == reply
+    else:
+        with pytest.raises(completion_api.CompletionError) as failure:
+            await dispatch()
+        assert (failure.value.status_code, failure.value.code, failure.value.message) == (
+            502, "provider_result_unknown", "usage_exceeds_reservation",
+        )
     upstream.assert_awaited_once()
     async with factory() as session:
         hold = (await session.scalars(select(StatelessCallReservation).where(
             StatelessCallReservation.user_id == user))).one()
-        assert hold.status == "settled" and hold.bound_credits < Decimal("0.02")
-        assert hold.actual_credits == Decimal("0.00014")
+        assert hold.bound_credits < Decimal("0.02")
+        if provider_input_tokens == 20:
+            assert hold.status == "settled" and hold.actual_credits == Decimal("0.00014")
+        else:
+            assert hold.status == "unknown" and hold.actual_credits is None
+            assert await session.scalar(select(ChatUsageLog.id).where(ChatUsageLog.event_id == hold.event_id)) is None
+            assert (await session.get(UserWallet, user)).used_quota_this_month == 0
 
 
 def _route():

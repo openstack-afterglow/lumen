@@ -401,6 +401,24 @@ func TestNativeOpenAIResponsesForcesStandardAndPreservesHostedBound(t *testing.T
 	}
 }
 
+func TestOfficialOpenAIWireLeavesOutputBudgetOmitted(t *testing.T) {
+	for _, e := range []Envelope{
+		{Provider: "openai", Protocol: "chat", Body: json.RawMessage(`{"model":"gpt-4o","messages":[{"role":"user","content":"test"}]}`)},
+		{Provider: "openai", Protocol: "responses", Body: json.RawMessage(`{"model":"o3","input":"test"}`)},
+	} {
+		t.Run(e.Protocol, func(t *testing.T) {
+			plan, err := prepare(context.Background(), e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer plan.close()
+			if bytes.Contains(plan.body, []byte(`"max_output_tokens"`)) || bytes.Contains(plan.body, []byte(`"max_tokens"`)) {
+				t.Fatalf("converter injected an output budget: %s", plan.body)
+			}
+		})
+	}
+}
+
 func TestAnthropicChatConversionPreservesPendingToolAndCompactionHead(t *testing.T) {
 	plan, err := prepare(context.Background(), Envelope{Provider: "anthropic", Protocol: "chat", APIKey: "a", Body: json.RawMessage(`{"model":"claude-sonnet-4-6","max_tokens":77,"context_management":{"edits":[{"type":"compact_20260112","trigger":{"type":"input_tokens","value":100000}}]},"messages":[{"role":"user","content":"question"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}],"provider_specific_fields":{"compaction_blocks":[{"type":"compaction","content":"summary"}]}},{"role":"tool","tool_call_id":"call_1","content":"answer"}]}`)})
 	if err != nil {

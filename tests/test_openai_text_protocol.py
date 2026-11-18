@@ -1,5 +1,6 @@
 """Offline GPT-6.2 catalog, protocol, and hosted tool billing contracts."""
 
+import asyncio
 from contextlib import aclosing
 from decimal import Decimal
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from lumen.api.compat.streaming import events_with_ping
 from lumen.models.api_requests import OpenAIChatRequest, ResponsesRequest
 from lumen.services import completion_api as core
 from lumen.services import credit, openai_tool_policy, provider_client, provider_metadata
@@ -200,6 +202,8 @@ async def test_responses_preserves_complete_inline_history(monkeypatch):
         {"role": "user", "content": "Look it up."},
         {"type": "function_call", "id": "fc_inline", "call_id": "call_inline", "name": "lookup", "arguments": "{}"},
         {"type": "function_call_output", "id": "fco_inline", "call_id": "call_inline", "output": "Found it."},
+        {"type": "mcp_call", "id": "mcp_inline", "arguments": "{}", "name": "lookup", "server_label": "docs",
+         "approval_request_id": None, "output": "Inline MCP result.", "status": "completed"},
     ]
     upstream = AsyncMock(return_value={
         "status": "completed", "service_tier": "default", "output": [],
@@ -471,7 +475,8 @@ async def test_small_openai_prompt_hold_uses_short_context_and_selected_output(m
         assert kwargs["bound"] == expected
 
     monkeypatch.setattr(core.stateless_credit, "reserve", reserve)
-    assert core._chat_output_budget(route, requested) == output
+    wire = core._chat_wire_budget(route, requested)
+    assert wire == requested and core._chat_hold_output_budget(route, wire) == output
     hold = await core._reserve_online(route, messages=messages, tools=None, max_output=output,
                                       prompt_options=options, **OWNER)
     assert (hold.input_bound, hold.output_bound) == (input_bound, output)
@@ -532,3 +537,138 @@ async def test_unheld_openai_chat_close_at_accounting_error_never_debits(monkeyp
         # Match the HTTP consumer: do not advance the iterator past the error.
     reserve.assert_not_awaited()
     debit.assert_not_awaited()
+
+
+@pytest.mark.parametrize("protocol,model,input_tokens", [("responses", "o3", 150_000), ("chat", "gpt-4o", 115_000)])
+async def test_large_prompt_without_explicit_output_cap_settles(monkeypatch, protocol, model, input_tokens):
+    text = "x" * input_tokens
+    usage = {"input_tokens": input_tokens, "output_tokens": 10}
+    if protocol == "responses":
+        raw = {"status": "completed", "service_tier": "default", "output": [], "usage": usage}
+    else:
+        raw = provider_client.provider_object({
+            "service_tier": "default", "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": input_tokens, "completion_tokens": 10},
+        })
+    dispatch = AsyncMock(return_value=raw)
+    settle = AsyncMock(return_value=Decimal("1"))
+    finish = AsyncMock()
+    monkeypatch.setattr(core, "_authorize_completion", AsyncMock())
+    monkeypatch.setattr(core.stateless_credit, "reserve", AsyncMock())
+    monkeypatch.setattr(core.stateless_credit, "settle", settle)
+    monkeypatch.setattr(core.stateless_credit, "finish", finish)
+    monkeypatch.setattr(provider_client, "_execute", dispatch)
+    if protocol == "responses":
+        await core.complete_responses(resolved=route_for(model), input=text, options={}, stream=False, **OWNER)
+    else:
+        await core.complete_once(
+            resolved=route_for(model), messages=[{"role": "user", "content": text}],
+            max_tokens=None, temperature=None, **OWNER,
+        )
+    wire = dispatch.await_args.args[2]
+    assert {"max_tokens", "max_output_tokens", "max_completion_tokens"}.isdisjoint(wire)
+    settle.assert_awaited_once()
+    assert settle.await_args.kwargs["prompt_tokens"] == input_tokens
+    finish.assert_not_awaited()
+
+
+@pytest.mark.parametrize("model,expected", [("gpt-6-astra", 36_000), (MODEL, 922_000)])
+def test_computer_screenshot_uses_vision_bound(model, expected):
+    route = route_for(model)
+    catalog = core._bounded_openai_model(route)
+    messages = [{"type": "computer_call_output", "call_id": "test", "output": {
+        "type": "computer_screenshot", "image_url": "https://img.test/x",
+    }}]
+    bound, _ = core._request_input_bound(
+        route, catalog, messages=messages, tools=None, max_output=128, prompt_options={}, content_growth=False,
+    )
+    if model == MODEL:
+        assert bound == expected
+    else:
+        assert expected <= bound < expected + 5_000
+
+
+def test_encrypted_reasoning_bytes_are_reserved_without_expanding_to_window():
+    route = route_for()
+    params = dict(tools=None, max_output=128, prompt_options={}, content_growth=False)
+    catalog = core._bounded_openai_model(route)
+    baseline, _ = core._request_input_bound(
+        route, catalog, messages=[{"type": "reasoning", "encrypted_content": ""}], **params,
+    )
+    with_reasoning, _ = core._request_input_bound(
+        route, catalog, messages=[{"type": "reasoning", "encrypted_content": "aGVsbG8=" * 1000}], **params,
+    )
+    assert with_reasoning == baseline + 8_000 < 922_000
+
+
+@pytest.mark.parametrize("protocol", ["responses", "chat"])
+@pytest.mark.parametrize("outcome", ["settled", "failed", "deadline", "missing_usage"])
+@pytest.mark.parametrize("pending_read", [False, True])
+async def test_held_stream_drains_after_disconnect(monkeypatch, protocol, outcome, pending_read):
+    reading = asyncio.Event()
+    unblock = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def chunks():
+        try:
+            if protocol == "responses":
+                yield {"type": "response.output_text.delta", "delta": "first"}
+            else:
+                yield provider_client.provider_object({"choices": [{"delta": {"content": "first"}}]})
+            reading.set()
+            await unblock.wait()
+            if outcome == "failed":
+                raise APIConnectionError()
+            if protocol == "responses":
+                terminal = {"status": "completed", "service_tier": "default", "output": []}
+                if outcome == "settled":
+                    terminal["usage"] = {"input_tokens": 5, "output_tokens": 2}
+                yield {"type": "response.completed", "response": terminal}
+            elif outcome == "settled":
+                yield provider_client.provider_object({
+                    "service_tier": "default", "usage": {"prompt_tokens": 5, "completion_tokens": 2}, "choices": [],
+                })
+        finally:
+            closed.set()
+
+    reserve, settle, finish = AsyncMock(), AsyncMock(return_value=Decimal("0.1")), AsyncMock()
+    monkeypatch.setattr(core, "_authorize_completion", AsyncMock())
+    monkeypatch.setattr(core.stateless_credit, "reserve", reserve)
+    monkeypatch.setattr(core.stateless_credit, "settle", settle)
+    monkeypatch.setattr(core.stateless_credit, "finish", finish)
+    monkeypatch.setattr(provider_client, "aresponses" if protocol == "responses" else "acompletion_stream",
+                        AsyncMock(return_value=chunks()))
+    if outcome == "deadline":
+        monkeypatch.setattr(core, "_HELD_STREAM_DRAIN_SECONDS", 0.02)
+    if protocol == "responses":
+        source = await core.complete_responses(resolved=route_for(), input="test", options={}, stream=True, **OWNER)
+        stream = events_with_ping(source)
+        delta_type = "response.output_text.delta"
+    else:
+        stream = await core.complete_stream(
+            resolved=route_for(), messages=MESSAGES, temperature=None, max_tokens=32, **OWNER,
+        )
+        delta_type = "delta"
+    assert (await anext(stream))["type"] == delta_type
+    if pending_read:
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(reading.wait(), timeout=1)
+        pending.cancel()
+    closing = asyncio.create_task(stream.aclose()) if not pending_read else pending
+    await asyncio.wait_for(reading.wait(), timeout=1)
+    if outcome != "deadline":
+        unblock.set()
+    try:
+        await asyncio.wait_for(closing, timeout=1)
+    except asyncio.CancelledError:
+        assert pending_read
+    await stream.aclose()
+    assert closed.is_set()
+    reserve.assert_awaited_once()
+    if outcome == "settled":
+        settle.assert_awaited_once()
+        assert (settle.await_args.kwargs["prompt_tokens"], settle.await_args.kwargs["completion_tokens"]) == (5, 2)
+        finish.assert_not_awaited()
+    else:
+        settle.assert_not_awaited()
+        finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True)
