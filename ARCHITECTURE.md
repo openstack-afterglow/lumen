@@ -670,9 +670,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "074aeec55786e7d69e3804faf07b96f9afefa59651048e57154dc5d724c888f7",
-  "reviewed_at": "2026-11-18T17:43:52Z",
-  "summary": "Merge integration 8b7273d into feat/ds-gemini-compat (Gemini shared key tool policy, closed function parts, Messages listing, x-goog-api-key authority test); docs/api regenerated with no diff"
+  "source_sha256": "4b1a6e6cb2cd017ca45a68e0ddf9bc65ee9cc303e31618354cd6d106bbd30fba",
+  "reviewed_at": "2026-11-18T17:46:40Z",
+  "summary": "Move official SDK test model-key helpers into tests/sdk_fixtures.py (bare import like provider_fixtures); no runtime change"
 }
 ```
 <!-- architecture-review:end -->

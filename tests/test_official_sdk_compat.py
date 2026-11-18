@@ -22,6 +22,9 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 from openai import AsyncOpenAI
+from sdk_fixtures import model_key_principal as _model_key_principal
+from sdk_fixtures import personal_key_row as _personal_key_row
+from sdk_fixtures import record_holds as _record_holds
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -34,7 +37,6 @@ from lumen.main import app
 from lumen.models.chat_db import LlmModel, LlmProvider, LlmProviderAccount, LlmProviderCredential
 from lumen.services import api_key_store, credit, provider_client
 from lumen.services.providers import credentials, routing
-from tests.test_gemini_sdk_compat import _model_key_principal, _personal_key_row, _record_holds
 
 pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
 
