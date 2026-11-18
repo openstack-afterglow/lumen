@@ -718,6 +718,8 @@ async def test_admin_unit_image_readiness_rejects_variants_the_model_cannot_exec
     assert "1024x1024:auto" in readiness["supported_variants"]
     gate = created.json()["effective_capabilities"]["feature_gates"]["image_output"]
     assert gate["available"] is False and gate["reason_code"] == "unsupported_image_variants"
+    assert created.json()["effective_price_source"] == "partial"
+    assert created.json()["price_origin"] is None
 
     fixed = await admin_client.patch(f"{path}/{created.json()['id']}", json={"media_pricing": {
         "billing_basis": "unit", "image_variants": {"1024x1024:high": "0.08", "1024x1024:auto": "0.039"},
@@ -728,6 +730,7 @@ async def test_admin_unit_image_readiness_rejects_variants_the_model_cannot_exec
     assert readiness["executable_variants"] == ["1024x1024:auto"]
     assert readiness["unsupported_variants"] == ["1024x1024:high"]
     assert fixed.json()["effective_capabilities"]["feature_gates"]["image_output"]["available"] is True
+    assert fixed.json()["effective_price_source"] == "manual" and fixed.json()["price_origin"] == "manual"
 
 
 @pytest.mark.parametrize("model_name", ["no-matching-catalog", "gpt-4o"])
