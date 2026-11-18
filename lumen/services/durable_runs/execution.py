@@ -637,6 +637,10 @@ def _provider_credit_bound(
     )
     route = route if isinstance(route, dict) else capabilities
     limit = route.get("context_limit")
+    max_input_tokens = route.get("max_input_tokens")
+    if type(limit) is int and type(max_input_tokens) is int and max_input_tokens > 0:
+        output_budget = max_tokens if type(max_tokens) is int and max_tokens > 0 else 0
+        limit = min(limit - output_budget, max_input_tokens)
     count = provider_metadata.count_context_tokens(
         str(route.get("model_name") or run.model_name), messages, tool_schemas
     )
@@ -1039,6 +1043,7 @@ class _DurableExecutionHooks:
         model_name: str,
         context_limit: int,
         output_reserve: int,
+        max_input_tokens: int | None = None,
         revision: str,
         cause: str,
         plan: dict[str, Any] | None = None,
@@ -1116,6 +1121,7 @@ class _DurableExecutionHooks:
                 tool_schemas,
                 model_name=model_name,
                 context_limit=context_limit,
+                max_input_tokens=max_input_tokens,
                 output_reserve=output_reserve,
                 revision=revision,
                 checkpoint_id=str(checkpoint.id),
@@ -1160,6 +1166,7 @@ class _DurableExecutionHooks:
                 context_limit = int(context_limit) if context_limit is not None else None
             except (TypeError, ValueError):
                 context_limit = None
+            max_input_tokens = route_capabilities.get("max_input_tokens")
             output_reserve = int(payload.get("max_tokens") or 4096)
             source = payload.get("context_source") if isinstance(payload.get("context_source"), dict) else {}
             revision = str(source.get("revision") or f"run:{self.run_id}")
@@ -1169,6 +1176,7 @@ class _DurableExecutionHooks:
                 tool_schemas,
                 model_name=run.model_name,
                 context_limit=context_limit,
+                max_input_tokens=max_input_tokens,
                 output_reserve=output_reserve,
                 revision=revision,
                 plan=plan,
@@ -1265,6 +1273,7 @@ class _DurableExecutionHooks:
                 output_reserve,
                 {
                     "summary_context_limit": summary_context_limit,
+                    "summary_max_input_tokens": route.get("max_input_tokens"),
                     "summary_output_reserve": 512,
                     "summary_token_counter": lambda current, tools: provider_metadata.count_context_tokens(
                         summary_model_name, current, tools
@@ -1277,6 +1286,7 @@ class _DurableExecutionHooks:
                     "checkpoint_raw_prefix_count": checkpoint_raw_prefix_count,
                     "summary_projection_count": 1,
                 },
+                max_input_tokens=max_input_tokens,
                 token_counter=lambda current, tools: (
                     context_manager._count_result(
                         current, tools, lambda m, t: provider_metadata.count_context_tokens(run.model_name, m, t)
@@ -1375,6 +1385,7 @@ class _DurableExecutionHooks:
             tool_schemas=tool_schemas,
             model_name=run.model_name,
             context_limit=context_limit,
+            max_input_tokens=max_input_tokens,
             output_reserve=output_reserve,
             revision=revision,
             cause="manual" if self.force_compaction else "automatic",

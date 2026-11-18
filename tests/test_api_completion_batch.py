@@ -173,6 +173,27 @@ async def test_responses_admission_sends_the_frozen_output_budget(route_catalog)
     assert prepared.required_scopes == ("compat:batches:write", "native:tools:execute")
 
 
+@pytest.mark.parametrize("input_tokens", [900_000, 922_001])
+async def test_responses_batch_freezes_distinct_input_bound(route_catalog, input_tokens):
+    from lumen.services.capabilities import provider_capabilities
+
+    route_catalog["route"]["model_name"] = "gpt-6.2-sol"
+    route_catalog["route"]["capabilities"] = provider_capabilities("gpt-6.2-sol", "openai")
+    route_catalog["tokens"] = input_tokens
+    request = {"model": "gpt-6.2-sol", "input": "test", "max_output_tokens": 128_000}
+    if input_tokens > 922_000:
+        with pytest.raises(DurableRunInputError, match="context_length_exceeded"):
+            await api_completion.prepare_api_completion_run(request, operation="responses", project_id="p", user_id="u")
+        return
+    prepared = await api_completion.prepare_api_completion_run(request, operation="responses", project_id="p", user_id="u")
+    assert prepared.capability_snapshot["context_limit"] == 1_050_000
+    assert prepared.capability_snapshot["max_input_tokens"] == 922_000
+    assert prepared.pricing_snapshot["context_limit"] == 922_000
+    assert api_completion._frozen_bound(prepared.pricing_snapshot) == credit.call_credit_bound(
+        prepared.pricing_snapshot, input_tokens=922_000, output_tokens=128_000,
+    )
+
+
 @pytest.mark.parametrize("item", [
     {"id": "private-reference"},
     {"type": None, "id": "private-reference"},
