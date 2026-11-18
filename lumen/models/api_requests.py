@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+ModelRowId = Annotated[int, Field(strict=True, ge=1, le=2**63 - 1)]
 
 
 class OpenAIPromptCacheOptions(BaseModel):
@@ -172,8 +174,18 @@ class ImageOptions(BaseModel):
         return value
 
 
-class ImageGenerationRequest(ImageOptions):
-    model_id: str = Field(min_length=1, max_length=190)
+class NativeMediaModelSelection(BaseModel):
+    model_id: str | None = Field(default=None, min_length=1, max_length=190)
+    model_row_id: ModelRowId | None = None
+
+    @model_validator(mode="after")
+    def require_model(self):
+        if self.model_id is None and self.model_row_id is None:
+            raise ValueError("model_id or model_row_id is required")
+        return self
+
+
+class ImageGenerationRequest(ImageOptions, NativeMediaModelSelection):
     provider_id: int | None = None
 
 
@@ -223,10 +235,9 @@ class OpenAIImageGenerationRequest(ImageOptions):
         return self
 
 
-class SpeechRequest(BaseModel):
+class SpeechRequest(NativeMediaModelSelection):
     model_config = ConfigDict(extra="forbid")
 
-    model_id: str = Field(min_length=1, max_length=190)
     provider_id: int | str | None = None
 
     input: str = Field(min_length=1, max_length=4096)
@@ -235,15 +246,14 @@ class SpeechRequest(BaseModel):
 
     @field_validator("model_id", "input", "voice")
     @classmethod
-    def not_blank(cls, value: str) -> str:
-        if not value.strip():
+    def not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
             raise ValueError("audio fields must not be blank")
         return value
 
 
-class TranscriptionRequest(BaseModel):
+class TranscriptionRequest(NativeMediaModelSelection):
     model_config = ConfigDict(extra="forbid")
-    model_id: str = Field(min_length=1, max_length=190)
     provider_id: int | str | None = None
     input_asset_id: UUID
     language: str | None = Field(default=None, max_length=16, pattern=r"^[A-Za-z-]+$")
@@ -253,7 +263,7 @@ class TranscriptionRequest(BaseModel):
 
     @field_validator("model_id")
     @classmethod
-    def not_blank(cls, value: str) -> str:
-        if not value.strip():
+    def not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
             raise ValueError("audio model must not be blank")
         return value

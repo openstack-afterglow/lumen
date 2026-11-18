@@ -40,6 +40,7 @@ class ChatRun(Base):
     )
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    payer_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     source: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="web")
     # No FK: API-key revocation must not delete accepted run provenance.
@@ -233,6 +234,8 @@ class ChatModelCallReservation(Base):
 
     run_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("chat_runs.id", ondelete="RESTRICT"), primary_key=True)
     segment_id: Mapped[str] = mapped_column(VARCHAR(190), primary_key=True)
+    payer_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    payer_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     bound_credits: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     actual_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
     status: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="reserved")
@@ -242,6 +245,7 @@ class ChatModelCallReservation(Base):
     __table_args__ = (
         CheckConstraint("bound_credits >= 0", name="ck_model_call_bound"),
         CheckConstraint("actual_credits IS NULL OR actual_credits >= 0", name="ck_model_call_actual"),
+        Index("idx_model_call_payer_domain", "payer_domain_id", "status"),
     )
 
 

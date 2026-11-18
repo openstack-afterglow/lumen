@@ -22,6 +22,20 @@ from .common import _factory, _now, descriptor
 from .errors import DurableRunCursorExpired, DurableRunError, DurableRunNotFound
 
 
+async def owned_run_history_domain(*, run_id: str, project_id: str, user_id: str) -> str | None:
+    """Read admission's verified history domain without widening run ownership."""
+    async with _factory()() as session:
+        snapshot = await session.scalar(
+            select(ChatRun.capability_snapshot).where(
+                ChatRun.id == run_id, ChatRun.project_id == project_id, ChatRun.user_id == user_id,
+            )
+        )
+        if snapshot is None:
+            raise DurableRunNotFound("chat run was not found")
+        domain_id = snapshot.get("history_domain_id")
+        return domain_id if isinstance(domain_id, str) and domain_id else None
+
+
 async def owned_run_cancel_scopes(*, run_id: str, project_id: str, user_id: str) -> tuple[str, ...]:
     from lumen.services.inference_authority import cancel_run_scopes
 

@@ -146,6 +146,9 @@ class Settings(BaseSettings):
     keystone_domain: str = "Default"
     keystone_region_name: str = "RegionOne"
     keystone_interface: str = "internal"
+    afterglow_ingress_secret: SecretStr = Field(
+        default=SecretStr(""), validation_alias="LUMEN_AFTERGLOW_INGRESS_SECRET",
+    )
     frontend_base_url: str = ""
     public_api_base: str = ""
     cors_origins: str = ""

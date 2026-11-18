@@ -160,6 +160,7 @@ async def create_batch(
             project_id=principal["project_id"],
             user_id=principal["user_id"],
             api_key_id=principal.get("api_key_id"),
+            payer=principal.get("payer"),
             scopes=_scopes(principal),
             source=principal.get("source", "web"),
             idempotency_key=idempotency_key,

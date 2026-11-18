@@ -363,7 +363,9 @@ async def test_automatic_memory_generation_denies_current_downgraded_owner(monke
     monkeypatch.setattr(memory_extract.cs, "list_messages_for_run", AsyncMock(return_value=[{"role": "user", "content": "remember"}]))
     provider = AsyncMock(side_effect=AssertionError("memory provider started after downgrade"))
     monkeypatch.setattr(memory_extract.provider_client, "acompletion", provider)
-    assert await memory_extract.generate_memory_if_applicable(conversation_id="conv", project_id="project", run_id="run", user_id="owner") is None
+    assert await memory_extract.generate_memory_if_applicable(
+        conversation_id="conv", project_id="project", run_id="run", user_id="owner", domain_id="domain",
+    ) is None
     provider.assert_not_awaited()
 
 
@@ -463,7 +465,8 @@ async def test_denied_intrinsic_memory_completes_optional_job_without_mutating_c
     monkeypatch.setattr(memory_extract.provider_client, "acompletion", provider)
     monkeypatch.setattr(memory_jobs.ms, "apply_automatic_ops_in_transaction", apply)
     monkeypatch.setattr(memory_jobs, "_retry", retry)
-    assert await memory_jobs._process_claimed(("job", "run", "conv", "project", "owner"), owner="worker")
+    monkeypatch.setattr(memory_jobs, "revalidate", AsyncMock())
+    assert await memory_jobs._process_claimed(("job", "run", "conv", "project", "owner", "domain"), owner="worker")
     assert job.status == "completed" and job.progress == {"applied": {"add": 0, "update": 0, "delete": 0}}
     assert run.status == "completed" and messages[-1]["content"] == "already delivered answer"
     auth.resolve_project_authority.assert_awaited_once_with("owner", "project")

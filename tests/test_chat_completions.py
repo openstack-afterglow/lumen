@@ -67,6 +67,7 @@ async def test_extension_selection_expands_omitted_ids_for_default_chat(monkeypa
                 "params_schema": {"type": "object"},
                 "config_version": 1,
                 "effect": "read",
+                **({"credential_version": 3} if kind == "mcp" else {}),
             },
             {
                 "id": 8,
@@ -77,16 +78,11 @@ async def test_extension_selection_expands_omitted_ids_for_default_chat(monkeypa
                 "params_schema": {"type": "object"},
                 "config_version": 1,
                 "effect": "external_mutation",
+                **({"credential_version": 4} if kind == "mcp" else {}),
             },
         ]
 
-    async def fake_credential_versions(server_ids, *, user_id, project_id):
-        assert server_ids == [7, 8]
-        assert (user_id, project_id) == ("u1", "p1")
-        return {7: 3, 8: 4}
-
     monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
-    monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", fake_credential_versions)
 
     no_agent = await chat_admission._resolve_extension_selection(
         None, ChatFeatureOptions(), user_id="u1", project_id="p1"
@@ -121,16 +117,11 @@ async def test_mcp_selection_snapshots_credential_version(monkeypatch):
                 "url": "https://mcp.example",
                 "transport": "http",
                 "config_version": 1,
+                "credential_version": 4,
             }
         ]
 
-    async def credential_versions(server_ids, *, user_id, project_id):
-        assert server_ids == [7]
-        assert (user_id, project_id) == ("u1", "p1")
-        return {7: 4}
-
     monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
-    monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", credential_versions)
 
     selection = await chat_admission._resolve_extension_selection(
         {"tool_ids": [], "mcp_ids": [7]},
@@ -236,7 +227,8 @@ async def test_preview_tool_schemas_match_the_first_provider_request(monkeypatch
     )
 
 
-async def _ok_precheck(user_id, project_id=None, api_key_id=None):
+async def _ok_precheck(user_id, project_id=None, api_key_id=None, *, payer=None):
+    del payer
     return None
 
 
@@ -789,7 +781,7 @@ class TestExecutionCapabilityGate:
         monkeypatch.setattr(chat_admission.memory_host, "recall_for_run", load_memory)
 
         workspace, memories = await chat_admission._load_context(
-            {"workspace_id": None}, "u1", "p1", include_memory=True
+            {"workspace_id": None}, "u1", "p1", include_memory=True, memory_domain="domain"
         )
 
         assert workspace is None
@@ -800,6 +792,7 @@ class TestExecutionCapabilityGate:
             "project_id": "p1",
             "workspace_id": None,
             "include_account": True,
+            "domain_id": "domain",
             "strategy": "recency",
             "query": "",
             "limit": 30,
@@ -909,11 +902,12 @@ class TestCanonicalCompletionRequests:
         monkeypatch.setattr(
             chat_admission,
             "_resolve_agent",
-            lambda *_args: _return(
+            lambda *_args, **_kwargs: _return(
                 {
                     "id": 9,
                     "role": "general",
                     "instructions": None,
+                    "model_name": "stale-legacy-default",
                     "params": {},
                     "tool_ids": [],
                     "mcp_ids": [],
@@ -944,6 +938,7 @@ class TestCanonicalCompletionRequests:
         response = await client.post(f"{_BASE}/c1/completions", headers=_HEADERS, json=_request(agent_id="9"))
 
         assert response.status_code == 202
+        assert seen["model_name"] == "gpt-3.5-turbo"
         policy = seen["request_payload"]["execution_policy"]
         assert policy["max_model_turns"] == 3
         assert policy["max_tool_calls"] == 7
@@ -1074,9 +1069,71 @@ class TestCanonicalCompletionRequests:
         assert response.status_code == 422
 
 
+@pytest.mark.parametrize("path,method", [
+    ("conversations/c1/completions", "create_persistent_run"),
+    ("conversations/c1/messages/12/regenerate", "create_run"),
+    ("temp-completions", "create_temp_run"),
+    ("conversations/c1/context-preview", None),
+    ("temp-threads/t1/context-preview", None),
+])
+async def test_native_selection_exact_row_and_name_assertion(client, monkeypatch, path, method):
+    await _patch_text_execution(monkeypatch)
+    monkeypatch.setattr(cs, "find_turn_start_user", lambda *_args, **_kwargs: _return(
+        {"id": 12, "content": "original"}
+    ))
+    first = _resolved()
+    second = {**first, "model_id": 2, "provider_id": 20, "provider_name": "another endpoint",
+              "capabilities": {**first["capabilities"], "max_output_tokens": 2048}}
+    routes = {1: first, 2: second}
+
+    async def resolve_exact(row_id, *, model_kind):
+        assert model_kind == "text"
+        return routes.get(row_id)
+
+    async def resolve_name(name):
+        if name == first["model_name"]:
+            raise ps.AmbiguousModelRouteError("duplicate text model")
+        return None
+
+    monkeypatch.setattr(ps, "resolve_model_by_id", resolve_exact)
+    monkeypatch.setattr(ps, "resolve_model", resolve_name)
+    seen = {}
+
+    async def create(**kwargs):
+        seen.update(kwargs)
+        return ChatRunDescriptor(run_id="row-selected", status="queued", events_url="/events", cancel_url="/cancel")
+
+    if method is not None:
+        monkeypatch.setattr(admission, method, create)
+    body = {"parts": [{"type": "text", "text": "hi"}]} if not path.endswith("/regenerate") else {}
+    url = f"/api/v1/chat/{path}"
+    response = await client.post(url, headers=_HEADERS, json={**body, "model_row_id": 2})
+    assert response.status_code == (202 if method else 200), response.text
+    if method is None:
+        assert response.json()["output_reserve"] == 2048
+    else:
+        assert seen["intent"]["model_row_id"] == 2
+        assert seen["model_name"] == second["model_name"]
+        assert seen["capability_snapshot"]["provider_id"] == 20
+        assert seen["capability_snapshot"]["model_id"] == 2
+
+    mismatch = await client.post(url, headers=_HEADERS, json={**body, "model_id": "wrong", "model_row_id": 2})
+    assert mismatch.status_code == 422
+    assert mismatch.json()["detail"] == "model_selection_mismatch"
+    legacy = await client.post(url, headers=_HEADERS, json={**body, "model_id": first["model_name"]})
+    assert legacy.status_code == 409
+
+
 class TestRetryFailedRun:
-    async def test_retry_preserves_agent_and_mcp_extensions(self, client, monkeypatch):
+    @pytest.mark.parametrize("model_row_id", [None, 2])
+    async def test_retry_preserves_agent_and_mcp_extensions(self, client, monkeypatch, model_row_id):
         await _patch_text_execution(monkeypatch)
+
+        async def resolve_exact(row_id, *, model_kind):
+            assert (row_id, model_kind) == (2, "text")
+            return {**_resolved(), "model_id": 2, "provider_id": 20}
+
+        monkeypatch.setattr(ps, "resolve_model_by_id", resolve_exact)
         monkeypatch.setattr(
             completions,
             "get_settings",
@@ -1094,6 +1151,7 @@ class TestRetryFailedRun:
             project_id = "test-project-123"
             status = "failed"
             model_name = "gpt-3.5-turbo"
+            capability_snapshot = {"model_id": model_row_id, "provider_id": 20} if model_row_id is not None else {}
             agent_id = 7
             execution_mode = "chat"
             credit_ceiling = None
@@ -1136,7 +1194,9 @@ class TestRetryFailedRun:
         monkeypatch.setattr(
             chat_admission,
             "_resolve_agent",
-            lambda agent_id, user_id, project_id: _return({"id": 7, "instructions": "agent-7"}),
+            lambda agent_id, user_id, project_id, *, domain_id=None: _return(
+                {"id": 7, "instructions": "agent-7", "model_row_id": 3}
+            ),
         )
         mcp_item = {
             "id": 99,
@@ -1150,7 +1210,9 @@ class TestRetryFailedRun:
         monkeypatch.setattr(
             chat_admission,
             "_resolve_extension_selection",
-            lambda agent, features, *, user_id, project_id: _return({"tools": [], "mcp": [mcp_item]}),
+            lambda agent, features, *, user_id, project_id, token_info=None: _return(
+                {"tools": [], "mcp": [mcp_item]}
+            ),
         )
 
         async def fake_list_for_user(kind, **kwargs):
@@ -1172,7 +1234,7 @@ class TestRetryFailedRun:
         monkeypatch.setattr(
             cs,
             "path_ending_at",
-            lambda conversation_id, user_id, project_id, message_id: _return(
+            lambda conversation_id, user_id, project_id, message_id, *, domain_id: _return(
                 [{"role": "user", "content": "retry turn"}]
             ),
         )
@@ -1191,9 +1253,18 @@ class TestRetryFailedRun:
 
         monkeypatch.setattr(admission, "create_run", fake_create_run)
 
-        response = await client.post(f"{_BASE}/c1/runs/run-source-1/retry", headers=_HEADERS)
+        url = f"{_BASE}/c1/runs/run-source-1/retry"
+        mismatch = await client.post(url, headers=_HEADERS, json={"model_row_id": 3})
+        assert mismatch.status_code == 422
+        assert mismatch.json()["detail"] == "model_selection_mismatch"
+        assert not seen_create
+        response = await client.post(
+            url, headers=_HEADERS, **({"json": {"model_row_id": model_row_id}} if model_row_id else {}),
+        )
 
         assert response.status_code == 202, f"Failed with: {response.json()}"
+        assert seen_create["capability_snapshot"]["model_id"] == (model_row_id or 1)
+        assert seen_create["capability_snapshot"]["provider_id"] == (20 if model_row_id else 1)
         assert seen_create["request_payload"]["extension_snapshot"] == {"tools": [], "mcp": [mcp_item]}
         assert seen_create["request_payload"]["skill_ids"] == [3]
         assert seen_create["user_message_id"] == 12
@@ -1230,7 +1301,8 @@ class TestRetryFailedRun:
     async def test_retry_rejects_quota_exceeded_before_creating_run(self, client, monkeypatch):
         await _patch_text_execution(monkeypatch)
 
-        async def quota_exceeded(user_id, project_id=None, api_key_id=None):
+        async def quota_exceeded(user_id, project_id=None, api_key_id=None, *, payer=None):
+            del payer
             raise credit.QuotaExceeded("월간 사용량 쿼터를 초과했습니다")
 
         monkeypatch.setattr(credit, "precheck", quota_exceeded)
@@ -1351,7 +1423,8 @@ class TestApiKeyLimitAdmission:
         await _patch_text_execution(monkeypatch)
         recorded = []
 
-        async def spy_precheck(user_id, project_id=None, api_key_id=None):
+        async def spy_precheck(user_id, project_id=None, api_key_id=None, *, payer=None):
+            del payer
             recorded.append((user_id, project_id, api_key_id))
             raise HTTPException(status_code=418, detail="stop after precheck")
 
@@ -2066,12 +2139,19 @@ class TestContextOutputLimitFallback:
         assert state["can_compact"] is True
 
     @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    @pytest.mark.parametrize("exact", [False, True])
     async def test_compaction_without_output_limit_admits_owned_run(
-        self, client, monkeypatch, context_route, parent
+        self, client, monkeypatch, context_route, parent, exact,
     ):
         from lumen.services import context_manager
 
         resolved, source = context_route
+
+        async def resolve_exact(row_id, *, model_kind):
+            assert (row_id, model_kind) == (21, "text")
+            return {**resolved, "model_id": 21, "provider_id": 20}
+
+        monkeypatch.setattr(ps, "resolve_model_by_id", resolve_exact)
         seen = {}
         real_context_state = context_manager.context_state
 
@@ -2095,7 +2175,7 @@ class TestContextOutputLimitFallback:
             f"/api/v1/chat/{parent}/compactions",
             headers=_HEADERS,
             json={
-                "model_id": resolved["model_name"],
+                **({"model_row_id": 21} if exact else {"model_id": resolved["model_name"]}),
                 "features": {},
                 "expected_context_revision": source["revision"],
             },
@@ -2112,6 +2192,16 @@ class TestContextOutputLimitFallback:
         assert run["expected_context_revision"] == source["revision"]
         assert run["request_payload"]["context_source"] == source
         assert run["request_payload"]["max_tokens"] == 4096
+        if exact:
+            assert run["intent"]["model_row_id"] == 21
+            assert run["model_name"] == resolved["model_name"]
+            assert run["capability_snapshot"]["provider_id"] == 20
+            mismatch = await client.post(
+                f"/api/v1/chat/{parent}/compactions", headers=_HEADERS,
+                json={"model_id": "wrong", "model_row_id": 21, "expected_context_revision": source["revision"]},
+            )
+            assert mismatch.status_code == 422
+            assert mismatch.json()["detail"] == "model_selection_mismatch"
 
     @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
     @pytest.mark.parametrize(
@@ -2164,8 +2254,9 @@ class TestContextOutputLimitFallback:
     ):
         resolved, source = context_route
 
-        async def deny_conversation(_conversation_id, *, user_id, project_id):
+        async def deny_conversation(_conversation_id, *, user_id, project_id, domain_id):
             assert (user_id, project_id) == ("test-user-123", "test-project-123")
+            assert domain_id == "test-domain-123"
             raise cs.ConversationForbidden("conversation is not accessible")
 
         async def deny_thread(**kwargs):

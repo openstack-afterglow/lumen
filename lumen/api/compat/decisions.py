@@ -26,9 +26,13 @@ async def create_decision(body: DecisionRequest,
         result = await decisions.decide(
             route=route, body=body, user_id=principal["user_id"], project_id=principal["project_id"],
             api_key_id=principal.get("api_key_id"), required_scopes=("decisions:write",), source="api",
+            payer=principal.get("payer"),
         )
     except decisions.DecisionError as exc:
-        return openai_error_response(exc.status_code, exc.message, code="decision_error")
+        return openai_error_response(
+            exc.status_code, exc.message,
+            code="domain_credit_insufficient" if exc.message == "domain_credit_insufficient" else "decision_error",
+        )
     return {key: result[key] for key in ("model", "answers", "usage")}
 
 
@@ -42,10 +46,13 @@ async def create_gemini_decision(
 ):
     body = parse_gemini_request(request, await request.body())
     try:
-        route = await decisions.resolve(body.model.removeprefix("models/"), provider_type="gemini")
+        model = body.model.removeprefix("models/") if body.model is not None else None
+        route = (await decisions.resolve(model, model_row_id=body.model_row_id, provider_type="gemini")
+                 if body.model_row_id is not None else await decisions.resolve(model, provider_type="gemini"))
         return await gemini_decisions.decide(
             route=route, body=body, user_id=principal["user_id"], project_id=principal["project_id"],
             api_key_id=principal.get("api_key_id"), required_scopes=("decisions:write",),
+            payer=principal.get("payer"),
         )
     except decisions.DecisionError as exc:
         raise HTTPException(exc.status_code, exc.message) from exc

@@ -81,6 +81,7 @@ class ChatBatch(Base):
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     # No FK: accepted batch provenance survives API-key revocation/removal.
     api_key_id: Mapped[int | None] = mapped_column(BIGINT)
+    payer_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     contract: Mapped[str] = mapped_column(VARCHAR(10), nullable=False)
     endpoint: Mapped[str | None] = mapped_column(VARCHAR(64))
     status: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="validating", server_default="validating")

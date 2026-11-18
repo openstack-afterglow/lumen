@@ -165,6 +165,9 @@ async def chat_completions(
         return openai_error_response(exc.status_code, exc.message)
 
     if openai_compat.is_lumen_virtual_model(body.model):
+        if token_info.get("credential_class") in {"personal_key", "service_key"}:
+            return openai_error_response(403, "Virtual model is unavailable to model API keys.",
+                                         code="model_not_allowed_for_key")
         if body.provider_options():
             return openai_error_response(422, "Provider options are not supported for model=lumen",
                                          code="provider_options_not_supported_for_lumen")
@@ -190,6 +193,7 @@ async def chat_completions(
                 user_id=user_id,
                 project_id=project_id,
                 api_key_id=api_key_id,
+                payer=token_info.get("payer"),
                 source=source,
                 max_tokens=capped_max_tokens,
                 temperature=validated_temp,
@@ -239,9 +243,9 @@ async def chat_completions(
 
     try:
         resolved = await core.resolve_api(body.model, provider=selected_provider)
-        await core.precheck(user_id, project_id, api_key_id=api_key_id)
+        await core.precheck(user_id, project_id, api_key_id=api_key_id, payer=token_info.get("payer"))
     except core.CompletionError as exc:
-        return openai_error_response(exc.status_code, exc.message)
+        return openai_error_response(exc.status_code, exc.message, code=exc.code)
 
     cmpl_id, created = _completion_id(), int(time.time())
     options = body.provider_options()
@@ -260,6 +264,7 @@ async def chat_completions(
                 user_id=user_id,
                 project_id=project_id,
                 api_key_id=api_key_id,
+                payer=token_info.get("payer"),
                 max_tokens=max_output,
                 temperature=body.temperature,
                 tools=body.tools,
@@ -279,6 +284,7 @@ async def chat_completions(
             user_id=user_id,
             project_id=project_id,
             api_key_id=api_key_id,
+            payer=token_info.get("payer"),
             max_tokens=max_output,
             temperature=body.temperature,
             tools=body.tools,
@@ -322,7 +328,6 @@ async def list_models(
     ),
     token_info: dict = Depends(require_api_key_scopes("models:read")),
 ):
-    del token_info
     try:
         models = await routing.list_api_models()
         models.extend(await routing.list_api_models(model_kind="embedding"))
@@ -330,5 +335,9 @@ async def list_models(
         models = []
     if x_lumen_provider is not None:
         models = [model for model in models if model.get("api_provider") == x_lumen_provider]
-    include_lumen = x_lumen_provider is None and await openai_compat.is_virtual_model_active(models)
+    include_lumen = (
+        x_lumen_provider is None
+        and token_info.get("credential_class") not in {"personal_key", "service_key"}
+        and await openai_compat.is_virtual_model_active(models)
+    )
     return models_list(models, include_lumen=include_lumen)

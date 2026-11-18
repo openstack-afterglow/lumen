@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from pydantic import AfterValidator, Field, StrictStr, TypeAdapter, model_validator
 
+from lumen.models.api_requests import ModelRowId
 from lumen.models.decision_contracts import WireModel
 
 MAX_GEMINI_DECISION_BODY_BYTES = 20 * 1024 * 1024
@@ -177,7 +178,8 @@ _QUESTION = TypeAdapter(QuestionType)
 
 
 class GeminiDecisionRequest(WireModel):
-    model: ModelName
+    model: ModelName | None = None
+    model_row_id: ModelRowId | None = None
     input: SharedInput
     questions: Annotated[dict[str, QuestionType], Field(min_length=1, max_length=MAX_QUESTIONS)]
 
@@ -197,6 +199,8 @@ class GeminiDecisionRequest(WireModel):
 
     @model_validator(mode="after")
     def nonempty_input(self):
+        if self.model is None and self.model_row_id is None:
+            raise ValueError("model or model_row_id is required")
         if not isinstance(self.input, str) and not any(
             isinstance(part, ImageContent) or part.text for part in _blocks(self.input)
         ):

@@ -12,6 +12,7 @@ from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 import httpx
 
 from lumen.config import get_settings
+from lumen.models.billing import Payer
 from lumen.models.decision_contracts import DecisionRequest
 from lumen.services import credit, provider_metadata, stateless_credit
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
@@ -43,13 +44,30 @@ class DecisionError(Exception):
         super().__init__(message)
 
 
-async def resolve(model: str, *, provider_type: str | None = None, openai_compat: bool = False) -> dict:
+async def resolve(
+    model: str | None, *, model_row_id: int | None = None,
+    provider_type: str | None = None, openai_compat: bool = False,
+) -> dict:
     try:
-        route = await routing.resolve_api_model(
-            model, model_kind="text" if openai_compat else ("text", "decision"),
-            provider_type=provider_type, required_capabilities=("decisions",),
-        )
-        if route is None and openai_compat:
+        if model_row_id is not None:
+            route = await routing.resolve_model_by_id(
+                model_row_id, model_kind=("text", "decision"), required_capabilities=("decisions",),
+            )
+            if route is not None:
+                selected_type = route["provider_type"]
+                if provider_type is not None and provider_type != selected_type:
+                    raise DecisionError(422, "model_selection_mismatch")
+                selector = model.removeprefix("models/") if model is not None and selected_type == "gemini" else model
+                if selector is not None and not routing.matches_api_model_selector(route, selector):
+                    raise DecisionError(422, "model_selection_mismatch")
+        else:
+            if model is None:
+                raise DecisionError(422, "model or model_row_id is required")
+            route = await routing.resolve_api_model(
+                model, model_kind="text" if openai_compat else ("text", "decision"),
+                provider_type=provider_type, required_capabilities=("decisions",),
+            )
+        if route is None and openai_compat and model is not None:
             gemini_route = await routing.resolve_api_model(
                 model.removeprefix("models/"), model_kind="decision", provider_type="gemini",
                 required_capabilities=("decisions",),
@@ -257,7 +275,7 @@ async def transport(route: dict, body: DecisionRequest, *, on_dispatch: Callable
     if provider_metadata.direct_provider_route("openai", base):
         base = "https://api.openai.com/v1"
     url = base.rstrip("/") + "/decisions"
-    payload = body.model_dump(exclude_none=True, exclude_unset=True)
+    payload = body.model_dump(exclude_none=True, exclude_unset=True, exclude={"model_row_id"})
     payload["model"] = route["api_model_name"]
     try:
         async with (
@@ -294,7 +312,9 @@ async def transport(route: dict, body: DecisionRequest, *, on_dispatch: Callable
 
 
 async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id: str,
-                 api_key_id: int | None, required_scopes: tuple[str, ...], source: str = "api") -> dict:
+                 api_key_id: int | None, required_scopes: tuple[str, ...], source: str = "api",
+                 payer: Payer | None = None,
+                 ) -> dict:
     _validate_route(route)
     tokens = input_token_bound(body)
     bound = credit_bound(route, tokens)
@@ -312,6 +332,7 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
             provider=route.get("provider_name"), prompt_tokens=usage["input_tokens"],
             completion_tokens=usage["output_tokens"], usage_cost=cost,
             margin_multiplier=route["margin_multiplier"], source=source, api_key_id=api_key_id,
+            payer=payer,
             breakdown=breakdown, execution_route=route,
             usage_components=[{"kind": "decision", "category": "decision", "unit": "request", "quantity": "1",
                                "cost_usd": str(cost.raw_cost), "input_tokens": usage["input_tokens"],
@@ -322,6 +343,7 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
 
     response, settled = await accounted_call(
         user_id=user_id, project_id=project_id, api_key_id=api_key_id, required_scopes=required_scopes,
+        payer=payer,
         bound=bound, dispatch=lambda mark: transport(route, body, on_dispatch=mark), account=account,
     )
     answers = validate_answers(response.get("answers"), body)
@@ -330,6 +352,7 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
 
 async def accounted_call(*, user_id: str, project_id: str, api_key_id: int | None,
                          required_scopes: tuple[str, ...], bound: Decimal,
+                         payer: Payer | None = None,
                          dispatch: Callable[[Callable[[], None]], Awaitable[dict]],
                          account: Callable[[str, dict], Awaitable[dict]]) -> tuple[dict, dict]:
     """Fence caller, hold shared credit, dispatch once, and account trusted usage."""
@@ -344,7 +367,7 @@ async def accounted_call(*, user_id: str, project_id: str, api_key_id: int | Non
         await authorize_new_io(user_id=user_id, project_id=project_id, api_key_id=api_key_id,
                                required_scopes=required_scopes)
         await stateless_credit.reserve(event_id=event_id, user_id=user_id, project_id=project_id,
-                                       api_key_id=api_key_id, bound=bound)
+                                       api_key_id=api_key_id, bound=bound, payer=payer)
         reserved = True
         response = await dispatch(mark_dispatched)
         settled = await account(event_id, response)
@@ -372,6 +395,6 @@ async def accounted_call(*, user_id: str, project_id: str, api_key_id: int | Non
     finally:
         if reserved:
             try:
-                await asyncio.shield(stateless_credit.finish(event_id, uncertain=sent))
+                await asyncio.shield(stateless_credit.finish(event_id, uncertain=sent, payer=payer))
             except Exception:
                 logger.exception("Decision reservation cleanup failed event_id=%s", event_id)

@@ -289,6 +289,43 @@ async def test_child_credit_overrun_blocks_child_and_parent_without_recharging_r
         assert (await session.get(ChatRun, root_id)).reserved_credits == Decimal("1.2")
 
 
+async def test_frozen_child_requires_current_project_domain_before_new_io(family, current_project_authority):
+    from lumen.models.chat_db import ChatAgent
+    from lumen.models.chat_runs import ChatRunSegment
+    from lumen.services.durable_runs.execution import _DurableExecutionHooks
+
+    factory, project, user, _root_id, _group_id, child_ids, owner = family
+    child_id = child_ids[0]
+    async with factory() as session, session.begin():
+        agent = ChatAgent(owner_user_id=user, project_id="agent-origin", domain_id="original-domain", name="Agent")
+        session.add(agent)
+        await session.flush()
+        agent_id = agent.id
+        child = await session.get(ChatRun, child_id)
+        child.agent_id = agent_id
+        child.status = "running"
+        child.lease_owner = owner
+        child.lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+    try:
+        hooks = _DurableExecutionHooks(run_id=child_id, owner=owner)
+        current_project_authority.return_value["domain_id"] = "different-domain"
+        with pytest.raises(children.ChildFailure, match="delegate agent is not available"):
+            await hooks.tool_started(round_index=0, tool_index=0, tool_call_id="tool-1", tool_name="ordinary-tool")
+        current_project_authority.assert_awaited_with(user, project)
+        async with factory() as session:
+            assert await session.get(ChatRunSegment, (child_id, "tool:0:0")) is None
+
+        current_project_authority.return_value["domain_id"] = "original-domain"
+        assert await hooks.tool_started(
+            round_index=0, tool_index=0, tool_call_id="tool-1", tool_name="ordinary-tool",
+        ) is None
+        async with factory() as session:
+            assert (await session.get(ChatRunSegment, (child_id, "tool:0:0"))).status == "provider_started"
+    finally:
+        async with factory() as session, session.begin():
+            await session.execute(delete(ChatAgent).where(ChatAgent.id == agent_id))
+
+
 @pytest.mark.parametrize("family", ["ON", "OFF"], indirect=True)
 @pytest.mark.parametrize("target", ["root", "child"])
 async def test_bounded_call_settlement_survives_concurrent_delta(family, monkeypatch, target):
@@ -440,7 +477,9 @@ async def test_expired_parent_lease_requeues_prepared_children_without_an_unresu
 
 
 @pytest.mark.parametrize("restricted", [False, True], ids=["human-parent", "reduced-parent"])
-async def test_two_child_group_commits_resources_and_replays_without_duplicate_reservations(monkeypatch, restricted):
+async def test_two_child_group_commits_resources_and_replays_without_duplicate_reservations(
+    monkeypatch, restricted, current_project_authority,
+):
     """Two siblings must commit atomically despite ledger/resource lock-class boundaries."""
     from types import SimpleNamespace
 
@@ -458,6 +497,9 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
     user = f"spawn-it-{nonce}"
     root_id, pool_id = str(uuid.uuid4()), str(uuid.uuid4())
     owner = f"spawn-worker-{nonce}#1"
+    origin = project if restricted else f"origin-{nonce}"
+    domain = None if restricted else f"domain-{nonce}"
+    current_project_authority.return_value["domain_id"] = f"domain-{nonce}"
     policy = default_execution_policy().model_copy(update={"can_delegate_read": True, "max_children": 2, "max_parallel_children": 2})
     original_authority = {
         "credential_restricted": True, "user_id": user, "source_project_id": project,
@@ -475,8 +517,8 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
                 region_name="RegionOne", image_ref="sha256:" + "a" * 64,
                 profile_digest="b" * 64, max_replicas=2,
             ))
-            parent_agent = ChatAgent(owner_user_id=user, project_id=project, name="Parent", is_active=True)
-            child_agent = ChatAgent(owner_user_id=user, project_id=project, name="Child", is_active=True)
+            parent_agent = ChatAgent(owner_user_id=user, project_id=origin, domain_id=domain, name="Parent", is_active=True)
+            child_agent = ChatAgent(owner_user_id=user, project_id=origin, domain_id=domain, name="Child", is_active=True)
             session.add_all([parent_agent, child_agent])
             await session.flush()
             parent_agent.delegable_agent_ids = [child_agent.id]
@@ -493,7 +535,9 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
                 credit_ceiling=Decimal("2"), sandbox_seconds_ceiling=60,
             ))
 
-        async def resolved_inputs(_parent, _payload, _call, _agent):
+        async def resolved_inputs(_parent, _payload, _call, _agent, *, domain_id):
+            assert domain_id == domain
+            assert _parent.project_id == project
             return {
                 "policy": policy, "direct_effects": frozenset({"read"}),
                 "route": {"model_name": "scripted-child"},
@@ -534,6 +578,7 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
             quota = await session.get(ChatProjectAgentQuota, project)
             root = await session.get(ChatRun, root_id)
             assert {row.id for row in rows} == set(child_ids)
+            assert all(row.project_id == project for row in rows)
             assert all(row.capability_snapshot.get("credential_authority") == original_authority for row in rows)
             if not restricted:
                 assert all("credential_authority" not in row.capability_snapshot for row in rows)
@@ -559,7 +604,7 @@ async def test_two_child_group_commits_resources_and_replays_without_duplicate_r
                 await session.execute(delete(ChatDelegationGroup).where(ChatDelegationGroup.id.in_(group_ids)))
             await session.execute(delete(ChatRun).where(ChatRun.id.in_(child_ids)))
             await session.execute(delete(ChatRun).where(ChatRun.id == root_id))
-            await session.execute(delete(ChatAgent).where(ChatAgent.project_id == project))
+            await session.execute(delete(ChatAgent).where(ChatAgent.owner_user_id == user, ChatAgent.project_id == origin))
             await session.execute(delete(ChatRuntimePool).where(ChatRuntimePool.id == pool_id))
             await session.execute(delete(ChatProjectAgentQuota).where(ChatProjectAgentQuota.project_id == project))
         await close_db()

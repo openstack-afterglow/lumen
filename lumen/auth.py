@@ -51,6 +51,7 @@ class Principal(TypedDict):
     credential_kind: NotRequired[str]
     expires_at: NotRequired[object]
     token: NotRequired[str]
+    ingress_verified: NotRequired[bool]
 
 
 @dataclass
@@ -502,6 +503,7 @@ async def get_principal(
 ) -> Principal:
     """Resolve exactly one Keystone or scoped API-key credential for user routes."""
     from lumen.services import api_key_store as aks
+    from lumen.services.afterglow_ingress import verify as verify_afterglow_ingress
 
     del _keystone_token, _keystone_bearer, _api_key_bearer, _x_api_key
 
@@ -569,6 +571,7 @@ async def get_principal(
         except Exception as exc:
             raise HTTPException(status_code=401, detail="인증 실패") from exc
 
+    principal["ingress_verified"] = verify_afterglow_ingress(request, keystone_token=keystone_token)
     request.state.token_info = principal
     return principal
 

@@ -78,6 +78,10 @@ async def lifespan(app: FastAPI):
 async def _service_lifespan(app: FastAPI):
     configure_logging("api")
     settings = get_settings()
+    from lumen.services.afterglow_ingress import ingress_key
+
+    if ingress_key() is None:
+        logger.warning("Agent Vault disabled: LUMEN_AFTERGLOW_INGRESS_SECRET must contain at least 32 bytes")
     registry = get_registry()
     # Approved distributions/versions are checked before any entry point is imported;
     # an incompatible or missing required plugin stops the process instead of falling back.
@@ -108,6 +112,12 @@ async def _service_lifespan(app: FastAPI):
 
         await setup_semantic_memory()
 
+    scope_backfill = None
+    if settings.database_url:
+        from lumen.services.domain_scope_backfill import startup_domain_scope_backfill
+
+        scope_backfill = asyncio.create_task(startup_domain_scope_backfill(), name="domain-scope-backfill")
+
     logger.info("api ready")
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
@@ -116,7 +126,12 @@ async def _service_lifespan(app: FastAPI):
             settings.chat_semantic_memory_enabled,
         )
 
-    yield
+    try:
+        yield
+    finally:
+        if scope_backfill is not None:
+            scope_backfill.cancel()
+            await asyncio.gather(scope_backfill, return_exceptions=True)
 
     try:
         from lumen.services.checkpointer import chat_checkpointer
@@ -354,8 +369,11 @@ from lumen.api import (
     chat_workspaces_router,
     claude_gateway,
 )
+from lumen.api import domain_pools as domain_pool_routes
+from lumen.api import extension_archives as extension_archive_routes
 from lumen.api import plugins as plugin_routes
 from lumen.api import policy as policy_routes
+from lumen.api import vault as vault_routes
 from lumen.api.compat import anthropic as compat_anthropic
 from lumen.api.compat import audio as compat_audio
 from lumen.api.compat import batches as compat_batches
@@ -375,6 +393,7 @@ from lumen.auth import require_chat_api_host
 app.include_router(policy_routes.router, prefix="/v1", tags=["Policy"])
 app.include_router(plugin_routes.admin_router, prefix="/v1", tags=["Plugin Administration"])
 app.include_router(plugin_routes.router, prefix="/v1", tags=["Plugin Catalogue"])
+app.include_router(vault_routes.router, prefix="/v1", tags=["Agent Vault"])
 app.include_router(agent_runtime_routes.admin_router, prefix="/v1", tags=["Agent Runtime Administration"])
 app.include_router(agent_runtime_routes.router, prefix="/v1", tags=["Agent Runtime"])
 for router, tag in (
@@ -395,7 +414,9 @@ for router, tag in (
     (chat_mcp_oauth_router, "Chat MCP OAuth"),
     (chat_extensions_admin_router, "Chat Extensions Admin"),
     (chat_extensions_user_router, "Chat Extensions"),
+    (extension_archive_routes.router, "Chat Extension Archives"),
     (chat_usage_router, "Chat Usage"),
+    (domain_pool_routes.router, "Domain Credits"),
     (chat_stats_router, "Chat Stats"),
     (chat_quotas_router, "Chat Quotas"),
     (chat_admin_router, "Chat Administration"),
@@ -453,6 +474,7 @@ def custom_openapi() -> dict:
         batch_item_scopes,
     )
     from lumen.models.chat_contracts import _CHAT_RUN_EVENT
+    from lumen.models.decision_contracts import NativeDecisionRequest
     from lumen.models.gemini_decision_contracts import GeminiDecisionRequest
     from lumen.service_authority import MODEL_API_KEY_ROUTE_SCOPES
 
@@ -684,6 +706,12 @@ def custom_openapi() -> dict:
     for def_name, def_schema in gemini_schema.pop("$defs", {}).items():
         components_schemas[f"GeminiDecision_{def_name}"] = def_schema
     components_schemas["GeminiDecisionRequest"] = gemini_schema
+    decision_schema = NativeDecisionRequest.model_json_schema(
+        ref_template="#/components/schemas/NativeDecision_{model}",
+    )
+    for def_name, def_schema in decision_schema.pop("$defs", {}).items():
+        components_schemas[f"NativeDecision_{def_name}"] = def_schema
+    components_schemas["NativeDecisionRequest"] = decision_schema
 
     def _fix_refs(obj: Any) -> None:
         if isinstance(obj, dict):

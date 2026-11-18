@@ -193,3 +193,14 @@ def test_domain_mcp_owner_check_matches_orm_and_is_registered():
     ]
     checks = [item for item in ChatMcpServer.__table__.constraints if isinstance(item, CheckConstraint)]
     assert any(item.name == name and str(item.sqltext) == expression for item in checks)
+
+
+def test_agent_model_identity_migration_only_adds_nullable_row_id():
+    from lumen.models.chat_db import ChatAgent
+
+    migration = next(item for item in load_manifest() if item.logical_id == "039-agent-model-identity")
+    assert _statements(MIGRATIONS / migration.relative_path) == [
+        "ALTER TABLE chat_agents\n    ADD COLUMN IF NOT EXISTS model_row_id BIGINT NULL"
+    ]
+    selection = ChatAgent.__table__.c.model_row_id
+    assert selection.nullable and not selection.foreign_keys

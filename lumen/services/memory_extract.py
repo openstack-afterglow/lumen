@@ -152,6 +152,7 @@ async def generate_memory_if_applicable(
     project_id: str,
     run_id: str,
     user_id: str,
+    domain_id: str,
 ) -> list[dict] | None:
     """Return validated deltas; unconfigured models, denied authority and malformed output skip extraction."""
     try:
@@ -162,7 +163,9 @@ async def generate_memory_if_applicable(
         return None
 
     try:
-        existing = await ms.list_memories(user_id=user_id, project_id=project_id)
+        existing = await ms.list_memories(
+            user_id=user_id, project_id=project_id, domain_id=domain_id, include_account=False,
+        )
         msgs = await cs.list_messages_for_run(run_id, user_id=user_id, project_id=project_id)
     except Exception as exc:
         raise MemoryExtractionRetryable("memory source loading failed") from exc
@@ -172,7 +175,6 @@ async def generate_memory_if_applicable(
         if (
             memory.get("is_active") is True
             and memory.get("scope") == "project"
-            and memory.get("project_id") == project_id
             and memory.get("status") == "active"
         )
     ][:_MAX_EXISTING]

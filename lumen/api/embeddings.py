@@ -30,6 +30,7 @@ async def create_embeddings(body: EmbedRequest,
         result = await embeddings.embed(
             route=route, inputs=body.input, user_id=principal["user_id"], project_id=principal["project_id"],
             api_key_id=principal.get("api_key_id"), required_scopes=("embeddings:write",),
+            payer=principal.get("payer"),
             dimensions=body.dimensions,
         )
     except embeddings.EmbeddingError as exc:

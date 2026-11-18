@@ -308,6 +308,7 @@ async def _serve() -> None:
     from lumen.services.memory_outbox import process_one as process_memory_outbox
     from lumen.services.semantic_memory import semantic_memory_available, setup_semantic_memory
     from lumen.services.title_jobs import process_one as process_title_generation
+    from lumen.services.vault_migration import process_one as process_vault_import
 
     if settings.chat_semantic_memory_enabled:
         try:
@@ -335,6 +336,9 @@ async def _serve() -> None:
 
     async def extract_memory() -> None:
         await process_memory_extraction(owner=registration_id)
+
+    async def import_legacy_memories() -> None:
+        await process_vault_import(owner=registration_id)
 
     async def reconcile_workspaces() -> None:
         workspace_policy = configured_workspace_policy(settings)
@@ -392,6 +396,7 @@ async def _serve() -> None:
             _Maintenance("workspace_reconcile", reconcile_workspaces, interval=1.0),
             _Maintenance("input_expiry", expire_inputs, interval=1.0),
             _Maintenance("memory_extraction", extract_memory, interval=0.5),
+            _Maintenance("vault_import", import_legacy_memories, interval=2.0),
         ]
         if memory_outbox_enabled:
             auxiliary_jobs.append(_Maintenance("memory_outbox", outbox, interval=0.5))

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from lumen_plugin_api.contracts import ExecutionContext, PluginError
+from lumen_plugin_api.contracts import ExecutionContext, Namespace, PluginError
 from lumen_plugin_api.mcp import McpGeneratedFile, McpRemoteProvider, McpToolOutput
 
 from lumen.plugins.registry import get_plugin
@@ -54,5 +54,18 @@ async def discover_tools(server: dict[str, Any], *, context: ExecutionContext | 
 
 
 async def call_tool(server: dict[str, Any], tool_name: str, args: dict[str, Any], *, context: ExecutionContext, expected_credential_epoch: int | None) -> str | McpToolOutput:
-    output = await _provider().call_tool(server, tool_name, args, context=context, expected_credential_epoch=expected_credential_epoch)
+    from lumen.services.mcp_oauth import OAuthFence, frozen_credentials
+
+    if server.get("auth_mode") == "oauth":
+        if type(expected_credential_epoch) is not int or expected_credential_epoch < 1:
+            raise PluginError("plugin_authority_revoked")
+        namespace = Namespace(user_id=context.user_id, project_id=context.project_id)
+        with frozen_credentials(namespace, {server["id"]: OAuthFence.from_server(server, expected_credential_epoch)}):
+            output = await _provider().call_tool(
+                server, tool_name, args, context=context, expected_credential_epoch=expected_credential_epoch,
+            )
+    else:
+        output = await _provider().call_tool(
+            server, tool_name, args, context=context, expected_credential_epoch=expected_credential_epoch,
+        )
     return output if output.files else output.text

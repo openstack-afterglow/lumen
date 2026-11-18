@@ -1,5 +1,21 @@
 # 테스트
 
+## Prepaid domain billing (migration 037)
+
+`test-defined`: `tests/integration/test_domain_credit.py` uses the migrated, disposable MariaDB. It races two humans and a service-key-shaped hold against a dashboard provider intent, checks project-quota lock order from two sessions, and checks nested allocation accounting. It also covers duplicate settlement/release/top-up, ledger balance, live manager denial, and the effective admin ceiling. No paid provider calls run in these tests.
+
+## Native catalog row selection (migration 039)
+
+`test-passed` on the model-identity slice: 1,066 focused pytest cases and Ruff on changed Python files. Coverage includes duplicate model names under separate provider connections, exact kind filters, native route assertions, legacy media decimal IDs, agent create/update/clone and child routing, retry after an agent model change, and unchanged OpenAI/Anthropic request schemas. Synthetic upstream tests confirm that local row IDs never enter the Decisions provider payload.
+
+`test-passed` after compatibility corrections: 1,025 focused cases and Ruff. Coverage includes explicit root selection with a stale or ambiguous name-only agent default, exact agent pin enforcement, shared legacy alias checks, and 409 responses for ambiguous OpenAI-compatible image generation and speech.
+
+The migration manifest and ORM contract passed locally. The history projection has a MariaDB integration case; that test and migration application against MariaDB were not run for this slice. No live provider or deployment check ran.
+
+## Agent Vault (migration 040)
+
+`test-passed`: focused pytest passed 164 cases on migrated disposable MariaDB 10.11.19; Ruff passed on touched Python files. `tests/integration/test_agent_vault.py` covers Vault scoping, decrypt fences, hash races, append-only records, account/project/workspace imports, extraction, Markdown and a dashboard graph tool round trip. `tests/test_afterglow_ingress.py` exercises actual Vault and persistent chat routes with signed, missing and invalid proofs, including token and project header changes. `tests/test_vault_secret.py` covers all nine detector patterns and ECMAScript whitespace parity. A local YAML/Jinja render confirms the Kolla API-only signer setting and disabled defaults. Keystone, the semantic index and the model are synthetic; no live authentication, pgvector, paid inference or deployment is verified.
+
 ## Lumen 0.6.20 — 발행·운영 배포·OpenAI 유료 확인
 
 - `live-verified`: `0.6.20` tag는 `d2751b6d76d34e58dfa04a0a405652ea3b2d154f`(검토한 `ed1e77d`와 트리 동일)이다. PR CI [`44288865371`](https://github.com/openstack-afterglow/lumen/actions/runs/44288865371), `dev` CI [`44290416680`](https://github.com/openstack-afterglow/lumen/actions/runs/44290416680), tag 이미지 [`44290538562`](https://github.com/openstack-afterglow/lumen/actions/runs/44290538562), 패키지 [`44290538570`](https://github.com/openstack-afterglow/lumen/actions/runs/44290538570)가 통과했다. 패키지 workflow가 미리 만든 [한영 GitHub Release](https://github.com/openstack-afterglow/lumen/releases/tag/0.6.20) 초안을 휠 8개와 함께 11:05:42 UTC에 게시했고(배포 전, 배포 대기로 표기), 배포 후 수신증으로 본문을 갱신했다.
@@ -698,6 +714,17 @@ uv run pytest -m "not integration and not system" tests
 # SDK 독립 검증 및 린트
 (cd sdk && uv run pytest && uv run ruff check .)
 ```
+
+### Migration 036 domain-scope acceptance (local test-passed)
+
+Focused contract pytest: 555 passed. Ruff passed for changed Python files. The disposable MariaDB/Redis integration run applied the ledger without schema repair and passed 76 tests, including ORM and schema snapshot drift checks:
+
+```sh
+uv run --frozen --offline --extra service --extra dev lumen-test integration -q --tb=short \
+  -k 'domain_scope_backfill or domain_history or shared_history_migration or agent_domain_scope or child_runs or mcp_domain_connections or mcp_connections_db or mcp_owner_activation or schema_snapshot or orm_declarations'
+```
+
+The integration slice proves same-user/domain history and agent behavior, origin-only legacy fallback, current-project run/asset authority, MCP activation and credential revision fences, archive recovery, same-server state replacement, and multi-account deduplication. Keystone fixtures are synthetic. No live Keystone, production upgrade, or cross-slice key and billing claims are included.
 
 ---
 

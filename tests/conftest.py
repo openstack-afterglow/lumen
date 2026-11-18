@@ -121,6 +121,7 @@ def _token_info(*, is_system_admin: bool) -> dict[str, object]:
         "user_id": "test-user-123",
         "username": "testuser",
         "project_id": "test-project-123",
+        "domain_id": "test-domain-123",
         "project_name": "test-project",
         "domain_id": "test-domain-123",
         "roles": ["admin", "member"] if is_system_admin else ["member"],
@@ -139,6 +140,7 @@ async def _client_for(mock_conn, *, is_system_admin: bool):
             "api_key_id": None,
             "scopes": (),
             "source": "web",
+            "ingress_verified": True,
         }
 
     async def conn_override():

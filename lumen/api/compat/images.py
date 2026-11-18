@@ -48,7 +48,8 @@ _EDIT_FIELDS = frozenset({
 
 def _compat_error(exc: HTTPException) -> JSONResponse:
     code = {402: 429, 422: 400}.get(exc.status_code, exc.status_code)
-    return openai_error_response(code, str(exc.detail))
+    return openai_error_response(code, str(exc.detail),
+                                 code="domain_credit_insufficient" if exc.detail == "domain_credit_insufficient" else None)
 
 
 def _failure(exc: Exception) -> JSONResponse:
@@ -121,6 +122,8 @@ async def _completed_image(run_id: str, *, principal: Principal, request: Reques
                     # The hold was released at zero: the refusal is reported with the upstream status class.
                     status, error_type, refusal = rejection_http_response(terminal.payload.safe_message)
                     return openai_error_response(status, refusal, type_=error_type)
+                if terminal is not None and getattr(terminal.payload, "error_code", None) == "domain_credit_insufficient":
+                    return openai_error_response(429, "domain_credit_insufficient", code="domain_credit_insufficient")
                 message = terminal.payload.safe_message if terminal is not None else "Image generation failed"
                 return openai_error_response(500, message or "Image generation failed", type_="api_error")
         except (durable_errors.DurableRunError, assets.AssetError, assets.AssetUnavailable, ChatStorageUnavailable) as exc:
@@ -146,6 +149,7 @@ async def generate_image(
             idempotency_key=idempotency_key or uuid.uuid4(),
             api_provider=body.provider,
             required_scopes=("compat:images:write",),
+            compat=True,
         )
     except HTTPException as exc:
         return _compat_error(exc)
@@ -247,6 +251,7 @@ async def edit_image(
             input_asset_id=primary,
             api_provider=provider,
             required_scopes=("compat:images:write",),
+            compat=True,
         )
     except HTTPException as exc:
         return _compat_error(exc)

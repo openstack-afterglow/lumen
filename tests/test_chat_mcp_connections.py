@@ -359,9 +359,17 @@ class TestCatalog:
 
     async def test_oauth_discovery_uses_the_requesters_token(self, monkeypatch, store):
         monkeypatch.setattr(
-            es, "get_global_mcp_revealed", _reveal({"id": 5, "is_active": True, "auth_mode": "oauth", "headers": {}})
+            es, "get_global_mcp_revealed", _reveal({
+                "id": 5, "is_active": True, "auth_mode": "oauth", "headers": {}, "config_version": 1,
+            })
         )
         seen = {}
+
+        async def visible(_kind, **kwargs):
+            assert kwargs["selected_ids"] == (5,)
+            return [{"id": 5, "config_version": 1, "credential_version": 2, "credential_id": "scoped-credential"}]
+
+        monkeypatch.setattr(es, "list_for_user", visible)
 
         async def bearer(*, user_id, project_id):
             return {5: {"Authorization": "Bearer user-token"}}
@@ -378,10 +386,10 @@ class TestCatalog:
     async def test_oauth_discovery_without_the_requesters_connection_is_refused(self, monkeypatch, store):
         monkeypatch.setattr(es, "get_global_mcp_revealed", _reveal({"id": 5, "is_active": True, "auth_mode": "oauth"}))
 
-        async def nobody(*, user_id, project_id):
-            return {}
+        async def nobody(*_args, **_kwargs):
+            return []
 
-        monkeypatch.setattr(mcp_connections.mcp_oauth, "headers_for_user", nobody)
+        monkeypatch.setattr(es, "list_for_user", nobody)
         with pytest.raises(mcp_connections.McpConnectionError):
             await mcp_connections.refresh_catalog(5, user_id="u1", project_id="p1")
 

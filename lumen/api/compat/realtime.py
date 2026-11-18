@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from lumen.auth import ensure_model_key_route, ensure_scopes
 from lumen.config import get_settings
-from lumen.services import api_key_store
+from lumen.services import api_key_store, credit
 from lumen.services.durable_runs.errors import RealtimeKindMismatch
 from lumen.services.durable_runs.realtime import admit_realtime_session, run_realtime_session
 from lumen.services.infrastructure.api_load import admit_websocket
@@ -153,10 +153,14 @@ async def _compat_socket(websocket: WebSocket, *, wire: str, kind: str = "conver
             {"model_id": model, "voice": voice, "instructions": instructions, **options},
             project_id=principal["project_id"], user_id=principal["user_id"],
             client_request_id=str(uuid4()), source="api", api_key_id=principal["api_key_id"], provider_type=wire,
+            payer=principal.get("payer"),
             kind=kind, wire=wire)
     except RealtimeKindMismatch:
         # A model of another realtime kind: the client picked the wrong endpoint for it.
         await websocket.close(code=4400)
+        return
+    except credit.DomainCreditInsufficient as exc:
+        await websocket.close(code=4429, reason=exc.code)
         return
     except Exception:
         await websocket.close(code=1011)
@@ -165,6 +169,8 @@ async def _compat_socket(websocket: WebSocket, *, wire: str, kind: str = "conver
         await run_realtime_session(websocket, run_id=result["session_id"], token=result["connect_token"], wire=wire)
     except WebSocketDisconnect:
         pass
+    except credit.DomainCreditInsufficient as exc:
+        await websocket.close(code=4429, reason=exc.code)
     except Exception:
         await websocket.close(code=1011)
     else:

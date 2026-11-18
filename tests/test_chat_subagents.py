@@ -1,3 +1,7 @@
+from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 from lumen_plugin_api.tools import AgentExecutionPolicy
 
@@ -89,3 +93,35 @@ def test_role_direct_effect_ceiling_is_separate_from_delegation_policy():
         "process",
         "external_mutation",
     }
+
+
+async def test_child_uses_pinned_model_and_rejects_ambiguous_legacy_name(monkeypatch):
+    from lumen.services import chat_admission
+    from lumen.services.durable_runs import children
+    from lumen.services.providers import routing
+
+    parent = SimpleNamespace(user_id="u", project_id="p", capability_snapshot={
+        "model_id": 11, "provider_id": 1, "execution_policy": _policy().model_dump(mode="json"),
+    })
+    child = children.DelegationCall("call", 4, "Inspect", "read", Decimal("1"), 1)
+    selected = {
+        "model_name": "same", "provider_name": "second", "model_id": 12, "provider_id": 2,
+        "config_version_hash": "a" * 64, "input_price_per_token": "0.1", "output_price_per_token": "0.2",
+    }
+    exact = AsyncMock(return_value=selected)
+    by_name = AsyncMock(side_effect=routing.AmbiguousModelRouteError("duplicate"))
+    inherited = AsyncMock(return_value={**selected, "model_id": 11, "provider_id": 1})
+    monkeypatch.setattr(routing, "resolve_model_by_id", exact)
+    monkeypatch.setattr(routing, "resolve_model", by_name)
+    monkeypatch.setattr(routing, "resolve_model_snapshot", inherited)
+    monkeypatch.setattr(chat_admission, "_resolve_extension_selection", AsyncMock(return_value={"tools": [], "mcp": []}))
+    monkeypatch.setattr(chat_admission, "_load_skill_snapshot", AsyncMock(return_value=([], [])))
+    pinned = await children._prepare_child_inputs(parent, {}, child, {"model_name": "same", "model_row_id": 12})
+    exact.assert_awaited_once_with(12, model_kind="text")
+    by_name.assert_not_called()
+    assert (pinned["capability_snapshot"]["model_id"], pinned["capability_snapshot"]["provider_id"]) == (12, 2)
+    with pytest.raises(children.ChildFailure) as ambiguous:
+        await children._prepare_child_inputs(parent, {}, child, {"model_name": "same"})
+    assert ambiguous.value.code == "child_route_ambiguous"
+    inherited_route = await children._prepare_child_inputs(parent, {}, child, {})
+    assert (inherited_route["capability_snapshot"]["model_id"], inherited_route["capability_snapshot"]["provider_id"]) == (11, 1)

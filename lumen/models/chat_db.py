@@ -186,8 +186,12 @@ class ChatMessageGraph(Base):
     id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
 
-    __table_args__ = (Index("idx_chat_message_graphs_owner", "project_id", "user_id"),)
+    __table_args__ = (
+        Index("idx_chat_message_graphs_owner", "project_id", "user_id"),
+        Index("idx_chat_message_graphs_domain", "domain_id", "user_id"),
+    )
 
 
 class ChatConversation(Base):
@@ -199,6 +203,7 @@ class ChatConversation(Base):
     )
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     # AES-256-GCM(도메인 chat_content) 암호문. 첫 메시지 요약 제목도 채팅 내용이라 암호화. TEXT(암호문 길이).
     title: Mapped[str | None] = mapped_column(TEXT)
     title_source: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="legacy")
@@ -231,6 +236,7 @@ class ChatConversation(Base):
     __table_args__ = (
         Index("idx_chat_conversations_graph", "graph_id"),
         Index("idx_chat_conversations_owner", "project_id", "user_id"),
+        Index("idx_chat_conversations_domain", "domain_id", "user_id", "updated_at"),
         Index("idx_chat_conversations_user_updated", "user_id", "updated_at"),  # 사용자별 목록(프로젝트 무관)
         Index("idx_chat_conversations_updated", "updated_at"),
         Index("idx_chat_conversations_code_workspace", "code_workspace_id"),
@@ -330,8 +336,12 @@ class ChatUsageLog(Base):
     __tablename__ = "chat_usage_logs"
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
-    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
-    user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    billing_scope: Mapped[str] = mapped_column(VARCHAR(10), server_default="user")
+    payer_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    payer_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     conversation_id: Mapped[str | None] = mapped_column(CHAR(36))  # 대화 삭제 후에도 원장 보존 — FK 없음
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     provider: Mapped[str | None] = mapped_column(VARCHAR(100))
@@ -364,6 +374,9 @@ class ChatUsageLog(Base):
     __table_args__ = (
         Index("idx_chat_usage_project_created", "project_id", "created_at"),
         Index("idx_chat_usage_user_created", "user_id", "created_at"),
+        Index("idx_chat_usage_domain_created", "domain_id", "created_at"),
+        Index("idx_chat_usage_payer_domain_created", "payer_domain_id", "created_at"),
+        Index("idx_chat_usage_payer_user_created", "payer_user_id", "created_at"),
         Index("idx_chat_usage_api_key_created", "api_key_id", "created_at"),
         Index("idx_chat_usage_run_id", "run_id"),
         Index("idx_chat_usage_provider_account", "provider_account_id", "created_at"),
@@ -439,6 +452,7 @@ class ChatMcpServer(Base):
     owner_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    legacy_domain_group: Mapped[str | None] = mapped_column(CHAR(64))
     connection_scope_key: Mapped[str] = mapped_column(VARCHAR(200), nullable=False, default="global", server_default="global")
     implicit_selection: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True, server_default="1")
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
@@ -489,7 +503,7 @@ class ChatMcpServer(Base):
 
 
 class ChatMcpActivation(Base):
-    """Owner/project approval for one exact administrator-published MCP revision."""
+    """Per-user approval of an exact MCP revision in the current domain."""
 
     __tablename__ = "chat_mcp_activations"
 
@@ -498,17 +512,22 @@ class ChatMcpActivation(Base):
     )
     owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
     owner_project_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
     config_version: Mapped[int] = mapped_column(BIGINT, nullable=False)
     generation: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
-    __table_args__ = (Index("idx_chat_mcp_activation_owner", "owner_user_id", "owner_project_id"),)
+    __table_args__ = (
+        Index("idx_chat_mcp_activation_owner", "owner_user_id", "owner_project_id"),
+        UniqueConstraint("mcp_server_id", "owner_user_id", "owner_domain_id", name="uq_chat_mcp_activation_domain"),
+        Index("idx_chat_mcp_activation_domain", "owner_domain_id", "owner_user_id"),
+    )
 
 
 class ChatMcpOAuthConnection(Base):
-    """Per-user/project OAuth token bundle for a remote MCP server."""
+    """Personal domain or shared organization OAuth token bundle for an MCP server."""
 
     __tablename__ = "chat_mcp_oauth_connections"
 
@@ -516,6 +535,7 @@ class ChatMcpOAuthConnection(Base):
     mcp_server_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
     owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     owner_project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     encrypted_tokens: Mapped[str] = mapped_column(TEXT, nullable=False)
     credential_version: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
     status: Mapped[str] = mapped_column(VARCHAR(12), nullable=False, default="active")
@@ -526,6 +546,8 @@ class ChatMcpOAuthConnection(Base):
 
     __table_args__ = (
         UniqueConstraint("mcp_server_id", "owner_user_id", "owner_project_id", name="uq_chat_mcp_oauth_connection"),
+        UniqueConstraint("mcp_server_id", "owner_user_id", "owner_domain_id", name="uq_chat_mcp_oauth_domain"),
+        Index("idx_chat_mcp_oauth_domain", "owner_domain_id", "owner_user_id"),
         Index("idx_chat_mcp_oauth_connection_owner", "owner_user_id", "owner_project_id", "status"),
     )
 
@@ -540,6 +562,7 @@ class ChatMcpOAuthRequest(Base):
     mcp_server_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
     owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     owner_project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     encrypted_payload: Mapped[str] = mapped_column(TEXT, nullable=False)
     server_config_version: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
     status: Mapped[str] = mapped_column(VARCHAR(12), nullable=False, default="pending")
@@ -648,7 +671,7 @@ class ChatGatewayDeviceGrant(Base):
 
 
 class ChatCustomTool(Base):
-    """커스텀 HTTP 툴 (백엔드가 SSRF 가드 후 대리 호출). scope: global|user."""
+    """SSRF-guarded HTTP extension; scope is global, user, or domain."""
 
     __tablename__ = "chat_custom_tools"
 
@@ -657,6 +680,9 @@ class ChatCustomTool(Base):
     owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     owner_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    legacy_domain_group: Mapped[str | None] = mapped_column(CHAR(64))
     name: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)  # 영숫자/언더스코어
     description: Mapped[str] = mapped_column(VARCHAR(500), nullable=False)
     method: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="GET")  # GET|POST
@@ -677,9 +703,35 @@ class ChatCustomTool(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
     __table_args__ = (
+        CheckConstraint("scope <> 'domain' OR owner_domain_id IS NOT NULL", name="ck_chat_tool_domain_owner"),
+        Index("idx_chat_tool_user_domain", "domain_id", "owner_user_id", "updated_at"),
+        Index("idx_chat_tool_domain", "owner_domain_id", "scope"),
         Index("idx_chat_tool_scope", "scope"),
         Index("idx_chat_tool_owner", "owner_user_id"),
         Index("idx_chat_custom_tools_project", "project_id"),
+    )
+
+
+class ChatExtensionArchive(Base):
+    """Encrypted snapshot of a merged extension and its original dependent records."""
+
+    __tablename__ = "chat_extension_archives"
+
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(VARCHAR(10), nullable=False)
+    entry_type: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="extension", server_default="extension")
+    original_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    canonical_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    domain_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
+    encrypted_snapshot: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
+    archived_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_chat_extension_archive_original", "kind", "original_id", "entry_type"),
+        Index("idx_chat_extension_archive_owner", "domain_id", "owner_user_id", "restored_at"),
     )
 
 
@@ -761,12 +813,15 @@ class ChatAgent(Base):
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
     owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
     description: Mapped[str | None] = mapped_column(VARCHAR(500))
     avatar: Mapped[str | None] = mapped_column(VARCHAR(500))  # 이모지 또는 URL
     # AES-256-GCM(chat_content) 암호문. 시스템 프롬프트로 주입되는 지침.
     instructions: Mapped[str | None] = mapped_column(MEDIUMTEXT)
     model_name: Mapped[str | None] = mapped_column(VARCHAR(190))
+    # Keep the exact selection even if the catalog row is removed; never fall back to its name.
+    model_row_id: Mapped[int | None] = mapped_column(BIGINT)
     params: Mapped[dict | None] = mapped_column(JSON)  # {temperature, max_tokens, ...}
     mcp_ids: Mapped[list | None] = mapped_column(JSON)  # 바인딩된 ChatMcpServer id 목록
     tool_ids: Mapped[list | None] = mapped_column(JSON)  # 바인딩된 ChatCustomTool id 목록
@@ -791,6 +846,7 @@ class ChatAgent(Base):
 
     __table_args__ = (
         Index("idx_chat_agents_owner", "owner_user_id"),
+        Index("idx_chat_agents_domain", "domain_id", "owner_user_id", "updated_at"),
         Index("idx_chat_agents_visibility", "visibility"),
         Index("idx_chat_agents_project", "project_id"),
         Index("idx_chat_agents_project_active", "project_id", "is_active"),
@@ -819,7 +875,7 @@ class ChatWorkspace(Base):
 
 
 class ChatMemory(Base):
-    """Encrypted memory source of truth, scoped for fail-closed semantic hydration."""
+    """Read-only legacy source for the Agent Vault migration."""
 
     __tablename__ = "chat_memories"
 
@@ -836,6 +892,8 @@ class ChatMemory(Base):
     # AES-256-GCM(chat_content) 암호문. 기억할 사실(예: "사용자는 Python 을 선호").
     content: Mapped[str | None] = mapped_column(MEDIUMTEXT)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
+    vault_migration_status: Mapped[str | None] = mapped_column(VARCHAR(16))
+    vault_migration_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
@@ -849,6 +907,7 @@ class ChatMemory(Base):
         ),
         Index("idx_chat_memories_user", "user_id"),
         Index("idx_chat_memories_scope", "user_id", "project_id", "workspace_id", "status", "is_active"),
+        Index("idx_chat_memories_vault_pending", "vault_migration_status", "vault_migration_retry_at", "id"),
     )
 
 

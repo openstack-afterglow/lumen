@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, or_, select
 
 from lumen.db import get_session_factory, is_db_available
+from lumen.models.billing import DomainCreditLedger, DomainCreditPool, Payer
 from lumen.models.chat_contracts import UsageRecord, UsageRecordPage
 from lumen.models.chat_db import ChatUsageLog
-from lumen.services import quota_policy
+from lumen.services import domain_credit, quota_policy
 from lumen.services.quota_periods import month_start, week_start
 
 logger = logging.getLogger(__name__)
@@ -46,10 +47,18 @@ _SUMS = (
 )
 
 
-async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int | None = None) -> dict:
-    """본인 누적/이번달·이번주 사용량과 기간별 쿼터. 실패 시 빈 요약(found=False).
+def payer_filter(payer: Payer):
+    if payer.domain_id is not None:
+        return ChatUsageLog.payer_domain_id == payer.domain_id
+    return or_(ChatUsageLog.payer_user_id == payer.user_id,
+               and_(ChatUsageLog.payer_user_id.is_(None), ChatUsageLog.payer_domain_id.is_(None),
+                    ChatUsageLog.user_id == payer.user_id))
 
-    project_id 인자는 하위호환용으로 받되 사용하지 않는다(사용량은 user_id 기준, 프로젝트 무관).
+
+async def user_usage_summary(user_id: str, project_id: str = "", *, payer: Payer | None = None) -> dict:
+    """Return payer-scoped usage, preserving historical user attribution.
+
+    project_id remains a legacy positional argument; it does not scope billing.
     """
     if not is_db_available():
         return dict(_EMPTY)
@@ -57,9 +66,11 @@ async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int
     if factory is None:
         return dict(_EMPTY)
     try:
-        base = [ChatUsageLog.user_id == user_id, ChatUsageLog.source != "system"]
-        if api_key_id is not None:
-            base.append(ChatUsageLog.api_key_id == api_key_id)
+        base = [ChatUsageLog.source != "system"]
+        if payer is not None:
+            base.append(payer_filter(payer))
+        else:
+            base.append(ChatUsageLog.user_id == user_id)
         async with factory() as session:
             total = (await session.execute(select(*_SUMS).where(*base))).one()
             month = (
@@ -90,9 +101,25 @@ async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int
                     .group_by(ChatUsageLog.source)
                 )
             ).all()
-            system_quota = await quota_policy.get_system_quota(session, user_id)
-        tc, tp, tct, tcount = total
-        mc, mp, mct, mcount = month
+            tc, tp, tct, tcount = total
+            mc, mp, mct, mcount = month
+            domain_id = payer.domain_id if payer is not None else None
+            if domain_id is None:
+                system_quota = await quota_policy.get_system_quota(session, user_id)
+                quota_max, quota_weekly_max = float(system_quota.monthly), float(system_quota.weekly)
+                pool_summary = {}
+            else:
+                pool = await session.get(DomainCreditPool, domain_id)
+                pool_summary = domain_credit.public(pool, domain_id)
+                quota_max = float(pool_summary["effective_monthly_limit_credits"] or 0)
+                quota_weekly_max = 0.0
+                ledger = DomainCreditLedger
+                charged = -ledger.amount_credits
+                tc, mc, week_credited = (await session.execute(select(
+                    func.sum(charged),
+                    func.sum(case((ledger.created_at >= month_start(), charged), else_=0)),
+                    func.sum(case((ledger.created_at >= week_start(), charged), else_=0)),
+                ).where(ledger.domain_id == domain_id, ledger.kind == "charge"))).one()
         by_source = [
             {"source": s or "web", "tokens": int(t or 0), "credited_cost": float(c or 0), "request_count": int(n or 0)}
             for s, t, c, n in src_rows
@@ -108,9 +135,13 @@ async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int
             "month_prompt_tokens": int(mp or 0),
             "month_completion_tokens": int(mct or 0),
             "month_request_count": int(mcount or 0),
-            "quota_used": float(mc or 0),
-            "quota_max": float(system_quota.monthly),
-            "quota_weekly_max": float(system_quota.weekly),
+            "billing_scope": payer.scope if payer is not None else "user",
+            "payer_user_id": payer.user_id if payer is not None else user_id,
+            "payer_domain_id": domain_id,
+            "quota_used": float(pool_summary.get("monthly_used_credits", mc) or 0),
+            "quota_max": quota_max,
+            "quota_weekly_max": quota_weekly_max,
+            **pool_summary,
             "by_source": by_source,
         }
     except Exception:
@@ -121,17 +152,19 @@ async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int
 async def list_usage_records(
     *,
     user_id: str,
-    api_key_id: int | None,
     source: str | None,
     before_id: int | None,
     limit: int,
+    payer: Payer | None = None,
 ) -> UsageRecordPage:
     """Return a cursor page of user-safe usage ledger fields, excluding system rows."""
     if not is_db_available() or (factory := get_session_factory()) is None:
         return UsageRecordPage(records=[])
-    predicates = [ChatUsageLog.user_id == user_id, ChatUsageLog.source.in_(("web", "api"))]
-    if api_key_id is not None:
-        predicates.append(ChatUsageLog.api_key_id == api_key_id)
+    predicates = [ChatUsageLog.source.in_(("web", "api"))]
+    if payer is not None:
+        predicates.append(payer_filter(payer))
+    else:
+        predicates.append(ChatUsageLog.user_id == user_id)
     if source is not None:
         predicates.append(ChatUsageLog.source == source)
     if before_id is not None:
@@ -170,9 +203,9 @@ async def list_usage_records(
                 cache_creation_1h_input_tokens=row.cache_creation_1h_input_tokens,
                 credited_cost=format(row.credited_cost, "f"),
                 source=row.source,
-                api_key_id=row.api_key_id,
-                conversation_id=row.conversation_id,
-                run_id=row.run_id,
+                api_key_id=row.api_key_id if row.user_id == user_id else None,
+                conversation_id=row.conversation_id if row.user_id == user_id else None,
+                run_id=row.run_id if row.user_id == user_id else None,
                 pricing_status=row.pricing_status,
             )
             for row in rows[:limit]
