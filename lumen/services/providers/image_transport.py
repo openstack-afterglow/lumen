@@ -338,13 +338,15 @@ def _openai_result_image(encoded: object, output_format: str | None) -> tuple[by
     return raw, _FORMAT_MIME[output_format]
 
 
+_PRESET_QUALITIES = ("auto", "low", "medium", "high", "xhigh", "max", "1k", "2k", "4k")
+
+
 def available_image_variants(route: dict) -> list[str]:
     """List executable size:quality choices for the route's selected billing basis."""
     pricing = route.get("media_pricing")
     try:
         if image_billing_basis(route) == "tokens":
-            variants = {f"{size}:{quality}" for size in _SIZES
-                        for quality in ("auto", "low", "medium", "high", "xhigh", "max", "1k", "2k", "4k")}
+            variants = {f"{size}:{quality}" for size in _SIZES for quality in _PRESET_QUALITIES}
         else:
             variants = pricing.get("image_variants") if isinstance(pricing, dict) else None
     except ProviderValidationError:
@@ -367,6 +369,37 @@ def available_image_variants(route: dict) -> list[str]:
 def image_route_ready(route: dict) -> bool:
     """True only if an API-key direct route has an executable priced variant."""
     return bool(available_image_variants(route))
+
+
+def image_pricing_readiness(route: dict) -> dict:
+    """Whether priced choices are executable for this provider/model, independent of credential state.
+
+    ``reason`` is ``route_unavailable`` (unsupported provider, model or endpoint),
+    ``pricing_unavailable`` (the selected basis lacks a needed rate, e.g. a base-only
+    unit price), ``unsupported_image_variants`` (positive unit variants exist but
+    none is a valid choice for this model) or ``None`` when ready.
+    """
+    probe = {**route, "api_key": "configured"}
+    try:
+        _model(probe)
+        basis = image_billing_basis(probe)
+    except ProviderValidationError:
+        return {"ready": False, "reason": "route_unavailable", "executable_variants": [],
+                "unsupported_variants": [], "supported_variants": []}
+    presets = dict.fromkeys((f"{size}:{quality}" for size in _SIZES for quality in _PRESET_QUALITIES), "1")
+    supported = available_image_variants({**probe, "media_pricing": {"billing_basis": "unit", "image_variants": presets}})
+    executable = available_image_variants(probe)
+    unsupported: list[str] = []
+    pricing = probe.get("media_pricing")
+    variants = pricing.get("image_variants") if basis == "unit" and isinstance(pricing, dict) else None
+    if isinstance(variants, dict):
+        unsupported = sorted(
+            key for key in variants
+            if key not in executable and (exact_media_price(pricing, "image_per_unit", variant=key) or 0) > 0
+        )
+    reason = None if executable else "unsupported_image_variants" if unsupported else "pricing_unavailable"
+    return {"ready": bool(executable), "reason": reason, "executable_variants": executable,
+            "unsupported_variants": unsupported, "supported_variants": supported}
 
 
 def max_image_count(route: dict) -> int:

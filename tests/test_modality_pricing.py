@@ -64,6 +64,14 @@ def test_media_pricing_keeps_omission_distinct_from_zero_and_rejects_ambiguous_n
             pricing.validate_media_pricing(kind, value)
 
 
+def test_unit_image_readiness_requires_a_positive_exact_variant():
+    assert not pricing.media_pricing_available("image", {"image_per_unit": "0.04"})
+    assert not pricing.media_pricing_available("image", {"image_per_unit": "0.04", "image_variants": {}})
+    assert not pricing.media_pricing_available("image", {"image_variants": {"1024x1024:high": "0"}})
+    assert not pricing.media_pricing_available("image", {"image_variants": {"1024x1024:high": "0.00000000001"}})
+    assert pricing.media_pricing_available("image", {"image_variants": {"1024x1024:low": "0", "1024x1024:high": "0.08"}})
+
+
 def test_duration_units_convert_exactly_only_at_calculation():
     minute = {"billing_basis": "session", "realtime_session_per_minute": "0.05"}
     hour = {"billing_basis": "session", "realtime_session_per_hour": "3"}

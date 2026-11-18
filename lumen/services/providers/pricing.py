@@ -358,6 +358,14 @@ _TOKEN_BASIS_TEXT_DIRECTIONS = {
 }
 
 
+def _executable_unit_price(value) -> bool:
+    try:
+        price = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return False
+    return price.is_finite() and 0 < price < _MAX_RATE and price == price.quantize(_USD_QUANTUM)
+
+
 def media_pricing_available(
     kind: str, pricing: dict | None, *, text_input_priced: bool = False, text_output_priced: bool = False,
     duration_families: tuple[str, ...] | None = None, provider_type: str | None = None,
@@ -389,8 +397,9 @@ def media_pricing_available(
             and all(text_priced[direction] for direction in _TOKEN_BASIS_TEXT_DIRECTIONS[kind])
         )
     if basis == "unit":
+        # Execution bills only a positive exact size:quality variant; a base rate alone is stored, not executable.
         variants = pricing.get("image_variants")
-        return bool(variants) if isinstance(variants, dict) else exact_media_price(pricing, "image_per_unit") is not None
+        return isinstance(variants, dict) and any(_executable_unit_price(value) for value in variants.values())
     if basis == "characters":
         return exact_media_price(pricing, "audio_per_character") is not None
     if basis == "session":
@@ -615,6 +624,28 @@ def _provider_public(row: LlmProvider) -> dict:
     }
 
 
+def _media_route(row: LlmModel, provider_type: str | None, api_base: str | None, *, configured: bool) -> dict:
+    """Credential-free route projection used to judge media readiness."""
+    input_rate, output_rate = _effective_model_rates(row, provider_type, api_base)
+    return {
+        "model_kind": _kind(row), "provider_type": provider_type,
+        "api_model_name": api_model_name(row.model_name, provider_type or ""),
+        "api_base": api_base, "api_key": "configured" if configured else None,
+        "media_pricing": _effective_media_pricing(row, provider_type, api_base),
+        "input_price_per_token": input_rate, "output_price_per_token": output_rate,
+        "cache_read_price_per_token": _resolved_cache_prices(row, provider_type, api_base)[0]["cache_read_price_per_token"],
+        "provider_auth": None,
+    }
+
+
+def _image_pricing_readiness(row: LlmModel, provider_type: str | None, api_base: str | None) -> dict | None:
+    if _kind(row) != "image":
+        return None
+    from .image_transport import image_pricing_readiness
+
+    return image_pricing_readiness(_media_route(row, provider_type, api_base, configured=True))
+
+
 def _effective_capabilities(
     row: LlmModel,
     provider_type: str | None,
@@ -670,22 +701,16 @@ def _effective_capabilities(
         # provider, configured API key, supported price and asset pipeline matter.
         route_available = False
         reservation_error = False
+        pricing_reason = None
         kind = _kind(row)
         configured = auth_mode == "api_key" and api_key_configured
         if kind == "realtime" or (configured and kind in {"image", "tts", "stt"}):
-            input_rate, output_rate = _effective_model_rates(row, provider_type, api_base)
-            route = {
-                "model_kind": kind, "provider_type": provider_type,
-                "api_model_name": api_model_name(row.model_name, provider_type or ""),
-                "api_base": api_base, "api_key": "configured" if configured else None,
-                "media_pricing": _effective_media_pricing(row, provider_type, api_base),
-                "input_price_per_token": input_rate, "output_price_per_token": output_rate,
-                "cache_read_price_per_token": _resolved_cache_prices(row, provider_type, api_base)[0]["cache_read_price_per_token"],
-                "provider_auth": None,
-            }
+            route = _media_route(row, provider_type, api_base, configured=configured)
             if kind == "image":
-                from .image_transport import image_route_ready
+                from .image_transport import image_pricing_readiness, image_route_ready
                 route_available = image_route_ready(route)
+                if configured and not route_available:
+                    pricing_reason = image_pricing_readiness(route)["reason"]
             elif kind == "realtime":
                 from .realtime_transport import realtime_route_ready
                 reservation_error = _realtime_reservation_too_small(route)
@@ -715,6 +740,8 @@ def _effective_capabilities(
                         if route_available and needs_assets
                         else "realtime_reservation_too_small"
                         if reservation_error
+                        else pricing_reason
+                        if pricing_reason
                         else "route_unavailable"
                     )
                     if name in features
@@ -845,6 +872,7 @@ def _model_public(
         "effective_media_pricing": effective_media,
         "effective_media_price_sources": _media_price_sources(effective_media or {}, stored_media or {}),
         "effective_text_price_sources": text_sources,
+        "image_pricing_readiness": _image_pricing_readiness(row, provider_type, api_base),
         "display_name": display_name,
         "is_active": row.is_active,
         "is_title_model": row.is_title_model,
