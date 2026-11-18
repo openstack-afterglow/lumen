@@ -208,7 +208,7 @@ def validate_image_request(
     if quality not in qualities:
         raise ProviderValidationError("unsupported image quality")
     if token_mode:
-        pricing = validate_media_pricing("image", route.get("media_pricing"))
+        pricing = validate_media_pricing("image", route.get("media_pricing"), provider_type=route.get("provider_type"))
         if not route_media_pricing_available({**route, "media_pricing": pricing}):
             raise ProviderValidationError("image token pricing is unavailable")
         image_rates = route_token_rates(route).get("image", {})

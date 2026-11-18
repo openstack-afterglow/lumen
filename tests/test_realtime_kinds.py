@@ -37,7 +37,7 @@ _RUN = SimpleNamespace(model_name="kind-model")
 _TRANSCRIBE = {"realtime_input_per_minute": "0.017"}
 _TRANSLATE = {"realtime_input_per_minute": "0.034"}
 _LIVE = {"billing_basis": "session", "realtime_session_per_minute": "0.05"}
-_TOKENS = {"billing_basis": "tokens", "reservation_usd": "0.5", "token_rates": {"audio": {
+_TOKENS = {"billing_basis": "tokens", "reservation_usd": "5", "token_rates": {"audio": {
     "input_per_million": "32", "output_per_million": "64"}}}
 
 
@@ -147,14 +147,55 @@ def test_input_only_duration_plans_reserve_and_settle_input_audio_seconds():
     assert cost.raw_cost == Decimal("0.0028333333")
 
 
-def test_live_bills_connected_session_seconds():
+def _live_checkpoint(*frames, connected="40"):
+    meter = realtime_protocol.LiveUsageMeter()
+    for frame in frames:
+        meter.observe(frame)
+    seconds, state = meter.result()
+    audio = AudioMeter(320, 320, 24000, 24000, connected_seconds=Decimal(connected), provider_seconds=seconds,
+                       provider_seconds_state=state)
+    # Settlement prices the durable JSON checkpoint, never the in-memory meter.
+    return json.loads(json.dumps(realtime._checkpoint(audio, "session")))
+
+
+def _usage_updated(seconds):
+    return {"type": "session.usage.updated", "usage": {"seconds": seconds}, "context_window": {"usage_ratio": 0.4}}
+
+
+def test_live_bills_the_providers_final_seconds_never_lumen_elapsed_time():
     plan = realtime_transport.validate_realtime_request(_route("gpt-live-1", _LIVE), max_duration_seconds=300)
     assert plan["billing_basis"] == "session" and plan["realtime_kind"] == "live"
     assert realtime._envelope_usd(plan, 300) == Decimal("0.25")
-    cost, components, _, summary = realtime._session_bill(_RUN, {**plan, "max_duration_seconds": 300},
-                                                          {"connected_seconds": "12.5"})
+    snapshot = {**plan, "max_duration_seconds": 300}
+    closed = {"type": "session.closed", "reason": "close_requested", "usage": {"seconds": 12.5}}
+    # Cumulative progress (4, 9, 12) is never summed; the close envelope's 12.5 s settles exactly.
+    checkpoint = _live_checkpoint(_usage_updated(4), _usage_updated(9), _usage_updated(12), closed)
+    assert (checkpoint["provider_seconds"], checkpoint["provider_seconds_state"]) == ("12.5", "complete")
+    cost, components, _, summary = realtime._session_bill(_RUN, snapshot, checkpoint)
     assert cost.raw_cost == Decimal("0.0104166667") and summary == {"session_seconds": "12.5"}
-    assert components[0]["kind"] == "realtime_session_seconds"
+    assert (components[0]["kind"], components[0]["quantity"], components[0]["metadata"]["usage_source"]) == (
+        "realtime_session_seconds", "12.5", "provider")
+    assert realtime._session_bill(_RUN, snapshot, _live_checkpoint(_usage_updated(3), {
+        "type": "session.closed", "usage": {"seconds": 3}}))[0].raw_cost == Decimal("0.0025")
+    unknown = [
+        _live_checkpoint(),  # provider ended without any usage
+        _live_checkpoint(_usage_updated(30)),  # progress only: disconnect before session.closed
+        _live_checkpoint({"type": "session.closed", "reason": "error"}),  # close without usage
+        _live_checkpoint({"type": "session.closed", "usage": {"seconds": "12"}}),  # malformed
+        _live_checkpoint({"type": "session.closed", "usage": {"seconds": True}}),
+        _live_checkpoint(_usage_updated(9), {"type": "session.closed", "usage": {"seconds": 8}}),  # decreased
+        _live_checkpoint(_usage_updated(9), _usage_updated(5)),
+        _live_checkpoint({"type": "session.closed", "usage": {"seconds": 300.5}}),  # above the held bound
+    ]
+    for checkpoint in unknown:
+        with pytest.raises(DurableRunProviderResultUnknown):
+            realtime._session_bill(_RUN, snapshot, checkpoint)
+    # Conversation models priced per session have no provider seconds and keep connected time.
+    conversation = {**realtime_transport.validate_realtime_request(_route("gpt-realtime", _LIVE)),
+                    "max_duration_seconds": 300}
+    cost, components, _, _ = realtime._session_bill(_RUN, conversation, {"connected_seconds": "12.5"})
+    assert cost.raw_cost == Decimal("0.0104166667")
+    assert components[0]["metadata"]["usage_source"] == "lumen_connected"
 
 
 def test_transcription_client_session_is_strict():
@@ -216,8 +257,28 @@ def test_kind_client_event_whitelists():
     for message, kind in rejected:
         with pytest.raises(RealtimeTransportError):
             event(message, kind)
-    with pytest.raises(RealtimeTransportError):
-        event({"type": "audio.input.append", "audio": _PCM}, "live", wire="native")
+    # Native Studio events map onto the vendor events; vendor names and other kinds' events do not.
+    native = {
+        ("audio.input.append", "translation"): {"type": "session.input_audio_buffer.append", "audio": _PCM},
+        ("audio.input.append", "live"): {"type": "session.input_audio.append", "audio": _PCM},
+        ("audio.input.mute", "live"): {"type": "session.input_audio.mute"},
+        ("audio.input.unmute", "live"): {"type": "session.input_audio.unmute"},
+        ("instructions.append", "live"): {"type": "session.instructions.append", "instructions": "slower"},
+    }
+    for (name, kind), upstream in native.items():
+        frame = {"type": name, "audio": _PCM, "instructions": "slower", "extra": 1}
+        assert event(frame, kind, wire="native")[0] == upstream
+    assert event({"type": "session.close"}, "translation", wire="native") == (None, 0, True)
+    for message, kind in [
+        ({"type": "session.input_audio_buffer.append", "audio": _PCM}, "translation"),
+        ({"type": "session.update", "session": {"audio": {"output": {"language": "fr"}}}}, "translation"),
+        ({"type": "audio.input.mute"}, "translation"),
+        ({"type": "session.input_audio.append", "audio": _PCM}, "live"),
+        ({"type": "audio.input.commit"}, "live"),
+        ({"type": "instructions.append", "instructions": "x" * 4097}, "live"),
+    ]:
+        with pytest.raises(RealtimeTransportError):
+            event(message, kind, wire="native")
 
 
 def test_live_session_start_refuses_delegation_storage_history_and_formats():
@@ -406,6 +467,7 @@ async def test_live_session_starts_from_admitted_values_and_drains_to_session_cl
     assert browser.events[-1] == {"type": "session.closed", "reason": "client_closed", "usage": {"seconds": 8.0}}
     assert (meter.input_bytes, meter.output_bytes) == (320, 640)
     assert meter.connected_seconds is not None
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (Decimal("8.0"), "complete")
 
 
 @pytest.mark.asyncio
@@ -418,6 +480,8 @@ async def test_close_drain_is_bounded_when_session_closed_never_arrives(monkeypa
         session_id="session", voice="marin", instructions=None, max_duration_seconds=30, wire="openai",
         is_canceled=_not_canceled, session_time=True), timeout=5)
     assert upstream.sent[-1] == {"type": "session.close"} and meter.output_bytes == 0
+    # No session.closed: the provider's final seconds are missing and settlement stays unknown.
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (None, "missing")
 
 
 @pytest.mark.asyncio
@@ -567,25 +631,39 @@ def test_compat_endpoints_discover_and_validate_kind_setup(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_native_capabilities_advertise_conversation_and_input_only_transcription(monkeypatch):
+async def test_native_capabilities_advertise_every_kind_with_its_session_fields(monkeypatch):
     from lumen.api import conversations
 
     gates = {"feature_gates": {name: {"available": True} for name in ("audio_input", "audio_output")}}
     monkeypatch.setattr(conversations.capabilities, "runtime_capabilities", lambda: {})
     monkeypatch.setattr(conversations.capabilities, "effective_runtime_capabilities", lambda *_args: {})
-    for model, pricing, voice in (("gpt-realtime-2", _TRANSCRIBE | {"realtime_output_per_minute": "1"}, "alloy"),
-                                  ("gpt-live-1", _LIVE, None), ("gpt-live-transcribe", _TRANSCRIBE, None)):
+    expected = (
+        ("gpt-realtime-2", _TRANSCRIBE | {"realtime_output_per_minute": "1"}, "alloy",
+         ["voice", "instructions", "reasoning_effort"]),
+        ("gpt-realtime-1.5", _TRANSCRIBE | {"realtime_output_per_minute": "1"}, "alloy", ["voice", "instructions"]),
+        ("gpt-live-1", _LIVE, "marin", ["voice", "instructions"]),
+        ("gpt-realtime-translate", _TRANSLATE, None, ["output_language"]),
+        ("gpt-live-transcribe", _TRANSCRIBE, None, []),
+    )
+    for model, pricing, voice, fields in expected:
         resolved = {**_route(model, pricing), "model_name": model, "capabilities": gates}
         monkeypatch.setattr(conversations.routing, "resolve_model_by_id", AsyncMock(return_value=resolved))
         result = await conversations.get_chat_capabilities(model_id=1, model_kind="realtime", token_info={})
-        assert result["default_voice"] == voice
-        assert (result["max_duration_seconds"] > 0) is (model != "gpt-live-1")
+        assert result["default_voice"] == voice and result["realtime_session_fields"] == fields
+        reasoning = "reasoning_effort" in fields
+        assert result["available_reasoning_efforts"] == (
+            ["minimal", "low", "medium", "high", "xhigh"] if reasoning else [])
+        assert result["default_reasoning_effort"] == ("low" if reasoning else None)
+        assert result["max_duration_seconds"] == 900 and result["input_sample_rate_hz"] == 24000
         assert result["realtime_kind"] == realtime_transport.realtime_kind(resolved)
+        # Every kind except transcription speaks audio back and needs the output gate.
+        resolved["capabilities"] = {"feature_gates": {"audio_input": {"available": True}}}
+        result = await conversations.get_chat_capabilities(model_id=1, model_kind="realtime", token_info={})
+        assert result["max_duration_seconds"] == (900 if model == "gpt-live-transcribe" else 0)
         if model == "gpt-live-transcribe":
             assert (result["input_sample_rate_hz"], result["output_sample_rate_hz"]) == (24000, 0)
-            resolved["capabilities"] = {"feature_gates": {"audio_input": {"available": True}}}
-            result = await conversations.get_chat_capabilities(model_id=1, model_kind="realtime", token_info={})
-            assert result["max_duration_seconds"] == 900
+        else:
+            assert result["realtime_session_fields"] == []
 
 
 def _transcription(model, **options):
@@ -707,7 +785,7 @@ def test_native_http_passes_kind_separately_without_changing_conversation_intent
     assert admitted.await_args.kwargs["project_id"] == "project"
 
 
-def test_native_transcription_requires_current_audio_permission_and_valid_kind(monkeypatch):
+def test_native_session_request_requires_audio_permission_and_kind_specific_fields(monkeypatch):
     app = FastAPI()
     app.include_router(native_api.router, prefix="/v1")
     principal = {"user_id": "owner", "project_id": "project", "auth_type": "keystone",
@@ -716,15 +794,29 @@ def test_native_transcription_requires_current_audio_permission_and_valid_kind(m
     admitted = AsyncMock(return_value={"session_id": str(uuid4())})
     monkeypatch.setattr(native_api, "admit_realtime_session", admitted)
     with TestClient(app) as client:
-        response = client.post("/v1/chat/realtime/sessions", json={"model_id": "selected", "kind": "transcription"},
-            headers={"Idempotency-Key": str(uuid4())})
-        assert response.status_code == 403
+        def post(body):
+            return client.post("/v1/chat/realtime/sessions", json={"model_id": "selected", **body},
+                               headers={"Idempotency-Key": str(uuid4())})
+
+        assert post({"kind": "transcription"}).status_code == 403
         principal["roles"] = ["member"]
-        for kind in ("translation", "live", "", None):
-            response = client.post("/v1/chat/realtime/sessions", json={"model_id": "selected", "kind": kind},
-                headers={"Idempotency-Key": str(uuid4())})
-            assert response.status_code == 422
-    admitted.assert_not_awaited()
+        for body in ({"kind": "dictation"}, {"kind": ""}, {"kind": None}, {"kind": "translation"},
+                     {"kind": "live", "output_language": "es"}, {"output_language": "es"},
+                     {"kind": "translation", "output_language": "e"},
+                     {"kind": "live", "delegation": {"type": "responses"}},
+                     {"kind": "live", "reasoning_effort": "low"}, {"reasoning_effort": "none"}):
+            assert post(body).status_code == 422
+        admitted.assert_not_awaited()
+        assert post({"kind": "translation", "output_language": "es-419", "max_duration_seconds": 120}).status_code == 201
+        assert admitted.await_args.args[0] == {"model_id": "selected", "provider_id": None, "voice": None,
+            "instructions": None, "output_language": "es-419", "max_duration_seconds": 120}
+        assert admitted.await_args.kwargs["kind"] == "translation"
+        assert post({"kind": "live", "voice": "quartz", "instructions": "be brief"}).status_code == 201
+        assert "output_language" not in admitted.await_args.args[0]
+        assert admitted.await_args.kwargs["kind"] == "live"
+        assert post({"reasoning_effort": "xhigh"}).status_code == 201
+        assert admitted.await_args.args[0]["reasoning_effort"] == "xhigh"
+        assert admitted.await_args.kwargs["kind"] == "conversation"
 
 
 @pytest.mark.asyncio
@@ -842,3 +934,361 @@ async def test_native_transcription_pending_turn_cannot_succeed_on_other_exits(m
     assert [frame["type"] for frame in upstream.sent] == [
         "session.update", "input_audio_buffer.append", "input_audio_buffer.commit"]
     assert not any(event["type"] == "session.closed" for event in browser.events)
+
+
+def _close_after_first_audio(event, events):
+    audio = [item for item in events if item["type"] == "audio.output.delta"]
+    return [{"type": "session.close"}] if event["type"] == "audio.output.delta" and len(audio) == 1 else []
+
+
+@pytest.mark.asyncio
+async def test_native_translation_sends_admitted_language_and_projects_studio_events(monkeypatch):
+    def react(sent):
+        if sent["type"] == "session.update":
+            return ({"type": "session.updated", "session": {"type": "translation"}},)
+        if sent["type"] == "session.input_audio_buffer.append":
+            return ({"type": "session.input_transcript.delta", "delta": "The lantern"},
+                    {"type": "session.output_audio.delta", "delta": _PCM})
+        if sent["type"] == "session.close":
+            return ({"type": "session.output_transcript.delta", "delta": "La linterna"},
+                    {"type": "session.output_audio.delta", "delta": _PCM},
+                    {"type": "error", "error": {"message": "provider secret detail"}},
+                    {"type": "session.closed"})
+        return ()
+
+    upstream = ScriptedUpstream(react)
+    captured = _connect(monkeypatch, upstream)
+    browser = ScriptedBrowser([{"type": "audio.input.append", "audio": _PCM}], _close_after_first_audio)
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(browser, _route("gpt-realtime-translate", _TRANSLATE),
+        session_id="session", voice=None, instructions=None, max_duration_seconds=30, is_canceled=_not_canceled,
+        output_language="es"), timeout=5)
+    assert captured["url"] == "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate"
+    assert upstream.sent[0] == {"type": "session.update", "session": {"audio": {"output": {"language": "es"}}}}
+    assert [item["type"] for item in upstream.sent[1:]] == ["session.input_audio_buffer.append", "session.close"]
+    assert browser.events == [
+        {"type": "session.ready", "session_id": "session", "provider_type": "openai", "realtime_kind": "translation",
+         "input_sample_rate_hz": 24000, "output_sample_rate_hz": 24000},
+        {"type": "transcript.input.delta", "delta": "The lantern"},
+        {"type": "audio.output.delta", "delta": _PCM, "sample_rate_hz": 24000},
+        {"type": "transcript.output.delta", "delta": "La linterna"},
+        {"type": "audio.output.delta", "delta": _PCM, "sample_rate_hz": 24000},
+        {"type": "error", "code": "upstream_error", "message": "Realtime provider returned an error"},
+    ]
+    # Lumen bills its own measured input audio: 320 bytes of PCM16 at 24 kHz.
+    assert (meter.input_bytes, meter.output_bytes) == (320, 640)
+    # Without its admitted language a native translation never opens the provider socket.
+    monkeypatch.setattr(realtime_protocol.websockets, "connect", AssertionError)
+    with pytest.raises(RealtimeTransportError, match="fixed at admission"):
+        await realtime_protocol.relay_audio(ScriptedBrowser([]), _route("gpt-realtime-translate", _TRANSLATE),
+            session_id="session", voice=None, instructions=None, max_duration_seconds=30, is_canceled=_not_canceled)
+
+
+@pytest.mark.asyncio
+async def test_native_live_waits_for_session_started_and_maps_studio_commands(monkeypatch):
+    def react(sent):
+        if sent["type"] == "session.start":
+            return ({"type": "session.started", "session": {"id": "sess_1", "model": "gpt-live-1"}},)
+        if sent["type"] == "session.input_audio.append":
+            return ({"type": "session.output_transcript.delta", "delta": "Hi"},
+                    {"type": "session.output_audio.delta", "delta": _PCM},
+                    {"type": "session.usage.updated", "usage": {"seconds": 2}})
+        if sent["type"] == "session.close":
+            return ({"type": "session.closed", "reason": "close_requested", "usage": {"seconds": 3}},)
+        return ()
+
+    upstream = ScriptedUpstream(react)
+    captured = _connect(monkeypatch, upstream)
+    browser = ScriptedBrowser([{"type": "instructions.append", "instructions": "slower"},
+                               {"type": "audio.input.mute"}, {"type": "audio.input.unmute"},
+                               {"type": "audio.input.append", "audio": _PCM}], _close_after_first_audio)
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(browser, _route("gpt-live-1", _LIVE),
+        session_id="session", voice="quartz", instructions="be kind", max_duration_seconds=30,
+        is_canceled=_not_canceled, session_time=True), timeout=5)
+    assert captured["url"] == "wss://api.openai.com/v1/live/sessions"
+    # Delegation is never configured: backend Responses usage is billed separately and not metered.
+    assert upstream.sent[0]["session"] == {"model": "gpt-live-1", "instructions": "be kind", "audio": {
+        "format": {"type": "audio/pcm", "rate": 24000}, "output": {"voice": "quartz"}}}
+    assert upstream.sent[1:] == [{"type": "session.instructions.append", "instructions": "slower"},
+                                 {"type": "session.input_audio.mute"}, {"type": "session.input_audio.unmute"},
+                                 {"type": "session.input_audio.append", "audio": _PCM}, {"type": "session.close"}]
+    assert browser.events == [
+        {"type": "session.ready", "session_id": "session", "provider_type": "openai", "realtime_kind": "live",
+         "input_sample_rate_hz": 24000, "output_sample_rate_hz": 24000},
+        {"type": "transcript.output.delta", "delta": "Hi"},
+        {"type": "audio.output.delta", "delta": _PCM, "sample_rate_hz": 24000},
+    ]
+    assert (meter.input_bytes, meter.output_bytes) == (320, 320) and meter.connected_seconds is not None
+    # The cumulative 2 s progress is not added to the final 3 s from session.closed.
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (Decimal("3"), "complete")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", ["client_disconnect", "deadline", "canceled"])
+async def test_live_requests_session_closed_on_every_lumen_side_exit(monkeypatch, exit_path):
+    def react(sent):
+        if sent["type"] == "session.start":
+            return ({"type": "session.started"},)
+        if sent["type"] == "session.close":
+            return ({"type": "session.usage.updated", "usage": {"seconds": 6}},
+                    {"type": "session.closed", "reason": "close_requested", "usage": {"seconds": 6.25}})
+        return ()
+
+    upstream = ScriptedUpstream(react)
+    _connect(monkeypatch, upstream)
+
+    class Browser(ScriptedBrowser):
+        async def receive_text(self):
+            if exit_path == "client_disconnect":
+                raise WebSocketDisconnect(1001)
+            return await super().receive_text()
+
+    async def canceled():
+        return exit_path == "canceled"
+
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(Browser([]), _route("gpt-live-1", _LIVE),
+        session_id="session", voice="marin", instructions=None,
+        # The deadline path ends the relay window (max - close timeout) 1 s after connecting.
+        max_duration_seconds=6 if exit_path == "deadline" else 30, is_canceled=canceled,
+        session_time=True), timeout=10)
+    assert upstream.sent[-1] == {"type": "session.close"}
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (Decimal("6.25"), "complete")
+
+
+@pytest.mark.asyncio
+async def test_live_upstream_end_without_session_closed_leaves_usage_missing(monkeypatch):
+    from websockets.exceptions import ConnectionClosedOK
+    from websockets.frames import Close
+
+    closed = ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True)
+
+    class ClosingUpstream(ScriptedUpstream):
+        # The provider ends the socket cleanly after the user's audio, before any session.closed.
+        async def recv(self):
+            item = await self.queue.get()
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        async def send(self, message):
+            kind = json.loads(message)["type"]
+            if kind == "session.close":
+                raise closed
+            await super().send(message)
+            if kind == "session.input_audio.append":
+                await self.queue.put(closed)
+
+    upstream = ClosingUpstream(lambda sent: ({"type": "session.started"}, {
+        "type": "session.usage.updated", "usage": {"seconds": 4}}) if sent["type"] == "session.start" else ())
+    _connect(monkeypatch, upstream)
+    browser = ScriptedBrowser([{"type": "audio.input.append", "audio": _PCM}])
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(browser, _route("gpt-live-1", _LIVE),
+        session_id="session", voice="marin", instructions=None, max_duration_seconds=30,
+        is_canceled=_not_canceled, session_time=True), timeout=5)
+    # Progress (4 s) is never billed in place of the missing final value.
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (None, "missing")
+    plan = realtime_transport.validate_realtime_request(_route("gpt-live-1", _LIVE), max_duration_seconds=30)
+    with pytest.raises(DurableRunProviderResultUnknown):
+        realtime._session_bill(_RUN, {**plan, "max_duration_seconds": 30}, json.loads(json.dumps(
+            realtime._checkpoint(meter, "session"))))
+
+
+@pytest.mark.asyncio
+async def test_native_live_refusal_before_session_started_never_reports_ready(monkeypatch):
+    upstream = ScriptedUpstream(lambda sent: ({"type": "error", "error": {"message": "secret detail"}},)
+                                if sent["type"] == "session.start" else ())
+    _connect(monkeypatch, upstream)
+    browser = ScriptedBrowser([{"type": "audio.input.append", "audio": _PCM}])
+    with pytest.raises(RealtimeTransportError) as failure:
+        await asyncio.wait_for(realtime_protocol.relay_audio(browser, _route("gpt-live-1", _LIVE),
+            session_id="session", voice="marin", instructions=None, max_duration_seconds=30,
+            is_canceled=_not_canceled, session_time=True), timeout=5)
+    assert browser.events == [] and [item["type"] for item in upstream.sent] == ["session.start"]
+    assert failure.value.meter.input_bytes == 0
+
+
+def _native_run(monkeypatch, route, payload, summary):
+    pricing = {**realtime_transport.validate_realtime_request(route, voice=payload["voice"], max_duration_seconds=60),
+               "max_duration_seconds": 60}
+    monkeypatch.setattr(realtime, "consume_ticket", AsyncMock(return_value=("u", "p")))
+    monkeypatch.setattr(realtime, "_start", AsyncMock(return_value=({}, pricing, payload, "owner")))
+    monkeypatch.setattr(realtime.routing, "resolve_model_snapshot", AsyncMock(return_value=route))
+    relay = AsyncMock(return_value=AudioMeter(320, 320, 24000, 24000, connected_seconds=Decimal("12.5")))
+    monkeypatch.setattr(realtime_protocol, "relay_audio", relay)
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return SimpleNamespace(one_or_none=lambda: ("running", "owner", None))
+
+    monkeypatch.setattr(realtime, "_factory", lambda: Session)
+    monkeypatch.setattr(realtime, "_settle", AsyncMock(return_value=summary))
+    finish = AsyncMock()
+    monkeypatch.setattr(execution, "_finish", finish)
+    return relay, finish
+
+
+class _Browser:
+    def __init__(self):
+        self.events = []
+
+    async def send_json(self, event):
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_natively_admitted_translation_and_live_run_on_the_native_wire(monkeypatch):
+    # API-key principals admit with compat reauthorization scopes even on the native endpoint,
+    # so the frozen admitting wire, not the scope, decides where the session may run.
+    scopes = ["compat:realtime:write"]
+    relay, finish = _native_run(monkeypatch, _route("gpt-live-1", _LIVE),
+        {"voice": "quartz", "instructions": "be kind", "required_scopes": scopes, "wire": "native"},
+        {"session_seconds": "12.5"})
+    browser = _Browser()
+    await realtime.run_realtime_session(browser, run_id="run", token="t" * 40)
+    assert {"wire": "native", "session_time": True, "token_usage": False, "output_language": None,
+            "token_hold": None}.items() <= relay.await_args.kwargs.items()
+    assert finish.await_args.kwargs["status"] == "completed"
+    assert browser.events == [{"type": "session.closed", "session_seconds": "12.5"}]
+
+    relay, _ = _native_run(monkeypatch, _route("gpt-realtime-translate", _TRANSLATE),
+        {"voice": None, "instructions": None, "output_language": "ko", "wire": "native"},
+        {"input_audio_seconds": "0.0066666667"})
+    browser = _Browser()
+    await realtime.run_realtime_session(browser, run_id="run", token="t" * 40)
+    assert relay.await_args.kwargs["output_language"] == "ko"
+    assert browser.events == [{"type": "session.closed", "input_audio_seconds": "0.0066666667"}]
+
+    # A native ticket without its admitted language, or a session admitted on another wire
+    # (or before the wire was frozen), never reaches the provider.
+    for payload, wire in (({"voice": None, "instructions": None, "wire": "native"}, "native"),
+                          ({"voice": None, "instructions": None, "output_language": "ko", "wire": "native"},
+                           "openai"),
+                          ({"voice": None, "instructions": None, "wire": "openai"}, "native"),
+                          ({"voice": None, "instructions": None, "output_language": "ko"}, "native")):
+        relay, finish = _native_run(monkeypatch, _route("gpt-realtime-translate", _TRANSLATE), payload, {})
+        with pytest.raises(DurableRunInputError, match="compatible wire"):
+            await realtime.run_realtime_session(_Browser(), run_id="run", token="t" * 40, wire=wire)
+        relay.assert_not_awaited()
+        assert finish.await_args.kwargs["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_translation_language_is_validated_at_admission_and_enters_the_intent(monkeypatch):
+    _routing(monkeypatch, _route("gpt-realtime-translate", _TRANSLATE))
+    for request, kind in (({"output_language": "English"}, "translation"), ({"output_language": ""}, "translation"),
+                          ({"output_language": "es"}, "live")):
+        with pytest.raises(DurableRunInputError):
+            await realtime.admit_realtime_session({"model_id": "gpt-realtime-translate", **request},
+                project_id="p", user_id="u", client_request_id=str(uuid4()), kind=kind)
+    precheck = AsyncMock(side_effect=DurableRunInputError("credit boundary"))
+    monkeypatch.setattr(realtime.credit, "precheck", precheck)
+    with pytest.raises(DurableRunInputError, match="credit boundary"):
+        await realtime.admit_realtime_session({"model_id": "gpt-realtime-translate", "output_language": "pt-BR"},
+            project_id="p", user_id="u", client_request_id=str(uuid4()), kind="translation")
+    intent = admission.existing_run_for_intent.await_args.kwargs["intent"]
+    assert (intent["realtime_kind"], intent["output_language"]) == ("translation", "pt-BR")
+    assert realtime._fingerprint(realtime._intent({"model_id": "m", "output_language": "es"}, "translation")) != (
+        realtime._fingerprint(realtime._intent({"model_id": "m", "output_language": "fr"}, "translation")))
+
+
+def test_catalog_conversation_models_and_snapshots_settle_on_structured_token_tariffs():
+    from lumen.models.chat_db import LlmModel
+    from lumen.services.providers import pricing
+
+    # Hold per 300 s: 100 input tokens/s at the highest input rate + 30 output tokens/s at the highest output
+    # rate ($1.536 full, $0.48 mini) plus two pinned worst-case responses ($0.919552 full, $0.265728 mini).
+    holds = {"gpt-realtime-2.1": "3.375104", "gpt-realtime-2": "3.375104", "gpt-realtime-1.5": "3.375104",
+             "gpt-realtime": "3.375104", "gpt-realtime-2025-08-28": "3.375104", "gpt-realtime-2.1-mini": "1.011456",
+             "gpt-realtime-mini": "1.011456", "gpt-realtime-mini-2025-12-15": "1.011456"}
+    for model, hold in holds.items():
+        row = LlmModel(model_name=model, model_kind="realtime", media_pricing=None)
+        media = pricing._effective_media_pricing(row, "openai", None)
+        assert media["billing_basis"] == "tokens" and "reservation_usd" not in media
+        assert set(media["token_rates"]) == {"audio", "image"}
+        text_in, text_out = pricing._effective_model_rates(row, "openai", None)
+        route = {**_route(model, media), "input_price_per_token": text_in, "output_price_per_token": text_out}
+        assert pricing.route_media_pricing_available(route) and realtime_transport.realtime_route_ready(route)
+        plan = realtime_transport.validate_realtime_request(route, max_duration_seconds=300)
+        assert Decimal(plan["reservation_usd"]) == Decimal(hold) and plan["reservation_source"] == "duration_policy"
+        assert realtime_transport.upstream_connection_spec(route)[0] == f"wss://api.openai.com/v1/realtime?model={model}"
+    # A shut-down snapshot is neither cataloged nor a realtime route.
+    assert pricing._effective_media_pricing(LlmModel(model_name="gpt-realtime-mini-2025-10-06", model_kind="realtime",
+                                                     media_pricing=None), "openai", None) is None
+    assert not realtime_transport.realtime_route_ready(_route("gpt-realtime-mini-2025-10-06", media))
+
+
+@pytest.mark.asyncio
+async def test_gpt_transcribe_realtime_sessions_bill_their_own_measured_duration_tariff(monkeypatch):
+    from lumen.models.chat_db import LlmModel
+    from lumen.services.providers import pricing
+
+    route = _route("gpt-transcribe", {"realtime_input_per_minute": "0.0045"})
+    assert realtime_transport.realtime_kind(route) == "transcription"
+    options = realtime_transport.available_realtime_options(route)
+    assert (options["realtime_kind"], options["output_sample_rate_hz"], options["available_voices"]) == (
+        "transcription", 0, [])
+    plan = realtime_transport.validate_realtime_request(route, max_duration_seconds=300)
+    assert plan["realtime_kind"] == "transcription" and set(plan["duration_rates"]) == {"realtime_input"}
+    assert realtime._envelope_usd(plan, 300) == Decimal("0.0225")
+    checkpoint = json.loads(json.dumps(realtime._checkpoint(AudioMeter(2 * 24000 * 60, 0, 24000, 0), "duration")))
+    cost, components, _, summary = realtime._duration_bill(_RUN, {**plan, "max_duration_seconds": 300}, checkpoint)
+    assert cost.raw_cost == Decimal("0.0045") and summary == {"input_audio_seconds": "60"}
+    # The file-STT tariff never stands in: its key is not a realtime price, and the catalog's
+    # stt entry prices only the stt row.
+    assert not realtime_transport.realtime_route_ready(_route("gpt-transcribe", {"audio_input_per_minute": "0.0045"}))
+    assert pricing._effective_media_pricing(LlmModel(model_name="gpt-transcribe", model_kind="realtime",
+                                                     media_pricing=None), "openai", None) is None
+    assert pricing._effective_media_pricing(LlmModel(model_name="gpt-transcribe", model_kind="stt",
+                                                     media_pricing=None), "openai", None) == {
+        "billing_basis": "duration", "audio_input_per_minute": "0.0045"}
+    assert not pricing.route_media_pricing_available({**_route("gpt-transcribe", {}), "media_pricing": None})
+    # Official options: languages[] (not language), keywords and prompt; delay is Whisper-only.
+    assert _transcription("gpt-transcribe", prompt="p", keywords=["Lumen"], languages=["en", "ko"])[1] == {
+        "prompt": "p", "keywords": ["Lumen"], "languages": ["en", "ko"]}
+    for option in ({"language": "en"}, {"delay": "low"}):
+        with pytest.raises(RealtimeTransportError):
+            _transcription("gpt-transcribe", **option)
+
+    def react(sent):
+        if sent["type"] == "input_audio_buffer.commit":
+            return ({"type": "conversation.item.input_audio_transcription.completed", "item_id": "item_1",
+                     "transcript": "hello", "languages": ["en"], "usage": {"type": "duration", "seconds": 1}},)
+        return ()
+
+    upstream = ScriptedUpstream(react)
+    captured = _connect(monkeypatch, upstream)
+    browser = ScriptedBrowser([{"type": "audio.input.append", "audio": _PCM}, {"type": "audio.input.commit"},
+                               {"type": "session.close"}])
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(browser, route, session_id="session", voice=None,
+        instructions=None, max_duration_seconds=30, is_canceled=_not_canceled,
+        transcription={"languages": ["en"]}), timeout=5)
+    assert captured["url"] == "wss://api.openai.com/v1/realtime?intent=transcription"
+    assert upstream.sent[0]["session"]["audio"]["input"]["transcription"] == {
+        "model": "gpt-transcribe", "languages": ["en"]}
+    assert {"type": "transcript.input.completed", "item_id": "item_1", "text": "hello"} in browser.events
+    assert meter.input_bytes == 320
+
+
+@pytest.mark.asyncio
+async def test_live_idle_timeout_requests_session_closed_and_settles_provider_seconds(monkeypatch):
+    monkeypatch.setattr(realtime_protocol, "_IDLE_SECONDS", 0.2)
+
+    def react(sent):
+        if sent["type"] == "session.start":
+            return ({"type": "session.started"},)
+        if sent["type"] == "session.close":
+            return ({"type": "session.closed", "reason": "close_requested", "usage": {"seconds": 0.2}},)
+        return ()
+
+    upstream = ScriptedUpstream(react)
+    _connect(monkeypatch, upstream)
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(ScriptedBrowser([]), _route("gpt-live-1", _LIVE),
+        session_id="session", voice="marin", instructions=None, max_duration_seconds=30,
+        is_canceled=_not_canceled, session_time=True), timeout=5)
+    assert upstream.sent[-1] == {"type": "session.close"}
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (Decimal("0.2"), "complete")
