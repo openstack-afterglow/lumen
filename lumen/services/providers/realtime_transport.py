@@ -193,6 +193,29 @@ def response_bound_usd(token_pricing: dict) -> Decimal:
     return worst.quantize(_USD_QUANTUM, rounding=ROUND_CEILING)
 
 
+class RealtimeReservationTooSmall(ProviderValidationError):
+    """The configured hold cannot cover two independently bounded responses."""
+
+
+def _check_reservation(envelope: Decimal, bound: Decimal) -> None:
+    minimum = 2 * bound
+    if envelope < minimum:
+        raise RealtimeReservationTooSmall(
+            f"configured realtime reservation_usd is below two worst-case responses (minimum ${format(minimum, 'f')})"
+        )
+
+
+def validate_configured_reservation(route: dict) -> None:
+    """Validate an admin-specified OpenAI realtime floor against effective token rates."""
+    media = route.get("media_pricing")
+    if route.get("model_kind") != "realtime" or route.get("provider_type") != "openai":
+        return
+    envelope = media_reservation_usd(media)
+    if envelope is None or any(route.get(f"{direction}_price_per_token") is None for direction in ("input", "output")):
+        return  # Other validators own absent or invalid rates and reservations.
+    _check_reservation(envelope, response_bound_usd(frozen_token_pricing(route)))
+
+
 def _billing_plan(route: dict, max_duration_seconds: int) -> dict:
     """Freeze exactly one billing basis; never mix duration, session and token rates."""
     provider, _ = _model(route)
@@ -247,9 +270,8 @@ def _billing_plan(route: dict, max_duration_seconds: int) -> dict:
             # Only OpenAI documents the audio token rate the derived hold relies on.
             envelope = _derived_token_hold(token_pricing, max_duration_seconds) + 2 * bound
             plan["reservation_source"] = "duration_policy"
-        elif envelope < 2 * bound:
-            # A configured reservation keeps precedence but must cover two worst-case responses.
-            raise ProviderValidationError("configured realtime reservation is below two worst-case responses")
+        else:
+            _check_reservation(envelope, bound)
     if envelope is None or envelope <= 0 or envelope >= Decimal("100000000"):
         raise ProviderValidationError("realtime token billing requires a positive reservation_usd")
     return {**plan, "reservation_usd": format(envelope, "f")}
@@ -298,7 +320,8 @@ def function_tools(tools: object, tool_choice: object = None) -> tuple[list[dict
         raise invalid
     if tool_choice is not None and tool_choice not in ("auto", "none", "required") and not (
             isinstance(tool_choice, dict) and set(tool_choice) == {"type", "name"}
-            and tool_choice["type"] == "function" and tool_choice["name"] in names):
+            and tool_choice["type"] == "function" and isinstance(tool_choice["name"], str)
+            and tool_choice["name"] in names):
         raise invalid
     return clean, tool_choice
 
