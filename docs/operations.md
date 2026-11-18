@@ -1,12 +1,12 @@
 # 운영 가이드
 
-## 0.6.19 롤아웃 메모 (준비 중; 미발행·미배포)
+## 0.6.19 롤아웃 메모
 
 - **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.
 - **순서:** API admission 차단 → worker drain(실행 중 run 0 확인, 실패 시 중단) → worker 정지 → 백업 → `--tags lumen --skip-tags haproxy` reconfigure → 새 API·worker cohort 확인. 무상태 Decisions 예약(034)은 이전·새 writer가 같은 테이블을 공유하므로 혼합 cohort로 오래 두지 않는다.
 - **Gemini Decisions 등록:** 배포 후 공식 Gemini API 키 공급자에 `gemini-decision-1`을 `model_kind=decision`으로 등록한다. 가격은 native catalog(입력 $0.10/1M)를 쓰며 관리자 수동 단가가 있으면 그것이 우선한다. 일반 채팅·호환·embedding·media 목록에는 나타나지 않고 `model_kind=decision` 목록과 `/v1/chat/decisions`, `/v1beta/decisions`에서만 쓴다.
 - **대시보드:** Afterglow Decision Studio의 Gemini 편집기는 capabilities 조회에 `model_kind=decision`을 보내므로 0.6.19 이전 Lumen에서는 "Lumen 업데이트 필요" 상태가 된다. Lumen을 먼저 배포한다.
-- Sandbox runtime은 계속 꺼 둔다. 이 메모는 발행·배포의 증거가 아니다.
+- 2026-11-18 07:21:14–07:22:18 UTC에 DMS Lab에서 실행했다. Sandbox runtime은 계속 꺼 뒀다. 롤백 핀과 전체 컨테이너 수신증은 `/etc/kolla/.afterglow-rollout-backups/lumen-0.6.19-20261118T071821Z`, 암호화 DB 백업은 `/var/backups/lumen/pre-v0.6.19-20261118T071821Z`에 있다. 실행·과금 수신증은 `docs/testing.md`를 참조한다.
 
 ## 0.6.18 롤아웃 메모
 
