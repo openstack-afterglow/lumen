@@ -6,6 +6,10 @@ Migration 040 changes the chat-memory writer and vector source; never run a pre-
 
 The importer is idempotent, retains original legacy rows, and assigns new Vault records IDs at or above 2^40 to avoid colliding with imported vector IDs. Semantic recall catches up through the configured vector outbox after SQL import. Rolling back old code after Vault accepts writes would hide those writes; preserve both the Vault and legacy tables and reconcile explicitly before reopening traffic.
 
+Provision one random shared value of at least 32 UTF-8 bytes in Kolla passwords as `lumen_afterglow_ingress_secret`; the Lumen API container receives `LUMEN_AFTERGLOW_INGRESS_SECRET`. Configure the same value in Afterglow's server-side signer. Keep the API-to-BFF transport private or protected by TLS and never expose or log the signer header. Absent or short configuration disables `/v1/vault`, `/v1/memories`, and Vault context and tools in new runs without disabling ordinary chat. Drain admitted Vault runs before emergency key removal or replacement.
+
+The BFF signs the exact forwarded request using `X-Lumen-Ingress: v1:<timestamp>:<lowercase-hex-HMAC-SHA256>`. The message is UTF-8 newline-joined fields: `v1`, Unix seconds, uppercase method, raw forwarded path without its query, lowercase SHA-256 hex of the lone `X-Auth-Token` value, `X-Project-Id` or empty, and `X-Target-Project-Id` or empty. Lumen accepts an absolute time skew of at most 120 seconds. Send no bearer or API-key headers on this path; do not trust a client-supplied ingress header.
+
 ## 0.6.20 롤아웃 메모
 
 - **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.

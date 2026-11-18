@@ -2,6 +2,8 @@
 
 import re
 
+# Keep JS whitespace semantics while retaining ASCII word boundaries and case folding.
+_JS_SPACE = r"[\x09-\x0d \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
 _PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b", re.ASCII),
@@ -12,7 +14,7 @@ _PATTERNS = (
     re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b", re.ASCII),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b", re.ASCII),
     re.compile(
-        r"""\b(?:api[_-]?key|secret|token|passwd|password)\b["']?\s*[:=]\s*["']?[A-Za-z0-9/+_.-]{20,}""",
+        rf"""\b(?:api[_-]?key|secret|token|passwd|password)\b["']?{_JS_SPACE}*[:=]{_JS_SPACE}*["']?[A-Za-z0-9/+_.-]{{20,}}""",
         re.ASCII | re.IGNORECASE,
     ),
 )

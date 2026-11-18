@@ -78,6 +78,10 @@ async def lifespan(app: FastAPI):
 async def _service_lifespan(app: FastAPI):
     configure_logging("api")
     settings = get_settings()
+    from lumen.services.afterglow_ingress import ingress_key
+
+    if ingress_key() is None:
+        logger.warning("Agent Vault disabled: LUMEN_AFTERGLOW_INGRESS_SECRET must contain at least 32 bytes")
     registry = get_registry()
     # Approved distributions/versions are checked before any entry point is imported;
     # an incompatible or missing required plugin stops the process instead of falling back.

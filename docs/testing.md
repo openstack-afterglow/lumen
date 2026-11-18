@@ -2,7 +2,7 @@
 
 ## Agent Vault (migration 040)
 
-`test-passed`: focused pytest passed 127 cases on migrated disposable MariaDB 10.11.19; Ruff passed on touched Python files. `tests/integration/test_agent_vault.py` covers global and same-domain visibility, rejection before decrypting foreign records, key and reduced-credential refusal, concurrent replacement, immutable notes, credential refusal, legacy account/project/workspace imports, automatic extraction deltas, Markdown rendering and a dashboard graph tool round trip. Keystone, the semantic index and the model are synthetic in this suite. No live authentication, pgvector, paid inference or deployment is verified.
+`test-passed`: focused pytest passed 164 cases on migrated disposable MariaDB 10.11.19; Ruff passed on touched Python files. `tests/integration/test_agent_vault.py` covers Vault scoping, decrypt fences, hash races, append-only records, account/project/workspace imports, extraction, Markdown and a dashboard graph tool round trip. `tests/test_afterglow_ingress.py` exercises actual Vault and persistent chat routes with signed, missing and invalid proofs, including token and project header changes. `tests/test_vault_secret.py` covers all nine detector patterns and ECMAScript whitespace parity. A local YAML/Jinja render confirms the Kolla API-only signer setting and disabled defaults. Keystone, the semantic index and the model are synthetic; no live authentication, pgvector, paid inference or deployment is verified.
 
 ## Lumen 0.6.20 — 발행·운영 배포·OpenAI 유료 확인
 
