@@ -40,7 +40,12 @@ from lumen.services import (
 )
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
 from lumen.services.completion_format import nonstream_response
-from lumen.services.inference_authority import completion_scopes
+from lumen.services.inference_authority import (
+    check_dispatch,
+    completion_scopes,
+    preflight_dispatch,
+    read_dispatch_candidate,
+)
 from lumen.services.providers import routing
 from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.errors import ProviderSubscriptionError
@@ -403,6 +408,12 @@ async def _segment_start(run_id: str, *, owner: str, operation: str, required_sc
     Lock order: payer -> batch (shared) -> run -> segment -> provider config.
     """
     from .admission import _lock_run_configurations
+    approval = None
+    async with _factory()() as session:
+        candidate = await read_dispatch_candidate(session, run_id, _SEGMENT)
+        if candidate is not None:
+            _require_owned_running_lease(candidate, owner)
+            approval = await preflight_dispatch(session, candidate, required_scopes)
 
     async def transaction() -> str:
         async with _factory()() as session, session.begin():
@@ -427,9 +438,7 @@ async def _segment_start(run_id: str, *, owner: str, operation: str, required_sc
             if not batch_open:
                 return "batch_closed"
             await _lock_run_configurations(session, run.capability_snapshot, model_name=run.model_name)
-            await authorize_api_key_in_transaction(session, api_key_id=run.api_key_id, user_id=run.user_id,
-                                                   project_id=run.project_id, required_scopes=required_scopes,
-                                                   credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
+            verified = await check_dispatch(session, run, approval)
             payer = credit.run_payer(run)
             await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
                                                             api_key_id=run.api_key_id, bound=bound, payer=payer)
@@ -437,6 +446,7 @@ async def _segment_start(run_id: str, *, owner: str, operation: str, required_sc
                                                  status="reserved", **payer.columns()))
             await credit.refresh_domain_reserved(session, payer)
             run.reserved_credits = bound
+            verified.require_fresh()
             begin_segment_io(segment)
             run.provider_started_at = _now()
             await append_event(session, run, _event(run, "run.stage.changed", {"stage": "model_request"}))

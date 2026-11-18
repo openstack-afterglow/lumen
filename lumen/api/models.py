@@ -462,6 +462,10 @@ class ModelResponse(BaseModel):
     model_kind: ModelKind = "text"
     media_pricing: dict | None = None
     effective_media_pricing: dict | None = None
+    effective_media_price_sources: dict = Field(default_factory=dict)
+    effective_text_price_sources: dict[str, Literal["manual", "catalog"]] = Field(default_factory=dict)
+    # Image rows only: priced choices this provider/model can execute, independent of credentials.
+    image_pricing_readiness: dict | None = None
     api_model_name: str
     api_provider: str
     provider_type: str | None = None
@@ -493,6 +497,8 @@ class ModelResponse(BaseModel):
     capability_source: str | None = None
     effective_capabilities: dict | None = None
     effective_capability_source: str | None = None
+    # Text models only: {"ready", "reason_code"}; set capabilities.context_limit to fix context_limit_unknown.
+    domain_billing: dict | None = None
     created_at: str | None
     updated_at: str | None
 
@@ -900,6 +906,8 @@ async def set_memory_model(payload: MemoryModelRequest):
 async def create_model(payload: ModelCreateRequest):
     try:
         return await repository.create_model(**payload.model_dump())
+    except errors.ImagePricingNotReady as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
@@ -929,6 +937,8 @@ async def update_model(model_id: int, payload: ModelUpdateRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except errors.ImagePricingNotReady as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:

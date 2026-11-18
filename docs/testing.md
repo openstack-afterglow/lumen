@@ -1,5 +1,11 @@
 # 테스트
 
+## Leaf media price overrides
+
+`test-passed`: 734 focused pytest cases across model routing, provider catalog, native-catalog admin, credit, image transport/compat, modality pricing and media rejection, plus Ruff on changed Python files. New cases cover a leaf override of only image output keeping catalog image input and token basis, null leaf clearing, replace-mode rows, exact-key variant overlay, merged readiness/validation (including a non-media PATCH and a rename on a leaf row), no-catalog leaf rows and admin provenance. Ten unrelated `tests/test_chat_cache_pricing.py` executor cases (`payer_domain_id`/`usage_record`) fail identically on the unmodified base. `lumen-test integration -k token_usage` on disposable MariaDB/Redis passed 17 cases, including `catalog_leaf_edited`: the durable image admission snapshot freezes merged catalog input + manual output rates and settlement uses them. No live provider or deployment check ran. `scripts/gen_api_docs.py` was not rerun because it already fails on the unmapped `Agent Vault` tag.
+
+Image unit readiness follow-up: `test-passed` with 734 focused cases and Ruff. Base-only unit pricing is not ready (`pricing_unavailable`). A Gemini 2.5 row with only a positive `1024x1024:high` variant is not ready (`unsupported_image_variants`), and adding `1024x1024:auto` makes it ready. Leaf variant overlays count toward readiness. The full `lumen-test integration` run on disposable MariaDB/Redis had 814 passed, 4 skipped and 5 failed. None of the failures involve pricing: `keystone_session_required` in `test_native_api_key_flow.py`, a missing `payer_domain_id` column in `test_runtime_workload_migration.py`, and a stale schema snapshot.
+
 ## Gemini Models API and SDK compatibility
 
 `test-passed` locally (2026-11-19, CPython 3.13.12, `google-genai==3.5.0`, `openai==2.53.0`, `anthropic==0.125.0`). `tests/test_gemini_sdk_compat.py`, `tests/test_official_sdk_compat.py`, `tests/test_embeddings_api.py` and `tests/test_cli_model_catalog.py`: 138 passed. The official clients call the real mounted ASGI app. Only the API-key lookup, credential decryption, credit precheck/settlement, an in-memory SQLite catalog and the private Bifrost endpoint are synthetic.

@@ -597,6 +597,64 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
     assert closed.is_set()
 
 
+@pytest.mark.parametrize("canceled", [False, True])
+async def test_dispatch_boundary_failure_after_stop_finishes_canceled(monkeypatch, canceled):
+    run = SimpleNamespace(
+        id="run-1", model_name="model", project_id="project-1", user_id="user-1", payer_domain_id=None,
+        source="web", api_key_id=None, run_scope="temp", conversation_id=None, user_message_id=None,
+        assistant_message_id=None, current_ordinal=0, capability_snapshot={},
+        pricing_snapshot={"input_price_per_token": "0", "output_price_per_token": "0", "component_prices": {},
+                          "margin_multiplier": "1", "chat_credit_per_usd": "1"},
+        execution_protocol_version=1, status="queued", lease_owner="worker#1", assigned_resource_id=None,
+        parent_run_id=None, credit_ceiling=None, sandbox_seconds_ceiling=None, depth=0,
+    )
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def begin(self):
+            return self
+
+        async def connection(self, **_kwargs):
+            return None
+
+    finished: list[dict] = []
+
+    async def engine_stream(**_kwargs):
+        # The locked dispatch fence refuses new provider I/O for a run whose stop landed first.
+        raise execution.DurableRunError("chat run canceled before provider start")
+        yield  # pragma: no cover
+
+    async def finish(_run_id, **kwargs):
+        finished.append(kwargs)
+
+    async def _return(value):
+        return value
+
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: _Session())
+    monkeypatch.setattr(execution, "claim_queued_run", lambda *_args, **_kwargs: _return(run))
+    monkeypatch.setattr(execution, "_payload",
+                        lambda _run: {"input_messages": [{"role": "user", "content": "x"}], "features": {}})
+    monkeypatch.setattr(execution, "_validate_run_protocol_payload", lambda *_args: True)
+    monkeypatch.setattr(execution.ps, "resolve_model_snapshot",
+                        lambda *_args, **_kwargs: _return({"model_name": "model", "provider_name": "provider"}))
+    monkeypatch.setattr(execution, "_managed_tool_configs", lambda *_args, **_kwargs: _return((None, None, None)))
+    monkeypatch.setattr(execution.engine, "stream", engine_stream)
+    monkeypatch.setattr(execution, "_append", lambda *_args, **_kwargs: _return(None))
+    monkeypatch.setattr(execution, "_finish", finish)
+    monkeypatch.setattr(execution, "_set_stage", lambda *_args, **_kwargs: _return(None))
+    monkeypatch.setattr(execution, "_cancel_requested", lambda _run_id: _return(canceled))
+    monkeypatch.setattr(execution, "_renew_lease", lambda *_args, **_kwargs: _return(True))
+    monkeypatch.setattr(execution.credit, "precheck", lambda *_args, **_kwargs: _return(None))
+
+    assert await execution.execute_queued_run("run-1", owner="worker-1", registration_id="registration-1") is True
+    expected = ("canceled", "canceled") if canceled else ("failed", "provider_failed")
+    assert (finished[-1]["status"], finished[-1]["error_code"]) == expected
+
 
 
 async def test_summary_compactor_fences_map_and_reduce_segments_and_records_usage(monkeypatch):

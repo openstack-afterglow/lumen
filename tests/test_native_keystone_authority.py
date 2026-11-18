@@ -1426,6 +1426,7 @@ async def _admit_native_ceiling_run(native_routes, monkeypatch):
 async def test_native_http_reduced_admin_ceiling_persists_and_fences_fresh_io(
     native_directory, native_routes, monkeypatch, metadata, surface, revocation,
 ):
+    from lumen.models.chat_runs import ChatRun
     from lumen.services import inference_authority
     from lumen.services.durable_runs import execution
     from lumen.services.durable_runs.errors import DurableRunInputError
@@ -1449,6 +1450,8 @@ async def test_native_http_reduced_admin_ceiling_persists_and_fences_fresh_io(
         user_id=OWNER_ID, project_id=PROJECT_ID, required_scopes=("native:images:write",),
         credential_authority=ceiling)
     session.execute = AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: run))
+    # Unlocked dispatch preflight reads the run; no segment row exists yet.
+    session.get = AsyncMock(side_effect=lambda model, _key: run if model is ChatRun else None)
     monkeypatch.setattr(execution, "_factory", lambda: lambda: session)
     monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *_args: None)
     monkeypatch.setattr(execution._DurableExecutionHooks, "_ensure_provider_turn", AsyncMock())

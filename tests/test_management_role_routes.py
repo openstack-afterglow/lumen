@@ -286,7 +286,7 @@ async def test_private_agent_detail_requires_project_writer(management_app, monk
         get.assert_not_called()
         principal["roles"] = ["member"]
         assert (await client.get("/v1/agents/1")).status_code == 200
-    get.assert_awaited_once_with(1, user_id="owner", project_id="project", domain_id=None)
+    get.assert_awaited_once_with(1, user_id="owner", project_id="project")
 
 
 @pytest.mark.parametrize("path,module,name,status", [

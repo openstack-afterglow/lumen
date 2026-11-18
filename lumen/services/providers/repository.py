@@ -28,6 +28,7 @@ from .credentials import (
 )
 from .errors import (
     ChatStorageUnavailable,
+    ImagePricingNotReady,
     ModelOrderConflictError,
     ProviderNotFoundError,
     ProviderValidationError,
@@ -36,6 +37,8 @@ from .errors import (
 from .pricing import (
     MODEL_KINDS,
     _effective_model_rates,
+    _has_manual_media_prices,
+    _image_pricing_readiness,
     _model_public,
     _per_million_price,
     _per_token_price,
@@ -45,7 +48,7 @@ from .pricing import (
     _to_decimal,
     _validate_cache_prices,
     decision_provider_supported,
-    validate_media_pricing,
+    validate_media_override,
 )
 from .routing import _lock_mutable_route, _require_db
 from .search_transport import _ENDPOINTS as _SEARCH_ENDPOINTS
@@ -125,13 +128,17 @@ def _validate_catalog_model_kind(provider_type: str, api_base: str | None, model
 
 
 def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: tuple,
-                          provider_type: str | None, *, model_name: str, api_base: str | None) -> dict | None:
+                          provider_type: str | None, *, model_name: str, api_base: str | None,
+                          previous_media_pricing: dict | None = None) -> dict | None:
     """Media models may carry applicable text rates; embeddings and decisions are input-only."""
     if kind in {"embedding", "decision"} and any(value is not None for value in token_prices[1:]):
         raise ProviderValidationError(f"{kind} models support input-token pricing only")
     if kind != "text" and any(value is not None for value in token_prices[3:]):
         raise ProviderValidationError("media 모델에는 cache write 가격을 설정할 수 없습니다")
-    pricing = validate_media_pricing(kind, media_pricing, provider_type=provider_type)
+    stored, pricing = validate_media_override(
+        kind, media_pricing, previous=previous_media_pricing, model_name=model_name,
+        provider_type=provider_type, api_base=api_base,
+    )
     if kind == "realtime" and provider_type == "openai" and pricing and "reservation_usd" in pricing:
         from .realtime_transport import validate_configured_reservation
 
@@ -144,7 +151,7 @@ def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: t
         validate_configured_reservation({"model_kind": kind, "provider_type": provider_type, "media_pricing": pricing,
                                         "input_price_per_token": input_rate, "output_price_per_token": output_rate,
                                         "cache_read_price_per_token": cache_rates["cache_read_price_per_token"]})
-    return pricing
+    return stored
 
 
 def _validate_text_prices(input_price_per_million, output_price_per_million):
@@ -153,6 +160,12 @@ def _validate_text_prices(input_price_per_million, output_price_per_million):
         _per_token_price(input_price_per_million, "input_price_per_million"),
         _per_token_price(output_price_per_million, "output_price_per_million"),
     )
+
+
+def _require_image_pricing_ready(row: LlmModel, provider: LlmProvider) -> None:
+    readiness = _image_pricing_readiness(row, provider.provider_type, provider.api_base)
+    if not readiness["ready"]:
+        raise ImagePricingNotReady(readiness)
 
 
 def _capability_override(value: dict | None) -> dict | None:
@@ -554,7 +567,7 @@ async def create_model(
                 price_source=(
                     "manual"
                     if (
-                        (model_kind != "text" and media_pricing)
+                        (model_kind != "text" and _has_manual_media_prices(media_pricing))
                         or (model_kind in {"text", "decision"} and (input_price is not None or output_price is not None))
                     )
                     else None
@@ -563,6 +576,9 @@ async def create_model(
                 capability_source=("override" if capabilities else None),
                 is_active=is_active,
             )
+            if model_kind == "image" and is_active:
+                # A default-active create is rejected outright; callers opt into an inactive draft.
+                _require_image_pricing_ready(row, provider)
             session.add(row)
             await session.flush()
             effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
@@ -679,6 +695,11 @@ async def update_model(model_id: int, patch: dict) -> dict:
             if provider is None:
                 raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
             row = models[0]
+            was_active = row.is_active
+            # Legacy rows already active without executable pricing stay editable; only
+            # activation and breaking a ready active row are refused.
+            was_ready = getattr(row, "model_kind", "text") != "image" or _image_pricing_readiness(
+                row, provider.provider_type, provider.api_base)["ready"]
             target_kind = patch.get("model_kind", getattr(row, "model_kind", "text"))
             _validate_model_kind(provider, target_kind)
             media_pricing = patch.get("media_pricing", getattr(row, "media_pricing", None))
@@ -691,8 +712,11 @@ async def update_model(model_id: int, patch: dict) -> dict:
                     ("cache_write_1h_price_per_million", "cache_write_1h_price"),
                 )),
             )
-            media_pricing = _validate_kind_prices(target_kind, media_pricing, token_prices, provider.provider_type,
-                model_name=str(patch.get("model_name") or row.model_name).strip(), api_base=provider.api_base)
+            media_pricing = _validate_kind_prices(
+                target_kind, media_pricing, token_prices, provider.provider_type,
+                model_name=str(patch.get("model_name") or row.model_name).strip(), api_base=provider.api_base,
+                previous_media_pricing=row.media_pricing if "media_pricing" in patch else None,
+            )
             target_active = row.is_active if patch.get("is_active") is None else bool(patch["is_active"])
             if target_active:
                 _validate_compatible_prices(
@@ -707,7 +731,7 @@ async def update_model(model_id: int, patch: dict) -> dict:
             if "media_pricing" in patch:
                 row.media_pricing = media_pricing
                 if target_kind != "text":
-                    row.price_source = "manual" if media_pricing else None
+                    row.price_source = "manual" if _has_manual_media_prices(media_pricing) else None
             if patch.get("model_name"):
                 canonical_name = canonical_subscription_model_name(str(patch["model_name"]), auth_mode)
                 if provider.provider_type == "perplexity" and auth_mode == "api_key":
@@ -761,6 +785,8 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 row.capability_source = "override" if row.capabilities else None
             if patch.get("is_active") is not None:
                 row.is_active = bool(patch["is_active"])
+            if row.model_kind == "image" and row.is_active and (not was_active or was_ready):
+                _require_image_pricing_ready(row, provider)
             await session.flush()
             effective_input, effective_output, effective_source, _ = _resolved_base_prices(row, provider)
             return _model_public(

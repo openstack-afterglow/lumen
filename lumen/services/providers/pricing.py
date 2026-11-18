@@ -103,20 +103,23 @@ def _decimal_text(value: Decimal) -> str:
     return format(value.normalize() if value else Decimal("0"), "f")
 
 
-def _validate_token_rates(value) -> dict[str, dict[str, str]]:
+def _validate_token_rates(value, *, sparse: bool = False) -> dict[str, dict[str, str | None]]:
     if not isinstance(value, dict) or set(value) - set(TOKEN_RATE_MODALITIES):
         raise ProviderValidationError("token_rates는 image/audio 가격 객체여야 합니다")
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, dict[str, str | None]] = {}
     for modality, rates in value.items():
-        if not isinstance(rates, dict) or not rates or set(rates) - set(TOKEN_RATE_FIELDS):
+        if not isinstance(rates, dict) or (not sparse and not rates) or set(rates) - set(TOKEN_RATE_FIELDS):
             raise ProviderValidationError(f"token_rates.{modality} 항목이 올바르지 않습니다")
-        if "cache_read_per_million" in rates and "input_per_million" not in rates:
+        if not sparse and "cache_read_per_million" in rates and "input_per_million" not in rates:
             raise ProviderValidationError(f"token_rates.{modality} 캐시 입력 가격에는 입력 가격이 필요합니다")
-        parsed = {key: _strict_decimal(amount, f"token_rates.{modality}.{key}") for key, amount in rates.items()}
+        parsed = {
+            key: None if sparse and amount is None else _strict_decimal(amount, f"token_rates.{modality}.{key}")
+            for key, amount in rates.items()
+        }
         for key, amount in parsed.items():
             if amount and (amount / _TOKENS_PER_MILLION).quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) == 0:
                 raise ProviderValidationError(f"token_rates.{modality}.{key} 값이 저장 정밀도보다 작습니다")
-        result[modality] = {key: _decimal_text(amount) for key, amount in parsed.items()}
+        result[modality] = {key: _decimal_text(amount) if amount is not None else None for key, amount in parsed.items()}
     return result
 
 
@@ -137,12 +140,8 @@ def _check_duration_aliases(pricing: dict, family: str) -> tuple[Decimal, int] |
     return rate, seconds
 
 
-def validate_media_pricing(model_kind: str, pricing: dict | None, *, provider_type: str | None = None) -> dict | None:
-    """Validate and serialize explicit per-kind USD rates without token-price fallback.
-
-    Absent keys stay absent (unpriced); an explicit zero is a real free rate.
-    Requested time units are retained; conversion happens only at calculation.
-    """
+def _normalize_media_prices(model_kind: str, pricing: dict | None, *, sparse: bool = False) -> dict | None:
+    """Validate price paths and amounts, retaining nulls only for a sparse patch."""
     if model_kind not in MODEL_KINDS:
         raise ProviderValidationError("지원하지 않는 model_kind 입니다")
     if pricing is None:
@@ -152,25 +151,35 @@ def validate_media_pricing(model_kind: str, pricing: dict | None, *, provider_ty
     allowed = set(MEDIA_PRICE_FIELDS[model_kind])
     if set(pricing) - allowed:
         raise ProviderValidationError("model_kind에 맞지 않는 media_pricing 항목입니다")
-    result: dict[str, str | dict] = {}
+    result = {}
     for key, value in pricing.items():
         if key == "image_variants":
             if not isinstance(value, dict) or len(value) > 500:
                 raise ProviderValidationError("image_variants는 variant 가격 객체여야 합니다")
-            variants: dict[str, str] = {}
+            variants = {}
             for variant, amount in value.items():
                 if not isinstance(variant, str) or not re.fullmatch(r"(auto|[1-9][0-9]*x[1-9][0-9]*):[A-Za-z0-9][A-Za-z0-9_-]*", variant):
                     raise ProviderValidationError("image_variants는 size:quality 정확한 키를 사용해야 합니다")
-                variants[variant] = _decimal_text(_strict_decimal(amount, key))
+                variants[variant] = None if sparse and amount is None else _decimal_text(_strict_decimal(amount, key))
             result[key] = variants
         elif key == "token_rates":
-            result[key] = _validate_token_rates(value)
+            result[key] = _validate_token_rates(value, sparse=sparse)
+        elif sparse and value is None:
+            result[key] = None
         elif key == "billing_basis":
             if not isinstance(value, str) or value not in BILLING_BASES.get(model_kind, ()):
                 raise ProviderValidationError("model_kind에 맞지 않는 billing_basis 입니다")
             result[key] = value
         else:
             result[key] = _decimal_text(_strict_decimal(value, key))
+    return result or None
+
+
+def validate_media_pricing(model_kind: str, pricing: dict | None, *, provider_type: str | None = None) -> dict | None:
+    """Validate a complete, mode-free media price object."""
+    result = _normalize_media_prices(model_kind, pricing)
+    if result is None:
+        return None
     for family in _KIND_DURATION_FAMILIES.get(model_kind, ()):
         _check_duration_aliases(result, family)
     basis = result.get("billing_basis")
@@ -181,7 +190,60 @@ def validate_media_pricing(model_kind: str, pricing: dict | None, *, provider_ty
             raise ProviderValidationError("reservation_usd는 0보다 커야 합니다")
     elif basis == "tokens" and not derived_hold_allowed(model_kind, provider_type):
         raise ProviderValidationError("tokens 과금 기준에는 양수 reservation_usd가 필요합니다")
+    return result
+
+
+def _media_price_overlay(base: dict | None, patch: dict) -> dict | None:
+    """Overlay validated price leaves without mutating the base; null removes an override."""
+    result = dict(base or {})
+    for key, value in patch.items():
+        if isinstance(value, dict):
+            merged = _media_price_overlay(result.get(key), value)
+            if merged:
+                result[key] = merged
+            else:
+                result.pop(key, None)
+        elif value is None:
+            result.pop(key, None)
+        else:
+            result[key] = value
     return result or None
+
+
+def _media_price_values(override: dict) -> dict:
+    return {key: value for key, value in override.items() if key != "override_mode"}
+
+
+def _catalog_media_prices(entry: dict, model_kind: str) -> dict | None:
+    return entry.get("media_pricing") if entry.get("kind") == model_kind else None
+
+
+def validate_media_override(
+    model_kind: str, override: dict | None, *, previous: dict | None, model_name: str,
+    provider_type: str | None, api_base: str | None,
+) -> tuple[dict | None, dict | None]:
+    """Return normalized stored override and validated effective pricing for a write."""
+    if override is None:
+        return None, None
+    if not isinstance(override, dict):
+        raise ProviderValidationError("media_pricing은 객체여야 합니다")
+    mode = override.get("override_mode", (previous or {}).get("override_mode", "replace"))
+    if mode not in ("replace", "leaf"):
+        raise ProviderValidationError("media_pricing.override_mode는 replace 또는 leaf여야 합니다")
+    prices = _media_price_values(override)
+    if mode == "replace":
+        complete = validate_media_pricing(model_kind, prices, provider_type=provider_type)
+        if complete and "override_mode" in override:
+            return {"override_mode": "replace", **complete}, complete
+        return complete, complete
+
+    patch = _normalize_media_prices(model_kind, prices, sparse=True)
+    manual = _media_price_overlay(_media_price_values(previous or {}), patch or {})
+    entry = native_catalog_entry(model_name, provider_type, api_base)
+    effective = _media_price_overlay(_catalog_media_prices(entry, model_kind), manual or {})
+    # Validate the merged object, including limits that span catalog and manual leaves.
+    effective = validate_media_pricing(model_kind, effective, provider_type=provider_type)
+    return {"override_mode": "leaf", **(manual or {})}, effective
 
 
 def media_billing_basis(kind: str, pricing: dict | None) -> str:
@@ -296,6 +358,14 @@ _TOKEN_BASIS_TEXT_DIRECTIONS = {
 }
 
 
+def _executable_unit_price(value) -> bool:
+    try:
+        price = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return False
+    return price.is_finite() and 0 < price < _MAX_RATE and price == price.quantize(_USD_QUANTUM)
+
+
 def media_pricing_available(
     kind: str, pricing: dict | None, *, text_input_priced: bool = False, text_output_priced: bool = False,
     duration_families: tuple[str, ...] | None = None, provider_type: str | None = None,
@@ -327,8 +397,9 @@ def media_pricing_available(
             and all(text_priced[direction] for direction in _TOKEN_BASIS_TEXT_DIRECTIONS[kind])
         )
     if basis == "unit":
+        # Execution bills only a positive exact size:quality variant; a base rate alone is stored, not executable.
         variants = pricing.get("image_variants")
-        return bool(variants) if isinstance(variants, dict) else exact_media_price(pricing, "image_per_unit") is not None
+        return isinstance(variants, dict) and any(_executable_unit_price(value) for value in variants.values())
     if basis == "characters":
         return exact_media_price(pricing, "audio_per_character") is not None
     if basis == "session":
@@ -346,17 +417,6 @@ def _realtime_duration_families(kind: str, model_name: object) -> tuple[str, ...
     from .realtime_transport import duration_families
 
     return duration_families(model_name)
-
-
-def model_media_pricing_available(model: LlmModel) -> bool:
-    """``media_pricing_available`` for a stored media model, including its text columns."""
-    return media_pricing_available(
-        _kind(model),
-        getattr(model, "media_pricing", None),
-        text_input_priced=getattr(model, "input_price", None) is not None,
-        text_output_priced=getattr(model, "output_price", None) is not None,
-        duration_families=_realtime_duration_families(_kind(model), getattr(model, "model_name", None)),
-    )
 
 
 def route_media_pricing_available(route: dict) -> bool:
@@ -564,6 +624,28 @@ def _provider_public(row: LlmProvider) -> dict:
     }
 
 
+def _media_route(row: LlmModel, provider_type: str | None, api_base: str | None, *, configured: bool) -> dict:
+    """Credential-free route projection used to judge media readiness."""
+    input_rate, output_rate = _effective_model_rates(row, provider_type, api_base)
+    return {
+        "model_kind": _kind(row), "provider_type": provider_type,
+        "api_model_name": api_model_name(row.model_name, provider_type or ""),
+        "api_base": api_base, "api_key": "configured" if configured else None,
+        "media_pricing": _effective_media_pricing(row, provider_type, api_base),
+        "input_price_per_token": input_rate, "output_price_per_token": output_rate,
+        "cache_read_price_per_token": _resolved_cache_prices(row, provider_type, api_base)[0]["cache_read_price_per_token"],
+        "provider_auth": None,
+    }
+
+
+def _image_pricing_readiness(row: LlmModel, provider_type: str | None, api_base: str | None) -> dict | None:
+    if _kind(row) != "image":
+        return None
+    from .image_transport import image_pricing_readiness
+
+    return image_pricing_readiness(_media_route(row, provider_type, api_base, configured=True))
+
+
 def _effective_capabilities(
     row: LlmModel,
     provider_type: str | None,
@@ -619,22 +701,16 @@ def _effective_capabilities(
         # provider, configured API key, supported price and asset pipeline matter.
         route_available = False
         reservation_error = False
+        pricing_reason = None
         kind = _kind(row)
         configured = auth_mode == "api_key" and api_key_configured
         if kind == "realtime" or (configured and kind in {"image", "tts", "stt"}):
-            input_rate, output_rate = _effective_model_rates(row, provider_type, api_base)
-            route = {
-                "model_kind": kind, "provider_type": provider_type,
-                "api_model_name": api_model_name(row.model_name, provider_type or ""),
-                "api_base": api_base, "api_key": "configured" if configured else None,
-                "media_pricing": _effective_media_pricing(row, provider_type, api_base),
-                "input_price_per_token": input_rate, "output_price_per_token": output_rate,
-                "cache_read_price_per_token": _resolved_cache_prices(row, provider_type, api_base)[0]["cache_read_price_per_token"],
-                "provider_auth": None,
-            }
+            route = _media_route(row, provider_type, api_base, configured=configured)
             if kind == "image":
-                from .image_transport import image_route_ready
+                from .image_transport import image_pricing_readiness, image_route_ready
                 route_available = image_route_ready(route)
+                if configured and not route_available:
+                    pricing_reason = image_pricing_readiness(route)["reason"]
             elif kind == "realtime":
                 from .realtime_transport import realtime_route_ready
                 reservation_error = _realtime_reservation_too_small(route)
@@ -664,6 +740,8 @@ def _effective_capabilities(
                         if route_available and needs_assets
                         else "realtime_reservation_too_small"
                         if reservation_error
+                        else pricing_reason
+                        if pricing_reason
                         else "route_unavailable"
                     )
                     if name in features
@@ -689,6 +767,25 @@ def _effective_capabilities(
         return apply_subscription_capability_limits(effective, auth_mode), "override"
     source = "native_catalog" if detected.get("metadata_status") == "observed" else "defaults"
     return apply_subscription_capability_limits(detected, auth_mode), source
+
+
+def domain_billing_readiness(capabilities: dict, *, input_price, output_price) -> dict:
+    """Whether a text model can fund a domain-paid call before admission.
+
+    Mirrors the run-time bound: a prepaid hold covers the whole frozen context
+    window plus an output budget the provider enforces. Unknown windows are
+    never fabricated; an administrator may set ``capabilities.context_limit``.
+    """
+    limit = capabilities.get("context_limit")
+    if input_price is None or output_price is None:
+        reason = "pricing_unavailable"
+    elif capabilities.get("output_budget_enforced") is False:
+        reason = "output_budget_unenforced"
+    elif type(limit) is not int or limit <= 0:
+        reason = "context_limit_unknown"
+    else:
+        reason = None
+    return {"ready": reason is None, "reason_code": reason}
 
 
 def _model_public(
@@ -747,11 +844,35 @@ def _model_public(
         if entry["kind"] == "decision":
             # Identify the supported registry kind even for legacy text rows.
             catalog_entry["kind"] = entry["kind"]
+        if entry["kind"] == _kind(row) and _kind(row) in BILLING_BASES:
+            # Media editors need the kind and official leaves that a manual override may hide.
+            catalog_entry.update(
+                kind=entry["kind"], token_pricing=entry.get("token_pricing"), media_pricing=entry.get("media_pricing"),
+            )
     price_origin = resolved_source if resolved_source in {"manual", "native_catalog"} else None
     # Stored manual cache columns stay nullable; effective rates are projected separately.
     effective_cache, effective_cache_sources = _effective_cache_prices(
         row, _resolved_cache_prices(row, provider_type, api_base), effective_input, effective_price_source or row.price_source
     )
+    stored_media = getattr(row, "media_pricing", None)
+    effective_media = _effective_media_pricing(row, provider_type, api_base)
+    text_sources = {}
+    if effective_input is not None:
+        text_sources["input_price_per_million"] = "manual" if row.input_price is not None else "catalog"
+    if effective_output is not None and _kind(row) != "embedding":
+        text_sources["output_price_per_million"] = "manual" if row.output_price is not None else "catalog"
+    for category, (field, _, resolved) in zip(_CACHE_CATEGORIES, CACHE_PRICE_FIELDS, strict=True):
+        if effective_cache[resolved] is None:
+            continue
+        source = effective_cache_sources[category]
+        if source == "manual":
+            text_sources[field] = "manual"
+        elif source == "native_catalog":
+            text_sources[field] = "catalog"
+        elif source and source.startswith("fallback_input:"):
+            text_sources[field] = text_sources["input_price_per_million"]
+        elif source and source.startswith("fallback_5m:"):
+            text_sources[field] = text_sources["cache_write_price_per_million"]
     return {
         "id": row.id,
         "provider_id": row.provider_id,
@@ -766,8 +887,11 @@ def _model_public(
         "provider_sort_order": provider_sort_order,
         "sort_order": row.sort_order,
         "model_kind": _kind(row),
-        "media_pricing": getattr(row, "media_pricing", None),
-        "effective_media_pricing": _effective_media_pricing(row, provider_type, api_base),
+        "media_pricing": stored_media,
+        "effective_media_pricing": effective_media,
+        "effective_media_price_sources": _media_price_sources(effective_media or {}, stored_media or {}),
+        "effective_text_price_sources": text_sources,
+        "image_pricing_readiness": _image_pricing_readiness(row, provider_type, api_base),
         "display_name": display_name,
         "is_active": row.is_active,
         "is_title_model": row.is_title_model,
@@ -793,6 +917,11 @@ def _model_public(
         "effective_capability_source": eff_caps_source,
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
+        # Not part of route capabilities, so run config hashes stay unchanged.
+        "domain_billing": (
+            domain_billing_readiness(eff_caps, input_price=effective_input, output_price=effective_output)
+            if _kind(row) == "text" else None
+        ),
     }
 
 
@@ -930,23 +1059,48 @@ def _effective_model_rates(
 
 
 
+def _media_price_sources(effective: dict, stored: dict) -> dict:
+    sources = {}
+    for key, value in effective.items():
+        if isinstance(value, dict):
+            nested = _media_price_sources(value, stored.get(key) or {})
+            if nested:
+                sources[key] = nested
+        else:
+            sources[key] = "manual" if key in stored else "catalog"
+    return sources
+
+
+def _has_manual_media_prices(pricing: dict | None) -> bool:
+    # Existing mode-free objects retain their historical provenance.
+    return pricing is not None and (pricing.get("override_mode") != "leaf" or len(pricing) > 1)
+
+
 def _effective_media_pricing(model: LlmModel, provider_type: str | None, api_base: str | None) -> dict | None:
-    if _kind(model) == "decision":
+    kind = _kind(model)
+    if kind == "decision":
         return None
     manual = getattr(model, "media_pricing", None)
-    if manual is not None:
-        return manual
+    if manual is not None and manual.get("override_mode") != "leaf":
+        return _media_price_values(manual) if "override_mode" in manual else manual
     entry = native_catalog_entry(model.model_name, provider_type, api_base)
-    return entry.get("media_pricing") if entry.get("kind") == _kind(model) else None
+    base = _catalog_media_prices(entry, kind)
+    return _media_price_overlay(base, _media_price_values(manual)) if manual and len(manual) > 1 else base
 
 
 def _resolved_context_tiers(model: LlmModel, provider_type: str | None, api_base: str | None) -> dict:
     entry = {} if _kind(model) == "decision" else native_catalog_entry(model.model_name, provider_type, api_base)
     token = entry.get("token_pricing") or {}
     tier = token.get("long_context") or {}
-    catalog_media = getattr(model, "media_pricing", None) is None and entry.get("kind") == _kind(model)
+    manual_media = getattr(model, "media_pricing", None)
+    leaf_mode = (manual_media or {}).get("override_mode") == "leaf"
+    catalog_media = (manual_media is None or leaf_mode) and entry.get("kind") == _kind(model)
+    manual_rates = (manual_media or {}).get("token_rates", {}) if leaf_mode else {}
     catalog_text = all(getattr(model, field, None) is None for field in ("input_price", "output_price", "cache_read_price"))
-    follow_text = bool(tier) and catalog_media and catalog_text and bool((entry.get("media_pricing") or {}).get("token_rates"))
+    follow_text = (
+        bool(tier) and catalog_media and catalog_text and not manual_rates
+        and bool((entry.get("media_pricing") or {}).get("token_rates"))
+    )
     media = entry.get("media_pricing") if catalog_media else None
     tier_rates = tier.get("token_rates") or {}
     input_rate, output_rate = _effective_model_rates(model, provider_type, api_base)
@@ -970,8 +1124,11 @@ def _resolved_context_tiers(model: LlmModel, provider_type: str | None, api_base
         ) if same_base else False
         if follow_text and same_base and same_tier:
             continue
+        manual_fields = manual_rates.get(modality, {})
+        if not fields.keys() - manual_fields.keys():
+            continue
         resolved_modality_tiers[modality] = {
-            field: tier_rates.get(modality, {}).get(
+            field: manual_fields[field] if field in manual_fields else tier_rates.get(modality, {}).get(
                 field, tier.get(field.removesuffix("_per_million"), token.get(field.removesuffix("_per_million"))),
             )
             for field in fields
@@ -1018,13 +1175,17 @@ def _resolved_model_prices(
     priced = input_price is not None and (kind == "decision" or output_price is not None)
     manual = model.input_price is not None
     if kind != "decision":
-        manual = manual or model.output_price is not None or getattr(model, "media_pricing", None) is not None
+        manual = manual or model.output_price is not None or _has_manual_media_prices(getattr(model, "media_pricing", None))
     if kind not in {"text", "embedding", "decision"}:
         media = _effective_media_pricing(model, provider_type, api_base)
         priced = media_pricing_available(
             kind, media, text_input_priced=input_price is not None, text_output_priced=output_price is not None,
             duration_families=_realtime_duration_families(kind, model.model_name), provider_type=provider_type,
         )
+        if priced and kind == "image":
+            # Priced variants the model cannot execute do not make the row priced.
+            readiness = _image_pricing_readiness(model, provider_type, api_base)
+            priced = readiness["reason"] != "unsupported_image_variants"
         if priced and kind == "realtime":
             cache_rates, _ = _resolved_cache_prices(model, provider_type, api_base)
             priced = not _realtime_reservation_too_small({"model_kind": kind, "provider_type": provider_type,

@@ -92,6 +92,14 @@ def _map_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=503, detail=str(exc))
 
 
+def _owner(token_info: dict) -> dict:
+    """Without a verified domain, the store binds agents to the exact selected project."""
+    owner = {"user_id": token_info["user_id"], "project_id": token_info["project_id"]}
+    if domain_id := history_domain_id(token_info):
+        owner["domain_id"] = domain_id
+    return owner
+
+
 @router.post("/agents", status_code=201)
 async def create_agent(payload: AgentCreate, token_info: dict = Depends(require_scopes("native:agents:write"))):
     try:
@@ -112,9 +120,7 @@ async def list_agents(include_private: bool = False, token_info: dict = Depends(
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
         return await ags.list_agents(
-            user_id=token_info["user_id"],
-            project_id=token_info["project_id"],
-            domain_id=history_domain_id(token_info),
+            **_owner(token_info),
             include_private=include_private,
         )
     except ags.ChatStorageUnavailable:
@@ -134,9 +140,7 @@ async def agent_hub(
             query=query,
             limit=limit,
             offset=offset,
-            user_id=token_info["user_id"],
-            project_id=token_info["project_id"],
-            domain_id=history_domain_id(token_info),
+            **_owner(token_info),
         )
     except ags.ChatStorageUnavailable:
         return []
@@ -147,9 +151,7 @@ async def get_agent(agent_id: int, token_info: dict = Depends(require_scopes("na
     try:
         return await ags.get_agent(
             agent_id,
-            user_id=token_info["user_id"],
-            project_id=token_info["project_id"],
-            domain_id=history_domain_id(token_info),
+            **_owner(token_info),
         )
     except (ags.AgentNotFound, ags.AgentForbidden, ags.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
@@ -160,9 +162,7 @@ async def update_agent(agent_id: int, payload: AgentUpdate, token_info: dict = D
     try:
         return await ags.update_agent(
             agent_id,
-            user_id=token_info["user_id"],
-            project_id=token_info["project_id"],
-            domain_id=history_domain_id(token_info),
+            **_owner(token_info),
             patch=payload.model_dump(exclude_unset=True),
         )
     except (ags.AgentNotFound, ags.AgentForbidden, ags.AgentValidationError, ags.ChatStorageUnavailable) as exc:
@@ -174,9 +174,7 @@ async def delete_agent(agent_id: int, token_info: dict = Depends(require_scopes(
     try:
         await ags.delete_agent(
             agent_id,
-            user_id=token_info["user_id"],
-            project_id=token_info["project_id"],
-            domain_id=history_domain_id(token_info),
+            **_owner(token_info),
         )
     except (ags.AgentNotFound, ags.AgentForbidden, ags.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
@@ -188,9 +186,7 @@ async def clone_agent(agent_id: int, token_info: dict = Depends(require_scopes("
     try:
         return await ags.clone_agent(
             agent_id,
-            user_id=token_info["user_id"],
-            project_id=token_info["project_id"],
-            domain_id=history_domain_id(token_info),
+            **_owner(token_info),
         )
     except (ags.AgentNotFound, ags.AgentForbidden, ags.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
