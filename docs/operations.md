@@ -501,6 +501,8 @@ After the schema-first cutover, a system administrator must fund each inference 
 
 No migration copies user balances or retroactively charges a domain. Unfunded domains fail closed with `domain_credit_insufficient`. Inactivating a pool or lowering its limit blocks new admissions without invalidating previously funded holds. Known zero-cost refusals release the hold; do not auto-expire `unknown` rows. Reconcile unknown amounts against provider evidence before changing the hold and ledger. Take the domain pool lock before changing either; do not edit the balance or reservation cache independently.
 
+Domain-billed text requires enforceable input/output bounds and known prices before dispatch. The prepaid envelope reserves the frozen context at the highest applicable input rate; ensure the pool and per-user guard can cover that envelope. Paid native web search without a provider-enforced request limit is unavailable on this path. A disconnect without complete provider usage retains an `unknown` hold; there is no automatic release or pool API for manual disposition.
+
 
 Elastic/Batch 후보의 additive migration은 022(runtime routing), 023(trusted identity), 024(batch ledger), 025(batch expiry default)다. 025는 이미 적용한 024를 수정하지 않고 MariaDB의 column-reference DEFAULT zero-date 오류를 교정한다. 모두 적용한 뒤 동일 `lumen-migrate --apply`를 재실행한다. `api_completion`과 Batch 상태를 모르는 구 worker를 신 schema의 실행자와 섞지 않는다. Runtime/Batch 활성화는 고정 worker 수용, managed guest/ingress 수용 및 별도 운영 cutover 승인 이후다.
 

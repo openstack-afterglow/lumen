@@ -22,6 +22,7 @@ from lumen.models.chat_infrastructure import ChatAgentReservation, ChatProjectAg
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment
 from lumen.models.stateless_reservations import StatelessCallReservation
 from lumen.services import credit, domain_credit, stateless_credit
+from lumen.services.chat_admission import _run_snapshots
 from lumen.services.durable_runs import budgets, execution
 from lumen.services.provider_metadata import UsageCost
 from lumen.services.usage import user_usage_summary
@@ -73,13 +74,14 @@ async def _hold(scope, actor, amount, *, key_id=None):
     return event_id
 
 
-async def _run(scope, *, parent=None):
+async def _run(scope, *, parent=None, snapshots=None):
+    capability, pricing = snapshots if snapshots is not None else ({}, {})
     run_id = str(uuid4())
     async with scope.factory() as session, session.begin():
         session.add(ChatRun(
             id=run_id, run_scope="temp" if parent is None else "child", run_kind="completion",
             user_id=scope.users[0], project_id=scope.project, payer_domain_id=scope.id,
-            model_name="synthetic-model", capability_snapshot={}, pricing_snapshot={},
+            model_name="synthetic-model", capability_snapshot=capability, pricing_snapshot=pricing,
             request_payload=encrypt_chat_content("{}"), client_request_id=str(uuid4()),
             request_fingerprint=run_id, fingerprint_version=1, execution_protocol_version=1,
             status="running", lease_owner="billing-worker", lease_expires_at=execution._now() + timedelta(minutes=1),
@@ -96,6 +98,35 @@ def _hooks(run_id):
 async def _durable_hold(run_id, amount="6"):
     await _hooks(run_id)._start(segment_id="provider:0:0", ordinal=0, endpoint="chat_completions",
                                turn_ordinal=0, credit_bound=lambda _: Decimal(amount))
+
+
+async def test_ordinary_chat_frozen_snapshot_reserves_and_charges_once(pool_scope, monkeypatch):
+    scope = pool_scope
+    monkeypatch.setattr(credit.get_settings(), "chat_credit_per_usd", Decimal(1))
+    await _fund(scope, "10")
+    snapshots = _run_snapshots({
+        "provider_id": 1, "model_id": 1, "provider_name": "configured-test-provider",
+        "provider_type": "openai", "model_name": "synthetic-model", "config_version_hash": "f" * 64,
+        "input_price_per_token": Decimal("0.001"), "output_price_per_token": Decimal("0.002"),
+        "capabilities": {"context_limit": 1024, "output_budget_enforced": True}, "price_source": "manual",
+    }, {})
+    run_id = await _run(scope, snapshots=snapshots)
+    hooks = _hooks(run_id)
+    await hooks.provider_started(round_index=0, attempt=0, max_tokens=20,
+                                 messages=[{"role": "user", "content": "synthetic"}])
+    async with scope.factory() as session:
+        pool = await session.get(DomainCreditPool, scope.id)
+        assert Decimal(1) < pool.reserved_credits < Decimal(2)
+        assert pool.balance_credits == 10
+    for _ in range(2):
+        await hooks.provider_completed(round_index=0, attempt=0,
+                                       usage={"prompt_tokens": 2, "completion_tokens": 3}, result_payload={})
+    async with scope.factory() as session:
+        pool = await session.get(DomainCreditPool, scope.id)
+        assert (pool.balance_credits, pool.reserved_credits, pool.monthly_used_credits) == (
+            Decimal("9.992"), 0, Decimal("0.008"),
+        )
+        assert (await session.get(UserWallet, scope.users[0])).used_quota_this_month == 0
 
 
 @pytest.mark.parametrize(("amount", "ceiling"), [("10", None), ("100", "10")])
