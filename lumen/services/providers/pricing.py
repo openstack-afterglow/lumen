@@ -1158,6 +1158,10 @@ def _resolved_model_prices(
             kind, media, text_input_priced=input_price is not None, text_output_priced=output_price is not None,
             duration_families=_realtime_duration_families(kind, model.model_name), provider_type=provider_type,
         )
+        if priced and kind == "image":
+            # Priced variants the model cannot execute do not make the row priced.
+            readiness = _image_pricing_readiness(model, provider_type, api_base)
+            priced = readiness["reason"] != "unsupported_image_variants"
         if priced and kind == "realtime":
             cache_rates, _ = _resolved_cache_prices(model, provider_type, api_base)
             priced = not _realtime_reservation_too_small({"model_kind": kind, "provider_type": provider_type,
