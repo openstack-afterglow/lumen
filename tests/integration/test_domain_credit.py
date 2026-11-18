@@ -297,6 +297,19 @@ async def test_slow_keystone_does_not_block_other_actor_billing(pool_scope, monk
             assert segment.status == "provider_started"
 
 
+async def test_canceled_run_commits_no_dispatch_hold(pool_scope):
+    scope = pool_scope
+    await _fund(scope, "10")
+    run_id = await _run(scope)
+    async with scope.factory() as session, session.begin():
+        (await session.get(ChatRun, run_id)).cancel_requested_at = execution._now()
+    with pytest.raises(execution.DurableRunError, match="canceled before provider start"):
+        await _durable_hold(run_id)
+    async with scope.factory() as session:
+        assert (await session.get(DomainCreditPool, scope.id)).reserved_credits == 0
+        assert await session.get(ChatRunSegment, (run_id, "provider:0:0")) is None
+
+
 async def test_domain_lock_precedes_quota_in_real_dashboard_transaction(pool_scope, monkeypatch):
     scope = pool_scope
     await _fund(scope, "10")

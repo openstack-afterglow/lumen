@@ -47,6 +47,15 @@ async def test_runtime_backfill_and_batch_ledger_survive_repeat_migration(snapsh
         "022-runtime-routing", "023-trusted-identity", "024-batch-ledger",
         "025-batch-expiry-default", "027-kubernetes-sandboxes",
     }]
+    # Today's ORM reads chat_runs and chat_batches here, so their later immutable additive payer
+    # columns (037) are applied verbatim; the other 037 tables come from migrations this test skips.
+    payer_columns = [
+        statement
+        for migration in migrations if migration.logical_id == "037-domain-credit-pools"
+        for statement in _statements(MIGRATIONS / migration.relative_path)
+        if re.match(r"ALTER TABLE (chat_runs|chat_batches) ", statement)
+    ]
+    assert len(payer_columns) == 2
     tables: list[str] = []
     run_ids = {kind: str(uuid.uuid4()) for kind in (
         "completion", "compaction", "image", "tts", "stt", "realtime",
@@ -123,6 +132,8 @@ async def test_runtime_backfill_and_batch_ledger_survive_repeat_migration(snapsh
                         assert table.startswith(prefix)
                         tables.append(table)
                     await connection.exec_driver_sql(statement)
+            for statement in payer_columns:
+                await connection.exec_driver_sql(statement)
 
         async with factory() as session:
             runs = (await session.scalars(select(ChatRun))).all()

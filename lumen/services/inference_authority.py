@@ -16,6 +16,10 @@ def dispatch_deadline() -> float:
     return monotonic() + _DISPATCH_APPROVAL_SECONDS
 
 
+def dispatch_expired(deadline: float) -> bool:
+    return monotonic() >= deadline
+
+
 def _dispatch_identity(run: ChatRun) -> tuple:
     return (
         run.id, run.user_id, run.project_id, run.api_key_id, run.agent_id, run.payer_domain_id,

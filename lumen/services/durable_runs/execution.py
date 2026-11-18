@@ -1650,6 +1650,9 @@ class _DurableExecutionHooks:
                 return {"_boundary_abort": "provider_result_unknown"}
             # Only new work needs a short-lived approval. Replays above never
             # make external authorization calls or invalidate committed I/O.
+            if run.cancel_requested_at is not None:
+                # The unlocked preflight skipped a canceled run; the handler records the stop as canceled.
+                raise DurableRunError("chat run canceled before provider start")
             try:
                 verified = await check_dispatch(session, run, approval)
             except ApiKeyForbidden as exc:
@@ -3268,17 +3271,20 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             await flush_deltas(check_cancel=False)
         except Exception:
             logger.warning("failed to persist buffered chat deltas run_id=%s", _safe_log_token(run_id))
-        if isinstance(exc, DurableRunEventValidationError):
-            error_code, safe_message = "internal_validation_failed", "chat run event validation failed"
+        if not isinstance(exc, SQLAlchemyError) and await _cancel_requested(run_id):
+            # A stop that reached a dispatch boundary first is the user's intent, not a provider failure.
+            status, error_code, safe_message = "canceled", "canceled", "chat run canceled"
+        elif isinstance(exc, DurableRunEventValidationError):
+            status, error_code, safe_message = "failed", "internal_validation_failed", "chat run event validation failed"
         elif isinstance(exc, MessageGraphError):
-            error_code, safe_message = "internal_graph_error", "chat conversation graph update failed"
+            status, error_code, safe_message = "failed", "internal_graph_error", "chat conversation graph update failed"
         elif isinstance(exc, SQLAlchemyError):
-            error_code, safe_message = "persistence_failed", "chat run persistence failed"
+            status, error_code, safe_message = "failed", "persistence_failed", "chat run persistence failed"
         else:
-            error_code, safe_message = "provider_failed", "chat provider failed"
+            status, error_code, safe_message = "failed", "provider_failed", "chat provider failed"
         await _finish(
             run_id,
-            status="failed",
+            status=status,
             message_id=message_id,
             owner=owner,
             error_code=error_code,

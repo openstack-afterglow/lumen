@@ -16,7 +16,6 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from time import monotonic
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -33,7 +32,7 @@ from lumen.plugins.registry import get_registry
 from lumen.services import agent_store as ags
 from lumen.services import credit, worker_routing
 from lumen.services.domain_scope import history_domain_id
-from lumen.services.inference_authority import dispatch_deadline
+from lumen.services.inference_authority import dispatch_deadline, dispatch_expired
 from lumen.services.providers.errors import AmbiguousModelRouteError
 from lumen.services.run_protocol_v2 import transition_allowed
 from lumen.services.run_store import NONTERMINAL, TERMINAL, append_event
@@ -476,7 +475,7 @@ async def prepare_delegations(
                     if by_call[call.call_id].fingerprint != call.fingerprint():
                         raise DurableRunConflict("replayed delegation call has a different fingerprint")
                 return _group_view(group, rows)
-            if domain_id is not None and (monotonic() >= scope_deadline or parent.project_id != parent_identity.project_id
+            if domain_id is not None and (dispatch_expired(scope_deadline) or parent.project_id != parent_identity.project_id
                                           or parent.user_id != parent_identity.user_id):
                 raise ChildFailure("child_agent_unavailable", "delegate agent authorization is stale")
             root_sandbox_deadline = None
@@ -683,7 +682,7 @@ async def prepare_delegations(
                     raise ChildFailure(exc.code, str(exc)) from exc
             if root_sandbox_deadline is not None and root_sandbox_deadline <= _now():
                 raise ChildFailure("sandbox_expired", "root selected sandbox lifetime has expired")
-            if domain_id is not None and monotonic() >= scope_deadline:
+            if domain_id is not None and dispatch_expired(scope_deadline):
                 raise ChildFailure("child_agent_unavailable", "delegate agent authorization is stale")
             return _group_view(group, rows)
 
