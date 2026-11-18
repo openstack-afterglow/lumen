@@ -27,6 +27,7 @@ from lumen.services.code_workspace_store import (
     normalize_git_host,
     validate_workspace_source,
 )
+from lumen.services.domain_scope import scope_clause
 
 _WORKSPACE_TTL = timedelta(days=7)
 
@@ -433,7 +434,7 @@ async def request_delete_workspace(workspace_id: str, *, user_id: str, project_i
 
 
 async def assign_conversation_workspace(
-    conversation_id: str, *, workspace_id: str | None, user_id: str, project_id: str
+    conversation_id: str, *, workspace_id: str | None, user_id: str, project_id: str, domain_id: str | None = None,
 ) -> dict[str, Any]:
     factory = _factory()
     try:
@@ -444,7 +445,10 @@ async def assign_conversation_workspace(
                     .where(
                         ChatConversation.id == conversation_id,
                         ChatConversation.user_id == user_id,
-                        ChatConversation.project_id == project_id,
+                        scope_clause(
+                            ChatConversation.domain_id, ChatConversation.project_id,
+                            domain_id=domain_id, project_id=project_id,
+                        ),
                     )
                     .with_for_update()
                 )

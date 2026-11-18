@@ -4,6 +4,8 @@
 
 `test-passed` on the model-identity slice: 1,066 focused pytest cases and Ruff on changed Python files. Coverage includes duplicate model names under separate provider connections, exact kind filters, native route assertions, legacy media decimal IDs, agent create/update/clone and child routing, retry after an agent model change, and unchanged OpenAI/Anthropic request schemas. Synthetic upstream tests confirm that local row IDs never enter the Decisions provider payload.
 
+`test-passed` after compatibility corrections: 1,025 focused cases and Ruff. Coverage includes explicit root selection with a stale or ambiguous name-only agent default, exact agent pin enforcement, shared legacy alias checks, and 409 responses for ambiguous OpenAI-compatible image generation and speech.
+
 The migration manifest and ORM contract passed locally. The history projection has a MariaDB integration case; that test and migration application against MariaDB were not run for this slice. No live provider or deployment check ran.
 
 ## Lumen 0.6.20 — 발행·운영 배포·OpenAI 유료 확인
@@ -702,6 +704,17 @@ uv run pytest -m "not integration and not system" tests
 # SDK 독립 검증 및 린트
 (cd sdk && uv run pytest && uv run ruff check .)
 ```
+
+### Migration 036 domain-scope acceptance (local test-passed)
+
+Focused contract pytest: 555 passed. Ruff passed for changed Python files. The disposable MariaDB/Redis integration run applied the ledger without schema repair and passed 76 tests, including ORM and schema snapshot drift checks:
+
+```sh
+uv run --frozen --offline --extra service --extra dev lumen-test integration -q --tb=short \
+  -k 'domain_scope_backfill or domain_history or shared_history_migration or agent_domain_scope or child_runs or mcp_domain_connections or mcp_connections_db or mcp_owner_activation or schema_snapshot or orm_declarations'
+```
+
+The integration slice proves same-user/domain history and agent behavior, origin-only legacy fallback, current-project run/asset authority, MCP activation and credential revision fences, archive recovery, same-server state replacement, and multi-account deduplication. Keystone fixtures are synthetic. No live Keystone, production upgrade, or cross-slice key and billing claims are included.
 
 ---
 

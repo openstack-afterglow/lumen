@@ -541,6 +541,12 @@ async def v2_tool_bindings(
                 add(binding)
 
     for custom in await _load_custom(ctx):
+        # Domain HTTP tools are explicit, on-demand and use the v2 approval boundary for mutations.
+        if (
+            custom.get("scope") == "domain" and extension_load_policy is not None
+            and not include_managed and custom.get("effect") != "read"
+        ):
+            continue
         if extension_load_policy is not None and custom.get("load_policy") != extension_load_policy:
             continue
         identifier = custom.get("id")

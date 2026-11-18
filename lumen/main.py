@@ -108,6 +108,12 @@ async def _service_lifespan(app: FastAPI):
 
         await setup_semantic_memory()
 
+    scope_backfill = None
+    if settings.database_url:
+        from lumen.services.domain_scope_backfill import startup_domain_scope_backfill
+
+        scope_backfill = asyncio.create_task(startup_domain_scope_backfill(), name="domain-scope-backfill")
+
     logger.info("api ready")
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
@@ -116,7 +122,12 @@ async def _service_lifespan(app: FastAPI):
             settings.chat_semantic_memory_enabled,
         )
 
-    yield
+    try:
+        yield
+    finally:
+        if scope_backfill is not None:
+            scope_backfill.cancel()
+            await asyncio.gather(scope_backfill, return_exceptions=True)
 
     try:
         from lumen.services.checkpointer import chat_checkpointer
@@ -354,6 +365,7 @@ from lumen.api import (
     chat_workspaces_router,
     claude_gateway,
 )
+from lumen.api import extension_archives as extension_archive_routes
 from lumen.api import plugins as plugin_routes
 from lumen.api import policy as policy_routes
 from lumen.api.compat import anthropic as compat_anthropic
@@ -395,6 +407,7 @@ for router, tag in (
     (chat_mcp_oauth_router, "Chat MCP OAuth"),
     (chat_extensions_admin_router, "Chat Extensions Admin"),
     (chat_extensions_user_router, "Chat Extensions"),
+    (extension_archive_routes.router, "Chat Extension Archives"),
     (chat_usage_router, "Chat Usage"),
     (chat_stats_router, "Chat Stats"),
     (chat_quotas_router, "Chat Quotas"),

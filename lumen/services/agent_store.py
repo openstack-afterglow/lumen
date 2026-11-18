@@ -1,8 +1,8 @@
 """빌트인 AI 채팅 에이전트 저장소 — 프롬프트+모델+파라미터+MCP/툴 묶음 (MySQL chat_agents).
 
-⚠️ 소유권(IDOR): CRUD와 실행은 호출자 user/project에 한정한다.
+Private CRUD and execution require the same user and verified domain, or exact legacy origin.
 instructions 는 AES-256-GCM(chat_content 도메인) 암호문으로 저장하고 조회 시 복호화한다.
-허브 복제는 active public 템플릿 또는 같은 프로젝트(레거시 NULL 포함) 소유 에이전트만 private 사본으로 복사한다.
+The hub shares active public templates, never their private attachments.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_contracts import validate_plugin_binding_ids
 from lumen.models.chat_db import ChatAgent
 from lumen.plugins.bindings import resolve_binding
+from lumen.services.domain_scope import scope_clause, scope_matches
 from lumen.services.providers import errors as provider_errors
 from lumen.services.providers import routing
 
@@ -67,8 +68,11 @@ def _enc(v: str | None) -> str | None:
     return encrypt_chat_content(v) if v else v
 
 
-def _public(row: ChatAgent, *, owner_view: bool = False, include_private: bool = True) -> dict:
+def _public(
+    row: ChatAgent, *, owner_view: bool, include_private: bool = True, public_template: bool = False,
+) -> dict:
     """Serialize owner configuration or an explicitly public hub template."""
+    include_attachments = owner_view and not public_template
     return {
         "id": row.id,
         "owner_user_id": row.owner_user_id,
@@ -80,11 +84,11 @@ def _public(row: ChatAgent, *, owner_view: bool = False, include_private: bool =
         "model_row_id": row.model_row_id,
         **({
             "params": row.params or {},
-            "mcp_ids": row.mcp_ids or [],
-            "tool_ids": row.tool_ids or [],
-            "skill_ids": getattr(row, "skill_ids", None) or [],
-            "plugin_tool_ids": (row.plugin_tool_ids or []) if owner_view else [],
-            "plugin_skill_ids": (row.plugin_skill_ids or []) if owner_view else [],
+            "mcp_ids": (row.mcp_ids or []) if include_attachments else [],
+            "tool_ids": (row.tool_ids or []) if include_attachments else [],
+            "skill_ids": (row.skill_ids or []) if include_attachments else [],
+            "plugin_tool_ids": (row.plugin_tool_ids or []) if include_attachments else [],
+            "plugin_skill_ids": (row.plugin_skill_ids or []) if include_attachments else [],
         } if include_private else {}),
         "visibility": row.visibility,
         "cloned_from_id": row.cloned_from_id,
@@ -139,6 +143,7 @@ async def create_agent(
     owner_user_id: str,
     project_id: str,
     name: str,
+    domain_id: str | None = None,
     description: str | None = None,
     avatar: str | None = None,
     instructions: str | None = None,
@@ -164,6 +169,7 @@ async def create_agent(
     row = ChatAgent(
         owner_user_id=owner_user_id,
         project_id=project_id,
+        domain_id=domain_id,
         name=name.strip(),
         description=(description or None),
         avatar=(avatar or None),
@@ -188,8 +194,16 @@ async def create_agent(
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def list_agents(*, user_id: str, project_id: str, include_private: bool = True) -> list[dict]:
-    """List only the caller's project-owned agents, optionally without private configuration."""
+def _owned_scope(user_id: str, project_id: str, *, domain_id: str | None):
+    return (ChatAgent.owner_user_id == user_id) & scope_clause(
+        ChatAgent.domain_id, ChatAgent.project_id, domain_id=domain_id, project_id=project_id,
+    )
+
+
+async def list_agents(
+    *, user_id: str, project_id: str, domain_id: str | None = None, include_private: bool = True,
+) -> list[dict]:
+    """List the caller's domain-owned agents and legacy agents from the selected project."""
     factory = _require_db()
     try:
         async with factory() as session:
@@ -197,7 +211,7 @@ async def list_agents(*, user_id: str, project_id: str, include_private: bool = 
                 (
                     await session.execute(
                         select(ChatAgent)
-                        .where(ChatAgent.owner_user_id == user_id, ChatAgent.project_id == project_id)
+                        .where(_owned_scope(user_id, project_id, domain_id=domain_id))
                         .order_by(ChatAgent.updated_at.desc())
                     )
                 )
@@ -211,9 +225,10 @@ async def list_agents(*, user_id: str, project_id: str, include_private: bool = 
 
 
 async def list_public(
-    *, query: str = "", limit: int = 30, offset: int = 0, user_id: str = "", project_id: str = ""
+    *, query: str = "", limit: int = 30, offset: int = 0, user_id: str = "", project_id: str = "",
+    domain_id: str | None = None,
 ) -> list[dict]:
-    """Search public templates and mark ownership only within the caller's project."""
+    """Search public templates without exposing their private bindings."""
     factory = _require_db()
     try:
         async with factory() as session:
@@ -225,26 +240,27 @@ async def list_public(
             stmt = stmt.order_by(ChatAgent.clone_count.desc(), ChatAgent.id.desc())
             stmt = stmt.limit(min(max(limit, 1), 100)).offset(max(offset, 0))
             rows = (await session.execute(stmt)).scalars().all()
-            return [_public(r, owner_view=(r.owner_user_id == user_id and r.project_id == project_id)) for r in rows]
+            return [
+                _public(
+                    row,
+                    owner_view=row.owner_user_id == user_id and scope_matches(
+                        row.domain_id, row.project_id, domain_id=domain_id, project_id=project_id,
+                    ),
+                    public_template=True,
+                )
+                for row in rows
+            ]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def _load(session, agent_id: int) -> ChatAgent:
-    row = await session.get(ChatAgent, agent_id)
-    if row is None:
-        raise AgentNotFound(f"에이전트 {agent_id} 를 찾을 수 없습니다")
-    return row
-
-
-async def _load_owned_project(session, agent_id: int, user_id: str, project_id: str) -> ChatAgent:
+async def _load_owned(session, agent_id: int, user_id: str, project_id: str, *, domain_id: str | None) -> ChatAgent:
     row = (
         await session.execute(
             select(ChatAgent).where(
                 ChatAgent.id == agent_id,
-                ChatAgent.owner_user_id == user_id,
-                ChatAgent.project_id == project_id,
+                _owned_scope(user_id, project_id, domain_id=domain_id),
             )
         )
     ).scalar_one_or_none()
@@ -253,20 +269,22 @@ async def _load_owned_project(session, agent_id: int, user_id: str, project_id: 
     return row
 
 
-async def get_agent(agent_id: int, *, user_id: str, project_id: str) -> dict:
-    """Read only the caller's project-owned agent."""
+async def get_agent(agent_id: int, *, user_id: str, project_id: str, domain_id: str | None = None) -> dict:
+    """Read only a caller-owned agent in scope."""
     factory = _require_db()
     try:
         async with factory() as session:
-            row = await _load_owned_project(session, agent_id, user_id, project_id)
+            row = await _load_owned(session, agent_id, user_id, project_id, domain_id=domain_id)
             return _public(row, owner_view=True)
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def update_agent(agent_id: int, *, user_id: str, project_id: str, patch: dict) -> dict:
-    """Update only a caller-owned project agent."""
+async def update_agent(
+    agent_id: int, *, user_id: str, project_id: str, patch: dict, domain_id: str | None = None,
+) -> dict:
+    """Update only a caller-owned agent in scope."""
     factory = _require_db()
     _validate(patch.get("name"), patch.get("visibility"))
     model_row_id = patch.get("model_row_id")
@@ -281,7 +299,7 @@ async def update_agent(agent_id: int, *, user_id: str, project_id: str, patch: d
             patch[field] = await _validate_plugin_selection(patch[field], kind, user_id=user_id, project_id=project_id)
     try:
         async with factory() as session, session.begin():
-            row = await _load_owned_project(session, agent_id, user_id, project_id)
+            row = await _load_owned(session, agent_id, user_id, project_id, domain_id=domain_id)
             if patch.get("name"):
                 row.name = str(patch["name"]).strip()
             if "description" in patch:
@@ -318,19 +336,19 @@ async def update_agent(agent_id: int, *, user_id: str, project_id: str, patch: d
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def delete_agent(agent_id: int, *, user_id: str, project_id: str) -> None:
+async def delete_agent(agent_id: int, *, user_id: str, project_id: str, domain_id: str | None = None) -> None:
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
-            row = await _load_owned_project(session, agent_id, user_id, project_id)
+            row = await _load_owned(session, agent_id, user_id, project_id, domain_id=domain_id)
             await session.delete(row)
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def clone_agent(agent_id: int, *, user_id: str, project_id: str) -> dict:
-    """Clone an active public template, same-project private agent, or owned legacy template."""
+async def clone_agent(agent_id: int, *, user_id: str, project_id: str, domain_id: str | None = None) -> dict:
+    """Clone an active public template or a private agent owned in the current scope."""
     factory = _require_db()
     try:
         async with factory() as session, session.begin():
@@ -341,8 +359,7 @@ async def clone_agent(agent_id: int, *, user_id: str, project_id: str) -> dict:
                         ChatAgent.is_active.is_(True),
                         or_(
                             ChatAgent.visibility == "public",
-                            (ChatAgent.owner_user_id == user_id)
-                            & or_(ChatAgent.project_id == project_id, ChatAgent.project_id.is_(None)),
+                            _owned_scope(user_id, project_id, domain_id=domain_id),
                         ),
                     )
                 )
@@ -352,6 +369,7 @@ async def clone_agent(agent_id: int, *, user_id: str, project_id: str) -> dict:
             clone = ChatAgent(
                 owner_user_id=user_id,
                 project_id=project_id,
+                domain_id=domain_id,
                 name=src.name,
                 description=src.description,
                 avatar=src.avatar,
@@ -380,21 +398,29 @@ async def clone_agent(agent_id: int, *, user_id: str, project_id: str) -> dict:
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def get_agent_for_run(agent_id: int, *, user_id: str, project_id: str) -> dict | None:
-    """Load only an active, caller-owned project agent for executable run snapshots."""
+async def load_active_agent(
+    session, agent_id: int, *, user_id: str, project_id: str, domain_id: str | None = None,
+) -> ChatAgent | None:
+    """Check current ownership and activity without using the agent configuration."""
+    return (
+        await session.execute(
+            select(ChatAgent).where(
+                ChatAgent.id == agent_id,
+                ChatAgent.is_active.is_(True),
+                _owned_scope(user_id, project_id, domain_id=domain_id),
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def get_agent_for_run(
+    agent_id: int, *, user_id: str, project_id: str, domain_id: str | None = None,
+) -> dict | None:
+    """Load only an active caller-owned agent for an executable snapshot."""
     factory = _require_db()
     try:
         async with factory() as session:
-            row = (
-                await session.execute(
-                    select(ChatAgent).where(
-                        ChatAgent.id == agent_id,
-                        ChatAgent.owner_user_id == user_id,
-                        ChatAgent.project_id == project_id,
-                        ChatAgent.is_active.is_(True),
-                    )
-                )
-            ).scalar_one_or_none()
+            row = await load_active_agent(session, agent_id, user_id=user_id, project_id=project_id, domain_id=domain_id)
             if row is None:
                 return None
             return {

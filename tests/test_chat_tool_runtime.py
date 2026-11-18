@@ -579,6 +579,7 @@ class TestRemoteMcpSafety:
     async def test_provider_resolution_mutation_blocks_dispatch(self, monkeypatch, mutation):
         server = {"id": 7, "url": "https://mcp.example/x", "auth_mode": "oauth",
                   "effect_overrides": {"search": "read"}}
+        server.update(config_version=1, credential_id="current-connection")
         state = {"epoch": 3, "active": True, "dispatched": False}
         received = []
 
@@ -708,21 +709,18 @@ class TestRemoteMcpSafety:
             return [{
                 "id": 7, "transport": "http", "url": "https://mcp.example/x",
                 "auth_mode": "oauth", "effect_overrides": {"search": "read"},
+                "config_version": 1, "credential_id": "current-connection",
+                "credential_version": 4 if condition == "rotated" else 3,
             }]
 
         async def headers_for_user(**kwargs):
-            if condition == "missing_epoch":
-                pytest.fail("missing epoch must not resolve or refresh credentials")
-            return {} if condition == "revoked" else {7: {"Authorization": "Bearer current-token"}}
-
-        async def credential_versions(*args, **kwargs):
-            return {7: 4 if condition == "rotated" else 3}
+            assert condition == "revoked", "missing or stale epoch must not resolve or refresh credentials"
+            return {}
 
         async def unexpected_call(*args, **kwargs):
             pytest.fail("authority-filtered server must never dispatch")
 
         monkeypatch.setattr(es, "list_for_user", list_for_user)
-        monkeypatch.setattr(es, "mcp_credential_versions", credential_versions)
         monkeypatch.setattr(mcp_oauth, "headers_for_user", headers_for_user)
         monkeypatch.setattr(bindings.mcp_client, "call_tool", unexpected_call)
         ctx = replace(_CTX, selected_mcp_ids=(7,), expected_mcp_credential_versions=(
@@ -791,7 +789,7 @@ class TestMcpTools:
     async def test_local_process_mcp_transport_is_not_exposed(self, monkeypatch):
         import lumen.services.extensions_store as es
 
-        async def fake_list_for_user(kind, *, user_id, project_id, active_only=False, reveal_secrets=False):
+        async def fake_list_for_user(*_args, **_kwargs):
             return [{"id": 7, "name": "local", "transport": "stdio", "url": "https://mcp.example/stdio"}]
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
@@ -817,16 +815,13 @@ class TestMcpTools:
         import lumen.services.extensions_store as es
 
         async def fake_list_for_user(*_args, **_kwargs):
-            return [{"id": 7, "transport": "http", "url": "https://mcp.example", "headers": {}}]
-
-        async def rotated_version(*_args, **_kwargs):
-            return {7: 2}
+            return [{"id": 7, "transport": "http", "url": "https://mcp.example", "auth_mode": "oauth",
+                     "config_version": 1, "credential_version": 2, "credential_id": "current-connection"}]
 
         async def unexpected_network_io(*_args, **_kwargs):
             raise AssertionError("MCP network I/O must not occur")
 
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
-        monkeypatch.setattr(es, "mcp_credential_versions", rotated_version)
         monkeypatch.setattr(selection.mcp_client, "call_tool", unexpected_network_io)
 
         output = await tool_runtime.context_execute(
@@ -887,6 +882,9 @@ class TestMcpTools:
                     "url": "https://mcp.notion.com/mcp",
                     "headers": {},
                     "auth_mode": "oauth",
+                    "config_version": 1,
+                    "credential_version": 3,
+                    "credential_id": "current-connection",
                 }
             ]
 
@@ -896,11 +894,7 @@ class TestMcpTools:
         async def connected_headers(*, user_id, project_id):
             return {7: {"Authorization": "Bearer user-oauth-token"}}
 
-        async def credential_versions(*args, **kwargs):
-            return {7: 3}
-
         ctx = replace(_CTX, expected_mcp_credential_versions=((7, 3),))
-        monkeypatch.setattr(es, "mcp_credential_versions", credential_versions)
         monkeypatch.setattr(es, "list_for_user", fake_list_for_user)
         monkeypatch.setattr(oauth, "headers_for_user", no_headers)
         assert await selection._load_mcp(ctx) == []

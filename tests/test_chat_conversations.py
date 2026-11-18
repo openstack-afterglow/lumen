@@ -74,6 +74,7 @@ class TestCreateAndList:
         assert captured == {
             "user_id": "test-user-123",
             "project_id": "test-project-123",
+            "domain_id": None,
             "query": "OpenStack",
             "limit": 20,
         }
@@ -354,6 +355,7 @@ async def test_messages_uses_anchor_and_returns_signed_page_cursors(client, monk
         "conv_id": "conv-1",
         "user_id": "test-user-123",
         "project_id": "test-project-123",
+        "domain_id": None,
         "anchor": "first",
         "cursor_direction": None,
         "cursor_position": None,

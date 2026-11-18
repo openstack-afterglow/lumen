@@ -13,6 +13,7 @@ _logger = logging.getLogger(__name__)
 _DOMAIN_LLM_PROVIDER_KEY = b"llm_provider_key"
 _DOMAIN_LLM_PROVIDER_BILLING_ADMIN_KEY = b"llm_provider_billing_admin_key"
 _DOMAIN_CHAT_CONTENT = b"chat_content"
+_DOMAIN_EXTENSION_ARCHIVE = b"extension_archive"
 
 _V3_PREFIX = aesgcm._V3_PREFIX
 
@@ -54,3 +55,11 @@ def decrypt_chat_content(ciphertext_b64: str) -> str:
     if not ciphertext_b64.startswith(_V3_PREFIX):
         return ciphertext_b64
     return aesgcm.decrypt(_get_key(), _DOMAIN_CHAT_CONTENT, ciphertext_b64)
+
+
+def encrypt_extension_archive(plaintext: str) -> str:
+    return aesgcm.encrypt(_get_key(), _DOMAIN_EXTENSION_ARCHIVE, plaintext)
+
+
+def decrypt_extension_archive(ciphertext_b64: str) -> str:
+    return aesgcm.decrypt(_get_key(), _DOMAIN_EXTENSION_ARCHIVE, ciphertext_b64)

@@ -45,6 +45,7 @@ from lumen.services.chat_admission import (
     _load_owned_conv,
     prepare_context_input,
 )
+from lumen.services.domain_scope import history_domain_id
 from lumen.services.durable_runs import admission, common, interactions, lifecycle, queries
 from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.infrastructure.api_load import admit_sse
@@ -133,14 +134,15 @@ async def create_completion(
     """Persist intent and return a descriptor; the worker owns all provider I/O."""
     user_id = token_info["user_id"]
     project_id = token_info["project_id"]
+    domain_id = history_domain_id(token_info)
     try:
         message_text = text_projection_from_user_input_parts(payload.parts)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    await _load_owned_conv(conversation_id, user_id, project_id)
+    await _load_owned_conv(conversation_id, user_id, project_id, domain_id=domain_id)
     try:
-        path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id)
+        path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id, domain_id=domain_id)
         expected_active_leaf_id = _active_leaf_fence(path["active_leaf_id"])
         features = _features_payload(payload.features)
         intent = {
@@ -231,6 +233,7 @@ async def create_completion(
         return await admission.create_persistent_run(
             project_id=project_id,
             user_id=user_id,
+            domain_id=domain_id,
             client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
@@ -292,10 +295,11 @@ async def regenerate_message(
 ):
     project_id = token_info["project_id"]
     user_id = token_info["user_id"]
-    await _load_owned_conv(conversation_id, user_id, project_id)
+    domain_id = history_domain_id(token_info)
+    await _load_owned_conv(conversation_id, user_id, project_id, domain_id=domain_id)
     try:
         turn_user = await cs.find_turn_start_user(
-            conversation_id, user_id=user_id, project_id=project_id, message_id=message_id
+            conversation_id, user_id=user_id, project_id=project_id, message_id=message_id, domain_id=domain_id,
         )
     except (cs.ConversationNotFound, cs.ConversationForbidden) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -334,7 +338,9 @@ async def regenerate_message(
     try:
         # Regeneration reads the selected user ancestor, but the mutation must
         # fence the active branch that was visible when this request started.
-        active_path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id)
+        active_path = await cs.get_active_path(
+            conversation_id, user_id=user_id, project_id=project_id, domain_id=domain_id,
+        )
         expected_active_leaf_id = _active_leaf_fence(active_path.get("active_leaf_id"))
     except cs.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
@@ -374,6 +380,7 @@ async def regenerate_message(
         return await admission.create_run(
             project_id=project_id,
             user_id=user_id,
+            domain_id=domain_id,
             client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
@@ -440,7 +447,8 @@ async def retry_failed_run(
 ):
     project_id = token_info["project_id"]
     user_id = token_info["user_id"]
-    await _load_owned_conv(conversation_id, user_id, project_id)
+    domain_id = history_domain_id(token_info)
+    await _load_owned_conv(conversation_id, user_id, project_id, domain_id=domain_id)
     source_run = None
     if payload is not None and payload.model_row_id is not None:
         source_run = await _load_retry_source(run_id, conversation_id, user_id, project_id)
@@ -487,7 +495,9 @@ async def retry_failed_run(
         # Retry projects the failed run's saved user turn, but fences the
         # active leaf observed before planning so a branch switch cannot be
         # overwritten by a late retry.
-        active_path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id)
+        active_path = await cs.get_active_path(
+            conversation_id, user_id=user_id, project_id=project_id, domain_id=domain_id,
+        )
         expected_active_leaf_id = _active_leaf_fence(active_path.get("active_leaf_id"))
     except cs.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
@@ -525,7 +535,7 @@ async def retry_failed_run(
     )
     raw_parts = payload_dict.get("input_parts")
     path_messages = await cs.path_ending_at(
-        conversation_id, user_id=user_id, project_id=project_id, message_id=message_id
+        conversation_id, user_id=user_id, project_id=project_id, message_id=message_id, domain_id=domain_id,
     )
     if isinstance(raw_parts, list) and raw_parts:
         try:
@@ -588,6 +598,7 @@ async def retry_failed_run(
         return await admission.create_run(
             project_id=project_id,
             user_id=user_id,
+            domain_id=domain_id,
             client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
@@ -743,7 +754,7 @@ async def temp_completion(
 
 
 async def _active_context_compaction_run_id(
-    *, conversation_id: str | None = None, temp_thread_id: str | None = None
+    *, user_id: str, project_id: str, conversation_id: str | None = None, temp_thread_id: str | None = None,
 ) -> str | None:
     if (conversation_id is None) == (temp_thread_id is None):
         raise ValueError("exactly one context parent is required")
@@ -751,6 +762,8 @@ async def _active_context_compaction_run_id(
         factory = common._factory()
         async with factory() as session:
             query = select(ChatRun.id).where(
+                ChatRun.user_id == user_id,
+                ChatRun.project_id == project_id,
                 ChatRun.status.in_(NONTERMINAL),
                 ChatRun.run_kind == "compaction",
                 ChatRun.conversation_id == conversation_id
@@ -803,7 +816,9 @@ async def preview_conversation_context(
     context_limit = capabilities.get("context_limit")
     output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens") or 4096)
     source = planned["source"]
-    active_compaction_run_id = await _active_context_compaction_run_id(conversation_id=conversation_id)
+    active_compaction_run_id = await _active_context_compaction_run_id(
+        conversation_id=conversation_id, user_id=user_id, project_id=project_id,
+    )
 
     return context_manager.context_state(
         planned["input_messages"],
@@ -860,7 +875,9 @@ async def preview_temp_context(
     context_limit = capabilities.get("context_limit")
     output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens") or 4096)
     source = planned["source"]
-    active_compaction_run_id = await _active_context_compaction_run_id(temp_thread_id=temp_thread_id)
+    active_compaction_run_id = await _active_context_compaction_run_id(
+        temp_thread_id=temp_thread_id, user_id=user_id, project_id=project_id,
+    )
 
     return context_manager.context_state(
         planned["input_messages"],
@@ -890,6 +907,8 @@ async def compact_conversation(
 ):
     user_id = token_info["user_id"]
     project_id = token_info["project_id"]
+    domain_id = history_domain_id(token_info)
+    await _load_owned_conv(conversation_id, user_id, project_id, domain_id=domain_id)
     features = _features_payload(payload.features)
     intent = {
         "endpoint": "compaction",
@@ -993,6 +1012,7 @@ async def compact_conversation(
         return await admission.create_compaction_run(
             project_id=project_id,
             user_id=user_id,
+            domain_id=domain_id,
             client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
@@ -1245,7 +1265,9 @@ async def list_conversation_runs(
     active: bool = Query(default=False),
     token_info: Principal = Depends(require_scopes("native:runs:read")),
 ):
-    await _load_owned_conv(conversation_id, token_info["user_id"], token_info["project_id"])
+    await _load_owned_conv(
+        conversation_id, token_info["user_id"], token_info["project_id"], domain_id=history_domain_id(token_info),
+    )
     descriptors = await queries.active_run_descriptors(
         conversation_id=conversation_id,
         project_id=token_info["project_id"],

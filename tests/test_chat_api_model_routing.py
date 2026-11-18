@@ -955,6 +955,20 @@ async def test_media_selector_exact_row_keeps_legacy_decimal_and_checks_assertio
     assert await routing.resolve_media_model(None, model_row_id=13, model_kind=kind) is None
 
 
+@pytest.mark.parametrize("provider_type,stored_name,selector", [
+    ("openai", "shared-model", "perplexity/shared-model"),
+    ("perplexity", "perplexity/perplexity/search", "search"),
+    ("gemini", "gemini/shared-model", "shared-model"),
+])
+async def test_legacy_selector_and_exact_row_accept_same_alias(provider_db, provider_type, stored_name, selector):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type=provider_type)
+    add_model(stored_name, model_id=12)
+    route = await routing.resolve_api_model(selector)
+    assert route["model_id"] == 12
+    assert routing.matches_api_model_selector(route, selector)
+
+
 async def test_root_agent_model_requires_exact_or_unambiguous_selection(provider_db):
     from fastapi import HTTPException
 
@@ -974,9 +988,13 @@ async def test_root_agent_model_requires_exact_or_unambiguous_selection(provider
             await _resolve_run_model(name, row_id, pinned)
         assert conflict.value.status_code == 422
     with pytest.raises(HTTPException) as ambiguous:
-        await _resolve_run_model(None, 12, {"model_name": "duplicate-model"})
+        await _resolve_run_model(None, None, {"model_name": "duplicate-model"})
     assert (ambiguous.value.status_code, ambiguous.value.detail) == (409, "model_route_ambiguous")
     assert (await _resolve_run_model(None, None, {"model_name": "unique-model"}))["model_id"] == 13
+    for legacy_default in ("duplicate-model", "unavailable"):
+        agent = {"model_name": legacy_default}
+        assert (await _resolve_run_model("unique-model", None, agent))["model_id"] == 13
+        assert (await _resolve_run_model(None, 12, agent))["provider_id"] == 2
 
 
 @pytest.mark.parametrize("kind,provider_type,name", [

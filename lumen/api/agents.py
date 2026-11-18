@@ -1,6 +1,6 @@
-"""빌트인 AI 채팅 에이전트 API (사용자·프로젝트 소유 리소스 + 공개 허브).
+"""빌트인 AI 채팅 에이전트 API (사용자·도메인 소유 리소스 + 공개 허브).
 
-전 엔드포인트 서비스 scope 인증. CRUD는 호출자 user/project에 한정하고,
+전 엔드포인트 서비스 scope 인증. CRUD는 호출자 user/domain 또는 레거시 원본 프로젝트에 한정하고,
 공개 허브는 복제 가능한 템플릿만 검색한다(IDOR 방어).
 """
 
@@ -13,6 +13,7 @@ from lumen.auth import ensure_scopes, require_scopes
 from lumen.models.api_requests import ModelRowId
 from lumen.models.chat_contracts import validate_plugin_binding_ids
 from lumen.services import agent_store as ags
+from lumen.services.domain_scope import history_domain_id
 
 router = APIRouter()
 
@@ -97,6 +98,7 @@ async def create_agent(payload: AgentCreate, token_info: dict = Depends(require_
         return await ags.create_agent(
             owner_user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
             **payload.model_dump(),
         )
     except (ags.AgentValidationError, ags.ChatStorageUnavailable) as exc:
@@ -110,7 +112,10 @@ async def list_agents(include_private: bool = False, token_info: dict = Depends(
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
         return await ags.list_agents(
-            user_id=token_info["user_id"], project_id=token_info["project_id"], include_private=include_private
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
+            include_private=include_private,
         )
     except ags.ChatStorageUnavailable:
         return []
@@ -131,6 +136,7 @@ async def agent_hub(
             offset=offset,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
         )
     except ags.ChatStorageUnavailable:
         return []
@@ -143,6 +149,7 @@ async def get_agent(agent_id: int, token_info: dict = Depends(require_scopes("na
             agent_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
         )
     except (ags.AgentNotFound, ags.AgentForbidden, ags.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
@@ -155,6 +162,7 @@ async def update_agent(agent_id: int, payload: AgentUpdate, token_info: dict = D
             agent_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
             patch=payload.model_dump(exclude_unset=True),
         )
     except (ags.AgentNotFound, ags.AgentForbidden, ags.AgentValidationError, ags.ChatStorageUnavailable) as exc:
@@ -168,6 +176,7 @@ async def delete_agent(agent_id: int, token_info: dict = Depends(require_scopes(
             agent_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
         )
     except (ags.AgentNotFound, ags.AgentForbidden, ags.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
@@ -181,6 +190,7 @@ async def clone_agent(agent_id: int, token_info: dict = Depends(require_scopes("
             agent_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
         )
     except (ags.AgentNotFound, ags.AgentForbidden, ags.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc

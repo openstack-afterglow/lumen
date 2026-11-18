@@ -67,6 +67,7 @@ async def test_extension_selection_expands_omitted_ids_for_default_chat(monkeypa
                 "params_schema": {"type": "object"},
                 "config_version": 1,
                 "effect": "read",
+                **({"credential_version": 3} if kind == "mcp" else {}),
             },
             {
                 "id": 8,
@@ -77,16 +78,11 @@ async def test_extension_selection_expands_omitted_ids_for_default_chat(monkeypa
                 "params_schema": {"type": "object"},
                 "config_version": 1,
                 "effect": "external_mutation",
+                **({"credential_version": 4} if kind == "mcp" else {}),
             },
         ]
 
-    async def fake_credential_versions(server_ids, *, user_id, project_id):
-        assert server_ids == [7, 8]
-        assert (user_id, project_id) == ("u1", "p1")
-        return {7: 3, 8: 4}
-
     monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
-    monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", fake_credential_versions)
 
     no_agent = await chat_admission._resolve_extension_selection(
         None, ChatFeatureOptions(), user_id="u1", project_id="p1"
@@ -121,16 +117,11 @@ async def test_mcp_selection_snapshots_credential_version(monkeypatch):
                 "url": "https://mcp.example",
                 "transport": "http",
                 "config_version": 1,
+                "credential_version": 4,
             }
         ]
 
-    async def credential_versions(server_ids, *, user_id, project_id):
-        assert server_ids == [7]
-        assert (user_id, project_id) == ("u1", "p1")
-        return {7: 4}
-
     monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
-    monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", credential_versions)
 
     selection = await chat_admission._resolve_extension_selection(
         {"tool_ids": [], "mcp_ids": [7]},
@@ -909,11 +900,12 @@ class TestCanonicalCompletionRequests:
         monkeypatch.setattr(
             chat_admission,
             "_resolve_agent",
-            lambda *_args: _return(
+            lambda *_args, **_kwargs: _return(
                 {
                     "id": 9,
                     "role": "general",
                     "instructions": None,
+                    "model_name": "stale-legacy-default",
                     "params": {},
                     "tool_ids": [],
                     "mcp_ids": [],
@@ -944,6 +936,7 @@ class TestCanonicalCompletionRequests:
         response = await client.post(f"{_BASE}/c1/completions", headers=_HEADERS, json=_request(agent_id="9"))
 
         assert response.status_code == 202
+        assert seen["model_name"] == "gpt-3.5-turbo"
         policy = seen["request_payload"]["execution_policy"]
         assert policy["max_model_turns"] == 3
         assert policy["max_tool_calls"] == 7
@@ -1199,7 +1192,9 @@ class TestRetryFailedRun:
         monkeypatch.setattr(
             chat_admission,
             "_resolve_agent",
-            lambda agent_id, user_id, project_id: _return({"id": 7, "instructions": "agent-7", "model_row_id": 3}),
+            lambda agent_id, user_id, project_id, *, domain_id=None: _return(
+                {"id": 7, "instructions": "agent-7", "model_row_id": 3}
+            ),
         )
         mcp_item = {
             "id": 99,
@@ -1213,7 +1208,9 @@ class TestRetryFailedRun:
         monkeypatch.setattr(
             chat_admission,
             "_resolve_extension_selection",
-            lambda agent, features, *, user_id, project_id: _return({"tools": [], "mcp": [mcp_item]}),
+            lambda agent, features, *, user_id, project_id, token_info=None: _return(
+                {"tools": [], "mcp": [mcp_item]}
+            ),
         )
 
         async def fake_list_for_user(kind, **kwargs):
@@ -1235,7 +1232,7 @@ class TestRetryFailedRun:
         monkeypatch.setattr(
             cs,
             "path_ending_at",
-            lambda conversation_id, user_id, project_id, message_id: _return(
+            lambda conversation_id, user_id, project_id, message_id, *, domain_id: _return(
                 [{"role": "user", "content": "retry turn"}]
             ),
         )
@@ -2253,8 +2250,9 @@ class TestContextOutputLimitFallback:
     ):
         resolved, source = context_route
 
-        async def deny_conversation(_conversation_id, *, user_id, project_id):
+        async def deny_conversation(_conversation_id, *, user_id, project_id, domain_id):
             assert (user_id, project_id) == ("test-user-123", "test-project-123")
+            assert domain_id is None
             raise cs.ConversationForbidden("conversation is not accessible")
 
         async def deny_thread(**kwargs):

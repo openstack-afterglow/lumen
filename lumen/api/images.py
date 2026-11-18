@@ -47,6 +47,7 @@ async def admit(
     input_asset_id: UUID | None = None,
     api_provider: str | None = None,
     required_scopes: tuple[str, ...] | None = None,
+    compat: bool = False,
 ) -> ChatRunDescriptor:
     if payload.svg_model is not None:
         ensure_scopes(principal, svg_author_scope(required_scopes))
@@ -75,6 +76,8 @@ async def admit(
         credit.QuotaExceeded,
         ProviderValidationError,
     ) as exc:
+        if compat and isinstance(exc, durable_errors.MediaModelAmbiguous):
+            raise HTTPException(status_code=409, detail="model_route_ambiguous") from exc
         raise image_error(exc) from exc
 
 
