@@ -33,7 +33,15 @@ Content-Type: application/json
 
 ## 서비스 키
 
-`GET/POST /v1/service-keys`, `PATCH /v1/service-keys/{id}/limits`, `DELETE /v1/service-keys/{id}`는 현재 도메인의 관리자만 호출할 수 있다. 요청마다 Keystone 사람 세션과 현재 도메인 관리자 권한을 확인한다. 요청에 다른 도메인을 지정하지 않는다. `GET /v1/admin/service-keys`는 시스템 관리자용 전체 인벤토리다.
+`GET/POST /v1/service-keys`, `GET /v1/service-keys/issuance-policy`, `PATCH /v1/service-keys/{id}/limits`, `DELETE /v1/service-keys/{id}`는 현재 도메인의 관리자만 호출할 수 있다. 요청마다 Keystone 사람 세션과 현재 도메인 관리자 권한을 확인한다. 요청에 다른 도메인을 지정하지 않는다. `GET /v1/admin/service-keys`는 시스템 관리자용 전체 인벤토리다.
+
+`GET /v1/service-keys/issuance-policy`는 `POST /v1/service-keys`가 받는 scope를 그대로 반환한다. 관리자 자신의 프로젝트 역할은 결과를 좁히지 않는다.
+
+```json
+{"domain_id": "<domain>", "allowed_scopes": ["compat:audio:write", "..."],
+ "default_scopes": ["models:read", "compat:completions:write"],
+ "scope_routes": {"embeddings:write": ["POST /v1/chat/embeddings", "POST /v1/embeddings", "..."]}}
+```
 
 서비스 키는 발급자가 아니라 도메인이 소유한다. 발급자의 관리자 역할이 사라져도 키는 유효하다. 도메인이 비활성화 또는 삭제되거나 키가 만료·폐기되면 인증을 거부한다. 서비스 키 사용량은 도메인 선불 풀에서 차감한다. 개별 키의 월·주 한도는 도메인 풀 한도와 별도로 적용된다.
 
@@ -52,7 +60,9 @@ Content-Type: application/json
 | `native:audio:write` | `POST /v1/chat/audio/speech` |
 | `compat:realtime:write` | WebSocket `/v1/realtime`, `/v1/realtime/translations`, `/v1/live/sessions`, `/v1beta/realtime` |
 
-모델 키로 대화와 실행 기록, 메모리, 서버 도구, MCP, 에이전트, 확장, 에셋, Batch/Files, 클라우드 도구 또는 키 관리에 접근할 수 없다. OpenAI·Anthropic 호환 텍스트 완료의 도구 요청은 별도 서버 도구 scope를 요구하므로 거절된다. Gemini `generateContent`의 호출자 정의 `functionDeclarations`는 서버가 실행하지 않고 `functionCall`로만 돌려주므로 이 scope 없이 허용되며, Gemini 서버 도구는 400으로 거절된다. 결과를 반환하지 않는 네이티브 이미지·실시간 실행 요청이나 에셋 권한이 필요한 네이티브 음성 전사 대신, 결과를 직접 반환하는 호환 API를 사용한다.
+모델 키로 대화와 실행 기록, 메모리, 서버 도구, MCP, 에이전트, 확장, 에셋, Batch/Files, 클라우드 도구 또는 키 관리에 접근할 수 없다. 결과를 반환하지 않는 네이티브 이미지·실시간 실행 요청이나 에셋 권한이 필요한 네이티브 음성 전사 대신, 결과를 직접 반환하는 호환 API를 사용한다.
+
+호환 완료 API는 클라이언트가 선언하고 직접 실행하는 도구를 그대로 전달한다. Lumen은 모델의 도구 호출만 반환하고 실행하지 않는다. 허용하는 도구는 OpenAI `function`/`custom`/`local_shell`/`shell`/`apply_patch`, Anthropic 사용자 정의 도구(`type` 없음 또는 `custom`)와 클라이언트 실행 `bash_*`/`text_editor_*`/`memory_*`, Gemini `functionDeclarations`다. Lumen이나 공급자가 실행하는 도구(OpenAI `web_search*`, `file_search`, `code_interpreter`, `computer_use_preview`, `image_generation`, `mcp`, `web_search_options`; Anthropic `web_search_*`, `web_fetch_*`, `code_execution_*`, `computer_*`, `container`, `mcp_servers`; Gemini `googleSearch`, `codeExecution`, `urlContext` 등)는 모든 API 키에서 403 `server_tool_not_allowed_for_key`로 거절한다. `model="lumen"` 가상 모델은 Claude Gateway 키만 조회·호출할 수 있다.
 
 Gemini 경로의 `{model}`은 `models/lumen/<provider_id>/<model_id>`처럼 `/`를 포함할 수 있어 route template은 `{model:path}`이다.
 

@@ -388,7 +388,7 @@ async def test_connection_failure_releases_hold(lifecycle):
     assert lifecycle["finish"].call_args.kwargs == {"uncertain": False}
 
 
-def principal(auth_type="api_key", scopes=("compat:completions:write", "native:runs:write")):
+def principal(auth_type="api_key", scopes=("decisions:write",)):
     return {"auth_type": auth_type, "user_id": "u", "project_id": "p", "api_key_id": 3 if auth_type == "api_key" else None,
             "source": "api", "scopes": scopes, "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False}
 
@@ -413,7 +413,7 @@ def test_compat_and_native_routes(path, auth_type, native_result, monkeypatch):
     reply = client(principal(auth_type)).post(path, json=request())
     assert reply.status_code == 200
     assert reply.json() == (result if native_result else {key: result[key] for key in ("model", "answers", "usage")})
-    assert call.call_args.kwargs["required_scopes"] == (("native:runs:write",) if native_result else ("compat:completions:write",))
+    assert call.call_args.kwargs["required_scopes"] == ("decisions:write",)
     assert call.call_args.kwargs["source"] == ("api" if auth_type == "api_key" else "web")
 
 

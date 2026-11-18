@@ -275,6 +275,21 @@ async def list_service_keys(principal: Principal = Depends(_require_service_key_
         raise _http(exc) from exc
 
 
+@router.get("/service-keys/issuance-policy")
+async def get_service_key_issuance_policy(principal: Principal = Depends(_require_service_key_manager)):
+    """Exactly what POST /service-keys accepts; the manager's own project roles never narrow it."""
+    routes: dict[str, list[str]] = {}
+    for (method, route), scope in service_authority.MODEL_API_KEY_ROUTE_SCOPES.items():
+        routes.setdefault(scope, []).append(f"{method} {route}")
+    allowed = sorted(aks.API_KEY_SCOPES)
+    return {
+        "domain_id": principal["domain_id"],
+        "allowed_scopes": allowed,
+        "default_scopes": list(aks.DEFAULT_API_KEY_SCOPES),
+        "scope_routes": {scope: sorted(routes.get(scope, ())) for scope in allowed},
+    }
+
+
 @router.post("/service-keys", status_code=201)
 async def create_service_key(body: ApiKeyCreateBody, principal: Principal = Depends(_require_service_key_manager)):
     try:

@@ -52,29 +52,27 @@ def test_operation_scope_mapping(operation, contract, body, required):
 
 
 @pytest.mark.parametrize("contract", ["native", "openai"])
-async def test_removing_batch_write_after_admission_blocks_frozen_authority(contract, monkeypatch):
+async def test_model_keys_never_hold_batch_write_even_with_legacy_stored_scope(contract, monkeypatch):
+    from lumen.auth import model_key_storage_id
     from lumen.services import api_key_store
 
-    async def current_authority(user_id, project_id):
-        return {"roles": ["member"], "is_system_admin": False}
-
-    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
-
+    monkeypatch.setattr(api_key_store, "_verify_model_key_owner", lambda **_kwargs: None)
     required = batches._scopes("chat.completions", contract, {})
     write = "native:batches:write" if contract == "native" else "compat:batches:write"
-    row = SimpleNamespace(id=7, owner_user_id="u", owner_project_id="p", is_active=True, revoked_at=None,
-                          expires_at=None, scopes=["compat:completions:write"])
+    row = SimpleNamespace(id=7, key_kind="personal", credential_kind="api_key", owner_user_id="u",
+                          owner_project_id=None, owner_domain_id=None, is_active=True, revoked_at=None,
+                          expires_at=None, scopes=["compat:completions:write", write])
 
     class Session:
         async def execute(self, _statement):
             return SimpleNamespace(scalar_one_or_none=lambda: row)
 
+    storage_id = model_key_storage_id(7)
+    await api_key_store.authorize_api_key_in_transaction(
+        Session(), api_key_id=7, user_id="u", project_id=storage_id, required_scopes=("compat:completions:write",))
     with pytest.raises(ApiKeyForbidden):
         await api_key_store.authorize_api_key_in_transaction(
-            Session(), api_key_id=7, user_id="u", project_id="p", required_scopes=required)
-    row.scopes = ["compat:completions:write", write]
-    await api_key_store.authorize_api_key_in_transaction(
-        Session(), api_key_id=7, user_id="u", project_id="p", required_scopes=required)
+            Session(), api_key_id=7, user_id="u", project_id=storage_id, required_scopes=required)
 
 
 @pytest.mark.parametrize(("error_type", "status", "code"), [
