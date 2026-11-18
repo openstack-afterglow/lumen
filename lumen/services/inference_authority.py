@@ -136,12 +136,25 @@ def native_run_scopes(payload: dict, *, agent_id: object = None) -> tuple[str, .
 
 # Client-declared tools: Lumen only forwards the declaration and returns the
 # model's call; the caller executes it. Every other tool runs on Lumen or the provider.
-_CLIENT_TOOL_TYPES = frozenset({"function", "custom", "local_shell", "shell", "apply_patch"})
+_CLIENT_TOOL_TYPES = frozenset({"function", "custom", "local_shell", "apply_patch"})
 _CLIENT_TOOL_PREFIXES = ("bash_", "text_editor_", "memory_")  # Anthropic-defined, client-executed
 _GEMINI_CLIENT_TOOL_KEYS = frozenset({"functionDeclarations", "function_declarations"})
 _HOSTED_REQUEST_FIELDS = ("web_search_options", "mcp_servers", "container")
 HOSTED_TOOL_CODE = "server_tool_not_allowed_for_key"
 HOSTED_TOOL_MESSAGE = "Server-executed tools are unavailable to API keys; declare client tools instead."
+
+
+def _client_tool(kind: str, tool: dict) -> bool:
+    if kind in _CLIENT_TOOL_TYPES or kind.startswith(_CLIENT_TOOL_PREFIXES):
+        return True
+    if kind != "shell":
+        return False
+    # OpenAI shell runs in the caller's environment only when it says so. The SDK
+    # (openai 2.53) leaves `environment` optional without a documented default, and
+    # container_auto/container_reference run in an OpenAI-hosted container, so an
+    # absent or unknown environment is treated as hosted, matching openai_tool_policy.
+    environment = tool.get("environment")
+    return isinstance(environment, dict) and environment.get("type") == "local"
 
 
 def hosted_tools(request: dict) -> tuple[str, ...]:
@@ -160,7 +173,7 @@ def hosted_tools(request: dict) -> tuple[str, ...]:
             if "name" in tool or "input_schema" in tool:
                 continue  # Anthropic custom tool
             hosted.extend(sorted(key for key in tool if key not in _GEMINI_CLIENT_TOOL_KEYS))
-        elif not isinstance(kind, str) or not (kind in _CLIENT_TOOL_TYPES or kind.startswith(_CLIENT_TOOL_PREFIXES)):
+        elif not isinstance(kind, str) or not _client_tool(kind, tool):
             hosted.append(str(kind))
     return tuple(dict.fromkeys(hosted))
 

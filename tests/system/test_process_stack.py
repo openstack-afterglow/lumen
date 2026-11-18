@@ -1089,12 +1089,14 @@ def test_process_stack_native_protocols_and_gateway_device_login() -> None:
         claude_messages = [{"role": "user", "content": "run a local command"}]
         before_denied = _get_fake_provider_stats(fake_provider_url)
         assert before_denied is not None
+        # Claude Code's own tools are forwarded; a provider-run server tool is refused before I/O.
         denied_gateway_tools = client.post(
             "/v1/claude-gateway/v1/messages", headers=gateway_headers,
-            json={"model": "client-alias-is-ignored", "max_tokens": 128,
-                  "messages": claude_messages, "tools": [bash_tool]},
+            json={"model": "client-alias-is-ignored", "max_tokens": 128, "messages": claude_messages,
+                  "tools": [bash_tool, {"type": "web_search_20250305", "name": "web_search"}]},
         )
         assert denied_gateway_tools.status_code == 403, denied_gateway_tools.text
+        assert "server_tool_not_allowed_for_key" in denied_gateway_tools.text
         after_denied = _get_fake_provider_stats(fake_provider_url)
         assert after_denied is not None and after_denied["history"] == before_denied["history"]
         tool_headers = {**headers, "anthropic-version": "2023-06-01",
