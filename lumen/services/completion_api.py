@@ -1630,17 +1630,22 @@ async def complete_gemini(
             await hold.aclose()
 
     async def events() -> AsyncIterator[dict]:
-        usage = None
+        # Hold one frame back so usage (cumulative in every Gemini frame) rides on
+        # the final candidate frame only after settlement succeeded.
+        usage = held = None
         try:
             async for frame in response:
                 if "usageMetadata" in frame:
                     usage = frame.pop("usageMetadata")
-                if frame:
-                    yield frame
+                if not frame:
+                    continue
+                if held is not None:
+                    yield held
+                held = frame
             await _bill_gemini(
                 resolved, messages, usage, user_id=user_id, project_id=project_id, api_key_id=api_key_id, hold=hold,
             )
-            yield {"usageMetadata": usage}
+            yield {**(held or {}), "usageMetadata": usage}
         finally:
             if hold is not None:
                 await hold.aclose()

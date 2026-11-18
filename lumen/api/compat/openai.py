@@ -387,11 +387,11 @@ async def list_models(
             models = await routing.list_api_models()
             models.extend(await routing.list_api_models(model_kind="embedding"))
         else:
-            # Messages SDKs list only rows /v1/messages can execute; bounded official
-            # OpenAI rows lack Messages accounting evidence (see billing_route).
+            # Messages SDKs list only rows /v1/messages can execute (model-level
+            # transport rule: bounded official OpenAI rows lack Messages accounting).
             models = [{"api_model_name": row["api_model_name"], "api_provider": row["provider"],
                        "required_scopes": row["required_scopes"]}
-                      for row in await routing.list_cli_models() if "messages" in row["protocols"]]
+                      for row in await routing.list_messages_api_models()]
     except errors.ChatStorageUnavailable:
         models = []
     # Discovery mirrors dispatch: hide routes whose intrinsic scopes (Sonar built-in

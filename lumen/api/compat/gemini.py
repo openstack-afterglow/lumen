@@ -155,6 +155,18 @@ def _inline_image(data: Any, allowed: frozenset[str]) -> tuple[str, str]:
     return mime, payload
 
 
+def _function_part(part: dict, kind: str) -> dict:
+    """Closed functionCall/functionResponse: nested ``parts`` (file references,
+    non-image bytes) would reach the provider with its credential, unmetered."""
+    value = part[kind]
+    allowed, payload = ({"id", "name", "args"}, "args") if kind == "functionCall" else ({"id", "name", "response"}, "response")
+    if not isinstance(value, dict) or set(value) - allowed or not isinstance(value.get("name"), str):
+        raise _reject(f"{kind} supports only {', '.join(sorted(allowed))}")
+    if not isinstance(value.get(payload, {}), dict) or not isinstance(value.get("id", ""), str):
+        raise _reject(f"{kind}.{payload} must be an object")
+    return value
+
+
 def _validate_native_parts(parts: Any, role: str) -> None:
     if not isinstance(parts, list) or not parts:
         raise _reject(f"{role} content needs at least one part")
@@ -169,6 +181,8 @@ def _validate_native_parts(parts: Any, role: str) -> None:
             _inline_image(part["inlineData"], _NATIVE_IMAGES)
         if "text" in part and not isinstance(part["text"], str):
             raise _reject("part text must be a string")
+        for kind in kinds & {"functionCall", "functionResponse"}:
+            _function_part(part, kind)
 
 
 def _openai_schema(schema: Any) -> Any:
@@ -274,7 +288,7 @@ def _chat_messages(body: GeminiGenerateRequest, *, images: frozenset[str], drop_
                 if "text" in part:
                     text.append(str(part["text"]))
                 elif "functionCall" in part:
-                    call = part["functionCall"]
+                    call = _function_part(part, "functionCall")
                     call_id = str(call.get("id") or f"call_{turn}_{index}")
                     pending.append((str(call.get("name")), call_id))
                     calls.append({"id": call_id, "type": "function", "function": {
@@ -289,7 +303,7 @@ def _chat_messages(body: GeminiGenerateRequest, *, images: frozenset[str], drop_
         user_parts: list[dict] = []
         for part in parts:
             if "functionResponse" in part:
-                response = part["functionResponse"]
+                response = _function_part(part, "functionResponse")
                 name = str(response.get("name"))
                 call_id = response.get("id")
                 if call_id is None:

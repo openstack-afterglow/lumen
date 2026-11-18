@@ -338,7 +338,10 @@ async def test_native_stream_chunks_then_usage(wire, boundary):
         model="gemini-sdk", contents="hello")]
 
     assert "".join(chunk.text or "" for chunk in chunks) == "gemini"
-    assert chunks[-1].usage_metadata.candidates_token_count == 4
+    final = chunks[-1]
+    assert final.usage_metadata.candidates_token_count == 4
+    # Usage rides on the held-back finish frame, never a candidate-less trailer.
+    assert final.candidates[0].finish_reason == types.FinishReason.STOP and final.text == "ini"
     assert all(chunk.usage_metadata is None for chunk in chunks[:-1])
     stream = next(item for item in wire.exchanges if item["path"].endswith(":streamGenerateContent"))
     assert stream["query"] == {"alt": "sse"}
@@ -465,6 +468,26 @@ async def test_generate_errors_use_google_shape(wire, boundary, model, config, c
         await _client(wire).aio.models.generate_content(model=model, contents="hello", config=config)
 
     assert (failure.value.code, failure.value.status) == (code, status)
+    assert boundary.bifrost == [] and boundary.settled == []
+
+
+@pytest.mark.parametrize("model", ["gemini-sdk", "sdk-chat"])
+async def test_function_response_nested_parts_are_rejected(wire, boundary, model):
+    """Nested file references or bytes would reach the provider unmetered with its credential."""
+    call = types.Part(function_call=types.FunctionCall(id="c1", name="lookup", args={}))
+    smuggled = types.Part(function_response=types.FunctionResponse(
+        id="c1", name="lookup", response={"ok": True},
+        parts=[types.FunctionResponsePart(file_data=types.FunctionResponseFileData(
+            file_uri="https://generativelanguage.googleapis.com/v1beta/files/private", mime_type="application/pdf"))],
+    ))
+    contents = [types.Content(role="user", parts=[types.Part(text="look up")]),
+                types.Content(role="model", parts=[call]), types.Content(role="user", parts=[smuggled])]
+
+    with pytest.raises(genai_errors.ClientError) as failure:
+        await _client(wire).aio.models.generate_content(model=model, contents=contents)
+
+    assert (failure.value.code, failure.value.status) == (400, "INVALID_ARGUMENT")
+    assert "functionResponse" in failure.value.message
     assert boundary.bifrost == [] and boundary.settled == []
 
 
