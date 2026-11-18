@@ -6,7 +6,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: package/runtime/lock/Kolla image default `0.6.18`은 불변 tag `0.6.18`(`c90d0664`)로 발행되어 2026-11-18 UTC에 DMS Lab 운영에 배포됐다(035 적용, 관리형 ClamAV, protocol 2, sandbox runtime 꺼짐; 수신증은 `docs/testing.md`). 직전 운영 버전은 `0.6.17`(`c5b020be`)이다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 035의 조직 MCP 소유권 CHECK는 writer drain·백업 후 새 writer보다 먼저 적용한다. 033·034의 schema-first 전환 및 혼합 writer 금지 조건도 유지한다.
+- 버전: package/runtime/lock/Kolla image default는 `0.6.19`(Gemini Decisions; 릴리스 준비, 아직 발행·배포 전)이다. 현재 운영 버전은 불변 tag `0.6.18`(`c90d0664`, 2026-11-18 UTC 배포; 035 적용, 관리형 ClamAV, protocol 2, sandbox runtime 꺼짐; 수신증은 `docs/testing.md`)이다. 0.6.19는 새 migration이 없다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 035의 조직 MCP 소유권 CHECK는 writer drain·백업 후 새 writer보다 먼저 적용한다. 033·034의 schema-first 전환 및 혼합 writer 금지 조건도 유지한다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
@@ -605,9 +605,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e25098bce24f3d4651f59cc75197b35e9776a0670cb925a341a1ff85657b7175",
-  "reviewed_at": "2026-11-18T06:15:25Z",
-  "summary": "Enable exact decision-kind Studio readiness and effective catalog-kind projection for admin reclassification. Authenticate before Gemini compat JSON parsing, reject operator-scoped Files API URLs, and verify transport failure settlement and scoped HTTP."
+  "source_sha256": "f68e178ece233d6f37e2d538f8f11bd5533288c299111f22aaae9389d2e0e8d9",
+  "reviewed_at": "2026-11-18T06:29:45Z",
+  "summary": "Release preparation 0.6.19: version bump (package, runtime, lock, Kolla default) for Gemini Decisions; no migration; sandbox runtime remains off."
 }
 ```
 <!-- architecture-review:end -->
