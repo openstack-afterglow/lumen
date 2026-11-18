@@ -173,6 +173,31 @@ async def test_responses_admission_sends_the_frozen_output_budget(route_catalog)
     assert prepared.required_scopes == ("compat:batches:write", "native:tools:execute")
 
 
+@pytest.mark.parametrize("item", [
+    {"id": "private-reference"},
+    {"type": None, "id": "private-reference"},
+    {"role": "user", "content": [{"arbitrary": {"id": "private-reference"}}]},
+])
+async def test_responses_admission_rejects_implicit_provider_references(route_catalog, item):
+    with pytest.raises(DurableRunInputError) as failure:
+        await api_completion.prepare_api_completion_run(
+            {"model": "gpt-test", "input": [item]}, operation="responses", project_id="p", user_id="u",
+        )
+    assert str(failure.value) == "provider_reference_unsupported"
+
+
+async def test_responses_admission_preserves_complete_inline_history(route_catalog):
+    history = [
+        {"role": "user", "content": "Look it up."},
+        {"type": "function_call", "id": "fc_inline", "call_id": "call_inline", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "id": "fco_inline", "call_id": "call_inline", "output": "Found it."},
+    ]
+    prepared = await api_completion.prepare_api_completion_run(
+        {"model": "gpt-test", "input": history}, operation="responses", project_id="p", user_id="u",
+    )
+    assert prepared.payload["input"] == history
+
+
 @pytest.mark.parametrize(
     ("operation", "body", "route_overrides", "tokens", "code"),
     [

@@ -59,6 +59,11 @@ def validate_input(source: str | list[dict], *, tool_search: bool = False) -> No
         if not isinstance(item, dict):
             continue
         kind = item.get("type")
+        # ItemReference permits an omitted or null discriminator. Complete
+        # inline history may also have an id, but carries its own content.
+        implicit_reference = kind is None and "id" in item and item.keys() <= {"id", "type"}
+        if implicit_reference:
+            raise UnsupportedProviderReference()
         if kind in ("item_reference", "container_reference", "code_interpreter_call") or any(
             name in item for name in (
                 "container_id", "file_id", "file_ids", "vector_store_id", "vector_store_ids",

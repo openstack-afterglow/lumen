@@ -153,6 +153,9 @@ def test_cache_and_chat_fields_serialize_and_normalize():
 
 @pytest.mark.parametrize("item", [
     {"type": "item_reference", "id": "private-reference"},
+    {"id": "private-reference"},
+    {"type": None, "id": "private-reference"},
+    {"role": "user", "content": [{"arbitrary": {"type": None, "id": "private-reference"}}]},
     {"role": "user", "content": [{"arbitrary": {"type": "item_reference", "id": "private-reference"}}]},
     {"role": "user", "content": [{"data": [{"type": "shell_call", "environment": {"container_id": "private-reference"}}]}]},
     {"role": "user", "content": [{"type": "input_file", "file_id": "private-reference"}]},
@@ -167,6 +170,24 @@ async def test_provider_references_rejected_before_reservation(item, monkeypatch
     assert "private-reference" not in failure.value.message
     reserve.assert_not_awaited()
     dispatch.assert_not_awaited()
+
+
+async def test_responses_preserves_complete_inline_history(monkeypatch):
+    history = [
+        {"role": "user", "content": "Look it up."},
+        {"type": "function_call", "id": "fc_inline", "call_id": "call_inline", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "id": "fco_inline", "call_id": "call_inline", "output": "Found it."},
+    ]
+    upstream = AsyncMock(return_value={
+        "status": "completed", "service_tier": "default", "output": [],
+        "usage": {"input_tokens": 10, "output_tokens": 1},
+    })
+    monkeypatch.setattr(core, "_authorize_completion", AsyncMock())
+    monkeypatch.setattr(core.stateless_credit, "reserve", AsyncMock())
+    monkeypatch.setattr(core.stateless_credit, "settle", AsyncMock(return_value=Decimal("0.1")))
+    monkeypatch.setattr(provider_client, "aresponses", upstream)
+    await core.complete_responses(resolved=route_for(), input=history, stream=False, options={}, **OWNER)
+    assert upstream.await_args.kwargs["input"] == history
 
 
 def test_prompt_cache_comparison_reference_rejected():
