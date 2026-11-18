@@ -143,7 +143,10 @@ async def get_chat_capabilities(
                 from lumen.policy import authorize
 
                 if authorize("native:runs:write", token_info):
-                    authors = await routing.resolve_image_svg_authors(resolved)
+                    try:
+                        authors = await routing.resolve_image_svg_authors(resolved)
+                    except errors.ChatStorageUnavailable as exc:
+                        raise HTTPException(status_code=503, detail="chat model configuration is unavailable") from exc
                     result["image_svg_author_models"] = [
                         {"model": row["api_model_name"], "reasoning_efforts": list(row["svg_reasoning_efforts"])}
                         for row in authors

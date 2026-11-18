@@ -114,10 +114,11 @@ def _image_usage(route: dict, result: dict, provider: str) -> UsageBreakdown | N
             output_details = raw.get("output_tokens_details")
             if model not in _OPENAI_PRESET_MODELS and isinstance(input_details, dict) and input_details.get("cached_tokens"):
                 raise ValueError("direct Images cache usage is unsupported")
-            if "output_tokens_details" not in raw and (
-                    model not in _OPENAI_PRESET_MODELS or model == "gpt-image-1-mini"):
-                # The official response makes the split optional. These models
-                # have exclusively image output (SVG authoring is separate).
+            if "output_tokens_details" not in raw:
+                # Direct Images returns images; SVG authoring is metered separately.
+                # Require the documented input split before using the optional output fallback.
+                if not isinstance(input_details, dict) or not {"image_tokens", "text_tokens"} <= input_details.keys():
+                    raise ValueError("image input modality usage is missing")
                 output_details = {"image_tokens": raw.get("output_tokens")}
                 raw = {**raw, "output_tokens_details": output_details}
             if not isinstance(output_details, dict) or "image_tokens" not in output_details:
@@ -210,6 +211,8 @@ def validate_image_request(
         raise ProviderValidationError("unsupported image moderation")
     _validate_edit_options(provider, model, edit=edit, source_count=source_count, overlay=overlay,
                            output_format=output_format, input_fidelity=input_fidelity)
+    if edit and not token_mode and (source_count > 1 or overlay is not None):
+        raise ProviderValidationError("multi-image and overlay edits require a token-billed image model")
     if svg_model is not None and (output_format != "svg" or author_prices is None or set(author_prices) != {svg_model}):
         raise ProviderValidationError("SVG requires an authorized, priced author model")
     if svg_reasoning_effort is not None and svg_model is None:
@@ -376,15 +379,17 @@ def available_image_options(route: dict) -> dict:
     provider, model = _model(route)
     options: dict = {}
     token_mode = image_billing_basis(route) == "tokens"
+    image_rates = route_token_rates(route).get("image", {}) if token_mode else {}
     if token_mode:
-        options["image_output_price_per_million"] = route_token_rates(route)["image"]["output_per_million"]
-    options["max_image_input_count"] = MAX_OPENAI_IMAGE_INPUT_COUNT if provider == "openai" else 1
+        options["image_output_price_per_million"] = image_rates["output_per_million"]
+    advanced_edits = provider == "openai" and "input_per_million" in image_rates
+    options["max_image_input_count"] = MAX_OPENAI_IMAGE_INPUT_COUNT if advanced_edits else 1
     if provider != "openai":
         return options
     formats = ["png", "jpeg", "webp"]
     options.update(image_output_formats=formats, image_backgrounds=["auto", "opaque", "transparent"])
-    options.update(image_moderation_options=["auto", "low"], image_mask_supported=True,
-                   image_markup_supported=model in _OPENAI_FLAGSHIP_MODELS)
+    options.update(image_moderation_options=["auto", "low"], image_mask_supported=advanced_edits,
+                   image_markup_supported=advanced_edits and model in _OPENAI_FLAGSHIP_MODELS)
     if model in _INPUT_FIDELITIES:
         options["image_input_fidelities"] = list(_INPUT_FIDELITIES[model])
     if token_mode and model not in _OPENAI_PRESET_MODELS:

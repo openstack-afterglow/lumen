@@ -501,7 +501,8 @@ async def test_gif_svg_wire_preserves_authoring_and_format(monkeypatch, output_f
         for name, value in frames.items():
             assert body[name] == value
         data = {"data": [{"b64_json": base64.b64encode(bytes_).decode()}],
-                "usage": {"input_tokens": 13, "output_tokens": 58, "total_tokens": 71}}
+                "usage": {"input_tokens": 13, "output_tokens": 58, "total_tokens": 71,
+                          "input_tokens_details": {"text_tokens": 13, "image_tokens": 0}}}
         if output_format == "svg":
             data["svg_usage"] = author_usage
         return httpx.Response(200, json=data)
@@ -548,8 +549,8 @@ async def test_direct_openai_image_cached_usage_fails_closed(monkeypatch, model)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_author", [False, True])
-async def test_svg_author_selection_wire_and_inconsistent_usage(monkeypatch, bad_author):
+@pytest.mark.parametrize("inconsistent_usage", [False, True])
+async def test_svg_author_selection_wire_and_inconsistent_usage(monkeypatch, inconsistent_usage):
     from lumen.services.providers.image_billing import svg_author_pricing
 
     def handler(request):
@@ -558,16 +559,17 @@ async def test_svg_author_selection_wire_and_inconsistent_usage(monkeypatch, bad
         assert "svg_model" not in body and "svg_reasoning_effort" not in body
         return httpx.Response(200, json={
             "data": [{"b64_json": base64.b64encode(b'<svg xmlns="http://www.w3.org/2000/svg"/>').decode()}],
-            "usage": {"input_tokens": 12, "output_tokens": 50, "total_tokens": 62},
+            "usage": {"input_tokens": 12, "output_tokens": 50, "total_tokens": 62,
+                      "input_tokens_details": {"text_tokens": 12, "image_tokens": 0}},
             "svg_usage": {"model": "gpt-5", "input_tokens": 20, "output_tokens": 200,
-                          "total_tokens": 221 if bad_author else 220, "reasoning_tokens": 40},
+                          "total_tokens": 221 if inconsistent_usage else 220, "reasoning_tokens": 40},
         })
 
     _mock_provider(monkeypatch, handler)
     kwargs = dict(prompt="Draw", size="1024x1024", quality="high", n=1, output_format="svg",
                   svg_model="gpt-5", svg_reasoning_effort="low", author_prices={"gpt-5": svg_author_pricing()["gpt-5"]})
     route = _catalog_route("gpt-image-2.6-flare")
-    if bad_author:
+    if inconsistent_usage:
         with pytest.raises(image_transport.ImageTransportError, match="SVG authoring usage"):
             await image_transport.generate_images(route, **kwargs)
     else:
@@ -620,3 +622,85 @@ def test_image_input_fidelity_is_model_scoped(model, fidelity, accepted):
                 route, size="1024x1024", quality="high", n=1, edit=True,
                 input_fidelity=fidelity, source_dimensions=[1, 1],
             )
+
+
+@pytest.mark.parametrize("count,overlay", [(2, None), (1, "mask"), (1, "markup")])
+def test_unit_price_does_not_admit_unmetered_advanced_edits(count, overlay):
+    route = _route("openai", "gpt-image-2.6-flare", {"1024x1024:high": "0.10"})
+    with pytest.raises(ProviderValidationError, match="token-billed"):
+        image_transport.validate_image_request(
+            route, size="1024x1024", quality="high", n=1, edit=True, source_count=count, overlay=overlay,
+        )
+    caps = image_transport.available_image_options(route)
+    assert caps["max_image_input_count"] == 1
+    assert not caps["image_mask_supported"] and not caps["image_markup_supported"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mime,metadata", [
+    ("image/jpeg", {"width": 2, "height": 2, "has_transparency": 1}),
+    ("image/png", {"width": 2, "height": 2}),
+    ("image/png", {"width": 2, "height": 3, "has_transparency": 1}),
+])
+async def test_edit_admission_rejects_wrong_overlay_type_or_geometry(monkeypatch, mime, metadata):
+    from lumen.services.durable_runs import images
+
+    async def resolve(*_args, **_kwargs):
+        return _catalog_route("gpt-image-2.6-flare")
+
+    async def asset(*, asset_id, **_owner):
+        return {"status": "clean", "size_bytes": 100,
+                "mime_type": "image/png" if asset_id == "source" else mime,
+                "media_metadata": {"width": 2, "height": 2} if asset_id == "source" else metadata}
+
+    monkeypatch.setattr(images.routing, "resolve_api_model", resolve)
+    monkeypatch.setattr(images.assets, "get_asset", asset)
+    with pytest.raises(images.DurableRunInputError, match="transparent PNG matching the first image"):
+        await images.prepare_image_run({"model_id": "image", "prompt": "Draw", "input_asset_id": "source",
+            "markup_asset_id": "overlay"}, project_id="p", user_id="u")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("available,error", [(False, "not available"), (True, "unsupported reasoning effort")])
+async def test_svg_author_admission_rejects_unavailable_author_and_effort(monkeypatch, available, error):
+    from lumen.services.durable_runs import images
+
+    async def resolve(*_args, **_kwargs):
+        return _catalog_route("gpt-image-2.6-flare")
+
+    async def authors(_route, *, model_name):
+        assert model_name == "gpt-5"
+        return [{"svg_reasoning_efforts": ("low",)}] if available else []
+
+    monkeypatch.setattr(images.routing, "resolve_api_model", resolve)
+    monkeypatch.setattr(images.routing, "resolve_image_svg_authors", authors)
+    with pytest.raises(images.DurableRunInputError, match=error):
+        await images.prepare_image_run({"model_id": "image", "prompt": "Draw", "output_format": "svg",
+            "svg_model": "gpt-5", "svg_reasoning_effort": "max"}, project_id="p", user_id="u")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-image-1.5", "chatgpt-image-latest"])
+async def test_legacy_direct_images_settle_with_optional_output_split_missing(monkeypatch, model):
+    from lumen.services.durable_runs.images import _image_usage_payload, _price_token_image
+
+    def handler(_request):
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(_PNG).decode()}],
+            "usage": {"input_tokens": 13, "output_tokens": 4200, "total_tokens": 4213,
+                      "input_tokens_details": {"text_tokens": 13, "image_tokens": 0}},
+        })
+
+    _mock_provider(monkeypatch, handler)
+    route = {**_catalog_route(model), "output_price_per_token": Decimal("0.000010")}
+    args = {"prompt": "Draw", "size": "1024x1024", "quality": "high", "n": 1}
+    observed = await image_transport.generate_images(route, **args)
+    hold = image_transport.validate_image_request(route, **args, edit=False)
+    prices = {**pricing.frozen_token_pricing(route), "reservation_usd": str(hold), "count": 1,
+              "size": args["size"], "quality": args["quality"]}
+    evidence = _image_usage_payload(1, observed.usage)
+    _, cost, components = _price_token_image(prices, evidence, model_name=model)
+    assert cost.raw_cost == Decimal("0.134465")
+    assert any(part["kind"] == "image_output_tokens" and part["cost_usd"] == "0.1344000000" for part in components)
+    with pytest.raises(ValueError, match="exceeds reservation"):
+        _price_token_image({**prices, "reservation_usd": "0.10"}, evidence, model_name=model)

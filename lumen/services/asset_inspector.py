@@ -118,6 +118,8 @@ def _svg(path: Path) -> dict[str, int]:
         for key, value in attrs.items():
             if key not in _SVG_ATTRIBUTES:
                 reject()
+            if key in {"id", "role", "aria-label", "aria-labelledby", "aria-describedby"}:
+                continue
             if key in _SVG_LOCAL_REFERENCE_ATTRIBUTES and _LOCAL_SVG_REFERENCE.fullmatch(value):
                 continue
             if key in _SVG_CLIP_ATTRIBUTES and value != "none":

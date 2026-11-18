@@ -234,11 +234,13 @@ OpenAI Images의 `n`은 1–10, `prompt`는 최대 32,000자이며 기본 `size`
 | `complexity` | GPT Image 2.6만: `low`, `medium`, `high`; 생략 시 provider 기본값 |
 | `frame_count`, `frame_duration_ms` | GIF 생성/편집만: 2–16(기본 9), 20–2000ms(기본 200). 명시 size 필수; `W×H×n×frames ≤ 10,485,760`. 4 bits/pixel의 Lumen 예산이며 실제 결과도 5 MiB 이하로 제한한다. |
 | `moderation` | OpenAI Images `auto`(기본값) 또는 `low`. |
-| `svg_model`, `svg_reasoning_effort` | GPT Image 2.6 생성의 SVG 출력(`n=1`)에서만 선택. 생략 시 provider 기본 author. 명시하면 동일 provider의 동일 account/credential에서 이용 가능한 등록된 비제한 OpenAI text 모델과 해당 모델의 지원 effort만 허용한다. 일반 text 실행 권한과 SVG preview 권한도 필요하다. 응답 author ID가 선택한 ID와 다르거나 usage가 불완전하면 `unknown`. 정적 UTF-8 SVG만 저장한다. |
+| `svg_model`, `svg_reasoning_effort` | GPT Image 2.6 생성의 SVG 출력(`n=1`)에서만 선택. 생략 시 provider 기본 author. 명시하면 동일 provider의 동일 account/credential에서 이용 가능한 등록된 비제한 OpenAI text 모델과 해당 모델의 지원 effort만 허용한다. 일반 text 실행 권한과 SVG preview 권한도 필요하다. 응답은 선택 ID 또는 같은 카탈로그 항목의 동결된 alias/snapshot만 정산하며, 그 외 ID 또는 불완전한 usage는 `unknown`이다. 정적 UTF-8 SVG만 저장한다. |
 
 Compat generation JSON also accepts the OpenAI SDK shape `svg: {model, reasoning: {effort}}` instead of the flat author fields. Do not combine the two shapes.
 
 Native 편집은 기존 `input_asset_id` 또는 `input_asset_ids`(순서 있는 1–16개)를 받는다. OpenAI 호환 multipart 편집은 `image` 또는 `image[]` 파일을 같은 순서로 반복한다. Native는 `mask_asset_id` 또는 `markup_asset_id`, 호환 multipart는 `mask` 또는 `markup` 파일 중 하나를 추가할 수 있다. Overlay는 첫 이미지와 방향 보정 후 크기가 같은 투명 PNG여야 한다. GIF는 mask 미지원, markup은 GPT Image 2.5/2.6만 지원한다. `input_fidelity`는 1.5와 그 snapshot에서 `low|high`, 1-mini에서 `low`만 지원한다. 외부 URL/file ID는 지원하지 않는다. Native Batch 편집은 한 개의 원본만 허용하며 mask/markup은 지원하지 않는다.
+
+여러 원본 또는 mask/markup을 포함한 편집에는 token 기준 OpenAI Images 모델이 필요하다. Unit 기준은 원본 한 개만 허용한다.
 
 Streaming이나 partial images 요청은 `422`; `stream=false`/`partial_images=0`은 생략과 같다. 선택한 옵션만 durable intent에 들어가므로 기존 요청의 fingerprint는 바뀌지 않는다. 모든 입력/출력 이미지 각 5 MiB 상한, MIME 검사, ClamAV 및 private S3 저장을 적용한다. Compat multipart 재요청은 필드 역할과 순서 모두에서 원본과 동일한 파일 digest가 필요하다.
 
