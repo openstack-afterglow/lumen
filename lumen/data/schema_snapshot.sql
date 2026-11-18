@@ -50,9 +50,8 @@ CREATE TABLE `chat_agents` (
   `updated_at` datetime NOT NULL,
   `plugin_tool_ids` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`plugin_tool_ids`)),
   `plugin_skill_ids` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`plugin_skill_ids`)),
-  `domain_id` varchar(64) DEFAULT NULL,
+  `model_row_id` bigint DEFAULT NULL,
   PRIMARY KEY (`id`),
-  KEY `idx_chat_agents_domain` (`domain_id`,`owner_user_id`,`updated_at`),
   KEY `idx_chat_agents_owner` (`owner_user_id`),
   KEY `idx_chat_agents_project` (`project_id`),
   KEY `idx_chat_agents_project_active` (`project_id`,`is_active`),
@@ -381,10 +380,8 @@ CREATE TABLE `chat_conversations` (
   `history_revision` bigint NOT NULL DEFAULT 0,
   `history_index_ready` tinyint NOT NULL DEFAULT 0,
   `graph_id` char(36) NOT NULL,
-  `domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `code_workspace_id` (`code_workspace_id`),
-  KEY `idx_chat_conversations_domain` (`domain_id`,`user_id`,`updated_at`),
   KEY `idx_chat_conversations_graph` (`graph_id`),
   KEY `idx_chat_conversations_owner` (`project_id`,`user_id`),
   KEY `idx_chat_conversations_updated` (`updated_at`),
@@ -414,16 +411,10 @@ CREATE TABLE `chat_custom_tools` (
   `load_policy` varchar(16) NOT NULL DEFAULT 'on_demand',
   `created_at` datetime NOT NULL,
   `updated_at` datetime NOT NULL,
-  `domain_id` varchar(64) DEFAULT NULL,
-  `owner_domain_id` varchar(64) DEFAULT NULL,
-  `legacy_domain_group` char(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_chat_custom_tools_project` (`project_id`),
-  KEY `idx_chat_tool_domain` (`owner_domain_id`,`scope`),
   KEY `idx_chat_tool_owner` (`owner_user_id`),
-  KEY `idx_chat_tool_scope` (`scope`),
-  KEY `idx_chat_tool_user_domain` (`domain_id`,`owner_user_id`,`updated_at`),
-  CONSTRAINT `ck_chat_tool_domain_owner` CHECK (`scope` <> 'domain' or `owner_domain_id` is not null)
+  KEY `idx_chat_tool_scope` (`scope`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_delegation_calls` (
@@ -445,23 +436,6 @@ CREATE TABLE `chat_delegation_calls` (
   CONSTRAINT `fk_delegation_call_child` FOREIGN KEY (`child_run_id`) REFERENCES `chat_runs` (`id`),
   CONSTRAINT `fk_delegation_call_group` FOREIGN KEY (`group_id`) REFERENCES `chat_delegation_groups` (`id`),
   CONSTRAINT `fk_delegation_call_parent` FOREIGN KEY (`parent_run_id`) REFERENCES `chat_runs` (`id`)
-) ENGINE=InnoDB;
-
-CREATE TABLE `chat_extension_archives` (
-  `id` bigint NOT NULL AUTO_INCREMENT,
-  `kind` varchar(10) NOT NULL,
-  `entry_type` varchar(20) NOT NULL DEFAULT 'extension',
-  `original_id` bigint NOT NULL,
-  `canonical_id` bigint NOT NULL,
-  `owner_user_id` varchar(64) DEFAULT NULL,
-  `domain_id` varchar(64) NOT NULL,
-  `name` varchar(100) NOT NULL,
-  `encrypted_snapshot` mediumtext NOT NULL,
-  `archived_at` datetime NOT NULL,
-  `restored_at` datetime DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  KEY `idx_chat_extension_archive_original` (`kind`,`original_id`,`entry_type`),
-  KEY `idx_chat_extension_archive_owner` (`domain_id`,`owner_user_id`,`restored_at`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_delegation_groups` (
@@ -631,10 +605,7 @@ CREATE TABLE `chat_mcp_activations` (
   `generation` bigint NOT NULL DEFAULT 1,
   `created_at` datetime NOT NULL DEFAULT current_timestamp(),
   `updated_at` datetime NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
-  `owner_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`mcp_server_id`,`owner_user_id`,`owner_project_id`),
-  UNIQUE KEY `uq_chat_mcp_activation_domain` (`mcp_server_id`,`owner_user_id`,`owner_domain_id`),
-  KEY `idx_chat_mcp_activation_domain` (`owner_domain_id`,`owner_user_id`),
   KEY `idx_chat_mcp_activation_owner` (`owner_user_id`,`owner_project_id`),
   CONSTRAINT `fk_chat_mcp_activation_server` FOREIGN KEY (`mcp_server_id`) REFERENCES `chat_mcp_servers` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB;
@@ -664,11 +635,8 @@ CREATE TABLE `chat_mcp_oauth_connections` (
   `server_config_version` bigint NOT NULL,
   `created_at` datetime NOT NULL,
   `updated_at` datetime NOT NULL,
-  `owner_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_chat_mcp_oauth_connection` (`mcp_server_id`,`owner_user_id`,`owner_project_id`),
-  UNIQUE KEY `uq_chat_mcp_oauth_domain` (`mcp_server_id`,`owner_user_id`,`owner_domain_id`),
-  KEY `idx_chat_mcp_oauth_domain` (`owner_domain_id`,`owner_user_id`),
   KEY `idx_chat_mcp_oauth_connection_owner` (`owner_user_id`,`owner_project_id`,`status`)
 ) ENGINE=InnoDB;
 
@@ -684,7 +652,6 @@ CREATE TABLE `chat_mcp_oauth_requests` (
   `expires_at` datetime NOT NULL,
   `completed_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL,
-  `owner_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `state_hash` (`state_hash`),
   KEY `idx_chat_mcp_oauth_request_expiry` (`expires_at`,`status`)
@@ -724,7 +691,6 @@ CREATE TABLE `chat_mcp_servers` (
   `owner_domain_id` varchar(64) DEFAULT NULL,
   `connection_scope_key` varchar(200) NOT NULL DEFAULT 'global',
   `implicit_selection` tinyint NOT NULL DEFAULT 1,
-  `legacy_domain_group` char(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_chat_mcp_scoped_template_label` (`connection_scope_key`,`template_key`,`connection_label`),
   KEY `idx_chat_mcp_owner` (`owner_user_id`),
@@ -816,9 +782,7 @@ CREATE TABLE `chat_message_graphs` (
   `id` char(36) NOT NULL,
   `user_id` varchar(64) NOT NULL,
   `project_id` varchar(64) NOT NULL,
-  `domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
-  KEY `idx_chat_message_graphs_domain` (`domain_id`,`user_id`),
   KEY `idx_chat_message_graphs_owner` (`project_id`,`user_id`)
 ) ENGINE=InnoDB;
 

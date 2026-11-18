@@ -11,6 +11,12 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
 
+### Native model identity
+
+Native chat, context, Decisions, image, audio and realtime requests can select an active catalog row through `model_row_id`. The exact lookup preserves model-kind, capability, pricing and authority checks. A supplied legacy selector must identify the same row. Provider/model identity is frozen in the durable snapshot; retry selects that row even after an agent's pinned model changes. Legacy snapshots without a row ID can only resolve a unique name. Compatible OpenAI and Anthropic requests continue to use public model names and provider selectors.
+
+Migration 039 adds nullable `chat_agents.model_row_id`. Root and delegated agents use an exact pin if configured. Without a pin, a root run honors its explicit request; an agent's legacy default must resolve uniquely when used. The column has no catalog foreign key: removing a model cannot clear a pin and silently redirect an agent. Message history projects only the row ID from the run's frozen route, never provider credentials or the full snapshot.
+
 ### Dashboard MCP and cloud-approval integration
 
 `mcp_domain_authority` resolves exact current project-domain membership and legitimate canonical-Default/direct-domain manager grants through native Keystone. It rejects reduced/API-key management and ignores Afterglow-derived manager projection grants. `ChatMcpServer` gains domain ownership and a scope-keyed uniqueness boundary in migration 033; the unmerged Drover migration 032 is independent and the loader permits the gap. Domain credentials are encrypted, shared only at execution, and absent from member responses. Personal activation, config fingerprint, credential version and current native membership are rechecked before frozen connections run. Activation reads Keystone membership before taking the published row lock (token refresh shares that lock) and fails closed inside the lock if the row's domain/scope changed; idempotent template install releases its lookup session before re-reading the effective view.

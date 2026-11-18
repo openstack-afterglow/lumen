@@ -49,6 +49,7 @@ from .errors import (
     DurableRunInputError,
     DurableRunNotFound,
     DurableRunProviderResultUnknown,
+    MediaModelAmbiguous,
 )
 from .lifecycle import _cancel_requested, _require_owned_running_lease
 from .media import (
@@ -71,14 +72,15 @@ _MAX_TRANSCRIPT = 65536
 
 def _intent(request: dict) -> dict:
     kind = request.get("kind")
+    model_row_id = {"model_row_id": request["model_row_id"]} if request.get("model_row_id") is not None else {}
     if kind == "tts":
         return {"kind": kind, "model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
                 "input": request.get("input"), "voice": request.get("voice"),
-                "response_format": request.get("response_format", "mp3")}
+                "response_format": request.get("response_format", "mp3"), **model_row_id}
     if kind == "stt":
         intent = {"kind": kind, "model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
                   "input_asset_id": request.get("input_asset_id"), "language": request.get("language"),
-                  "prompt": request.get("prompt")}
+                  "prompt": request.get("prompt"), **model_row_id}
         try:
             granularities = audio_transport.normalize_timestamp_granularities(request.get("timestamp_granularities"))
         except ProviderValidationError as exc:
@@ -205,19 +207,16 @@ async def prepare_audio_run(request: dict, *, project_id: str, user_id: str,
         request = {**request, "kind": "tts" if operation == "audio.speech" else "stt"}
     intent = _intent_with_credential_authority(_intent(request), credential_authority)
     kind = intent["kind"]
-    model_id, provider_id = intent["model_id"], intent["provider_id"]
-    if not isinstance(model_id, str) or not model_id or (provider_id is not None and not isinstance(provider_id, (str, int))):
+    model_id, model_row_id, provider_id = intent["model_id"], intent.get("model_row_id"), intent["provider_id"]
+    if ((model_id is not None and not isinstance(model_id, str)) or (not model_id and model_row_id is None)
+            or (provider_id is not None and not isinstance(provider_id, (str, int)))):
         raise DurableRunInputError("audio model is required")
-    provider_number = int(provider_id) if provider_id is not None and str(provider_id).isdecimal() else None
-    api_provider = str(provider_id) if provider_id is not None and provider_number is None else None
     try:
-        route = (await routing.resolve_model_by_id(int(model_id), model_kind=kind) if model_id.isdecimal()
-                 else await routing.resolve_api_model(model_id, provider=api_provider,
-                                                       provider_id=provider_number, model_kind=kind))
+        route = await routing.resolve_media_model(model_id, model_row_id=model_row_id, provider_id=provider_id,
+                                                  model_kind=kind)
     except AmbiguousModelRouteError as exc:
-        raise DurableRunInputError("audio provider selection is ambiguous") from exc
-    if route is None or (provider_number is not None and route["provider_id"] != provider_number) or (
-            api_provider is not None and route["api_provider"] != api_provider):
+        raise MediaModelAmbiguous("audio provider selection is ambiguous") from exc
+    if route is None:
         raise DurableRunInputError("audio provider or model is unavailable")
     if kind == "tts":
         if not isinstance(intent["input"], str) or not intent["input"].strip() or len(intent["input"]) > audio_transport._MAX_TEXT_CHARS:

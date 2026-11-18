@@ -568,6 +568,11 @@ def project_public_execution(activity: PublicActivityRead, *, durations_ms: dict
     }
 
 
+def _public_run_model(run: ChatRun) -> dict[str, int]:
+    model_row_id = (run.capability_snapshot or {}).get("model_id")
+    return {"model_row_id": model_row_id} if model_row_id is not None else {}
+
+
 async def list_messages(
     conv_id: str, *, user_id: str, project_id: str, limit: int = 200, offset: int = 0, domain_id: str | None = None,
 ) -> list[dict]:
@@ -631,6 +636,7 @@ async def list_messages(
                         "run_id": run.id,
                         "status": run.status,
                         "agent_id": run.agent_id,
+                        **_public_run_model(run),
                         "skill_ids": skill_ids if isinstance(skill_ids, list) else [],
                         "skills": skills,
                     }
@@ -1048,6 +1054,7 @@ async def list_message_page(
                         "run_id": run.id,
                         "status": run.status,
                         "retryable": run.status in {"failed", "canceled"},
+                        **_public_run_model(run),
                     }
 
             # The indexed history endpoint must retain the same journal as live SSE.
@@ -1064,6 +1071,7 @@ async def list_message_page(
                     execution_by_message[run.assistant_message_id] = {
                         "run_id": run.id,
                         "status": run.status,
+                        **_public_run_model(run),
                         **project_public_execution(activity_by_run[run.id], durations_ms={}, last_seq=run.last_seq),
                     }
 

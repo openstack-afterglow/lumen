@@ -354,7 +354,8 @@ def test_metadata_serializers_do_not_decrypt_private_configuration(monkeypatch):
     monkeypatch.setattr(extensions_store, "decrypt_chat_content", unexpected)
     monkeypatch.setattr(plugins.bindings, "decrypt_chat_content", unexpected)
     agent = SimpleNamespace(id=1, owner_user_id="owner", name="agent", description=None, avatar=None,
-                            instructions="ciphertext", model_name=None, visibility="private", cloned_from_id=None,
+                            instructions="ciphertext", model_name=None, model_row_id=None,
+                            visibility="private", cloned_from_id=None,
                             clone_count=0, created_at=None, updated_at=None)
     skill = SimpleNamespace(id=1, scope="user", name="skill", description=None,
                             instructions="ciphertext", is_active=True, created_at=None)

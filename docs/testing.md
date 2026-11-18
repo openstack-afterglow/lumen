@@ -1,5 +1,13 @@
 # 테스트
 
+## Native catalog row selection (migration 039)
+
+`test-passed` on the model-identity slice: 1,066 focused pytest cases and Ruff on changed Python files. Coverage includes duplicate model names under separate provider connections, exact kind filters, native route assertions, legacy media decimal IDs, agent create/update/clone and child routing, retry after an agent model change, and unchanged OpenAI/Anthropic request schemas. Synthetic upstream tests confirm that local row IDs never enter the Decisions provider payload.
+
+`test-passed` after compatibility corrections: 1,025 focused cases and Ruff. Coverage includes explicit root selection with a stale or ambiguous name-only agent default, exact agent pin enforcement, shared legacy alias checks, and 409 responses for ambiguous OpenAI-compatible image generation and speech.
+
+The migration manifest and ORM contract passed locally. The history projection has a MariaDB integration case; that test and migration application against MariaDB were not run for this slice. No live provider or deployment check ran.
+
 ## Lumen 0.6.20 — 발행·운영 배포·OpenAI 유료 확인
 
 - `live-verified`: `0.6.20` tag는 `d2751b6d76d34e58dfa04a0a405652ea3b2d154f`(검토한 `ed1e77d`와 트리 동일)이다. PR CI [`44288865371`](https://github.com/openstack-afterglow/lumen/actions/runs/44288865371), `dev` CI [`44290416680`](https://github.com/openstack-afterglow/lumen/actions/runs/44290416680), tag 이미지 [`44290538562`](https://github.com/openstack-afterglow/lumen/actions/runs/44290538562), 패키지 [`44290538570`](https://github.com/openstack-afterglow/lumen/actions/runs/44290538570)가 통과했다. 패키지 workflow가 미리 만든 [한영 GitHub Release](https://github.com/openstack-afterglow/lumen/releases/tag/0.6.20) 초안을 휠 8개와 함께 11:05:42 UTC에 게시했고(배포 전, 배포 대기로 표기), 배포 후 수신증으로 본문을 갱신했다.

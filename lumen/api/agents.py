@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from lumen.auth import ensure_scopes, require_scopes
+from lumen.models.api_requests import ModelRowId
 from lumen.models.chat_contracts import validate_plugin_binding_ids
 from lumen.services import agent_store as ags
 from lumen.services.domain_scope import history_domain_id
@@ -25,6 +26,7 @@ class AgentCreate(BaseModel):
     avatar: str | None = Field(default=None, max_length=500)
     instructions: str | None = Field(default=None, max_length=_MAX_INSTRUCTIONS)
     model_name: str | None = Field(default=None, max_length=190)
+    model_row_id: ModelRowId | None = None
     params: dict | None = None
     mcp_ids: list[int] | None = None
     tool_ids: list[int] | None = None
@@ -54,6 +56,7 @@ class AgentUpdate(BaseModel):
     avatar: str | None = Field(default=None, max_length=500)
     instructions: str | None = Field(default=None, max_length=_MAX_INSTRUCTIONS)
     model_name: str | None = Field(default=None, max_length=190)
+    model_row_id: ModelRowId | None = None
     params: dict | None = None
     mcp_ids: list[int] | None = None
     tool_ids: list[int] | None = None
@@ -82,6 +85,8 @@ def _map_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, ags.AgentForbidden):
         return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, ags.AgentModelSelectionError):
+        return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, ags.AgentValidationError):
         return HTTPException(status_code=400, detail=str(exc))
     return HTTPException(status_code=503, detail=str(exc))

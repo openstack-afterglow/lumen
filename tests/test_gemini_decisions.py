@@ -274,7 +274,7 @@ async def test_google_http_shape_and_fresh_credential(ledger, fake_http):
     response = result(image=True)
     calls, pin = fake_http(200, {"answers": response["answers"], "usage": response["usage"]})
     selected = route(capabilities={"decisions": True}, model_kind="text")
-    assert await call(selected=selected, body=validate(input=[TEXT, IMAGE])) == response
+    assert await call(selected=selected, body=validate(input=[TEXT, IMAGE], model=None, model_row_id=12)) == response
     assert len(calls) == 1 and str(calls[0].url) == gemini_decisions.API_URL
     assert calls[0].headers["x-goog-api-key"] == pin.return_value and "authorization" not in calls[0].headers
     assert json.loads(calls[0].content) == request(model="gemini-decision-1", input=[TEXT, IMAGE])
@@ -372,6 +372,27 @@ def test_native_branch_and_google_compat(path, auth_type, expected_scope, monkey
         resolve.assert_awaited_once_with("gemini-decision-1", provider_type="gemini")
     assert run.call_args.kwargs["required_scopes"] == (expected_scope,)
     old_run.assert_not_called()
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/decisions", "/v1beta/decisions"])
+def test_gemini_http_exact_row_accepts_alias_and_rejects_mismatch(path, monkeypatch):
+    selected = route(model_id=12, provider_id=2)
+    exact = AsyncMock(return_value=selected)
+    legacy = AsyncMock(side_effect=routing.AmbiguousModelRouteError("duplicate model"))
+    monkeypatch.setattr(routing, "resolve_model_by_id", exact)
+    monkeypatch.setattr(routing, "resolve_api_model", legacy)
+    run = AsyncMock(return_value=result())
+    monkeypatch.setattr(gemini_decisions, "decide", run)
+    http = client()
+    assert http.post(path, json=request(model=None, model_row_id=12)).status_code == 200
+    exact.assert_awaited_once_with(12, model_kind=("text", "decision"), required_capabilities=("decisions",))
+    assert run.await_args.kwargs["route"]["provider_id"] == 2
+    legacy.assert_not_called()
+    assert http.post(path, json=request(model="models/gemini-decision-1", model_row_id=12)).status_code == 200
+    wrong = http.post(path, json=request(model="different", model_row_id=12))
+    assert (wrong.status_code, wrong.json()["detail"]) == (422, "model_selection_mismatch")
+    assert http.post(path, json=request()).status_code == 409
+    assert run.await_count == 2
 
 
 @pytest.mark.parametrize("path", ["/v1/chat/decisions", "/v1beta/decisions"])
@@ -512,3 +533,6 @@ def test_main_registers_google_host_route_and_security():
     }
     schemas = app.openapi()["components"]["schemas"]
     assert {"GeminiDecisionRequest", "GeminiDecision_ChoiceQuestion"} <= schemas.keys()
+    assert "model_row_id" in schemas["GeminiDecisionRequest"]["properties"]
+    assert "model_row_id" in schemas["NativeDecisionRequest"]["properties"]
+    assert "model_row_id" not in schemas["DecisionRequest"]["properties"]

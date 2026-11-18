@@ -466,6 +466,7 @@ def custom_openapi() -> dict:
         batch_item_scopes,
     )
     from lumen.models.chat_contracts import _CHAT_RUN_EVENT
+    from lumen.models.decision_contracts import NativeDecisionRequest
     from lumen.models.gemini_decision_contracts import GeminiDecisionRequest
 
     schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
@@ -707,6 +708,12 @@ def custom_openapi() -> dict:
     for def_name, def_schema in gemini_schema.pop("$defs", {}).items():
         components_schemas[f"GeminiDecision_{def_name}"] = def_schema
     components_schemas["GeminiDecisionRequest"] = gemini_schema
+    decision_schema = NativeDecisionRequest.model_json_schema(
+        ref_template="#/components/schemas/NativeDecision_{model}",
+    )
+    for def_name, def_schema in decision_schema.pop("$defs", {}).items():
+        components_schemas[f"NativeDecision_{def_name}"] = def_schema
+    components_schemas["NativeDecisionRequest"] = decision_schema
 
     def _fix_refs(obj: Any) -> None:
         if isinstance(obj, dict):

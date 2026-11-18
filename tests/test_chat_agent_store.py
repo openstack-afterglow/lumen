@@ -123,6 +123,7 @@ async def test_owned_legacy_template_clones_only_in_its_origin(monkeypatch):
         avatar=None,
         instructions=None,
         model_name=None,
+        model_row_id=None,
         params=None,
         is_active=True,
         visibility="private",
@@ -149,6 +150,47 @@ async def test_owned_legacy_template_clones_only_in_its_origin(monkeypatch):
     assert session.added.tool_ids is None
 
 
+async def test_exact_agent_model_create_update_and_run_projection(client, monkeypatch):
+    class ModelSession(_Session):
+        async def execute(self, statement):
+            self.statements.append(statement)
+            return _Result(self.added)
+
+        async def flush(self):
+            self.added.id = 41
+
+    session = ModelSession()
+    _scope_store(monkeypatch, session)
+
+    async def resolve(row_id, *, model_kind):
+        assert model_kind == "text"
+        if row_id in (11, 12):
+            return {"model_name": "duplicate", "model_id": row_id, "provider_id": row_id - 10}
+        return None
+
+    monkeypatch.setattr(ags.routing, "resolve_model_by_id", resolve)
+    url = "/api/v1/chat/agents"
+    invalid = await client.post(url, json={"name": "Pinned", "model_row_id": 12, "model_name": "wrong"})
+    assert (invalid.status_code, invalid.json()["detail"]) == (422, "model_selection_mismatch")
+    created = await client.post(url, json={"name": "Pinned", "model_row_id": 12})
+    assert created.status_code == 201
+    assert (created.json()["model_row_id"], created.json()["model_name"]) == (12, "duplicate")
+    assert session.added.model_row_id == 12
+
+    invalid = await client.patch(f"{url}/41", json={"model_row_id": 11, "model_name": "wrong"})
+    assert (invalid.status_code, invalid.json()["detail"]) == (422, "model_selection_mismatch")
+    assert session.added.model_row_id == 12
+    updated = await client.patch(f"{url}/41", json={"model_row_id": 11, "model_name": "duplicate"})
+    assert updated.status_code == 200
+    assert updated.json()["model_row_id"] == 11
+    for_run = await ags.get_agent_for_run(41, user_id="test-user-123", project_id="test-project-123")
+    assert (for_run["model_row_id"], for_run["model_name"]) == (11, "duplicate")
+    echoed = await client.patch(f"{url}/41", json={"model_name": "duplicate"})
+    assert echoed.json()["model_row_id"] == 11
+    legacy = await client.patch(f"{url}/41", json={"model_name": "new-name"})
+    assert (legacy.json()["model_row_id"], legacy.json()["model_name"]) == (None, "new-name")
+
+
 async def test_agent_use_without_verified_domain_requires_exact_legacy_origin(monkeypatch):
     session = _Session()
     _scope_store(monkeypatch, session)
@@ -173,6 +215,7 @@ async def test_hub_hides_private_attachments_even_if_ownership_matches(monkeypat
         avatar=None,
         instructions=None,
         model_name=None,
+        model_row_id=None,
         params=None,
         mcp_ids=[4],
         tool_ids=[5],
@@ -212,7 +255,8 @@ async def test_same_user_can_clone_public_template_from_another_project(monkeypa
         description=None,
         avatar=None,
         instructions=None,
-        model_name=None,
+        model_name="pinned-model",
+        model_row_id=12,
         params=None,
         is_active=True,
         visibility="public",
@@ -230,3 +274,4 @@ async def test_same_user_can_clone_public_template_from_another_project(monkeypa
 
     assert clone["cloned_from_id"] == 41
     assert session.added.project_id == "project-current"
+    assert (clone["model_row_id"], clone["model_name"]) == (12, "pinned-model")

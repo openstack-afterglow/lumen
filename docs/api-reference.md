@@ -90,6 +90,14 @@ API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만
 | Memory/usage | `GET/POST /v1/memories`, `GET /v1/memories/document`, search, patch/delete; `GET /v1/usage`, `/keys`, `/timeseries`, `/records` |
 | Keystone-only key/admin management / scoped resources | `/v1/api-keys`, owner limits와 `/v1/admin/*`는 Keystone-only. Agent/workspace/code/Git 및 `/v1/assets`는 해당 service action과 owner scope를 요구하며 API key도 stored scope와 current leaf가 모두 있어야 함 |
 
+## Native model selection
+
+Send `model_row_id` as a positive JSON integer from the model catalog's `id`. It selects one active model row, including when multiple provider connections list the same name. Native completion, temporary completion, regenerate, context preview and compaction accept it instead of `model_id`. Native images, speech, transcription and realtime sessions accept it alongside the legacy decimal-string or model name. Native `/v1/chat/decisions` and Gemini `/v1beta/decisions` accept it instead of `model`. If both selectors or a legacy provider selector are present, they must match the selected row; disagreement returns HTTP 422 `model_selection_mismatch`. The selected row must support the requested kind and capabilities. Native embeddings already take the catalog ID as integer `model_id`. OpenAI and Anthropic compatibility routes retain their existing name/provider request shape.
+
+Ambiguous name-only OpenAI image and audio requests return HTTP 409. Native image and audio requests retain HTTP 422 for ambiguous legacy selections.
+
+Agent create and patch accept `model_row_id` with optional `model_name`. An exact agent pin controls root and child runs; a conflicting root request returns 422. Without a pin, an explicit root model selection wins. A legacy agent name must resolve uniquely when used as a default or for a child run. Patching a different name without a row ID replaces the pin with a legacy selection. A retry always reuses the source run's frozen row ID when present; an optional body `{"model_row_id": 12}` asserts the source row, not an override. Persistent message history includes `execution.model_row_id` when the snapshot records it.
+
 ## Provider account and credential administration
 
 All paths below are relative to `/v1/admin/providers/{provider_id}` and require the existing **human Keystone verified system-admin** boundary (`require_admin`), not an ordinary API key. `provider_id` identifies the endpoint; account and credential IDs are numeric and must belong to that endpoint. Responses expose configuration/status/provenance only, never plaintext key, subscription token or ciphertext. Account/auth actions use no-store responses; Afterglow mirrors them under `/api/v1/chat/admin/providers/{provider_id}` and applies provider-route no-store on success and handled failures.

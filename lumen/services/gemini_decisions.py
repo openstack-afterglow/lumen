@@ -172,7 +172,7 @@ async def _safety_code(response: httpx.Response) -> str | None:
 
 async def transport(route: dict, body: GeminiDecisionRequest, *, on_dispatch: Callable[[], None]) -> dict:
     key = await resolve_route_api_key(route)
-    payload = body.model_dump(exclude_none=True)
+    payload = body.model_dump(exclude_none=True, exclude={"model_row_id"})
     payload["model"] = route["api_model_name"]
     rejection = None
     try:
