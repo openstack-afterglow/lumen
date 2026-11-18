@@ -34,7 +34,7 @@ from lumen.services.domain_scope import history_domain_id
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
 from lumen.services.providers.credentials import execution_identity
-from lumen.services.providers.pricing import _has_component_prices, frozen_token_pricing
+from lumen.services.providers.pricing import _has_component_prices, domain_billing_readiness, frozen_token_pricing
 from lumen.services.tool_runtime import contracts
 from lumen.services.usage_breakdown import required_modalities_for_request
 from lumen.services.vault_store import human_domain
@@ -136,6 +136,7 @@ def _require_execution_capability(
     *,
     parts: list[UserInputPart] | None = None,
     feature_routes: dict[str, dict[str, Any]] | None = None,
+    domain_paid: bool = False,
 ) -> None:
     """Reject requested features, modalities, and output combinations without a priced route."""
     requested = ["text"]
@@ -194,6 +195,18 @@ def _require_execution_capability(
             reason = gate.get("reason_code") or "pricing_unavailable"
             raise HTTPException(
                 status_code=422, detail=f"requested chat capability is not available: {feature} ({reason})"
+            )
+    if domain_paid:
+        # Reject before admission what the prepaid bound would refuse at provider start.
+        readiness = domain_billing_readiness(
+            capabilities,
+            input_price=resolved.get("input_price_per_token"),
+            output_price=resolved.get("output_price_per_token"),
+        )
+        if not readiness["ready"]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"requested chat capability is not available: domain_billing ({readiness['reason_code']})",
             )
 
     # Output generation modalities still lack execution paths. Keep them
@@ -1258,7 +1271,11 @@ async def prepare_context_input(
             )
 
     feature_routes = await _resolve_feature_routes(features)
-    _require_execution_capability(features, resolved, parts=parts, feature_routes=feature_routes)
+    payer = (token_info or {}).get("payer")
+    _require_execution_capability(
+        features, resolved, parts=parts, feature_routes=feature_routes,
+        domain_paid=not is_preview and payer is not None and payer.domain_id is not None,
+    )
     validated_reasoning_effort = _validated_reasoning_effort(reasoning_effort, resolved)
     _validate_tool_reasoning_compatibility(validated_reasoning_effort, resolved, features)
 

@@ -206,7 +206,7 @@ async def test_inconsistent_usage_leaves_hold_uncertain(ledger, monkeypatch, usa
         await call()
     assert exc.value.status_code == 502 and exc.value.uncertain
     ledger.settle.assert_not_called()
-    assert ledger.finish.call_args.kwargs == {"uncertain": True}
+    assert ledger.finish.call_args.kwargs == {"uncertain": True, "payer": None}
 
 
 @pytest.mark.parametrize("key,changes", [
@@ -293,7 +293,7 @@ async def test_http_rejection_and_ambiguity_single_attempt(ledger, fake_http, st
     assert len(calls) == 1
     assert exc.value.status_code == (status if status in {400, 429} else 502)
     assert exc.value.message == (code if code in gemini_decisions.SAFETY_CODES else "upstream decision request rejected")
-    assert ledger.finish.call_args.kwargs == {"uncertain": status not in decisions._REJECTION_STATUSES}
+    assert ledger.finish.call_args.kwargs == {"uncertain": status not in decisions._REJECTION_STATUSES, "payer": None}
     ledger.settle.assert_not_called()
 
 
@@ -336,7 +336,7 @@ async def test_gemini_transport_failure_hold_outcomes(ledger, fake_http, monkeyp
     assert len(calls) == 1
     ledger.reserve.assert_awaited_once()
     ledger.finish.assert_awaited_once()
-    assert ledger.finish.call_args.kwargs == {"uncertain": uncertain}
+    assert ledger.finish.call_args.kwargs == {"uncertain": uncertain, "payer": None}
     ledger.settle.assert_not_called()
 
 

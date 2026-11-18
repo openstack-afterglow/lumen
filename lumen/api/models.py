@@ -493,6 +493,8 @@ class ModelResponse(BaseModel):
     capability_source: str | None = None
     effective_capabilities: dict | None = None
     effective_capability_source: str | None = None
+    # Text models only: {"ready", "reason_code"}; set capabilities.context_limit to fix context_limit_unknown.
+    domain_billing: dict | None = None
     created_at: str | None
     updated_at: str | None
 

@@ -691,6 +691,25 @@ def _effective_capabilities(
     return apply_subscription_capability_limits(detected, auth_mode), source
 
 
+def domain_billing_readiness(capabilities: dict, *, input_price, output_price) -> dict:
+    """Whether a text model can fund a domain-paid call before admission.
+
+    Mirrors the run-time bound: a prepaid hold covers the whole frozen context
+    window plus an output budget the provider enforces. Unknown windows are
+    never fabricated; an administrator may set ``capabilities.context_limit``.
+    """
+    limit = capabilities.get("context_limit")
+    if input_price is None or output_price is None:
+        reason = "pricing_unavailable"
+    elif capabilities.get("output_budget_enforced") is False:
+        reason = "output_budget_unenforced"
+    elif type(limit) is not int or limit <= 0:
+        reason = "context_limit_unknown"
+    else:
+        reason = None
+    return {"ready": reason is None, "reason_code": reason}
+
+
 def _model_public(
     row: LlmModel,
     *,
@@ -793,6 +812,11 @@ def _model_public(
         "effective_capability_source": eff_caps_source,
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
+        # Not part of route capabilities, so run config hashes stay unchanged.
+        "domain_billing": (
+            domain_billing_readiness(eff_caps, input_price=effective_input, output_price=effective_output)
+            if _kind(row) == "text" else None
+        ),
     }
 
 

@@ -50,6 +50,8 @@ class AvailableModel(BaseModel):
     context_limit: int | None = None
     # Whether reasoning_effort="none" passes chat admission for this model (same rule).
     reasoning_none_supported: bool = False
+    # Text models only: whether domain-paid chat can admit this model, with a reason code when not.
+    domain_billing: dict | None = None
     effective_input_price_per_million: Decimal | None = None
 
     model_config = {"protected_namespaces": ()}
@@ -101,6 +103,7 @@ async def list_available_models(
                     caps if isinstance(caps, dict) else None,
                     provider_type,
                 ),
+                **({"domain_billing": m.get("domain_billing")} if model_kind == "text" else {}),
                 **({"effective_input_price_per_million": m.get("effective_input_price_per_million")}
                    if model_kind == "decision" else {}),
             }
