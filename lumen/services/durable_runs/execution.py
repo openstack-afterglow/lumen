@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import replace
 from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from time import monotonic
@@ -1608,6 +1609,7 @@ class _DurableExecutionHooks:
                 raise DurableRunInputError("inference_authority_revoked") from exc
             except ApiKeyAuthorityUnavailable as exc:
                 raise DurableRunError("inference_authority_unavailable") from exc
+            await children.require_frozen_agent(session, run)
             if self.requires_credit_reservation:
                 if credit_bound is None:
                     raise DurableRunError("v2 call is missing its bounded credit estimate")
@@ -2568,9 +2570,17 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             await _set_stage(run_id, "response_writing", owner=owner)
             response_writing = True
 
+    extension_actor = ExitStack()
     try:
         if not _validate_run_protocol_payload(run, payload):
             raise DurableRunProtocolMismatch("run execution protocol does not match this worker")
+        extension_domain = capability_snapshot.get("history_domain_id")
+        extension_actor.enter_context(extensions_store.actor_scope(
+            human=False, mode="run",
+            owner=(user_id, project_id, extension_domain)
+            if isinstance(extension_domain, str) and extension_domain and getattr(run, "api_key_id", None) is None
+            else None,
+        ))
         await _set_stage(run_id, "model_request", owner=owner)
         resolved = await ps.resolve_model_snapshot(capability_snapshot)
         if resolved is None:
@@ -3216,6 +3226,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             safe_message=safe_message,
         )
     finally:
+        extension_actor.close()
         if deadline_task is not None:
             deadline_task.cancel()
             await asyncio.gather(deadline_task, return_exceptions=True)

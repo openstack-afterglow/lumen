@@ -134,6 +134,11 @@ async def context_execute_result(name: str, args: dict, ctx: ToolContext) -> con
         except (PluginError, TypeError, ValueError):
             continue
         if binding.definition.name == name:
+            if tool_def.get("scope") == "domain" and binding.definition.effect != "read":
+                return contracts.ToolExecutionResult(
+                    "Domain HTTP mutations require the v2 approval protocol.",
+                    warning_code="tool_approval_required", status="failed",
+                )
             try:
                 safe_args = validate_tool_arguments(binding.definition.input_schema, args)
             except ValueError:

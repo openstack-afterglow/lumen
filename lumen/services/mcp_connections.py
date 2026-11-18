@@ -15,6 +15,8 @@ import hashlib
 import json
 from typing import Any
 
+from lumen_plugin_api.contracts import Namespace
+
 from lumen.services import extensions_store as es
 from lumen.services import mcp_client, mcp_oauth
 from lumen.services.mcp_registry_model import AUTH_MODES, McpRegistryError, normalized_url
@@ -153,7 +155,17 @@ async def refresh_catalog(server_id: int, *, user_id: str | None, project_id: st
     if row.get("auth_mode") == "oauth":
         if not user_id or not project_id:
             raise McpConnectionError("OAuth 연결의 도구 검색에는 연결한 사용자 인증이 필요합니다")
-        bearer = (await mcp_oauth.headers_for_user(user_id=user_id, project_id=project_id)).get(server_id)
+        active = await es.list_for_user(
+            "mcp", user_id=user_id, project_id=project_id, active_only=True,
+            include_domain=False, selected_ids=(server_id,),
+        )
+        selected = next((item for item in active if item["id"] == server_id), None)
+        epoch = selected.get("credential_version") if selected else None
+        if type(epoch) is not int or epoch < 1 or selected["config_version"] != server["config_version"]:
+            raise McpConnectionError("요청한 사용자에게 이 연결의 활성 OAuth 연결이 없습니다")
+        namespace = Namespace(user_id=user_id, project_id=project_id)
+        with mcp_oauth.frozen_credentials(namespace, {server_id: mcp_oauth.OAuthFence.from_server(selected, epoch)}):
+            bearer = (await mcp_oauth.headers_for_user(user_id=user_id, project_id=project_id)).get(server_id)
         if not bearer:
             raise McpConnectionError("요청한 사용자에게 이 연결의 활성 OAuth 연결이 없습니다")
         server["headers"] = {**(server.get("headers") or {}), **bearer}

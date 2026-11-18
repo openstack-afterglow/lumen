@@ -697,6 +697,17 @@ uv run pytest -m "not integration and not system" tests
 (cd sdk && uv run pytest && uv run ruff check .)
 ```
 
+### Migration 036 domain-scope acceptance (local test-passed)
+
+Focused contract pytest: 555 passed. Ruff passed for changed Python files. The disposable MariaDB/Redis integration run applied the ledger without schema repair and passed 76 tests, including ORM and schema snapshot drift checks:
+
+```sh
+uv run --frozen --offline --extra service --extra dev lumen-test integration -q --tb=short \
+  -k 'domain_scope_backfill or domain_history or shared_history_migration or agent_domain_scope or child_runs or mcp_domain_connections or mcp_connections_db or mcp_owner_activation or schema_snapshot or orm_declarations'
+```
+
+The integration slice proves same-user/domain history and agent behavior, origin-only legacy fallback, current-project run/asset authority, MCP activation and credential revision fences, archive recovery, same-server state replacement, and multi-account deduplication. Keystone fixtures are synthetic. No live Keystone, production upgrade, or cross-slice key and billing claims are included.
+
 ---
 
 ## Compose 프로젝트 격리 및 환경 오버라이드

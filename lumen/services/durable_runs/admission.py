@@ -17,6 +17,7 @@ from lumen.models.chat_contracts import ChatRunDescriptor, validate_user_input_p
 from lumen.models.chat_db import ChatConversation, ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatRunProvider, ChatTempThread
 from lumen.services import worker_routing
+from lumen.services.domain_scope import scope_clause
 from lumen.services.inference_authority import native_run_scopes
 from lumen.services.message_graph import (
     append_active_message,
@@ -344,6 +345,8 @@ async def _bind_user_assets(
 ) -> list[dict[str, Any]]:
     """Bind owned input assets and return the canonical parts persisted for the message."""
     canonical = await _canonical_user_parts(session, parts=parts, user_id=user_id, project_id=project_id)
+    if any(part["type"] != "text" for part in canonical):
+        await session.flush()  # The run must exist before its asset FK rows are inserted.
     for index, part in enumerate(canonical):
         if part["type"] == "text":
             continue
@@ -411,6 +414,7 @@ async def create_persistent_run(
     expected_parent_id: int | None = None,
     agent_budget: dict[str, Any] | None = None,
     execution_mode: str = "chat",
+    domain_id: str | None = None,
 ) -> ChatRunDescriptor:
     """Atomically create the user turn, run, and first journal event.
 
@@ -457,7 +461,9 @@ async def create_persistent_run(
                 select(ChatConversation)
                 .where(
                     ChatConversation.id == conversation_id,
-                    ChatConversation.project_id == project_id,
+                    scope_clause(
+                        ChatConversation.domain_id, ChatConversation.project_id, domain_id=domain_id, project_id=project_id,
+                    ),
                     ChatConversation.user_id == user_id,
                 )
                 .with_for_update()
@@ -530,12 +536,6 @@ async def create_persistent_run(
         user_message.parts = serialize_parts(canonical_parts)
         user_message.parts_version = 1
         run_id = str(uuid.uuid4())
-        for index, part in enumerate(canonical_parts):
-            if part["type"] == "text":
-                continue
-            session.add(ChatRunAsset(run_id=run_id, asset_id=part["asset_id"], purpose="input"))
-            session.add(ChatMessageAsset(message_id=user_message.id, asset_id=part["asset_id"], part_index=index))
-
         route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
         run = ChatRun(
             id=run_id,
@@ -569,6 +569,12 @@ async def create_persistent_run(
         _add_run_providers(session, run, capability_snapshot)
         session.add(run)
         await session.flush()
+        for index, part in enumerate(canonical_parts):
+            if part["type"] == "text":
+                continue
+            session.add(ChatRunAsset(run_id=run_id, asset_id=part["asset_id"], purpose="input"))
+            session.add(ChatMessageAsset(message_id=user_message.id, asset_id=part["asset_id"], part_index=index))
+
         order.take("root")
         waiting_resource = await _apply_root_budget(
             session, run, agent_budget=agent_budget, execution_mode=execution_mode, quota=quota, order=order
@@ -619,6 +625,7 @@ async def create_run(
     expected_parent_id: int | None = None,
     agent_budget: dict[str, Any] | None = None,
     execution_mode: str = "chat",
+    domain_id: str | None = None,
 ) -> ChatRunDescriptor:
     """Create/reuse one owner-scoped run and its first durable event."""
     try:
@@ -660,7 +667,10 @@ async def create_run(
                     select(ChatConversation)
                     .where(
                         ChatConversation.id == conversation_id,
-                        ChatConversation.project_id == project_id,
+                        scope_clause(
+                            ChatConversation.domain_id, ChatConversation.project_id,
+                            domain_id=domain_id, project_id=project_id,
+                        ),
                         ChatConversation.user_id == user_id,
                     )
                     .with_for_update()
@@ -774,6 +784,14 @@ async def create_run(
         )
         session.add(run)
         _add_run_providers(session, run, capability_snapshot)
+        input_parts = request_payload.get("input_parts")
+        if conv is not None and input_parts is not None:
+            # Replay may read a shared message, but it must bind only assets
+            # owned by the selected project. Do not modify that shared message.
+            await _bind_user_assets(
+                session, parts=input_parts, message_id=None, run_id=run.id,
+                user_id=user_id, project_id=project_id,
+            )
         await session.flush()
         order.take("root")
         if await _apply_root_budget(
@@ -1001,6 +1019,7 @@ async def create_compaction_run(
     execution_protocol_version: int = 1,
     source: str = "web",
     api_key_id: int | None = None,
+    domain_id: str | None = None,
 ) -> ChatRunDescriptor:
     """Admit a manual compaction run with strict parent->run->checkpoint locking and revision fence."""
     try:
@@ -1029,7 +1048,10 @@ async def create_compaction_run(
                     select(ChatConversation)
                     .where(
                         ChatConversation.id == conversation_id,
-                        ChatConversation.project_id == project_id,
+                        scope_clause(
+                            ChatConversation.domain_id, ChatConversation.project_id,
+                            domain_id=domain_id, project_id=project_id,
+                        ),
                         ChatConversation.user_id == user_id,
                     )
                     .with_for_update()
@@ -1096,6 +1118,7 @@ async def create_compaction_run(
             temp_thread_id=temp_thread_id,
             user_id=user_id,
             project_id=project_id,
+            domain_id=domain_id,
             session=session,
         )
         if current_source.get("revision") != expected_context_revision:

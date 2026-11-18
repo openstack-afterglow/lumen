@@ -175,7 +175,7 @@ async def test_reader_reads_history_and_member_creates_forks_and_deletes(managem
 async def test_admin_does_not_bypass_real_conversation_ownership(management_app, monkeypatch, user_id, project_id):
     app, principal = management_app
     principal.update(roles=["admin"], user_id=user_id, project_id=project_id)
-    row = SimpleNamespace(user_id="owner", project_id="project")
+    row = SimpleNamespace(user_id="owner", project_id="project", domain_id=None)
 
     class Session:
         async def __aenter__(self):
@@ -286,7 +286,7 @@ async def test_private_agent_detail_requires_project_writer(management_app, monk
         get.assert_not_called()
         principal["roles"] = ["member"]
         assert (await client.get("/v1/agents/1")).status_code == 200
-    get.assert_awaited_once_with(1, user_id="owner", project_id="project")
+    get.assert_awaited_once_with(1, user_id="owner", project_id="project", domain_id=None)
 
 
 @pytest.mark.parametrize("path,module,name,status", [
@@ -369,10 +369,11 @@ def test_metadata_serializers_do_not_decrypt_private_configuration(monkeypatch):
 async def test_oauth_callback_accepts_current_project_member_owner(monkeypatch):
     row = SimpleNamespace(status="pending", expires_at=datetime.now(UTC) + timedelta(minutes=5),
                           owner_user_id="owner", owner_project_id="project", encrypted_payload="encrypted",
-                          mcp_server_id=7)
+                          owner_domain_id=None, mcp_server_id=7, server_config_version=1)
     result = SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: row))
     session = SimpleNamespace(
-        execute=AsyncMock(return_value=result), get=AsyncMock(return_value=SimpleNamespace(scope="global")),
+        execute=AsyncMock(return_value=result),
+        get=AsyncMock(return_value=SimpleNamespace(scope="global", is_active=True, auth_mode="oauth", config_version=1)),
     )
 
     @asynccontextmanager
@@ -461,7 +462,9 @@ async def test_member_provisions_code_workspace_and_key_assignment_requires_agen
         principal["scopes"] = ("native:conversations:write", "native:agents:use")
         assert (await client.put("/v1/conversations/conversation/code-workspace", json={"code_workspace_id": _IDENTIFIER})).status_code == 200
     assert create.call_args.kwargs["user_id"] == "owner" and create.call_args.kwargs["project_id"] == "project"
-    assign.assert_awaited_once_with("conversation", workspace_id=_IDENTIFIER, user_id="owner", project_id="project")
+    assign.assert_awaited_once_with(
+        "conversation", workspace_id=_IDENTIFIER, user_id="owner", project_id="project", domain_id=None,
+    )
 
 
 async def test_member_plugin_create_and_update_preserve_namespace(management_app, monkeypatch):

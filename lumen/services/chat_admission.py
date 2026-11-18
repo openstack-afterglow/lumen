@@ -25,9 +25,11 @@ from lumen.services import agent_store as ags
 from lumen.services import context_inspector as inspector
 from lumen.services import conversation_store as cs
 from lumen.services import extensions_store as es
+from lumen.services import mcp_settings
 from lumen.services import memory_store as ms
 from lumen.services import workspace_store as ws
 from lumen.services.capabilities import reasoning_can_be_disabled
+from lumen.services.domain_scope import history_domain_id
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
 from lumen.services.providers.credentials import execution_identity
@@ -428,6 +430,7 @@ async def _resolve_extension_selection(
     *,
     user_id: str,
     project_id: str,
+    token_info: dict | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     """Resolve one owner-scoped, active, frozen extension selection before admission."""
     if features.tool_policy.mode == "none":
@@ -460,11 +463,6 @@ async def _resolve_extension_selection(
                     item["id"] for item in visible
                     if isinstance(item.get("id"), int) and (kind != "mcp" or item.get("implicit_selection", True))
                 ]
-            credential_versions = (
-                await es.mcp_credential_versions(selected_ids, user_id=user_id, project_id=project_id)
-                if kind == "mcp"
-                else {}
-            )
         except es.ChatStorageUnavailable as exc:
             if agent is None and explicit_ids is None:
                 return []
@@ -500,15 +498,16 @@ async def _resolve_extension_selection(
                 # run, which is wrong for a connector the caller never chose.
                 # An explicitly selected one still warns — that request asked
                 # for a server it cannot reach.
-                credential_version = credential_versions.get(item_id, 0)
+                credential_version = item.get("credential_version", 0)
                 if credential_version is None and implicit_selection:
                     continue
                 selected_item["credential_version"] = credential_version
             selected.append(selected_item)
         return selected
 
-    tools = await resolve("tool", features.tool_policy.enabled_tool_ids, "tool_ids")
-    mcp = await resolve("mcp", features.tool_policy.enabled_mcp_ids, "mcp_ids")
+    with mcp_settings.actor(token_info or {}):
+        tools = await resolve("tool", features.tool_policy.enabled_tool_ids, "tool_ids")
+        mcp = await resolve("mcp", features.tool_policy.enabled_mcp_ids, "mcp_ids")
     return {"tools": tools, "mcp": mcp}
 
 
@@ -523,9 +522,11 @@ def _capability_extension_snapshot(selection: dict[str, list[dict[str, object]]]
     }
 
 
-async def _load_owned_conv(conversation_id: str, user_id: str, project_id: str) -> dict:
+async def _load_owned_conv(
+    conversation_id: str, user_id: str, project_id: str, *, domain_id: str | None = None,
+) -> dict:
     try:
-        return await cs.get_conversation(conversation_id, user_id=user_id, project_id=project_id)
+        return await cs.get_conversation(conversation_id, user_id=user_id, project_id=project_id, domain_id=domain_id)
     except cs.ConversationNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except cs.ConversationForbidden as exc:
@@ -597,12 +598,14 @@ def _validate_tool_reasoning_compatibility(effort: str, resolved: dict, features
         )
 
 
-async def _resolve_agent(agent_id: int | None, user_id: str, project_id: str) -> dict | None:
-    """Resolve only an active caller-owned project agent for an executable run."""
+async def _resolve_agent(
+    agent_id: int | None, user_id: str, project_id: str, *, domain_id: str | None = None,
+) -> dict | None:
+    """Resolve only an active agent visible to the caller."""
     if agent_id is None:
         return None
     try:
-        agent = await ags.get_agent_for_run(agent_id, user_id=user_id, project_id=project_id)
+        agent = await ags.get_agent_for_run(agent_id, user_id=user_id, project_id=project_id, domain_id=domain_id)
     except ags.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if agent is None:
@@ -1124,10 +1127,11 @@ async def prepare_context_input(
     if execution_mode != "chat":
         _agent_runtime_prerequisites(execution_mode)
     sandbox_tools = _freeze_sandbox_tools(features)
+    domain_id = history_domain_id(token_info)
 
     conv = None
     if conversation_id is not None:
-        conv = await _load_owned_conv(conversation_id, user_id, project_id)
+        conv = await _load_owned_conv(conversation_id, user_id, project_id, domain_id=domain_id)
 
     if allow_empty_source:
         if conversation_id is not None or temp_thread_id is not None:
@@ -1148,6 +1152,7 @@ async def prepare_context_input(
                 temp_thread_id=temp_thread_id,
                 user_id=user_id,
                 project_id=project_id,
+                domain_id=domain_id,
                 leaf_id=leaf_id,
             )
         except (cs.ConversationNotFound, LookupError) as exc:
@@ -1168,14 +1173,16 @@ async def prepare_context_input(
         if token_info is not None:
             ensure_scopes(token_info, *history_scopes)
 
-    agent = await _resolve_agent(agent_id, user_id, project_id)
+    agent = await _resolve_agent(agent_id, user_id, project_id, domain_id=domain_id)
     frozen_budget = (
         None
         if is_preview or is_context_operation
         else await _validate_agent_budget(agent_budget, execution_mode=execution_mode, project_id=project_id, agent=agent)
     )
     resolved = await _resolve_model(model_id)
-    extension_selection = await _resolve_extension_selection(agent, features, user_id=user_id, project_id=project_id)
+    extension_selection = await _resolve_extension_selection(
+        agent, features, user_id=user_id, project_id=project_id, token_info=token_info,
+    )
     selected_plugin_tool_ids = (
         []
         if features.tool_policy.mode == "none"
@@ -1268,6 +1275,8 @@ async def prepare_context_input(
     )
     capability_snapshot["extensions"] = _capability_extension_snapshot(extension_selection)
     capability_snapshot["sandbox_tools"] = sandbox_tools
+    if domain_id is not None:
+        capability_snapshot["history_domain_id"] = domain_id
     credential_authority = credential_authority_snapshot(token_info) if token_info is not None else None
     if credential_authority is not None:
         capability_snapshot["credential_authority"] = credential_authority

@@ -23,6 +23,7 @@ from lumen.services.code_workspace_service import (
     update_git_credential,
 )
 from lumen.services.code_workspace_store import CodeWorkspaceValidationError
+from lumen.services.domain_scope import history_domain_id
 
 router = APIRouter()
 
@@ -172,6 +173,7 @@ async def put_conversation_code_workspace(
             workspace_id=payload.code_workspace_id,
             user_id=token_info["user_id"],
             project_id=_project(token_info),
+            domain_id=history_domain_id(token_info),
         )
     except (CodeWorkspaceNotFound, CodeWorkspaceConflict, CodeWorkspaceUnavailable) as exc:
         raise _error(exc) from exc

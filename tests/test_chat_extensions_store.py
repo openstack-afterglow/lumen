@@ -16,7 +16,7 @@ def _mcp(server_id: int) -> dict:
 
 
 async def test_frozen_mcp_selection_requires_matching_active_credential_version(monkeypatch):
-    current = _mcp(7)
+    current = {**_mcp(7), "credential_version": 3}
     snapshot = {
         "tools": [],
         "mcp": [
@@ -32,7 +32,6 @@ async def test_frozen_mcp_selection_requires_matching_active_credential_version(
         return [current] if kind == "mcp" else []
 
     monkeypatch.setattr(es, "list_for_user", list_visible)
-    monkeypatch.setattr(es, "mcp_credential_versions", lambda *_args, **_kwargs: _return({7: 3}))
 
     tools, mcp, warnings = await es.validated_frozen_selection(snapshot, user_id="u1", project_id="p1")
 
@@ -43,7 +42,7 @@ async def test_frozen_mcp_selection_requires_matching_active_credential_version(
 
 @pytest.mark.parametrize("current_version", [4, None])
 async def test_frozen_mcp_selection_blocks_rotated_or_revoked_credential(monkeypatch, current_version):
-    current = _mcp(7)
+    current = {**_mcp(7), "credential_version": current_version}
     snapshot = {
         "tools": [],
         "mcp": [
@@ -59,7 +58,6 @@ async def test_frozen_mcp_selection_blocks_rotated_or_revoked_credential(monkeyp
         return [current] if kind == "mcp" else []
 
     monkeypatch.setattr(es, "list_for_user", list_visible)
-    monkeypatch.setattr(es, "mcp_credential_versions", lambda *_args, **_kwargs: _return({7: current_version}))
 
     _, mcp, warnings = await es.validated_frozen_selection(snapshot, user_id="u1", project_id="p1")
 
@@ -98,10 +96,6 @@ def test_revealing_corrupt_mcp_headers_fails_closed(monkeypatch):
         es._reveal_mcp(server)
 
 
-async def _return(value):
-    return value
-
-
 async def test_frozen_mcp_approval_does_not_survive_disable_reenable(monkeypatch):
     approved = {**_mcp(7), "activation_generation": 1}
     reenabled = {**approved, "activation_generation": 3}
@@ -114,7 +108,6 @@ async def test_frozen_mcp_approval_does_not_survive_disable_reenable(monkeypatch
         return [reenabled] if kind == "mcp" else []
 
     monkeypatch.setattr(es, "list_for_user", visible)
-    monkeypatch.setattr(es, "mcp_credential_versions", lambda *args, **kwargs: _return({}))
     assert es.selection_fingerprint(approved) != es.selection_fingerprint(reenabled)
     _, selected, warnings = await es.validated_frozen_selection(snapshot, user_id="u1", project_id="p1")
     assert selected == ()
@@ -137,3 +130,9 @@ async def test_activation_store_rejects_invalid_input_before_database(is_active,
 def test_owner_activation_metadata_preserves_direct_mcp_configuration_identity():
     direct = _mcp(7)
     assert es.selection_fingerprint(direct) == es.selection_fingerprint({**direct, "activation_generation": 0})
+
+
+@pytest.mark.parametrize("field", ["domain_id", "owner_domain_id", "activation_owner_domain_id", "credential_id"])
+def test_frozen_identity_changes_with_scope_or_credential(field):
+    original = _mcp(7)
+    assert es.selection_fingerprint(original) != es.selection_fingerprint({**original, field: "domain-or-id"})
