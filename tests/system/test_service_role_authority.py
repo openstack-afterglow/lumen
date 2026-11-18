@@ -382,9 +382,25 @@ def test_member_api_key_action_scopes_at_native_and_compat_http(authority_http, 
     for boundary in ("native", "compat"):
         marker = "SENTINEL_AUTHORITY_DENIED_" + uuid4().hex
         denied_markers.append(marker)
+        if removed_action == "tools" and boundary == "compat":
+            # Provider-executed tools are refused for every key; client tools are forwarded below.
+            path, payload = _authority_payload("chat", boundary, marker)
+            denied = api.post(path, headers={**headers, "Idempotency-Key": str(uuid4())},
+                              json={**payload, "web_search_options": {}})
+            assert denied.status_code == 403, denied.text
+            assert denied.json()["error"]["code"] == "server_tool_not_allowed_for_key", denied.text
+            continue
         denied = _authority_post(api, headers, removed_action, boundary, marker)
         assert denied.status_code == 403, (removed_action, boundary, denied.text)
     _assert_no_provider_io(provider, before, denied_markers)
+
+    if removed_action == "tools":
+        # A client-declared function is forwarded, never executed by Lumen.
+        before = _provider_stats(provider)
+        forwarded = _authority_post(api, headers, "tools", "compat", "SENTINEL_CLIENT_TOOL_" + uuid4().hex)
+        _assert_positive_response(api, headers, "tools", "compat", forwarded)
+        after = _provider_stats(provider)
+        assert after["request_count"] > before["request_count"], (before, after)
 
     # Only compatible synchronous model endpoints and native speech may proceed.
     for action in ("chat", "images", "audio"):
