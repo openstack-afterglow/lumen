@@ -863,6 +863,9 @@ the hold itself, and fails closed on missing, inconsistent, unpriced or
 over-hold usage. Keep an unknown hold for reconciliation; never retry a paid
 operation automatically. Project-level SVG/GIF preview access, actual
 estimator variance, and invoice parity require separate provider acceptance.
+`svg_usage` carries no cache split, so authoring tokens settle at the frozen
+author input rate. If OpenAI applies a GPT-6.x/5.6 cache-write premium to
+authoring input (unverified), that premium is not billed.
 
 ### Gemini Decisions catalog
 
@@ -877,6 +880,8 @@ tariffs unset. The output limit is not an output tariff; do not turn a live
 between provider-published modalities and Lumen's text/image-only execution scope.
 Re-read sources and advance `catalog_version` when updating this entry. Do not
 copy Gemini 4/3 image token counts or defaults into the Decision 1 entry.
+
+### Catalog precedence, cache slots and overrides
 
 Runtime prices use stored administrator rates first, then exact native catalog rates,
 then no rate. Stored historical `price_source` strings remain provenance only. Runtime

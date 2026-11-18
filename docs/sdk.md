@@ -188,7 +188,7 @@ with Client("https://lumen.example", "sk-afgl-...", timeout=180) as client:
 from openai import OpenAI
 
 api = OpenAI(base_url="https://lumen.example/v1", api_key="sk-afgl-...", timeout=180)
-picture = api.images.generate(model="gpt-image-1", prompt="A red bicycle", response_format="b64_json")
+picture = api.images.generate(model="gpt-image-2", prompt="A red bicycle")
 print(len(picture.data[0].b64_json))
 with api.audio.speech.with_streaming_response.create(model="gpt-4o-mini-tts", input="Hello", voice="alloy") as speech:
     speech.stream_to_file("speech.mp3")

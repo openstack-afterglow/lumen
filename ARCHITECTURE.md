@@ -622,8 +622,8 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 {
   "schema_version": 1,
   "source_sha256": "168a0b7e03eb7b3d1a93666e1d92beacaafa9d6a0a36e6fbbed893d84947117d",
-  "reviewed_at": "2026-11-18T10:34:26Z",
-  "summary": "Release preparation 0.6.20: OpenAI Images catalog token billing with request-sized holds, GPT-6.2 Sol/Astra with standard-tier, cache-TTL and hosted-tool policy, OpenAI Realtime token tariffs with pinned limits, translation/GPT-Live/image/function sessions; no migration; sandbox runtime remains off."
+  "reviewed_at": "2026-11-18T10:48:23Z",
+  "summary": "Release preparation 0.6.20: OpenAI Images catalog token billing with request-sized holds, GPT-6.2 Sol/Astra with standard-tier, cache-TTL and hosted-tool policy, OpenAI Realtime token tariffs with pinned limits, translation/GPT-Live/image/function sessions; integration review doc fixes; no migration; sandbox runtime remains off."
 }
 ```
 <!-- architecture-review:end -->
