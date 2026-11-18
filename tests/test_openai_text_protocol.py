@@ -159,6 +159,10 @@ def test_cache_and_chat_fields_serialize_and_normalize():
     {"role": "user", "content": [{"arbitrary": {"type": "item_reference", "id": "private-reference"}}]},
     {"role": "user", "content": [{"data": [{"type": "shell_call", "environment": {"container_id": "private-reference"}}]}]},
     {"role": "user", "content": [{"type": "input_file", "file_id": "private-reference"}]},
+    {"type": "mcp_approval_response", "approval_request_id": "private-reference", "approve": True},
+    {"role": "user", "content": [{"arbitrary": [{"approval_request_id": "private-reference"}]}]},
+    {"type": "tool_search_output", "tools": [{"arbitrary": {"approval_request_id": "private-reference"}}]},
+    {"role": "user", "content": [{"arbitrary": {"skill_id": "private-reference"}}]},
 ])
 async def test_provider_references_rejected_before_reservation(item, monkeypatch):
     reserve, dispatch = AsyncMock(), AsyncMock()
@@ -221,6 +225,9 @@ OUTPUT = [
     {"type": "shell", "environment": {"type": "container_reference", "container_id": "existing"}},
     {"type": "shell", "environment": {"type": "container_auto", "skills": [{"type": "skill_reference"}]}},
     {"type": "mcp", "connector_id": "connector"},
+    {"type": "mcp", "server_url": "https://mcp.example.test"},
+    {"type": "mcp", "server_url": "https://mcp.example.test", "require_approval": "always"},
+    {"type": "mcp", "server_url": "https://mcp.example.test", "require_approval": "never", "tunnel_id": "existing"},
 ])
 def test_unsupported_hosted_tools(tool):
     with pytest.raises(openai_tool_policy.UnsupportedHostedTool):
@@ -229,7 +236,7 @@ def test_unsupported_hosted_tools(tool):
 
 def test_token_only_tools_and_bounded_fees():
     tools = [{"type": kind} for kind in ("function", "custom", "computer_use", "apply_patch", "tool_search")]
-    tools.append({"type": "mcp", "server_url": "https://mcp.example.test"})
+    tools.append({"type": "mcp", "server_url": "https://mcp.example.test", "require_approval": "never"})
     options = {"tools": tools + TOOLS}
     meter = openai_tool_policy.admit("test", options, metered=True)
     assert options["max_tool_calls"] == 10

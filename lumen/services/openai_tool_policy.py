@@ -37,7 +37,10 @@ def _token_only(tool: Any) -> bool:
         return False
     if kind in _CLIENT_TOOLS or kind == "tool_search":
         return True
-    if kind == "mcp" and "connector_id" not in tool and isinstance(tool.get("server_url"), str):
+    if (
+        kind == "mcp" and "connector_id" not in tool and "tunnel_id" not in tool
+        and tool.get("require_approval") == "never" and isinstance(tool.get("server_url"), str)
+    ):
         try:
             url = urlsplit(tool["server_url"])
             return url.scheme == "https" and bool(url.hostname) and url.username is None
@@ -51,6 +54,7 @@ def _token_only(tool: Any) -> bool:
 def validate_input(source: str | list[dict], *, tool_search: bool = False) -> None:
     """Reject provider-owned IDs and undeclared hosted tool definitions at any depth."""
     pending = [source]
+    unsupported_tool = False
     while pending:
         item = pending.pop()
         if isinstance(item, list):
@@ -62,22 +66,25 @@ def validate_input(source: str | list[dict], *, tool_search: bool = False) -> No
         # ItemReference permits an omitted or null discriminator. Complete
         # inline history may also have an id, but carries its own content.
         implicit_reference = kind is None and "id" in item and item.keys() <= {"id", "type"}
-        if implicit_reference:
-            raise UnsupportedProviderReference()
-        if kind in ("item_reference", "container_reference", "code_interpreter_call") or any(
+        if implicit_reference or kind in (
+            "item_reference", "container_reference", "code_interpreter_call", "mcp_approval_response", "skill_reference",
+        ) or any(
             name in item for name in (
                 "container_id", "file_id", "file_ids", "vector_store_id", "vector_store_ids",
                 "response_id", "previous_response_id", "comparison_response_id", "conversation",
+                "approval_request_id", "skill_id", "connector_id", "tunnel_id",
             )
         ):
             raise UnsupportedProviderReference()
         if kind == "additional_tools":
-            raise UnsupportedHostedTool()
+            unsupported_tool = True
         if kind == "tool_search_output":
             tools = item.get("tools")
             if not tool_search or not isinstance(tools, list) or not all(_token_only(tool) for tool in tools):
-                raise UnsupportedHostedTool()
+                unsupported_tool = True
         pending.extend(item.values())
+    if unsupported_tool:
+        raise UnsupportedHostedTool()
 
 
 @dataclass(frozen=True)

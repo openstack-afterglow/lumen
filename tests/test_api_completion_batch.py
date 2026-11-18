@@ -177,8 +177,10 @@ async def test_responses_admission_sends_the_frozen_output_budget(route_catalog)
     {"id": "private-reference"},
     {"type": None, "id": "private-reference"},
     {"role": "user", "content": [{"arbitrary": {"id": "private-reference"}}]},
+    {"type": "mcp_approval_response", "approval_request_id": "private-reference", "approve": True},
+    {"role": "user", "content": [{"arbitrary": [{"approval_request_id": "private-reference"}]}]},
 ])
-async def test_responses_admission_rejects_implicit_provider_references(route_catalog, item):
+async def test_responses_admission_rejects_provider_references(route_catalog, item):
     with pytest.raises(DurableRunInputError) as failure:
         await api_completion.prepare_api_completion_run(
             {"model": "gpt-test", "input": [item]}, operation="responses", project_id="p", user_id="u",
