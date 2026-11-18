@@ -41,6 +41,7 @@ from .pricing import (
     _per_token_price,
     _provider_public,
     _resolved_base_prices,
+    _resolved_cache_prices,
     _to_decimal,
     _validate_cache_prices,
     decision_provider_supported,
@@ -135,10 +136,14 @@ def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: t
         from .realtime_transport import validate_configured_reservation
 
         manual_input, manual_output = _validate_text_prices(*token_prices[:2])
-        proposed = LlmModel(model_name=model_name, model_kind=kind, input_price=manual_input, output_price=manual_output)
+        manual_cache = _per_token_price(token_prices[2], "cache_read_price_per_million")
+        proposed = LlmModel(model_name=model_name, model_kind=kind, input_price=manual_input, output_price=manual_output,
+                            cache_read_price=manual_cache)
         input_rate, output_rate = _effective_model_rates(proposed, provider_type, api_base)
+        cache_rates, _ = _resolved_cache_prices(proposed, provider_type, api_base)
         validate_configured_reservation({"model_kind": kind, "provider_type": provider_type, "media_pricing": pricing,
-                                        "input_price_per_token": input_rate, "output_price_per_token": output_rate})
+                                        "input_price_per_token": input_rate, "output_price_per_token": output_rate,
+                                        "cache_read_price_per_token": cache_rates["cache_read_price_per_token"]})
     return pricing
 
 

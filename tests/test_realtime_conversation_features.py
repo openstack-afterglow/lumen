@@ -539,6 +539,54 @@ def test_openai_admin_rejects_small_hold_and_marks_existing_row_unavailable():
         assert dto["effective_price_source"] == "partial"
 
 
+@pytest.mark.parametrize("modality", ["audio", "image"])
+def test_expensive_modality_cache_is_covered_by_the_derived_hold(modality):
+    rates = _TOKEN_MEDIA["token_rates"]
+    media = {**_TOKEN_MEDIA, "token_rates": {**rates, modality: {**rates[modality],
+                                                               "cache_read_per_million": "50000"}}}
+    route = _route(media=media)
+    plan = realtime_transport.validate_realtime_request(route, max_duration_seconds=10)
+    assert Decimal(plan["response_bound_usd"]) == Decimal("819.595264")
+    assert Decimal(plan["reservation_usd"]) == Decimal("1689.209728")
+
+    done = _done("cached", audio_in=100, cached_audio=100)
+    if modality == "image":
+        details = done["response"]["usage"]["input_token_details"]
+        details.update(audio_tokens=0, image_tokens=100)
+        details["cached_tokens_details"].update(audio_tokens=0, image_tokens=100)
+    meter = TokenUsageMeter("openai")
+    meter.image_sent = modality == "image"
+    meter.observe(done)
+    usage, state = meter.result()
+    checkpoint = realtime._checkpoint(AudioMeter(320 if modality == "audio" else 0, 0, 24000, 24000,
+        usage=usage, usage_state=state, image_sent=meter.image_sent), "tokens")
+    cost, _, _, _ = realtime._token_bill(_RUN, plan, checkpoint)
+    assert cost.raw_cost == Decimal("5")  # $50,000/M × 100, above the ordinary catalog hold.
+
+
+def test_expensive_text_cache_raises_the_same_floor_for_admission_and_admin():
+    from lumen.models.chat_db import LlmModel
+    from lumen.services.providers import pricing, repository
+
+    route = {**_route(), "cache_read_price_per_token": Decimal("0.05")}
+    plan = realtime_transport.validate_realtime_request(route, max_duration_seconds=10)
+    assert Decimal(plan["response_bound_usd"]) == Decimal("2483.462144")
+    minimum = 2 * Decimal(plan["response_bound_usd"])
+    assert minimum == Decimal("4966.924288")
+    manual = {**_TOKEN_MEDIA, "reservation_usd": "2"}
+    with pytest.raises(ProviderValidationError, match=r"minimum \$4966\.924288"):
+        realtime_transport.validate_realtime_request({**route, "media_pricing": manual})
+    with pytest.raises(ProviderValidationError, match=r"minimum \$4966\.924288"):
+        repository._validate_kind_prices("realtime", manual, (None, None, "50000", None, None), "openai",
+                                         model_name="gpt-realtime-2.1", api_base=None)
+    row = LlmModel(model_name="gpt-realtime-2.1", model_kind="realtime", media_pricing=manual,
+                   cache_read_price=Decimal("0.05"))
+    dto = pricing._model_public(row, api_provider="openai", provider_type="openai", api_key_configured=True)
+    assert dto["effective_price_source"] == "partial"
+    assert dto["effective_capabilities"]["feature_gates"]["audio_input"]["reason_code"] == (
+        "realtime_reservation_too_small")
+
+
 def test_images_without_reported_modality_make_usage_unknown():
     meter = TokenUsageMeter("openai")
     meter.image_sent = True
