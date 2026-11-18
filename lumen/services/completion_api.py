@@ -264,8 +264,6 @@ def _request_input_bound(
             if kind in ("input_image", "image_url", "computer_screenshot") and not content_growth:
                 url = item.get("image_url")
                 detail = url.get("detail") if isinstance(url, dict) else item.get("detail")
-                if kind == "computer_screenshot":
-                    detail = "auto"
                 image_bound = _openai_image_bound(model["id"], detail)
                 if image_bound is None:
                     content_growth = True
@@ -309,6 +307,7 @@ class _OnlineReservation:
     output_bound: int
     dispatched: bool = False
     settled: bool = False
+    settling: bool = False
 
     async def aclose(self) -> None:
         if not self.settled:
@@ -509,8 +508,13 @@ async def _bill(
         final_usage=final_usage,
     )
     pt, ct = breakdown.input_tokens, breakdown.output_tokens
-    if hold is not None and (pt > hold.input_bound or ct > hold.output_bound):
-        raise CompletionError(502, "usage_exceeds_reservation", code="provider_result_unknown")
+    if hold is not None:
+        logger.info(
+            "OpenAI held usage reservation_id=%s input_tokens=%d input_bound=%d output_tokens=%d output_bound=%d",
+            hold.event_id, pt, hold.input_bound, ct, hold.output_bound,
+        )
+        if pt > hold.input_bound or ct > hold.output_bound:
+            raise CompletionError(502, "usage_exceeds_reservation", code="provider_result_unknown")
     try:
         usage_cost = provider_metadata.cost_from_usage(
             model_name,
@@ -554,26 +558,33 @@ async def _bill(
             pricing_snapshot={**usage_cost.pricing_snapshot, "hosted_tools": tool_charges},
         )
     settle = stateless_credit.settle if hold is not None else credit.apply_usage
+    if hold is not None:
+        hold.settling = True
     try:
-        credited = await settle(
-            event_id=event_id,
-            user_id=user_id,
-            project_id=project_id,
-            model_name=model_name,
-            provider=resolved.get("provider_name"),
-            prompt_tokens=pt,
-            completion_tokens=ct,
-            usage_cost=usage_cost,
-            margin_multiplier=resolved["margin_multiplier"],
-            conversation_id=None,
-            source="api",
-            api_key_id=api_key_id,
-            execution_route=resolved,
-            breakdown=breakdown,
-            **({"credit_per_usd": hold.credit_per_usd} if hold is not None else {}),
-        )
+        # Once we have terminal accounting evidence, finish the atomic write.
+        with anyio.CancelScope(shield=hold is not None):
+            credited = await settle(
+                event_id=event_id,
+                user_id=user_id,
+                project_id=project_id,
+                model_name=model_name,
+                provider=resolved.get("provider_name"),
+                prompt_tokens=pt,
+                completion_tokens=ct,
+                usage_cost=usage_cost,
+                margin_multiplier=resolved["margin_multiplier"],
+                conversation_id=None,
+                source="api",
+                api_key_id=api_key_id,
+                execution_route=resolved,
+                breakdown=breakdown,
+                **({"credit_per_usd": hold.credit_per_usd} if hold is not None else {}),
+            )
     except stateless_credit.ChargeExceedsReservation as exc:
         raise CompletionError(502, "charge_exceeds_reservation", code="provider_result_unknown") from exc
+    finally:
+        if hold is not None:
+            hold.settling = False
     if hold is not None:
         hold.settled = True
     return pt, ct, credited
@@ -959,6 +970,9 @@ class _ProviderEvents:
             raise StopAsyncIteration
         if self._hold is None:
             return await anext(self._events)
+        return await self._next_held()
+
+    async def _next_held(self) -> dict:
         # Client cancellation must not be injected into an active provider read.
         if self._pending is None:
             self._pending = asyncio.create_task(anext(self._events))
@@ -977,11 +991,8 @@ class _ProviderEvents:
         if self._hold is None or not self._hold.dispatched or self._hold.settled or self._ended:
             return
         with anyio.move_on_after(_HELD_STREAM_DRAIN_SECONDS), suppress(StopAsyncIteration):
-            if self._pending is not None:
-                await asyncio.shield(self._pending)
-                self._pending = None
             while not self._hold.settled:
-                await anext(self._events)
+                await self._next_held()
 
     async def aclose(self) -> None:
         if self._closed:
@@ -994,7 +1005,9 @@ class _ProviderEvents:
                 logger.warning("provider stream failed after client disconnect")
             finally:
                 if self._pending is not None:
-                    self._pending.cancel()
+                    # The drain deadline stops provider reads, not terminal settlement.
+                    if self._hold is None or not self._hold.settling:
+                        self._pending.cancel()
                     await asyncio.gather(self._pending, return_exceptions=True)
                     self._pending = None
                 try:

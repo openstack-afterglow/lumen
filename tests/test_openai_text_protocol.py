@@ -593,12 +593,17 @@ async def test_large_prompt_without_explicit_output_cap_settles(monkeypatch, pro
     finish.assert_not_awaited()
 
 
-@pytest.mark.parametrize("model,expected", [("gpt-6-astra", 36_000), (MODEL, 922_000)])
-def test_computer_screenshot_uses_vision_bound(model, expected):
+@pytest.mark.parametrize("model,detail,expected", [
+    ("gpt-6-astra", None, 36_000),
+    (MODEL, None, 922_000),
+    ("gpt-5.4", "original", 12_000),
+])
+def test_computer_screenshot_uses_vision_bound(model, detail, expected):
     route = route_for(model)
     catalog = core._bounded_openai_model(route)
     messages = [{"type": "computer_call_output", "call_id": "test", "output": {
         "type": "computer_screenshot", "image_url": "https://img.test/x",
+        **({"detail": detail} if detail else {}),
     }}]
     bound, _ = core._request_input_bound(
         route, catalog, messages=messages, tools=None, max_output=128, prompt_options={}, content_growth=False,
@@ -693,3 +698,73 @@ async def test_held_stream_drains_after_disconnect(monkeypatch, protocol, outcom
     else:
         settle.assert_not_awaited()
         finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True)
+
+
+@pytest.mark.parametrize("protocol", ["responses", "chat"])
+async def test_held_stream_settlement_outlives_drain_deadline(monkeypatch, caplog, protocol):
+    settlement_entered = asyncio.Event()
+    settlement_release = asyncio.Event()
+    drain_expired = asyncio.Event()
+
+    async def chunks():
+        if protocol == "responses":
+            yield {"type": "response.output_text.delta", "delta": "private prompt text"}
+            yield {"type": "response.completed", "response": {
+                "status": "completed", "service_tier": "default", "output": [],
+                "usage": {"input_tokens": 5, "output_tokens": 2},
+            }}
+        else:
+            yield provider_client.provider_object({"choices": [{"delta": {"content": "private prompt text"}}]})
+            yield provider_client.provider_object({
+                "service_tier": "default", "usage": {"prompt_tokens": 5, "completion_tokens": 2}, "choices": [],
+            })
+
+    async def settle(**_kwargs):
+        settlement_entered.set()
+        await settlement_release.wait()
+        return Decimal("0.1")
+
+    original_drain = core._ProviderEvents._drain_held
+
+    async def observe_drain(self):
+        await original_drain(self)
+        drain_expired.set()
+
+    reserve, settle_once, finish = AsyncMock(), AsyncMock(side_effect=settle), AsyncMock()
+    monkeypatch.setattr(core, "_HELD_STREAM_DRAIN_SECONDS", 0.05)
+    monkeypatch.setattr(core._ProviderEvents, "_drain_held", observe_drain)
+    monkeypatch.setattr(core, "_authorize_completion", AsyncMock())
+    monkeypatch.setattr(core.stateless_credit, "reserve", reserve)
+    monkeypatch.setattr(core.stateless_credit, "settle", settle_once)
+    monkeypatch.setattr(core.stateless_credit, "finish", finish)
+    monkeypatch.setattr(provider_client, "aresponses" if protocol == "responses" else "acompletion_stream",
+                        AsyncMock(return_value=chunks()))
+    caplog.set_level("INFO", logger=core.__name__)
+    if protocol == "responses":
+        source = await core.complete_responses(
+            resolved=route_for(), input="test", options={"max_output_tokens": 32}, stream=True, **OWNER,
+        )
+        stream = events_with_ping(source)
+    else:
+        stream = await core.complete_stream(
+            resolved=route_for(), messages=MESSAGES, temperature=None, max_tokens=32, **OWNER,
+        )
+    await anext(stream)
+    closing = asyncio.create_task(stream.aclose())
+    try:
+        await asyncio.wait_for(settlement_entered.wait(), timeout=1)
+        await asyncio.wait_for(drain_expired.wait(), timeout=1)
+        assert not closing.done()
+        finish.assert_not_awaited()
+    finally:
+        settlement_release.set()
+        await asyncio.wait_for(closing, timeout=1)
+    settle_once.assert_awaited_once()
+    finish.assert_not_awaited()
+    (record,) = (record for record in caplog.records if record.name == core.__name__ and record.levelname == "INFO")
+    assert record.msg == (
+        "OpenAI held usage reservation_id=%s input_tokens=%d input_bound=%d output_tokens=%d output_bound=%d"
+    )
+    event_id, input_tokens, input_bound, output_tokens, output_bound = record.args
+    assert (event_id, input_tokens, output_tokens, output_bound) == (reserve.await_args.kwargs["event_id"], 5, 2, 32)
+    assert input_bound > input_tokens
