@@ -30,6 +30,7 @@ All Kubernetes collection consumers share bounded, paginated `_list` normalizati
 The independently versioned `lumen-sandbox` 0.1.2 stdio bridge accepts only correlated JSON-RPC 2.0 responses with exactly one result/error. It skips bounded notifications, rejects unsupported server requests with -32601, enforces one exchange deadline and the existing frame bound, and terminates the child on invalid output. Tools/call requires an object result; no notification or missing result becomes an empty success. Fixed-chunk stderr draining prevents subprocess backpressure without retaining tool output. Production must pin the rebuilt sandbox image; local subprocess tests are not live Playwright/Markitdown acceptance.
 Each MCP exchange emits one metadata-only log line (profile, bounded outbound method, request ID, skipped/answered counts, outcome, elapsed milliseconds). No frame, argument, result, notification parameter, tool-supplied method or stderr content is logged.
 Cold startup remains lazy, bounded by one 60-second startup deadline. A separate outer caller deadline bounds startup plus invocation by the existing tool/run remainder; no readiness prewarm, timeout extension or retry is introduced. The full worker/controller/Pod-readiness deadline chain is documented in `packages/lumen-sandbox/IMAGE.md`.
+Restart fencing always terminates the old process group after bounded grace, including descendants of an already-exited leader; it confirms leader exit and cancels the old stderr drain without awaiting EOF. HTTP subprocess regression proves subsequent journal entries become terminal rather than wedging on a cancelled drain task.
 
 Selected sandboxes have their own `resource.deadline_at`, separate from the run's wall-clock deadline. A budgeted root reserves at most `min(300 s, ceiling/2, pool lifetime, wall time)` so children keep budget. On expiry the controller deletes the Pod with a fenced intent. Only never-started runs (`lease_fence == 0`) fail, and later sandbox calls or new delegations return `sandbox_expired` without reallocation. An already-settled delegation group still replays its joined child results. Code-mode runs with a sandbox-tool selection are refused with 422 `sandbox_code_combination_unsupported` before any hold or provider I/O.
 
@@ -594,9 +595,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "0d09e3ce98dc8a6e3fc5b3497f833b5f3dd5b66da834df133710373d7d27ed42",
-  "reviewed_at": "2026-11-18T03:45:42Z",
-  "summary": "Review independent lumen-sandbox0.1.2 MCP response correlation, bounded notification/server-request handling, metadata-only exchange logs, stderr drain, single60s startup and existing whole-call/run deadline, poisoned-child restart fencing, subprocess regression tests and image/deadline docs; no service schema/config change"
+  "source_sha256": "c872e87bbf38aea4c107e6da391a3ca4890eb99603779223f14942cbe857509e",
+  "reviewed_at": "2026-11-18T04:01:21Z",
+  "summary": "0.6.18: MCP restart fence terminates the old process group and cancels stderr drain"
 }
 ```
 <!-- architecture-review:end -->

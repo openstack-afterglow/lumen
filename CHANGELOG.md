@@ -16,6 +16,8 @@
 - **English — Sandbox diagnostics:** Emit one metadata-only INFO line per MCP exchange with profile, outbound method, request ID, notification/server-request counts, outcome and elapsed time. Never log frames, arguments, results, notification parameters or stderr.
 - **한국어 — MCP cold start:** initialize부터 tools/list까지 하나의 60초 startup deadline을 적용해 gVisor의 정상적인 느린 시작을 허용한다. 더 작은 변경으로 lazy startup을 유지하고, startup+실제 호출 전체를 기존 tool/run 잔여 시간 안에 묶는다. 기본 tool 60초에는 관측된 19.7초 Markitdown cold 변환이 들어가며 짧게 지정한 시간은 늘리지 않는다. Pod readiness를 MCP prewarm 완료로 오인하지 않는다.
 - **English — MCP cold start:** Bound initialize through tools/list by one 60-second startup deadline, allowing valid slow gVisor initialization. Keep the smaller lazy-start change and charge startup plus invocation to the existing remaining tool/run budget. The default 60-second tool budget admits the observed 19.7-second Markitdown cold conversion; explicit shorter deadlines are not extended. Pod readiness does not imply prewarmed MCP processes.
+- **한국어 — MCP 재시작 fence:** 이전 leader가 종료돼도 남은 process group을 종료하고 stderr drain은 EOF를 기다리지 않고 취소한다. stderr를 붙잡은 descendant가 다음 시작·실행 journal을 막는 경로를 닫고 HTTP에서 timeout 이후 두 호출의 정상 종료를 검증한다.
+- **English — MCP restart fence:** Terminate the old process group even after its leader exits and cancel the stderr drain without waiting for EOF. A descendant retaining stderr can no longer wedge the next startup or execution journal; HTTP regression proves two later calls terminate successfully after the initial timeout.
 
 ## 0.6.17 — 2026-11-18 (published and deployed; OpenAI paid paths unverified)
 

@@ -73,8 +73,10 @@ def fake_mcp_server(tmp_path: Path):
     requests_path = tmp_path / "requests.jsonl"
     result_path = tmp_path / "result.json"
     script.write_text('''import json
+import os
 import sys
 import signal
+import subprocess
 import time
 
 advertised = json.loads(sys.argv[1])
@@ -108,11 +110,21 @@ for line in sys.stdin:
     delay = behavior.get(method + ":delay", 0)
     if delay:
         time.sleep(delay)
-    if fault == "ignore_term_once":
+    if fault in {"ignore_term_once", "orphan_stderr_once"}:
         with open(sys.argv[2]) as log:
             calls = sum(json.loads(row).get("method") == "tools/call" for row in log)
         if calls == 1:
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            if fault == "ignore_term_once":
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            else:
+                ready_file = sys.argv[2] + ".child"
+                child = "import pathlib,signal,sys,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);pathlib.Path(sys.argv[1]).touch();time.sleep(10)"
+                subprocess.Popen([sys.executable, "-c", child, ready_file],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                deadline = time.monotonic() + 2
+                while not os.path.exists(ready_file):
+                    assert time.monotonic() < deadline
+                    time.sleep(0.001)
             time.sleep(10)
     if fault in {"notification", "mixed", "slow_notifications", "notification_flood"}:
         count = 129 if fault in {"slow_notifications", "notification_flood"} else 1
@@ -774,6 +786,58 @@ def test_mcp_execution_replay_and_polling(sandbox_fixture, monkeypatch):
     assert replay_resp.status_code == 200
     assert replay_resp.json()["id"] == eid
     assert replay_resp.json()["mcp_result"] == mock_result
+
+
+def test_mcp_restart_with_inherited_stderr_keeps_http_journal_terminal(sandbox_fixture, fake_mcp_server, monkeypatch):
+    f = sandbox_fixture
+    server = fake_mcp_server(["browser_navigate", "browser_snapshot"], behavior={"tools/call": "orphan_stderr_once"})
+    f.config.profiles["playwright"] = server.profile
+    processes = []
+    original_start = McpProcess.start
+
+    async def track_start(process):
+        await original_start(process)
+        processes.append((process.proc, process._stderr_task))
+
+    monkeypatch.setattr(McpProcess, "start", track_start)
+
+    def execute(client, call_id, timeout, revision):
+        body = {"run_id": f.config.run_id, "call_id": call_id, "fence": 1,
+                "profile": "playwright", "tool": "browser_navigate", "arguments": {},
+                "timeout_seconds": timeout, "workspace_revision": revision}
+        response = client.post("/v1/mcp/executions", json=body, headers={
+            "Authorization": auth_header(f.config, "POST", "/v1/mcp/executions", body),
+        })
+        assert response.status_code == 202
+        path = "/v1/executions/" + response.json()["id"]
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            result = client.get(path, headers={"Authorization": auth_header(f.config, "GET", path)})
+            assert result.status_code == 200
+            if result.json()["state"] not in {"reserved", "running"}:
+                return result.json()
+            time.sleep(0.01)
+        pytest.fail("MCP execution journal remained nonterminal")
+
+    try:
+        with TestClient(create_kubernetes_app(f.config)) as client:
+            assert execute(client, "orphan-first", 1, 0)["state"] == "timeout"
+            old, drain = processes[0]
+            deadline = time.monotonic() + 1
+            while old.returncode is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert old.returncode == -signal.SIGTERM
+            assert not drain.done()  # A SIGTERM-ignoring descendant still holds the inherited stderr pipe.
+            assert execute(client, "fresh-second", 5, 1)["state"] == "succeeded"
+            assert len(processes) == 2 and processes[1][0].pid != old.pid
+            assert execute(client, "fresh-third", 5, 2)["state"] == "succeeded"
+            assert len(processes) == 2
+    finally:
+        for process, _ in processes:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):  # macOS reports EPERM for an all-zombie group.
+                pass
 
 
 def test_workspace_revision_survives_tools_and_daemon_resume(sandbox_fixture, fake_mcp_server):

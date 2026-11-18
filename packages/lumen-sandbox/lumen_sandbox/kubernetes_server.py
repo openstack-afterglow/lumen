@@ -285,13 +285,15 @@ class McpProcess:
                     try:
                         await asyncio.wait_for(self.proc.wait(), timeout=1.0)
                     except TimeoutError:
-                        try:
-                            os.killpg(self.proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        await asyncio.wait_for(self.proc.wait(), timeout=1.0)
+                        pass
+                    # The leader may exit while descendants still own its pipes. Fence the entire old group.
+                    try:
+                        os.killpg(self.proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await asyncio.wait_for(self.proc.wait(), timeout=1.0)
                     if self._stderr_task is not None:
-                        await asyncio.wait_for(self._stderr_task, timeout=1.0)
+                        self._stderr_task.cancel()
                 self._poisoned = False
                 await self._start()
         except (Exception, asyncio.CancelledError):
