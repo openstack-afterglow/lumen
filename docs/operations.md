@@ -1,5 +1,14 @@
 # 운영 가이드
 
+## 0.6.20 롤아웃 메모 (준비 중; 미발행·미배포)
+
+- **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.
+- **순서:** 0.6.19와 같다. API admission 차단 → worker drain(실행 중 run 0 확인, 실패 시 중단) → worker 정지 → 암호화 백업 → `--tags lumen --skip-tags haproxy` reconfigure → 새 API·worker cohort 확인. 공식 OpenAI 텍스트 호출은 이제 무상태 예약(034 테이블)을 쓰므로 혼합 cohort로 오래 두지 않는다.
+- **카탈로그 추종 전환:** 운영 OpenAI 행 중 수동 단가가 카탈로그와 같아 장문 구간·12시간 캐시 쓰기 단가를 가리는 GPT-6.2 행과, billing basis 없는 불완전한 수동 이미지 단가가 남은 GPT Image 행은 배포 후 가격 필드를 null로 PATCH해 카탈로그를 따르게 한다. 저장값이 확인한 값과 정확히 같을 때만, 같은 행 잠금 안에서 비교한 뒤 바꾼다. 실제 관리자 override는 보존한다.
+- **행동 변화:** 공식 OpenAI 텍스트 호출은 요청 크기 기반 상한을 먼저 예약하므로 잔액이 부족하면 거절될 수 있다. 예약이 있는 공식 OpenAI 모델의 `/v1/messages`는 거절된다. `service_tier`는 `default`/`auto`만 허용한다. `gpt-transcribe` 실시간 전사는 파일 STT 행과 같은 모델 이름이므로 별도 OpenAI 공급자 행에 `realtime` 종류와 가격을 등록해야 노출된다.
+- **대시보드:** Afterglow 1.32.27의 OpenAI Image/Realtime Studio 확장은 0.6.20 capabilities에 의존한다. Lumen을 먼저 배포한다.
+- Sandbox runtime은 계속 꺼 둔다. 이 메모는 발행·배포의 증거가 아니다.
+
 ## 0.6.19 롤아웃 메모
 
 - **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.

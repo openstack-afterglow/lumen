@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026-11-18.1",
+  "catalog_version": "2026-11-18.2",
   "providers": {
     "openai": {
       "display_name": "OpenAI",
