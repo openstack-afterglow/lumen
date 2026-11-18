@@ -537,7 +537,7 @@ async def test_svg_author_requires_a_registered_unrestricted_route_on_the_image_
     async with routing._require_db()() as session:
         with session.sync.begin():
             credential = session.sync.get(LlmProviderCredential, 1)
-            credential.allowed_model_ids = [created["id"], 11]
+            credential.allowed_model_ids = [created["id"], 11, 13, 14]
     route = await routing.resolve_model_by_id(created["id"], model_kind="image")
     for rejected in ("gpt-6-cyber", "gpt-4.1-mini", "gpt-4.1", "gpt-5-mini", "gpt-4o", "openai/gpt-5"):
         assert await routing.resolve_image_svg_authors(route, model_name=rejected) == []
