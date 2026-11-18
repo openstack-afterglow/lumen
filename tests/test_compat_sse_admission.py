@@ -158,7 +158,10 @@ def harness(monkeypatch):
     monkeypatch.setattr(core, "resolve", resolve)
     monkeypatch.setattr(core, "resolve_api", resolve)
     monkeypatch.setattr(core, "precheck", precheck)
-    monkeypatch.setattr(core, "complete_stream", lambda **_kwargs: events("chat"))
+    async def chat_stream(**_kwargs):
+        return events("chat")
+
+    monkeypatch.setattr(core, "complete_stream", chat_stream)
     monkeypatch.setattr(core, "complete_once", once)
     monkeypatch.setattr(core, "complete_responses", native_responses)
     monkeypatch.setattr(core, "complete_anthropic", native_anthropic)

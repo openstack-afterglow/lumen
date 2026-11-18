@@ -321,6 +321,86 @@ func TestOfficialOpenAIUsesBifrostResponsesBridge(t *testing.T) {
 		t.Fatalf("bridge lost output %s", result)
 	}
 }
+
+func TestGPT62WireAndUsage(t *testing.T) {
+	const raw = `{"status":"completed","service_tier":"default","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}],"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":30,"cache_write_tokens_details":{"ttl_30m_tokens":20,"ttl_12h_tokens":10}}}}`
+	for _, format := range []string{
+		`{"type":"json_object"}`,
+		`{"type":"json_schema","json_schema":{"name":"result","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"string"}}}}}`,
+	} {
+		plan, err := prepare(context.Background(), Envelope{Provider: "openai", Protocol: "chat", Body: json.RawMessage(
+			`{"model":"gpt-6.2-sol","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":17,"reasoning_effort":"high","service_tier":"auto","prompt_cache_key":"route","prompt_cache_options":{"ttl":"12h"},"response_format":` + format + `}`,
+		)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer plan.close()
+		for _, fragment := range []string{`"service_tier":"default"`, `"store":false`, `"max_output_tokens":17`,
+			`"effort":"high"`, `"prompt_cache_key":"route"`, `"ttl":"12h"`, `"text":{"format":`} {
+			if !bytes.Contains(plan.body, []byte(fragment)) {
+				t.Fatalf("missing request fragment %s: %s", fragment, plan.body)
+			}
+		}
+		if strings.Contains(format, "json_schema") && !bytes.Contains(plan.body, []byte(`"name":"result"`)) {
+			t.Fatalf("missing structured output schema: %s", plan.body)
+		}
+		converted, err := plan.response([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertGPT62CacheEvidence(t, converted)
+		stream := eventConverter(nil, "responses", "chat", plan)
+		frames, terminal, err := stream([]byte(`{"type":"response.completed","response":` + raw + `}`))
+		if err != nil || !terminal || len(frames) != 1 {
+			t.Fatalf("incorrect terminal: %t %v %s", terminal, err, frames)
+		}
+		assertGPT62CacheEvidence(t, frames[0])
+	}
+}
+
+func assertGPT62CacheEvidence(t *testing.T, raw []byte) {
+	t.Helper()
+	var response struct {
+		Tier  string `json:"service_tier"`
+		Usage struct {
+			PromptTokens int `json:"prompt_tokens"`
+			Details      struct {
+				Read   int            `json:"cached_tokens"`
+				Writes int            `json:"cache_write_tokens"`
+				TTL    map[string]int `json:"cache_write_tokens_details"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(raw, &response) != nil || response.Tier != "default" || response.Usage.PromptTokens != 100 ||
+		response.Usage.Details.Read != 10 || response.Usage.Details.Writes != 30 ||
+		response.Usage.Details.TTL["ttl_30m_tokens"] != 20 || response.Usage.Details.TTL["ttl_12h_tokens"] != 10 {
+		t.Fatalf("lost reported evidence: %s", raw)
+	}
+}
+
+func TestNativeOpenAIResponsesForcesStandardAndPreservesHostedBound(t *testing.T) {
+	e := Envelope{Provider: "openai", Protocol: "responses", Body: json.RawMessage(
+		`{"model":"gpt-6.2-astra","input":"test","service_tier":"auto","max_tool_calls":10,"tools":[{"type":"web_search"}],"prompt_cache_options":{"ttl":"12h"}}`,
+	)}
+	plan, err := prepare(context.Background(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	if plan.target != "https://api.openai.com/v1/responses" {
+		t.Fatal(plan.target)
+	}
+	for _, fragment := range []string{`"service_tier":"default"`, `"store":false`, `"max_tool_calls":10`, `"ttl":"12h"`} {
+		if !bytes.Contains(plan.body, []byte(fragment)) {
+			t.Fatalf("missing request fragment %s: %s", fragment, plan.body)
+		}
+	}
+	e.Body = json.RawMessage(`{"model":"gpt-6.2-astra","input":"test","service_tier":"fast"}`)
+	if _, err := prepare(context.Background(), e); err == nil {
+		t.Fatal("non-standard tier accepted")
+	}
+}
+
 func TestAnthropicChatConversionPreservesPendingToolAndCompactionHead(t *testing.T) {
 	plan, err := prepare(context.Background(), Envelope{Provider: "anthropic", Protocol: "chat", APIKey: "a", Body: json.RawMessage(`{"model":"claude-sonnet-4-6","max_tokens":77,"context_management":{"edits":[{"type":"compact_20260112","trigger":{"type":"input_tokens","value":100000}}]},"messages":[{"role":"user","content":"question"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}],"provider_specific_fields":{"compaction_blocks":[{"type":"compaction","content":"summary"}]}},{"role":"tool","tool_call_id":"call_1","content":"answer"}]}`)})
 	if err != nil {

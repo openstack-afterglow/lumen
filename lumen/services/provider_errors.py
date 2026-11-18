@@ -65,6 +65,14 @@ class APIConnectionError(ProviderError):
     code = "provider_transport_outcome_unknown"
 
 
+class OpenAIServiceTierMismatch(APIConnectionError):
+    code = "openai_service_tier_mismatch"
+
+
+class OpenAIUsageInvalid(APIConnectionError):
+    code = "openai_usage_invalid"
+
+
 class Timeout(APIConnectionError):
     status_code = 504
     code = "provider_timeout_outcome_unknown"

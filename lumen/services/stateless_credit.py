@@ -16,6 +16,10 @@ def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+class ChargeExceedsReservation(ValueError):
+    pass
+
+
 async def reserve(*, event_id: str, user_id: str, project_id: str, api_key_id: int | None, bound: Decimal) -> None:
     async def transaction():
         async with credit._require_db()() as session, session.begin():
@@ -62,6 +66,9 @@ async def settle(*, event_id: str, **usage) -> Decimal:
             if row.status not in {"reserved", "unknown"}:
                 raise ValueError("stateless reservation is not settleable")
             actual = await credit.apply_usage_in_transaction(session, event_id=event_id, **usage)
+            if actual > row.bound_credits:
+                # Ledger and wallet mutations are rolled back with this transaction.
+                raise ChargeExceedsReservation("provider charge exceeds stateless reservation")
             row.actual_credits = actual
             row.status = "settled"
             row.settled_at = _now()

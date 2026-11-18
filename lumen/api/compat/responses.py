@@ -48,8 +48,9 @@ async def responses(
     ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
     if body.store is True:
         return responses_error(400, "store=true is not supported", code="stateful_responses_not_supported")
-    if body.previous_response_id is not None:
-        return responses_error(400, "previous_response_id is not supported", code="stateful_responses_not_supported")
+    if body.previous_response_id is not None or body.conversation is not None:
+        return responses_error(422, "References to provider-side objects are not supported.",
+                               code="provider_reference_unsupported")
     if body.background is True:
         return responses_error(400, "background responses are not supported", code="background_not_supported")
 
@@ -66,6 +67,7 @@ async def responses(
                 "store",
                 "previous_response_id",
                 "background",
+                "conversation",
                 "client_metadata",
             },
             exclude_none=True,
@@ -80,7 +82,7 @@ async def responses(
             options=options,
         )
     except core.CompletionError as exc:
-        return responses_error(exc.status_code, exc.message)
+        return responses_error(exc.status_code, exc.message, code=exc.code)
 
     if not body.stream:
         return JSONResponse(content=result)
@@ -95,6 +97,8 @@ async def responses(
                         yield ": ping\n\n"
                     else:
                         yield _sse(event)
+            except core.CompletionError as exc:
+                yield _sse({"type": "error", "error": {"type": "api_error", "message": exc.message, "code": exc.code}})
             except Exception:
                 yield _sse(
                     {

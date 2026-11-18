@@ -537,6 +537,7 @@ class NativeCatalogModel(BaseModel):
     display_name: str
     status: Literal["active", "preview", "deprecated"]
     context_window: int | None
+    max_input_tokens: int | None = None
     max_output_tokens: int | None
     input_modalities: list[str] | None
     output_modalities: list[str] | None
