@@ -44,7 +44,7 @@ def audio_error(exc: Exception) -> HTTPException:
 async def admit(payload: SpeechRequest | TranscriptionRequest, *, kind: str, principal: Principal,
                 idempotency_key: UUID, api_provider: str | None = None,
                 required_scopes: tuple[str, ...] | None = None) -> str:
-    body = payload.model_dump(mode="json")
+    body = payload.model_dump(mode="json", exclude={"model_row_id"} if payload.model_row_id is None else None)
     body["kind"] = kind
     if api_provider is not None:
         body["provider_id"] = api_provider

@@ -43,13 +43,30 @@ class DecisionError(Exception):
         super().__init__(message)
 
 
-async def resolve(model: str, *, provider_type: str | None = None, openai_compat: bool = False) -> dict:
+async def resolve(
+    model: str | None, *, model_row_id: int | None = None,
+    provider_type: str | None = None, openai_compat: bool = False,
+) -> dict:
     try:
-        route = await routing.resolve_api_model(
-            model, model_kind="text" if openai_compat else ("text", "decision"),
-            provider_type=provider_type, required_capabilities=("decisions",),
-        )
-        if route is None and openai_compat:
+        if model_row_id is not None:
+            route = await routing.resolve_model_by_id(
+                model_row_id, model_kind=("text", "decision"), required_capabilities=("decisions",),
+            )
+            if route is not None:
+                selected_type = route["provider_type"]
+                if provider_type is not None and provider_type != selected_type:
+                    raise DecisionError(422, "model_selection_mismatch")
+                selector = model.removeprefix("models/") if model is not None and selected_type == "gemini" else model
+                if selector is not None and not routing.matches_api_model_selector(route, selector):
+                    raise DecisionError(422, "model_selection_mismatch")
+        else:
+            if model is None:
+                raise DecisionError(422, "model or model_row_id is required")
+            route = await routing.resolve_api_model(
+                model, model_kind="text" if openai_compat else ("text", "decision"),
+                provider_type=provider_type, required_capabilities=("decisions",),
+            )
+        if route is None and openai_compat and model is not None:
             gemini_route = await routing.resolve_api_model(
                 model.removeprefix("models/"), model_kind="decision", provider_type="gemini",
                 required_capabilities=("decisions",),
@@ -257,7 +274,7 @@ async def transport(route: dict, body: DecisionRequest, *, on_dispatch: Callable
     if provider_metadata.direct_provider_route("openai", base):
         base = "https://api.openai.com/v1"
     url = base.rstrip("/") + "/decisions"
-    payload = body.model_dump(exclude_none=True, exclude_unset=True)
+    payload = body.model_dump(exclude_none=True, exclude_unset=True, exclude={"model_row_id"})
     payload["model"] = route["api_model_name"]
     try:
         async with (

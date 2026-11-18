@@ -18,6 +18,8 @@ from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_contracts import validate_plugin_binding_ids
 from lumen.models.chat_db import ChatAgent
 from lumen.plugins.bindings import resolve_binding
+from lumen.services.providers import errors as provider_errors
+from lumen.services.providers import routing
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,10 @@ class AgentForbidden(PermissionError):
 
 class AgentValidationError(ValueError):
     """입력 검증 실패 — 400."""
+
+
+class AgentModelSelectionError(AgentValidationError):
+    """An exact model row is unavailable or disagrees with its legacy name."""
 
 
 def _require_db():
@@ -71,6 +77,7 @@ def _public(row: ChatAgent, *, owner_view: bool = False, include_private: bool =
         "avatar": row.avatar,
         **({"instructions": _dec(row.instructions)} if include_private else {}),
         "model_name": row.model_name,
+        "model_row_id": row.model_row_id,
         **({
             "params": row.params or {},
             "mcp_ids": row.mcp_ids or [],
@@ -114,6 +121,19 @@ async def _validate_plugin_selection(values: list[str] | None, kind: str, *, use
         raise AgentValidationError("selected plugin binding is unavailable") from exc
 
 
+async def _exact_model_name(model_row_id: int, model_name: str | None) -> str:
+    try:
+        route = await routing.resolve_model_by_id(model_row_id, model_kind="text")
+    except provider_errors.ChatStorageUnavailable as exc:
+        raise ChatStorageUnavailable("agent model catalog is unavailable") from exc
+    if route is None:
+        raise AgentModelSelectionError("model_row_unavailable")
+    selected_name = route["model_name"]
+    if model_name is not None and model_name != selected_name:
+        raise AgentModelSelectionError("model_selection_mismatch")
+    return selected_name
+
+
 async def create_agent(
     *,
     owner_user_id: str,
@@ -123,6 +143,7 @@ async def create_agent(
     avatar: str | None = None,
     instructions: str | None = None,
     model_name: str | None = None,
+    model_row_id: int | None = None,
     params: dict | None = None,
     mcp_ids: list[int] | None = None,
     tool_ids: list[int] | None = None,
@@ -133,6 +154,8 @@ async def create_agent(
 ) -> dict:
     factory = _require_db()
     _validate(name, visibility)
+    if model_row_id is not None:
+        model_name = await _exact_model_name(model_row_id, model_name)
     mcp_ids = _validate_ids(mcp_ids, "MCP")
     tool_ids = _validate_ids(tool_ids, "tool")
     skill_ids = _validate_ids(skill_ids, "skill")
@@ -146,6 +169,7 @@ async def create_agent(
         avatar=(avatar or None),
         instructions=_enc(instructions or None),
         model_name=(model_name or None),
+        model_row_id=model_row_id,
         params=(params or None),
         mcp_ids=(mcp_ids or None),
         tool_ids=(tool_ids or None),
@@ -245,6 +269,10 @@ async def update_agent(agent_id: int, *, user_id: str, project_id: str, patch: d
     """Update only a caller-owned project agent."""
     factory = _require_db()
     _validate(patch.get("name"), patch.get("visibility"))
+    model_row_id = patch.get("model_row_id")
+    model_name = patch.get("model_name")
+    if model_row_id is not None:
+        model_name = await _exact_model_name(model_row_id, model_name)
     for field, label in (("mcp_ids", "MCP"), ("tool_ids", "tool"), ("skill_ids", "skill")):
         if field in patch:
             _validate_ids(patch[field], label)
@@ -262,8 +290,14 @@ async def update_agent(agent_id: int, *, user_id: str, project_id: str, patch: d
                 row.avatar = patch["avatar"] or None
             if "instructions" in patch:
                 row.instructions = _enc(patch["instructions"] or None)
-            if "model_name" in patch:
+            if "model_row_id" in patch:
+                if model_row_id is not None or "model_name" in patch:
+                    row.model_name = model_name or None
+                row.model_row_id = model_row_id
+            elif "model_name" in patch and (patch["model_name"] or None) != row.model_name:
+                # A legacy client can replace the selection by changing its name.
                 row.model_name = patch["model_name"] or None
+                row.model_row_id = None
             if "params" in patch:
                 row.params = patch["params"] or None
             if "mcp_ids" in patch:
@@ -323,6 +357,7 @@ async def clone_agent(agent_id: int, *, user_id: str, project_id: str) -> dict:
                 avatar=src.avatar,
                 instructions=src.instructions,
                 model_name=src.model_name,
+                model_row_id=src.model_row_id,
                 params=src.params,
                 mcp_ids=None,
                 tool_ids=None,
@@ -366,6 +401,7 @@ async def get_agent_for_run(agent_id: int, *, user_id: str, project_id: str) -> 
                 "id": row.id,
                 "instructions": _dec(row.instructions),
                 "model_name": row.model_name,
+                "model_row_id": row.model_row_id,
                 "params": row.params or {},
                 "mcp_ids": row.mcp_ids or [],
                 "role": row.role,

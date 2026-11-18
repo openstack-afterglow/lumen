@@ -50,7 +50,7 @@ async def admit(
 ) -> ChatRunDescriptor:
     if payload.svg_model is not None:
         ensure_scopes(principal, svg_author_scope(required_scopes))
-    request = payload.model_dump(mode="json")
+    request = payload.model_dump(mode="json", exclude={"model_row_id"} if payload.model_row_id is None else None)
     if api_provider is not None:
         request["provider_id"] = api_provider
     if input_asset_id is not None:

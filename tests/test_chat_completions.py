@@ -1074,9 +1074,71 @@ class TestCanonicalCompletionRequests:
         assert response.status_code == 422
 
 
+@pytest.mark.parametrize("path,method", [
+    ("conversations/c1/completions", "create_persistent_run"),
+    ("conversations/c1/messages/12/regenerate", "create_run"),
+    ("temp-completions", "create_temp_run"),
+    ("conversations/c1/context-preview", None),
+    ("temp-threads/t1/context-preview", None),
+])
+async def test_native_selection_exact_row_and_name_assertion(client, monkeypatch, path, method):
+    await _patch_text_execution(monkeypatch)
+    monkeypatch.setattr(cs, "find_turn_start_user", lambda *_args, **_kwargs: _return(
+        {"id": 12, "content": "original"}
+    ))
+    first = _resolved()
+    second = {**first, "model_id": 2, "provider_id": 20, "provider_name": "another endpoint",
+              "capabilities": {**first["capabilities"], "max_output_tokens": 2048}}
+    routes = {1: first, 2: second}
+
+    async def resolve_exact(row_id, *, model_kind):
+        assert model_kind == "text"
+        return routes.get(row_id)
+
+    async def resolve_name(name):
+        if name == first["model_name"]:
+            raise ps.AmbiguousModelRouteError("duplicate text model")
+        return None
+
+    monkeypatch.setattr(ps, "resolve_model_by_id", resolve_exact)
+    monkeypatch.setattr(ps, "resolve_model", resolve_name)
+    seen = {}
+
+    async def create(**kwargs):
+        seen.update(kwargs)
+        return ChatRunDescriptor(run_id="row-selected", status="queued", events_url="/events", cancel_url="/cancel")
+
+    if method is not None:
+        monkeypatch.setattr(admission, method, create)
+    body = {"parts": [{"type": "text", "text": "hi"}]} if not path.endswith("/regenerate") else {}
+    url = f"/api/v1/chat/{path}"
+    response = await client.post(url, headers=_HEADERS, json={**body, "model_row_id": 2})
+    assert response.status_code == (202 if method else 200), response.text
+    if method is None:
+        assert response.json()["output_reserve"] == 2048
+    else:
+        assert seen["intent"]["model_row_id"] == 2
+        assert seen["model_name"] == second["model_name"]
+        assert seen["capability_snapshot"]["provider_id"] == 20
+        assert seen["capability_snapshot"]["model_id"] == 2
+
+    mismatch = await client.post(url, headers=_HEADERS, json={**body, "model_id": "wrong", "model_row_id": 2})
+    assert mismatch.status_code == 422
+    assert mismatch.json()["detail"] == "model_selection_mismatch"
+    legacy = await client.post(url, headers=_HEADERS, json={**body, "model_id": first["model_name"]})
+    assert legacy.status_code == 409
+
+
 class TestRetryFailedRun:
-    async def test_retry_preserves_agent_and_mcp_extensions(self, client, monkeypatch):
+    @pytest.mark.parametrize("model_row_id", [None, 2])
+    async def test_retry_preserves_agent_and_mcp_extensions(self, client, monkeypatch, model_row_id):
         await _patch_text_execution(monkeypatch)
+
+        async def resolve_exact(row_id, *, model_kind):
+            assert (row_id, model_kind) == (2, "text")
+            return {**_resolved(), "model_id": 2, "provider_id": 20}
+
+        monkeypatch.setattr(ps, "resolve_model_by_id", resolve_exact)
         monkeypatch.setattr(
             completions,
             "get_settings",
@@ -1094,6 +1156,7 @@ class TestRetryFailedRun:
             project_id = "test-project-123"
             status = "failed"
             model_name = "gpt-3.5-turbo"
+            capability_snapshot = {"model_id": model_row_id, "provider_id": 20} if model_row_id is not None else {}
             agent_id = 7
             execution_mode = "chat"
             credit_ceiling = None
@@ -1136,7 +1199,7 @@ class TestRetryFailedRun:
         monkeypatch.setattr(
             chat_admission,
             "_resolve_agent",
-            lambda agent_id, user_id, project_id: _return({"id": 7, "instructions": "agent-7"}),
+            lambda agent_id, user_id, project_id: _return({"id": 7, "instructions": "agent-7", "model_row_id": 3}),
         )
         mcp_item = {
             "id": 99,
@@ -1191,9 +1254,18 @@ class TestRetryFailedRun:
 
         monkeypatch.setattr(admission, "create_run", fake_create_run)
 
-        response = await client.post(f"{_BASE}/c1/runs/run-source-1/retry", headers=_HEADERS)
+        url = f"{_BASE}/c1/runs/run-source-1/retry"
+        mismatch = await client.post(url, headers=_HEADERS, json={"model_row_id": 3})
+        assert mismatch.status_code == 422
+        assert mismatch.json()["detail"] == "model_selection_mismatch"
+        assert not seen_create
+        response = await client.post(
+            url, headers=_HEADERS, **({"json": {"model_row_id": model_row_id}} if model_row_id else {}),
+        )
 
         assert response.status_code == 202, f"Failed with: {response.json()}"
+        assert seen_create["capability_snapshot"]["model_id"] == (model_row_id or 1)
+        assert seen_create["capability_snapshot"]["provider_id"] == (20 if model_row_id else 1)
         assert seen_create["request_payload"]["extension_snapshot"] == {"tools": [], "mcp": [mcp_item]}
         assert seen_create["request_payload"]["skill_ids"] == [3]
         assert seen_create["user_message_id"] == 12
@@ -2066,12 +2138,19 @@ class TestContextOutputLimitFallback:
         assert state["can_compact"] is True
 
     @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    @pytest.mark.parametrize("exact", [False, True])
     async def test_compaction_without_output_limit_admits_owned_run(
-        self, client, monkeypatch, context_route, parent
+        self, client, monkeypatch, context_route, parent, exact,
     ):
         from lumen.services import context_manager
 
         resolved, source = context_route
+
+        async def resolve_exact(row_id, *, model_kind):
+            assert (row_id, model_kind) == (21, "text")
+            return {**resolved, "model_id": 21, "provider_id": 20}
+
+        monkeypatch.setattr(ps, "resolve_model_by_id", resolve_exact)
         seen = {}
         real_context_state = context_manager.context_state
 
@@ -2095,7 +2174,7 @@ class TestContextOutputLimitFallback:
             f"/api/v1/chat/{parent}/compactions",
             headers=_HEADERS,
             json={
-                "model_id": resolved["model_name"],
+                **({"model_row_id": 21} if exact else {"model_id": resolved["model_name"]}),
                 "features": {},
                 "expected_context_revision": source["revision"],
             },
@@ -2112,6 +2191,16 @@ class TestContextOutputLimitFallback:
         assert run["expected_context_revision"] == source["revision"]
         assert run["request_payload"]["context_source"] == source
         assert run["request_payload"]["max_tokens"] == 4096
+        if exact:
+            assert run["intent"]["model_row_id"] == 21
+            assert run["model_name"] == resolved["model_name"]
+            assert run["capability_snapshot"]["provider_id"] == 20
+            mismatch = await client.post(
+                f"/api/v1/chat/{parent}/compactions", headers=_HEADERS,
+                json={"model_id": "wrong", "model_row_id": 21, "expected_context_revision": source["revision"]},
+            )
+            assert mismatch.status_code == 422
+            assert mismatch.json()["detail"] == "model_selection_mismatch"
 
     @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
     @pytest.mark.parametrize(

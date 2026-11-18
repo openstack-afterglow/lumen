@@ -50,6 +50,7 @@ CREATE TABLE `chat_agents` (
   `updated_at` datetime NOT NULL,
   `plugin_tool_ids` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`plugin_tool_ids`)),
   `plugin_skill_ids` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`plugin_skill_ids`)),
+  `model_row_id` bigint DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_chat_agents_owner` (`owner_user_id`),
   KEY `idx_chat_agents_project` (`project_id`),
