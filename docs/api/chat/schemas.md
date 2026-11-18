@@ -57,15 +57,21 @@ Explicit root ceilings; delegation/code execution is unavailable without them.
 | `api_provider` | string | yes | — | Api Provider |
 | `provider_id` | integer | yes | — | Provider Id |
 | `provider_type` | string | yes | — | Provider Type |
+| `provider_family` | enum: `native`, `compatible` | yes | — | Provider Family |
+| `price_origin` | enum: `manual`, `native_catalog` \| null | no | — | Price Origin |
+| `catalog_version` | string \| null | no | — | Catalog Version |
+| `catalog_entry` | map of any \| null | no | — | Catalog Entry |
 | `provider_sort_order` | integer | no | `0` | Provider Sort Order |
 | `sort_order` | integer | no | `0` | Sort Order |
-| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime` | no | `"text"` | Model Kind |
+| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding`, `decision` | no | `"text"` | Model Kind |
 | `display_name` | string | yes | — | Display Name |
 | `provider` | string \| null | no | — | Provider |
 | `provider_api_key_configured` | boolean | yes | — | Provider Api Key Configured |
 | `capabilities` | map of any \| null | no | — | Capabilities |
 | `context_limit` | integer \| null | no | — | Context Limit |
 | `reasoning_none_supported` | boolean | no | `false` | Reasoning None Supported |
+| `domain_billing` | map of any \| null | no | — | Domain Billing |
+| `effective_input_price_per_million` | string \| null | no | — | Effective Input Price Per Million |
 
 ### ChatFeatureOptions
 
@@ -97,7 +103,7 @@ Explicit root ceilings; delegation/code execution is unavailable without them.
 
 ### ChatRunEvent
 
-Type: [RunStartedEvent](#runstartedevent) \| [RunStageChangedEvent](#runstagechangedevent) \| [RunWarningEvent](#runwarningevent) \| [ContextUpdatedEvent](#contextupdatedevent) \| [MessageCreatedEvent](#messagecreatedevent) \| [PartDeltaEvent](#partdeltaevent) \| [PartCompletedEvent](#partcompletedevent) \| [ToolCallStartedEvent](#toolcallstartedevent) \| [ToolCallCompletedEvent](#toolcallcompletedevent) \| [ToolApprovalRequiredEvent](#toolapprovalrequiredevent) \| [ToolApprovalResolvedEvent](#toolapprovalresolvedevent) \| [RunInteractionResolvedEvent](#runinteractionresolvedevent) \| [UsageUpdatedEvent](#usageupdatedevent) \| [RunCompletedEvent](#runcompletedevent) \| [RunFailedEvent](#runfailedevent) \| [RunCanceledEvent](#runcanceledevent) \| [ChildCreatedEvent](#childcreatedevent) \| [ChildCompletedEvent](#childcompletedevent)
+Type: [RunStartedEvent](#runstartedevent) \| [RunStageChangedEvent](#runstagechangedevent) \| [RunWarningEvent](#runwarningevent) \| [ContextUpdatedEvent](#contextupdatedevent) \| [MessageCreatedEvent](#messagecreatedevent) \| [PartDeltaEvent](#partdeltaevent) \| [PartCompletedEvent](#partcompletedevent) \| [ToolCallStartedEvent](#toolcallstartedevent) \| [ToolCallProgressEvent](#toolcallprogressevent) \| [ToolCallCompletedEvent](#toolcallcompletedevent) \| [ToolApprovalRequiredEvent](#toolapprovalrequiredevent) \| [ToolApprovalResolvedEvent](#toolapprovalresolvedevent) \| [RunInteractionResolvedEvent](#runinteractionresolvedevent) \| [UsageUpdatedEvent](#usageupdatedevent) \| [RunCompletedEvent](#runcompletedevent) \| [RunFailedEvent](#runfailedevent) \| [RunCanceledEvent](#runcanceledevent) \| [ChildCreatedEvent](#childcreatedevent) \| [ChildCompletedEvent](#childcompletedevent)
 
 ### ChatRunResponse
 
@@ -182,7 +188,8 @@ Context compaction admission input, fenced to a saved source revision.
 | --- | --- | --- | --- | --- |
 | `reasoning_effort` | enum: `auto`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | no | `"auto"` | Reasoning Effort |
 | `client_timezone` | string \| null | no | — | Client Timezone |
-| `model_id` | string | yes | — | Model Id (max 190 chars) |
+| `model_id` | string \| null | no | — | Model Id |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 | `features` | [ChatFeatureOptions](#chatfeatureoptions) | no | — |  |
 | `agent_id` | string \| null | no | — | Agent Id |
 | `execution_mode` | enum: `chat`, `plan`, `code` | no | `"chat"` | Execution Mode |
@@ -201,7 +208,8 @@ Canonical client intent; routing, pricing, and tool resolution are server snapsh
 | --- | --- | --- | --- | --- |
 | `reasoning_effort` | enum: `auto`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | no | `"auto"` | Reasoning Effort |
 | `client_timezone` | string \| null | no | — | Client Timezone |
-| `model_id` | string | yes | — | Model Id (max 190 chars) |
+| `model_id` | string \| null | no | — | Model Id |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 | `features` | [ChatFeatureOptions](#chatfeatureoptions) | no | — |  |
 | `agent_id` | string \| null | no | — | Agent Id |
 | `execution_mode` | enum: `chat`, `plan`, `code` | no | `"chat"` | Execution Mode |
@@ -251,7 +259,8 @@ Read-only context admission input, including an optional unsaved draft.
 | --- | --- | --- | --- | --- |
 | `reasoning_effort` | enum: `auto`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | no | `"auto"` | Reasoning Effort |
 | `client_timezone` | string \| null | no | — | Client Timezone |
-| `model_id` | string | yes | — | Model Id (max 190 chars) |
+| `model_id` | string \| null | no | — | Model Id |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 | `features` | [ChatFeatureOptions](#chatfeatureoptions) | no | — |  |
 | `agent_id` | string \| null | no | — | Agent Id |
 | `execution_mode` | enum: `chat`, `plan`, `code` | no | `"chat"` | Execution Mode |
@@ -341,6 +350,14 @@ Read-only context admission input, including an optional unsaved draft.
 | `name` | string | yes | — | Name (max 255 chars) |
 | `page_count` | integer | yes | — | Page Count (numeric lower bound) |
 
+### EmbedRequest
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `model_id` | integer | yes | — | Model Id (numeric lower bound) |
+| `input` | array of string | yes | — | Input (max 16 items) |
+| `dimensions` | integer \| null | no | — | Dimensions |
+
 ### FilePart
 
 | Field | Type | Required | Default | Notes |
@@ -356,6 +373,63 @@ Read-only context admission input, including an optional unsaved draft.
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `message_id` | integer | yes | — | Message Id |
+
+### GeminiDecisionRequest
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `model` | string \| null | no | `null` | Model |
+| `model_row_id` | integer \| null | no | `null` | Model Row Id |
+| `input` | string \| [GeminiDecision_TextContent](#geminidecision_textcontent) \| [GeminiDecision_ImageContent](#geminidecision_imagecontent) \| array of [GeminiDecision_TextContent](#geminidecision_textcontent) \| [GeminiDecision_ImageContent](#geminidecision_imagecontent) | yes | — | Input |
+| `questions` | map of [GeminiDecision_NoulQuestion](#geminidecision_noulquestion) \| [GeminiDecision_ChoiceQuestion](#geminidecision_choicequestion) \| [GeminiDecision_ScoreQuestion](#geminidecision_scorequestion) | yes | — | Questions |
+
+### GeminiDecision_ChoiceQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `instructions` | string \| [GeminiDecision_TextContent](#geminidecision_textcontent) \| array of [GeminiDecision_TextContent](#geminidecision_textcontent) | yes | — | Instructions |
+| `type` | const `choice` | yes | — | Type |
+| `criteria` | map of string | yes | — | Criteria |
+
+### GeminiDecision_ImageContent
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `image` | yes | — | Type |
+| `mime_type` | enum: `image/png`, `image/jpeg`, `image/webp`, `image/heic`, `image/heif`, `image/gif`, `image/bmp`, `image/tiff` | yes | — | Mime Type |
+| `data` | string \| null | no | `null` | Data |
+| `uri` | string \| null | no | `null` | Uri |
+| `resolution` | enum: `low`, `medium`, `high`, `ultra_high` \| null | no | `null` | Resolution |
+
+### GeminiDecision_NoulCriteria
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `true_description` | string \| null | no | `null` | True Description |
+| `false_description` | string \| null | no | `null` | False Description |
+
+### GeminiDecision_NoulQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `instructions` | string \| [GeminiDecision_TextContent](#geminidecision_textcontent) \| array of [GeminiDecision_TextContent](#geminidecision_textcontent) | yes | — | Instructions |
+| `type` | const `noul` | yes | — | Type |
+| `criteria` | [GeminiDecision_NoulCriteria](#geminidecision_noulcriteria) \| null | no | `null` |  |
+
+### GeminiDecision_ScoreQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `instructions` | string \| [GeminiDecision_TextContent](#geminidecision_textcontent) \| array of [GeminiDecision_TextContent](#geminidecision_textcontent) | yes | — | Instructions |
+| `type` | const `score` | yes | — | Type |
+| `criteria` | array of string | yes | — | Criteria (max 255 items) |
+
+### GeminiDecision_TextContent
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `text` | yes | — | Type |
+| `text` | string | yes | — | Text |
 
 ### HTTPValidationError
 
@@ -440,6 +514,183 @@ Bounded bidirectional page from the selected conversation path.
 | `position` | integer \| null | no | — | Position |
 | `branch` | map of integer \| null \| null | no | — | Branch |
 
+### NativeDecisionRequest
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `model` | string \| null | no | `null` | Model |
+| `input` | string \| array of [NativeDecision_UserMessage](#nativedecision_usermessage) \| [NativeDecision_InstructionMessage](#nativedecision_instructionmessage) \| [NativeDecision_AssistantMessage](#nativedecision_assistantmessage) \| [NativeDecision_FunctionCall](#nativedecision_functioncall) \| [NativeDecision_CustomToolCall](#nativedecision_customtoolcall) \| [NativeDecision_ToolOutput](#nativedecision_tooloutput) | yes | — | Input |
+| `questions` | array of [NativeDecision_PredicateQuestion](#nativedecision_predicatequestion) \| [NativeDecision_ChoiceQuestion](#nativedecision_choicequestion) \| [NativeDecision_ScoreQuestion](#nativedecision_scorequestion) | yes | — | Questions (max 400 items) |
+| `prompt_cache_key` | string \| null | no | `null` | Prompt Cache Key |
+| `prompt_cache_options` | [NativeDecision_PromptCacheOptions](#nativedecision_promptcacheoptions) \| null | no | `null` |  |
+| `safety_identifier` | string \| null | no | `null` | Safety Identifier |
+| `model_row_id` | integer \| null | no | `null` | Model Row Id |
+
+### NativeDecision_AssistantMessage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `message` | no | `"message"` | Type |
+| `role` | const `assistant` | yes | — | Role |
+| `content` | string \| array of [NativeDecision_OutputText](#nativedecision_outputtext) \| [NativeDecision_RefusalText](#nativedecision_refusaltext) | yes | — | Content |
+| `phase` | enum: `commentary`, `final_answer` \| null | no | `null` | Phase |
+
+### NativeDecision_CacheBreakpoint
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `mode` | const `explicit` | no | `"explicit"` | Mode |
+
+### NativeDecision_Choice
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `value` | string \| boolean | yes | — | Value |
+| `description` | string \| null | no | `null` | Description |
+
+### NativeDecision_ChoiceQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `choice` | yes | — | Type |
+| `name` | string \| null | no | `null` | Name |
+| `instructions` | string \| array of [NativeDecision_QuestionText](#nativedecision_questiontext) \| [NativeDecision_QuestionImage](#nativedecision_questionimage) \| [NativeDecision_InputJSON](#nativedecision_inputjson) | yes | — | Instructions |
+| `choices` | array of [NativeDecision_Choice](#nativedecision_choice) | yes | — | Choices (max 255 items) |
+
+### NativeDecision_CustomToolCall
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `custom_tool_call` | yes | — | Type |
+| `input` | string | yes | — | Input (max 1048576 chars) |
+| `call_id` | string | yes | — | Call Id (max 64 chars) |
+| `name` | string | yes | — | Name (max 64 chars) |
+| `id` | string \| null | no | `null` | Id |
+| `namespace` | string \| null | no | `null` | Namespace |
+| `status` | enum: `in_progress`, `completed`, `incomplete` \| null | no | `null` | Status |
+
+### NativeDecision_FunctionCall
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `function_call` | yes | — | Type |
+| `arguments` | string | yes | — | Arguments (max 1048576 chars) |
+| `call_id` | string | yes | — | Call Id (max 64 chars) |
+| `name` | string | yes | — | Name (max 128 chars) |
+| `id` | string \| null | no | `null` | Id |
+| `namespace` | string \| null | no | `null` | Namespace |
+| `status` | enum: `in_progress`, `completed`, `incomplete` \| null | no | `null` | Status |
+
+### NativeDecision_InputImage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `input_image` | no | `"input_image"` | Type |
+| `image_url` | string | yes | — | Image Url (max 1073741824 chars) |
+| `detail` | enum: `low`, `high`, `auto`, `original` \| null | no | `"auto"` | Detail |
+| `prompt_cache_breakpoint` | [NativeDecision_CacheBreakpoint](#nativedecision_cachebreakpoint) \| null | no | `null` |  |
+
+### NativeDecision_InputJSON
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `input_json` | no | `"input_json"` | Type |
+| `data` | map of any \| array of map of any | yes | — | Data |
+
+### NativeDecision_InputText
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `input_text` | no | `"input_text"` | Type |
+| `text` | string | yes | — | Text (max 10485760 chars) |
+| `prompt_cache_breakpoint` | [NativeDecision_CacheBreakpoint](#nativedecision_cachebreakpoint) \| null | no | `null` |  |
+
+### NativeDecision_InstructionMessage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `message` | no | `"message"` | Type |
+| `role` | enum: `developer`, `system` | yes | — | Role |
+| `content` | string \| array of [NativeDecision_InputText](#nativedecision_inputtext) | yes | — | Content |
+
+### NativeDecision_Level
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `label` | string | yes | — | Label (max 1048576 chars) |
+| `description` | string \| null | no | `null` | Description |
+
+### NativeDecision_OutputText
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `output_text` | no | `"output_text"` | Type |
+| `text` | string | yes | — | Text (max 10485760 chars) |
+
+### NativeDecision_PredicateQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `predicate` | yes | — | Type |
+| `name` | string \| null | no | `null` | Name |
+| `instructions` | string \| array of [NativeDecision_QuestionText](#nativedecision_questiontext) \| [NativeDecision_QuestionImage](#nativedecision_questionimage) \| [NativeDecision_InputJSON](#nativedecision_inputjson) | yes | — | Instructions |
+
+### NativeDecision_PromptCacheOptions
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `mode` | enum: `implicit`, `explicit` \| null | no | `null` | Mode |
+| `ttl` | const `30m` | no | `"30m"` | Ttl |
+
+### NativeDecision_QuestionImage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `input_image` | no | `"input_image"` | Type |
+| `image_url` | string | yes | — | Image Url (max 1073741824 chars) |
+| `detail` | enum: `low`, `high`, `auto`, `original` \| null | no | `"auto"` | Detail |
+
+### NativeDecision_QuestionText
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `input_text` | no | `"input_text"` | Type |
+| `text` | string | yes | — | Text (max 10485760 chars) |
+
+### NativeDecision_RefusalText
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `refusal` | no | `"refusal"` | Type |
+| `refusal` | string | yes | — | Refusal (max 10485760 chars) |
+
+### NativeDecision_ScoreQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `score` | yes | — | Type |
+| `name` | string \| null | no | `null` | Name |
+| `instructions` | string \| array of [NativeDecision_QuestionText](#nativedecision_questiontext) \| [NativeDecision_QuestionImage](#nativedecision_questionimage) \| [NativeDecision_InputJSON](#nativedecision_inputjson) | yes | — | Instructions |
+| `levels` | array of [NativeDecision_Level](#nativedecision_level) | yes | — | Levels (max 10 items) |
+
+### NativeDecision_ToolOutput
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | enum: `function_call_output`, `custom_tool_call_output` | yes | — | Type |
+| `call_id` | string | yes | — | Call Id (max 64 chars) |
+| `output` | string \| array of [NativeDecision_InputText](#nativedecision_inputtext) \| [NativeDecision_InputImage](#nativedecision_inputimage) | yes | — | Output |
+| `id` | string \| null | no | `null` | Id |
+| `status` | enum: `in_progress`, `completed`, `incomplete` \| null | no | `null` | Status |
+
+### NativeDecision_UserMessage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `message` | no | `"message"` | Type |
+| `role` | const `user` | yes | — | Role |
+| `content` | string \| array of [NativeDecision_InputText](#nativedecision_inputtext) \| [NativeDecision_InputImage](#nativedecision_inputimage) \| [NativeDecision_InputJSON](#nativedecision_inputjson) | yes | — | Content |
+
 ### PartCompletedEvent
 
 | Field | Type | Required | Default | Notes |
@@ -493,7 +744,8 @@ Bounded bidirectional page from the selected conversation path.
 | --- | --- | --- | --- | --- |
 | `reasoning_effort` | enum: `auto`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | no | `"auto"` | Reasoning Effort |
 | `client_timezone` | string \| null | no | — | Client Timezone |
-| `model_id` | string | yes | — | Model Id (max 190 chars) |
+| `model_id` | string \| null | no | — | Model Id |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 | `features` | [ChatFeatureOptions](#chatfeatureoptions) | no | — |  |
 
 ### ResponseFormat
@@ -504,6 +756,12 @@ Bounded bidirectional page from the selected conversation path.
 | `name` | string \| null | no | — | Name |
 | `version` | string \| null | no | — | Version |
 | `schema` | map of any \| null | no | — | Schema |
+
+### RetryRequest
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 
 ### RunCanceledEvent
 
@@ -677,7 +935,8 @@ Canonical first-turn temporary completion request.
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `parts` | array of [UserTextInputPart](#usertextinputpart) \| [UserAssetInputPart](#userassetinputpart) | yes | — | Parts (max 32 items) |
-| `model_id` | string | yes | — | Model Id (max 190 chars) |
+| `model_id` | string \| null | no | — | Model Id |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 | `features` | [ChatFeatureOptions](#chatfeatureoptions) | no | — |  |
 | `reasoning_effort` | enum: `auto`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | no | `"auto"` | Reasoning Effort |
 | `execution_mode` | string | no | `"chat"` | Execution Mode |
@@ -779,6 +1038,27 @@ Canonical first-turn temporary completion request.
 | `arguments` | map of any | yes | — | Arguments |
 | `status` | enum: `pending`, `running`, `completed`, `failed`, `denied` | yes | — | Status |
 
+### ToolCallProgressEvent
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `event_id` | string | yes | — | Event Id (max 256 chars) |
+| `run_id` | string | yes | — | Run Id (max 36 chars) |
+| `seq` | integer | yes | — | Seq (numeric lower bound) |
+| `created_at` | string (date-time) | yes | — | Created At |
+| `type` | const `tool.call.progress` | yes | — | Type |
+| `payload` | [ToolCallProgressPayload](#toolcallprogresspayload) | yes | — |  |
+
+### ToolCallProgressPayload
+
+Already-public progress text, never provider-private execution state.
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `call_id` | string | yes | — | Call Id (max 190 chars) |
+| `name` | string | yes | — | Name (max 190 chars) |
+| `text` | string | yes | — | Text (max 4000 chars) |
+
 ### ToolCallStartedEvent
 
 | Field | Type | Required | Default | Notes |
@@ -808,6 +1088,7 @@ Canonical first-turn temporary completion request.
 | `approval_mode` | enum: `required_for_mutations`, `always` | no | `"required_for_mutations"` | Approval Mode |
 | `enabled_tool_ids` | array of integer \| null | no | — | Enabled Tool Ids |
 | `enabled_mcp_ids` | array of integer \| null | no | — | Enabled Mcp Ids |
+| `enabled_sandbox_tools` | array of string | no | — | Enabled Sandbox Tools (max 100 items) |
 | `workspace_write_mode` | enum: `ask`, `auto_edit` | no | `"ask"` | Workspace Write Mode |
 
 ### ToolResultPart

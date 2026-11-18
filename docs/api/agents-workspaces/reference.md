@@ -30,6 +30,19 @@
 | POST | `/v1/memories/search` | Search Memories | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | [MemorySearch](schemas.md#memorysearch) | 200 | `search_memories_v1_memories_search_post` |
 | DELETE | `/v1/memories/{memory_id}` | Delete Memory | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 204 | `delete_memory_v1_memories__memory_id__delete` |
 | PATCH | `/v1/memories/{memory_id}` | Update Memory | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | [MemoryUpdate](schemas.md#memoryupdate) | 200 | `update_memory_v1_memories__memory_id__patch` |
+| GET | `/v1/vault/coding-standards` | Coding Standards | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `coding_standards_v1_vault_coding_standards_get` |
+| PUT | `/v1/vault/coding-standards` | Write Coding Standards | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | [SlotWrite](schemas.md#slotwrite) | 200 | `write_coding_standards_v1_vault_coding_standards_put` |
+| GET | `/v1/vault/document` | Document | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `document_v1_vault_document_get` |
+| GET | `/v1/vault/notes` | Notes | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `notes_v1_vault_notes_get` |
+| POST | `/v1/vault/notes` | Write Note | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | [NoteWrite](schemas.md#notewrite) | 201 | `write_note_v1_vault_notes_post` |
+| GET | `/v1/vault/notes/{note_id}` | Read Note | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `read_note_v1_vault_notes__note_id__get` |
+| PATCH | `/v1/vault/notes/{note_id}` | Replace Note | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | [NoteReplace](schemas.md#notereplace) | 200 | `replace_note_v1_vault_notes__note_id__patch` |
+| GET | `/v1/vault/notes/{note_id}/revisions` | Revisions | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `revisions_v1_vault_notes__note_id__revisions_get` |
+| GET | `/v1/vault/profile` | Profile | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `profile_v1_vault_profile_get` |
+| PUT | `/v1/vault/profile` | Write Profile | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | [SlotWrite](schemas.md#slotwrite) | 200 | `write_profile_v1_vault_profile_put` |
+| GET | `/v1/vault/search` | Search | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `search_v1_vault_search_get` |
+| GET | `/v1/vault/short-term` | Short Term | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `short_term_v1_vault_short_term_get` |
+| PUT | `/v1/vault/short-term` | Write Short Term | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | [SlotWrite](schemas.md#slotwrite) | 200 | `write_short_term_v1_vault_short_term_put` |
 | GET | `/v1/workspaces` | List Workspaces | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `list_workspaces_v1_workspaces_get` |
 | POST | `/v1/workspaces` | Create Workspace | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | [WorkspaceCreate](schemas.md#workspacecreate) | 201 | `create_workspace_v1_workspaces_post` |
 | DELETE | `/v1/workspaces/{workspace_id}` | Delete Workspace | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 204 | `delete_workspace_v1_workspaces__workspace_id__delete` |

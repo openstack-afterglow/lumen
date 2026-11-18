@@ -70,6 +70,23 @@ Administrator-approved OAuth or static-header MCP source.
 | `oauth_client_secret` | string \| null | no | — | Oauth Client Secret |
 | `load_policy` | enum: `preloaded`, `on_demand` \| null | no | — | Load Policy |
 
+### ArchiveList
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `items` | array of [ArchivedConnection](#archivedconnection) | yes | — | Items |
+
+### ArchivedConnection
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `id` | integer | yes | — | Id |
+| `kind` | enum: `mcp`, `tool` | yes | — | Kind |
+| `original_id` | integer | yes | — | Original Id |
+| `canonical_id` | integer | yes | — | Canonical Id |
+| `name` | string | yes | — | Name |
+| `archived_at` | string (date-time) | yes | — | Archived At |
+
 ### BindingCreate
 
 | Field | Type | Required | Default | Notes |
@@ -127,6 +144,23 @@ registration; arbitrary headers, commands, and secret variables are rejected.
 | `transport` | string \| null | no | — | Transport |
 | `url` | string \| null | no | — | Url |
 | `is_active` | boolean \| null | no | — | Is Active |
+
+### McpTemplateConnectionBody
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `variables` | map of string \| null | no | — | Variables |
+| `auth_mode` | enum: `none`, `oauth`, `admin` \| null | no | — | Auth Mode |
+| `headers` | map of string \| null | no | — | Headers |
+| `label` | string \| null | no | — | Label |
+| `template_id` | string | yes | — | Template Id (max 100 chars) |
+
+### RestoredConnection
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `kind` | enum: `mcp`, `tool` | yes | — | Kind |
+| `id` | integer | yes | — | Id |
 
 ### SkillBody
 

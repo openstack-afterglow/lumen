@@ -198,11 +198,7 @@ def _require_execution_capability(
             )
     if domain_paid:
         # Reject before admission what the prepaid bound would refuse at provider start.
-        readiness = domain_billing_readiness(
-            capabilities,
-            input_price=resolved.get("input_price_per_token"),
-            output_price=resolved.get("output_price_per_token"),
-        )
+        readiness = route_domain_billing(resolved)
         if not readiness["ready"]:
             raise HTTPException(
                 status_code=422,
@@ -261,12 +257,24 @@ def _feature_route_snapshot(route: dict[str, Any], *, purpose: str) -> dict[str,
     return snapshot
 
 
-async def resolve_summary_route(execution_route: dict[str, Any]) -> dict[str, Any]:
-    """Resolve the dedicated title route once, falling back to the execution route."""
+def route_domain_billing(route: dict[str, Any]) -> dict:
+    """Domain-billing readiness of a resolved route (execution, title or compaction)."""
+    return domain_billing_readiness(route.get("capabilities") or {}, frozen_token_pricing(route))
+
+
+async def resolve_summary_route(execution_route: dict[str, Any], *, domain_paid: bool = False) -> dict[str, Any]:
+    """Resolve the dedicated title route once, falling back to the execution route.
+
+    A domain-paid run reserves prepaid credit for compaction calls. When the
+    configured title model cannot be bounded, the run compacts with its own
+    execution route, which admission already checked, so it never fails mid-run.
+    """
     try:
         route = await ps.resolve_title_model()
     except errors.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if route is not None and domain_paid and not route_domain_billing(route)["ready"]:
+        return execution_route
     return route or execution_route
 
 
@@ -1272,9 +1280,9 @@ async def prepare_context_input(
 
     feature_routes = await _resolve_feature_routes(features)
     payer = (token_info or {}).get("payer")
+    domain_paid = not is_preview and payer is not None and payer.domain_id is not None
     _require_execution_capability(
-        features, resolved, parts=parts, feature_routes=feature_routes,
-        domain_paid=not is_preview and payer is not None and payer.domain_id is not None,
+        features, resolved, parts=parts, feature_routes=feature_routes, domain_paid=domain_paid,
     )
     validated_reasoning_effort = _validated_reasoning_effort(reasoning_effort, resolved)
     _validate_tool_reasoning_compatibility(validated_reasoning_effort, resolved, features)
@@ -1320,7 +1328,7 @@ async def prepare_context_input(
         # Preserve legacy online Codex defaults without discarding caller intent.
         resolved = {**resolved, "provider_request_defaults": {"omit_output_budget": True, "omit_sampling": True}}
 
-    summary_route = await resolve_summary_route(resolved)
+    summary_route = await resolve_summary_route(resolved, domain_paid=domain_paid)
     capability_snapshot, pricing_snapshot = _run_snapshots(
         resolved,
         features.model_dump(mode="json", by_alias=True),

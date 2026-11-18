@@ -769,19 +769,27 @@ def _effective_capabilities(
     return apply_subscription_capability_limits(detected, auth_mode), source
 
 
-def domain_billing_readiness(capabilities: dict, *, input_price, output_price) -> dict:
-    """Whether a text model can fund a domain-paid call before admission.
+def domain_billing_readiness(capabilities: dict, pricing: dict) -> dict:
+    """Whether a text route can fund a domain-paid call before admission.
 
-    Mirrors the run-time bound: a prepaid hold covers the whole frozen context
-    window plus an output budget the provider enforces. Unknown windows are
-    never fabricated; an administrator may set ``capabilities.context_limit``.
+    Mirrors ``_provider_credit_bound``: a priced input needs a frozen context
+    window and a priced output needs a provider-enforced output budget. Rates
+    are the bound's own worst case over text, cache and modality prices, so a
+    zero-rate route reserves nothing and stays ready. Unknown windows are never
+    fabricated; an administrator may set ``capabilities.context_limit``.
     """
+    from lumen.services.credit import worst_case_token_rates
+
+    if pricing.get("input_price_per_token") is None or pricing.get("output_price_per_token") is None:
+        return {"ready": False, "reason_code": "pricing_unavailable"}
+    try:
+        input_rate, output_rate, _ = worst_case_token_rates(pricing)
+    except ValueError:
+        return {"ready": False, "reason_code": "pricing_unavailable"}
     limit = capabilities.get("context_limit")
-    if input_price is None or output_price is None:
-        reason = "pricing_unavailable"
-    elif capabilities.get("output_budget_enforced") is False:
+    if output_rate > 0 and capabilities.get("output_budget_enforced") is False:
         reason = "output_budget_unenforced"
-    elif type(limit) is not int or limit <= 0:
+    elif input_rate > 0 and (type(limit) is not int or limit <= 0):
         reason = "context_limit_unknown"
     else:
         reason = None
@@ -919,7 +927,12 @@ def _model_public(
         "updated_at": _iso(row.updated_at),
         # Not part of route capabilities, so run config hashes stay unchanged.
         "domain_billing": (
-            domain_billing_readiness(eff_caps, input_price=effective_input, output_price=effective_output)
+            domain_billing_readiness(eff_caps, {
+                "input_price_per_token": effective_input,
+                "output_price_per_token": effective_output,
+                **{resolved: effective_cache[resolved] for _, _, resolved in CACHE_PRICE_FIELDS},
+                "token_rates": route_token_rates({"media_pricing": _effective_media_pricing(row, provider_type, api_base)}),
+            })
             if _kind(row) == "text" else None
         ),
     }

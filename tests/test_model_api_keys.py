@@ -212,8 +212,10 @@ async def test_only_current_domain_managers_manage_service_keys(key_db, director
         assert policy.json()["domain_id"] == "domain-a"
         assert policy.json()["allowed_scopes"] == sorted(MODEL_API_KEY_SCOPES)
         assert set(policy.json()["default_scopes"]) <= MODEL_API_KEY_SCOPES
-        assert policy.json()["scope_routes"]["embeddings:write"] == ["POST /v1/chat/embeddings", "POST /v1/embeddings",
-            "POST /v1beta/models/{model}:batchEmbedContents", "POST /v1beta/models/{model}:embedContent"]
+        assert policy.json()["scope_routes"]["embeddings:write"] == sorted(
+            f"{method} {route}" for (method, route), scope in MODEL_API_KEY_ROUTE_SCOPES.items()
+            if scope == "embeddings:write")
+        assert "POST /v1/embeddings" in policy.json()["scope_routes"]["embeddings:write"]
         # POST /service-keys validates against exactly this vocabulary.
         assert policy.json()["allowed_scopes"] == sorted(get_args(api_keys.ApiKeyScope))
         issued = await client.post(base, headers=owner, json={"name": "runner"})
@@ -372,6 +374,7 @@ _CODEX_TOOLS = [
     {"type": "custom", "name": "apply_patch", "description": "Apply a patch",
      "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}},
     {"type": "local_shell"},
+    {"type": "shell", "environment": {"type": "local"}},
 ]
 _CLAUDE_CODE_TOOLS = [
     {"name": "Bash", "description": "Run a command",
@@ -447,6 +450,11 @@ async def test_client_declared_tools_are_forwarded_for_model_keys(key_db, direct
         {"type": "web_search"}, {"type": "web_search_preview"}, {"type": "file_search", "vector_store_ids": ["v"]},
         {"type": "code_interpreter", "container": {"type": "auto"}}, {"type": "computer_use_preview"},
         {"type": "image_generation"}, {"type": "mcp", "server_label": "s", "server_url": "https://mcp.example"},
+        # Only an explicit local environment runs on the caller's machine.
+        {"type": "shell", "environment": {"type": "container_auto"}},
+        {"type": "shell", "environment": {"type": "container_reference", "container_id": "cntr_1"}},
+        {"type": "shell", "environment": {"type": "future_environment"}},
+        {"type": "shell"},
     )],
     ("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "x"}], "web_search_options": {}}),
     *[("/v1/messages", {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "x"}],

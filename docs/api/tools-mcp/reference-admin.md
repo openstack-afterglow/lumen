@@ -17,6 +17,7 @@
 | POST | `/v1/admin/mcp-connections/{item_id}/catalog/refresh` | Admin Refresh Mcp Connection Catalog | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `admin_refresh_mcp_connection_catalog_v1_admin_mcp_connections__item_id__catalog_refresh_post` |
 | GET | `/v1/admin/mcp-registry` | Admin List Mcp Registry | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `admin_list_mcp_registry_v1_admin_mcp_registry_get` |
 | POST | `/v1/admin/mcp-registry/install-all` | Admin Install Mcp Registry All | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `admin_install_mcp_registry_all_v1_admin_mcp_registry_install_all_post` |
+| POST | `/v1/admin/mcp-registry/install-featured` | Admin Install Featured Mcp Registry | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `admin_install_featured_mcp_registry_v1_admin_mcp_registry_install_featured_post` |
 | POST | `/v1/admin/mcp-registry/{entry_id}/install` | Admin Install Mcp Registry Entry | Keystone (X-Auth-Token), Keystone (Bearer) | — | [AdminMcpRegistryInstallBody](schemas.md#adminmcpregistryinstallbody) | 200 | `admin_install_mcp_registry_entry_v1_admin_mcp_registry__entry_id__install_post` |
 | GET | `/v1/admin/mcp-servers` | Admin List Mcp | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `admin_list_mcp_v1_admin_mcp_servers_get` |
 | POST | `/v1/admin/mcp-servers` | Admin Create Mcp | Keystone (X-Auth-Token), Keystone (Bearer) | — | [AdminMcpServerBody](schemas.md#adminmcpserverbody) | 201 | `admin_create_mcp_v1_admin_mcp_servers_post` |

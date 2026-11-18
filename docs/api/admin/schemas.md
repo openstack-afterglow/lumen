@@ -16,7 +16,7 @@ Live provider IDs with reviewed native metadata, or unannotated compatible IDs.
 | `generation_methods` | array of string | no | — | Generation Methods |
 | `input_token_limit` | integer \| null | no | — | Input Token Limit |
 | `output_token_limit` | integer \| null | no | — | Output Token Limit |
-| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding` \| null | no | — | Model Kind |
+| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding`, `decision` \| null | no | — | Model Kind |
 | `provider_family` | enum: `native`, `compatible` | no | `"native"` | Provider Family |
 | `requires_manual_pricing` | boolean | no | `false` | Requires Manual Pricing |
 | `status` | string \| null | no | — | Status |
@@ -113,7 +113,7 @@ Live provider IDs with reviewed native metadata, or unannotated compatible IDs.
 | `model_name` | string | yes | — | Model Name (max 190 chars) |
 | `display_name` | string \| null | no | — | Display Name |
 | `sort_order` | integer | no | `0` | Sort Order (numeric lower bound) |
-| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding` | no | `"text"` | Model Kind |
+| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding`, `decision` | no | `"text"` | Model Kind |
 | `media_pricing` | map of any \| null | no | — | Media Pricing |
 | `input_price_per_million` | number \| string \| null | no | — | Input Price Per Million |
 | `output_price_per_million` | number \| string \| null | no | — | Output Price Per Million |
@@ -138,9 +138,12 @@ Live provider IDs with reviewed native metadata, or unannotated compatible IDs.
 | `id` | integer | yes | — | Id |
 | `provider_id` | integer | yes | — | Provider Id |
 | `model_name` | string | yes | — | Model Name |
-| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding` | no | `"text"` | Model Kind |
+| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding`, `decision` | no | `"text"` | Model Kind |
 | `media_pricing` | map of any \| null | no | — | Media Pricing |
 | `effective_media_pricing` | map of any \| null | no | — | Effective Media Pricing |
+| `effective_media_price_sources` | map of any | no | — | Effective Media Price Sources |
+| `effective_text_price_sources` | map of enum: `manual`, `catalog` | no | — | Effective Text Price Sources |
+| `image_pricing_readiness` | map of any \| null | no | — | Image Pricing Readiness |
 | `api_model_name` | string | yes | — | Api Model Name |
 | `api_provider` | string | yes | — | Api Provider |
 | `provider_type` | string \| null | no | — | Provider Type |
@@ -171,6 +174,7 @@ Live provider IDs with reviewed native metadata, or unannotated compatible IDs.
 | `capability_source` | string \| null | no | — | Capability Source |
 | `effective_capabilities` | map of any \| null | no | — | Effective Capabilities |
 | `effective_capability_source` | string \| null | no | — | Effective Capability Source |
+| `domain_billing` | map of any \| null | no | — | Domain Billing |
 | `created_at` | string \| null | yes | — | Created At |
 | `updated_at` | string \| null | yes | — | Updated At |
 
@@ -181,7 +185,7 @@ Live provider IDs with reviewed native metadata, or unannotated compatible IDs.
 | `model_name` | string \| null | no | — | Model Name |
 | `display_name` | string \| null | no | — | Display Name |
 | `sort_order` | integer \| null | no | — | Sort Order |
-| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding` \| null | no | — | Model Kind |
+| `model_kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding`, `decision` \| null | no | — | Model Kind |
 | `media_pricing` | map of any \| null | no | — | Media Pricing |
 | `input_price_per_million` | number \| string \| null | no | — | Input Price Per Million |
 | `output_price_per_million` | number \| string \| null | no | — | Output Price Per Million |
@@ -221,10 +225,11 @@ Published embedding dimensions; null means the provider did not publish a constr
 | --- | --- | --- | --- | --- |
 | `id` | string | yes | — | Id |
 | `aliases` | array of string | yes | — | Aliases |
-| `kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding` | yes | — | Kind |
+| `kind` | enum: `text`, `image`, `tts`, `stt`, `realtime`, `embedding`, `decision` | yes | — | Kind |
 | `display_name` | string | yes | — | Display Name |
 | `status` | enum: `active`, `preview`, `deprecated` | yes | — | Status |
 | `context_window` | integer \| null | yes | — | Context Window |
+| `max_input_tokens` | integer \| null | no | — | Max Input Tokens |
 | `max_output_tokens` | integer \| null | yes | — | Max Output Tokens |
 | `input_modalities` | array of string \| null | yes | — | Input Modalities |
 | `output_modalities` | array of string \| null | yes | — | Output Modalities |
