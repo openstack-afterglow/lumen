@@ -44,6 +44,8 @@ The context fence and preview use the smaller of the provider input ceiling and 
 
 Online official OpenAI text normally reserves from request bytes, framing, published image bounds and the requested output budget. Server-expanded input uses the model ceiling. The stateless Messages bridge does not advertise or dispatch held OpenAI text routes because it cannot attest their terminal tier and cache evidence; Anthropic and compatible transports retain their legacy policy.
 
+A full model-ceiling reservation for server-expanded input does not bypass GPT-6.2's admission check for locally countable input. Over-limit requests fail before a hold or upstream dispatch.
+
 The Chat stream disables fallback billing before emitting an accounting error, so a client closing at the SSE error cannot turn a rejected result into a Standard-rate estimate.
 
 For held Chat and Responses streams, the SSE owner retains the pending upstream read and drains for at most 15 seconds after downstream disconnect. Delivery stops immediately; only authoritative terminal evidence can settle the hold.

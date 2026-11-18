@@ -342,6 +342,27 @@ async def test_distinct_input_limit_rejects_before_send(monkeypatch):
     send.assert_not_awaited()
 
 
+async def test_web_search_input_above_ceiling_rejects_before_reserve_or_dispatch(monkeypatch):
+    tools = [{"type": "web_search"}]
+    # In this tokenizer each repeated " a" adds one token to the framed request.
+    prefix = " a"
+    count = provider_metadata.count_context_tokens
+    framing = count(MODEL, [{"role": "user", "content": prefix}], tools).tokens - 1
+    prompt = prefix * (922_001 - framing)
+    assert count(MODEL, [{"role": "user", "content": prompt}], tools).tokens == 922_001
+    reserve, dispatch = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(core, "_authorize_completion", AsyncMock())
+    monkeypatch.setattr(core.stateless_credit, "reserve", reserve)
+    monkeypatch.setattr(provider_client, "aresponses", dispatch)
+
+    with pytest.raises(core.CompletionError) as failure:
+        await core.complete_responses(resolved=route_for(), input=prompt, stream=False, options={"tools": tools}, **OWNER)
+
+    assert (failure.value.status_code, failure.value.code) == (422, "context_length_exceeded")
+    reserve.assert_not_awaited()
+    dispatch.assert_not_awaited()
+
+
 @pytest.mark.parametrize("outcome", ["settled", "tier", "truncated"])
 async def test_hosted_sse_uses_terminal_evidence(monkeypatch, outcome):
     async def response():

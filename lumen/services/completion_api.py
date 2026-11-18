@@ -286,13 +286,14 @@ def _request_input_bound(
     # Framing is a Lumen allowance, not a vendor tokenizer guarantee. Count
     # encrypted reasoning bytes assuming ciphertext bytes >= replayed tokens.
     # Usage over the bound cannot settle.
-    if content_growth:
-        return ceiling, may_write_long
-    try:
-        size = len(json.dumps(prompt, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
-    except (ValueError, UnicodeError):
-        raise CompletionError(422, "Invalid OpenAI request content.", code="invalid_request_body") from None
-    bound = min(ceiling, size - image_wire_bytes + image_tokens + 4_096 + 16 * (len(messages) + len(tools or ())))
+    bound = ceiling
+    if not content_growth:
+        try:
+            size = len(json.dumps(prompt, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+        except (ValueError, UnicodeError):
+            raise CompletionError(422, "Invalid OpenAI request content.", code="invalid_request_body") from None
+        bound = min(ceiling, size - image_wire_bytes + image_tokens + 4_096 + 16 * (len(messages) + len(tools or ())))
+    # A full funding envelope does not exempt countable input from admission.
     if bound == ceiling and model.get("max_input_tokens") is not None:
         count = provider_metadata.count_context_tokens(route["model_name"], messages, tools).tokens
         if count is not None and count > ceiling:
