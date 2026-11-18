@@ -4,6 +4,8 @@
 
 `test-passed` on the model-identity slice: 1,066 focused pytest cases and Ruff on changed Python files. Coverage includes duplicate model names under separate provider connections, exact kind filters, native route assertions, legacy media decimal IDs, agent create/update/clone and child routing, retry after an agent model change, and unchanged OpenAI/Anthropic request schemas. Synthetic upstream tests confirm that local row IDs never enter the Decisions provider payload.
 
+`test-passed` after compatibility corrections: 1,025 focused cases and Ruff. Coverage includes explicit root selection with a stale or ambiguous name-only agent default, exact agent pin enforcement, shared legacy alias checks, and 409 responses for ambiguous OpenAI-compatible image generation and speech.
+
 The migration manifest and ORM contract passed locally. The history projection has a MariaDB integration case; that test and migration application against MariaDB were not run for this slice. No live provider or deployment check ran.
 
 ## Lumen 0.6.20 — 발행·운영 배포·OpenAI 유료 확인

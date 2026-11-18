@@ -458,24 +458,41 @@ async def resolve_model(model_name: str, *, required_capabilities=("chat",)) -> 
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
+def _api_model_candidates(selector: str) -> set[str]:
+    candidates = {selector, f"perplexity/{selector}", f"perplexity/perplexity/{selector}", f"gemini/{selector}"}
+    for prefix in ("perplexity/", "perplexity/perplexity/", "gemini/"):
+        if selector.startswith(prefix):
+            bare = selector.removeprefix(prefix)
+            candidates.add(bare)
+            if prefix == "gemini/":
+                candidates.add(f"gemini/{bare}")
+            else:
+                candidates.update((f"perplexity/{bare}", f"perplexity/perplexity/{bare}"))
+    return candidates
+
+
+def _api_model_name_matches(selector: str, model_name: str, provider_type: str) -> bool:
+    api_name = api_model_name(model_name, provider_type)
+    short_name = short_model_name(model_name, provider_type)
+    return (
+        selector in (api_name, short_name, model_name)
+        or f"perplexity/{selector}" == api_name
+        or selector.removeprefix("perplexity/") in (short_name, api_name.removeprefix("perplexity/"))
+        or (provider_type == "gemini" and (
+            f"gemini/{selector}" == model_name or selector.removeprefix("gemini/") in (short_name, api_name)
+        ))
+    )
+
+
 def matches_api_model_selector(route: dict, selector: str) -> bool:
-    """Check a public selector against an already-selected catalog row."""
+    """Check the same public selector accepted by name routing against an exact row."""
     route_ids = parse_cli_route_id(selector)
     if route_ids is not None:
         return route_ids == (route["provider_id"], route["model_id"])
     model_name = route["model_name"]
-    provider_type = route["provider_type"]
-    api_name = route["api_model_name"]
-    short_name = short_model_name(model_name, provider_type)
-    if selector in (model_name, api_name, short_name):
-        return True
-    if provider_type == "gemini":
-        return selector.removeprefix("gemini/") in (api_name, short_name)
-    if provider_type == "perplexity":
-        return selector.removeprefix("perplexity/").removeprefix("perplexity/") in (
-            short_name, api_name.removeprefix("perplexity/"),
-        )
-    return False
+    return model_name in _api_model_candidates(selector) and _api_model_name_matches(
+        selector, model_name, route["provider_type"],
+    )
 
 
 async def resolve_media_model(
@@ -495,9 +512,9 @@ async def resolve_media_model(
             raise ProviderValidationError("model_selection_mismatch")
         route = await resolve_model_by_id(row_id, model_kind=model_kind)
     elif model_id is not None:
-        filters = {"provider_type": provider_type} if provider_type is not None or model_kind == "realtime" else {}
         route = await resolve_api_model(
-            model_id, provider=api_provider, provider_id=provider_number, model_kind=model_kind, **filters,
+            model_id, provider=api_provider, provider_id=provider_number, model_kind=model_kind,
+            provider_type=provider_type,
         )
     else:
         return None
@@ -531,26 +548,7 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None,
             *route_ids, provider=provider, model_kind=model_kind, provider_id=provider_id, provider_type=provider_type,
             required_capabilities=required_capabilities,
         )
-    candidates = {
-        model_name,
-        f"perplexity/{model_name}",
-        f"perplexity/perplexity/{model_name}",
-        f"gemini/{model_name}",
-    }
-    if model_name.startswith("perplexity/"):
-        bare = model_name.removeprefix("perplexity/")
-        candidates.add(bare)
-        candidates.add(f"perplexity/{bare}")
-        candidates.add(f"perplexity/perplexity/{bare}")
-    if model_name.startswith("perplexity/perplexity/"):
-        bare = model_name.removeprefix("perplexity/perplexity/")
-        candidates.add(bare)
-        candidates.add(f"perplexity/{bare}")
-        candidates.add(f"perplexity/perplexity/{bare}")
-    if model_name.startswith("gemini/"):
-        bare = model_name.removeprefix("gemini/")
-        candidates.add(bare)
-        candidates.add(f"gemini/{bare}")
+    candidates = _api_model_candidates(model_name)
     factory = _require_db()
     try:
         async with factory() as session:
@@ -573,27 +571,10 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None,
                 stmt = stmt.where(LlmProvider.provider_type == provider_type)
             rows = (await session.execute(stmt)).all()
 
-            def _row_matches(model_row: LlmModel, provider_row: LlmProvider) -> bool:
-                ptype = provider_row.provider_type
-                api_name = api_model_name(model_row.model_name, ptype)
-                short_name = short_model_name(model_row.model_name, ptype)
-                if model_name in (api_name, short_name, model_row.model_name):
-                    return True
-                if f"perplexity/{model_name}" == api_name:
-                    return True
-                if model_name.removeprefix("perplexity/") in (
-                    short_name,
-                    api_name.removeprefix("perplexity/"),
-                ):
-                    return True
-                if ptype == "gemini" and (
-                    f"gemini/{model_name}" == model_row.model_name
-                    or model_name.removeprefix("gemini/") in (short_name, api_name)
-                ):
-                    return True
-                return False
-
-            matches = [(model, route_provider) for model, route_provider in rows if _row_matches(model, route_provider)]
+            matches = [
+                (model, route_provider) for model, route_provider in rows
+                if _api_model_name_matches(model_name, model.model_name, route_provider.provider_type)
+            ]
             if not matches:
                 return None
 

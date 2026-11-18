@@ -49,6 +49,7 @@ from .errors import (
     DurableRunInputError,
     DurableRunNotFound,
     DurableRunProviderResultUnknown,
+    MediaModelAmbiguous,
 )
 from .lifecycle import _cancel_requested, _require_owned_running_lease
 from .media import (
@@ -214,9 +215,7 @@ async def prepare_audio_run(request: dict, *, project_id: str, user_id: str,
         route = await routing.resolve_media_model(model_id, model_row_id=model_row_id, provider_id=provider_id,
                                                   model_kind=kind)
     except AmbiguousModelRouteError as exc:
-        if "compat:audio:write" in (required_scopes or ()):
-            raise DurableRunConflict("model_route_ambiguous") from exc
-        raise DurableRunInputError("audio provider selection is ambiguous") from exc
+        raise MediaModelAmbiguous("audio provider selection is ambiguous") from exc
     if route is None:
         raise DurableRunInputError("audio provider or model is unavailable")
     if kind == "tts":

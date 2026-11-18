@@ -558,16 +558,14 @@ async def _resolve_model(model_name: str | None, *, model_row_id: int | None = N
 async def _resolve_run_model(
     model_name: str | None, model_row_id: int | None, agent: dict | None,
 ) -> dict:
-    """A configured agent pins the primary chat route; otherwise use the request."""
-    agent_model_name = (agent or {}).get("model_name")
+    """An exact agent pin is authoritative; a legacy name is only a default."""
     agent_model_row_id = (agent or {}).get("model_row_id")
-    if agent_model_row_id is None and not agent_model_name:
+    if agent_model_row_id is None:
+        if model_name is None and model_row_id is None:
+            model_name = (agent or {}).get("model_name")
         return await _resolve_model(model_name, model_row_id=model_row_id)
 
-    route = await _resolve_model(
-        agent_model_name if agent_model_row_id is None else None,
-        model_row_id=agent_model_row_id,
-    )
+    route = await _resolve_model(None, model_row_id=agent_model_row_id)
     if (model_row_id is not None and model_row_id != route["model_id"]) or (
         model_name is not None and model_name != route["model_name"]
     ):

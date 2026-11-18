@@ -914,6 +914,7 @@ class TestCanonicalCompletionRequests:
                     "id": 9,
                     "role": "general",
                     "instructions": None,
+                    "model_name": "stale-legacy-default",
                     "params": {},
                     "tool_ids": [],
                     "mcp_ids": [],
@@ -944,6 +945,7 @@ class TestCanonicalCompletionRequests:
         response = await client.post(f"{_BASE}/c1/completions", headers=_HEADERS, json=_request(agent_id="9"))
 
         assert response.status_code == 202
+        assert seen["model_name"] == "gpt-3.5-turbo"
         policy = seen["request_payload"]["execution_policy"]
         assert policy["max_model_turns"] == 3
         assert policy["max_tool_calls"] == 7

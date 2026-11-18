@@ -15,7 +15,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 Native chat, context, Decisions, image, audio and realtime requests can select an active catalog row through `model_row_id`. The exact lookup preserves model-kind, capability, pricing and authority checks. A supplied legacy selector must identify the same row. Provider/model identity is frozen in the durable snapshot; retry selects that row even after an agent's pinned model changes. Legacy snapshots without a row ID can only resolve a unique name. Compatible OpenAI and Anthropic requests continue to use public model names and provider selectors.
 
-Migration 039 adds nullable `chat_agents.model_row_id`. Root and delegated agents use an exact pin if configured; otherwise a legacy agent's name must resolve uniquely. The column has no catalog foreign key: removing a model cannot clear a pin and silently redirect an agent. Message history projects only the row ID from the run's frozen route, never provider credentials or the full snapshot.
+Migration 039 adds nullable `chat_agents.model_row_id`. Root and delegated agents use an exact pin if configured. Without a pin, a root run honors its explicit request; an agent's legacy default must resolve uniquely when used. The column has no catalog foreign key: removing a model cannot clear a pin and silently redirect an agent. Message history projects only the row ID from the run's frozen route, never provider credentials or the full snapshot.
 
 ### Dashboard MCP and cloud-approval integration
 

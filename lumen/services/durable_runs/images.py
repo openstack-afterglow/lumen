@@ -45,6 +45,7 @@ from .errors import (
     DurableRunInputError,
     DurableRunNotFound,
     DurableRunProviderResultUnknown,
+    MediaModelAmbiguous,
 )
 from .lifecycle import _cancel_requested, _require_owned_running_lease
 from .media import (
@@ -143,9 +144,7 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
         route = await routing.resolve_media_model(model_id, model_row_id=model_row_id, provider_id=provider_id,
                                                   model_kind="image")
     except AmbiguousModelRouteError as exc:
-        if "compat:images:write" in (required_scopes or ()):
-            raise DurableRunConflict("model_route_ambiguous") from exc
-        raise DurableRunInputError("image provider selection is ambiguous") from exc
+        raise MediaModelAmbiguous("image provider selection is ambiguous") from exc
     if route is None:
         raise DurableRunInputError("image provider or model is unavailable")
     source_asset_id = intent["source_asset_id"]
