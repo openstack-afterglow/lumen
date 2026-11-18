@@ -19,7 +19,12 @@ async def candidate_ids(
     project_id: str | None,
     workspace_id: int | None,
     limit: int,
+    domain_id: str,
 ) -> list[int]:
     """Return only vector IDs for one exact namespace; plaintext stays in MySQL until hydration."""
     namespace = Namespace(user_id=user_id, project_id=project_id, workspace_id=workspace_id, include_account=False)
-    return await memory_host.recall_candidate_ids(namespace=namespace, strategy="semantic", query=query, limit=limit)
+    target_project = domain_id if project_id is not None else None
+    return await memory_host.recall_candidate_ids(
+        namespace=namespace, strategy="semantic", query=query, limit=limit, domain_id=domain_id,
+        vector_scopes=((target_project, workspace_id),),
+    )

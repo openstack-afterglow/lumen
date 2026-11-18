@@ -53,6 +53,7 @@ async def stream(
     delegation_enabled: bool = False,
     sandbox_lease: tuple[str, int] | None = None,
     sandbox_tools: list[dict[str, str]] | None = None,
+    vault_domain_id: str | None = None,
 ) -> AsyncIterator[dict]:
     async for ev in graph.stream(
         model=model,
@@ -94,5 +95,6 @@ async def stream(
         delegation_enabled=delegation_enabled,
         sandbox_lease=sandbox_lease,
         sandbox_tools=sandbox_tools,
+        vault_domain_id=vault_domain_id,
     ):
         yield ev

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +14,11 @@ from lumen.services import title_jobs
 pytestmark = pytest.mark.asyncio
 # These tests replace the committed claim and exercise only post-claim behavior.
 # Actual registration gates and finish-inflight behavior are integration-tested.
+
+@pytest.fixture(autouse=True)
+def current_vault_scope(monkeypatch):
+    monkeypatch.setattr(jobs, "revalidate", AsyncMock())
+
 
 
 class _Result:
@@ -42,6 +48,9 @@ def _run(**overrides):
         "run_scope": "persistent",
         "parent_run_id": None,
         "conversation_id": "conversation-1",
+        "source": "web",
+        "api_key_id": None,
+        "capability_snapshot": {"vault_domain_id": "domain-1"},
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -69,6 +78,8 @@ async def test_enqueue_completed_run_uses_one_idempotency_key():
         (_run(run_scope="temp"), True),
         (_run(parent_run_id="parent-run"), True),
         (_run(conversation_id=None), True),
+        (_run(api_key_id=7), True),
+        (_run(capability_snapshot={}), True),
         (_run(), False),
     ],
 )
@@ -85,7 +96,7 @@ async def test_process_one_applies_small_model_deltas_and_completes_atomically(m
 
     async def fake_claim(*, owner):
         assert owner == "worker-1"
-        return "job-1", "run-1", "conversation-1", "project-1", "user-1"
+        return "job-1", "run-1", "conversation-1", "project-1", "user-1", "domain-1"
 
     async def fake_extract(**kwargs):
         assert kwargs == {
@@ -93,6 +104,7 @@ async def test_process_one_applies_small_model_deltas_and_completes_atomically(m
             "project_id": "project-1",
             "run_id": "run-1",
             "user_id": "user-1",
+            "domain_id": "domain-1",
         }
         return [{"op": "add", "category": "preference", "content": "다크 모드 선호"}]
 
@@ -110,6 +122,7 @@ async def test_process_one_applies_small_model_deltas_and_completes_atomically(m
         "owner": "worker-1",
         "project_id": "project-1",
         "user_id": "user-1",
+        "domain_id": "domain-1",
         "ops": [{"op": "add", "category": "preference", "content": "다크 모드 선호"}],
     }
 
@@ -118,7 +131,7 @@ async def test_process_one_does_not_retry_when_another_worker_owns_the_lease(mon
     retried = []
 
     async def fake_claim(*, owner):
-        return "job-1", "run-1", "conversation-1", "project-1", "user-1"
+        return "job-1", "run-1", "conversation-1", "project-1", "user-1", "domain-1"
 
     async def fake_extract(**_kwargs):
         return []
@@ -142,7 +155,7 @@ async def test_process_one_retries_transient_extraction_failure(monkeypatch):
     retried = {}
 
     async def fake_claim(*, owner):
-        return "job-1", "run-1", "conversation-1", "project-1", "user-1"
+        return "job-1", "run-1", "conversation-1", "project-1", "user-1", "domain-1"
 
     async def fake_extract(**_kwargs):
         raise RuntimeError("provider unavailable")
@@ -162,7 +175,7 @@ async def test_process_one_retries_post_apply_failure(monkeypatch):
     retried = {}
 
     async def fake_claim(*, owner):
-        return "job-1", "run-1", "conversation-1", "project-1", "user-1"
+        return "job-1", "run-1", "conversation-1", "project-1", "user-1", "domain-1"
 
     async def fake_extract(**_kwargs):
         return [{"op": "add", "category": "preference", "content": "다크 모드 선호"}]
@@ -237,6 +250,7 @@ async def test_post_apply_crash_rolls_back_the_memory_and_completion_transaction
             owner="worker-1",
             project_id="project-1",
             user_id="user-1",
+            domain_id="domain-1",
             ops=[{"op": "add", "category": "preference", "content": "다크 모드 선호"}],
         )
 

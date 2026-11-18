@@ -12,8 +12,8 @@ from sqlalchemy.orm import aliased
 from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content
 from lumen.db import get_session_factory
-from lumen.models.chat_db import ChatMemory
 from lumen.models.chat_jobs import ChatMemoryOutbox
+from lumen.models.vault import VaultNote
 from lumen.services import auxiliary
 from lumen.services.memory_embeddings import embed_maintenance
 from lumen.services.memory_store import memory_content_fingerprint
@@ -35,16 +35,16 @@ class ClaimedMemoryMutation:
     active: bool
 
 
-def _snapshot(row: ChatMemoryOutbox, memory: ChatMemory | None) -> ClaimedMemoryMutation:
+def _snapshot(row: ChatMemoryOutbox, memory: VaultNote | None) -> ClaimedMemoryMutation:
     return ClaimedMemoryMutation(
         change_seq=row.change_seq,
-        memory_id=row.memory_id,
-        mutation=row.mutation,
+        memory_id=row.vault_note_id if row.vault_note_id is not None else row.memory_id,
+        mutation=row.mutation if row.vault_note_id is not None else "delete",
         content_hash=row.content_hash,
         required_generations=tuple(int(value) for value in row.required_generations),
         plaintext=decrypt_chat_content(memory.content) if memory and memory.content else None,
         user_id=memory.user_id if memory else None,
-        project_id=memory.project_id if memory else None,
+        project_id=memory.vector_project_id if memory else None,
         workspace_id=memory.workspace_id if memory else None,
         active=bool(memory and memory.status == "active" and memory.is_active),
     )
@@ -132,7 +132,7 @@ async def _claim_snapshot(*, owner: str, lease_seconds: int, required_generation
         row = await claim_next(session, owner=owner, lease_seconds=lease_seconds)
         if row is None:
             return None
-        memory = await session.get(ChatMemory, row.memory_id)
+        memory = await session.get(VaultNote, row.vault_note_id) if row.vault_note_id is not None else None
         return _snapshot(row, memory)
 
 
@@ -153,8 +153,8 @@ async def _finish_claim(
         if row is None or row.status != "running" or row.lease_owner != owner:
             return
 
-        current = await session.get(ChatMemory, row.memory_id)
-        stale_upsert = row.mutation == "upsert" and (
+        current = await session.get(VaultNote, row.vault_note_id) if row.vault_note_id is not None else None
+        stale_upsert = row.vault_note_id is not None and row.mutation == "upsert" and (
             current is None
             or current.status != "active"
             or not current.content
@@ -166,11 +166,7 @@ async def _finish_claim(
         if row.status == "completed":
             row.lease_owner = None
             row.lease_expires_at = None
-            if row.mutation == "delete" and current is not None and current.status == "deleting":
-                # The FK prevents ciphertext removal until this completed event is gone.
-                await session.delete(row)
-                await session.flush()
-                await session.delete(current)
+            # The immutable Vault revision history owns archived ciphertext.
             return
         row.attempts += 1
         row.error_code = error_code or "memory_vector_apply_failed"

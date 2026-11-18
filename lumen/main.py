@@ -356,6 +356,7 @@ from lumen.api import (
 )
 from lumen.api import plugins as plugin_routes
 from lumen.api import policy as policy_routes
+from lumen.api import vault as vault_routes
 from lumen.api.compat import anthropic as compat_anthropic
 from lumen.api.compat import audio as compat_audio
 from lumen.api.compat import batches as compat_batches
@@ -375,6 +376,7 @@ from lumen.auth import require_chat_api_host
 app.include_router(policy_routes.router, prefix="/v1", tags=["Policy"])
 app.include_router(plugin_routes.admin_router, prefix="/v1", tags=["Plugin Administration"])
 app.include_router(plugin_routes.router, prefix="/v1", tags=["Plugin Catalogue"])
+app.include_router(vault_routes.router, prefix="/v1", tags=["Agent Vault"])
 app.include_router(agent_runtime_routes.admin_router, prefix="/v1", tags=["Agent Runtime Administration"])
 app.include_router(agent_runtime_routes.router, prefix="/v1", tags=["Agent Runtime"])
 for router, tag in (
