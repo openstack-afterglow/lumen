@@ -51,6 +51,7 @@ async def owner():
 async def dashboard(owner):
     identity = {"auth_type": "keystone", "credential_class": "keystone", "source": "web", "roles": ["member"],
                 "scopes": (), "api_key_id": None, "is_system_admin": False, "user_id": owner.user_id,
+                "ingress_verified": True,
                 "domain_id": owner.domain_id, "project_id": owner.project_id}
     app.dependency_overrides[get_principal] = lambda: identity
     try:
@@ -254,7 +255,7 @@ async def test_automatic_ops_and_dashboard_tool_dispatch(owner, monkeypatch):
 
     monkeypatch.setattr(vault_store.auth, "_resolve_project_authority", current)
     run = SimpleNamespace(source="web", api_key_id=None, run_scope="persistent", parent_run_id=None,
-                          capability_snapshot={"vault_domain_id": owner.domain_id})
+                          capability_snapshot={"vault_domain_id": owner.domain_id, "vault_ingress_verified": True})
     ctx = ToolContext(run_id="synthetic-run", tool_call_id="tool-1", user_id=owner.user_id,
                       project_id=owner.project_id, vault_domain_id=vault_store.frozen_run_domain(run),
                       execution_hooks=object(), binding_session=contracts.ToolBindingSession(),

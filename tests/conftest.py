@@ -139,6 +139,7 @@ async def _client_for(mock_conn, *, is_system_admin: bool):
             "api_key_id": None,
             "scopes": (),
             "source": "web",
+            "ingress_verified": True,
         }
 
     async def conn_override():

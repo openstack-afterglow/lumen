@@ -1320,6 +1320,7 @@ async def prepare_context_input(
         capability_snapshot["credential_authority"] = credential_authority
     if vault_domain_id is not None:
         capability_snapshot["vault_domain_id"] = vault_domain_id
+        capability_snapshot["vault_ingress_verified"] = True
     from lumen.services.inference_authority import model_required_scopes, native_run_scopes
 
     capability_snapshot["required_scopes"] = list(native_run_scopes({

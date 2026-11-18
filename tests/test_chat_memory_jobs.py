@@ -50,7 +50,7 @@ def _run(**overrides):
         "conversation_id": "conversation-1",
         "source": "web",
         "api_key_id": None,
-        "capability_snapshot": {"vault_domain_id": "domain-1"},
+        "capability_snapshot": {"vault_domain_id": "domain-1", "vault_ingress_verified": True},
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -80,6 +80,7 @@ async def test_enqueue_completed_run_uses_one_idempotency_key():
         (_run(conversation_id=None), True),
         (_run(api_key_id=7), True),
         (_run(capability_snapshot={}), True),
+        (_run(capability_snapshot={"vault_domain_id": "domain-1"}), True),
         (_run(), False),
     ],
 )

@@ -314,7 +314,7 @@ async def test_member_can_destroy_owned_config_without_owner_bypass(management_a
 
 async def test_memory_cleanup_requires_project_writer(management_app, monkeypatch):
     app, principal = management_app
-    principal.update(domain_id="domain", source="web")
+    principal.update(domain_id="domain", source="web", ingress_verified=True)
     provider = SimpleNamespace(delete=AsyncMock())
     monkeypatch.setattr(memory, "get_plugin", lambda _: provider)
     monkeypatch.setattr(memory.memory_host, "access_for", lambda namespace, **_kwargs: namespace)

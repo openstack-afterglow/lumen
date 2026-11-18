@@ -65,6 +65,7 @@ def human_domain(principal: dict | None) -> str | None:
         or principal.get("source") != "web"
         or principal.get("api_key_id") is not None
         or principal.get("credential_restricted", False)
+        or principal.get("ingress_verified") is not True
     ):
         return None
     domain_id = principal.get("domain_id")
@@ -79,7 +80,7 @@ def frozen_run_domain(run) -> str | None:
     ):
         return None
     snapshot = run.capability_snapshot or {}
-    if snapshot.get("credential_authority") is not None:
+    if snapshot.get("credential_authority") is not None or snapshot.get("vault_ingress_verified") is not True:
         return None
     domain_id = snapshot.get("vault_domain_id")
     return domain_id if isinstance(domain_id, str) and 0 < len(domain_id) <= 64 else None

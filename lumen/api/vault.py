@@ -38,7 +38,7 @@ router = APIRouter(prefix="/vault", route_class=VaultRoute)
 
 async def dashboard_principal(principal: dict = Depends(get_principal)) -> dict:
     if vs.human_domain(principal) is None:
-        raise HTTPException(403, "vault_dashboard_required")
+        raise HTTPException(403, "vault_ingress_unverified")
     return principal
 
 

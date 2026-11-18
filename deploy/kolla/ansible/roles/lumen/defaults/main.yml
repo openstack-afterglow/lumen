@@ -97,6 +97,8 @@ lumen_public_haproxy_enabled: false
 lumen_public_haproxy_fqdn: ""
 
 lumen_encryption_key: ""
+# Optional shared password from Kolla inventory. Empty disables dashboard Vault.
+lumen_afterglow_ingress_secret: ""
 # Provider bootstrap credentials are explicit Kolla inventory variables, not
 # inherited from the Ansible host shell. Keep values out of lumen.conf.
 lumen_openai_api_key: ""
@@ -325,6 +327,7 @@ lumen_service_environments:
     KEYSTONE_REGION_NAME: "{{ lumen_keystone_region_name }}"
     KEYSTONE_INTERFACE: "{{ lumen_keystone_interface }}"
     LUMEN_ENCRYPTION_KEY: "{{ lumen_encryption_key }}"
+    LUMEN_AFTERGLOW_INGRESS_SECRET: "{{ lumen_afterglow_ingress_secret | default('', true) }}"
     MCP_CONTROL_PLANE_URL: "{{ lumen_mcp_control_plane_url }}"
     LUMEN_MCP_SERVICE_TOKEN: "{{ lumen_mcp_service_token }}"
     CHAT_EXECUTION_PROTOCOL_VERSION: "{{ lumen_chat_execution_protocol_version | string }}"
