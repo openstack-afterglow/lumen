@@ -6,6 +6,34 @@
 
 Image unit readiness follow-up: `test-passed` with 734 focused cases and Ruff. Base-only unit pricing is not ready (`pricing_unavailable`). A Gemini 2.5 row with only a positive `1024x1024:high` variant is not ready (`unsupported_image_variants`), and adding `1024x1024:auto` makes it ready. Leaf variant overlays count toward readiness. The full `lumen-test integration` run on disposable MariaDB/Redis had 814 passed, 4 skipped and 5 failed. None of the failures involve pricing: `keystone_session_required` in `test_native_api_key_flow.py`, a missing `payer_domain_id` column in `test_runtime_workload_migration.py`, and a stale schema snapshot.
 
+## Gemini Models API and SDK compatibility
+
+`test-passed` locally (2026-11-19, CPython 3.13.12, `google-genai==3.5.0`, `openai==2.53.0`, `anthropic==0.125.0`). `tests/test_gemini_sdk_compat.py`, `tests/test_official_sdk_compat.py`, `tests/test_embeddings_api.py` and `tests/test_cli_model_catalog.py`: 138 passed. The official clients call the real mounted ASGI app. Only the API-key lookup, credential decryption, credit precheck/settlement, an in-memory SQLite catalog and the private Bifrost endpoint are synthetic.
+
+Gen AI coverage:
+- discovery: models.list paging through `pageToken`; exact text and embedding names for duplicated public IDs; chat-eligibility discovery (tools- and streaming-disabled priced model listed with `generateContent` only and callable; unpriced model hidden); models.get bare/exact/ambiguous-409/`X-Lumen-Provider`;
+- native Gemini: `generate_content` with system instruction, `topK` and pass-through `safetySettings`, plus an injected `maxOutputTokens` equal to the hold bound; inline PNG; `generate_content_stream` (`alt=sse`, usage in the final chunk);
+- translated routes: OpenAI with function declarations returned as `functionCall`; streaming through an Anthropic route;
+- embeddings: `embed_content`;
+- errors and policy: Google error envelopes for 404, the virtual `lumen` model, server tools, `candidateCount`, translated-only rejections, upstream 429, 401, missing-scope 403 and `countTokens` 501; one settlement row per successful call.
+
+The OpenAI SDK covers model list, chat, Responses and base64 embeddings; the Anthropic SDK covers paged model list and Messages. A mixed catalog (custom OpenAI, Claude, Gemini, bounded official `gpt-6.2-sol`) lists only Messages-eligible IDs; each listed ID succeeds through `messages.create`, and the hidden ID returns `messages_accounting_unsupported`.
+
+`go vet ./...` and `go test ./...` in `runtime/bifrost` passed, including the native `gemini_generate` wire, response passthrough and usage-terminal test. The full root `-m "not integration and not system"` suite had the same 82 failures on this branch and on the base `37ab4b1` (identical failure lists; for example, `tests/test_gemini_decisions.py` payer assertions and `tests/test_service_inference_authority.py`).
+
+A `@google/genai` wire probe confirmed the Node.js SDK sends `x-goog-api-key` and keeps `models/lumen/<p>/<m>` slashes raw for list/get/generate/stream. It ran against a stubbed fetch, not Lumen.
+
+After merging the migration 038 key branch (`feat/ds-keys-on-int@8194594`), the unit fixtures return the real personal model-key principal (payer, `lumen:key:<id>` storage actor, synthetic Keystone owner/domain) and record payer-scoped stateless reserve/settle/finish. `tests/test_gemini_sdk_compat.py` and `tests/test_official_sdk_compat.py` 27 passed. These include a Sonar case: the route is hidden from `/v1/models` (both formats), `/v1/cli/models` and `/v1beta/models`, and OpenAI, Anthropic and Gemini dispatch return 403 `model_requires_server_tools` with no hold or provider call. The six-file unit set (`test_gemini_sdk_compat`, `test_official_sdk_compat`, `test_embeddings_api`, `test_ai_compat`, `test_cli_model_catalog`, `test_model_api_keys`) ran 183 passed / 48 failed. The same 48 fail on a clean `8194594` checkout (key-branch fixture drift still being fixed there).
+
+`uv run lumen-test integration -k "gemini_model_key or model_api_key_billing or embedding_settlement"`: 9 passed on disposable MariaDB/Redis. `tests/integration/test_gemini_model_key_sdk.py` drives the official SDK through the real API-key dependency with persisted personal and service keys; only the Keystone directory and private Bifrost are synthetic. It covers:
+- two Gemini providers with same-named embedding rows listed as distinct exact IDs, each embedded successfully;
+- `generate_content` settles exactly one payer-scoped stateless hold and writes a ledger row: personal → user payer, service → domain pool, `project_id` NULL;
+- a key holding only `models:read` gets 403 `PERMISSION_DENIED` for generate and embed;
+- an official `perplexity/sonar` row is hidden from discovery and refused with 403 `model_requires_server_tools`, with no hold row;
+- a text row and an embedding row sharing a public name are listed as two exact IDs; get works for each and the bare name returns 409; `generate_content`/`embed_content` succeed on the respective IDs.
+
+Not verified: live providers, JavaScript end-to-end against Lumen, deployment.
+
 ## Prepaid domain billing (migration 037)
 
 `test-defined`: `tests/integration/test_domain_credit.py` uses the migrated, disposable MariaDB. It races two humans and a service-key-shaped hold against a dashboard provider intent, checks project-quota lock order from two sessions, and checks nested allocation accounting. It also covers duplicate settlement/release/top-up, ledger balance, live manager denial, and the effective admin ceiling. No paid provider calls run in these tests.

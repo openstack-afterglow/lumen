@@ -48,7 +48,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({{
             "contract": {runtime.CONTRACT!r},
             "version": "wrong" if mode == "bad_probe" else {runtime.BIFROST_VERSION!r},
-            "supported_protocols": ["chat", "responses", "messages", "count_tokens", "embeddings"],
+            "supported_protocols": ["chat", "responses", "messages", "count_tokens", "embeddings", "gemini_generate"],
         }}).encode())
 server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
 print(json.dumps({{"ready": True,

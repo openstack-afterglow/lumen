@@ -22,7 +22,7 @@ const Version = "v1.13.2-0.20261021235121-668a660e5ac0"
 const Contract = "single-attempt-v1"
 const ContractHeader = "X-Lumen-Bifrost-Contract"
 
-var Protocols = []string{"chat", "responses", "messages", "count_tokens", "embeddings"}
+var Protocols = []string{"chat", "responses", "messages", "count_tokens", "embeddings", "gemini_generate"}
 
 // Envelope is never persisted or logged. Authentication material belongs to this invocation.
 type Envelope struct {

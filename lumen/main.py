@@ -382,6 +382,7 @@ from lumen.api.compat import decisions as compat_decisions
 from lumen.api.compat import discovery as compat_discovery
 from lumen.api.compat import embeddings as compat_embeddings
 from lumen.api.compat import files as compat_files
+from lumen.api.compat import gemini as compat_gemini
 from lumen.api.compat import images as compat_images
 from lumen.api.compat import openai as compat_openai
 from lumen.api.compat import realtime as compat_realtime
@@ -441,6 +442,7 @@ for router, tag in (
     app.include_router(router, prefix="/v1", tags=[tag], dependencies=[Depends(require_chat_api_host)])
 app.include_router(compat_realtime.router, tags=["Realtime Voice Compat"])
 compat_embeddings.google_router.include_router(compat_decisions.google_router, tags=["Gemini Decisions Compat"])
+compat_embeddings.google_router.include_router(compat_gemini.router)
 app.include_router(
     compat_embeddings.google_router, tags=["Gemini Compat"],
     dependencies=[Depends(require_chat_api_host)],
@@ -487,6 +489,7 @@ def custom_openapi() -> dict:
         "openai_embeddings": "OpenAI-compatible stateless text embeddings (/v1/embeddings)",
         "openai_decisions": "OpenAI-compatible stateless typed decisions (/v1/decisions)",
         "gemini_embeddings": "Google Gemini-compatible text embeddings (/v1beta/models/{model}:embedContent, :batchEmbedContents)",
+        "gemini_models": "Google Gemini API v1beta models list/get, generateContent and streamGenerateContent (?alt=sse)",
         "gemini_decisions": "Google Gemini-compatible stateless typed decisions (/v1beta/decisions)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
         "openai_images": "OpenAI-compatible durable image generation and edits (/v1/images/generations, /v1/images/edits)",
@@ -554,9 +557,15 @@ def custom_openapi() -> dict:
     ):
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             schema["paths"][path][method]["security"] = api_key_security
-    for path in ("/v1beta/decisions", "/v1beta/models/{model}:embedContent", "/v1beta/models/{model}:batchEmbedContents"):
-        if path in schema.get("paths", {}) and "post" in schema["paths"][path]:
-            schema["paths"][path]["post"]["security"] = [*api_key_security, {"GoogleApiKey": []}]
+    gemini_paths = (
+        ("/v1beta/decisions", "post"), ("/v1beta/models/{model}:embedContent", "post"),
+        ("/v1beta/models/{model}:batchEmbedContents", "post"), ("/v1beta/models", "get"),
+        ("/v1beta/models/{model}", "get"), ("/v1beta/models/{model}:generateContent", "post"),
+        ("/v1beta/models/{model}:streamGenerateContent", "post"), ("/v1beta/models/{model}:countTokens", "post"),
+    )
+    for path, method in gemini_paths:
+        if path in schema.get("paths", {}) and method in schema["paths"][path]:
+            schema["paths"][path][method]["security"] = [*api_key_security, {"GoogleApiKey": []}]
 
     route_scopes: dict[tuple[str, str], list[str]] = {
         ("/v1/claude-gateway/v1/messages", "post"): ["compat:completions:write"],
@@ -622,7 +631,8 @@ def custom_openapi() -> dict:
         ("/v1/batches/{batch_id}/cancel", "post"): ["compat:batches:write"],
     }
     model_key_scopes = {
-        (path, method.lower()): [scope]
+        # Route templates may use converters (``{model:path}``); OpenAPI paths do not.
+        (path.replace("{model:path}", "{model}"), method.lower()): [scope]
         for (method, path), scope in MODEL_API_KEY_ROUTE_SCOPES.items()
         if method != "WEBSOCKET"
     }

@@ -16,7 +16,7 @@ from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun, ChatRunProvider
 from lumen.services.bifrost_runtime import BIFROST_VERSION
-from lumen.services.capabilities import reasoning_explicitly_unsupported
+from lumen.services.capabilities import provider_capabilities, reasoning_explicitly_unsupported
 from lumen.services.provider_metadata import (
     NATIVE_PROVIDER_TYPES,
     bounded_openai_text_model,
@@ -600,6 +600,18 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None,
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
+def _intrinsic_scopes(model: LlmModel, provider: LlmProvider) -> list[str]:
+    """Scopes every call on this route needs (Sonar built-in search), as dispatch derives them.
+
+    ``web_search_required`` is always the detected value; overrides cannot remove it.
+    """
+    from lumen.services.inference_authority import model_required_scopes
+
+    api_base = provider.api_base if getattr(provider, "auth_mode", "api_key") == "api_key" else None
+    detected = provider_capabilities(model.model_name, provider.provider_type, api_base)
+    return list(model_required_scopes({"capabilities": {"web_search_required": detected["web_search_required"]}}))
+
+
 async def list_api_models(*, model_kind: str = "text") -> list[dict]:
     """List active public model identities without decrypting credentials or pricing."""
     factory = _require_db()
@@ -623,9 +635,11 @@ async def list_api_models(*, model_kind: str = "text") -> list[dict]:
                     "api_model_name": api_model_name(model.model_name, provider.provider_type),
                     "api_provider": provider.api_provider,
                     "provider_id": provider.id,
+                    "model_id": model.id,
                     "provider_type": provider.provider_type,
                     "provider_sort_order": provider.sort_order,
                     "sort_order": model.sort_order,
+                    "required_scopes": _intrinsic_scopes(model, provider),
                 }
                 for model, provider in rows
                 if not is_gemini_decision_model(model.model_name, provider.provider_type) or model_kind == "decision"
@@ -802,14 +816,12 @@ def _cli_model_row(model: LlmModel, provider: LlmProvider) -> dict:
         "capabilities": {key: effective[key] for key in _CLI_CAPABILITY_KEYS if key in effective},
         "input_price_per_million": _price_text(_per_million_price(input_price)),
         "output_price_per_million": _price_text(_per_million_price(output_price)),
+        "required_scopes": _intrinsic_scopes(model, provider),
     }
 
 
-async def list_cli_models() -> list[dict]:
-    """Active text routes for coding CLIs, in configured provider/model order, without secrets.
-
-    Credential presence is read from configuration only; nothing is decrypted.
-    """
+async def _active_text_rows(project) -> list:
+    """Active non-decision text rows in configured provider/model order, projected without secrets."""
     factory = _require_db()
     try:
         async with factory() as session:
@@ -825,14 +837,80 @@ async def list_cli_models() -> list[dict]:
                     .order_by(LlmProvider.sort_order, LlmProvider.id, LlmModel.sort_order, LlmModel.id)
                 )
             ).all()
-            return [
-                _cli_model_row(model, provider)
-                for model, provider in rows
-                if not is_gemini_decision_model(model.model_name, provider.provider_type)
-            ]
+            projected = (project(model, provider) for model, provider in rows
+                         if not is_gemini_decision_model(model.model_name, provider.provider_type))
+            return [row for row in projected if row is not None]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def list_cli_models() -> list[dict]:
+    """Active text routes for coding CLIs, in configured provider/model order, without secrets.
+
+    Credential presence is read from configuration only; nothing is decrypted.
+    """
+    return await _active_text_rows(_cli_model_row)
+
+
+_GEMINI_API_PROVIDER_TYPES = frozenset({"gemini", "openai", "anthropic", "perplexity"})
+
+
+def _gemini_api_model_row(model: LlmModel, provider: LlmProvider) -> dict | None:
+    """A route plain ``generateContent`` can execute: chat credentials, prices and text I/O.
+
+    Unlike the coding-CLI gate, tools and streaming are not required; streaming
+    only decides whether ``streamGenerateContent`` is advertised.
+    """
+    if (getattr(provider, "auth_mode", "api_key") != "api_key"
+            or provider.provider_type not in _GEMINI_API_PROVIDER_TYPES
+            or model.model_name.startswith(("chatgpt/", "anthropic-subscription/"))
+            or not _cli_credentials_configured(model, provider, required_capabilities=("chat",))):
+        return None
+    input_price, output_price, price_source, _ = _resolved_base_prices(model, provider)
+    if input_price is None or output_price is None:
+        return None
+    public = _model_public(
+        model,
+        effective_input_price_per_million=_per_million_price(input_price),
+        effective_output_price_per_million=_per_million_price(output_price),
+        effective_price_source=price_source,
+        provider_type=provider.provider_type,
+        api_provider=provider.api_provider,
+        provider_sort_order=provider.sort_order,
+        auth_mode="api_key",
+        api_key_configured=True,
+        api_base=provider.api_base,
+    )
+    effective = public.get("effective_capabilities") or {}
+    inputs, outputs = effective.get("input_modalities"), effective.get("output_modalities")
+    context = effective.get("context_limit")
+    # Model keys always carry a payer, so the credit hold must be sizeable (see
+    # completion_api._reserve_online): a native bounded OpenAI contract or a context bound.
+    hold_sizeable = bool(bounded_openai_text_model(model.model_name, provider.provider_type, provider.api_base)) or (
+        type(context) is int and context > 0 and effective.get("output_budget_enforced") is not False
+    )
+    if (not hold_sizeable
+            or ((effective.get("feature_gates") or {}).get("text") or {}).get("available") is False
+            or isinstance(inputs, list) and inputs and "text" not in inputs
+            or isinstance(outputs, list) and outputs and "text" not in outputs):
+        return None
+    return {
+        "id": cli_route_id(provider.id, model.id),
+        "api_model_name": public["api_model_name"],
+        "display_name": public["display_name"],
+        "provider": provider.api_provider,
+        "provider_name": provider.name,
+        "provider_type": provider.provider_type,
+        "streaming": effective.get("streaming") is not False,
+        "required_scopes": _intrinsic_scopes(model, provider),
+        "capabilities": {key: effective[key] for key in _CLI_CAPABILITY_KEYS if key in effective},
+    }
+
+
+async def list_gemini_api_models() -> list[dict]:
+    """Text routes for the Gemini ``v1beta`` catalog, without decrypting credentials."""
+    return await _active_text_rows(_gemini_api_model_row)
 
 
 async def resolve_model_by_id(

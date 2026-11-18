@@ -6,15 +6,16 @@ import base64
 import struct
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field, StrictStr, ValidationError
 
+from lumen.api.compat.google import GoogleModelRoute
 from lumen.api.compat.openai import openai_error_response
 from lumen.auth import Principal, require_api_key_scopes
 from lumen.services import embeddings
 
 router = APIRouter()
-google_router = APIRouter()
+google_router = APIRouter(route_class=GoogleModelRoute)
 
 
 class OpenAIEmbeddingRequest(BaseModel):
@@ -92,17 +93,22 @@ async def openai_embeddings(body: OpenAIEmbeddingRequest,
             "total_tokens": result["usage"]["total_tokens"]}}
 
 
-@google_router.post("/v1beta/models/{model}:embedContent")
+@google_router.post("/v1beta/models/{model:path}:embedContent")
 async def gemini_embed(model: str, body: GeminiEmbedRequest,
+        x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider", min_length=1, max_length=40,
+                                              pattern=r"^[a-z0-9][a-z0-9_-]*$"),
         principal: Principal = Depends(require_api_key_scopes("embeddings:write"))):
     result = await _run(model, [body.content.parts[0].text], principal=principal,
                         dimensions=body.outputDimensionality, max_inputs=1, provider_type="gemini",
+                        provider=x_lumen_provider,
                         task_type=body.taskType if "taskType" in body.model_fields_set else None, title=body.title)
     return {"embedding": {"values": result["embeddings"][0]["embedding"]}}
 
 
-@google_router.post("/v1beta/models/{model}:batchEmbedContents")
+@google_router.post("/v1beta/models/{model:path}:batchEmbedContents")
 async def gemini_batch_embed(model: str, request: Request,
+        x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider", min_length=1, max_length=40,
+                                              pattern=r"^[a-z0-9][a-z0-9_-]*$"),
         principal: Principal = Depends(require_api_key_scopes("embeddings:write"))):
     try:
         payload: Any = await request.json()
@@ -120,5 +126,6 @@ async def gemini_batch_embed(model: str, request: Request,
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
         raise HTTPException(status_code=400, detail="invalid Gemini embedding request") from exc
     result = await _run(model, inputs, principal=principal, dimensions=next(iter(dimensions)), max_inputs=100,
-                        provider_type="gemini", task_type=next(iter(task_types)), title=next(iter(titles)))
+                        provider_type="gemini", provider=x_lumen_provider,
+                        task_type=next(iter(task_types)), title=next(iter(titles)))
     return {"embeddings": [{"values": item["embedding"]} for item in result["embeddings"]]}

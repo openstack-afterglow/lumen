@@ -43,8 +43,8 @@ Content-Type: application/json
 
 | Scope | 엔드포인트 |
 | --- | --- |
-| `models:read` | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models` |
-| `compat:completions:write` | `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` |
+| `models:read` | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1beta/models`, `/v1beta/models/{model}` |
+| `compat:completions:write` | `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens` |
 | `embeddings:write` | `POST /v1/embeddings`, `/v1/chat/embeddings`, `/v1beta/models/{model}:embedContent`, `/v1beta/models/{model}:batchEmbedContents` |
 | `decisions:write` | `POST /v1/decisions`, `/v1/chat/decisions`, `/v1beta/decisions` |
 | `compat:images:write` | `POST /v1/images/generations`, `/v1/images/edits` |
@@ -52,7 +52,11 @@ Content-Type: application/json
 | `native:audio:write` | `POST /v1/chat/audio/speech` |
 | `compat:realtime:write` | WebSocket `/v1/realtime`, `/v1/realtime/translations`, `/v1/live/sessions`, `/v1beta/realtime` |
 
-모델 키로 대화와 실행 기록, 메모리, 서버 도구, MCP, 에이전트, 확장, 에셋, Batch/Files, 클라우드 도구 또는 키 관리에 접근할 수 없다. 호환 텍스트 완료의 도구 요청은 별도 서버 도구 scope를 요구하므로 거절된다. 결과를 반환하지 않는 네이티브 이미지·실시간 실행 요청이나 에셋 권한이 필요한 네이티브 음성 전사 대신, 결과를 직접 반환하는 호환 API를 사용한다.
+모델 키로 대화와 실행 기록, 메모리, 서버 도구, MCP, 에이전트, 확장, 에셋, Batch/Files, 클라우드 도구 또는 키 관리에 접근할 수 없다. OpenAI·Anthropic 호환 텍스트 완료의 도구 요청은 별도 서버 도구 scope를 요구하므로 거절된다. Gemini `generateContent`의 호출자 정의 `functionDeclarations`는 서버가 실행하지 않고 `functionCall`로만 돌려주므로 이 scope 없이 허용되며, Gemini 서버 도구는 400으로 거절된다. 결과를 반환하지 않는 네이티브 이미지·실시간 실행 요청이나 에셋 권한이 필요한 네이티브 음성 전사 대신, 결과를 직접 반환하는 호환 API를 사용한다.
+
+Gemini 경로의 `{model}`은 `models/lumen/<provider_id>/<model_id>`처럼 `/`를 포함할 수 있어 route template은 `{model:path}`이다.
+
+Perplexity Sonar처럼 검색을 항상 내장 실행하는 모델은 `native:tools:execute`가 필요하므로 모델 키로 호출하면 OpenAI·Anthropic·Gemini 경로 모두 크레딧 예약이나 공급자 호출 전에 HTTP 403 `model_requires_server_tools`를 반환한다. 키가 보는 모델 목록(`/v1/models`의 두 형식, `/v1/cli/models`, `/v1beta/models`)에서도 이 모델을 숨긴다. Keystone 대시보드 목록은 바뀌지 않는다.
 
 사용량 조회(`/v1/usage`, `/v1/usage/timeseries`, `/v1/usage/keys`, `/v1/usage/records`)는 Keystone 세션만 사용할 수 있다.
 
