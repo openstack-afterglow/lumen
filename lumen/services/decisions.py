@@ -1,4 +1,4 @@
-"""Single-attempt OpenAI Decisions, strict usage accounting and atomic quota holds."""
+"""OpenAI Decisions wire adapter and shared stateless Decisions credit lifecycle."""
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +6,7 @@ import json
 import logging
 import math
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 
 import httpx
@@ -43,9 +43,19 @@ class DecisionError(Exception):
         super().__init__(message)
 
 
-async def resolve(model: str) -> dict:
+async def resolve(model: str, *, provider_type: str | None = None, openai_compat: bool = False) -> dict:
     try:
-        route = await routing.resolve_api_model(model, model_kind="text", required_capabilities=("decisions",))
+        route = await routing.resolve_api_model(
+            model, model_kind="text" if openai_compat else ("text", "decision"),
+            provider_type=provider_type, required_capabilities=("decisions",),
+        )
+        if route is None and openai_compat:
+            gemini_route = await routing.resolve_api_model(
+                model.removeprefix("models/"), model_kind="decision", provider_type="gemini",
+                required_capabilities=("decisions",),
+            )
+            if gemini_route is not None:
+                raise DecisionError(422, "Gemini decision models require /v1beta/decisions")
     except errors.AmbiguousModelRouteError as exc:
         raise DecisionError(409, "model_route_ambiguous") from exc
     except errors.ChatStorageUnavailable as exc:
@@ -288,20 +298,8 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
     _validate_route(route)
     tokens = input_token_bound(body)
     bound = credit_bound(route, tokens)
-    event_id = str(uuid.uuid4())
-    reserved = sent = False
 
-    def mark_dispatched() -> None:
-        nonlocal sent
-        sent = True
-
-    try:
-        await authorize_new_io(user_id=user_id, project_id=project_id, api_key_id=api_key_id,
-                               required_scopes=required_scopes)
-        await stateless_credit.reserve(event_id=event_id, user_id=user_id, project_id=project_id,
-                                       api_key_id=api_key_id, bound=bound)
-        reserved = True
-        response = await transport(route, body, on_dispatch=mark_dispatched)
+    async def account(event_id: str, response: dict) -> dict:
         usage, breakdown = validate_usage(response.get("usage"))
         if usage["input_tokens"] > tokens:
             raise DecisionError(502, "decision usage exceeds admitted input ceiling", uncertain=True)
@@ -319,10 +317,39 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
                                "cost_usd": str(cost.raw_cost), "input_tokens": usage["input_tokens"],
                                "output_tokens": usage["output_tokens"]}],
         )
+        return {"usage": usage, "cost_usd": float(cost.raw_cost), "credited_cost": float(credited),
+                "usage_log_id": event_id}
+
+    response, settled = await accounted_call(
+        user_id=user_id, project_id=project_id, api_key_id=api_key_id, required_scopes=required_scopes,
+        bound=bound, dispatch=lambda mark: transport(route, body, on_dispatch=mark), account=account,
+    )
+    answers = validate_answers(response.get("answers"), body)
+    return {"model": route["model_name"], "answers": answers, **settled}
+
+
+async def accounted_call(*, user_id: str, project_id: str, api_key_id: int | None,
+                         required_scopes: tuple[str, ...], bound: Decimal,
+                         dispatch: Callable[[Callable[[], None]], Awaitable[dict]],
+                         account: Callable[[str, dict], Awaitable[dict]]) -> tuple[dict, dict]:
+    """Fence caller, hold shared credit, dispatch once, and account trusted usage."""
+    event_id = str(uuid.uuid4())
+    reserved = sent = False
+
+    def mark_dispatched() -> None:
+        nonlocal sent
+        sent = True
+
+    try:
+        await authorize_new_io(user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+                               required_scopes=required_scopes)
+        await stateless_credit.reserve(event_id=event_id, user_id=user_id, project_id=project_id,
+                                       api_key_id=api_key_id, bound=bound)
+        reserved = True
+        response = await dispatch(mark_dispatched)
+        settled = await account(event_id, response)
         reserved = False
-        answers = validate_answers(response.get("answers"), body)
-        return {"model": route["model_name"], "answers": answers, "usage": usage,
-                "cost_usd": float(cost.raw_cost), "credited_cost": float(credited), "usage_log_id": event_id}
+        return response, settled
     except credit.QuotaExceeded as exc:
         raise DecisionError(429, str(exc)) from exc
     except ApiKeyForbidden as exc:

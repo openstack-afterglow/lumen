@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urlencode
 
-from lumen.services.native_catalog import native_catalog
+from lumen.services.native_catalog import ModelKind, native_catalog
 from lumen.services.provider_metadata import NATIVE_PROVIDER_TYPES, native_catalog_entry, provider_family
 from lumen.services.providers import errors
 from lumen.services.providers import routing as provider_store
@@ -78,7 +78,7 @@ class DiscoveredCandidate:
     generation_methods: tuple[str, ...] = ()
     input_token_limit: int | None = None
     output_token_limit: int | None = None
-    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] | None = None
+    model_kind: ModelKind | None = None
 
 
 @dataclass(frozen=True)
@@ -119,7 +119,14 @@ def _serialize_candidate(
 ) -> dict[str, Any]:
     compatible = family == "compatible"
     entry = {} if compatible else native_catalog_entry(candidate.id, provider_type, api_base)
-    kind = entry.get("kind") or (None if compatible else candidate.model_kind)
+    if compatible:
+        kind = None
+    elif candidate.model_kind == "decision":
+        kind = "decision"
+        if entry.get("kind") != kind:
+            entry = {}
+    else:
+        kind = entry.get("kind") or candidate.model_kind
     purpose = "unknown" if compatible else (
         "chat" if kind == "text" else "non_chat" if kind else candidate.purpose
     )
@@ -373,7 +380,11 @@ def _gemini_candidate(item: dict) -> DiscoveredCandidate | None:
     output_limit = item.get("outputTokenLimit")
     input_limit = input_limit if type(input_limit) is int and input_limit > 0 else None
     output_limit = output_limit if type(output_limit) is int and output_limit > 0 else None
-    kind = "realtime" if "bidiGenerateContent" in methods else None
+    kind: ModelKind | None = None
+    if "createDecision" in methods:
+        kind = "decision"
+    elif "bidiGenerateContent" in methods:
+        kind = "realtime"
     return DiscoveredCandidate(
         id=model_id,
         display_name=display_name,

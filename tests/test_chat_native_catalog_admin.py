@@ -195,6 +195,129 @@ async def test_compatible_embedding_needs_input_only(provider_db):
         assert row.output_price is None
 
 
+async def test_decision_admin_registration_and_manual_price_clear(provider_db, admin_client, monkeypatch):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="gemini")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    created = await admin_client.post("/v1/admin/models", json={
+        "provider_id": 1, "model_name": "gemini/gemini-decision-1", "model_kind": "decision",
+    })
+    assert created.status_code == 201, created.text
+    result = created.json()
+    assert result["model_kind"] == "decision"
+    assert result["effective_price_source"] == result["price_origin"] == "native_catalog"
+    assert Decimal(result["effective_input_price_per_million"]) == Decimal("0.10")
+    assert result["effective_output_price_per_million"] is None
+    assert result["effective_cache_price_sources"] == {
+        "cache_read": None, "cache_creation_5m": None, "cache_creation_1h": None,
+    }
+    caps = result["effective_capabilities"]
+    assert caps["decisions"] is True
+    assert caps["context_limit"] == 262144
+    assert caps["max_output_tokens"] == 0
+    assert caps["feature_gates"]["decisions"] == {
+        "available": True, "mode": "native", "reason_code": None, "pricing_available": True,
+    }
+    assert all(not gate["available"] for feature, gate in caps["feature_gates"].items() if feature != "decisions")
+
+    path = f"/v1/admin/models/{result['id']}"
+    manual = await admin_client.patch(path, json={"input_price_per_million": "0"})
+    assert manual.status_code == 200, manual.text
+    assert Decimal(manual.json()["effective_input_price_per_million"]) == 0
+    assert manual.json()["price_source"] == manual.json()["price_origin"] == "manual"
+    assert manual.json()["effective_output_price_per_million"] is None
+    cleared = await admin_client.patch(path, json={"input_price_per_million": None})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["price_source"] is None
+    assert cleared.json()["price_origin"] == "native_catalog"
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("output_price_per_million", "0", "input-token pricing only"),
+    ("cache_read_price_per_million", "0", "input-token pricing only"),
+    ("cache_write_price_per_million", "0", "input-token pricing only"),
+    ("cache_write_1h_price_per_million", "0", "input-token pricing only"),
+    ("media_pricing", {"image_per_unit": "0"}, "model_kind"),
+])
+async def test_decision_registry_rejects_non_input_price_on_create_or_update(provider_db, field, value, error):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="gemini")
+    create = {"provider_id": 1, "model_name": "gemini-decision-1", "model_kind": "decision"}
+    with pytest.raises(errors.ProviderValidationError, match=error):
+        await repository.create_model(**create, **{field: value})
+    model = await repository.create_model(**create)
+    with pytest.raises(errors.ProviderValidationError, match=error):
+        await repository.update_model(model["id"], {field: value})
+
+
+async def test_decision_kind_edit_requires_clearing_old_output_price(provider_db, admin_client, monkeypatch):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type="gemini")
+    add_model("gemini-decision-1")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    path = "/v1/admin/models/10"
+    denied = await admin_client.patch(path, json={"model_kind": "decision"})
+    assert denied.status_code == 400, denied.text
+    assert "input-token pricing only" in denied.json()["detail"]
+    saved = await admin_client.patch(path, json={"model_kind": "decision", "output_price_per_million": None})
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["model_kind"] == "decision"
+    assert saved.json()["price_origin"] == "manual"
+    assert saved.json()["effective_output_price_per_million"] is None
+
+
+@pytest.mark.parametrize("provider_type,auth_mode,api_base", [
+    ("openai", "api_key", None),
+    ("gemini", "api_key", "https://compatible.invalid/v1"),
+    ("chatgpt", "chatgpt_device", None),
+])
+async def test_decision_registry_requires_direct_gemini_api_key(provider_db, provider_type, auth_mode, api_base):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type=provider_type, auth_mode=auth_mode)
+    await _set_provider(api_base=api_base)
+    match = "decision models require a direct Gemini API-key provider"
+    with pytest.raises(errors.ProviderValidationError, match=match):
+        await repository.create_model(provider_id=1, model_name="decision", model_kind="decision")
+    add_model("decision")
+    with pytest.raises(errors.ProviderValidationError, match=match):
+        await repository.update_model(10, {"model_kind": "decision", "output_price_per_million": None})
+
+
+async def test_exact_gemini_decision_cannot_be_registered_as_text(provider_db):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="gemini")
+    name = "gemini/gemini-decision-1"
+    match = "requires model_kind=decision"
+    with pytest.raises(errors.ProviderValidationError, match=match):
+        await repository.create_model(provider_id=1, model_name=name)
+    decision = await repository.create_model(provider_id=1, model_name=name, model_kind="decision")
+    with pytest.raises(errors.ProviderValidationError, match=match):
+        await repository.update_model(decision["id"], {"model_kind": "text"})
+
+
+async def test_inactive_decision_row_blocks_invalid_provider_transition(provider_db):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="gemini")
+    await repository.create_model(provider_id=1, model_name="gemini-decision-1", model_kind="decision", is_active=False)
+    for patch in ({"provider_type": "openai"}, {"api_base": "https://compatible.invalid/v1"}):
+        with pytest.raises(errors.ProviderValidationError, match="direct Gemini API-key provider"):
+            await repository.update_provider(1, patch)
+    updated = await repository.update_provider(1, {"api_base": "https://generativelanguage.googleapis.com/v1beta"})
+    assert updated["provider_type"] == "gemini"
+
+
+async def test_gemini_provider_transition_checks_target_catalog_for_text_rows(provider_db):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="openai")
+    await repository.create_model(
+        provider_id=1, model_name="gemini-decision-1",
+        input_price_per_million="1", output_price_per_million="2",
+    )
+    with pytest.raises(errors.ProviderValidationError, match="requires model_kind=decision"):
+        await repository.update_provider(1, {"provider_type": "gemini"})
+    assert (await repository.list_providers())[0]["provider_type"] == "openai"
+
+
 async def test_compatible_activation_and_active_price_clearing_require_manual_prices(provider_db):
     add_provider, add_model, _ = provider_db
     add_provider(provider_type="openai")

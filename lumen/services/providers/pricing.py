@@ -12,6 +12,7 @@ from lumen.services.capabilities import (
     normalize_capabilities,
     provider_capabilities,
 )
+from lumen.services.native_catalog import MODEL_KINDS
 from lumen.services.provider_metadata import (
     bundled_cache_rates,
     catalog_model_metadata,
@@ -30,7 +31,6 @@ _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _USD_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
 _MAX_RATE = Decimal("100000000")
-MODEL_KINDS = frozenset({"text", "image", "tts", "stt", "realtime", "embedding"})
 _UNIT_SECONDS = {"second": 1, "minute": 60, "hour": 3600}
 # Duration family -> (JSON key, seconds per priced unit). Legacy aliases stay accepted.
 DURATION_PRICE_FAMILIES: dict[str, tuple[tuple[str, int], ...]] = {
@@ -52,7 +52,10 @@ BILLING_BASES = {
     "stt": frozenset({"duration", "tokens"}),
     "realtime": frozenset({"duration", "session", "tokens"}),
 }
-_DEFAULT_BASIS = {"text": "tokens", "image": "unit", "tts": "duration", "stt": "duration", "realtime": "duration", "embedding": "tokens"}
+_DEFAULT_BASIS = {
+    "text": "tokens", "image": "unit", "tts": "duration", "stt": "duration",
+    "realtime": "duration", "embedding": "tokens", "decision": "tokens",
+}
 TOKEN_RATE_MODALITIES = ("image", "audio")
 TOKEN_RATE_FIELDS = ("input_per_million", "cache_read_per_million", "output_per_million")
 MEDIA_PRICE_FIELDS = {
@@ -62,6 +65,7 @@ MEDIA_PRICE_FIELDS = {
     "stt": (),
     "realtime": (),
     "embedding": (),
+    "decision": (),
 }
 for _kind_name, _families in _KIND_DURATION_FAMILIES.items():
     MEDIA_PRICE_FIELDS[_kind_name] += tuple(key for family in _families for key, _ in DURATION_PRICE_FAMILIES[family])
@@ -362,6 +366,10 @@ def _kind(row: LlmModel) -> str:
     return getattr(row, "model_kind", None) or "text"
 
 
+def decision_provider_supported(provider_type: str | None, api_base: str | None, auth_mode: str) -> bool:
+    return provider_type == "gemini" and auth_mode == "api_key" and direct_provider_route(provider_type, api_base)
+
+
 def _iso(dt) -> str | None:
     return dt.isoformat() if dt else None
 
@@ -421,6 +429,8 @@ def _resolved_cache_prices(
         key: None for _, _, resolved in CACHE_PRICE_FIELDS for key in (resolved, f"{resolved}_above_200k")
     }
     sources: dict[str, str | None] = dict.fromkeys(_CACHE_CATEGORIES)
+    if _kind(model) == "decision":
+        return prices, sources
     catalog = bundled_cache_rates(model.model_name, provider_type, api_base)
     for category, (_, column, key) in zip(_CACHE_CATEGORIES, CACHE_PRICE_FIELDS, strict=True):
         manual = getattr(model, column, None)
@@ -548,6 +558,27 @@ def _effective_capabilities(
     api_base: str | None = None,
 ) -> tuple[dict, str]:
     """Overrides win; legacy imported options/windows fill only missing catalog fields."""
+    kind = _kind(row)
+    entry = native_catalog_entry(row.model_name, provider_type, api_base) if provider_type == "gemini" else {}
+    known_decision = entry.get("kind") == "decision"
+    if kind == "decision" or known_decision:
+        supported = kind == "decision" and known_decision and decision_provider_supported(provider_type, api_base, auth_mode)
+        ready = supported and api_key_configured
+        gates = {
+            feature: {"available": False, "mode": "none", "reason_code": "route_unavailable", "pricing_available": False}
+            for feature in ("text", "embeddings", "image_output", "audio_input", "audio_output")
+        }
+        gates["decisions"] = {
+            "available": ready, "mode": "native" if ready else "none",
+            "reason_code": None if ready else "route_unavailable", "pricing_available": False,
+        }
+        return {
+            "decisions": ready,
+            "decisions_transport_supported": supported,
+            "feature_gates": gates,
+            "context_limit": entry["context_window"] if known_decision else None,
+            "max_output_tokens": 0,
+        }, "native_catalog" if known_decision else "registry"
     if _kind(row) == "embedding":
         ready = auth_mode == "api_key" and api_key_configured and provider_type not in {"anthropic", "chatgpt"}
         gates = {
@@ -760,20 +791,20 @@ def _pricing_aware_capabilities(
     input_price: Decimal | None = None,
     output_price: Decimal | None = None,
 ) -> dict:
-    if _kind(model) == "embedding":
+    kind = _kind(model)
+    if kind in {"decision", "embedding"}:
         normalized = dict(capabilities)
         gates = {name: dict(gate) for name, gate in (capabilities.get("feature_gates") or {}).items()}
-        gate = gates.get("embeddings")
+        gate = gates.get("decisions" if kind == "decision" else "embeddings")
         if gate is not None:
             gate["pricing_available"] = bool(gate.get("available")) and (
                 (model.input_price if input_price is None else input_price) is not None
             )
         normalized["feature_gates"] = gates
         return normalized
-    if _kind(model) != "text":
+    if kind != "text":
         normalized = dict(capabilities)
         gates = {name: dict(gate) for name, gate in (capabilities.get("feature_gates") or {}).items()}
-        kind = _kind(model)
         feature = {"image": "image_output", "tts": "audio_output", "stt": "audio_input", "realtime": "audio_input"}[kind]
         available = (gates.get(feature) or {}).get("pricing_available", False)
         for feature in {"image": ("image_output",), "tts": ("audio_output",),
@@ -852,7 +883,19 @@ def _pricing_aware_capabilities(
 def _effective_model_rates(
     model: LlmModel, provider_type: str | None, api_base: str | None,
 ) -> tuple[Decimal | None, Decimal | None]:
+    if _kind(model) == "decision":
+        if model.input_price is not None:
+            return Decimal(model.input_price), None
+        entry = native_catalog_entry(model.model_name, provider_type, api_base)
+        if entry.get("kind") == "decision":
+            return Decimal(entry["token_pricing"]["input"]) / _TOKENS_PER_MILLION, None
+        return None, None
     fallback_input, fallback_output = effective_prices_per_million(model.model_name, provider_type, api_base=api_base)
+    if (
+        provider_type == "gemini" and fallback_input is not None and fallback_output is None
+        and native_catalog_entry(model.model_name, provider_type, api_base).get("kind") == "decision"
+    ):
+        fallback_input = None
     return (
         Decimal(model.input_price) if model.input_price is not None else fallback_input / _TOKENS_PER_MILLION if fallback_input is not None else None,
         Decimal(model.output_price) if model.output_price is not None else fallback_output / _TOKENS_PER_MILLION if fallback_output is not None else None,
@@ -862,6 +905,8 @@ def _effective_model_rates(
 
 
 def _effective_media_pricing(model: LlmModel, provider_type: str | None, api_base: str | None) -> dict | None:
+    if _kind(model) == "decision":
+        return None
     manual = getattr(model, "media_pricing", None)
     if manual is not None:
         return manual
@@ -870,7 +915,7 @@ def _effective_media_pricing(model: LlmModel, provider_type: str | None, api_bas
 
 
 def _resolved_context_tiers(model: LlmModel, provider_type: str | None, api_base: str | None) -> dict:
-    entry = native_catalog_entry(model.model_name, provider_type, api_base)
+    entry = {} if _kind(model) == "decision" else native_catalog_entry(model.model_name, provider_type, api_base)
     token = entry.get("token_pricing") or {}
     tier = token.get("long_context") or {}
     catalog_media = getattr(model, "media_pricing", None) is None and entry.get("kind") == _kind(model)
@@ -929,16 +974,19 @@ def _resolved_model_prices(
     model: LlmModel, provider_type: str | None, api_base: str | None,
 ) -> tuple[Decimal | None, Decimal | None, str, str | None]:
     input_price, output_price = _effective_model_rates(model, provider_type, api_base)
-    if _kind(model) == "embedding":
+    kind = _kind(model)
+    if kind == "embedding":
         output_price = Decimal(0)
-    media = _effective_media_pricing(model, provider_type, api_base)
-    priced = input_price is not None and output_price is not None
-    if _kind(model) not in {"text", "embedding"}:
+    priced = input_price is not None and (kind == "decision" or output_price is not None)
+    manual = model.input_price is not None
+    if kind != "decision":
+        manual = manual or model.output_price is not None or getattr(model, "media_pricing", None) is not None
+    if kind not in {"text", "embedding", "decision"}:
+        media = _effective_media_pricing(model, provider_type, api_base)
         priced = media_pricing_available(
-            _kind(model), media, text_input_priced=input_price is not None, text_output_priced=output_price is not None,
-            duration_families=_realtime_duration_families(_kind(model), model.model_name),
+            kind, media, text_input_priced=input_price is not None, text_output_priced=output_price is not None,
+            duration_families=_realtime_duration_families(kind, model.model_name),
         )
-    manual = model.input_price is not None or model.output_price is not None or getattr(model, "media_pricing", None) is not None
     if priced:
         source = "manual" if manual else "native_catalog"
     else:

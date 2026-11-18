@@ -36,7 +36,11 @@ Selected sandboxes have their own `resource.deadline_at`, separate from the run'
 
 `lumen/services/native_catalog.py` strictly validates the bundled `native_model_catalog.json` for official OpenAI, Anthropic, Gemini and Perplexity routes. Developers update it manually from official pages (procedure in docs). Compatible OpenAI/Anthropic custom endpoints use only administrator model IDs, prices and capability overrides. Stored rates override catalog token and media rates; explicit capability overrides override catalog observations, with conservative defaults otherwise. Admission freezes the effective base, cache and context tiers and the per-model threshold. Legacy `_above_200k` fields remain storage slots, and old snapshots keep their 200000 default. Native discovery annotates authoritative live IDs; subscription modes read the bundled list. Historical models.dev SQL columns stay nullable and are no longer mapped.
 
-OpenAI Decisions is an endpoint capability, not a model kind, because the same model ID is a registered text model. `lumen/models/decision_contracts.py` owns the bounded request contract. `services/decisions.py` resolves an active OpenAI-protocol model with effective `decisions`, rechecks caller authority, resolves the provider credential at transport time, sends once and validates typed answers and usage. `services/stateless_credit.py` owns content-free persistent holds (`chat_stateless_call_reservations`, migration 034) and atomic ledger/wallet settlement. The shared wallet admission counts durable and stateless reserved/unknown holds for user and API-key ceilings.
+`POST /v1/chat/decisions` resolves the active registered route before choosing its strict provider wire contract. OpenAI Decisions remains a `decisions` capability on API-key `text` routes such as `gpt-6-luna`. Gemini Decision 1 is a separate `decision` model kind for the official Gemini Developer API with API-key credentials only. It is not eligible for chat, embeddings, media, batch, or CLI model surfaces. Decision Studio opts into `GET /v1/chat/models?model_kind=decision`; the ordinary list is unchanged. `/v1/decisions` stays OpenAI-only; `/v1beta/decisions` is Gemini-only and reuses Google embedding compatibility authorization.
+
+`lumen/models/gemini_decision_contracts.py` validates bounded text/image input and typed questions before dispatch. The Gemini routes cap the raw request at 20 MiB. `lumen/services/gemini_decisions.py` uses the shared stateless credit lifecycle in `lumen/services/decisions.py`: recheck caller authority, resolve the current provider key, and send once to the official endpoint. Lumen does not fetch image URLs locally or assume a local token count. Gemini uses privacy-safe errors and returns only `model`, `answers`, and `usage` on success.
+
+`lumen/services/stateless_credit.py` owns content-free persistent holds (`chat_stateless_call_reservations`, migration 034) and atomic ledger/wallet settlement. Shared wallet admission counts durable and stateless reserved/unknown holds for user and API-key ceilings. Gemini reserves the full 262,144-token context at the frozen effective input rate (manual before catalog) for every request. Google's [Decisions API](https://aistudio.google.com/docs/decisions-api) documents the context and image resolution labels, but the [general media-token table](https://aistudio.google.com/docs/media-resolution#token-counts) does not establish Decision 1 per-image counts or a default. Settle trusted input usage before validating answers; reject malformed answers without undoing settlement. Missing, inconsistent, or over-bound usage leaves the hold uncertain. No new migration. OpenSpec defines local ASGI, fake-HTTP, and MariaDB verification scenarios; it does not establish their execution or production acceptance.
 
 Kolla optionally manages ClamAV with `enable_lumen_clamav`. The pinned official image uses host networking with clamd bound only to `127.0.0.1:3310`, finite memory/CPU/PID limits and persistent signature storage. Loaded-signature freshness plus PING/VERSION gates API/worker startup. The external-scanner path remains supported. This host-network choice is required by the observed production Docker configuration (`bridge=none`, iptables and forwarding disabled); a Docker bridge recipe is not a qualified production path.
 
@@ -595,9 +599,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c872e87bbf38aea4c107e6da391a3ca4890eb99603779223f14942cbe857509e",
-  "reviewed_at": "2026-11-18T05:32:53Z",
-  "summary": "0.6.18 published and deployed (035); sandbox activation deferred with measured startup latency"
+  "source_sha256": "7e219b649d24b1f5559b18f51ae285cb013eac982f060776751c54b21fea68e5",
+  "reviewed_at": "2026-11-18T05:47:09Z",
+  "summary": "Gemini Decisions request and response validation, provider-specific HTTP and stateless usage accounting, input-only registry/catalog, route isolation, and synthetic HTTP and MariaDB regressions. No migration."
 }
 ```
 <!-- architecture-review:end -->

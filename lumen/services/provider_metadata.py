@@ -29,6 +29,12 @@ _RAW_COST_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
 
 CATALOG_PRICE_SOURCE = "native_catalog"
+GEMINI_DECISION_MODEL = "gemini-decision-1"
+
+
+def is_gemini_decision_model(model_name: str, provider_type: str | None) -> bool:
+    return provider_type == "gemini" and api_model_name(model_name, provider_type) == GEMINI_DECISION_MODEL
+
 
 # Only exact official routes may use public-provider metadata.
 _DIRECT_API_BASES = {

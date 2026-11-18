@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026-11-18",
+  "catalog_version": "2026-11-18.1",
   "providers": {
     "openai": {
       "display_name": "OpenAI",
@@ -4824,6 +4824,38 @@
           ],
           "verified_at": "2026-11-17",
           "notes": "Audio/video input $3.00 and audio output $12.00 per 1M tokens. Text rates are token_pricing. No published reservation_usd; media_pricing remains null. Grounding/search/maps query fees and allowances are not expressible in media_pricing; token rates exclude those fees."
+        },
+        {
+          "id": "gemini-decision-1",
+          "aliases": [],
+          "kind": "decision",
+          "display_name": "Gemini Decision 1",
+          "status": "active",
+          "context_window": 262144,
+          "max_output_tokens": 0,
+          "input_modalities": [
+            "text",
+            "image",
+            "audio",
+            "video",
+            "pdf"
+          ],
+          "output_modalities": null,
+          "capabilities": {
+            "decisions": true
+          },
+          "token_pricing": {
+            "input": "0.10"
+          },
+          "media_pricing": null,
+          "source_urls": [
+            "https://aistudio.google.com/docs/models/gemini-decision-1",
+            "https://aistudio.google.com/docs/decisions-api",
+            "https://aistudio.google.com/docs/pricing#gemini-decision",
+            "https://aistudio.google.com/docs/rate-limits#gemini-decision"
+          ],
+          "verified_at": "2026-11-18",
+          "notes": "Calibrated answers use no output tokens. All input modalities share the same paid-tier rate; caching is not supported. Lumen's Decisions API accepts text and images only."
         },
         {
           "id": "gemini-embedding-2",

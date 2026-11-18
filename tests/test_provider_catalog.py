@@ -64,6 +64,67 @@ def test_bundled_catalog_is_valid_and_packaged():
     assert set(catalog["providers"]) == {"openai", "anthropic", "gemini", "perplexity"}
 
 
+def test_gemini_decision_catalog_projects_zero_output_and_input_only_price():
+    entry = metadata.native_catalog_entry("gemini/gemini-decision-1", "gemini")
+    assert entry["kind"] == "decision"
+    assert entry["token_pricing"] == {"input": "0.10"}
+    assert entry["media_pricing"] is None
+    assert entry["context_window"] == 262144
+    assert entry["max_output_tokens"] == 0
+    assert entry["capabilities"] == {"decisions": True}
+    assert "https://aistudio.google.com/docs/models/gemini-decision-1" in entry["source_urls"]
+    projected = metadata.catalog_model_metadata("gemini-decision-1", "gemini")
+    assert projected["mode"] == "decision"
+    assert projected["max_output_tokens"] == 0
+    assert projected["supports_decisions"] is True
+    assert metadata.effective_prices_per_million("gemini-decision-1", "gemini") == (Decimal("0.10"), None)
+
+
+@pytest.mark.parametrize("patch,error", [
+    ({"max_output_tokens": 1}, "max_output_tokens must be zero"),
+    ({"max_output_tokens": False}, "max_output_tokens must be zero"),
+    ({"max_output_tokens": None}, "max_output_tokens must be zero"),
+    ({"kind": "text"}, "max_output_tokens: positive integer required"),
+    ({"capabilities": {"decisions": False}}, "decision capability required"),
+    ({"token_pricing": {"input": "0.10", "output": "0"}}, "pricing must specify only input"),
+    ({"token_pricing": {"input": "0.10", "cache_read": "0"}}, "pricing must specify only input"),
+    ({"media_pricing": {}}, "pricing must specify only input"),
+    ({"source_urls": ["https://untrusted.invalid/pricing"]}, "official HTTPS source required"),
+])
+def test_decision_catalog_checks_metadata_and_price_shape(patch, error):
+    catalog = native_catalog()
+    provider = catalog["providers"]["gemini"]
+    entry = metadata.native_catalog_entry("gemini-decision-1", "gemini")
+    candidate = {**catalog, "providers": {"gemini": {**provider, "models": [{**entry, **patch}]}}}
+    with pytest.raises(ValueError, match=error):
+        validate_catalog(candidate)
+
+
+@pytest.mark.parametrize("model_name,provider_type,api_base,expected", [
+    ("gemini-decision-1", "gemini", None, (Decimal("0.0000001"), None, "native_catalog")),
+    ("gemini-decision-1", "gemini", "https://compatible.invalid", (None, None, "unpriced")),
+    ("gemini-decision-1", "openai", None, (None, None, "unpriced")),
+    ("gemini-decision-1-future", "gemini", None, (None, None, "unpriced")),
+    ("gemini-4-carbon", "gemini", None, (None, None, "unpriced")),
+])
+def test_decision_price_fallback_requires_exact_decision_entry(model_name, provider_type, api_base, expected):
+    row = model()
+    row.model_name = model_name
+    row.model_kind = "decision"
+    provider = SimpleNamespace(provider_type=provider_type, api_base=api_base)
+    assert _resolved_base_prices(row, provider)[:3] == expected
+
+
+def test_stale_text_row_does_not_inherit_decision_capability_or_tariff():
+    row = model()
+    row.model_name = "gemini-decision-1"
+    provider = SimpleNamespace(provider_type="gemini", api_base=None)
+    caps, _ = _effective_capabilities(row, "gemini", api_key_configured=True)
+    assert caps["decisions"] is False
+    assert not any(gate["available"] for gate in caps["feature_gates"].values())
+    assert _resolved_base_prices(row, provider) == (None, None, "unpriced", None)
+
+
 @pytest.mark.parametrize("bad", ["-1", "NaN", "Infinity", "-Infinity", 1.2, True, 2])
 def test_rejects_invalid_or_nonstring_prices(bad):
     value = fixture_catalog()
