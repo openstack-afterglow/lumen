@@ -26,10 +26,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from lumen import auth
+from lumen.auth import model_key_storage_id
 from lumen.main import app
+from lumen.models.billing import Payer
 from lumen.models.chat_db import LlmModel, LlmProvider, LlmProviderAccount, LlmProviderCredential
-from lumen.service_authority import SERVICE_CAPABILITIES
-from lumen.services import api_key_store, credit, provider_client
+from lumen.services import api_key_store, credit, provider_client, stateless_credit
 from lumen.services.providers import credentials, routing
 
 pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
@@ -42,6 +44,45 @@ _CONTRACT = {"X-Lumen-Bifrost-Contract": "single-attempt-v1"}
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
+
+
+def _model_key_principal(scopes: tuple[str, ...]) -> dict:
+    """The post-038 personal model-key principal shape returned by ``verify_key``."""
+    return {"auth_type": "api_key", "credential_class": "personal_key", "domain_id": None,
+            "payer": Payer("user", "u1", None), "user_id": "u1", "project_id": model_key_storage_id(7),
+            "api_key_id": 7, "scopes": scopes, "credential_kind": "api_key", "expires_at": None,
+            "source": "api", "roles": [], "is_system_admin": False, "service_system_admin": False}
+
+
+def _personal_key_row(store, monkeypatch) -> None:
+    """Persisted personal model-key columns plus a synthetic live Keystone owner/domain."""
+    store.key.key_kind, store.key.credential_kind = "personal", "api_key"
+    store.key.owner_user_id, store.key.owner_domain_id = "u1", None
+    directory = SimpleNamespace(
+        users=SimpleNamespace(get=lambda user_id: SimpleNamespace(id=user_id, domain_id="d1", enabled=True)),
+        domains=SimpleNamespace(get=lambda domain_id: SimpleNamespace(id=domain_id, enabled=True)),
+    )
+    monkeypatch.setattr(auth, "_get_admin_ks_client", lambda: directory)
+
+
+def _record_holds(monkeypatch, state) -> None:
+    """Payer-scoped stateless holds: record reserve/settle/finish instead of SQL."""
+    state.holds = []
+
+    async def reserve(**kwargs):
+        state.holds.append(("reserve", kwargs["event_id"], kwargs["payer"]))
+
+    async def settle(**kwargs):
+        state.holds.append(("settle", kwargs["event_id"], kwargs["payer"]))
+        state.settled.append(kwargs)
+        return Decimal("0.000123")
+
+    async def finish(event_id, *, uncertain, payer=None):
+        state.holds.append(("finish", event_id, payer))
+
+    monkeypatch.setattr(stateless_credit, "reserve", reserve)
+    monkeypatch.setattr(stateless_credit, "settle", settle)
+    monkeypatch.setattr(stateless_credit, "finish", finish)
 
 
 class _Session(AbstractAsyncContextManager):
@@ -146,11 +187,11 @@ def catalog(monkeypatch):
             session.add(LlmProvider(margin_multiplier=Decimal("1"), accounts=[account], **row))
     with factory.begin() as session:
         session.add_all([
-            LlmModel(id=11, provider_id=1, model_name="sdk-chat", sort_order=0, **priced),
-            LlmModel(id=12, provider_id=1, model_name="shared-chat", sort_order=1, **priced),
-            LlmModel(id=21, provider_id=2, model_name="claude-sdk", sort_order=0, **priced),
+            LlmModel(id=11, provider_id=1, model_name="sdk-chat", sort_order=0, **priced, **limits),
+            LlmModel(id=12, provider_id=1, model_name="shared-chat", sort_order=1, **priced, **limits),
+            LlmModel(id=21, provider_id=2, model_name="claude-sdk", sort_order=0, **priced, **limits),
             LlmModel(id=31, provider_id=3, model_name="gemini-sdk", sort_order=0, **priced, **limits),
-            LlmModel(id=32, provider_id=3, model_name="shared-chat", sort_order=1, **priced),
+            LlmModel(id=32, provider_id=3, model_name="shared-chat", sort_order=1, **priced, **limits),
             LlmModel(id=33, provider_id=3, model_name="gemini-embed", sort_order=2, model_kind="embedding",
                      capabilities={"embedding": {"default_dimensions": 3, "supports_dimensions": False},
                                    "context_limit": 2048}, capability_source="override",
@@ -162,16 +203,17 @@ def catalog(monkeypatch):
 
 
 @pytest.fixture
-def boundary(monkeypatch, catalog):
+def boundary(monkeypatch, catalog, synthetic_inference_store):
+    _personal_key_row(synthetic_inference_store, monkeypatch)
     state = SimpleNamespace(keys=[], precheck=[], settled=[], bifrost=[])
 
     async def verify_key(raw):
         state.keys.append(raw)
-        scopes = {_API_KEY: ("models:read", "compat:completions:write"), _READ_ONLY_KEY: ("models:read",)}.get(raw)
+        scopes = {_API_KEY: ("models:read", "compat:completions:write", "embeddings:write"),
+                  _READ_ONLY_KEY: ("models:read",)}.get(raw)
         if scopes is None:
             return None
-        return {"user_id": "u1", "project_id": "p1", "api_key_id": 7, "scopes": scopes,
-                "roles": ["member", *SERVICE_CAPABILITIES]}
+        return _model_key_principal(scopes)
 
     async def resolve_credential(ref):
         return {"api_key": _UPSTREAM_KEY, "_fingerprint": "synthetic-fingerprint"}
@@ -197,6 +239,7 @@ def boundary(monkeypatch, catalog):
     monkeypatch.setattr(credentials, "resolve_inference_credential", resolve_credential)
     monkeypatch.setattr(credit, "precheck", precheck)
     monkeypatch.setattr(credit, "apply_usage", apply_usage)
+    _record_holds(monkeypatch, state)
     monkeypatch.setattr(provider_client, "get_bifrost_runtime", runtime)
     monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **_kwargs: httpx.ASGITransport(app=bifrost))
     return state
@@ -376,7 +419,11 @@ async def test_discovery_uses_chat_eligibility_not_coding_cli_gate(wire, boundar
         session.add_all([
             LlmModel(id=34, provider_id=3, model_name="gemini-plain", input_price=_per_token("1"),
                      output_price=_per_token("2"), price_source="manual", capability_source="override",
-                     capabilities={"function_calling": False, "tool_call": False, "streaming": False}),
+                     capabilities={"function_calling": False, "tool_call": False, "streaming": False,
+                                   "context_limit": 4096, "max_output_tokens": 1024}),
+            # Priced but no context bound: a model key's payer hold cannot be sized.
+            LlmModel(id=36, provider_id=3, model_name="gemini-unbounded", input_price=_per_token("1"),
+                     output_price=_per_token("2"), price_source="manual"),
             LlmModel(id=35, provider_id=3, model_name="gemini-unpriced"),
         ])
     client = _client(wire)
@@ -385,7 +432,7 @@ async def test_discovery_uses_chat_eligibility_not_coding_cli_gate(wire, boundar
 
     assert listed["models/gemini-plain"] == ["generateContent"]
     assert listed["models/gemini-sdk"] == ["generateContent", "streamGenerateContent"]
-    assert "models/gemini-unpriced" not in listed
+    assert "models/gemini-unpriced" not in listed and "models/gemini-unbounded" not in listed
     response = await client.aio.models.generate_content(model="gemini-plain", contents="hello")
     assert response.text == "gemini ok"
     with pytest.raises(genai_errors.ClientError) as no_stream:

@@ -11,6 +11,13 @@ def model_required_scopes(resolved: dict | None) -> tuple[str, ...]:
     return ("native:tools:execute",) if capabilities.get("web_search_required") is True else ()
 
 
+def principal_may_use(principal: dict, required_scopes) -> bool:
+    """Discovery mirror of dispatch: hide routes whose intrinsic scopes this caller lacks."""
+    from lumen.policy import authorize
+
+    return all(authorize(scope, principal) for scope in required_scopes)
+
+
 def cancel_run_scopes(run, payload: dict) -> tuple[str, ...]:
     """Cancel only the owned operation's generation authority, never a text-write alias."""
     kind = run.run_kind

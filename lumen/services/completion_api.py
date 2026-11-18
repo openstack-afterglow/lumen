@@ -40,7 +40,7 @@ from lumen.services import (
 )
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
 from lumen.services.capabilities import reasoning_can_be_disabled
-from lumen.services.inference_authority import authorize_new_io, completion_scopes
+from lumen.services.inference_authority import authorize_new_io, completion_scopes, model_required_scopes
 from lumen.services.provider_errors import BadRequestError, OpenAIServiceTierMismatch, OpenAIUsageInvalid, ProviderError
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
@@ -77,6 +77,15 @@ class CompletionError(Exception):
 
 async def _authorize_completion(user_id: str, project_id: str, api_key_id: int | None, request: dict, resolved: dict) -> None:
     try:
+        intrinsic = model_required_scopes(resolved)
+        if intrinsic:
+            # Built-in server tools (Perplexity Sonar search) are a model property,
+            # not a request option; model-only keys can never hold that scope.
+            try:
+                await authorize_new_io(user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+                                       required_scopes=intrinsic)
+            except ApiKeyForbidden as exc:
+                raise CompletionError(403, "model_requires_server_tools", code="model_requires_server_tools") from exc
         await authorize_new_io(user_id=user_id, project_id=project_id, api_key_id=api_key_id,
                                required_scopes=completion_scopes(request, resolved=resolved))
     except ApiKeyForbidden as exc:

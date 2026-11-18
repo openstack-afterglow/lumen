@@ -375,7 +375,8 @@ def test_openapi_documents_only_model_key_routes():
     paths = app.openapi()["paths"]
     for (method, route), scope in MODEL_API_KEY_ROUTE_SCOPES.items():
         if method != "WEBSOCKET":
-            operation = paths[route][method.lower()]
+            # Route templates may carry Starlette converters; OpenAPI paths do not.
+            operation = paths[route.replace("{model:path}", "{model}")][method.lower()]
             assert operation["x-model-api-key-allowed"] is True
             assert operation["x-required-api-key-scopes"] == [scope]
     assert not paths["/v1/chat/images/generations"]["post"]["x-model-api-key-allowed"]

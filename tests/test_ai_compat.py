@@ -823,6 +823,7 @@ class TestOpenAIEndpoint:
                     "model_name": "gpt-4o",
                     "api_model_name": "gpt-4o",
                     "api_provider": "openai",
+                    "required_scopes": [],
                 }
             ]
 
@@ -998,6 +999,7 @@ class TestOpenAILumenVirtualModel:
                     "model_name": "gpt-4o",
                     "api_model_name": "gpt-4o",
                     "api_provider": "openai",
+                    "required_scopes": [],
                 }
             ]
 
@@ -1024,7 +1026,7 @@ class TestOpenAILumenVirtualModel:
 
         async def list_models(model_kind=None):
             return [] if model_kind == "embedding" else [
-                {"model_name": "gpt-4o", "api_model_name": "gpt-4o", "api_provider": "openai"},
+                {"model_name": "gpt-4o", "api_model_name": "gpt-4o", "api_provider": "openai", "required_scopes": []},
             ]
 
         async def forbidden_run(**kwargs):
@@ -1056,6 +1058,7 @@ class TestOpenAILumenVirtualModel:
                     "model_name": "gpt-4o",
                     "api_model_name": "gpt-4o",
                     "api_provider": "openai",
+                    "required_scopes": [],
                 }
             ]
 
@@ -1654,11 +1657,13 @@ class TestOpenAILumenVirtualModel:
                     "model_name": "gpt-4o",
                     "api_model_name": "gpt-4o",
                     "api_provider": "openai",
+                    "required_scopes": [],
                 },
                 {
                     "model_name": "lumen",
                     "api_model_name": "lumen",
                     "api_provider": "custom_provider",
+                    "required_scopes": [],
                 },
             ]
 

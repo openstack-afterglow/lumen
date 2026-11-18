@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
 from lumen.services import openai_compat
+from lumen.services.inference_authority import principal_may_use
 from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 from lumen.services.providers import errors, routing
 
@@ -61,24 +62,28 @@ def _reject(message: str) -> core.CompletionError:
 
 
 # ── Catalog ───────────────────────────────────────────────────────────────────
-async def _catalog(provider: str | None) -> list[dict]:
+async def _catalog(provider: str | None, principal: dict) -> list[dict]:
     try:
         text = await routing.list_gemini_api_models()
         embeddings = [row for row in await routing.list_api_models(model_kind="embedding")
                       if row["provider_type"] == "gemini"]
     except errors.ChatStorageUnavailable as exc:
         raise core.CompletionError(503, "model catalog unavailable") from exc
+    # Hide routes whose intrinsic scopes (Sonar built-in search) this caller cannot hold.
+    text = [row for row in text if principal_may_use(principal, row["required_scopes"])]
+    embeddings = [row for row in embeddings if principal_may_use(principal, row["required_scopes"])]
     if provider is not None:
         text = [row for row in text if row["provider"] == provider]
         embeddings = [row for row in embeddings if row["api_provider"] == provider]
+    # ``/v1beta/models`` is one namespace: a public ID shared by any two listed rows,
+    # of any kind, is issued only as each row's exact route instead of guessing.
     counts: dict[str, int] = {}
-    for row in text:
+    for row in (*text, *embeddings):
         counts[row["api_model_name"]] = counts.get(row["api_model_name"], 0) + 1
     models = []
     for row in text:
         public = row["api_model_name"]
         caps = row["capabilities"]
-        # Same public ID on several providers: issue the exact route instead of guessing.
         model = {
             "name": f"models/{public if counts[public] == 1 else row['id']}",
             "baseModelId": public,
@@ -93,11 +98,8 @@ async def _catalog(provider: str | None) -> list[dict]:
         if isinstance(caps.get("max_output_tokens"), int):
             model["outputTokenLimit"] = caps["max_output_tokens"]
         models.append(model)
-    embedding_counts: dict[str, int] = {}
-    for row in embeddings:
-        embedding_counts[row["api_model_name"]] = embedding_counts.get(row["api_model_name"], 0) + 1
     models.extend({
-        "name": "models/" + (row["api_model_name"] if embedding_counts[row["api_model_name"]] == 1
+        "name": "models/" + (row["api_model_name"] if counts[row["api_model_name"]] == 1
                              else routing.cli_route_id(row["provider_id"], row["model_id"])),
         "baseModelId": row["api_model_name"], "version": "lumen",
         "displayName": row["api_model_name"], "description": row["api_provider"],
@@ -113,11 +115,10 @@ async def list_models(
     x_lumen_provider: str | None = _PROVIDER_HEADER,
     token_info: dict = Depends(require_api_key_scopes("models:read")),
 ):
-    del token_info
     if pageToken is not None and not pageToken.isdecimal():
         raise _reject("pageToken is invalid")
     offset = int(pageToken or 0)
-    models = await _catalog(x_lumen_provider)
+    models = await _catalog(x_lumen_provider, token_info)
     page = {"models": models[offset:offset + pageSize]}
     if offset + pageSize < len(models):
         page["nextPageToken"] = str(offset + pageSize)
@@ -130,9 +131,8 @@ async def get_model(
     x_lumen_provider: str | None = _PROVIDER_HEADER,
     token_info: dict = Depends(require_api_key_scopes("models:read")),
 ):
-    del token_info
     selector = model.removeprefix("models/")
-    matches = [row for row in await _catalog(x_lumen_provider)
+    matches = [row for row in await _catalog(x_lumen_provider, token_info)
                if row["name"] == f"models/{selector}" or row["baseModelId"] == selector]
     exact = [row for row in matches if row["name"] == f"models/{selector}"]
     if len(exact or matches) > 1:

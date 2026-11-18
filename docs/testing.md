@@ -17,7 +17,16 @@ The OpenAI SDK covers model list, chat, Responses and base64 embeddings; the Ant
 
 A `@google/genai` wire probe confirmed the Node.js SDK sends `x-goog-api-key` and keeps `models/lumen/<p>/<m>` slashes raw for list/get/generate/stream. It ran against a stubbed fetch, not Lumen.
 
-Not verified: payer-specific holds through persisted personal/service keys (needs the migration 038 key branch), live providers, JavaScript end-to-end against Lumen, deployment.
+After merging the migration 038 key branch (`feat/ds-keys-on-int@8194594`), the unit fixtures return the real personal model-key principal (payer, `lumen:key:<id>` storage actor, synthetic Keystone owner/domain) and record payer-scoped stateless reserve/settle/finish. `tests/test_gemini_sdk_compat.py` and `tests/test_official_sdk_compat.py` 27 passed. These include a Sonar case: the route is hidden from `/v1/models` (both formats), `/v1/cli/models` and `/v1beta/models`, and OpenAI, Anthropic and Gemini dispatch return 403 `model_requires_server_tools` with no hold or provider call. The six-file unit set (`test_gemini_sdk_compat`, `test_official_sdk_compat`, `test_embeddings_api`, `test_ai_compat`, `test_cli_model_catalog`, `test_model_api_keys`) ran 183 passed / 48 failed. The same 48 fail on a clean `8194594` checkout (key-branch fixture drift still being fixed there).
+
+`uv run lumen-test integration -k "gemini_model_key or model_api_key_billing or embedding_settlement"`: 9 passed on disposable MariaDB/Redis. `tests/integration/test_gemini_model_key_sdk.py` drives the official SDK through the real API-key dependency with persisted personal and service keys; only the Keystone directory and private Bifrost are synthetic. It covers:
+- two Gemini providers with same-named embedding rows listed as distinct exact IDs, each embedded successfully;
+- `generate_content` settles exactly one payer-scoped stateless hold and writes a ledger row: personal → user payer, service → domain pool, `project_id` NULL;
+- a key holding only `models:read` gets 403 `PERMISSION_DENIED` for generate and embed;
+- an official `perplexity/sonar` row is hidden from discovery and refused with 403 `model_requires_server_tools`, with no hold row;
+- a text row and an embedding row sharing a public name are listed as two exact IDs; get works for each and the bare name returns 409; `generate_content`/`embed_content` succeed on the respective IDs.
+
+Not verified: live providers, JavaScript end-to-end against Lumen, deployment.
 
 ## Prepaid domain billing (migration 037)
 

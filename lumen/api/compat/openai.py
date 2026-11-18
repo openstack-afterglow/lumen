@@ -23,7 +23,7 @@ from lumen.models.api_requests import OpenAIChatRequest, OpenAIChatResponse
 from lumen.services import completion_api as core
 from lumen.services import openai_compat
 from lumen.services.completion_format import nonstream_response, prompt_token_details
-from lumen.services.inference_authority import completion_scopes
+from lumen.services.inference_authority import completion_scopes, principal_may_use
 from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 from lumen.services.providers import errors, routing
 
@@ -389,10 +389,14 @@ async def list_models(
         else:
             # Messages SDKs list only rows /v1/messages can execute; bounded official
             # OpenAI rows lack Messages accounting evidence (see billing_route).
-            models = [{"api_model_name": row["api_model_name"], "api_provider": row["provider"]}
+            models = [{"api_model_name": row["api_model_name"], "api_provider": row["provider"],
+                       "required_scopes": row["required_scopes"]}
                       for row in await routing.list_cli_models() if "messages" in row["protocols"]]
     except errors.ChatStorageUnavailable:
         models = []
+    # Discovery mirrors dispatch: hide routes whose intrinsic scopes (Sonar built-in
+    # search needs native:tools:execute) this caller cannot hold.
+    models = [model for model in models if principal_may_use(token_info, model["required_scopes"])]
     if x_lumen_provider is not None:
         models = [model for model in models if model.get("api_provider") == x_lumen_provider]
     if anthropic_version is not None:

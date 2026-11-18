@@ -15,8 +15,12 @@ from types import SimpleNamespace
 
 import anthropic
 import httpx
+import openai
 import pytest
 from anthropic import AsyncAnthropic
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 from openai import AsyncOpenAI
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -28,9 +32,9 @@ from starlette.routing import Route
 
 from lumen.main import app
 from lumen.models.chat_db import LlmModel, LlmProvider, LlmProviderAccount, LlmProviderCredential
-from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import api_key_store, credit, provider_client
 from lumen.services.providers import credentials, routing
+from tests.test_gemini_sdk_compat import _model_key_principal, _personal_key_row, _record_holds
 
 pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
 
@@ -112,7 +116,8 @@ def catalog(monkeypatch):
         dict(id=2, name="Anthropic Compatible", provider_type="anthropic", api_provider="anthropic", sort_order=1,
              api_base="https://anthropic-compatible.invalid"),
     ]
-    priced = {"input_price": _per_token("1"), "output_price": _per_token("2"), "price_source": "manual"}
+    priced = {"input_price": _per_token("1"), "output_price": _per_token("2"), "price_source": "manual",
+              "capabilities": {"context_limit": 200_000, "max_output_tokens": 8192}, "capability_source": "override"}
     embedding = {
         "default_dimensions": 3, "supports_dimensions": False,
         "min_dimensions": None, "max_dimensions": None, "allowed_dimensions": None,
@@ -139,19 +144,16 @@ def catalog(monkeypatch):
 
 
 @pytest.fixture
-def boundary(monkeypatch, catalog):
+def boundary(monkeypatch, catalog, synthetic_inference_store):
     """Record the synthetic key, credential, credit and Bifrost boundaries."""
+    _personal_key_row(synthetic_inference_store, monkeypatch)
     state = SimpleNamespace(keys=[], credentials=[], precheck=[], settled=[], bifrost=[])
 
     async def verify_key(raw):
         state.keys.append(raw)
         if raw != _API_KEY:
             return None
-        return {
-            "user_id": "u1", "project_id": "p1", "api_key_id": 7,
-            "scopes": ("models:read", "compat:completions:write"),
-            "roles": ["member", *SERVICE_CAPABILITIES],
-        }
+        return _model_key_principal(("models:read", "compat:completions:write", "embeddings:write"))
 
     async def resolve_credential(ref):
         state.credentials.append(dict(ref))
@@ -178,6 +180,7 @@ def boundary(monkeypatch, catalog):
     monkeypatch.setattr(credentials, "resolve_inference_credential", resolve_credential)
     monkeypatch.setattr(credit, "precheck", precheck)
     monkeypatch.setattr(credit, "apply_usage", apply_usage)
+    _record_holds(monkeypatch, state)
     monkeypatch.setattr(provider_client, "get_bifrost_runtime", runtime)
     monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **_kwargs: httpx.ASGITransport(app=bifrost))
     return state
@@ -392,7 +395,9 @@ async def test_anthropic_sdk_lists_only_messages_eligible_routes(anthropic_sdk, 
                                     api_provider=api_provider, sort_order=provider_id, api_base=None,
                                     margin_multiplier=Decimal("1"), accounts=[account]))
     with catalog.begin() as session:
-        priced = {"input_price": _per_token("1"), "output_price": _per_token("2"), "price_source": "manual"}
+        priced = {"input_price": _per_token("1"), "output_price": _per_token("2"), "price_source": "manual",
+                  "capabilities": {"context_limit": 200_000, "max_output_tokens": 8192},
+                  "capability_source": "override"}
         session.add_all([LlmModel(id=31, provider_id=3, model_name="gpt-6.2-sol", **priced),
                          LlmModel(id=41, provider_id=4, model_name="gemini-sdk", **priced)])
 
@@ -410,3 +415,39 @@ async def test_anthropic_sdk_lists_only_messages_eligible_routes(anthropic_sdk, 
         await anthropic_sdk.messages.create(
             model="gpt-6.2-sol", max_tokens=16, messages=[{"role": "user", "content": "hello"}])
     assert len(boundary.bifrost) == 3
+
+
+async def test_model_keys_never_see_or_call_sonar_built_in_search(openai_sdk, anthropic_sdk, wire, boundary, catalog):
+    with catalog.begin() as session:
+        credential = LlmProviderCredential(id=5, name="synthetic", auth_mode="api_key", generation=0,
+                                           encrypted_api_key="sealed-synthetic-not-a-real-credential")
+        session.add(LlmProvider(id=5, name="Perplexity", provider_type="perplexity", api_provider="perplexity",
+                                sort_order=5, api_base=None, margin_multiplier=Decimal("1"),
+                                accounts=[LlmProviderAccount(id=5, name="synthetic", credentials=[credential])]))
+    with catalog.begin() as session:
+        session.add(LlmModel(id=51, provider_id=5, model_name="sonar", input_price=_per_token("1"),
+                             output_price=_per_token("1"), price_source="manual", capability_source="override",
+                             capabilities={"context_limit": 128_000, "max_output_tokens": 8192}))
+    gemini = genai.Client(api_key=_API_KEY, http_options=genai_types.HttpOptions(
+        base_url="http://lumen.test", api_version="v1beta", httpx_async_client=wire.client,
+        retry_options=genai_types.HttpRetryOptions(attempts=1)))
+
+    # Discovery hides the route on every key-facing catalog...
+    assert "perplexity/sonar" not in [model.id async for model in openai_sdk.models.list()]
+    assert "perplexity/sonar" not in [model.id for model in (await anthropic_sdk.models.list(limit=100)).data]
+    assert not [model.name async for model in await gemini.aio.models.list() if "sonar" in model.name]
+    cli = await wire.client.get("http://lumen.test/v1/cli/models", headers={"Authorization": f"Bearer {_API_KEY}"})
+    assert cli.status_code == 200 and not [row for row in cli.json()["models"] if row["provider"] == "perplexity"]
+
+    # ...and dispatch refuses it with the same reason before any hold or provider I/O.
+    messages = [{"role": "user", "content": "search"}]
+    with pytest.raises(openai.PermissionDeniedError) as chat:
+        await openai_sdk.chat.completions.create(model="perplexity/sonar", messages=messages)
+    assert chat.value.body["code"] == "model_requires_server_tools"
+    with pytest.raises(anthropic.PermissionDeniedError, match="model_requires_server_tools"):
+        await anthropic_sdk.messages.create(model="perplexity/sonar", max_tokens=16, messages=messages)
+    with pytest.raises(genai_errors.ClientError) as generate:
+        await gemini.aio.models.generate_content(model="perplexity/sonar", contents="search")
+    assert (generate.value.code, generate.value.status, generate.value.message) == (
+        403, "PERMISSION_DENIED", "model_requires_server_tools")
+    assert boundary.bifrost == [] and boundary.holds == [] and boundary.settled == []
