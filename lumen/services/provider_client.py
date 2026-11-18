@@ -188,7 +188,7 @@ def _check_openai_usage(payload: dict, *, converted: bool, require_usage: bool) 
     raw = payload.get("provider_usage" if converted else "usage")
     if raw is None and not require_usage:
         return
-    usage = UsageBreakdown.from_responses(raw)
+    usage = UsageBreakdown.from_responses(raw, official_openai=True)
     if usage is None or usage.modality_usage_invalid:
         raise OpenAIUsageInvalid()
 

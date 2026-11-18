@@ -57,7 +57,7 @@ async def test_openai_hosted_text_stateless_hold_and_atomic_ledger(sql_owner, mo
     route = route_for()
     monkeypatch.setattr(completion_api.get_settings(), "chat_credit_per_usd", Decimal(1))
     monkeypatch.setattr(completion_api, "_authorize_completion", AsyncMock())
-    totals = 10000000 if outcome == "over_hold" else 272001
+    totals = 272001
     payload = {
         "status": "completed", "service_tier": "default", "output": OUTPUT,
         "usage": {"input_tokens": totals, "output_tokens": 20, "total_tokens": totals + 20,
@@ -74,6 +74,10 @@ async def test_openai_hosted_text_stateless_hold_and_atomic_ledger(sql_owner, mo
     cap = credit.call_credit_bound(
         {**route, "chat_credit_per_usd": Decimal(1)}, input_tokens=922000, output_tokens=64,
     ) + Decimal("1.30")
+    if outcome == "over_hold":
+        # Exercise transaction rollback, not only the earlier count fence.
+        cap = Decimal("1.30")
+        monkeypatch.setattr(credit, "call_credit_bound", lambda *_args, **_kwargs: Decimal("0"))
     async with factory() as session, session.begin():
         wallet = await session.get(UserWallet, user)
         wallet.max_quota_monthly = cap - Decimal("0.01") if outcome == "low" else cap
@@ -122,6 +126,29 @@ async def test_openai_hosted_text_stateless_hold_and_atomic_ledger(sql_owner, mo
                 assert ledger.pricing_snapshot["hosted_tools"]["container"]["blocks"] == 2
             else:
                 assert hold.status == "unknown" and ledger is None and wallet.used_quota_this_month == 0
+
+
+async def test_small_openai_text_prompt_fits_low_credit_wallet(sql_owner, monkeypatch):
+    from test_openai_text_protocol import route_for
+
+    factory, user, project = sql_owner
+    monkeypatch.setattr(completion_api.get_settings(), "chat_credit_per_usd", 1.0)
+    monkeypatch.setattr(completion_api, "_authorize_completion", AsyncMock())
+    reply = {"status": "completed", "output": [], "usage": {"input_tokens": 20, "output_tokens": 10}}
+    upstream = AsyncMock(return_value=reply)
+    monkeypatch.setattr(completion_api.provider_client, "aresponses", upstream)
+    async with factory() as session, session.begin():
+        (await session.get(UserWallet, user)).max_quota_monthly = Decimal("0.02")
+    assert await completion_api.complete_responses(
+        resolved=route_for(), input="test", stream=False, user_id=user, project_id=project,
+        api_key_id=None, options={"max_output_tokens": 128},
+    ) == reply
+    upstream.assert_awaited_once()
+    async with factory() as session:
+        hold = (await session.scalars(select(StatelessCallReservation).where(
+            StatelessCallReservation.user_id == user))).one()
+        assert hold.status == "settled" and hold.bound_credits < Decimal("0.02")
+        assert hold.actual_credits == Decimal("0.00014")
 
 
 def _route():

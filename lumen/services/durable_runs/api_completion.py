@@ -32,7 +32,6 @@ from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunPro
 from lumen.services import (
     completion_api,
     credit,
-    openai_tool_policy,
     provider_client,
     provider_errors,
     provider_metadata,
@@ -181,10 +180,8 @@ async def prepare_api_completion_run(
         if body.service_tier not in (None, "default", "auto"):
             raise DurableRunInputError("service_tier_unsupported")
         try:
-            max_output = completion_api.clamp_max_tokens(
-                body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
-            )
             chat_options = completion_api.chat_provider_options(body.provider_options(), resolved=route)
+            max_output = completion_api.clamp_max_tokens(chat_options.get("max_completion_tokens", body.max_tokens))
             route = completion_api.billing_route(route, body.messages, protocol="chat", options={"tools": body.tools})
         except completion_api.CompletionError as exc:
             raise _input_error(exc) from exc
@@ -201,11 +198,9 @@ async def prepare_api_completion_run(
         if body.conversation is not None:
             raise DurableRunInputError("provider_reference_unsupported")
         try:
-            openai_tool_policy.validate_input(body.input)
-        except openai_tool_policy.UnsupportedProviderReference as exc:
-            raise DurableRunInputError("provider_reference_unsupported") from exc
-        except openai_tool_policy.UnsupportedHostedTool as exc:
-            raise DurableRunInputError("provider_builtin_tool_unsupported") from exc
+            completion_api.validate_openai_input(route, body.input)
+        except completion_api.CompletionError as exc:
+            raise _input_error(exc) from exc
         if body.background is True:
             raise DurableRunInputError("background_not_supported")
         if body.context_management is not None:

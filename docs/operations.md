@@ -740,6 +740,30 @@ the catalog's short-context number does not turn a manual price into a tier.
 Published Cyber/Rosalind prices do not grant access. Unpublished long-context
 cache-write rates remain unavailable, not copies of the short-context rate.
 
+### OpenAI text credit envelope
+
+The online hold uses UTF-8 bytes of compact JSON for prompt messages, tool
+definitions and output schemas, plus 4,096 tokens of framing, 16 per message
+or tool definition, and the published per-image token cap when available.
+This framing allowance is Lumen policy, not a provider guarantee. For media
+without a published cap (including GPT-6.2 image input), encrypted history,
+or tools that add server-side context, use the available input ceiling instead.
+The ceiling is the smaller of the input limit and context less output reserve.
+The output reserve is the explicit caller cap, or the model's published maximum.
+
+Choose the maximum frozen applicable input rate, including cache writes.
+Default 30m writes count; reserve the 12h rate if the request or an input
+breakpoint asks for 12h. Include long-context rates only if the input bound
+can exceed the model threshold. Add the hosted fee ceiling, then apply credit
+conversion and margin. A provider report beyond the reserved token or charge
+ceiling does not settle. Examples before margin, credit conversion and rounding:
+
+| Request | Reservation |
+| --- | ---: |
+| Sol, prompt of 1,000 UTF-8 bytes, one user message, compact Chat envelope of 73 bytes, 128 output tokens | 5,185 × $2.50/M + 128 × $10/M = $0.0142425 |
+| Same Sol request, no output cap | 5,185 × $2.50/M + 128,000 × $10/M = $1.2929625 |
+| Astra with Web Search, default 10 calls, default cache TTL and no output cap | 922,000 × $20/M + 128,000 × $60/M + 10 × $0.01 = $26.22 |
+
 For official OpenAI text, use Standard processing. Online routes with known
 catalog limits reserve worst-case token cost before dispatch. Metered Responses
 tools add a bound based on `max_tool_calls` (default 10, maximum 20). Web Search

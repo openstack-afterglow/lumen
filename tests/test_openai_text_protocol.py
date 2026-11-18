@@ -11,7 +11,7 @@ from lumen.models.api_requests import OpenAIChatRequest, ResponsesRequest
 from lumen.services import completion_api as core
 from lumen.services import credit, openai_tool_policy, provider_client, provider_metadata
 from lumen.services.completion_format import prompt_token_details
-from lumen.services.provider_errors import OpenAIUsageInvalid
+from lumen.services.provider_errors import APIConnectionError, BadRequestError, OpenAIUsageInvalid
 from lumen.services.providers.pricing import _resolved_base_prices, _resolved_cache_prices, _resolved_context_tiers
 from lumen.services.usage_breakdown import UsageBreakdown
 
@@ -108,6 +108,25 @@ def test_bad_cache_evidence_is_not_repaired(delta):
         UsageBreakdown.from_runtime({"prompt_tokens": 1000, "completion_tokens": 0, "prompt_tokens_details": details}),
     ):
         assert breakdown is not None and breakdown.modality_usage_invalid
+
+
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+@pytest.mark.parametrize("bifrost,long", [(True, 300), (False, 0)])
+def test_legacy_cache_write_shapes_keep_aggregate_and_split(protocol, bifrost, long):
+    details = {"cached_tokens": 100, "cache_write_tokens": 500}
+    if bifrost:
+        details["cached_read_tokens"] = 100
+        details["cached_write_tokens"] = 500
+        details["cached_write_token_details"] = {"cached_write_tokens_5m": 200, "cached_write_tokens_1h": 300}
+    usage = (
+        UsageBreakdown.from_runtime({"prompt_tokens": 1000, "completion_tokens": 10, "prompt_tokens_details": details})
+        if protocol == "chat"
+        else UsageBreakdown.from_responses({"input_tokens": 1000, "output_tokens": 10, "input_tokens_details": details})
+    )
+    assert usage == UsageBreakdown(1000, 10, 100, 500 - long, long)
+    raw = {"input_tokens": 1000, "output_tokens": 10, "input_tokens_details": details}
+    with pytest.raises(OpenAIUsageInvalid):
+        provider_client._check_openai_usage({"usage": raw}, converted=False, require_usage=True)
 
 
 def test_no_unpublished_restricted_long_write_rate():
@@ -310,7 +329,10 @@ async def test_distinct_input_limit_rejects_before_send(monkeypatch):
     monkeypatch.setattr(core.stateless_credit, "reserve", reserve)
     monkeypatch.setattr(provider_client, "acompletion", send)
     with pytest.raises(core.CompletionError) as failure:
-        await core.complete_once(resolved=route_for(), messages=MESSAGES, temperature=None, max_tokens=32, **OWNER)
+        await core.complete_once(
+            resolved=route_for(), messages=[{"role": "user", "content": "a" * 922_001}],
+            temperature=None, max_tokens=32, **OWNER,
+        )
     assert (failure.value.status_code, failure.value.code) == (422, "context_length_exceeded")
     reserve.assert_not_awaited()
     send.assert_not_awaited()
@@ -356,3 +378,132 @@ async def test_hosted_sse_uses_terminal_evidence(monkeypatch, outcome):
     if outcome != "settled":
         settle.assert_not_awaited()
         finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_official_chat_rejects_provider_file_id_before_send(monkeypatch, stream):
+    messages = [{"role": "user", "content": [{"type": "file", "file": {"file_id": "private-reference"}}]}]
+    reserve, dispatch = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(core.stateless_credit, "reserve", reserve)
+    monkeypatch.setattr(provider_client, "acompletion_stream" if stream else "acompletion", dispatch)
+    invoke = core.complete_stream if stream else core.complete_once
+    with pytest.raises(core.CompletionError) as failure:
+        await invoke(resolved=route_for(), messages=messages, temperature=None, max_tokens=32, **OWNER)
+    assert failure.value.code == "provider_reference_unsupported"
+    assert "private-reference" not in failure.value.message
+    reserve.assert_not_awaited()
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("options,code", [
+    ({}, "messages_accounting_unsupported"),
+    ({"tools": [{"type": "web_search_20250305"}]}, "hosted_tool_unsupported"),
+    ({"container": "private-reference"}, "hosted_tool_unsupported"),
+])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_official_messages_cannot_bypass_accounting_or_tool_gate(monkeypatch, options, code, stream):
+    dispatch = AsyncMock()
+    monkeypatch.setattr(provider_client, "aanthropic_messages", dispatch)
+    with pytest.raises(core.CompletionError) as failure:
+        await core.complete_anthropic(
+            resolved=route_for(), messages=MESSAGES, max_tokens=32, stream=stream, options=options, **OWNER,
+        )
+    assert (failure.value.status_code, failure.value.code) == (422, code)
+    dispatch.assert_not_awaited()
+
+
+async def test_nonofficial_responses_preserves_legacy_tools_and_input(monkeypatch):
+    route = {**route_for(), "api_base": "https://compatible.test/v1"}
+    input_items = [{"type": "item_reference", "id": "compatible-object"}]
+    tools = [{"type": "code_interpreter", "container": "compatible-container"}]
+    reply = {"output": [], "usage": {"input_tokens": 5, "output_tokens": 1}}
+    dispatch = AsyncMock(return_value=reply)
+    monkeypatch.setattr(core, "_authorize_completion", AsyncMock())
+    monkeypatch.setattr(provider_client, "aresponses", dispatch)
+    monkeypatch.setattr(core.credit, "apply_usage", AsyncMock(return_value=Decimal("0.1")))
+    assert await core.complete_responses(
+        resolved=route, input=input_items, stream=False,
+        options={"tools": tools, "service_tier": "auto", "prompt_cache_key": "legacy"}, **OWNER,
+    ) == reply
+    assert dispatch.await_args.kwargs["input"] == input_items
+    assert dispatch.await_args.kwargs["tools"] == tools
+    assert dispatch.await_args.kwargs["prompt_cache_key"] == "legacy"
+    assert "service_tier" not in dispatch.await_args.kwargs
+
+
+def test_nonofficial_chat_does_not_forward_new_options():
+    route = {**route_for(), "api_base": "https://compatible.test/v1"}
+    options = {"service_tier": "auto", "max_completion_tokens": 32, "reasoning_effort": "high",
+               "prompt_cache_key": "local-key", "response_format": {"type": "json_object"}}
+    assert core.chat_provider_options(options, resolved=route) == {}
+    for normalize in (core.chat_provider_options, core.responses_provider_options):
+        with pytest.raises(core.CompletionError) as failure:
+            normalize({**options, "service_tier": "fast"}, resolved=route)
+        assert failure.value.code == "service_tier_unsupported"
+
+
+def test_openai_input_allows_reference_named_mcp_schema_properties():
+    history = [{"type": "mcp_list_tools", "id": "inline", "server_label": "docs", "tools": [
+        {"name": "describe", "input_schema": {"type": "object", "properties": {
+            "file_id": {"type": "string"}, "response_id": {"type": "string"},
+        }}},
+    ]}]
+    openai_tool_policy.validate_input(history)
+
+
+@pytest.mark.parametrize("requested,output", [(128, 128), (None, 128_000)])
+async def test_small_openai_prompt_hold_uses_short_context_and_selected_output(monkeypatch, requested, output):
+    monkeypatch.setattr(core.get_settings(), "chat_credit_per_usd", 1.0)
+    route = route_for()
+    options = {"tool_choice": None, "service_tier": "default"}
+    messages = [{"role": "user", "content": "x" * 1000}]
+    # 1,000 text bytes + 73 bytes of JSON envelope + 4,096 base + 16 framing
+    # tokens. Default 30m writes cost $2.50/M; short output costs $10/M.
+    input_bound = 5185
+    expected = (Decimal(input_bound) * Decimal("0.0000025") + Decimal(output) * Decimal("0.00001")).quantize(
+        Decimal("0.00000001"),
+    ) + Decimal("0.00000001")
+    quota = expected
+
+    async def reserve(**kwargs):
+        if kwargs["bound"] > quota:
+            raise credit.QuotaExceeded("fixture credit limit")
+        assert kwargs["bound"] == expected
+
+    monkeypatch.setattr(core.stateless_credit, "reserve", reserve)
+    assert core._chat_output_budget(route, requested) == output
+    hold = await core._reserve_online(route, messages=messages, tools=None, max_output=output,
+                                      prompt_options=options, **OWNER)
+    assert (hold.input_bound, hold.output_bound) == (input_bound, output)
+
+
+@pytest.mark.parametrize("model,expected", [(MODEL, 922_000), ("gpt-4o", 4303)])
+def test_vision_request_uses_published_image_cap_when_known(model, expected):
+    route = route_for(model)
+    catalog = core._bounded_openai_model(route)
+    messages = [{"role": "user", "content": [{"type": "input_image", "image_url": "https://img.test/x", "detail": "low"}]}]
+    bound, _ = core._request_input_bound(
+        route, catalog, messages=messages, tools=None, max_output=128, prompt_options={}, content_growth=False,
+    )
+    assert bound == expected
+
+
+@pytest.mark.parametrize("failure,held,uncertain", [
+    (APIConnectionError, False, False), (BadRequestError, True, False), (APIConnectionError, True, True),
+])
+async def test_chat_stream_unknown_code_requires_dispatched_unsettled_hold(monkeypatch, failure, held, uncertain):
+    route = route_for() if held else {**route_for(), "api_base": "https://compatible.test/v1"}
+    finish = AsyncMock()
+    monkeypatch.setattr(core.stateless_credit, "reserve", AsyncMock())
+    monkeypatch.setattr(core.stateless_credit, "finish", finish)
+    monkeypatch.setattr(core, "_authorize_completion", AsyncMock())
+    monkeypatch.setattr(provider_client, "acompletion_stream", AsyncMock(side_effect=failure()))
+    stream = await core.complete_stream(resolved=route, messages=MESSAGES, temperature=None, max_tokens=32, **OWNER)
+    events = [event async for event in stream]
+    assert len(events) == 1 and events[0]["type"] == "error"
+    assert events[0].get("code") == ("provider_result_unknown" if uncertain else None)
+    if held:
+        finish.assert_awaited_once()
+        assert finish.await_args.kwargs["uncertain"] is uncertain
+    else:
+        finish.assert_not_awaited()

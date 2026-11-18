@@ -19,6 +19,7 @@ from lumen.services.bifrost_runtime import BIFROST_VERSION
 from lumen.services.capabilities import reasoning_explicitly_unsupported
 from lumen.services.provider_metadata import (
     NATIVE_PROVIDER_TYPES,
+    bounded_openai_text_model,
     direct_provider_route,
     is_gemini_decision_model,
     provider_family,
@@ -57,6 +58,7 @@ _MAX_ROW_ID = 9223372036854775807
 # capabilities; absent keys stay absent rather than being invented.
 _CLI_CAPABILITY_KEYS = (
     "context_limit",
+    "max_input_tokens",
     "max_output_tokens",
     "input_modalities",
     "output_modalities",
@@ -659,6 +661,8 @@ def _cli_transport_protocols(model: LlmModel, provider: LlmProvider) -> tuple[st
         return ()
     if provider.provider_type == "openai" and not direct_provider_route("openai", provider.api_base):
         return ("messages",)
+    if bounded_openai_text_model(model.model_name, provider.provider_type, provider.api_base):
+        return ("responses",)  # the Messages stream cannot prove OpenAI settlement evidence
     return ("messages", "responses")
 
 

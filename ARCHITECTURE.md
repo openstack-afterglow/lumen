@@ -42,6 +42,8 @@ Remote MCP requires a direct HTTPS URL and `require_approval: "never"` on statel
 
 The context fence and preview use the smaller of the provider input ceiling and the window after output and safety reserves. Batch freezes the smaller of the input ceiling and the window after the requested output budget, without reserving the full context as input.
 
+Online official OpenAI text normally reserves from request bytes, framing, published image bounds and the requested output budget. Server-expanded input uses the model ceiling. The stateless Messages bridge does not advertise or dispatch held OpenAI text routes because it cannot attest their terminal tier and cache evidence; Anthropic and compatible transports retain their legacy policy.
+
 `POST /v1/chat/decisions` resolves the active registered route before choosing its strict provider wire contract. OpenAI Decisions remains a `decisions` capability on API-key `text` routes such as `gpt-6-luna`. Gemini Decision 1 is a separate `decision` model kind for the official Gemini Developer API with API-key credentials only. It is not eligible for chat, embeddings, media, batch, or CLI model surfaces. Decision Studio opts into `GET /v1/chat/models?model_kind=decision`; the ordinary list is unchanged. `/v1/decisions` stays OpenAI-only; `/v1beta/decisions` is Gemini-only and reuses Google embedding compatibility authorization.
 
 The official Google Gen AI Python SDK exercise lives in the isolated system stack. The pinned SDK is a dev extra only; service images do not depend on it. `/v1beta/decisions` uses the existing selector ambiguity check and accepts the unmodified model string sent by the SDK, including the exact Lumen route selector.

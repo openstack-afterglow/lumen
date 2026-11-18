@@ -194,6 +194,16 @@ async def test_responses_batch_freezes_distinct_input_bound(route_catalog, input
     )
 
 
+async def test_chat_batch_rejects_provider_file_id_before_freezing(route_catalog):
+    body = {
+        "model": "gpt-test",
+        "messages": [{"role": "user", "content": [{"type": "file", "file": {"file_id": "private-reference"}}]}],
+    }
+    with pytest.raises(DurableRunInputError) as failure:
+        await api_completion.prepare_api_completion_run(body, operation="chat.completions", project_id="p", user_id="u")
+    assert str(failure.value) == "provider_reference_unsupported"
+
+
 @pytest.mark.parametrize("item", [
     {"id": "private-reference"},
     {"type": None, "id": "private-reference"},
