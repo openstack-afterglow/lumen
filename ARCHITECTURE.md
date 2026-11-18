@@ -44,9 +44,11 @@ The context fence and preview use the smaller of the provider input ceiling and 
 
 Online official OpenAI text normally reserves from request bytes, framing, published image bounds and the requested output budget. Server-expanded input uses the model ceiling. The stateless Messages bridge does not advertise or dispatch held OpenAI text routes because it cannot attest their terminal tier and cache evidence; Anthropic and compatible transports retain their legacy policy.
 
+A full model-ceiling reservation for server-expanded input does not bypass GPT-6.2's admission check for locally countable input. Over-limit requests fail before a hold or upstream dispatch.
+
 The Chat stream disables fallback billing before emitting an accounting error, so a client closing at the SSE error cannot turn a rejected result into a Standard-rate estimate.
 
-For held Chat and Responses streams, the SSE owner retains the pending upstream read and drains for at most 15 seconds after downstream disconnect. Delivery stops immediately; only authoritative terminal evidence can settle the hold.
+For held Chat and Responses streams, the SSE owner retains the pending upstream read and waits up to 15 seconds after downstream disconnect for terminal evidence. Delivery stops immediately. Once the atomic settlement starts, the drain deadline cannot cancel it.
 
 `POST /v1/chat/decisions` resolves the active registered route before choosing its strict provider wire contract. OpenAI Decisions remains a `decisions` capability on API-key `text` routes such as `gpt-6-luna`. Gemini Decision 1 is a separate `decision` model kind for the official Gemini Developer API with API-key credentials only. It is not eligible for chat, embeddings, media, batch, or CLI model surfaces. Decision Studio opts into `GET /v1/chat/models?model_kind=decision`; the ordinary list is unchanged. `/v1/decisions` stays OpenAI-only; `/v1beta/decisions` is Gemini-only and reuses Google embedding compatibility authorization.
 

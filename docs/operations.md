@@ -757,9 +757,10 @@ or tool definition, and the published per-image token cap when available.
 This framing allowance is Lumen policy, not a provider guarantee. Encrypted
 reasoning replay contributes its encoded UTF-8 bytes, assuming ciphertext bytes
 are at least the replayed token count. Computer-use screenshots follow image
-rules at automatic detail. For media without a published cap (including GPT-6.2
-images), files/audio, or tools that add server-side context, use the published
-input limit, or the context window if no separate input limit exists.
+rules at the requested detail, with automatic detail when omitted. For media
+without a published cap (including GPT-6.2 images), files/audio, or tools that
+add server-side context, use the published input limit, or the context window
+if no separate input limit exists.
 The output reserve is independent: use the explicit caller cap or the published
 output maximum. An omitted cap stays omitted when sent to official OpenAI.
 
@@ -787,9 +788,11 @@ reuse is permitted. Missing usage, missing container IDs, a nonstandard tier
 or tracking beyond the held bound leaves a content-free `unknown` reservation
 for operator disposition; do not retry the original request to settle it.
 After a held Chat or Responses client disconnect, the SSE owner stops client
-delivery and drains upstream for up to 15 seconds. It settles only from the
-terminal evidence. Failure, missing usage, or a drain deadline leaves the hold
-`unknown`; the owner closes upstream before releasing its SSE capacity slot.
+delivery and waits up to 15 seconds for terminal usage. Once the atomic
+settlement starts, it may complete beyond the drain deadline. If the terminal
+evidence does not arrive in time, the hold stays `unknown`. The owner closes
+upstream before releasing the SSE slot. Each held settlement attempt with valid
+token counts logs only the reservation ID and reported counts versus their bounds.
 
 ### OpenAI Images funding policy
 
