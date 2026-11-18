@@ -6,7 +6,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: package/runtime/lock/Kolla image default `0.6.18`은 release preparation이며 아직 발행·배포하지 않았다. 운영은 불변 tag `0.6.17`(`c5b020be`, 2026-11-17 UTC 배포; 033·034, 관리형 ClamAV, protocol 2)이다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 035의 조직 MCP 소유권 CHECK는 writer drain·백업 후 새 writer보다 먼저 적용한다. 033·034의 schema-first 전환 및 혼합 writer 금지 조건도 유지한다.
+- 버전: package/runtime/lock/Kolla image default `0.6.18`은 불변 tag `0.6.18`(`c90d0664`)로 발행되어 2026-11-18 UTC에 DMS Lab 운영에 배포됐다(035 적용, 관리형 ClamAV, protocol 2, sandbox runtime 꺼짐; 수신증은 `docs/testing.md`). 직전 운영 버전은 `0.6.17`(`c5b020be`)이다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 035의 조직 MCP 소유권 CHECK는 writer drain·백업 후 새 writer보다 먼저 적용한다. 033·034의 schema-first 전환 및 혼합 writer 금지 조건도 유지한다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
@@ -596,8 +596,8 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 {
   "schema_version": 1,
   "source_sha256": "c872e87bbf38aea4c107e6da391a3ca4890eb99603779223f14942cbe857509e",
-  "reviewed_at": "2026-11-18T04:01:21Z",
-  "summary": "0.6.18: MCP restart fence terminates the old process group and cancels stderr drain"
+  "reviewed_at": "2026-11-18T05:32:53Z",
+  "summary": "0.6.18 published and deployed (035); sandbox activation deferred with measured startup latency"
 }
 ```
 <!-- architecture-review:end -->
