@@ -7,7 +7,7 @@ import base64
 import json
 import uuid
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC
 from decimal import Decimal
 
@@ -24,6 +24,7 @@ from lumen.services.provider_metadata import UsageCost
 from lumen.services.providers import image_transport, routing
 from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.errors import AmbiguousModelRouteError
+from lumen.services.providers.image_billing import parse_svg_usage, svg_author_pricing
 from lumen.services.providers.pricing import frozen_token_pricing
 from lumen.services.run_store import (
     append_event,
@@ -60,6 +61,9 @@ from .media import (
 
 _SEGMENT = "image:1"
 _MAX_SOURCE_BYTES = 5 * 1024 * 1024
+_SOURCE_MIMES = {"image/png", "image/jpeg", "image/webp"}
+_OUTPUT_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp",
+                      "image/gif": "gif", "image/svg+xml": "svg"}
 
 
 def _intent(request: dict) -> dict:
@@ -67,8 +71,7 @@ def _intent(request: dict) -> dict:
               "prompt": request.get("prompt"), "size": request.get("size", "auto"), "quality": request.get("quality", "auto"),
               "n": request.get("n", 1), "source_asset_id": request.get("source_asset_id", request.get("input_asset_id"))}
     # Added only when requested so every pre-existing request keeps its idempotency fingerprint.
-    if request.get("complexity") is not None:
-        intent["complexity"] = request["complexity"]
+    intent.update(image_transport.image_options(request))
     return intent
 
 
@@ -88,6 +91,7 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
                             required_scopes: tuple[str, ...] | None = None,
                             credential_authority: dict | None = None) -> PreparedImageRun:
     """Freeze one finite image request without inference or source-byte I/O."""
+    image_transport.reject_streaming(stream=request.get("stream"), partial_images=request.get("partial_images"))
     if "model" in request:
         # OpenAI-compatible JSON body (Batch /v1/images/generations): same limits as the sync route.
         if request.get("response_format", "b64_json") != "b64_json":
@@ -117,28 +121,37 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
             or (api_provider is not None and api_provider != route["api_provider"])):
         raise DurableRunInputError("image provider or model is unavailable")
     source_asset_id = intent["source_asset_id"]
+    dimensions = None
     if source_asset_id is not None:
         if not isinstance(source_asset_id, str):
             raise DurableRunInputError("invalid source asset")
         asset = await assets.get_asset(asset_id=source_asset_id, user_id=user_id, project_id=project_id)
-        if asset["status"] != "clean" or asset["mime_type"] not in {"image/png", "image/jpeg", "image/webp"} or asset["size_bytes"] > _MAX_SOURCE_BYTES:
+        if asset["status"] != "clean" or asset["mime_type"] not in _SOURCE_MIMES or asset["size_bytes"] > _MAX_SOURCE_BYTES:
             raise DurableRunInputError("source image must be a bounded scanned owned asset")
+        metadata = asset.get("media_metadata") or {}
+        dimensions = [metadata.get("width"), metadata.get("height")]
     size = request.get("size", "auto")
     quality = request.get("quality", "auto")
     n = request.get("n", 1)
-    unit_price = image_transport.validate_image_request(route, size=size, quality=quality, n=n,
-                                                        edit=source_asset_id is not None,
-                                                        complexity=intent.get("complexity"))
+    options = image_transport.image_options(intent)
+    author_prices = svg_author_pricing() if options.get("output_format") == "svg" else None
+    unit_price = image_transport.validate_image_request(
+        route, size=size, quality=quality, n=n, edit=source_asset_id is not None, prompt=intent["prompt"],
+        source_dimensions=dimensions, author_prices=author_prices, **options,
+    )
     basis = image_transport.image_billing_basis(route)
     if not assets.asset_pipeline_available():
         raise DurableRunInputError("image asset storage or scanner is unavailable")
-    await credit.precheck(user_id, project_id, api_key_id)
     per_usd = Decimal(str(get_settings().chat_credit_per_usd))
     margin = Decimal(str(route["margin_multiplier"]))
     cost = unit_price if basis == "tokens" else unit_price * n
     bound = credit.credits_for_cost(cost, margin, per_usd)
-    if bound <= 0:
-        raise DurableRunInputError("image pricing must be a positive exact variant")
+    if bound <= 0 or bound >= Decimal("10000000000"):
+        raise DurableRunInputError("image credit reservation is outside the supported range")
+    if basis == "tokens" and "reservation_usd" not in route["media_pricing"]:
+        await credit.precheck(user_id, project_id, api_key_id, bound=bound)
+    else:
+        await credit.precheck(user_id, project_id, api_key_id)
     capability = {key: route[key] for key in ("provider_id", "model_id", "provider_name", "model_name", "model_kind", "config_version_hash")}
     capability.update(execution_identity(route))
     capability["effective_features"] = {}
@@ -151,6 +164,10 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
         pricing["reservation_usd"] = format(unit_price, "f")
         pricing["media_pricing"] = json.loads(json.dumps(route["media_pricing"]))
         pricing["required_token_modalities"] = ["image_output", *(["image_input"] if source_asset_id is not None else [])]
+        if "reservation_usd" not in route["media_pricing"] and dimensions is not None:
+            pricing["source_dimensions"] = dimensions
+        if author_prices is not None:
+            pricing["svg_author_pricing"] = deepcopy(author_prices)
     else:
         pricing["image_per_unit"] = format(unit_price, "f")
     pricing["bound_credits"] = format(bound, "f")
@@ -220,6 +237,7 @@ async def admit_image_run(request: dict, *, project_id: str, user_id: str, clien
     """Preserve UUID idempotency before checks, then commit before the Redis hint."""
     from .admission import existing_run_for_intent
 
+    image_transport.reject_streaming(stream=request.get("stream"), partial_images=request.get("partial_images"))
     intent = _intent_with_credential_authority(_intent(request), credential_authority)
     previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
         client_request_id=client_request_id, intent=intent, conversation_id=None)
@@ -279,7 +297,8 @@ async def _image_segment_start(run_id: str, *, owner: str, bound: Decimal) -> st
     return await budgets.retry_deadlocks(transaction)
 
 
-async def _image_checkpoint(run_id: str, *, owner: str, asset_ids: list[str], usage: UsageBreakdown | None) -> None:
+async def _image_checkpoint(run_id: str, *, owner: str, asset_ids: list[str],
+                            usage: UsageBreakdown | None, svg_usage: dict | None = None) -> None:
     factory = _factory()
     async with factory() as session, session.begin():
         run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one()
@@ -289,15 +308,19 @@ async def _image_checkpoint(run_id: str, *, owner: str, asset_ids: list[str], us
         if segment.status != "provider_started":
             raise DurableRunProviderResultUnknown("image provider boundary is no longer owned")
         complete_segment_io(segment, result_payload={"asset_ids": asset_ids},
-                            usage_payload=_image_usage_payload(len(asset_ids), usage))
+                            usage_payload=_image_usage_payload(len(asset_ids), usage, svg_usage))
         await append_event(session, run, _event(run, "run.stage.changed", {"stage": "model_response"}))
 
 
-def _image_usage_payload(count: int, usage: UsageBreakdown | None) -> dict:
-    return {"count": count, "token_usage": usage.as_usage_dict() if usage is not None else None}
+def _image_usage_payload(count: int, usage: UsageBreakdown | None, svg_usage: dict | None = None) -> dict:
+    payload = {"count": count, "token_usage": usage.as_usage_dict() if usage is not None else None}
+    if svg_usage is not None:
+        payload["svg_usage"] = svg_usage
+    return payload
 
 
-async def _record_image_usage(run_id: str, *, owner: str, count: int, usage: UsageBreakdown) -> None:
+async def _record_image_usage(run_id: str, *, owner: str, count: int, usage: UsageBreakdown,
+                              svg_usage: dict | None = None) -> None:
     """Persist paid provider usage before asset I/O so an ingestion failure keeps the evidence."""
     async with _factory()() as session, session.begin():
         run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one()
@@ -306,7 +329,47 @@ async def _record_image_usage(run_id: str, *, owner: str, count: int, usage: Usa
                           ChatRunSegment.segment_id == _SEGMENT).with_for_update())).scalar_one()
         if segment.status != "provider_started":
             raise DurableRunProviderResultUnknown("image provider boundary is no longer owned")
-        record_segment_usage(segment, _image_usage_payload(count, usage))
+        record_segment_usage(segment, _image_usage_payload(count, usage, svg_usage))
+
+
+def _price_token_image(pricing: dict, usage: object, *, model_name: str) -> tuple[UsageBreakdown, UsageCost, list[dict]]:
+    if not isinstance(usage, dict) or usage.get("count") != pricing["count"]:
+        raise ValueError("image usage count is inconsistent")
+    breakdown = UsageBreakdown.from_canonical(usage.get("token_usage"))
+    if breakdown is None or not breakdown.reported("image", "output"):
+        raise ValueError("image output token usage is missing")
+    usage_cost = credit.usage_cost_from_pricing_snapshot(
+        pricing, prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens, breakdown=breakdown,
+    )
+    if usage_cost.pricing_status != "priced":
+        raise ValueError("image token usage is unpriced")
+    metadata = {"size": pricing["size"], "quality": pricing["quality"]}
+    components = credit.token_usage_components(
+        usage_cost, segment_id=_SEGMENT, source="media", model_name=model_name, metadata=metadata,
+    )
+    author_prices = pricing.get("svg_author_pricing")
+    if author_prices is not None:
+        author = parse_svg_usage(usage.get("svg_usage"))
+        author_model = author["model"]
+        author_cost = credit.usage_cost_from_pricing_snapshot(
+            author_prices[author_model], prompt_tokens=author["input_tokens"], completion_tokens=author["output_tokens"],
+        )
+        if author_cost.pricing_status != "priced":
+            raise ValueError("SVG authoring usage is unpriced")
+        components += credit.token_usage_components(
+            author_cost, segment_id=_SEGMENT, source="media", model_name=author_model,
+            metadata={**metadata, "stage": "svg_authoring", "reasoning_tokens": author["reasoning_tokens"]},
+        )
+        breakdown += UsageBreakdown.from_totals(author["input_tokens"], author["output_tokens"])
+        usage_cost = replace(usage_cost, raw_cost=usage_cost.raw_cost + author_cost.raw_cost,
+                             input_cost=usage_cost.input_cost + author_cost.input_cost,
+                             output_cost=usage_cost.output_cost + author_cost.output_cost,
+                             pricing_snapshot={**usage_cost.pricing_snapshot, "svg_usage": author})
+    elif "svg_usage" in usage:
+        raise ValueError("unexpected SVG authoring usage")
+    if usage_cost.raw_cost > Decimal(pricing["reservation_usd"]):
+        raise ValueError("image token usage exceeds reservation")
+    return breakdown, usage_cost, components
 
 
 async def _settle_image(run_id: str, *, owner: str) -> None:
@@ -345,18 +408,9 @@ async def _settle_image(run_id: str, *, owner: str) -> None:
             if token_mode:
                 usage = load_segment_payload(segment.usage_payload)
                 try:
-                    breakdown = UsageBreakdown.from_canonical(usage.get("token_usage") if isinstance(usage, dict) else None)
-                    if not breakdown.reported("image", "output"):
-                        raise ValueError("image output token usage is missing")
-                    usage_cost = credit.usage_cost_from_pricing_snapshot(pricing,
-                        prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens,
-                        breakdown=breakdown)
-                    if usage_cost.pricing_status != "priced" or usage_cost.raw_cost > Decimal(pricing["reservation_usd"]):
-                        raise ValueError("image token usage is unpriced or exceeds reservation")
+                    breakdown, usage_cost, components = _price_token_image(pricing, usage, model_name=run.model_name)
                 except (ValueError, TypeError, KeyError) as exc:
                     raise DurableRunProviderResultUnknown("image token usage cannot safely be settled") from exc
-                components = credit.token_usage_components(usage_cost, segment_id=_SEGMENT,
-                    source="media", model_name=run.model_name, metadata={"size": pricing["size"], "quality": pricing["quality"]})
             else:
                 price = Decimal(pricing["image_per_unit"])
                 total = price * count
@@ -391,13 +445,15 @@ async def _settle_image(run_id: str, *, owner: str) -> None:
     await budgets.retry_deadlocks(transaction)
 
 
-async def _read_source(*, asset_id: str, user_id: str, project_id: str, run_id: str | None = None) -> tuple[bytes, str]:
+async def _read_image_asset(*, asset_id: str, user_id: str, project_id: str,
+                            run_id: str | None = None, output: bool = False) -> tuple[bytes, str]:
     # A Batch run reads its accepted input pin even if the asset was later deleted.
     opened = (await assets.open_run_input_download(asset_id=asset_id, run_id=run_id, user_id=user_id, project_id=project_id)
               if run_id is not None else await assets.open_download(asset_id=asset_id, user_id=user_id, project_id=project_id))
-    if opened.mime_type not in {"image/png", "image/jpeg", "image/webp"} or opened.size_bytes > _MAX_SOURCE_BYTES:
+    allowed = _OUTPUT_EXTENSIONS if output else _SOURCE_MIMES
+    if opened.mime_type not in allowed or opened.size_bytes > _MAX_SOURCE_BYTES:
         await asyncio.to_thread(opened.body.close)
-        raise DurableRunInputError("source image is not a bounded scanned image")
+        raise DurableRunInputError("asset is not a bounded scanned image")
     data = bytearray()
     async for chunk in opened.chunks():
         if len(data) + len(chunk) > _MAX_SOURCE_BYTES:
@@ -469,16 +525,22 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
             route = {**route, "media_pricing": pricing_snapshot["media_pricing"],
                      **{key: pricing_snapshot.get(key) for key in (
                          "input_price_per_token", "output_price_per_token", "cache_read_price_per_token")}}
-        price = image_transport.validate_image_request(route, size=pricing_snapshot["size"],
-                    quality=pricing_snapshot["quality"], n=pricing_snapshot["count"], edit=bool(source_id),
-                    complexity=payload.get("complexity"))
+        extra = image_transport.image_options(payload)
+        if "source_dimensions" in pricing_snapshot:
+            extra["source_dimensions"] = pricing_snapshot["source_dimensions"]
+        if "svg_author_pricing" in pricing_snapshot:
+            extra["author_prices"] = pricing_snapshot["svg_author_pricing"]
+        price = image_transport.validate_image_request(
+            route, size=pricing_snapshot["size"], quality=pricing_snapshot["quality"],
+            n=pricing_snapshot["count"], edit=bool(source_id), prompt=payload["prompt"], **extra,
+        )
         expected_price = Decimal(pricing_snapshot["reservation_usd"] if token_mode else pricing_snapshot["image_per_unit"])
         if price != expected_price:
             raise DurableRunInputError("image price changed after admission")
         bound = credit.credits_for_cost(price if token_mode else price * pricing_snapshot["count"],
                        Decimal(pricing_snapshot["margin_multiplier"]), Decimal(pricing_snapshot["credit_per_usd"]))
         if source_id:
-            source_data, source_mime = await _read_source(asset_id=source_id, user_id=payload["user_id"],
+            source_data, source_mime = await _read_image_asset(asset_id=source_id, user_id=payload["user_id"],
                 project_id=payload["project_id"], run_id=run_id if is_batch else None)
         state = await _image_segment_start(run_id, owner=owner, bound=bound)
         if state in IO_BLOCKED:
@@ -488,8 +550,6 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
             raise DurableRunProviderResultUnknown("image provider result cannot be replayed")
         if state == "started":
             try:
-                # ``complexity`` is forwarded only when requested, keeping every other call shape unchanged.
-                extra = {"complexity": payload["complexity"]} if payload.get("complexity") is not None else {}
                 generated = await image_transport.generate_images(route, prompt=payload["prompt"],
                              size=pricing_snapshot["size"], quality=pricing_snapshot["quality"],
                              n=pricing_snapshot["count"], source_image=source_data, source_mime=source_mime, **extra)
@@ -505,16 +565,24 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
             if len(outputs) != pricing_snapshot["count"]:
                 raise DurableRunProviderResultUnknown("provider returned a different image count")
             if generated.usage is not None:
-                await _record_image_usage(run_id, owner=owner, count=len(outputs), usage=generated.usage)
+                await _record_image_usage(run_id, owner=owner, count=len(outputs),
+                                          usage=generated.usage, svg_usage=generated.svg_usage)
             stored_ids = []
+            gif_pixels = 0
             for index, (image_bytes, mime_type) in enumerate(outputs):
-                extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(mime_type)
+                extension = _OUTPUT_EXTENSIONS.get(mime_type)
                 if extension is None:
                     raise DurableRunProviderResultUnknown("provider returned unsupported image MIME")
                 stored = await assets.create_generated_asset_bytes(data=image_bytes, original_name=f"image-{index + 1}.{extension}",
                               media_type=mime_type, user_id=payload["user_id"], project_id=payload["project_id"], run_id=run_id)
+                if mime_type == "image/gif":
+                    metadata = stored["media_metadata"]
+                    gif_pixels += metadata["width"] * metadata["height"] * metadata["frame_count"]
+                    if gif_pixels > image_transport.GIF_LIMITS["max_total_pixels"]:
+                        raise DurableRunProviderResultUnknown("provider GIF result exceeds the frame pixel budget")
                 stored_ids.append(stored["id"])
-            await _image_checkpoint(run_id, owner=owner, asset_ids=stored_ids, usage=generated.usage)
+            await _image_checkpoint(run_id, owner=owner, asset_ids=stored_ids,
+                                    usage=generated.usage, svg_usage=generated.svg_usage)
         await _settle_image(run_id, owner=owner)
         canceled = await _cancel_requested(run_id)
         await _finish(run_id, status="canceled" if canceled else "completed", message_id=None, owner=owner,
@@ -557,6 +625,6 @@ async def image_result(*, run_id: str, project_id: str, user_id: str) -> dict:
         created = int(run.created_at.replace(tzinfo=run.created_at.tzinfo or UTC).timestamp())
     output = []
     for asset_id in asset_ids:
-        data, _mime = await _read_source(asset_id=asset_id, user_id=user_id, project_id=project_id)
+        data, _mime = await _read_image_asset(asset_id=asset_id, user_id=user_id, project_id=project_id, output=True)
         output.append({"b64_json": base64.b64encode(data).decode("ascii"), "asset_id": asset_id})
     return {"created": created, "data": output}

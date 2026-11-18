@@ -16,7 +16,7 @@ from lumen.services.providers.errors import ProviderValidationError
 
 _TEXT = {"provider": "openai", "model_name": "gpt-4.1-mini", "model_kind": "text",
          "input_price_per_million": "1", "output_price_per_million": "3"}
-_IMAGE = {"provider": "openai", "model_name": "gpt-image-1", "model_kind": "image",
+_IMAGE = {"provider": "openai", "model_name": "gpt-image-2", "model_kind": "image",
           "media_pricing": {"image_variants": {"1024x1024:high": "0.05"}}}
 
 

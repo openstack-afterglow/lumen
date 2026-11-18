@@ -1704,14 +1704,17 @@
             "input": "5.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-2.6-sunburst.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"30.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching. For GPT-Image-2/2.5, cached input prices apply only to Responses image generation, not direct Images requests. Shape cannot express endpoint-specific cache eligibility."
+          "verified_at": "2026-11-18",
+          "notes": "Direct Images API tariff. OpenAI publishes an image cache rate, but direct Images cache applicability is not documented for this model."
         },
         {
           "id": "gpt-image-2.6-flare",
@@ -1736,14 +1739,17 @@
             "input": "5.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-2.6-flare.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"30.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching. For GPT-Image-2/2.5, cached input prices apply only to Responses image generation, not direct Images requests. Shape cannot express endpoint-specific cache eligibility."
+          "verified_at": "2026-11-18",
+          "notes": "Direct Images API tariff. OpenAI publishes an image cache rate, but direct Images cache applicability is not documented for this model."
         },
         {
           "id": "gpt-image-2.5-sunburst",
@@ -1770,14 +1776,17 @@
             "input": "5.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"30.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching. For GPT-Image-2/2.5, cached input prices apply only to Responses image generation, not direct Images requests. Shape cannot express endpoint-specific cache eligibility."
+          "verified_at": "2026-11-18",
+          "notes": "Direct Images API tariff. Cached input prices apply only to Responses image generation."
         },
         {
           "id": "gpt-image-2.5-flare",
@@ -1804,14 +1813,17 @@
             "input": "5.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-2.5-flare.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"30.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching. For GPT-Image-2/2.5, cached input prices apply only to Responses image generation, not direct Images requests. Shape cannot express endpoint-specific cache eligibility."
+          "verified_at": "2026-11-18",
+          "notes": "Direct Images API tariff. Cached input prices apply only to Responses image generation."
         },
         {
           "id": "gpt-image-2",
@@ -1838,14 +1850,17 @@
             "input": "5.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-2.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"30.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching. For GPT-Image-2/2.5, cached input prices apply only to Responses image generation, not direct Images requests. Shape cannot express endpoint-specific cache eligibility."
+          "verified_at": "2026-11-18",
+          "notes": "Direct Images API tariff. Cached input prices apply only to Responses image generation. Scheduled shutdown 2027-02-10."
         },
         {
           "id": "gpt-image-1.5",
@@ -1874,14 +1889,17 @@
             "output": "10.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "32.00", "cache_read_per_million": "2.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-1.5.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"32.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"output\": \"10.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null."
+          "verified_at": "2026-11-18",
+          "notes": "Scheduled shutdown 2026-12-01."
         },
         {
           "id": "gpt-image-1-mini",
@@ -1906,14 +1924,17 @@
             "input": "2.00",
             "cache_read": "0.20"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "2.50", "output_per_million": "8.00", "cache_read_per_million": "0.25"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-1-mini.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"2.50\", \"output\": \"8.00\", \"cache_read\": \"0.25\"}; Text: {\"input\": \"2.00\", \"cache_read\": \"0.20\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null."
+          "verified_at": "2026-11-18",
+          "notes": "Scheduled shutdown 2026-12-01."
         },
         {
           "id": "chatgpt-image-latest",
@@ -1940,14 +1961,17 @@
             "output": "10.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "32.00", "cache_read_per_million": "2.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/chatgpt-image-latest.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"32.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"output\": \"10.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching."
+          "verified_at": "2026-11-18",
+          "notes": "Scheduled shutdown 2026-12-01."
         },
         {
           "id": "gpt-realtime-2.1",
