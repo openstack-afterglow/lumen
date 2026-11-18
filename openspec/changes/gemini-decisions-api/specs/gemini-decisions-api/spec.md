@@ -25,6 +25,12 @@ Keystone `POST /v1/chat/decisions` SHALL require `native:runs:write`, resolve th
 - **WHEN** a valid Keystone call specifies an active Gemini Decision route as `lumen/<provider_id>/<model_id>`
 - **THEN** Lumen SHALL resolve that exact registered model and require the Google request shape without attempting OpenAI validation or another route
 
+#### Scenario: Google SDK model selectors
+
+- **WHEN** a Google SDK client sends `gemini-decision-1`, `models/gemini-decision-1`, or `gemini/gemini-decision-1` on `/v1beta/decisions`
+- **THEN** Lumen SHALL resolve the registered Gemini Decision model name if unambiguous
+- **AND** `lumen/<provider_id>/<model_id>` SHALL select the exact route only when both IDs are canonical positive decimal integers; `lumen/gemini/gemini-decision-1` SHALL NOT resolve as an exact selector
+
 #### Scenario: Compat endpoint wire mismatch
 
 - **WHEN** a caller selects a Gemini route on `/v1/decisions` or an OpenAI route on `/v1beta/decisions`

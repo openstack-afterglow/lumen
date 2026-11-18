@@ -11,6 +11,14 @@
 
 No live Gemini call, paid provider usage, tag, or deployment was made.
 
+### Official Google SDK compatibility
+
+`test-passed` on architecture source `924718a1406eedadc4c8298a807575b3696f2dbfae2ab7b1517a8d643b1925e4`. The dev-only `google-genai==3.5.0` system case calls real Lumen and checks both the SDK's outbound wire and its decoded answer/usage models. It uses `POST /v1beta/decisions`, `x-goog-api-key`, and an unchanged JSON `model` value. The bare, `models/`-prefixed, registered `gemini/`-prefixed, and exact numeric selectors all resolve; `lumen/gemini/gemini-decision-1` returns 404.
+
+- `uv sync --locked --extra service --extra dev` passed. `uv run --frozen lumen-test contract` passed 8,170 service tests (807 deselected), 145 SDK tests, and both Ruff checks.
+- `uv run --frozen lumen-test system` passed 39 with all positive SDK selectors. After the negative selector assertion was added, `uv run --frozen lumen-test system -q -k gemini_http_routes` passed the updated case (1 passed, 38 deselected).
+- `@google/genai` 3.5.0 emitted the same request shape and decoded fixture output against a local HTTP recorder. This was a wire check only, not a JavaScript end-to-end test against Lumen.
+
 ## 0.6.18 production rollout and smoke (2026-11-18 UTC)
 
 Deployed tag `0.6.18` (`c90d0664`; images amd64+arm64, revision label `c90d06646ff8`, tag digest = `latest`) with `--tags lumen --skip-tags haproxy` after a fail-closed drain (61 runs terminal, 0 model-call or stateless holds in flight) and an encrypted backup. Observed: API/worker on the pinned digests, `lumen.__version__` 0.6.18, protocol 2 on every API/worker, restarts 0, migrate status rc0, ledger row `035-mcp-domain-owner-check`, constraint `ck_chat_mcp_servers_domain_owner` present, direct `/v1/ready` 200 on each host, public health/ready/openapi 200, managed ClamAV unchanged (VERSION 28186). Census changed only `lumen_api`/`lumen_worker` per controller; VIP, protected-setting hashes and runtime=false unchanged.

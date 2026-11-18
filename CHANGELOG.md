@@ -5,6 +5,8 @@
 - **한국어 — Gemini Decisions:** 공식 Gemini API 키 경로에 `gemini-decision-1`(`decision` 종류)을 추가한다. Keystone `/v1/chat/decisions`는 모델의 공급자별 요청을 검증하고, Lumen 키 호환 API는 `/v1beta/decisions`에서 Google 형식을 사용한다. `/v1/decisions`는 OpenAI 전용이다. 텍스트·문자열로 직렬화한 JSON·이미지를 최대 20 MiB 요청에서 처리하고, 음성·동영상·PDF는 거절한다. Decision Studio는 `model_kind=decision`을 명시해야 하며 일반 모델 목록과 실행 경로에는 노출하지 않는다. 기존 034 예약으로 입력 문맥 전체를 먼저 확보하고 검증된 입력 usage만 정산한다. 새 migration은 없으며 배포·유료 공급자 호출은 검증하지 않았다.
 - **English — Gemini Decisions:** Add `gemini-decision-1` as a `decision` model on official Gemini API-key routes. Keystone `/v1/chat/decisions` validates the selected provider's wire format; `/v1beta/decisions` accepts Lumen API keys and uses Google's format. `/v1/decisions` stays OpenAI-only. Accept text, JSON serialized as text, and images within a 20 MiB request; reject audio, video, and PDF. Decision Studio explicitly filters by `model_kind=decision`; ordinary model lists and other execution routes exclude it. Reuse migration 034 to reserve full input context and settle only trusted input usage. No new migration, verified deployment, or paid-provider call.
 
+- **Google SDK:** `gemini-decision-1`, `models/gemini-decision-1`, `gemini/gemini-decision-1`, `lumen/<provider_id>/<model_id>` (양의 정수 ID / positive integer IDs).
+
 ## 0.6.18 — 2026-11-18 (published and deployed; sandbox runtime remains off)
 
 - **배포:** tag `0.6.18`(`c90d0664`)을 2026-11-18 05:28–05:30 UTC에 DMS Lab 세 컨트롤러에 반영했다. 같은 drain된 cohort에서 035를 적용했고 sandbox runtime은 꺼 둔 채로 유지했다. 수신증은 `docs/testing.md`와 `docs/operations.md`에 있다.

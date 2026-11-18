@@ -1,11 +1,14 @@
 """Local API -> synthetic Keystone/MariaDB -> isolated TLS Gemini HTTP."""
 from __future__ import annotations
 
+import json
 import os
 from uuid import uuid4
 
 import httpx
 import pytest
+from google import genai
+from google.genai import types
 from system.fake_keystone import DIRECTORY_PROJECT_ID, DIRECTORY_TOKEN, OWNER_TOKEN, PROJECT_ID
 
 pytestmark = pytest.mark.system
@@ -42,15 +45,45 @@ def test_gemini_http_routes_keep_provider_and_lumen_credentials_separate():
             wire = {"model": selector, "input": "The package arrived damaged.", "questions": {
                 "is_defect": {"type": "noul", "instructions": "Is the customer reporting a product defect?"},
             }}
-            for path, auth in [("/v1/chat/decisions", owner), ("/v1beta/decisions", headers)]:
-                response = client.post(path, headers=auth, json=wire)
-                assert response.status_code == 200, response.text
-                assert response.json() == {
-                    "model": model,
-                    "answers": {"is_defect": {"type": "noul", "noul": 0.03, "confidence": 0.97}},
-                    "usage": {"total_input_tokens": 100, "input_tokens_by_modality": [{"modality": "text", "tokens": 100}],
-                              "total_output_tokens": 0, "total_tokens": 100},
-                }
+            response = client.post("/v1/chat/decisions", headers=owner, json=wire)
+            assert response.status_code == 200, response.text
+            expected_usage = {"total_input_tokens": 100, "input_tokens_by_modality": [{"modality": "text", "tokens": 100}],
+                              "total_output_tokens": 0, "total_tokens": 100}
+            assert response.json() == {
+                "model": model,
+                "answers": {"is_defect": {"type": "noul", "noul": 0.03, "confidence": 0.97}},
+                "usage": expected_usage,
+            }
+
+            sent_models = []
+
+            def record_request(request):
+                assert request.method == "POST" and str(request.url) == f"{base.rstrip('/')}/v1beta/decisions"
+                assert request.headers.get("x-goog-api-key") == headers["x-goog-api-key"]
+                assert "authorization" not in request.headers and "x-api-key" not in request.headers
+                body = json.loads(request.content)
+                assert body == {**wire, "model": body["model"]}
+                sent_models.append(body["model"])
+
+            aliases = ["gemini-decision-1", "models/gemini-decision-1", model, selector]
+            with genai.Client(
+                api_key=headers["x-goog-api-key"], vertexai=False,
+                http_options=types.HttpOptions(
+                    api_version="v1beta", base_url=base, retry_options=types.HttpRetryOptions(attempts=1),
+                    client_args={"trust_env": False, "event_hooks": {"request": [record_request]}},
+                ),
+            ) as sdk:
+                for alias in aliases:
+                    decision = sdk.decisions.create(model=alias, input=wire["input"], questions=wire["questions"])
+                    assert set(decision.answers) == {"is_defect"}
+                    assert decision.answers["is_defect"].model_dump(exclude_none=True) == {
+                        "type": "noul", "noul": 0.03, "confidence": 0.97,
+                    }
+                    assert decision.usage.model_dump(exclude_none=True) == expected_usage
+                invalid = "lumen/gemini/gemini-decision-1"
+                with pytest.raises(Exception, match=r"Error code: 404.*decision model not found"):
+                    sdk.decisions.create(model=invalid, input=wire["input"], questions=wire["questions"])
+            assert sent_models == [*aliases, invalid]
             response = client.post("/v1/chat/decisions", headers=owner, json={**wire, "input": "synthetic safety rejection"})
             assert response.status_code == 400 and response.json() == {"detail": "image_safety"}
             visible = client.get("/v1/chat/models?model_kind=decision", headers=owner)
