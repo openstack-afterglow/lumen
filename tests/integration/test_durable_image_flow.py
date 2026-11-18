@@ -362,7 +362,7 @@ async def test_media_start_does_not_block_another_users_text_start(monkeypatch, 
 @pytest.mark.parametrize("outcome", [
     "observed", "missing", "over_envelope", "invalid", "storage_failure",
     "catalog_edited", "catalog_missing", "catalog_over_hold", "catalog_low_credit", "svg_known", "svg_unknown",
-    "svg_selected", "svg_alias", "svg_mismatch", "catalog_multi_edit",
+    "svg_selected", "svg_alias", "svg_mismatch", "catalog_multi_edit", "catalog_leaf_edited",
 ])
 async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, outcome):
     nonce = uuid.uuid4().hex
@@ -370,7 +370,8 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     catalog = outcome.startswith(("catalog_", "svg_"))
     svg = outcome.startswith("svg_")
-    edit = outcome in {"catalog_edited", "catalog_multi_edit"}
+    leaf = outcome == "catalog_leaf_edited"
+    edit = outcome in {"catalog_edited", "catalog_multi_edit", "catalog_leaf_edited"}
     multi = outcome == "catalog_multi_edit"
     selected = outcome in {"svg_selected", "svg_alias", "svg_mismatch"}
     count = 2 if edit else 1
@@ -399,6 +400,8 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
                     "image_variants": {"1024x1024:high": "0.99"},
                     "token_rates": {"image": {"input_per_million": "10", "cache_read_per_million": "2",
                                                "output_per_million": "20"}}}))
+            if leaf:
+                model.media_pricing = {"override_mode": "leaf", "token_rates": {"image": {"output_per_million": "40"}}}
             session.add(model)
             await session.flush()
             model_id = model.id
@@ -501,12 +504,19 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
                                              registration_id=registration_id)
             owner, capability, frozen = claimed.lease_owner, dict(claimed.capability_snapshot), dict(claimed.pricing_snapshot)
         if catalog:
-            assert frozen["price_source"] == "native_catalog"
+            assert frozen["price_source"] == ("manual" if leaf else "native_catalog")
             assert "reservation_usd" not in frozen["media_pricing"]
             if edit:
                 # Two 2,634-output-token images, 8,704 image-input tokens, and 276 prompt/frame tokens.
-                expected_hold = "0.368316" if multi else "0.229052"
+                expected_hold = "0.281732" if leaf else "0.368316" if multi else "0.229052"
                 assert Decimal(frozen["reservation_usd"]) == Decimal(expected_hold)
+            if leaf:
+                assert frozen["billing_basis"] == "tokens"
+                assert frozen["media_pricing"] == {
+                    "billing_basis": "tokens",
+                    "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "40"}},
+                }
+                assert frozen["token_rates"] == {"image": {"input_per_million": "8", "output_per_million": "40"}}
             if selected:
                 assert set(frozen["svg_author_pricing"]) == {"gpt-4.1-mini"}
                 assert Decimal(frozen["reservation_usd"]) == Decimal("0.211492")
@@ -532,14 +542,14 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
             segment = (await session.execute(select(ChatRunSegment).where(ChatRunSegment.run_id == run.id))).scalar_one()
             assert hold.bound_credits == credit.credits_for_cost(
                 Decimal(frozen["reservation_usd"]), Decimal("2"), Decimal(frozen["credit_per_usd"]))
-            success = outcome in {"catalog_edited", "catalog_multi_edit", "svg_known", "svg_selected", "svg_alias"}
+            success = edit or outcome in {"svg_known", "svg_selected", "svg_alias"}
             if multi:
                 input_ids = (await session.scalars(select(ChatRunAsset.asset_id).where(
                     ChatRunAsset.run_id == run.id, ChatRunAsset.purpose == "input"))).all()
                 assert set(input_ids) == {source_id, *extra_ids}
             if success:
                 assert run.status == "completed" and hold.status == "settled"
-                expected_cost = Decimal("0.00665" if edit else "0.0074" if selected else "0.00702")
+                expected_cost = Decimal("0.00865" if leaf else "0.00665" if edit else "0.0074" if selected else "0.00702")
                 assert len(ledger) == 1 and ledger[0].raw_cost == expected_cost
                 assert hold.actual_credits < hold.bound_credits
                 assert ledger[0].prompt_tokens == (600 if svg else 100)
