@@ -60,10 +60,20 @@ class FakeUpstream:
         self.incoming = incoming
         self.sent = []
         self.queue = asyncio.Queue()
+        self.limits = {}
+
+    async def ack_setup(self, frame):
+        if frame.get("type") != "session.update":
+            return
+        session = frame["session"]
+        self.limits.update({key: session[key] for key in ("max_output_tokens", "truncation") if key in session})
+        if self.limits:
+            await self.queue.put(json.dumps({"type": "session.updated", "session": {**session, **self.limits}}))
 
     async def send(self, message):
         parsed = json.loads(message)
         self.sent.append(parsed)
+        await self.ack_setup(parsed)
         if (parsed.get("type") == "input_audio_buffer.append" or "realtimeInput" in parsed
                 and "audio" in parsed["realtimeInput"]):
             if self.provider == "openai":
@@ -411,6 +421,7 @@ async def test_relay_ends_a_token_session_before_confirmed_usage_can_exhaust_the
         async def send(self, message):
             parsed = json.loads(message)
             self.sent.append(parsed)
+            await self.ack_setup(parsed)
             if parsed.get("type") == "input_audio_buffer.append":
                 self.responses += 1
                 done = _openai_done(f"resp_{self.responses}", text_in=200, audio_in=800, cached_text=100,
@@ -522,6 +533,7 @@ async def test_token_relay_omits_separately_billed_transcription_and_drains_fina
         async def send(self, message):
             parsed = json.loads(message)
             self.sent.append(parsed)
+            await self.ack_setup(parsed)
             if parsed.get("type") == "input_audio_buffer.append":
                 await self.queue.put(json.dumps({"type": "response.created", "response": {"id": "resp_1"}}))
                 await self.queue.put(json.dumps({"type": "response.output_audio.delta", "delta": encoded}))
@@ -543,7 +555,7 @@ async def test_token_relay_omits_separately_billed_transcription_and_drains_fina
 
     meter = await realtime_protocol.relay_audio(FakeBrowser("openai", encoded), _route(), session_id="session",
         voice="alloy", instructions=None, max_duration_seconds=10, is_canceled=not_canceled, token_usage=True)
-    assert "transcription" not in upstream.sent[0]["session"]["audio"]["input"]
+    assert "transcription" not in upstream.sent[1]["session"]["audio"]["input"]
     assert {"type": "response.cancel"} in upstream.sent
     assert meter.usage_state == "complete" and meter.usage.output_tokens == 500
     assert meter.connected_seconds is not None and meter.connected_seconds >= 0
@@ -561,6 +573,7 @@ async def test_relay_failure_keeps_completed_usage_as_unsettleable_evidence(monk
         async def send(self, message):
             parsed = json.loads(message)
             self.sent.append(parsed)
+            await self.ack_setup(parsed)
             if parsed.get("type") == "input_audio_buffer.append":
                 await self.queue.put(json.dumps(_FIRST))
                 await self.queue.put(RuntimeError("secret-bearing provider failure"))
@@ -652,7 +665,7 @@ async def test_reasoning_effort_is_configurable_only_where_published_and_reaches
     browser = FakeBrowser("openai", upstream.incoming)
     await realtime_protocol.relay_audio(browser, route, session_id="session", voice="alloy", instructions=None,
         max_duration_seconds=10, is_canceled=not_canceled, token_usage=True, reasoning_effort="high")
-    assert upstream.sent[0]["session"]["reasoning"] == {"effort": "high"}
+    assert upstream.sent[1]["session"]["reasoning"] == {"effort": "high"}
 
     def compat(session, model):
         return realtime_protocol._client_event({"type": "session.update", "session": session}, "openai",

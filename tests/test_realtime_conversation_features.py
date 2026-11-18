@@ -91,6 +91,7 @@ def test_function_tools_are_bounded_client_functions_only():
         ([{**_TOOL, "name": "has space"}], None), ([{**_TOOL, "parameters": "object"}], None),
         ([{**_TOOL, "strict": True}], None), ([_TOOL], {"type": "function", "name": "other"}),
         ([_TOOL], "always"), ([], None), (None, "auto"),
+        ([_TOOL], {"type": "function", "name": []}), ([_TOOL], {"type": "function", "name": {}}),
     ]
     for tools, choice in rejected:
         with pytest.raises(ProviderValidationError):
@@ -179,14 +180,27 @@ def test_native_function_call_events_are_projected():
 
 
 class _Upstream:
-    def __init__(self):
+    def __init__(self, *, auto_ack=True):
         self.sent = []
+        self.sent_frames = asyncio.Queue()
         self.queue = asyncio.Queue()
+        self.limits = {}
+        self.auto_ack = auto_ack
         self.transport = SimpleNamespace(abort=lambda: None)
+
+    async def ack(self, session):
+        self.limits.update({key: session[key] for key in ("max_output_tokens", "truncation") if key in session})
+        await self.emit({"type": "session.updated", "session": {**session, **self.limits}})
+
+    async def emit(self, frame):
+        await self.queue.put(json.dumps(frame))
 
     async def send(self, message):
         parsed = json.loads(message)
         self.sent.append(parsed)
+        await self.sent_frames.put(parsed)
+        if parsed["type"] == "session.update" and self.auto_ack:
+            await self.ack(parsed["session"])
         if parsed["type"] == "response.create":
             await self.queue.put(json.dumps({"type": "response.created", "response": {"id": "resp_2"}}))
             await self.queue.put(json.dumps({"type": "response.done", "response": {"id": "resp_2", "usage": {
@@ -205,12 +219,14 @@ class _Browser:
         for frame in frames:
             self.queue.put_nowait(json.dumps(frame))
         self.events = []
+        self.received = asyncio.Queue()
 
     async def receive_text(self):
         return await self.queue.get()
 
     async def send_json(self, event):
         self.events.append(event)
+        await self.received.put(event)
 
 
 def _connect(monkeypatch, upstream):
@@ -236,28 +252,45 @@ async def _not_canceled():
 
 
 @pytest.mark.asyncio
-async def test_native_session_configures_tools_relays_images_and_continues_after_function_output(monkeypatch):
+async def test_native_parallel_calls_continue_once_after_outputs_and_response_done(monkeypatch):
+    image = {"type": "conversation.input_image", "image_url": _data_url(_png())}
+    browser = _Browser([image])
     upstream = _Upstream()
     captured = _connect(monkeypatch, upstream)
-    browser = _Browser([{"type": "conversation.input_image", "image_url": _data_url(_png())},
-                        {"type": "function_call.output", "call_id": "call_1", "output": "shipped"},
-                        {"type": "session.close"}])
-    meter = await asyncio.wait_for(realtime_protocol.relay_audio(browser, _route(), session_id="session",
+    task = asyncio.create_task(realtime_protocol.relay_audio(browser, _route(), session_id="session",
         voice="alloy", instructions=None, max_duration_seconds=30, is_canceled=_not_canceled, token_usage=True,
-        tools=[_TOOL], tool_choice="auto"), timeout=5)
-    session = upstream.sent[0]["session"]
-    assert session["tools"] == [_TOOL] and session["tool_choice"] == "auto"
-    assert session["max_output_tokens"] == realtime_transport.RESPONSE_MAX_OUTPUT_TOKENS
-    # Image sessions accept one image per frame in both directions.
-    assert captured["max_size"] == 2 * 1024 * 1024
-    # Closing while that response may still be in flight cancels it and drains its final usage.
-    sent = [frame["type"] for frame in upstream.sent[1:]]
-    assert sent[:3] == ["conversation.item.create", "conversation.item.create", "response.create"]
-    assert set(sent[3:]) <= {"response.cancel"}
-    assert upstream.sent[1]["item"]["content"][0]["type"] == "input_image"
-    assert upstream.sent[2]["item"] == {"type": "function_call_output", "call_id": "call_1", "output": "shipped"}
-    # The Lumen-issued response.create is metered and its usage drained before close.
-    assert meter.usage_state == "complete" and meter.usage.input_tokens == 50
+        tools=[_TOOL], tool_choice="auto"))
+    async with asyncio.timeout(5):
+        limits = (await upstream.sent_frames.get())["session"]
+        session = (await upstream.sent_frames.get())["session"]
+        assert "tools" not in limits and limits["max_output_tokens"] == realtime_transport.RESPONSE_MAX_OUTPUT_TOKENS
+        assert session["tools"] == [_TOOL] and session["tool_choice"] == "auto"
+        assert captured["max_size"] == 2 * 1024 * 1024
+        assert (await upstream.sent_frames.get())["item"]["content"][0]["type"] == "input_image"
+        await upstream.emit({"type": "response.created", "response": {"id": "parent"}})
+        for number in (1, 2):
+            await upstream.emit({"type": "response.function_call_arguments.done", "response_id": "parent",
+                "call_id": f"call_{number}", "name": _TOOL["name"], "arguments": "{}"})
+        for event_type in ("session.ready", "function_call.arguments.done", "function_call.arguments.done"):
+            assert (await browser.received.get())["type"] == event_type
+        for call_id in ("unknown", "call_1", "call_1", "call_2"):
+            await browser.queue.put(json.dumps({"type": "function_call.output", "call_id": call_id, "output": "ok"}))
+        outputs = [await upstream.sent_frames.get(), await upstream.sent_frames.get()]
+        assert [event["item"]["call_id"] for event in outputs] == ["call_1", "call_2"]
+        assert upstream.sent_frames.empty()
+        parent = _done("parent", text_in=50, text_out=10)
+        parent["response"]["status"] = "completed"
+        await upstream.emit(parent)
+        assert (await upstream.sent_frames.get())["type"] == "response.create"
+        # Duplicate terminal events and answered call IDs cannot resume the response again.
+        await upstream.emit(parent)
+        await browser.queue.put(json.dumps({"type": "function_call.output", "call_id": "call_2", "output": "duplicate"}))
+        await browser.queue.put(json.dumps({"type": "session.close"}))
+        meter = await task
+    assert [frame["type"] for frame in upstream.sent].count("response.create") == 1
+    errors = [event["code"] for event in browser.events if event["type"] == "error"]
+    assert errors == ["invalid_function_call_id"] * 3
+    assert meter.usage_state == "complete" and meter.usage.input_tokens == 100 and meter.image_sent
 
 
 @pytest.mark.asyncio
@@ -360,6 +393,8 @@ async def test_hold_covers_any_response_within_the_pinned_bound(monkeypatch, sce
         async def send(self, message):
             parsed = json.loads(message)
             self.sent.append(parsed)
+            if parsed["type"] == "session.update":
+                await self.ack(parsed["session"])
             if parsed["type"] == "input_audio_buffer.append" and script:
                 response_id = f"resp_{len(script)}"
                 await self.queue.put(json.dumps({"type": "response.created", "response": {"id": response_id}}))
@@ -391,14 +426,119 @@ async def test_hold_covers_any_response_within_the_pinned_bound(monkeypatch, sce
 async def test_client_response_requests_beyond_the_hold_are_never_started(monkeypatch):
     upstream = _Upstream()
     _connect(monkeypatch, upstream)
-    browser = _Browser([{"type": "response.create"}])
+    browser = _Browser([{"type": "response.create"}, {"type": "input_audio_buffer.append", "audio": _PCM},
+                        {"type": "session.close"}])
     price = realtime._token_hold({**realtime_transport.validate_realtime_request(_route()),
                                   "max_duration_seconds": 300})[0]
     # A hold below two worst-case responses (only reachable for a tampered snapshot) refuses at once.
     await asyncio.wait_for(realtime_protocol.relay_audio(browser, _route(), session_id="session", voice="alloy",
         instructions=None, max_duration_seconds=30, wire="openai", is_canceled=_not_canceled, token_usage=True,
         token_hold=(price, Decimal("1"), Decimal("0.919552"))), timeout=5)
-    assert [frame["type"] for frame in upstream.sent] == ["session.update"]
+    assert [frame["type"] for frame in upstream.sent] == ["session.update", "session.update", "input_audio_buffer.append"]
+    assert any(event.get("error", {}).get("code") == "realtime_hold_limit" for event in browser.events)
+
+
+@pytest.mark.asyncio
+async def test_compat_commit_during_inflight_vad_does_not_close_session(monkeypatch):
+    browser = _Browser([{"type": "input_audio_buffer.append", "audio": _PCM}])
+    upstream = _Upstream()
+    _connect(monkeypatch, upstream)
+    token_hold = realtime._token_hold(realtime_transport.validate_realtime_request(_route(), max_duration_seconds=60))
+    task = asyncio.create_task(realtime_protocol.relay_audio(browser, _route(), session_id="session", voice="alloy",
+        instructions=None, max_duration_seconds=60, wire="openai", is_canceled=_not_canceled, token_usage=True,
+        token_hold=token_hold))
+    async with asyncio.timeout(5):
+        for frame_type in ("session.update", "session.update", "input_audio_buffer.append"):
+            assert (await upstream.sent_frames.get())["type"] == frame_type
+        await upstream.emit({"type": "response.created", "response": {"id": "vad"}})
+        for event_type in ("session.updated", "session.updated", "response.created"):
+            assert (await browser.received.get())["type"] == event_type
+        await browser.queue.put(json.dumps({"type": "input_audio_buffer.commit"}))
+        assert (await upstream.sent_frames.get())["type"] == "input_audio_buffer.commit"
+        await upstream.emit(_done("vad", audio_in=100, audio_out=5))
+        assert (await browser.received.get())["type"] == "response.done"
+        await browser.queue.put(json.dumps({"type": "session.close"}))
+        assert (await task).usage_state == "complete"
+
+
+@pytest.mark.asyncio
+async def test_lumen_buffers_early_audio_until_both_setup_acknowledgements(monkeypatch):
+    browser = _Browser([{"type": "audio.input.append", "audio": _PCM}, {"type": "session.close"}])
+    upstream = _Upstream(auto_ack=False)
+    _connect(monkeypatch, upstream)
+    task = asyncio.create_task(realtime_protocol.relay_audio(browser, _route(), session_id="session", voice="alloy",
+        instructions=None, max_duration_seconds=30, is_canceled=_not_canceled, token_usage=True, tools=[_TOOL]))
+    async with asyncio.timeout(5):
+        first = (await upstream.sent_frames.get())["session"]
+        assert first["audio"]["input"]["turn_detection"] is None and "tools" not in first
+        assert browser.events == [] and upstream.sent_frames.empty()
+        await upstream.emit({"type": "session.created"})
+        await upstream.ack(first)
+        second = (await upstream.sent_frames.get())["session"]
+        assert second["tools"] == [_TOOL] and second["audio"]["input"]["turn_detection"] == {"type": "server_vad"}
+        assert browser.events == [] and upstream.sent_frames.empty()
+        await upstream.ack(second)
+        assert (await browser.received.get())["type"] == "session.ready"
+        assert (await upstream.sent_frames.get())["type"] == "input_audio_buffer.append"
+        assert (await task).input_bytes == 320
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [1, 2])
+@pytest.mark.parametrize("failure", ["error", "mismatched_limits", "timeout"])
+async def test_setup_failure_never_readies_session_or_sends_audio(monkeypatch, phase, failure):
+    browser = _Browser([{"type": "audio.input.append", "audio": _PCM}])
+    upstream = _Upstream(auto_ack=False)
+    _connect(monkeypatch, upstream)
+    monkeypatch.setattr(realtime_protocol, "_REALTIME_SETUP_SECONDS", 0.2)
+    task = asyncio.create_task(realtime_protocol.relay_audio(browser, _route(), session_id="session", voice="alloy",
+        instructions=None, max_duration_seconds=30, is_canceled=_not_canceled, token_usage=True, tools=[_TOOL]))
+    async with asyncio.timeout(5):
+        first = (await upstream.sent_frames.get())["session"]
+        if phase == 2:
+            await upstream.ack(first)
+            await upstream.sent_frames.get()
+        if failure == "error":
+            await upstream.emit({"type": "error", "error": {"message": "provider detail"}})
+        elif failure == "mismatched_limits":
+            await upstream.emit({"type": "session.updated", "session": {**first, "max_output_tokens": 8192}})
+        with pytest.raises(RealtimeTransportError, match="usage is incomplete") as error:
+            await task
+    assert browser.events == [] and error.value.meter.input_bytes == 0
+    assert [frame["type"] for frame in upstream.sent] == ["session.update"] * phase
+
+
+def test_openai_admin_rejects_small_hold_and_marks_existing_row_unavailable():
+    from lumen.models.chat_db import LlmModel
+    from lumen.services.providers import pricing, repository
+
+    small_hold = {**_TOKEN_MEDIA, "reservation_usd": "0.5"}
+    scope = {"model_name": "gpt-realtime-2.1", "api_base": None}
+    with pytest.raises(ProviderValidationError, match=r"reservation_usd.*minimum \$1.839104"):
+        repository._validate_kind_prices("realtime", small_hold, (None,) * 5, "openai", **scope)
+    assert repository._validate_kind_prices("realtime", {**small_hold, "reservation_usd": "2"},
+        (None,) * 5, "openai", **scope)["reservation_usd"] == "2"
+    row = LlmModel(model_name=scope["model_name"], model_kind="realtime", media_pricing=small_hold)
+    for configured in (False, True):
+        dto = pricing._model_public(row, api_provider="openai", provider_type="openai", api_key_configured=configured)
+        gate = dto["effective_capabilities"]["feature_gates"]["audio_input"]
+        assert gate == {"available": False, "mode": "none", "reason_code": "realtime_reservation_too_small",
+                        "pricing_available": False}
+        assert dto["effective_price_source"] == "partial"
+
+
+def test_images_without_reported_modality_make_usage_unknown():
+    meter = TokenUsageMeter("openai")
+    meter.image_sent = True
+    done = _done("image", text_in=50, text_out=20)
+    del done["response"]["usage"]["input_token_details"]["image_tokens"]
+    assert meter.observe(done) is None
+    assert meter.result() == (None, "invalid")
+    plan = realtime_transport.validate_realtime_request(_route())
+    checkpoint = realtime._checkpoint(AudioMeter(0, 0, 24000, 24000, usage_state="complete", image_sent=True), "tokens")
+    assert checkpoint["image_sent"] is True
+    with pytest.raises(realtime.DurableRunProviderResultUnknown):
+        realtime._token_bill(_RUN, plan, checkpoint)
 
 
 def test_derived_hold_exemption_is_openai_only():

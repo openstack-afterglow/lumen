@@ -85,6 +85,7 @@ _NATIVE_STREAM_TRANSCRIPTS = {"session.input_transcript.delta": "transcript.inpu
                               "session.output_transcript.delta": "transcript.output.delta"}
 # GPT-Live accepts audio only after session.started.
 _LIVE_START_SECONDS = 10
+_REALTIME_SETUP_SECONDS = 10
 # GPT-Live's session.closed must arrive before the funded deadline's transport abort.
 _LIVE_CLOSE_MARGIN_SECONDS = 0.5
 
@@ -99,6 +100,7 @@ class AudioMeter:
     # ``usage_state`` is "unmetered" (other bases), "complete", "incomplete" or "invalid".
     usage: UsageBreakdown | None = None
     usage_state: str = "unmetered"
+    image_sent: bool = False
     # Monotonic seconds from completed upstream open handshake to completed close.
     connected_seconds: Decimal | None = None
     # GPT-Live only: the provider's final billable voice seconds from ``session.closed`` and
@@ -179,6 +181,7 @@ class TokenUsageMeter:
         self._snapshot: UsageBreakdown | None = None
         self._pending = False
         self._invalid = False
+        self.image_sent = False
 
     @property
     def pending(self) -> bool:
@@ -186,9 +189,8 @@ class TokenUsageMeter:
         return not self._invalid and (bool(self._in_flight) or self._pending)
 
     @property
-    def in_flight(self) -> int:
-        """Responses created upstream whose final usage has not arrived yet."""
-        return len(self._in_flight)
+    def invalid(self) -> bool:
+        return self._invalid
 
     def request_sent(self, message: dict) -> None:
         # A client-requested response can start I/O before response.created reaches us.
@@ -223,9 +225,16 @@ class TokenUsageMeter:
             if response_id not in self._responses:
                 self._in_flight.add(response_id)
             return None
-        usage = UsageBreakdown.from_openai_media(response.get("usage"))
+        raw_usage = response.get("usage")
+        usage = UsageBreakdown.from_openai_media(raw_usage)
         previous = self._responses.get(response_id)
-        if (usage is None or usage.modality_usage_invalid or (previous is not None and previous != usage)
+        details = (raw_usage.get("input_tokens_details", raw_usage.get("input_token_details"))
+                   if usage is not None else None)
+        missing_image_split = (self.image_sent and previous is None and usage is not None and usage.input_tokens > 0
+                               and (not isinstance(details, dict) or type(details.get("image_tokens")) is not int
+                                    or not usage.reported("image", "input")))
+        if (usage is None or usage.modality_usage_invalid or missing_image_split
+                or (previous is not None and previous != usage)
                 or (previous is None and len(self._responses) >= _MAX_METERED_RESPONSES)):
             self._invalid = True
             return None
@@ -702,6 +711,75 @@ def _native_stream_events(message: dict) -> tuple[list[dict], int]:
     return [], 0
 
 
+class NativeFunctionCalls:
+    """Correlate client outputs and resume each completed response at most once."""
+
+    def __init__(self) -> None:
+        self.owners: dict[str, str] = {}
+        self.remaining: dict[str, set[str]] = {}
+        self.completed: set[str] = set()
+
+    def observe(self, message: dict) -> bool:
+        event = message.get("type")
+        if event == "response.function_call_arguments.done":
+            call_id, response_id = message.get("call_id"), message.get("response_id")
+            if (not all(isinstance(value, str) and 0 < len(value) <= _MAX_CALL_ID_CHARS
+                        for value in (call_id, response_id)) or call_id in self.owners):
+                return False
+            if len(self.owners) >= _MAX_METERED_RESPONSES:
+                raise RealtimeTransportError("too many realtime function calls")
+            self.owners[call_id] = response_id
+            self.remaining.setdefault(response_id, set()).add(call_id)
+        elif event == "response.done":
+            response = message.get("response")
+            response_id = response.get("id") if isinstance(response, dict) else None
+            if isinstance(response_id, str) and response_id in self.remaining:
+                if response.get("status") == "completed":
+                    self.completed.add(response_id)
+                else:
+                    del self.remaining[response_id]
+                    self.completed.discard(response_id)
+        return True
+
+    def awaiting(self, call_id: str) -> bool:
+        return call_id in self.remaining.get(self.owners.get(call_id), ())
+
+    def answered(self, call_id: str) -> None:
+        self.remaining[self.owners[call_id]].remove(call_id)
+
+    def take_ready(self) -> bool:
+        for response_id in self.completed:
+            if not self.remaining[response_id]:
+                self.completed.remove(response_id)
+                del self.remaining[response_id]
+                return True
+        return False
+
+
+async def _confirmed_session_update(upstream, config: dict, limits: dict, frame_limit: int,
+                                    compat_events: list[dict] | None) -> None:
+    """Require a matching acknowledgement before the next setup phase or any client traffic."""
+    async with asyncio.timeout(_REALTIME_SETUP_SECONDS):
+        await upstream.send(json.dumps({"type": "session.update", "session": config}))
+        message = _object(await upstream.recv(), frame_limit)
+        if message.get("type") == "session.created":
+            if compat_events is not None:
+                compat_events.append(message)
+            message = _object(await upstream.recv(), frame_limit)
+        session = message.get("session")
+        if (message.get("type") != "session.updated" or not isinstance(session, dict)
+                or any(session.get(key) != value for key, value in limits.items())):
+            raise RealtimeTransportError("realtime provider did not confirm session configuration")
+        if compat_events is not None:
+            compat_events.append(message)
+
+
+def _client_realtime_error(wire: str, code: str, message: str) -> dict:
+    if wire == "openai":
+        return {"type": "error", "error": {"type": "invalid_request_error", "code": code, "message": message}}
+    return {"type": "error", "code": code, "message": message}
+
+
 async def _await_live_started(upstream) -> None:
     """Hold the native session.ready until GPT-Live confirms its session."""
     async with asyncio.timeout(_LIVE_START_SECONDS):
@@ -876,8 +954,8 @@ async def relay_audio(
     neither configured nor accepted for token-basis sessions. OpenAI token sessions pin
     ``max_output_tokens`` and retention-ratio truncation so one response has a known worst
     case; ``token_hold`` is ``(frozen per-response price, reserved USD, that worst case)``
-    and the session stops once confirmed usage plus the in-flight and two further
-    worst-case responses would exceed the hold, or one response exceeds the worst case.
+    and the session stops once confirmed usage plus two further worst-case responses
+    would exceed the hold, or one response exceeds the worst case.
     Image input and function calling are relayed only where ``conversation_features`` allows.
 
     Native and compatible non-conversation kinds use the same admitted upstream setup.
@@ -911,12 +989,16 @@ async def relay_audio(
     if (tools is not None or tool_choice is not None) and not features.get("function_calling"):
         raise RealtimeTransportError("realtime function calling is unavailable for this session")
     frame_limit = client_frame_limit(features.get("image_input") is True)
+    calls = NativeFunctionCalls() if wire == "native" and tools is not None else None
     images = 0
     spent = Decimal(0)
     hold_reached = False
     loop = asyncio.get_running_loop()
     connected_ns: int | None = None
     hard_close: asyncio.TimerHandle | None = None
+
+    def has_response_funding() -> bool:
+        return token_hold is None or spent + 2 * token_hold[2] <= token_hold[1]
 
     def measurement(*, failed: bool = False) -> AudioMeter:
         elapsed = (Decimal(time.monotonic_ns() - connected_ns) / Decimal(1_000_000_000)
@@ -926,7 +1008,7 @@ async def relay_audio(
             state = "incomplete"
         provider_seconds, provider_state = live.result() if live is not None else (None, "unmetered")
         return AudioMeter(incoming, outgoing, input_rate, 0 if kind == "transcription" else 24000,
-                          usage=usage, usage_state=state,
+                          usage=usage, usage_state=state, image_sent=images > 0,
                           connected_seconds=elapsed, provider_seconds=provider_seconds,
                           provider_seconds_state=provider_state)
 
@@ -969,15 +1051,23 @@ async def relay_audio(
                 if reasoning_effort is not None:
                     session["reasoning"] = {"effort": reasoning_effort}
                 if tokens is not None:
-                    # Per-response limits that make the hold guard's worst case real.
-                    session["max_output_tokens"] = RESPONSE_MAX_OUTPUT_TOKENS
-                    session["truncation"] = {"type": "retention_ratio", "retention_ratio": 0.8, "token_limits": {
-                        "post_instructions": RESPONSE_POST_INSTRUCTION_TOKENS}}
-                if tools is not None:
-                    session["tools"] = tools
-                if tool_choice is not None:
-                    session["tool_choice"] = tool_choice
-                await upstream.send(json.dumps({"type": "session.update", "session": session}))
+                    # Hold all client input behind both acknowledgements; VAD cannot start
+                    # a response during the first, limits-only setup phase.
+                    limits = {"max_output_tokens": RESPONSE_MAX_OUTPUT_TOKENS,
+                              "truncation": {"type": "retention_ratio", "retention_ratio": 0.8,
+                                             "token_limits": {"post_instructions": RESPONSE_POST_INSTRUCTION_TOKENS}}}
+                    compat_events = [] if wire == "openai" else None
+                    await _confirmed_session_update(upstream, {"type": "realtime", **limits,
+                        "audio": {"input": {"turn_detection": None}}}, limits, frame_limit, compat_events)
+                    if tools is not None:
+                        session["tools"] = tools
+                    if tool_choice is not None:
+                        session["tool_choice"] = tool_choice
+                    await _confirmed_session_update(upstream, session, limits, frame_limit, compat_events)
+                    for event in compat_events or ():
+                        await websocket.send_json(event)
+                else:
+                    await upstream.send(json.dumps({"type": "session.update", "session": session}))
             else:
                 config = {"responseModalities": ["AUDIO"], "speechConfig": {
                     "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}}
@@ -1033,30 +1123,32 @@ async def relay_audio(
                             if incoming + size > 2 * input_rate * max_duration_seconds:
                                 raise RealtimeTransportError("session input exceeds duration bound")
                             item_type = (message.get("item") or {}).get("type")
-                            starts_response = message.get("type") in {"response.create", "input_audio_buffer.commit"} or (
-                                wire == "native" and item_type == "function_call_output")
-                            if (starts_response and token_hold is not None
-                                    and spent + (tokens.in_flight + 2) * token_hold[2] > token_hold[1]):
-                                # A response the hold could not cover is never started.
-                                hold_reached = True
-                                break
-                            if tokens is not None:
-                                tokens.request_sent(message)
-                            if item_type == "message":
-                                images += 1
-                                if images > MAX_SESSION_IMAGES:
+                            call_id = message["item"]["call_id"] if (
+                                wire == "native" and item_type == "function_call_output") else None
+                            if call_id is not None and (calls is None or not calls.awaiting(call_id)):
+                                await websocket.send_json(_client_realtime_error(wire, "invalid_function_call_id",
+                                    "Function call ID is unknown or already answered"))
+                            elif (message.get("type") in {"response.create", "input_audio_buffer.commit"}
+                                  and not has_response_funding()):
+                                await websocket.send_json(_client_realtime_error(wire, "realtime_hold_limit",
+                                    "The realtime hold cannot cover another response"))
+                            else:
+                                if tokens is not None:
+                                    tokens.request_sent(message)
+                                if item_type == "message" and images >= MAX_SESSION_IMAGES:
                                     raise RealtimeTransportError("too many realtime images")
-                            await upstream.send(json.dumps(message, separators=(",", ":")))
-                            if wire == "native" and item_type == "function_call_output":
-                                # The native function result continues the model's turn.
-                                tokens.request_sent({"type": "response.create"})
-                                await upstream.send(json.dumps({"type": "response.create"}))
+                                await upstream.send(json.dumps(message, separators=(",", ":")))
+                                if item_type == "message":
+                                    images += 1
+                                    tokens.image_sent = True
+                                if call_id is not None:
+                                    calls.answered(call_id)
+                                incoming += size
+                                if kind == "transcription" and message["type"] == "input_audio_buffer.commit":
+                                    pending_transcriptions += 1
+                                    if pending_transcriptions + len(finished_transcriptions) > _MAX_METERED_RESPONSES:
+                                        raise RealtimeTransportError("too many realtime transcription turns")
                             last_activity = loop.time()
-                            incoming += size
-                            if kind == "transcription" and message["type"] == "input_audio_buffer.commit":
-                                pending_transcriptions += 1
-                                if pending_transcriptions + len(finished_transcriptions) > _MAX_METERED_RESPONSES:
-                                    raise RealtimeTransportError("too many realtime transcription turns")
                             client = asyncio.create_task(websocket.receive_text())
                     if server in done:
                         try:
@@ -1078,7 +1170,9 @@ async def relay_audio(
                                     cost = hold  # Unpriceable usage: stop now; settlement decides.
                                 spent += cost
                                 # A response above the pinned worst case voids the guard's premise.
-                                hold_reached = cost > bound or spent + (tokens.in_flight + 2) * bound > hold
+                                hold_reached = cost > bound or not has_response_funding()
+                            if tokens.invalid:
+                                hold_reached = True
                         if kind == "transcription" and parsed.get("type") in {
                             "conversation.item.input_audio_transcription.completed",
                             "conversation.item.input_audio_transcription.failed",
@@ -1088,7 +1182,10 @@ async def relay_audio(
                                     and item_id not in finished_transcriptions):
                                 finished_transcriptions.add(item_id)
                                 pending_transcriptions -= 1
-                        events, size = _provider_events(parsed, provider, wire=wire, kind=kind)
+                        if calls is None or calls.observe(parsed):
+                            events, size = _provider_events(parsed, provider, wire=wire, kind=kind)
+                        else:
+                            events, size = [], 0
                         last_activity = loop.time()
                         if outgoing + size > output_limit:
                             raise RealtimeTransportError("session output exceeds duration bound")
@@ -1106,6 +1203,14 @@ async def relay_audio(
                             break
                         if hold_reached:
                             break
+                    if calls is not None and not tokens.pending and calls.take_ready():
+                        if has_response_funding():
+                            response_request = {"type": "response.create"}
+                            tokens.request_sent(response_request)
+                            await upstream.send(json.dumps(response_request))
+                        else:
+                            await websocket.send_json(_client_realtime_error(wire, "realtime_hold_limit",
+                                "The realtime hold cannot cover another response"))
                 if tokens is not None and tokens.pending:
                     server, outgoing = await _drain_final_usage(upstream, server, tokens, provider=provider,
                         wire=wire, outgoing=outgoing, output_limit=output_limit, frame_limit=frame_limit)

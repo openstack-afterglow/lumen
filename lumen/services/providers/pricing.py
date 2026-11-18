@@ -618,15 +618,17 @@ def _effective_capabilities(
         # Media metadata does not imply an executable route. A real direct
         # provider, configured API key, supported price and asset pipeline matter.
         route_available = False
+        reservation_error = False
         kind = _kind(row)
-        if kind in {"image", "tts", "stt", "realtime"} and auth_mode == "api_key" and api_key_configured:
+        configured = auth_mode == "api_key" and api_key_configured
+        if kind == "realtime" or (configured and kind in {"image", "tts", "stt"}):
+            input_rate, output_rate = _effective_model_rates(row, provider_type, api_base)
             route = {
                 "model_kind": kind, "provider_type": provider_type,
                 "api_model_name": api_model_name(row.model_name, provider_type or ""),
-                "api_base": api_base, "api_key": "configured",
+                "api_base": api_base, "api_key": "configured" if configured else None,
                 "media_pricing": _effective_media_pricing(row, provider_type, api_base),
-                "input_price_per_token": _effective_model_rates(row, provider_type, api_base)[0],
-                "output_price_per_token": _effective_model_rates(row, provider_type, api_base)[1],
+                "input_price_per_token": input_rate, "output_price_per_token": output_rate,
                 "cache_read_price_per_token": _resolved_cache_prices(row, provider_type, api_base)[0]["cache_read_price_per_token"],
                 "provider_auth": None,
             }
@@ -635,7 +637,8 @@ def _effective_capabilities(
                 route_available = image_route_ready(route)
             elif kind == "realtime":
                 from .realtime_transport import realtime_route_ready
-                route_available = realtime_route_ready(route)
+                reservation_error = _realtime_reservation_too_small(route)
+                route_available = configured and not reservation_error and realtime_route_ready(route)
             else:
                 from .audio_transport import audio_route_ready
                 route_available = audio_route_ready(route)
@@ -659,6 +662,8 @@ def _effective_capabilities(
                         if ready
                         else "asset_pipeline_unavailable"
                         if route_available and needs_assets
+                        else "realtime_reservation_too_small"
+                        if reservation_error
                         else "route_unavailable"
                     )
                     if name in features
@@ -991,6 +996,18 @@ def _resolved_base_prices(
     return _resolved_model_prices(model, provider.provider_type, provider.api_base)
 
 
+def _realtime_reservation_too_small(route: dict) -> bool:
+    from .realtime_transport import RealtimeReservationTooSmall, validate_configured_reservation
+
+    try:
+        validate_configured_reservation(route)
+    except RealtimeReservationTooSmall:
+        return True
+    except ProviderValidationError:
+        pass  # Other invalid pricing is reported by the normal readiness checks.
+    return False
+
+
 def _resolved_model_prices(
     model: LlmModel, provider_type: str | None, api_base: str | None,
 ) -> tuple[Decimal | None, Decimal | None, str, str | None]:
@@ -1008,6 +1025,9 @@ def _resolved_model_prices(
             kind, media, text_input_priced=input_price is not None, text_output_priced=output_price is not None,
             duration_families=_realtime_duration_families(kind, model.model_name), provider_type=provider_type,
         )
+        if priced and kind == "realtime":
+            priced = not _realtime_reservation_too_small({"model_kind": kind, "provider_type": provider_type,
+                "media_pricing": media, "input_price_per_token": input_price, "output_price_per_token": output_price})
     if priced:
         source = "manual" if manual else "native_catalog"
     else:

@@ -133,6 +133,7 @@ def _checkpoint(meter, basis: str) -> dict:
     if basis == "tokens":
         usage["usage_state"] = meter.usage_state
         usage["usage"] = meter.usage.as_usage_dict() if meter.usage is not None else None
+        usage["image_sent"] = meter.image_sent
     return usage
 
 
@@ -213,7 +214,7 @@ def _token_bill(run: ChatRun, snapshot: dict, usage: dict):
     required: tuple[str, ...] = ()
     if observed is None:
         # A truly idle session can be free; sent input without completion usage is uncertain.
-        if usage.get("input_bytes") != 0 or usage.get("output_bytes") != 0:
+        if usage.get("input_bytes") != 0 or usage.get("output_bytes") != 0 or usage.get("image_sent"):
             raise DurableRunProviderResultUnknown("realtime provider token usage is missing")
         breakdown = UsageBreakdown.from_totals(0, 0)
     else:
@@ -221,9 +222,8 @@ def _token_bill(run: ChatRun, snapshot: dict, usage: dict):
             breakdown = UsageBreakdown.from_canonical(observed)
         except ValueError as exc:
             raise DurableRunProviderResultUnknown("realtime provider token usage is invalid") from exc
-        # Observed PCM in a direction demands the provider's audio share for it.
-        required = tuple(name for name, size in (("audio_input", usage.get("input_bytes")),
-                                                 ("audio_output", usage.get("output_bytes"))) if size)
+        required = tuple(name for name, observed_input in (("audio_input", usage.get("input_bytes")),
+            ("audio_output", usage.get("output_bytes")), ("image_input", usage.get("image_sent"))) if observed_input)
     try:
         usage_cost = credit.usage_cost_from_pricing_snapshot(snapshot["token_pricing"],
             prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens,

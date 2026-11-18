@@ -35,6 +35,7 @@ from .errors import (
 )
 from .pricing import (
     MODEL_KINDS,
+    _effective_model_rates,
     _model_public,
     _per_million_price,
     _per_token_price,
@@ -123,13 +124,22 @@ def _validate_catalog_model_kind(provider_type: str, api_base: str | None, model
 
 
 def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: tuple,
-                          provider_type: str | None) -> dict | None:
+                          provider_type: str | None, *, model_name: str, api_base: str | None) -> dict | None:
     """Media models may carry applicable text rates; embeddings and decisions are input-only."""
     if kind in {"embedding", "decision"} and any(value is not None for value in token_prices[1:]):
         raise ProviderValidationError(f"{kind} models support input-token pricing only")
     if kind != "text" and any(value is not None for value in token_prices[3:]):
         raise ProviderValidationError("media 모델에는 cache write 가격을 설정할 수 없습니다")
-    return validate_media_pricing(kind, media_pricing, provider_type=provider_type)
+    pricing = validate_media_pricing(kind, media_pricing, provider_type=provider_type)
+    if kind == "realtime" and provider_type == "openai" and pricing and "reservation_usd" in pricing:
+        from .realtime_transport import validate_configured_reservation
+
+        manual_input, manual_output = _validate_text_prices(*token_prices[:2])
+        proposed = LlmModel(model_name=model_name, model_kind=kind, input_price=manual_input, output_price=manual_output)
+        input_rate, output_rate = _effective_model_rates(proposed, provider_type, api_base)
+        validate_configured_reservation({"model_kind": kind, "provider_type": provider_type, "media_pricing": pricing,
+                                        "input_price_per_token": input_rate, "output_price_per_token": output_rate})
+    return pricing
 
 
 def _validate_text_prices(input_price_per_million, output_price_per_million):
@@ -504,7 +514,7 @@ async def create_model(
             media_pricing = _validate_kind_prices(model_kind, media_pricing, (
                 input_price_per_million, output_price_per_million, cache_read_price_per_million,
                 cache_write_price_per_million, cache_write_1h_price_per_million,
-            ), provider.provider_type)
+            ), provider.provider_type, model_name=model_name.strip(), api_base=provider.api_base)
             _validate_compatible_prices(
                 provider.provider_type, provider.api_base, provider.auth_mode, model_kind, input_price, output_price,
             )
@@ -676,7 +686,8 @@ async def update_model(model_id: int, patch: dict) -> dict:
                     ("cache_write_1h_price_per_million", "cache_write_1h_price"),
                 )),
             )
-            media_pricing = _validate_kind_prices(target_kind, media_pricing, token_prices, provider.provider_type)
+            media_pricing = _validate_kind_prices(target_kind, media_pricing, token_prices, provider.provider_type,
+                model_name=str(patch.get("model_name") or row.model_name).strip(), api_base=provider.api_base)
             target_active = row.is_active if patch.get("is_active") is None else bool(patch["is_active"])
             if target_active:
                 _validate_compatible_prices(
