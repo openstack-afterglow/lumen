@@ -27,6 +27,10 @@ The selected sandbox path uses `features.tool_policy.enabled_sandbox_tools` (def
 
 All Kubernetes collection consumers share bounded, paginated `_list` normalization: only absent item `apiVersion` and `kind` inherit from the enclosing typed List. Present fields remain authoritative and must match the expected resource type. Preflight inventories policies/Services and reconciliation inventories Pods through this path; auxiliary cleanup still uses exact-name GET and UID-bound deletion, never a broad Secret sweep. Existing owned objects therefore do not prevent a second resource admission solely because Kubernetes omits per-item TypeMeta.
 
+The independently versioned `lumen-sandbox` 0.1.2 stdio bridge accepts only correlated JSON-RPC 2.0 responses with exactly one result/error. It skips bounded notifications, rejects unsupported server requests with -32601, enforces one exchange deadline and the existing frame bound, and terminates the child on invalid output. Tools/call requires an object result; no notification or missing result becomes an empty success. Fixed-chunk stderr draining prevents subprocess backpressure without retaining tool output. Production must pin the rebuilt sandbox image; local subprocess tests are not live Playwright/Markitdown acceptance.
+Each MCP exchange emits one metadata-only log line (profile, bounded outbound method, request ID, skipped/answered counts, outcome, elapsed milliseconds). No frame, argument, result, notification parameter, tool-supplied method or stderr content is logged.
+Cold startup remains lazy, bounded by one 60-second startup deadline. A separate outer caller deadline bounds startup plus invocation by the existing tool/run remainder; no readiness prewarm, timeout extension or retry is introduced. The full worker/controller/Pod-readiness deadline chain is documented in `packages/lumen-sandbox/IMAGE.md`.
+
 Selected sandboxes have their own `resource.deadline_at`, separate from the run's wall-clock deadline. A budgeted root reserves at most `min(300 s, ceiling/2, pool lifetime, wall time)` so children keep budget. On expiry the controller deletes the Pod with a fenced intent. Only never-started runs (`lease_fence == 0`) fail, and later sandbox calls or new delegations return `sandbox_expired` without reallocation. An already-settled delegation group still replays its joined child results. Code-mode runs with a sandbox-tool selection are refused with 422 `sandbox_code_combination_unsupported` before any hold or provider I/O.
 
 `lumen/services/native_catalog.py` strictly validates the bundled `native_model_catalog.json` for official OpenAI, Anthropic, Gemini and Perplexity routes. Developers update it manually from official pages (procedure in docs). Compatible OpenAI/Anthropic custom endpoints use only administrator model IDs, prices and capability overrides. Stored rates override catalog token and media rates; explicit capability overrides override catalog observations, with conservative defaults otherwise. Admission freezes the effective base, cache and context tiers and the per-model threshold. Legacy `_above_200k` fields remain storage slots, and old snapshots keep their 200000 default. Native discovery annotates authoritative live IDs; subscription modes read the bundled list. Historical models.dev SQL columns stay nullable and are no longer mapped.
@@ -590,9 +594,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "741c64f879589853f90722fe7ada123268c7c7e5648a7750be37a5c04f61265b",
-  "reviewed_at": "2026-11-18T03:33:34Z",
-  "summary": "Extend real-shaped Kubernetes Pod LIST regression to prove list_owned inventory transitions 2 to 1 to 0 after UID-bound deletion; production normalization unchanged"
+  "source_sha256": "0d09e3ce98dc8a6e3fc5b3497f833b5f3dd5b66da834df133710373d7d27ed42",
+  "reviewed_at": "2026-11-18T03:45:42Z",
+  "summary": "Review independent lumen-sandbox0.1.2 MCP response correlation, bounded notification/server-request handling, metadata-only exchange logs, stderr drain, single60s startup and existing whole-call/run deadline, poisoned-child restart fencing, subprocess regression tests and image/deadline docs; no service schema/config change"
 }
 ```
 <!-- architecture-review:end -->
