@@ -6,7 +6,7 @@ Keys without a human actor skip the wallet; admin mutations only lock the pool.
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, true
 from sqlalchemy.dialects.mysql import insert
 
 from lumen.models.billing import DomainCreditLedger, DomainCreditPool, utc_now
@@ -50,32 +50,35 @@ async def lock_pool(session, domain_id: str, *, create: bool = False) -> DomainC
 
 
 async def pending(session, domain_id: str | None, *, actor_user_id: str | None = None,
-                  api_key_id: int | None = None) -> Decimal:
-    """Count provider holds and only the unused part of each active child allocation."""
+                  api_key_id: int | None = None, user_funded: bool = False) -> Decimal:
+    """Count provider holds plus unused child allocations; no domain means all payers."""
     call = ChatModelCallReservation
     stateless = StatelessCallReservation
     allocation = ChatAgentReservation
-    def domain(column):
-        return column.is_not(None) if domain_id is None else column == domain_id
+
+    def funding(column):
+        if user_funded:
+            return column.is_(None)
+        return true() if domain_id is None else column == domain_id
 
     calls = select(func.coalesce(func.sum(call.bound_credits), 0)).where(
-        domain(call.payer_domain_id), call.status.in_(UNSETTLED))
+        funding(call.payer_domain_id), call.status.in_(UNSETTLED))
     stateless_calls = select(func.coalesce(func.sum(stateless.bound_credits), 0)).where(
-        domain(stateless.payer_domain_id), stateless.status.in_(UNSETTLED))
+        funding(stateless.payer_domain_id), stateless.status.in_(UNSETTLED))
     committed_child = select(func.coalesce(func.sum(case(
         (call.status.in_(UNSETTLED), call.bound_credits), else_=call.actual_credits)), 0)).where(
-        call.run_id == allocation.run_id, call.payer_domain_id == allocation.payer_domain_id,
+        call.run_id == allocation.run_id, call.payer_domain_id.is_not_distinct_from(allocation.payer_domain_id),
     ).scalar_subquery()
     allocations = select(func.coalesce(func.sum(func.greatest(0, allocation.amount - committed_child)), 0)).where(
-        domain(allocation.payer_domain_id), allocation.kind == "credit", allocation.status == "reserved",
+        funding(allocation.payer_domain_id), allocation.kind == "credit", allocation.status == "reserved",
     )
     if actor_user_id is not None or api_key_id is not None:
         calls = calls.join(ChatRun, ChatRun.id == call.run_id)
         allocations = allocations.join(ChatRun, ChatRun.id == allocation.run_id)
     if actor_user_id is not None:
-        calls = calls.where(ChatRun.user_id == actor_user_id, ChatRun.api_key_id.is_(None))
-        allocations = allocations.where(ChatRun.user_id == actor_user_id, ChatRun.api_key_id.is_(None))
-        stateless_calls = stateless_calls.where(stateless.user_id == actor_user_id, stateless.api_key_id.is_(None))
+        calls = calls.where(ChatRun.user_id == actor_user_id)
+        allocations = allocations.where(ChatRun.user_id == actor_user_id)
+        stateless_calls = stateless_calls.where(stateless.user_id == actor_user_id)
     if api_key_id is not None:
         calls = calls.where(ChatRun.api_key_id == api_key_id)
         allocations = allocations.where(ChatRun.api_key_id == api_key_id)

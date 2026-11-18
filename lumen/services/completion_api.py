@@ -338,12 +338,17 @@ async def _reserve_online(
             route, model, messages=messages, tools=tools, max_output=max_output,
             prompt_options=prompt_options or {}, content_growth=bool(tool_bound_usd),
         )
-    elif payer is not None and payer.domain_id is not None and not tool_bound_usd:
+    elif payer is not None and not tool_bound_usd:
         # Outside the bounded OpenAI contract, reserve the entire configured
         # model context. A local tokenizer estimate is not a funding envelope.
-        input_bound = (route.get("capabilities") or {}).get("context_limit")
-        if type(input_bound) is not int or input_bound <= 0 or max_output <= 0:
-            raise CompletionError(422, "Model context bound unavailable.", code="pricing_unavailable")
+        capabilities = route.get("capabilities") or {}
+        input_bound = capabilities.get("context_limit")
+        if (type(input_bound) is not int or input_bound <= 0 or max_output <= 0
+                or capabilities.get("output_budget_enforced") is False):
+            raise CompletionError(422, "Model context or output bound unavailable.", code="pricing_unavailable")
+        max_allowed_output = capabilities.get("max_output_tokens")
+        if type(max_allowed_output) is int and max_output > max_allowed_output:
+            raise CompletionError(422, "Output token budget exceeds the model limit.", code="max_output_tokens_exceeded")
         may_write_long = True
     elif tool_bound_usd:
         raise CompletionError(422, "Hosted tool pricing requires a bounded model.", code="pricing_unavailable")
@@ -719,6 +724,8 @@ async def complete_once(
     await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
     options = chat_provider_options(options or {}, resolved=resolved)
     max_output = _chat_wire_budget(resolved, max_tokens)
+    if payer is not None and max_output is None:
+        max_output = _chat_hold_output_budget(resolved, None)
     hold = await _reserve_online(
         resolved, messages=messages, tools=tools, max_output=_chat_hold_output_budget(resolved, max_output),
         user_id=user_id, project_id=project_id, api_key_id=api_key_id,
@@ -784,6 +791,8 @@ async def complete_stream(
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
     options = chat_provider_options(options or {}, resolved=resolved)
     max_output = _chat_wire_budget(resolved, max_tokens)
+    if payer is not None and max_output is None:
+        max_output = _chat_hold_output_budget(resolved, None)
     await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
     hold = await _reserve_online(
         resolved, messages=messages, tools=tools, max_output=_chat_hold_output_budget(resolved, max_output),
@@ -1235,9 +1244,12 @@ async def complete_responses(
         messages = [{"role": "system", "content": options["instructions"]}, *messages]
     resolved = billing_route(resolved, messages, protocol="responses", options=options)
     await _authorize_completion(user_id, project_id, api_key_id, options, resolved)
+    max_output = options.get("max_output_tokens") or catalog.get("max_output_tokens") or _DEFAULT_MAX_TOKENS
+    if payer is not None:
+        options["max_output_tokens"] = max_output
     hold = await _reserve_online(
         resolved, messages=messages, tools=options.get("tools"),
-        max_output=options.get("max_output_tokens") or catalog.get("max_output_tokens") or _DEFAULT_MAX_TOKENS,
+        max_output=max_output,
         user_id=user_id, project_id=project_id, api_key_id=api_key_id,
         payer=payer,
         tool_bound_usd=meter.bound_usd if meter is not None else Decimal("0"), prompt_options=options,
@@ -1366,7 +1378,7 @@ async def complete_anthropic(
     hold = await _reserve_online(
         resolved, messages=messages, tools=options.get("tools"), max_output=max_tokens,
         user_id=user_id, project_id=project_id, api_key_id=api_key_id, payer=payer, prompt_options=options,
-    ) if payer is not None and payer.domain_id is not None else None
+    ) if payer is not None else None
     event_id = hold.event_id if hold else str(uuid.uuid4())
     try:
         if hold is not None:

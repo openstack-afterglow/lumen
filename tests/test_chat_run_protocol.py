@@ -498,6 +498,9 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
         project_id="project-1",
         user_id="user-1",
         payer_domain_id=None,
+        source="web",
+        api_key_id=None,
+        run_scope="temp",
         conversation_id=None,
         user_message_id=None,
         assistant_message_id=None,
@@ -1362,6 +1365,9 @@ def tool_result_worker(monkeypatch):
         execution_protocol_version=1, status="queued", lease_owner="worker#1", assigned_resource_id=None,
         parent_run_id=None, credit_ceiling=None, sandbox_seconds_ceiling=None, depth=0, last_seq=0,
         payer_domain_id=None,
+        source="web",
+        api_key_id=None,
+        run_scope="temp",
     )
     journal = []
     finished = []

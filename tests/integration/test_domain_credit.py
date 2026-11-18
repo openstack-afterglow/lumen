@@ -17,10 +17,11 @@ from lumen.auth import get_principal, require_admin
 from lumen.crypto import encrypt_chat_content
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.billing import DomainCreditLedger, DomainCreditPool, Payer
-from lumen.models.chat_db import ChatUsageLog, UserWallet
+from lumen.models.chat_db import ChatApiKey, ChatUsageLog, UserWallet
 from lumen.models.chat_infrastructure import ChatAgentReservation, ChatProjectAgentQuota
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment
 from lumen.models.stateless_reservations import StatelessCallReservation
+from lumen.scripts.migrate import migrate
 from lumen.services import credit, domain_credit, stateless_credit
 from lumen.services.chat_admission import _run_snapshots
 from lumen.services.durable_runs import budgets, execution
@@ -28,6 +29,14 @@ from lumen.services.provider_metadata import UsageCost
 from lumen.services.usage import user_usage_summary
 
 pytestmark = pytest.mark.integration
+
+
+async def test_domain_billing_migration_rechecks_without_replaying():
+    # The immutable 028 preflight still checks the exact usage-table shape.
+    # It must accept this verified 037 delta on both dry-run and API bootstrap.
+    database_url = os.environ["DATABASE_URL"]
+    assert await migrate(database_url, apply=False, repair_schema_drift=False) == ([], 0)
+    assert await migrate(database_url, apply=True, repair_schema_drift=False) == ([], 0)
 
 
 @pytest.fixture
@@ -53,6 +62,9 @@ async def pool_scope(monkeypatch):
             await session.execute(delete(StatelessCallReservation).where(StatelessCallReservation.payer_domain_id == scope.id))
             await session.execute(delete(DomainCreditLedger).where(DomainCreditLedger.domain_id == scope.id))
             await session.execute(delete(DomainCreditPool).where(DomainCreditPool.domain_id == scope.id))
+            await session.execute(delete(StatelessCallReservation).where(StatelessCallReservation.user_id.in_(scope.users)))
+            await session.execute(delete(ChatUsageLog).where(ChatUsageLog.user_id.in_(scope.users)))
+            await session.execute(delete(ChatApiKey).where(ChatApiKey.owner_user_id.in_(scope.users)))
             await session.execute(delete(UserWallet).where(UserWallet.user_id.in_(scope.users)))
         await close_db()
 
@@ -127,6 +139,66 @@ async def test_ordinary_chat_frozen_snapshot_reserves_and_charges_once(pool_scop
             Decimal("9.992"), 0, Decimal("0.008"),
         )
         assert (await session.get(UserWallet, scope.users[0])).used_quota_this_month == 0
+
+
+@pytest.mark.parametrize("first", ["dashboard", "personal", "race"])
+async def test_dashboard_and_personal_key_share_actor_monthly_budget(pool_scope, first):
+    scope = pool_scope
+    user_id = scope.users[0]
+    await _fund(scope, "300")
+    async with scope.factory() as session, session.begin():
+        wallet = await credit.lock_wallet(session, user_id, scope.project)
+        wallet.max_quota_monthly = Decimal(100)
+        key = ChatApiKey(owner_user_id=user_id, owner_project_id=scope.project, name="personal billing test",
+                         key_prefix="synthetic", key_hash=uuid4().hex * 2, scopes=["compat:completions:write"])
+        session.add(key)
+        await session.flush()
+        key_id = key.id
+    personal = Payer("user", user_id, None)
+    run_id = await _run(scope)
+
+    async def dashboard_hold():
+        await _durable_hold(run_id, "90")
+
+    async def key_hold():
+        event_id = str(uuid4())
+        await stateless_credit.reserve(event_id=event_id, user_id=user_id, project_id=f"lumen:key:{key_id}",
+                                       api_key_id=key_id, bound=Decimal(90), payer=personal)
+        return event_id
+
+    if first == "race":
+        results = await asyncio.gather(dashboard_hold(), key_hold(), return_exceptions=True)
+        [error] = [result for result in results if isinstance(result, Exception)]
+        assert isinstance(error, credit.QuotaExceeded) and "월 사용 한도" in str(error)
+        async with scope.factory() as session:
+            assert await domain_credit.pending(session, None, actor_user_id=user_id) == 90
+        return
+
+    if first == "dashboard":
+        await dashboard_hold()
+        try_next = key_hold
+    else:
+        key_event = await key_hold()
+        try_next = dashboard_hold
+    with pytest.raises(credit.QuotaExceeded, match="월 사용 한도"):
+        await try_next()
+
+    if first == "dashboard":
+        async with scope.factory() as session, session.begin():
+            quota, root, run = await _hooks(run_id)._credit_lineage(session)
+            segment = await session.get(ChatRunSegment, (run_id, "provider:0:0"))
+            await budgets.settle_call_credit(session, run=run, root=root, quota=quota, segment=segment, actual=Decimal(90))
+    else:
+        charge = UsageCost(Decimal(90), Decimal(90), Decimal(0), "priced", {})
+        await stateless_credit.settle(
+            **{**_usage(scope, key_event), "project_id": f"lumen:key:{key_id}", "api_key_id": key_id,
+               "payer": personal, "usage_cost": charge, "source": "api"},
+        )
+    with pytest.raises(credit.QuotaExceeded, match="월 사용 한도"):
+        await try_next()
+    async with scope.factory() as session:
+        wallet = await session.get(UserWallet, user_id)
+        assert wallet.used_quota_this_month == (0 if first == "dashboard" else 90)
 
 
 @pytest.mark.parametrize(("amount", "ceiling"), [("10", None), ("100", "10")])

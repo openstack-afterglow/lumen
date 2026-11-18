@@ -116,16 +116,17 @@ async def embed(
     if route.get("input_price_per_token") is None:
         raise EmbeddingError(422, "embedding input pricing unavailable")
     domain_billed = payer is not None and payer.domain_id is not None
+    bounded = payer is not None
     event_id = str(uuid.uuid4())
     held = dispatched = False
     conversion = Decimal(str(get_settings().chat_credit_per_usd))
     try:
-        if not domain_billed:
+        if not bounded:
             await credit.precheck(user_id, project_id, api_key_id=api_key_id, payer=payer)
         await authorize_new_io(
             user_id=user_id, project_id=project_id, api_key_id=api_key_id, required_scopes=required_scopes,
         )
-        if domain_billed:
+        if bounded:
             max_tokens = embedding_metadata(route)["max_input_tokens"]
             if type(max_tokens) is not int or max_tokens <= 0:
                 raise EmbeddingError(422, "embedding input bound unavailable")
@@ -163,7 +164,7 @@ async def embed(
             getattr(usage, "prompt_tokens", None) if usage is not None else None
         )
         estimated = type(prompt_tokens) is not int or prompt_tokens <= 0
-        if domain_billed and (estimated or prompt_tokens > max_tokens):
+        if bounded and (estimated or prompt_tokens > max_tokens):
             raise EmbeddingError(502, "provider_result_unknown")
         if estimated:
             prompt_tokens = sum(provider_metadata.count_tokens(route["model_name"], text=text) for text in inputs)
@@ -174,7 +175,7 @@ async def embed(
                 input_price_per_token=route.get("input_price_per_token"),
                 output_price_per_token=Decimal(0), price_source=route.get("price_source"),
                 provider_type=route.get("provider_type"), api_base=route.get("api_base"), breakdown=breakdown,
-                allow_catalog_prices=not domain_billed,
+                allow_catalog_prices=not bounded,
             )
             settle = stateless_credit.settle if held else credit.apply_usage
             with anyio.CancelScope(shield=held):

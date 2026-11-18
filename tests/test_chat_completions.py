@@ -2256,7 +2256,7 @@ class TestContextOutputLimitFallback:
 
         async def deny_conversation(_conversation_id, *, user_id, project_id, domain_id):
             assert (user_id, project_id) == ("test-user-123", "test-project-123")
-            assert domain_id is None
+            assert domain_id == "test-domain-123"
             raise cs.ConversationForbidden("conversation is not accessible")
 
         async def deny_thread(**kwargs):
