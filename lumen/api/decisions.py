@@ -155,7 +155,7 @@ def _openai_request(raw: object) -> NativeDecisionRequest:
     ]}}},
 }})
 async def create_decision(request: Request,
-                          principal: Principal = Depends(require_scopes("native:runs:write"))):
+                          principal: Principal = Depends(require_scopes("decisions:write"))):
     content = await request.body()
     if not content:
         raise RequestValidationError([{"type": "missing", "loc": ("body",), "msg": "Field required"}])
@@ -190,7 +190,7 @@ async def create_decision(request: Request,
     if model is None and model_row_id is None:
         _openai_request(raw)
     caller = dict(user_id=principal["user_id"], project_id=principal["project_id"],
-                  api_key_id=principal.get("api_key_id"), required_scopes=("native:runs:write",),
+                  api_key_id=principal.get("api_key_id"), required_scopes=("decisions:write",),
                   payer=principal.get("payer"),
                   source="api" if principal.get("api_key_id") is not None else "web")
     try:

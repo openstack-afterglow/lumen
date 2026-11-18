@@ -546,6 +546,7 @@ def _compat_app(monkeypatch, admission_mock):
     app = FastAPI()
     app.include_router(compat.router)
     monkeypatch.setattr(compat.api_key_store, "verify_key", AsyncMock(return_value={
+        "auth_type": "api_key", "credential_class": "personal_key",
         "user_id": "owner", "project_id": "project", "api_key_id": 37, "scopes": ["compat:realtime:write"],
         "roles": ["member", "lumen-audio_user"], "service_system_admin": False}))
     monkeypatch.setattr(compat, "get_settings", lambda: SimpleNamespace(chat_api_hosts="testserver"))

@@ -26,8 +26,11 @@ from typing import Any
 
 import httpx
 import pytest
+from system.fake_keystone import OWNER_TOKEN, PROJECT_ID
 
 pytestmark = pytest.mark.system
+
+_OWNER_HEADERS = {"X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID}
 
 
 def _load_connection_context() -> tuple[str, str, str, str, str]:
@@ -269,7 +272,7 @@ def test_process_stack_temp_completion_e2e() -> None:
 
         # 4. Submit native temp completion
         temp_headers = {
-            "Authorization": f"Bearer {api_key}",
+            **_OWNER_HEADERS,
             "Idempotency-Key": str(uuid.uuid4()),
             "Content-Type": "application/json",
         }
@@ -286,11 +289,12 @@ def test_process_stack_temp_completion_e2e() -> None:
         run_id = run_data.get("run_id") or run_data.get("id")
         assert run_id, f"Response missing run_id: {run_data}"
 
-        run_detail = _poll_run_until_terminal(client, run_id, headers)
+        run_detail = _poll_run_until_terminal(client, run_id, _OWNER_HEADERS)
         assert run_detail.get("status") == "completed"
 
         # 5. Assert usage attribution via public usage API
-        usage_resp = client.get("/v1/usage/records", headers={"Authorization": f"Bearer {api_key}"})
+        assert client.get("/v1/usage/records", headers=headers).status_code == 403
+        usage_resp = client.get("/v1/usage/records", headers=_OWNER_HEADERS)
         assert usage_resp.status_code == 200, f"Failed getting usage records: {usage_resp.text}"
         usage_data = usage_resp.json()
 
@@ -299,9 +303,8 @@ def test_process_stack_temp_completion_e2e() -> None:
 
         native_record = next((item for item in records if item.get("run_id") == run_id), None)
         assert native_record is not None, f"Expected usage record for native run {run_id}"
-        assert native_record["source"] == "api"
-        api_key_id = native_record["api_key_id"]
-        assert isinstance(api_key_id, int)
+        assert native_record["source"] == "web"
+        assert native_record["api_key_id"] is None
 
 
 # ============================================================================
@@ -316,11 +319,11 @@ def test_process_stack_small_delta_exposed_within_scheduler_allowance() -> None:
     The worker's flush deadline (50ms) and SSE poller (100ms) guarantee the client observes
     'delta1' well before the provider finishes (observed < 1.5s while total duration >= 2.0s).
     """
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _configure_fake_provider(fake_provider_url, {"mode": "small_delta_pause", "pause_seconds": 2.0})
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        **_OWNER_HEADERS,
         "Idempotency-Key": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
@@ -344,7 +347,7 @@ def test_process_stack_small_delta_exposed_within_scheduler_allowance() -> None:
         completed_seen = False
 
         with client.stream(
-            "GET", f"/v1/runs/{run_id}/events", headers={"Authorization": f"Bearer {api_key}"}
+            "GET", f"/v1/runs/{run_id}/events", headers=_OWNER_HEADERS
         ) as stream_resp:
             assert stream_resp.status_code == 200
             for line in stream_resp.iter_lines():
@@ -401,11 +404,11 @@ def test_process_stack_burst_streaming_ordered_and_replayable_terminal() -> None
     The observable contract is strict event ordering and exact reconstruction of the
     2,000-character provider output on both the live and replay streams.
     """
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _configure_fake_provider(fake_provider_url, {"mode": "burst", "burst_chunks": 500, "burst_chunk_size": 4})
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        **_OWNER_HEADERS,
         "Idempotency-Key": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
@@ -427,7 +430,7 @@ def test_process_stack_burst_streaming_ordered_and_replayable_terminal() -> None
         live_seqs: list[int] = []
 
         with client.stream(
-            "GET", f"/v1/runs/{run_id}/events", headers={"Authorization": f"Bearer {api_key}"}
+            "GET", f"/v1/runs/{run_id}/events", headers=_OWNER_HEADERS
         ) as stream_resp:
             assert stream_resp.status_code == 200
             for line in stream_resp.iter_lines():
@@ -459,7 +462,7 @@ def test_process_stack_burst_streaming_ordered_and_replayable_terminal() -> None
         # 2. Replay terminal stream from database journal
         replay_resp = client.get(
             f"/v1/runs/{run_id}/events?after_seq=0",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=_OWNER_HEADERS,
         )
         assert replay_resp.status_code == 200
 
@@ -504,11 +507,11 @@ def test_process_stack_context_preview_readonly_no_provider_calls() -> None:
     - HTTP 200 ContextState returned with valid budget, revision, and recommendations
     - Provider request count remains completely unchanged before and after the preview call
     """
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _reset_fake_provider(fake_provider_url)
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        **_OWNER_HEADERS,
         "Idempotency-Key": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
@@ -539,7 +542,7 @@ def test_process_stack_context_preview_readonly_no_provider_calls() -> None:
         # Execute preview request
         preview_resp = client.post(
             preview_url,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers=_OWNER_HEADERS,
             json={
                 "model_id": model_name,
                 "features": {},
@@ -582,10 +585,10 @@ def test_process_stack_manual_compaction_and_sentinel_preservation() -> None:
     5. Compaction completes without inserting new message rows in conversation/thread history.
     6. Next completion prompt receives summary preserving the old sentinels and recent turns.
     """
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _reset_fake_provider(fake_provider_url)
 
-    auth_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    auth_headers = _OWNER_HEADERS
 
     with httpx.Client(base_url=api_base_url, timeout=45.0) as client:
         # Determine whether persistent conversation creation is available
@@ -756,10 +759,10 @@ def test_process_stack_manual_compaction_and_sentinel_preservation() -> None:
 
 def test_process_stack_title_first_answer_influences_title_no_extra_calls() -> None:
     """Verify title generation occurs once after first turn, influenced by answer, with no extra calls."""
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _reset_fake_provider(fake_provider_url)
 
-    auth_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    auth_headers = _OWNER_HEADERS
 
     with httpx.Client(base_url=api_base_url, timeout=30.0) as client:
         # The generated local transport is authorized for the native persistent
@@ -844,11 +847,11 @@ def test_process_stack_title_first_answer_influences_title_no_extra_calls() -> N
 
 def test_process_stack_paused_provider_and_cancellation() -> None:
     """Verify an in-flight run under provider pause can be canceled cleanly via public cancel API."""
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _configure_fake_provider(fake_provider_url, {"mode": "pause", "pause_seconds": 6.0})
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        **_OWNER_HEADERS,
         "Idempotency-Key": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
@@ -871,7 +874,7 @@ def test_process_stack_paused_provider_and_cancellation() -> None:
         # Issue cancellation
         cancel_resp = client.post(
             f"/v1/runs/{run_id}/cancel",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=_OWNER_HEADERS,
         )
         assert cancel_resp.status_code in (200, 202), f"Cancel failed: {cancel_resp.status_code}"
 
@@ -1277,7 +1280,7 @@ def test_process_stack_discovers_and_routes_new_claude_without_restart() -> None
 
         unsupported = client.post(
             "/v1/temp-completions",
-            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+            headers={**_OWNER_HEADERS, "Idempotency-Key": str(uuid.uuid4())},
             json={
                 "parts": [{"type": "text", "text": "search must remain denied"}],
                 "model_id": model_name,
@@ -1302,7 +1305,7 @@ def test_process_stack_discovers_and_routes_new_claude_without_restart() -> None
 
         admitted = client.post(
             "/v1/temp-completions",
-            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+            headers={**_OWNER_HEADERS, "Idempotency-Key": str(uuid.uuid4())},
             json={
                 "parts": [{"type": "text", "text": "newly registered worker route"}],
                 "model_id": model_name,
@@ -1311,10 +1314,10 @@ def test_process_stack_discovers_and_routes_new_claude_without_restart() -> None
         )
         assert admitted.status_code == 202, admitted.text
         run_id = admitted.json()["run_id"]
-        terminal = _poll_run_until_terminal(client, run_id, headers)
+        terminal = _poll_run_until_terminal(client, run_id, _OWNER_HEADERS)
         assert terminal["status"] == "completed", terminal
 
-        records = client.get("/v1/usage/records", headers=headers)
+        records = client.get("/v1/usage/records", headers=_OWNER_HEADERS)
         assert records.status_code == 200, records.text
         record = next(item for item in records.json()["records"] if item["run_id"] == run_id)
         assert record["model_name"] == model_name

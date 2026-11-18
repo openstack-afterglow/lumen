@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from httpx import ASGITransport, AsyncClient
 from lumen_plugin_api.contracts import ExecutionContext
 
+from lumen import auth
 from lumen.api import conversations as history_api
 from lumen.api.completions import _active_context_compaction_run_id, list_conversation_runs
 from lumen.db import close_db, get_session_factory, init_db
+from lumen.main import app
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
-from lumen.models.chat_db import ChatConversation, ChatMessage, ChatMessageGraph
+from lumen.models.chat_db import ChatApiKey, ChatConversation, ChatMessage, ChatMessageGraph
 from lumen.models.chat_runs import ChatRun
 from lumen.plugins.tools_host import ToolsConversationAccess
 from lumen.scripts.migrate import migrate
-from lumen.services import assets, context_store, workspace_store
+from lumen.services import api_key_store, assets, context_store, workspace_store
 from lumen.services import conversation_store as history
 from lumen.services.durable_runs import admission, queries
 from lumen.services.durable_runs.errors import DurableRunConflict, DurableRunInputError, DurableRunNotFound
@@ -143,6 +148,82 @@ async def test_same_user_domain_history_fork_cursor_and_legacy_origin(scopes):
     ):
         await history.delete_conversation(conversation["id"], **owner)
     await workspace_store.delete_workspace(workspace["id"], user_id=current["user_id"])
+
+
+async def test_history_http_resolves_current_project_domain_without_principal_override(scopes, monkeypatch):
+    origin, current = scopes
+    user_id = origin["user_id"]
+    home_domain = origin["domain_id"]
+    foreign = {"user_id": user_id, "project_id": str(uuid4()), "domain_id": str(uuid4())}
+    projects = {scope["project_id"]: scope["domain_id"] for scope in (origin, current, foreign)}
+    roles = [{"id": "member-id", "name": "member", "domain_id": None}]
+
+    def token_data(token, *, include_catalog):
+        assert include_catalog is False
+        return {"token": {
+            "methods": ["password"],
+            "user": {"id": user_id, "name": "fixture", "domain": {"id": home_domain}},
+            "project": {"id": token, "name": "fixture", "domain": {"id": projects[token]}},
+            "roles": roles,
+            "issued_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }}
+
+    def get(path):
+        if path == "/roles":
+            return None, {"roles": roles}
+        if path == "/role_inferences":
+            return None, {"role_inferences": []}
+        query = parse_qs(urlsplit(path).query)
+        project_id, = query["scope.project.id"]
+        assert project_id in projects and query["user.id"] == [user_id]
+        return None, {"role_assignments": [{
+            "scope": {"project": {"id": project_id}}, "user": {"id": user_id}, "role": {"id": "member-id"},
+        }]}
+
+    monkeypatch.setattr(auth, "_get_admin_ks_client", lambda: SimpleNamespace(
+        get=get,
+        tokens=SimpleNamespace(get_token_data=token_data),
+        users=SimpleNamespace(get=lambda value: SimpleNamespace(id=value, enabled=True, domain_id=home_domain)),
+        projects=SimpleNamespace(get=lambda value: SimpleNamespace(id=value, enabled=True, domain_id=projects[value])),
+        domains=SimpleNamespace(get=lambda value: SimpleNamespace(id=value, enabled=True)),
+    ))
+
+    conversation = await history.create_conversation(title="Domain proof", model_name=None, **origin)
+    conversation_id = conversation["id"]
+    key_ids = []
+    factory = get_session_factory()
+    assert factory is not None
+    try:
+        async with factory() as db, db.begin():
+            credentials = []
+            for kind, ownership in (("personal", {"owner_user_id": user_id}), ("service", {"owner_domain_id": home_domain})):
+                row, raw = api_key_store._new_key(
+                    "History acceptance", ("models:read", "native:conversations:read"), expires_at=None,
+                    key_kind=kind, credential_kind="api_key", created_by_user_id=user_id, **ownership,
+                )
+                db.add(row)
+                await db.flush()
+                key_ids.append(row.id)
+                credentials.append(raw)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            for scope in (origin, current, foreign):
+                headers = {"X-Auth-Token": scope["project_id"], "X-Project-Id": scope["project_id"]}
+                listed = await client.get("/v1/conversations", headers=headers)
+                assert listed.status_code == 200, listed.text
+                assert [item["id"] for item in listed.json()] == ([] if scope is foreign else [conversation_id])
+                detail = await client.get(f"/v1/conversations/{conversation_id}", headers=headers)
+                assert detail.status_code == (403 if scope is foreign else 200), detail.text
+            for raw in credentials:
+                headers = {"X-API-Key": raw, "X-Project-Id": origin["project_id"]}
+                assert (await client.get("/v1/models", headers=headers)).status_code == 200
+                assert (await client.get("/v1/conversations", headers=headers)).status_code == 403
+                assert (await client.get(f"/v1/conversations/{conversation_id}", headers=headers)).status_code == 403
+    finally:
+        await history.delete_conversation(conversation_id, **origin)
+        async with factory() as db, db.begin():
+            for key_id in key_ids:
+                await db.delete(await db.get(ChatApiKey, key_id))
 
 
 @pytest.mark.usefixtures("current_project_authority")
