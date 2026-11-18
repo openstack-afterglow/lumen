@@ -144,10 +144,10 @@ def test_compat_edit_scans_png_and_returns_generated_image(monkeypatch):
     with Image.open(io.BytesIO(base64.b64decode(response.json()["data"][0]["b64_json"]))) as image:
         assert image.getpixel((0, 0)) == (55, 66, 77)
     unsupported = client.post(
-        url, data={**data, "mask": "unsupported"}, files={"image": ("source.png", source, "image/png")}
+        url, data={**data, "unknown_overlay": "unsupported"}, files={"image": ("source.png", source, "image/png")}
     )
     assert unsupported.status_code == 400
-    assert "mask" in unsupported.json()["error"]["message"]
+    assert "unknown_overlay" in unsupported.json()["error"]["message"]
     assert len(uploads) == 1
 
 
@@ -243,3 +243,59 @@ def test_compat_generation_maps_a_settled_provider_refusal_to_the_caller_status(
     monkeypatch.setattr(image_api.queries, "owned_events", unknown_events)
     assert client.post("/v1/images/generations", json={"model": "gpt-image-2", "prompt": "A red dot",
                                                        "provider": "openai"}).status_code == 500
+
+
+def test_compat_multipart_accepts_ordered_images_and_a_markup_upload(monkeypatch):
+    content = [_png((red, 0, 0)) for red in (10, 20, 30)]
+    ids = [str(uuid4()) for _ in content]
+    uploaded = []
+
+    async def upload(*, path, **_kwargs):
+        uploaded.append(path.read_bytes())
+        return {"id": ids[len(uploaded) - 1]}
+
+    async def admit_image_run(body, **_owner):
+        assert body["input_asset_ids"] == ids[:2] and body["markup_asset_id"] == ids[2]
+        assert body["moderation"] == "low"
+        return SimpleNamespace(run_id="run-edit")
+
+    async def result(*_args, **_kwargs):
+        return {"received": True}
+
+    monkeypatch.setattr(image_api.assets, "create_uploaded_asset", upload)
+    monkeypatch.setattr(native_images, "admit_image_run", admit_image_run)
+    monkeypatch.setattr(image_api, "_completed_image", result)
+    app = FastAPI()
+    app.include_router(image_api.router, prefix="/v1")
+    app.dependency_overrides[get_principal] = _principal
+    client = TestClient(app)
+    files = [(field, (f"{index}.png", data, "image/png"))
+             for index, (field, data) in enumerate(zip(("image[]", "image[]", "markup"), content, strict=True))]
+    response = client.post("/v1/images/edits", data={
+        "model": "gpt-image-2.6-flare", "prompt": "Draw", "moderation": "low",
+    }, files=files)
+    assert response.status_code == 200, response.text
+    assert uploaded == content
+
+
+def test_compat_explicit_svg_author_requires_text_scope(monkeypatch):
+    async def admit_image_run(body, **_owner):
+        assert body["svg_model"] == "gpt-5" and body["svg_reasoning_effort"] == "low"
+        return SimpleNamespace(run_id="run-svg")
+
+    async def result(*_args, **_kwargs):
+        return {"received": True}
+
+    monkeypatch.setattr(native_images, "admit_image_run", admit_image_run)
+    monkeypatch.setattr(image_api, "_completed_image", result)
+    app = FastAPI()
+    app.include_router(image_api.router, prefix="/v1")
+    app.dependency_overrides[get_principal] = _principal
+    client = TestClient(app)
+    body = {"model": "gpt-image-2.6-flare", "prompt": "Draw", "output_format": "svg",
+            "svg_model": "gpt-5", "svg_reasoning_effort": "low"}
+    assert client.post("/v1/images/generations", json=body).status_code == 403
+    app.dependency_overrides[get_principal] = lambda: {
+        **_principal(), "scopes": (*_principal()["scopes"], "compat:completions:write"),
+    }
+    assert client.post("/v1/images/generations", json=body).status_code == 200

@@ -218,12 +218,17 @@ OpenAI Images의 `n`은 1–10, `prompt`는 최대 32,000자이며 기본 `size`
 | `output_format` | `png`(기본값), `jpeg`, `webp`; token-billed GPT Image 2.6은 `gif`, `svg` 추가 |
 | `output_compression` | JPEG/WebP만, 정수 0–100 |
 | `complexity` | GPT Image 2.6만: `low`, `medium`, `high`; 생략 시 provider 기본값 |
-| `frame_count`, `frame_duration_ms` | GIF 생성/편집만: 2–16(기본 9), 20–2000ms(기본 200). 명시 size는 `W×H×n×frames ≤ 132,710,400`인 Lumen 한도를 지킨다. OpenAI 조직 권한과 별도 provider 한도 적용. |
-| SVG | GPT Image 2.6 생성만, `n=1`; provider 기본 author 사용. SVG author ID/usage가 admission-frozen native text tariff와 일치해야 정산한다. URL·스크립트·스타일시트·외부 참조를 허용하지 않는 정적 UTF-8 SVG만 저장한다. |
+| `frame_count`, `frame_duration_ms` | GIF 생성/편집만: 2–16(기본 9), 20–2000ms(기본 200). 명시 size 필수; `W×H×n×frames ≤ 10,485,760`. 4 bits/pixel의 Lumen 예산이며 실제 결과도 5 MiB 이하로 제한한다. |
+| `moderation` | OpenAI Images `auto`(기본값) 또는 `low`. |
+| `svg_model`, `svg_reasoning_effort` | GPT Image 2.6 생성의 SVG 출력(`n=1`)에서만 선택. 생략 시 provider 기본 author. 명시하면 동일 provider의 동일 account/credential에서 이용 가능한 등록된 비제한 OpenAI text 모델과 해당 모델의 지원 effort만 허용한다. 일반 text 실행 권한과 SVG preview 권한도 필요하다. 응답 author ID가 선택한 ID와 다르거나 usage가 불완전하면 `unknown`. 정적 UTF-8 SVG만 저장한다. |
 
-위 옵션은 native·compat JSON과 compat 편집 Form에 동일하게 적용된다. Streaming이나 partial images 요청은 `422`; `stream=false`/`partial_images=0`은 생략과 같다. 마스크·마크업·SVG author 선택은 지원하지 않는다. 선택한 옵션만 durable intent에 들어가므로 기존 요청의 fingerprint는 바뀌지 않는다. 결과당 5 MiB 상한, MIME 검사, ClamAV 및 private S3 저장을 공통 적용한다.
+Native 편집은 기존 `input_asset_id` 또는 `input_asset_ids`(순서 있는 1–16개)를 받는다. OpenAI 호환 multipart 편집은 `image` 또는 `image[]` 파일을 같은 순서로 반복한다. Native는 `mask_asset_id` 또는 `markup_asset_id`, 호환 multipart는 `mask` 또는 `markup` 파일 중 하나를 추가할 수 있다. Overlay는 첫 이미지와 방향 보정 후 크기가 같은 투명 PNG여야 한다. GIF는 mask 미지원, markup은 GPT Image 2.5/2.6만 지원한다. `input_fidelity`는 1.5와 그 snapshot에서 `low|high`, 1-mini에서 `low`만 지원한다. 외부 URL/file ID는 지원하지 않는다. Native Batch 편집은 한 개의 원본만 허용하며 mask/markup은 지원하지 않는다.
+
+Streaming이나 partial images 요청은 `422`; `stream=false`/`partial_images=0`은 생략과 같다. 선택한 옵션만 durable intent에 들어가므로 기존 요청의 fingerprint는 바뀌지 않는다. 모든 입력/출력 이미지 각 5 MiB 상한, MIME 검사, ClamAV 및 private S3 저장을 적용한다. Compat multipart 재요청은 필드 역할과 순서 모두에서 원본과 동일한 파일 digest가 필요하다.
 
 `GET /v1/capabilities?model_kind=image&model_id=…`는 `available_image_variants`(`size:quality`), `max_image_count`, 실행 가능 모델의 `image_backgrounds`, `image_output_formats`, `image_complexities`, `image_custom_size`(`min_pixels`, `max_pixels`, `dimension_multiple`, `max_edge`, `max_aspect_ratio`), `image_gif`의 프레임 범위·기본값·`max_total_pixels`, token-billed 모델의 `image_output_price_per_million`(USD decimal 문자열)을 제공한다. 없는 옵션 키는 미지원이다. 광고된 CRUD 설정·형식은 OpenAI 프로젝트 또는 preview 접근 권한을 보장하지 않는다.
+
+추가 키는 `max_image_input_count`, `image_mask_supported`, `image_markup_supported`, `image_input_fidelities`, `image_moderation_options`, `image_svg_author_models`(`[{model,reasoning_efforts}]`), 그리고 `image_gif.size_auto_supported`(false)다.
 
 Media 비용은 admission-frozen 가격·선택 기준·실제 usage에 margin과 credit 환율을 적용한다. Provider I/O 전 `ChatModelCallReservation`과 account-scoped 월/주·API-key hold를 생성한다. Image/TTS는 asset 저장 전에 관측 usage를 암호화 checkpoint하고, realtime relay 실패도 부분 evidence를 남긴다. 이 checkpoint는 segment를 완료하지 않는다. 누락·불일치·over-envelope usage나 downstream 저장 실패는 debit/retry 없이 `unknown` hold를 유지한다. 확정 ledger와 hold settlement는 같은 transaction에서 한 번만 기록한다. Modality token component는 `image_*_tokens`, `audio_*_tokens`, character는 `audio_input_characters`/`character`, session은 `realtime_session_seconds`/`second`로 공개한다. Lumen DB에는 사용량·암호화된 요청/segment와 소유 asset만 저장하며 realtime PCM/audio transcript는 저장하지 않는다. 생성 이미지 및 유한 TTS/STT는 scanner/S3가 필요하지만 realtime에는 필요하지 않다.
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class OpenAIChatRequest(BaseModel):
@@ -97,6 +97,9 @@ class ImageOptions(BaseModel):
     frame_duration_ms: int | None = Field(default=None, ge=20, le=2000, strict=True)
     stream: Literal[False] | None = None
     partial_images: Literal[0] | None = None
+    moderation: Literal["auto", "low"] | None = None
+    svg_model: str | None = Field(default=None, min_length=1, max_length=190)
+    svg_reasoning_effort: str | None = Field(default=None, min_length=1, max_length=20)
     prompt: str = Field(min_length=1)
     size: str = "auto"
     quality: str = "auto"
@@ -119,7 +122,19 @@ class ImageGenerationRequest(ImageOptions):
 
 
 class ImageEditRequest(ImageGenerationRequest):
-    input_asset_id: UUID
+    input_asset_id: UUID | None = None
+    input_asset_ids: list[UUID] | None = Field(default=None, min_length=1, max_length=16)
+    mask_asset_id: UUID | None = None
+    markup_asset_id: UUID | None = None
+    input_fidelity: Literal["low", "high"] | None = None
+
+    @model_validator(mode="after")
+    def validate_assets(self) -> ImageEditRequest:
+        if (self.input_asset_id is None) == (self.input_asset_ids is None):
+            raise ValueError("specify one of input_asset_id or input_asset_ids")
+        if self.mask_asset_id is not None and self.markup_asset_id is not None:
+            raise ValueError("mask and markup are mutually exclusive")
+        return self
 
 
 class OpenAIImageGenerationRequest(ImageOptions):

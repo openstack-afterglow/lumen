@@ -236,6 +236,7 @@ async def _lock_run_configurations(
     search = routes.get("search")
     advisor = routes.get("advisor")
     summary = capability_snapshot.get("summary_route")
+    svg_author = capability_snapshot.get("svg_author_route")
     try:
         await ps.lock_execution_routes(
             session,
@@ -243,6 +244,7 @@ async def _lock_run_configurations(
             search=search if isinstance(search, dict) else None,
             advisor=advisor if isinstance(advisor, dict) else None,
             summary=summary if isinstance(summary, dict) else None,
+            **({"svg_author": svg_author} if isinstance(svg_author, dict) else {}),
         )
     except ps.ProviderConfigurationChangedError as exc:
         raise DurableRunConflict("provider_configuration_changed") from exc

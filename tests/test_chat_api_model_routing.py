@@ -508,11 +508,49 @@ async def test_catalog_image_registration_exposes_price_and_ready_options(provid
     assert capabilities["image_gif"] == {
         "min_frame_count": 2, "max_frame_count": 16, "default_frame_count": 9,
         "min_frame_duration_ms": 20, "max_frame_duration_ms": 2000, "default_frame_duration_ms": 200,
-        "max_total_pixels": 132710400,
+        "max_total_pixels": 10485760, "size_auto_supported": False,
     }
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: False)
     unavailable = await get_chat_capabilities(model_id=model["id"], model_kind="image", token_info={})
     assert unavailable["available_image_variants"] == [] and "image_output_formats" not in unavailable
+
+
+async def test_svg_author_requires_a_registered_unrestricted_route_on_the_image_credential(
+    provider_db, admin_client, monkeypatch,
+):
+    from lumen.api.conversations import get_chat_capabilities
+    from lumen.services import assets
+
+    add_provider, add_model, _model_name = provider_db
+    add_provider(provider_type="openai")
+    add_provider(provider_type="openai", provider_id=2, api_provider="other")
+    add_model("gpt-5", model_id=11)
+    add_model("gpt-4.1-mini", model_id=12, provider_id=2)
+    add_model("gpt-6-cyber", model_id=13)
+    add_model("gpt-5-mini", model_id=14, is_active=False)
+    add_model("gpt-4o", model_id=15)
+    monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr(routing, "_effective_capabilities", pricing._effective_capabilities)
+    monkeypatch.setattr(routing, "_pricing_aware_capabilities", pricing._pricing_aware_capabilities)
+    created = await repository.create_model(provider_id=1, model_name="gpt-image-2.6-flare", model_kind="image")
+    async with routing._require_db()() as session:
+        with session.sync.begin():
+            credential = session.sync.get(LlmProviderCredential, 1)
+            credential.allowed_model_ids = [created["id"], 11]
+    route = await routing.resolve_model_by_id(created["id"], model_kind="image")
+    for rejected in ("gpt-6-cyber", "gpt-4.1-mini", "gpt-4.1", "gpt-5-mini", "gpt-4o", "openai/gpt-5"):
+        assert await routing.resolve_image_svg_authors(route, model_name=rejected) == []
+    assert [row["api_model_name"] for row in await routing.resolve_image_svg_authors(route, model_name="gpt-5")] == [
+        "gpt-5",
+    ]
+    principal = {"user_id": "u", "project_id": "p", "auth_type": "api_key", "roles": ["member", "ai_inference_user"]}
+    restricted = await get_chat_capabilities(model_id=created["id"], model_kind="image",
+                                            token_info={**principal, "scopes": ("models:read",)})
+    assert "image_svg_author_models" not in restricted
+    allowed = await get_chat_capabilities(model_id=created["id"], model_kind="image",
+                                         token_info={**principal, "scopes": ("models:read", "native:runs:write")})
+    assert [author["model"] for author in allowed["image_svg_author_models"]] == ["gpt-5"]
 
 
 async def test_media_registration_rejects_unsupported_transport_before_persistence(provider_db):

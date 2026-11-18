@@ -607,6 +607,12 @@ def test_generated_gif_inspection_bounds_each_animation(tmp_path, frames, accept
     b"<foreignObject/>",
     b"<image href='https://example.invalid/raster.png'/>",
     b"<path onload=''/>",
+    b"<path mask=\"image-set('https://example.invalid/resource' 1x)\"/>",
+    b"<path mask=\"-webkit-image-set('https://example.invalid/resource' 1x)\"/>",
+    b"<path fill=\"image('https://example.invalid/resource')\"/>",
+    b"<path color=\"src('https://example.invalid/resource')\"/>",
+    b"<path fill=\"cross-fade(red, blue)\"/>",
+    b"<path clip-path='circle(20%)'/>",
     b"<path fill='url(https://example.invalid/paint)'/>",
 ])
 def test_generated_svg_inspector_rejects_nonstatic_content(tmp_path, markup):
@@ -622,7 +628,7 @@ def test_generated_svg_inspector_rejects_nonstatic_content(tmp_path, markup):
 def test_generated_svg_inspector_accepts_static_utf8_vector_with_local_paint(tmp_path):
     path = tmp_path / "content"
     path.write_text(
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><title>그림</title>'
+        '<svg xmlns="http://www.w3.org/2000/svg" version="1.1" baseProfile="full" viewBox="0 0 1 1"><title>그림</title>'
         '<defs><linearGradient id="paint"><stop stop-color="#abc"/></linearGradient></defs>'
         '<path d="M0 0L1 1" fill="url(#paint)"/></svg>', encoding="utf-8",
     )
@@ -631,3 +637,29 @@ def test_generated_svg_inspector_accepts_static_utf8_vector_with_local_paint(tmp
         result = assets.inspect_generated_file(path, original_name="image.svg", media_type="image/svg+xml")
         assert result.mime_type == "image/svg+xml"
         assert result.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_generated_gif_requires_a_trailer(tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "content"
+    Image.new("RGB", (2, 2)).save(path, format="GIF", save_all=True,
+        append_images=[Image.new("RGB", (2, 2), "blue")], duration=100)
+    path.write_bytes(path.read_bytes()[:-1])
+    with pytest.raises(ValueError, match="trailer"):
+        asset_inspector.inspect(path, "image/gif")
+
+
+def test_png_overlay_metadata_proves_transparency_and_oriented_dimensions(tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "content"
+    overlay = Image.new("RGBA", (4, 2), "blue")
+    overlay.putpixel((0, 0), (0, 0, 0, 0))
+    overlay.save(path, format="PNG", exif=Image.Exif())
+    assert asset_inspector.inspect(path)["metadata"] == {"width": 4, "height": 2, "has_transparency": 1}
+    overlay.putpixel((0, 0), (0, 0, 0, 255))
+    exif = Image.Exif()
+    exif[274] = 6
+    overlay.save(path, format="PNG", exif=exif)
+    assert asset_inspector.inspect(path)["metadata"] == {"width": 2, "height": 4}

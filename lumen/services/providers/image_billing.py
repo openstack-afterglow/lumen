@@ -91,6 +91,23 @@ def svg_author_pricing() -> dict[str, dict]:
     return rates
 
 
+@cache
+def selectable_svg_authors() -> dict[str, tuple[str, ...]]:
+    """Exact nonrestricted catalog author IDs and published effort choices."""
+    priced_ids = svg_author_pricing()
+    authors = {}
+    for entry in native_catalog()["providers"]["openai"]["models"]:
+        notes = (entry["notes"] or "").lower()
+        if (entry["id"] not in priced_ids or entry["kind"] != "text" or not entry["input_modalities"]
+                or "restricted" in notes or "trusted access" in notes):
+            continue
+        efforts = next((tuple(option["values"]) for option in entry.get("reasoning_options") or ()
+                        if option["type"] == "effort"), ())
+        for model_id in (entry["id"], *entry["aliases"]):
+            authors[model_id] = efforts
+    return authors
+
+
 def svg_author_hold(prices: dict[str, dict], prompt_bytes: int) -> Decimal:
     if not prices:
         raise ProviderValidationError("SVG authoring rates are unavailable")
@@ -98,16 +115,17 @@ def svg_author_hold(prices: dict[str, dict], prompt_bytes: int) -> Decimal:
     # Reserve at the largest known text rates, including long-context tiers.
     return max(
         max(Decimal(price[f"input_price_per_token{suffix}"]) for suffix in ("", "_above_200k")
-            if f"input_price_per_token{suffix}" in price) * (prompt_bytes + _SVG_INPUT_ENVELOPE)
+            if price.get(f"input_price_per_token{suffix}") is not None) * (prompt_bytes + _SVG_INPUT_ENVELOPE)
         + max(Decimal(price[f"output_price_per_token{suffix}"]) for suffix in ("", "_above_200k")
-              if f"output_price_per_token{suffix}" in price) * _SVG_OUTPUT_ENVELOPE
+              if price.get(f"output_price_per_token{suffix}") is not None) * _SVG_OUTPUT_ENVELOPE
         for price in prices.values()
     )
 
 
 def openai_image_hold(model: str, *, size: str, quality: str, count: int, frames: int, prompt: str,
                       edit: bool, source_dimensions: tuple[int, int] | list[int] | None,
-                      image_rates: dict[str, str], text_input_rate: object, author_prices: dict[str, dict] | None) -> Decimal:
+                      additional_dimensions: list[list[int]] | None, image_rates: dict[str, str],
+                      text_input_rate: object, author_prices: dict[str, dict] | None) -> Decimal:
     try:
         prompt_bytes = len(prompt.encode("utf-8"))
     except UnicodeEncodeError as exc:
@@ -115,7 +133,10 @@ def openai_image_hold(model: str, *, size: str, quality: str, count: int, frames
     output = output_token_bound(model, size, quality) * count * frames
     image_cost = output * Decimal(image_rates["output_per_million"])
     if edit:
-        image_cost += input_image_token_bound(source_dimensions) * Decimal(image_rates["input_per_million"])
+        image_input = input_image_token_bound(source_dimensions) + sum(
+            input_image_token_bound(dimensions) for dimensions in additional_dimensions or ()
+        )
+        image_cost += image_input * Decimal(image_rates["input_per_million"])
     total = image_cost / MILLION + (prompt_bytes + 256) * Decimal(str(text_input_rate))
     if author_prices is not None:
         total += svg_author_hold(author_prices, prompt_bytes)

@@ -52,6 +52,7 @@ from .media import (
     MediaAuthorizationRevoked,
     authorize_media_in_transaction,
     confirmed_media_rejection,
+    image_input_ids,
     lock_media_run_for_io,
     lock_media_source_in_transaction,
     media_io_allowed,
@@ -66,12 +67,39 @@ _OUTPUT_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "we
                       "image/gif": "gif", "image/svg+xml": "svg"}
 
 
+def svg_author_scope(required_scopes: tuple[str, ...] | None) -> str:
+    return ("compat:completions:write" if required_scopes and "compat:images:write" in required_scopes
+            else "native:runs:write")
+
+
+def _route_snapshot(route: dict) -> dict:
+    return {**{key: route[key] for key in ("provider_id", "model_id", "provider_name", "model_name",
+                                         "model_kind", "config_version_hash")},
+            **execution_identity(route)}
+
+
 def _intent(request: dict) -> dict:
     intent = {"kind": "image", "model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
               "prompt": request.get("prompt"), "size": request.get("size", "auto"), "quality": request.get("quality", "auto"),
               "n": request.get("n", 1), "source_asset_id": request.get("source_asset_id", request.get("input_asset_id"))}
     # Added only when requested so every pre-existing request keeps its idempotency fingerprint.
     intent.update(image_transport.image_options(request))
+    ordered = request.get("input_asset_ids")
+    if ordered is not None:
+        if (not isinstance(ordered, list) or not 1 <= len(ordered) <= image_transport.MAX_OPENAI_IMAGE_INPUT_COUNT
+                or intent["source_asset_id"] is not None):
+            raise DurableRunInputError("specify one to sixteen ordered input assets")
+        intent["source_asset_id"] = ordered[0]
+        if len(ordered) > 1:
+            intent["additional_source_asset_ids"] = ordered[1:]
+    for key in ("mask_asset_id", "markup_asset_id"):
+        if request.get(key) is not None:
+            intent[key] = request[key]
+    if "mask_asset_id" in intent and "markup_asset_id" in intent:
+        raise DurableRunInputError("mask and markup are mutually exclusive")
+    inputs = image_input_ids(intent)
+    if any(not isinstance(item, str) or not item for item in inputs) or (inputs and not intent["source_asset_id"]):
+        raise DurableRunInputError("image inputs must be owned assets")
     return intent
 
 
@@ -121,23 +149,39 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
             or (api_provider is not None and api_provider != route["api_provider"])):
         raise DurableRunInputError("image provider or model is unavailable")
     source_asset_id = intent["source_asset_id"]
-    dimensions = None
-    if source_asset_id is not None:
-        if not isinstance(source_asset_id, str):
-            raise DurableRunInputError("invalid source asset")
-        asset = await assets.get_asset(asset_id=source_asset_id, user_id=user_id, project_id=project_id)
-        if asset["status"] != "clean" or asset["mime_type"] not in _SOURCE_MIMES or asset["size_bytes"] > _MAX_SOURCE_BYTES:
+    inputs = image_input_ids(intent)
+    overlay = next((name for name in ("mask", "markup") if f"{name}_asset_id" in intent), None)
+    dimensions = []
+    for asset_id in inputs:
+        asset = await assets.get_asset(asset_id=asset_id, user_id=user_id, project_id=project_id)
+        if (asset["status"] != "clean" or asset["mime_type"] not in _SOURCE_MIMES
+                or not 0 < asset["size_bytes"] <= _MAX_SOURCE_BYTES):
             raise DurableRunInputError("source image must be a bounded scanned owned asset")
         metadata = asset.get("media_metadata") or {}
-        dimensions = [metadata.get("width"), metadata.get("height")]
+        dimensions.append([metadata.get("width"), metadata.get("height")])
+        if overlay and asset_id == intent[f"{overlay}_asset_id"] and (
+                asset["mime_type"] != "image/png" or metadata.get("has_transparency") != 1
+                or dimensions[-1] != dimensions[0] or any(type(value) is not int for value in dimensions[0])):
+            raise DurableRunInputError("mask or markup must be a transparent PNG matching the first image")
     size = request.get("size", "auto")
     quality = request.get("quality", "auto")
     n = request.get("n", 1)
     options = image_transport.image_options(intent)
     author_prices = svg_author_pricing() if options.get("output_format") == "svg" else None
+    author_route = None
+    if options.get("svg_model") is not None:
+        authors = await routing.resolve_image_svg_authors(route, model_name=options["svg_model"])
+        if not authors:
+            raise DurableRunInputError("requested SVG author is not available")
+        author_route = authors[0]
+        effort = options.get("svg_reasoning_effort")
+        if effort is not None and effort not in author_route["svg_reasoning_efforts"]:
+            raise DurableRunInputError("unsupported reasoning effort for the SVG author")
+        author_prices = {options["svg_model"]: frozen_token_pricing(author_route)}
     unit_price = image_transport.validate_image_request(
         route, size=size, quality=quality, n=n, edit=source_asset_id is not None, prompt=intent["prompt"],
-        source_dimensions=dimensions, author_prices=author_prices, **options,
+        source_dimensions=dimensions[0] if dimensions else None, additional_dimensions=dimensions[1:],
+        source_count=len(inputs) - (overlay is not None), overlay=overlay, author_prices=author_prices, **options,
     )
     basis = image_transport.image_billing_basis(route)
     if not assets.asset_pipeline_available():
@@ -152,8 +196,9 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
         await credit.precheck(user_id, project_id, api_key_id, bound=bound)
     else:
         await credit.precheck(user_id, project_id, api_key_id)
-    capability = {key: route[key] for key in ("provider_id", "model_id", "provider_name", "model_name", "model_kind", "config_version_hash")}
-    capability.update(execution_identity(route))
+    capability = _route_snapshot(route)
+    if author_route is not None:
+        capability["svg_author_route"] = _route_snapshot(author_route)
     capability["effective_features"] = {}
     if credential_authority is not None:
         capability["credential_authority"] = deepcopy(credential_authority)
@@ -164,14 +209,18 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
         pricing["reservation_usd"] = format(unit_price, "f")
         pricing["media_pricing"] = json.loads(json.dumps(route["media_pricing"]))
         pricing["required_token_modalities"] = ["image_output", *(["image_input"] if source_asset_id is not None else [])]
-        if "reservation_usd" not in route["media_pricing"] and dimensions is not None:
-            pricing["source_dimensions"] = dimensions
+        if "reservation_usd" not in route["media_pricing"] and dimensions:
+            pricing["source_dimensions"] = dimensions[0]
+            if len(dimensions) > 1:
+                pricing["additional_dimensions"] = dimensions[1:]
         if author_prices is not None:
             pricing["svg_author_pricing"] = deepcopy(author_prices)
     else:
         pricing["image_per_unit"] = format(unit_price, "f")
     pricing["bound_credits"] = format(bound, "f")
     scopes = required_scopes or ("native:images:write", *(("native:assets:read",) if source_asset_id else ()))
+    if author_route is not None and (author_scope := svg_author_scope(scopes)) not in scopes:
+        scopes = (*scopes, author_scope)
     return PreparedImageRun(intent, capability, pricing, scopes, source_asset_id, project_id, user_id)
 
 
@@ -215,15 +264,19 @@ async def persist_image_run_in_transaction(
                                                        "required_scopes": list(prepared.required_scopes)})),
         status="queued", last_seq=0, current_ordinal=0)
     session.add(run)
-    if prepared.source_asset_id is not None:
-        row = await lock_media_source_in_transaction(session, asset_id=prepared.source_asset_id, user_id=user_id,
+    for source_id in sorted(set(image_input_ids(intent))):
+        row = await lock_media_source_in_transaction(session, asset_id=source_id, user_id=user_id,
             project_id=project_id, run_kind="image", pricing=pricing, batch_id=batch_id)
         session.add(ChatRunAsset(run_id=run.id, asset_id=row.id, purpose="input"))
-    session.add(ChatRunProvider(run_id=run.id, purpose="executor", provider_id=capability["provider_id"],
-        model_id=capability["model_id"], provider_label=capability["provider_name"],
-        model_label=capability["model_name"], config_version_hash=capability["config_version_hash"],
-        **{key: value for key, value in execution_identity(capability).items()
-           if key not in {"provider_auth", "provider_quota_group"}}))
+    provider_routes = [("executor", capability)]
+    if "svg_author_route" in capability:
+        provider_routes.append(("svg_author", capability["svg_author_route"]))
+    for purpose, snapshot in provider_routes:
+        session.add(ChatRunProvider(run_id=run.id, purpose=purpose, provider_id=snapshot["provider_id"],
+            model_id=snapshot["model_id"], provider_label=snapshot["provider_name"],
+            model_label=snapshot["model_name"], config_version_hash=snapshot["config_version_hash"],
+            **{key: value for key, value in execution_identity(snapshot).items()
+               if key not in {"provider_auth", "provider_quota_group"}}))
     await append_event(session, run, _event(run, "run.started", {"conversation_id": None,
         "temp_thread_id": None, "model_name": run.model_name, "effective_features": {}, "run_kind": "image"}))
     await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
@@ -518,6 +571,8 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
         if route is None:
             raise DurableRunInputError("image provider configuration changed")
         source_id = payload.get("source_asset_id")
+        additional_ids = payload.get("additional_source_asset_ids") or ()
+        overlay = next((name for name in ("mask", "markup") if f"{name}_asset_id" in payload), None)
         source_data = source_mime = None
         token_mode = pricing_snapshot.get("billing_basis", "unit") == "tokens"
         if token_mode:
@@ -526,13 +581,15 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
                      **{key: pricing_snapshot.get(key) for key in (
                          "input_price_per_token", "output_price_per_token", "cache_read_price_per_token")}}
         extra = image_transport.image_options(payload)
-        if "source_dimensions" in pricing_snapshot:
-            extra["source_dimensions"] = pricing_snapshot["source_dimensions"]
+        for key in ("source_dimensions", "additional_dimensions"):
+            if key in pricing_snapshot:
+                extra[key] = pricing_snapshot[key]
         if "svg_author_pricing" in pricing_snapshot:
             extra["author_prices"] = pricing_snapshot["svg_author_pricing"]
         price = image_transport.validate_image_request(
             route, size=pricing_snapshot["size"], quality=pricing_snapshot["quality"],
-            n=pricing_snapshot["count"], edit=bool(source_id), prompt=payload["prompt"], **extra,
+            n=pricing_snapshot["count"], edit=bool(source_id), prompt=payload["prompt"],
+            source_count=(1 + len(additional_ids)) if source_id else 0, overlay=overlay, **extra,
         )
         expected_price = Decimal(pricing_snapshot["reservation_usd"] if token_mode else pricing_snapshot["image_per_unit"])
         if price != expected_price:
@@ -540,8 +597,15 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
         bound = credit.credits_for_cost(price if token_mode else price * pricing_snapshot["count"],
                        Decimal(pricing_snapshot["margin_multiplier"]), Decimal(pricing_snapshot["credit_per_usd"]))
         if source_id:
-            source_data, source_mime = await _read_image_asset(asset_id=source_id, user_id=payload["user_id"],
-                project_id=payload["project_id"], run_id=run_id if is_batch else None)
+            async def read_source(asset_id: str) -> tuple[bytes, str]:
+                return await _read_image_asset(asset_id=asset_id, user_id=payload["user_id"],
+                    project_id=payload["project_id"], run_id=run_id if is_batch else None)
+
+            source_data, source_mime = await read_source(source_id)
+            if additional_ids:
+                extra["additional_sources"] = [await read_source(asset_id) for asset_id in additional_ids]
+            if overlay:
+                extra["overlay_data"] = (overlay, *await read_source(payload[f"{overlay}_asset_id"]))
         state = await _image_segment_start(run_id, owner=owner, bound=bound)
         if state in IO_BLOCKED:
             await _finish(run_id, status="canceled", message_id=None, owner=owner, error_code=state, safe_message="image run canceled")

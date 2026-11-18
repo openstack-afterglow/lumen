@@ -114,7 +114,6 @@ async def get_chat_capabilities(
     token_info: dict = Depends(require_scopes("models:read")),
 ):
     """Expose selected-model and deployment runtime gates without secrets."""
-    del token_info
     try:
         resolved = (
             await routing.resolve_model_by_id(model_id)
@@ -140,6 +139,15 @@ async def get_chat_capabilities(
         result["max_image_count"] = image_transport.max_image_count(resolved) if routable else 0
         if routable:
             result.update(image_transport.available_image_options(resolved))
+            if "svg" in result.get("image_output_formats", ()):
+                from lumen.policy import authorize
+
+                if authorize("native:runs:write", token_info):
+                    authors = await routing.resolve_image_svg_authors(resolved)
+                    result["image_svg_author_models"] = [
+                        {"model": row["api_model_name"], "reasoning_efforts": list(row["svg_reasoning_efforts"])}
+                        for row in authors
+                    ]
     if model_kind == "tts":
         audio_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("audio_output") or {}
         if audio_gate.get("available") is True:

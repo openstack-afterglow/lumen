@@ -760,18 +760,19 @@ The default hold is **not** a tariff or hard provider limit. Lumen computes:
   bills. Multiply by `n` and for GIF by `frame_count` (default 9).
 - Reserve one text input token per UTF-8 prompt byte plus 256 for hidden
   request framing. For edits add `8192 + 512 × ceil(Wsrc/256) × ceil(Hsrc/256)`
-  input-image tokens, using the scanner's validated dimensions. OpenAI does
-  not publish GPT Image edit-input token counts. This Lumen policy budgets
+  input-image tokens per scanned source or overlay, using the scanner's
+  validated dimensions. OpenAI does not publish GPT Image edit-input token counts. This Lumen policy budgets
   more than its historical tile/fidelity overhead without treating that old
   tariff as the current model's formula.
 - For SVG, add an authoring envelope for `prompt_bytes + 65,536` input
   tokens and 32,768 output tokens. This covers space for the prompt, reference
   image and hidden input, plus a vector document and reasoning. Admission
   freezes exact native text model IDs and published rates (including context
-  tiers) and reserves at the highest combined candidate cost. It does not
-  request privileged author-model selection. Settlement requires a consistent
-  `svg_usage`, an exact frozen author ID, and rates sufficient to price its
-  unsplit input/output counts. Reasoning is already included in output.
+  tiers). When the caller omits `svg_model`, reserve at the highest combined
+  candidate cost. When the caller selects one, require an exact nonrestricted
+  native catalog ID registered on the image provider and authorized by the
+  image route's fixed account and credential; reserve at its resolved rates
+  and require exact ID equality in `svg_usage`. Reasoning is already included in output.
 - Sum each quantity × its matching USD/token rate; round the derived USD
   envelope up to 10 decimal places. Apply frozen margin and credit conversion.
   Admission checks available headroom without charging; the worker atomically

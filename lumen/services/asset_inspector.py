@@ -32,9 +32,14 @@ def _image(path: Path) -> dict[str, int]:
         image.verify()
     with Image.open(path) as image:
         width, height = image.size
-    if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
-        raise ValueError("image dimensions exceed limit")
-    return {"width": width, "height": height}
+        if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
+            raise ValueError("image dimensions exceed limit")
+        if image.getexif().get(274) in (5, 6, 7, 8):
+            width, height = height, width
+        # An edit overlay needs a real transparent pixel, not just an alpha channel.
+        transparent = (image.format == "PNG" and ("A" in image.getbands() or "transparency" in image.info)
+                       and image.convert("RGBA").getchannel("A").getextrema()[0] == 0)
+    return {"width": width, "height": height, **({"has_transparency": 1} if transparent else {})}
 
 
 def _gif(path: Path) -> dict[str, int]:
@@ -57,7 +62,7 @@ def _gif(path: Path) -> dict[str, int]:
                 if frame < 2:
                     raise ValueError("GIF must be animated") from None
                 return {"width": width, "height": height, "frame_count": frame}
-            if frame == 16 or image.size != (width, height):
+            if frame == 16 or image.size != (width, height) or width * height * (frame + 1) > 10 * 1024 * 1024:
                 raise ValueError("GIF frame bounds exceeded")
             image.load()
     raise ValueError("GIF frame bounds exceeded")
@@ -70,6 +75,7 @@ _SVG_ELEMENTS = frozenset({
 })
 _SVG_ATTRIBUTES = frozenset({
     "id", "role", "aria-label", "aria-labelledby", "aria-describedby", "viewBox", "preserveAspectRatio",
+    "version", "baseProfile",
     "x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "width", "height", "d", "points", "transform",
     "textLength", "lengthAdjust", "dx", "dy", "rotate",
     "gradientUnits", "gradientTransform", "fx", "fy", "fr", "spreadMethod", "offset",
@@ -80,7 +86,9 @@ _SVG_ATTRIBUTES = frozenset({
     "dominant-baseline", "alignment-baseline", "letter-spacing", "vector-effect", "display", "visibility",
 })
 _LOCAL_SVG_REFERENCE = re.compile(r"url\(#[a-zA-Z_][a-zA-Z_0-9.-]*\)")
-_SVG_PRESENTATION_REFERENCE_ATTRIBUTES = frozenset({"fill", "stroke", "mask", "clip-path"})
+_SVG_LOCAL_REFERENCE_ATTRIBUTES = frozenset({"fill", "stroke", "clip-path", "mask"})
+_SVG_CLIP_ATTRIBUTES = frozenset({"clip-path", "mask"})
+_SVG_IMAGE_FUNCTION = re.compile(r"(?:url|(?:-webkit-)?image-set|image|src|cross-fade)\s*\(", re.IGNORECASE)
 
 
 def _svg(path: Path) -> dict[str, int]:
@@ -110,12 +118,11 @@ def _svg(path: Path) -> dict[str, int]:
         for key, value in attrs.items():
             if key not in _SVG_ATTRIBUTES:
                 reject()
-            if key in _SVG_PRESENTATION_REFERENCE_ATTRIBUTES and _LOCAL_SVG_REFERENCE.fullmatch(value):
+            if key in _SVG_LOCAL_REFERENCE_ATTRIBUTES and _LOCAL_SVG_REFERENCE.fullmatch(value):
                 continue
-            # No CSS escapes, comments, quoted URLs, or style properties.
-            # Other presentation values may use simple function notation
-            # (rgb(), transforms, etc.) but never a URL function.
-            if "\\" in value or "/*" in value or re.search(r"url\s*\(", value, re.IGNORECASE):
+            if key in _SVG_CLIP_ATTRIBUTES and value != "none":
+                reject()
+            if "\\" in value or "/*" in value or _SVG_IMAGE_FUNCTION.search(value):
                 reject()
 
     def end(_name: str) -> None:

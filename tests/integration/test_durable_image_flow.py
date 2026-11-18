@@ -362,6 +362,7 @@ async def test_media_start_does_not_block_another_users_text_start(monkeypatch, 
 @pytest.mark.parametrize("outcome", [
     "observed", "missing", "over_envelope", "invalid", "storage_failure",
     "catalog_edited", "catalog_missing", "catalog_over_hold", "catalog_low_credit", "svg_known", "svg_unknown",
+    "svg_selected", "svg_mismatch", "catalog_multi_edit",
 ])
 async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, outcome):
     nonce = uuid.uuid4().hex
@@ -369,7 +370,9 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     catalog = outcome.startswith(("catalog_", "svg_"))
     svg = outcome.startswith("svg_")
-    edit = outcome == "catalog_edited"
+    edit = outcome in {"catalog_edited", "catalog_multi_edit"}
+    multi = outcome == "catalog_multi_edit"
+    selected = outcome in {"svg_selected", "svg_mismatch"}
     count = 2 if edit else 1
     expected_svg = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>'
     factory = get_session_factory()
@@ -399,12 +402,21 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
             session.add(model)
             await session.flush()
             model_id = model.id
+            if selected:
+                session.add(LlmModel(provider_id=provider.id, model_kind="text", model_name="gpt-4.1-mini",
+                    is_active=True, input_price=Decimal("0.000001"), output_price=Decimal("0.000002")))
             source_id = str(uuid.uuid4())
             if edit:
                 session.add(ChatAsset(id=source_id, project_id=project_id, user_id=user_id,
                     object_key=f"image-token/{nonce}/source", bucket_name="image-test", original_name="source.png",
                     mime_type="image/png", size_bytes=len(_PNG), sha256="a" * 64, status="clean",
                     media_metadata={"width": 1, "height": 1}))
+            extra_ids = [str(uuid.uuid4()), str(uuid.uuid4())] if multi else []
+            for idx, asset_id in enumerate(extra_ids):
+                session.add(ChatAsset(id=asset_id, project_id=project_id, user_id=user_id,
+                    object_key=f"image-token/{nonce}/source-{idx}", bucket_name="image-test",
+                    original_name="source.png", mime_type="image/png", size_bytes=len(_PNG), sha256="a" * 64,
+                    status="clean", media_metadata={"width": 1, "height": 1, "has_transparency": 1}))
 
         async def open_owned(*, asset_id, user_id, project_id):
             row = await assets.get_asset(asset_id=asset_id, user_id=user_id, project_id=project_id)
@@ -438,15 +450,21 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
             observed = UsageBreakdown(100, image_output, modality_tokens={"image": ModalityTokens(
                 input_tokens=50 if edit else 0, output_tokens=image_output,
             )})
-        author = {"model": "gpt-4.1-mini" if outcome == "svg_known" else "unlisted-author",
+        author = {"model": ("gpt-4.1-mini" if outcome in {"svg_known", "svg_selected"} else
+                            "gpt-4.1" if outcome == "svg_mismatch" else "unlisted-author"),
                   "input_tokens": 500, "output_tokens": 200, "reasoning_tokens": 100, "total_tokens": 700}
 
         async def provider_call(route, **kwargs):
             calls.append(kwargs["prompt"])
             if edit:
                 assert kwargs["source_dimensions"] == [1, 1] and kwargs["source_image"] == _PNG
+            if multi:
+                assert kwargs["additional_sources"] == [(_PNG, "image/png")]
+                assert kwargs["overlay_data"] == ("markup", _PNG, "image/png")
             if svg:
                 assert kwargs["output_format"] == "svg"
+                if selected:
+                    assert kwargs["svg_model"] == "gpt-4.1-mini"
             return images.image_transport.ImageResult(
                 [(expected_svg, "image/svg+xml") if svg else (_PNG, "image/png")] * count,
                 observed if outcome not in {"missing", "catalog_missing"} else None, author if svg else None)
@@ -455,8 +473,13 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
         request = {"model_id": str(model_id), "prompt": "A cached cobalt cube", "size": "1024x1024", "quality": "high"}
         if edit:
             request.update(source_asset_id=source_id, n=count, background="opaque", output_format="png")
+        if multi:
+            del request["source_asset_id"]
+            request.update(input_asset_ids=[source_id, extra_ids[0]], markup_asset_id=extra_ids[1])
         if svg:
             request["output_format"] = "svg"
+        if selected:
+            request["svg_model"] = "gpt-4.1-mini"
         if outcome == "catalog_low_credit":
             async def quota(_session, _user_id):
                 return type("Quota", (), {"monthly": Decimal("0.001"), "weekly": Decimal(0)})()
@@ -482,7 +505,12 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
             assert "reservation_usd" not in frozen["media_pricing"]
             if edit:
                 # Two 2,634-output-token images, 8,704 image-input tokens, and 276 prompt/frame tokens.
-                assert Decimal(frozen["reservation_usd"]) == Decimal("0.229052")
+                expected_hold = "0.368316" if multi else "0.229052"
+                assert Decimal(frozen["reservation_usd"]) == Decimal(expected_hold)
+            if selected:
+                assert set(frozen["svg_author_pricing"]) == {"gpt-4.1-mini"}
+                assert Decimal(frozen["reservation_usd"]) == Decimal("0.211492")
+                assert capability["svg_author_route"]["model_name"] == "gpt-4.1-mini"
         # The transport revalidation sees a changed current rate; settlement must still use admission's prices.
         resolve = routing.resolve_model_snapshot
 
@@ -494,7 +522,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
 
         monkeypatch.setattr(routing, "resolve_model_snapshot", changed_prices)
         await images.execute_image_run(admitted.run_id, owner=owner,
-            payload={**request, "user_id": user_id, "project_id": project_id},
+            payload={**images._intent(request), "user_id": user_id, "project_id": project_id},
             capability_snapshot=capability, pricing_snapshot=frozen)
         async with factory() as session:
             run = await session.get(ChatRun, admitted.run_id)
@@ -504,9 +532,14 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
             segment = (await session.execute(select(ChatRunSegment).where(ChatRunSegment.run_id == run.id))).scalar_one()
             assert hold.bound_credits == credit.credits_for_cost(
                 Decimal(frozen["reservation_usd"]), Decimal("2"), Decimal(frozen["credit_per_usd"]))
-            if outcome in {"catalog_edited", "svg_known"}:
+            success = outcome in {"catalog_edited", "catalog_multi_edit", "svg_known", "svg_selected"}
+            if multi:
+                input_ids = (await session.scalars(select(ChatRunAsset.asset_id).where(
+                    ChatRunAsset.run_id == run.id, ChatRunAsset.purpose == "input"))).all()
+                assert set(input_ids) == {source_id, *extra_ids}
+            if success:
                 assert run.status == "completed" and hold.status == "settled"
-                expected_cost = Decimal("0.00665" if edit else "0.00702")
+                expected_cost = Decimal("0.00665" if edit else "0.0074" if selected else "0.00702")
                 assert len(ledger) == 1 and ledger[0].raw_cost == expected_cost
                 assert hold.actual_credits < hold.bound_credits
                 assert ledger[0].prompt_tokens == (600 if svg else 100)
@@ -524,7 +557,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
                 assert hold.actual_credits == credit.credits_for_cost(Decimal("0.004305"), Decimal("2"), Decimal(frozen["credit_per_usd"]))
                 checkpoint = images.load_segment_payload(segment.usage_payload)
                 assert checkpoint["token_usage"]["modality_tokens"]["image"]["cache_read_input_tokens"] == 30
-            elif outcome not in {"catalog_edited", "svg_known"}:
+            elif not success:
                 assert run.status == "failed" and hold.status == "unknown" and ledger == []
                 assert run.reserved_credits == hold.bound_credits
                 if outcome in {"invalid", "storage_failure"}:
