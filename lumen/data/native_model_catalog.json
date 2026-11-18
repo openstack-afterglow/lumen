@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026-11-18.1",
+  "catalog_version": "2026-11-18.2",
   "providers": {
     "openai": {
       "display_name": "OpenAI",
@@ -8,6 +8,98 @@
         "https://developers.openai.com/api/docs/pricing"
       ],
       "models": [
+        {
+          "id": "gpt-6.2-sol",
+          "aliases": [],
+          "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}],
+          "display_name": "GPT-6.2 Sol",
+          "status": "active",
+          "context_window": 1050000,
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "input_modalities": ["text", "image"],
+          "output_modalities": ["text"],
+          "capabilities": {
+            "vision": true,
+            "tool_call": true,
+            "reasoning": true,
+            "prompt_caching": true,
+            "structured_output": true,
+            "web_search": true
+          },
+          "token_pricing": {
+            "input": "2.00",
+            "output": "10.00",
+            "cache_read": "0.10",
+            "cache_write": "2.50",
+            "cache_write_long": "5.00",
+            "cache_write_ttl": "30m",
+            "cache_write_long_ttl": "12h",
+            "long_context": {
+              "threshold_tokens": 272000,
+              "input": "4.00",
+              "output": "15.00",
+              "cache_read": "0.20",
+              "cache_write": "5.00",
+              "cache_write_long": "10.00"
+            }
+          },
+          "media_pricing": null,
+          "source_urls": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models/gpt-6.2-sol.md",
+            "https://developers.openai.com/api/docs/guides/latest-model.md"
+          ],
+          "verified_at": "2026-11-18",
+          "notes": "Standard processing only. Long-context prices apply to the whole request above 272,000 input tokens. Tool calling requires Responses."
+        },
+        {
+          "id": "gpt-6.2-astra",
+          "aliases": [],
+          "kind": "text",
+          "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}],
+          "display_name": "GPT-6.2 Astra",
+          "status": "active",
+          "context_window": 1050000,
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "input_modalities": ["text", "image"],
+          "output_modalities": ["text"],
+          "capabilities": {
+            "vision": true,
+            "tool_call": true,
+            "reasoning": true,
+            "prompt_caching": true,
+            "structured_output": true,
+            "web_search": true
+          },
+          "token_pricing": {
+            "input": "8.00",
+            "output": "40.00",
+            "cache_read": "0.40",
+            "cache_write": "10.00",
+            "cache_write_long": "20.00",
+            "cache_write_ttl": "30m",
+            "cache_write_long_ttl": "12h",
+            "long_context": {
+              "threshold_tokens": 272000,
+              "input": "16.00",
+              "output": "60.00",
+              "cache_read": "0.80",
+              "cache_write": "20.00",
+              "cache_write_long": "40.00"
+            }
+          },
+          "media_pricing": null,
+          "source_urls": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models/gpt-6.2-astra.md",
+            "https://developers.openai.com/api/docs/guides/latest-model.md"
+          ],
+          "verified_at": "2026-11-18",
+          "notes": "Standard processing only. Long-context prices apply to the whole request above 272,000 input tokens. Tool calling requires Responses."
+        },
         {
           "id": "gpt-6-astra",
           "aliases": [],
@@ -1273,8 +1365,8 @@
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-6-cyber.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Restricted-access model; published rate does not imply account entitlement. Restricted-access model; published rate does not imply account entitlement. Published maximum input tokens: 922,000. PDF input is supported through the documented Chat/Responses file-input path for this vision model; endpoint-specific limits apply."
+          "verified_at": "2026-11-18",
+          "notes": "Restricted-access model; published rate does not imply account entitlement. Published maximum input tokens: 922,000. Long-context cache-write rates are not published."
         },
         {
           "id": "gpt-5.6-cyber",
@@ -1361,28 +1453,28 @@
             "prompt_caching": true
           },
           "token_pricing": {
-            "input": "15.00",
-            "output": "75.00",
-            "cache_read": "1.50",
-            "cache_write": "18.75",
-            "cache_write_long": "37.50",
+            "input": "10.00",
+            "output": "50.00",
+            "cache_read": "1.00",
+            "cache_write": "12.50",
+            "cache_write_long": "25.00",
             "cache_write_ttl": "30m",
             "cache_write_long_ttl": "12h",
             "long_context": {
               "threshold_tokens": 272000,
-              "input": "30.00",
-              "output": "112.50",
-              "cache_read": "3.00",
-              "cache_write": "37.50",
-              "cache_write_long": "75.00"
+              "input": "20.00",
+              "output": "75.00",
+              "cache_read": "2.00",
+              "cache_write": "25.00",
+              "cache_write_long": "50.00"
             }
           },
           "media_pricing": null,
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Restricted-access model; published rate does not imply account entitlement. Restricted-access model; published rate does not imply account entitlement. Individual model specification page unavailable; unknown limits, modalities, and capabilities remain null/omitted."
+          "verified_at": "2026-11-18",
+          "notes": "Restricted-access model; published rate does not imply account entitlement. Promotional prices apply at least through 2026-12-31. Individual model specification page unavailable; limits, modalities and endpoint support are unverified."
         },
         {
           "id": "gpt-rosalind-research",
@@ -1704,14 +1796,17 @@
             "input": "5.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-2.6-sunburst.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"30.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching. For GPT-Image-2/2.5, cached input prices apply only to Responses image generation, not direct Images requests. Shape cannot express endpoint-specific cache eligibility."
+          "verified_at": "2026-11-18",
+          "notes": "Direct Images API tariff. OpenAI publishes an image cache rate, but direct Images cache applicability is not documented for this model."
         },
         {
           "id": "gpt-image-2.6-flare",
@@ -1736,14 +1831,17 @@
             "input": "5.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-2.6-flare.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"30.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching. For GPT-Image-2/2.5, cached input prices apply only to Responses image generation, not direct Images requests. Shape cannot express endpoint-specific cache eligibility."
+          "verified_at": "2026-11-18",
+          "notes": "Direct Images API tariff. OpenAI publishes an image cache rate, but direct Images cache applicability is not documented for this model."
         },
         {
           "id": "gpt-image-2.5-sunburst",
@@ -1770,14 +1868,17 @@
             "input": "5.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"30.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching. For GPT-Image-2/2.5, cached input prices apply only to Responses image generation, not direct Images requests. Shape cannot express endpoint-specific cache eligibility."
+          "verified_at": "2026-11-18",
+          "notes": "Direct Images API tariff. Cached input prices apply only to Responses image generation."
         },
         {
           "id": "gpt-image-2.5-flare",
@@ -1804,14 +1905,17 @@
             "input": "5.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-2.5-flare.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"30.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching. For GPT-Image-2/2.5, cached input prices apply only to Responses image generation, not direct Images requests. Shape cannot express endpoint-specific cache eligibility."
+          "verified_at": "2026-11-18",
+          "notes": "Direct Images API tariff. Cached input prices apply only to Responses image generation."
         },
         {
           "id": "gpt-image-2",
@@ -1838,14 +1942,17 @@
             "input": "5.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-2.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"30.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching. For GPT-Image-2/2.5, cached input prices apply only to Responses image generation, not direct Images requests. Shape cannot express endpoint-specific cache eligibility."
+          "verified_at": "2026-11-18",
+          "notes": "Direct Images API tariff. Cached input prices apply only to Responses image generation. Scheduled shutdown 2027-02-10."
         },
         {
           "id": "gpt-image-1.5",
@@ -1874,14 +1981,17 @@
             "output": "10.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "32.00", "cache_read_per_million": "2.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-1.5.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"32.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"output\": \"10.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null."
+          "verified_at": "2026-11-18",
+          "notes": "Scheduled shutdown 2026-12-01."
         },
         {
           "id": "gpt-image-1-mini",
@@ -1906,14 +2016,17 @@
             "input": "2.00",
             "cache_read": "0.20"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "2.50", "output_per_million": "8.00", "cache_read_per_million": "0.25"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-image-1-mini.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"2.50\", \"output\": \"8.00\", \"cache_read\": \"0.25\"}; Text: {\"input\": \"2.00\", \"cache_read\": \"0.20\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null."
+          "verified_at": "2026-11-18",
+          "notes": "Scheduled shutdown 2026-12-01."
         },
         {
           "id": "chatgpt-image-latest",
@@ -1940,14 +2053,17 @@
             "output": "10.00",
             "cache_read": "1.25"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "32.00", "cache_read_per_million": "2.00"}}
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/chatgpt-image-latest.md",
             "https://developers.openai.com/api/docs/guides/image-generation.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Image: {\"input\": \"8.00\", \"output\": \"32.00\", \"cache_read\": \"2.00\"}; Text: {\"input\": \"5.00\", \"output\": \"10.00\", \"cache_read\": \"1.25\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null. Image cache discounts may be endpoint-dependent; consult image-generation guide before enabling caching."
+          "verified_at": "2026-11-18",
+          "notes": "Scheduled shutdown 2026-12-01."
         },
         {
           "id": "gpt-realtime-2.1",
@@ -1977,13 +2093,26 @@
             "output": "24.00",
             "cache_read": "0.40"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {
+              "audio": {
+                "input_per_million": "32.00",
+                "cache_read_per_million": "0.40",
+                "output_per_million": "64.00"
+              },
+              "image": {
+                "input_per_million": "5.00",
+                "cache_read_per_million": "0.50"
+              }
+            }
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-realtime-2.1.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Audio: {\"input\": \"32.00\", \"output\": \"64.00\", \"cache_read\": \"0.40\"}; Text: {\"input\": \"4.00\", \"output\": \"24.00\", \"cache_read\": \"0.40\"}; Image: {\"input\": \"5.00\", \"cache_read\": \"0.50\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null."
+          "verified_at": "2026-11-18",
+          "notes": "Text token rates are in token_pricing; audio and image token rates (USD per 1M, cached input included) are in media_pricing.token_rates. Realtime conversation settles provider-reported response.done usage per modality. No provider reservation is published: Lumen derives the session hold from the admitted maximum duration (docs/operations.md)."
         },
         {
           "id": "gpt-realtime-2.1-mini",
@@ -2013,13 +2142,26 @@
             "output": "2.40",
             "cache_read": "0.06"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {
+              "audio": {
+                "input_per_million": "10.00",
+                "cache_read_per_million": "0.30",
+                "output_per_million": "20.00"
+              },
+              "image": {
+                "input_per_million": "0.80",
+                "cache_read_per_million": "0.08"
+              }
+            }
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-realtime-2.1-mini.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Audio: {\"input\": \"10.00\", \"output\": \"20.00\", \"cache_read\": \"0.30\"}; Text: {\"input\": \"0.60\", \"output\": \"2.40\", \"cache_read\": \"0.06\"}; Image: {\"input\": \"0.80\", \"cache_read\": \"0.08\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null."
+          "verified_at": "2026-11-18",
+          "notes": "Text token rates are in token_pricing; audio and image token rates (USD per 1M, cached input included) are in media_pricing.token_rates. Realtime conversation settles provider-reported response.done usage per modality. No provider reservation is published: Lumen derives the session hold from the admitted maximum duration (docs/operations.md)."
         },
         {
           "id": "gpt-realtime-2",
@@ -2049,13 +2191,26 @@
             "output": "24.00",
             "cache_read": "0.40"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {
+              "audio": {
+                "input_per_million": "32.00",
+                "cache_read_per_million": "0.40",
+                "output_per_million": "64.00"
+              },
+              "image": {
+                "input_per_million": "5.00",
+                "cache_read_per_million": "0.50"
+              }
+            }
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-realtime-2.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Audio: {\"input\": \"32.00\", \"output\": \"64.00\", \"cache_read\": \"0.40\"}; Text: {\"input\": \"4.00\", \"output\": \"24.00\", \"cache_read\": \"0.40\"}; Image: {\"input\": \"5.00\", \"cache_read\": \"0.50\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null."
+          "verified_at": "2026-11-18",
+          "notes": "Text token rates are in token_pricing; audio and image token rates (USD per 1M, cached input included) are in media_pricing.token_rates. Realtime conversation settles provider-reported response.done usage per modality. No provider reservation is published: Lumen derives the session hold from the admitted maximum duration (docs/operations.md)."
         },
         {
           "id": "gpt-realtime-1.5",
@@ -2085,13 +2240,26 @@
             "output": "16.00",
             "cache_read": "0.40"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {
+              "audio": {
+                "input_per_million": "32.00",
+                "cache_read_per_million": "0.40",
+                "output_per_million": "64.00"
+              },
+              "image": {
+                "input_per_million": "5.00",
+                "cache_read_per_million": "0.50"
+              }
+            }
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-realtime-1.5.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Audio: {\"input\": \"32.00\", \"output\": \"64.00\", \"cache_read\": \"0.40\"}; Text: {\"input\": \"4.00\", \"output\": \"16.00\", \"cache_read\": \"0.40\"}; Image: {\"input\": \"5.00\", \"cache_read\": \"0.50\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null."
+          "verified_at": "2026-11-18",
+          "notes": "Text token rates are in token_pricing; audio and image token rates (USD per 1M, cached input included) are in media_pricing.token_rates. Realtime conversation settles provider-reported response.done usage per modality. No provider reservation is published: Lumen derives the session hold from the admitted maximum duration (docs/operations.md)."
         },
         {
           "id": "gpt-realtime-mini",
@@ -2123,13 +2291,26 @@
             "output": "2.40",
             "cache_read": "0.06"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {
+              "audio": {
+                "input_per_million": "10.00",
+                "cache_read_per_million": "0.30",
+                "output_per_million": "20.00"
+              },
+              "image": {
+                "input_per_million": "0.80",
+                "cache_read_per_million": "0.08"
+              }
+            }
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-realtime-mini.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Audio: {\"input\": \"10.00\", \"output\": \"20.00\", \"cache_read\": \"0.30\"}; Text: {\"input\": \"0.60\", \"output\": \"2.40\", \"cache_read\": \"0.06\"}; Image: {\"input\": \"0.80\", \"cache_read\": \"0.08\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null."
+          "verified_at": "2026-11-18",
+          "notes": "Text token rates are in token_pricing; audio and image token rates (USD per 1M, cached input included) are in media_pricing.token_rates. Realtime conversation settles provider-reported response.done usage per modality. No provider reservation is published: Lumen derives the session hold from the admitted maximum duration (docs/operations.md)."
         },
         {
           "id": "gpt-realtime",
@@ -2161,13 +2342,26 @@
             "output": "16.00",
             "cache_read": "0.40"
           },
-          "media_pricing": null,
+          "media_pricing": {
+            "billing_basis": "tokens",
+            "token_rates": {
+              "audio": {
+                "input_per_million": "32.00",
+                "cache_read_per_million": "0.40",
+                "output_per_million": "64.00"
+              },
+              "image": {
+                "input_per_million": "5.00",
+                "cache_read_per_million": "0.50"
+              }
+            }
+          },
           "source_urls": [
             "https://developers.openai.com/api/docs/pricing",
             "https://developers.openai.com/api/docs/models/gpt-realtime.md"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Published USD per 1M tokens by modality: Audio: {\"input\": \"32.00\", \"output\": \"64.00\", \"cache_read\": \"0.40\"}; Text: {\"input\": \"4.00\", \"output\": \"16.00\", \"cache_read\": \"0.40\"}; Image: {\"input\": \"5.00\", \"cache_read\": \"0.50\"}. Token-basis media requires a positive reservation_usd not published by provider; media_pricing remains null."
+          "verified_at": "2026-11-18",
+          "notes": "Text token rates are in token_pricing; audio and image token rates (USD per 1M, cached input included) are in media_pricing.token_rates. Realtime conversation settles provider-reported response.done usage per modality. No provider reservation is published: Lumen derives the session hold from the admitted maximum duration (docs/operations.md)."
         },
         {
           "id": "gpt-audio-1.5",

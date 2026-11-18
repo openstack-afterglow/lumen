@@ -83,6 +83,14 @@ def native_catalog_entry(model: str, provider_type: str | None, api_base: str | 
                 return copy.deepcopy(entry)
     return {}
 
+def bounded_openai_text_model(model: str, provider_type: str | None, api_base: str | None) -> dict[str, Any]:
+    """Official text catalog entry with enough published limits to reserve credit."""
+    if provider_type != "openai":
+        return {}
+    entry = native_catalog_entry(model, provider_type, api_base)
+    return entry if entry.get("kind") == "text" and entry.get("context_window") and entry.get("max_output_tokens") else {}
+
+
 
 def catalog_model_metadata(model: str, provider_type: str | None = None, api_base: str | None = None) -> dict[str, Any]:
     """Project tracked native fields into the executor's existing metadata vocabulary."""
@@ -91,7 +99,8 @@ def catalog_model_metadata(model: str, provider_type: str | None = None, api_bas
         return {}
     flags = entry["capabilities"]
     metadata = {
-        "max_input_tokens": entry["context_window"],
+        "context_window": entry["context_window"],
+        "max_input_tokens": entry.get("max_input_tokens", entry["context_window"]),
         "max_output_tokens": entry["max_output_tokens"],
         "input_modalities": entry["input_modalities"],
         "output_modalities": entry["output_modalities"],
@@ -543,6 +552,10 @@ def cost_from_usage(
         configured, catalog, configured_tier, catalog_tier = cache_rates[name]
         rate = configured if configured is not None else catalog
         source = cache_sources.get(name, "manual") if configured is not None else CATALOG_PRICE_SOURCE if catalog is not None else None
+        if tokens and prompt_tokens > long_context_threshold_tokens and (
+            cache_sources.get(f"{name}_above_200k") == "unpublished"
+        ):
+            raise ValueError("long-context cache-write rate is unpublished")
         tier = configured_tier if configured_tier is not None else catalog_tier if source == CATALOG_PRICE_SOURCE else None
         if prompt_tokens > long_context_threshold_tokens and tier is not None:
             rate = tier

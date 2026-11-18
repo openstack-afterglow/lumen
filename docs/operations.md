@@ -1,5 +1,14 @@
 # 운영 가이드
 
+## 0.6.20 롤아웃 메모 (준비 중; 미발행·미배포)
+
+- **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.
+- **순서:** 0.6.19와 같다. API admission 차단 → worker drain(실행 중 run 0 확인, 실패 시 중단) → worker 정지 → 암호화 백업 → `--tags lumen --skip-tags haproxy` reconfigure → 새 API·worker cohort 확인. 공식 OpenAI 텍스트 호출은 이제 무상태 예약(034 테이블)을 쓰므로 혼합 cohort로 오래 두지 않는다.
+- **카탈로그 추종 전환:** 운영 OpenAI 행 중 수동 단가가 카탈로그와 같아 장문 구간·12시간 캐시 쓰기 단가를 가리는 GPT-6.2 행과, billing basis 없는 불완전한 수동 이미지 단가가 남은 GPT Image 행은 배포 후 가격 필드를 null로 PATCH해 카탈로그를 따르게 한다. 저장값이 확인한 값과 정확히 같을 때만, 같은 행 잠금 안에서 비교한 뒤 바꾼다. 실제 관리자 override는 보존한다.
+- **행동 변화:** 공식 OpenAI 텍스트 호출은 요청 크기 기반 상한을 먼저 예약하므로 잔액이 부족하면 거절될 수 있다. 예약이 있는 공식 OpenAI 모델의 `/v1/messages`는 거절된다. `service_tier`는 `default`/`auto`만 허용한다. `gpt-transcribe` 실시간 전사는 파일 STT 행과 같은 모델 이름이므로 별도 OpenAI 공급자 행에 `realtime` 종류와 가격을 등록해야 노출된다.
+- **대시보드:** Afterglow 1.32.27의 OpenAI Image/Realtime Studio 확장은 0.6.20 capabilities에 의존한다. Lumen을 먼저 배포한다.
+- Sandbox runtime은 계속 꺼 둔다. 이 메모는 발행·배포의 증거가 아니다.
+
 ## 0.6.19 롤아웃 메모
 
 - **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.
@@ -425,15 +434,23 @@ Media reservation은 provider I/O 직전에 user wallet row lock으로 월·주�
 
 ### OpenAI image·음성·realtime 모델 커버리지 (2026-11-10, source only)
 
-지원 모델 ID와 kind별 wire는 [API reference](api-reference.md#이미지유한-오디오실시간-음성)가 정본이다. 배포 전에는 이 코드가 운영 API/worker에 없으므로 운영 `gpt-image-*` 모델 행은 관리자가 `billing_basis: "tokens"`와 양의 `reservation_usd`(및 text input 가격) 또는 정확한 `image_variants`를 설정해야 실행된다. `media_pricing`에 `token_rates`만 있고 기준이 없으면 기존처럼 unit 과금이며 variants가 없어 실행되지 않는다. Realtime 전사·번역은 입력 PCM 분 단가(`realtime_input_per_minute`), 라이브는 `realtime_session_per_minute`를 설정한다(공식 가격표 기준 gpt-live-1 0.05, gpt-realtime-translate 0.034, gpt-live-transcribe·gpt-realtime-whisper 0.017 USD/분이며 값은 운영자가 최신 표로 재확인한다). 2026-11-10에 운영 계정 키로 공식 OpenAI에 대해 실제 호출을 확인했다. 실행 방식은 검토 중인 `lumen/`을 실행 중인 worker 컨테이너의 임시 경로에 올려 Lumen 자신의 transport·relay 코드를 호출한 것이며 서비스 재시작과 DB 쓰기는 없었고 확인 후 임시 코드를 삭제했다. 관측 범위: 이미지 7개 모델 생성·편집, 사용자 지정 size, `xhigh`, `complexity`, `n=2`; TTS 3개; STT 4개; relay로 대화 6개, 전사 2개, 번역 1개, 라이브 1개와 kind별 whitelist 거절 3건. 운영 API·DB admission·과금을 통한 종단 확인은 배포 후 별도 smoke가 필요하다. 이미지 token 기준은 `gpt-image-2.6-*`의 `max` quality가 1024² 한 장에서도 수천 token을 쓸 수 있으므로 reservation을 충분히 잡아야 하고 큰 사용자 지정 size는 더 크게 필요하다.
+지원 모델 ID와 kind별 wire는 [API reference](api-reference.md#이미지유한-오디오실시간-음성)가 정본이다. 2026-11-10 운영 계정 키로 공식 OpenAI에 대해 transport 단독 호출을 확인했다. 실행 worker 컨테이너에 임시 `lumen/`을 올려 서비스 재시작·DB 쓰기 없이 호출하고 제거했다. 관측 범위: 이미지 7개 모델 생성·편집, 사용자 지정 size, `xhigh`, `complexity`, `n=2`; TTS 3개; STT 4개; relay 대화 6개, 전사 2개, 번역 1개, 라이브 1개와 kind별 whitelist 거절 3건. 이 기록은 새 catalog 과금, GIF/SVG entitlement 또는 배포를 검증한 것이 아니다.
 
-토큰 기준(`billing_basis: "tokens"`) 이미지·realtime 대화 모델은 provider usage에 캐시된 텍스트·오디오·이미지 token이 포함될 수 있다(예: realtime 응답의 `cached_tokens`는 반복되는 instructions 접두부에서 나온다). 해당 방향의 캐시 읽기 단가(모델의 `cache_read_price_per_million`과 `token_rates.<modality>.cache_read_per_million`)가 없으면 Lumen은 가격을 추정하지 않고 run을 `provider_result_unknown`/hold `unknown`으로 남긴다. 사용자 응답은 정상이어도 정산이 보류되므로 token 기준 모델은 캐시 읽기 단가를 함께 등록한다. 2026-11-10 로컬 실제 호출에서 캐시 단가 없는 `gpt-realtime`·`-mini`·`-1.5`가 반복 호출 시 간헐적으로 이 상태가 되었고 단가 추가 후 12회 모두 `completed`였다. 로컬 실제 공급자 스택(MariaDB·Redis·TLS MinIO·ClamAV·API·worker, 합성 Keystone)에서 이미지 8개 모델 중 `gpt-image-1`만 계정에 없는 모델(`The model 'gpt-image-1' does not exist.`)이라 실패했다.
+토큰 기준에서 미설정 단가의 캐시 사용량은 `provider_result_unknown`/hold `unknown`으로 남긴다. 2026-11-10 로컬 실제 호출에서 캐시 단가 없는 `gpt-realtime`·`-mini`·`-1.5`가 반복 호출 시 간헐적으로 이 상태가 되었고 단가 추가 후 12회 모두 `completed`였다. 당시 로컬 실제 공급자 스택에서 `gpt-image-1`만 계정에 없는 모델로 실패했다. 현재 종료된 `gpt-image-1`은 실행 allowlist에서 제거했다. Direct OpenAI Images의 cache 적용 범위와 예약 방법은 [이미지 자금 예약 정책](#openai-images-funding-policy)을 참조한다.
 
 **동시 admission·지갑·거절 정산 (이번 변경에서 수정).** (1) 마이그레이션 `030_chat_runs_idempotency_index.sql`이 `chat_runs (project_id, user_id, client_request_id)` unique 인덱스 `uq_chat_runs_idempotency`를 만든다. ORM 모델은 처음부터 선언했지만 baseline이 만들지 않아, 같은 멱등 키의 동시 admission은 `SELECT ... FOR UPDATE`의 gap 락으로만 직렬화됐고 같은 gap 락이 같은 provider 동시 admission을 MariaDB 1213 교착(HTTP 500)시켰다(로컬 동시 이미지 8건 중 7건). 이제 이미지·오디오·realtime admission은 READ COMMITTED로 실행하고 unique 인덱스가 권위가 된다. 경합한 중복은 1062로 실패하고 기존 `IntegrityError` 경로가 승자 run을 돌려준다. **인덱스 없이 READ COMMITTED만 적용하면 같은 키 12건이 run 12개로 admitted되므로(중복 실행·과금) API보다 migration을 먼저 적용해야 한다.** 중복 키가 있는 DB에서는 `1062`로 중단되므로 적용 전에 `SELECT project_id, user_id, client_request_id, COUNT(*) FROM chat_runs GROUP BY project_id, user_id, client_request_id HAVING COUNT(*) > 1;`를 확인한다(운영 DB는 2026-11-10 읽기 전용 조회에서 36행·중복 0건). (2) `credit._get_or_create_wallet`은 지갑이 없으면 no-op `INSERT ... ON DUPLICATE KEY UPDATE`와 잠금 재조회로 만들고, `credit.precheck`는 REPEATABLE READ 스냅샷을 쥐므로 잠금 충돌(1020/1205/1213)을 `budgets.retry_deadlocks`로 재시도한다. 신규 사용자의 동시 첫 요청이 더 이상 wallet 기본 키 중복이나 교착으로 실패하지 않는다. (3) 온라인 이미지·TTS·STT에서 provider 거절의 HTTP 상태가 기존 `_REJECTION_STATUSES`(400, 401, 403, 404, 413, 415, 422, 429)에 있으면 추론 이전의 거절로 보고 run을 `provider_rejected`로 실패시키며 hold를 같은 트랜잭션에서 0원으로 정산한다(이전에는 Batch만). 그 밖의 실패는 계속 `provider_result_unknown`/hold `unknown`이다. 호출자는 400(400/413/415/422), 429, 502(401/403/404, 운영자 설정 문제)를 받고 메시지에 provider 숫자 상태가 들어간다. **provider가 거절된 미디어 요청에 실제로 과금하는지는 확인하지 않았다(예: 생성 후 safety 차단).** 청구서와 대조하고, 과금이 확인되면 이 규칙을 좁혀야 한다.
 
 **네이티브 텍스트 admission (이번 변경에서 수정).** `create_persistent_run`, `create_run`, `create_temp_run`, `create_compaction_run`(`durable_runs/admission.py`)은 REPEATABLE READ에서 멱등성 `SELECT ... FOR UPDATE`(새 키의 gap 락) → `_lock_run_configurations` → INSERT 순서여서 media와 같은 MariaDB 1213 교착이 났다. 처음에는 코드 검사만으로 의심했고 재현하지 않았지만, 같은 사용자가 같은 provider로 12건을 동시에 보내는 통합 테스트(`tests/integration/test_text_admission_concurrency.py`)가 수정 전 코드에서 12개 케이스 중 8개를 실패시켰다(2026-11-10 전체 결과 `8 failed, 4 passed`, 실패한 케이스마다 12건 중 11건이 `1213`): temp의 distinct key·one-key, persistent의 distinct key, run의 distinct key를 `innodb_snapshot_isolation` ON/OFF 모두에서. persistent·run의 한 키 12건은 같은 대화 행 락이 직렬화하므로 수정 전에도 통과했다. 이제 네 함수의 transaction은 첫 문장으로 `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`를 실행하고, `_replay_idempotency_race` 데코레이터가 같은 키 경합의 패자가 만난 `IntegrityError`(unique `uq_chat_runs_idempotency`)를 승자 run의 replay로 바꾼다(다른 intent면 기존 `idempotency_key_reused_with_different_intent`). **migration 030이 먼저 적용돼 있어야 한다.** 수정 후에는 12개 케이스가 모두 통과한다. `create_compaction_run`에도 같은 수정을 적용했지만 이를 직접 실행하는 동시성 테스트는 없다.
 
 **스키마 인덱스 드리프트와 부트스트랩 자체 복구 (이번 변경에서 수정).** baseline이 `CREATE TABLE`로 만들어져 ORM `Index(...)`가 migration에 반영되지 않았다. 2026-11-10 대조에서 unique 4개(`uq_chat_runs_parent_delegation`, `uq_chat_run_segments_boundary`, `uq_chat_run_segments_ordinal`, `uq_chat_run_turn_message_event`)와 일반 인덱스 44개(예: `idx_chat_runs_temp_status`, `idx_chat_runs_root_status`가 없어 활성 run `FOR UPDATE` 조회가 잠금 스캔이었다)가 DB에 없었고(테이블·컬럼은 모두 일치), migration `031_orm_index_catchup.sql`이 테이블당 하나의 `ALTER TABLE ... ADD [UNIQUE] INDEX IF NOT EXISTS`로 48개를 한 번에 추가한다(online InnoDB DDL, 재실행 안전). 운영 DB는 같은 날 읽기 전용 조회에서 네 unique 키 모두 중복 0건이었고 테이블이 작다(최대 127행). unique 추가는 중복 키가 있으면 1062로 중단하고 데이터를 지우지 않는다. **forward028 정확 비교는 `chat_usage_logs`의 두 인덱스(`idx_chat_usage_user_created`, `idx_chat_usage_project_created`)를 `provider_account_migration.POST_CUTOVER_INDEXES`로 무시한다.** 그렇지 않으면 031 이후 모든 `lumen-migrate` 재실행이 `schema_drift_chat_usage_logs`로 거부된다. 또한 `lumen-migrate --apply`(compose `migrate`, Kolla bootstrap, CI)는 검증된 ledger를 적용한 뒤 `lumen/scripts/schema_repair.py`로 실제 스키마를 `lumen/data/schema_snapshot.sql`과 비교해 **추가만 하는 복구**를 자동 실행한다. **복구 기준은 ORM이 아니라 이 snapshot이다.** snapshot은 ledger migration만으로 만든 DB의 `SHOW CREATE TABLE`(AUTO_INCREMENT·표시 폭·테이블 기본 charset 제거)이고, `tests/integration/test_schema_index_drift.py`가 ledger 결과와 다르면 실패시킨다. 처음 구현은 ORM `create_all`로 테이블을 만들었는데, 실제 실행에서 `datetime(6)`가 `datetime`으로, `DEFAULT 'reserved'`·`DEFAULT current_timestamp(6)`가 사라지고 FK·key 이름이 달라졌으며 탐지기가 타입·기본값을 보지 않아 영원히 "드리프트 없음"으로 보고했다. 지금은 snapshot DDL로 만들어 기본값·정밀도·key·FK 이름이 ledger와 같다. 자동 복구 대상: 없는 nullable 또는 DEFAULT가 있는 컬럼(PK·FK·CHECK 컬럼 아님, snapshot 정의 그대로 추가), 없는 index·unique key(unique는 먼저 중복 키 조회), 그리고 **빈 상태로 다시 만들어도 되는 임시 조정 테이블 4개의 누락**(`chat_scheduler_leases`, `chat_worker_registrations`, `chat_memory_owner_locks`, `chat_gateway_device_grants`: lease·worker 등록·lock row·대기 중 device 로그인이라 실행 중인 시스템이 스스로 다시 만든다). 복구한 항목은 WARNING 로그 `schema repair: ...`로 남는다. **정책은 기본 거부다(`schema_repair.RECREATABLE_EMPTY`).** 이 4개 외의 모든 테이블(65개 중 61개)은 누락돼도, 그 테이블의 컬럼이 누락돼도 복구하지 않고 첫 DDL 이전에 모든 이유를 나열하며 `MigrationLedgerError`로 실패해 API·worker가 뜨기 전에 막힌다. 사용자 콘텐츠·대화 이력·잔액·자격 증명·run journal·cloud resource를 빈 테이블로 조용히 바꾸면 손실이 가려지거나 잔액이 초기화되기 때문이고, 실행기 자신의 `_verify_active_paths`가 membership·active path 누락을 DDL 이후에야 거부하기 때문이다(전체 integration 실행에서 실제로 관찰했다). 처음에는 비밀·잔액 이름 패턴(65개 중 36개 보호)으로 판단했으나 agents·skills·memories·run events 같은 사용자 데이터가 조용히 비워진다는 점에서 기본 거부로 바꿨고, 새 테이블은 이 목록에 넣기 전까지 보호된다. 목록은 상수 하나다. 그 밖의 실패 사유: DEFAULT 없는 NOT NULL 컬럼·PK·FK·CHECK 컬럼 누락, 중복 키가 있는 unique. **보호 테이블의 index·key는 복구하지만 CLI에서 닿는 범위가 다르다.** 계정 테이블 7개(`provider_account_migration.REPAIRED_SCHEMA`)는 `inspect_account_state`가 `SHOW CREATE TABLE`을 정확히 비교하며 앞서 실행되므로, `POST_CUTOVER_INDEXES` 두 개 외의 KEY가 없으면 복구 단계 전에 `schema_drift_<table>`로 거부된다. 나머지 보호 테이블(예: `chat_api_keys`, `chat_runs`)의 key는 복구된다. presence는 테이블·컬럼·key 이름으로만 비교하며 컬럼 타입·기존 컬럼의 nullability·FK 제약·DB에만 있는 객체는 비교하거나 고치지 않는다(서버별 표기 차이와 데이터 손실 위험). 테이블이 없어 복구된 경우 데이터는 복구되지 않는다. `--apply` 없이 실행하면 ledger가 모두 적용된 DB에서 드리프트를 `schema-repair: ...` 항목으로 보고하고 0이 아닌 코드로 끝난다. `--no-schema-repair`는 ledger migration만 적용하며 통합 테스트 계층이 migration의 누락을 가리지 않도록 쓴다(운영 사용 금지). migration이 테이블을 바꾸면 snapshot을 다시 만든다: `LUMEN_UPDATE_SCHEMA_SNAPSHOT=1 uv run lumen-test integration -k schema_snapshot`(안 하면 위 테스트가 실패한다). 이 복구는 accepted OpenSpec 요구사항 "Schema changes MUST use additive migrations and update manifest checksums"의 예외이므로 `openspec/changes/bootstrap-schema-repair`가 MODIFIED requirement로 기록한다. 검증: `tests/integration/test_schema_repair.py`(합성 테이블 SQL DDL 동일성), `tests/integration/test_schema_repair_real_schema.py`(실제 스키마에서 임시 조정 테이블 3개, 컬럼 하나, 보호 테이블의 key를 지운 뒤 실제 `lumen-migrate` CLI로 복구해 DDL이 snapshot과 글자 그대로 같음, 보호 테이블 누락은 CLI 실패), `tests/test_schema_repair_policy.py`.
+
+### OpenAI realtime 대화 token hold
+
+2026-11-18 공식 가격표 기준 catalog는 `gpt-realtime-2.1`, `-2.1-mini`, `-2`, `-1.5`, `gpt-realtime`, `gpt-realtime-mini`(snapshot alias `gpt-realtime-2025-08-28`, `gpt-realtime-mini-2025-12-15` 포함)를 `billing_basis: "tokens"`로 둔다. Text 입력·cached·출력은 `token_pricing`, audio 입력·cached·출력과 image 입력·cached는 `media_pricing.token_rates`에 정확한 USD/1M 값으로 있다. 정산은 provider `response.done` usage를 modality별로 나누어 계산하며 분 단위 대체 요금을 쓰지 않는다. Usage 누락·불일치·hold 초과는 `unknown`이다.
+
+OpenAI는 realtime 대화의 session 단위 예약액을 공개하지 않는다. 그래서 `reservation_usd`가 없는 OpenAI 대화 route의 hold는 Lumen funding 정책으로 정한다(`realtime_transport._derived_token_hold`·`response_bound_usd`, plan의 `reservation_source: "duration_policy"`). **최악 응답 bound**: Lumen은 모든 OpenAI token 세션에 `max_output_tokens: 4096`과 retention-ratio truncation(`post_instructions: 16384`)을 고정하고 client가 바꾸지 못하게 한다. 응답 하나는 instructions(4096자 → 16,384 byte)·function tools(16,384 byte)·overhead 512 token을 최고 text 입력 단가(일반·cache read 중 큰 값)로, 대화 16,384 token을 최고 입력 단가(text/audio/image의 일반·cache read 모두 비교)로, 출력 4,096 token을 최고 출력 단가로 계산한 값을 넘을 수 없다고 본다. text token이 UTF-8 1 byte 이상이라는 가정과 `max_output_tokens`가 reasoning을 포함한다는 가정은 공식 문서에 명시되지 않은 [INFERENCE]다. **Duration 부분**: 공식 비용 안내의 사용자 audio 100 ms당 1 token, assistant audio 50 ms당 1 token을 근거로 admission 최대 시간 1초마다 입력 100 token(이후 최대 10개 응답에서 uncached로 다시 읽힘)을 최고 입력 단가로, 출력 30 token(assistant audio 20 + transcript text 10)을 최고 출력 단가로 계산한다. Hold = duration 부분 + 최악 응답 2개. 예: `gpt-realtime-2.1`은 최악 응답 $0.919552, 300초 hold $1.536 + $1.839104 = $3.375104, 10초 $1.890304; `-2.1-mini`는 최악 응답 $0.265728, 300초 $1.011456. 여기에 margin과 credit 환율을 곱하며, 잔액이 이 hold보다 적으면 provider I/O 전에 402로 거절한다. Relay는 응답 usage가 확정될 때마다 frozen 단가로 누적하고, 누적 + 2 × 최악 응답이 hold를 넘으면 새 응답을 시작하지 않고 세션을 끝낸 뒤 진행 중 응답을 drain한다. 응답 하나가 최악값을 넘으면(가정 위반) 즉시 끝낸다. 따라서 위 가정이 맞는 한 확정 비용은 hold를 넘지 않는다. 가정이 틀려 넘으면 정산은 `unknown`으로 남아 운영자 처분이 필요하다. 관리자가 설정한 `reservation_usd`는 최악 응답 2개 이상이어야 한다. 미달이면 관리자 저장 요청에서 최소 USD와 함께 오류를 반환한다. 기존 미달 행은 audio capability gate에 `realtime_reservation_too_small`을 표시하며 실행할 수 없다. Token 세션은 upstream이 고정 limits, 이후 VAD·도구 설정을 두 차례 확인하기 전에 client audio나 명령을 전달하지 않는다.
+
+관리자가 모델에 양의 `reservation_usd`를 설정하면 그 값이 우선한다. Derived hold 예외는 OpenAI provider에만 적용된다. Gemini Live의 token 기준은 공개된 초당 audio token 근거가 없어 계속 `reservation_usd`가 필요하며, 없으면 관리자 저장 단계에서 거절된다. `gpt-transcribe` 실시간 전사는 realtime row의 `realtime_input_per_minute`($0.0045/분)로 Lumen 측정 입력 시간을 청구하며 file STT 단가로 대체하지 않는다. `(provider_id, model_name)`이 unique이므로 기존 stt `gpt-transcribe` row와 다른 OpenAI provider 항목에 realtime row를 만든다. 전사(`gpt-live-transcribe`, `gpt-realtime-whisper`, $0.017/분)와 번역(`gpt-realtime-translate`, $0.034/분)은 Lumen이 측정한 입력 PCM 시간으로 청구한다. 번역은 provider usage event가 없다. 라이브(`gpt-live-1`, $0.05/분, 초 단위)는 provider가 `session.closed`에 보고한 최종 `usage.seconds`로 청구한다. 누적 `session.usage.updated`는 진행값으로만 보관하고 합산하지 않는다. 최종값 누락(provider 연결 종료·오류)·형식 오류·감소·예약 최대 시간 초과는 Lumen 연결 시간으로 대체 청구하지 않고 hold를 `unknown`으로 남긴다. 번역은 공개된 usage event가 없어서만 Lumen 측정 입력 시간으로 청구한다. Lumen은 WebSocket만 쓰므로 WebRTC 초기화 15초 선과금 경로는 없다. Live delegation(별도 Responses 과금)은 거부한다. Reasoning effort는 `gpt-realtime-2`/`-2.1`에서만 설정할 수 있다. Reasoning token은 보고된 출력 usage로 정산되며 hold 정책은 바꾸지 않는다. 이미지 입력과 function calling은 `gpt-realtime-2.1`/`-2.1-mini`/`-2`/`-1.5` token 세션에서만 열리며 위 최악 응답 bound 안에서 image/text token으로 정산된다. 이미지는 저장하지 않고 header 크기만 검사하며 ClamAV를 거치지 않는다(provider로만 전달).
 
 ## Kolla 로그와 비동기 채팅 실패 추적
 
@@ -709,9 +726,10 @@ administrators register their IDs and required rates explicitly.
    threshold can be represented by the preceding integer, with the source condition
    explained in `notes`. Never substitute a global 200K boundary.
 4. Use the existing media-pricing shape only when the published tariff fits it exactly.
-   Token-basis media requires a positive administrator funding reservation; a provider
-   tariff does not publish that envelope. Leave unsupported media prices null and explain
-   the missing shape in `notes`; never invent a reservation or approximate a unit tariff.
+   Published rates never define a funding hold. Direct OpenAI Images derives
+   a hold per request (below); transports without a derived policy require a
+   positive operator `reservation_usd`. Leave unsupported published rates null
+   and explain the missing evidence in `notes`; never approximate a unit tariff.
    Additional provider search, storage, grounding or tool charges documented in notes are
    not silently included in token prices.
    Unit-priced image entries must include exact `image_variants` for every supported
@@ -719,8 +737,8 @@ administrators register their IDs and required rates explicitly.
    a route executable. The 2026-11-18 review of [Gemini pricing](https://aistudio.google.com/docs/pricing#gemini-2.5-flash-image)
    and the [model specification](https://aistudio.google.com/docs/models/gemini-2.5-flash-image)
    confirms Gemini 2.5 Flash Image output costs 1,290 tokens × $30/1M = $0.039/image.
-   Its four Lumen aspect-ratio size presets with quality auto share that rate; no
-   other model price or administrator override changes in this catalog revision.
+   Its four Lumen aspect-ratio size presets with quality auto share that rate.
+   Stored administrator media prices retain precedence over bundled prices.
 5. Run `pytest tests/test_provider_catalog.py tests/test_chat_native_catalog_admin.py`
    in the service development environment, then the focused capability/pricing suites
    for affected models. The loader rejects unknown fields, bad kinds, duplicate IDs or
@@ -730,6 +748,126 @@ administrators register their IDs and required rates explicitly.
    prices, capabilities, cache rates and media availability. Record intentional changes
    and gaps in the change evidence. Source/local tests do not establish provider or
    production acceptance, and a catalog edit does not authorize a deployment.
+
+GPT-6.2 Sol and Astra use exact Standard and over-272,000 whole-request tariffs
+from [OpenAI pricing](https://developers.openai.com/api/docs/pricing). Keep
+`max_input_tokens` (922,000) distinct from the 1,050,000-token context window
+and the 128,000-token output limit. Explicit administrator rates still win.
+Clear a manual base rate to activate its catalog long-context tier; matching
+the catalog's short-context number does not turn a manual price into a tier.
+Published Cyber/Rosalind prices do not grant access. Unpublished long-context
+cache-write rates remain unavailable, not copies of the short-context rate.
+
+### OpenAI text credit envelope
+
+The online hold uses UTF-8 bytes of compact JSON for prompt messages, tool
+definitions and output schemas, plus 4,096 tokens of framing, 16 per message
+or tool definition, and the published per-image token cap when available.
+This framing allowance is Lumen policy, not a provider guarantee. Encrypted
+reasoning replay contributes its encoded UTF-8 bytes, assuming ciphertext bytes
+are at least the replayed token count. Computer-use screenshots follow image
+rules at the requested detail, with automatic detail when omitted. For media
+without a published cap (including GPT-6.2 images), files/audio, or tools that
+add server-side context, use the published input limit, or the context window
+if no separate input limit exists.
+The output reserve is independent: use the explicit caller cap or the published
+output maximum. An omitted cap stays omitted when sent to official OpenAI.
+
+Choose the maximum frozen applicable input rate, including cache writes.
+Default 30m writes count; reserve the 12h rate if the request or an input
+breakpoint asks for 12h. Include long-context rates only if the input bound
+can exceed the model threshold. Add the hosted fee ceiling, then apply credit
+conversion and margin. A provider report beyond the reserved token or charge
+ceiling does not settle. Examples before margin, credit conversion and rounding:
+
+| Request | Reservation |
+| --- | ---: |
+| Sol, prompt of 1,000 UTF-8 bytes, one user message, compact Chat envelope of 73 bytes, 128 output tokens | 5,185 × $2.50/M + 128 × $10/M = $0.0142425 |
+| Same Sol request, no output cap | 5,185 × $2.50/M + 128,000 × $10/M = $1.2929625 |
+| Astra with Web Search, default 10 calls, default cache TTL and no output cap | 922,000 × $20/M + 128,000 × $60/M + 10 × $0.01 = $26.22 |
+
+For official OpenAI text, use Standard processing. Online routes with known
+catalog limits reserve worst-case token cost before dispatch. Metered Responses
+tools add a bound based on `max_tool_calls` (default 10, maximum 20). Web Search
+is $0.01 per output call. Auto Code Interpreter/Shell containers are billed
+one full 20-minute block per distinct reported container at the request's
+memory tier. This may exceed OpenAI's per-minute invoice. Only GPT-6.2 Sol/Astra
+have the metered hosted tool policy here; no explicit container or provider file
+reuse is permitted. Missing usage, missing container IDs, a nonstandard tier
+or tracking beyond the held bound leaves a content-free `unknown` reservation
+for operator disposition; do not retry the original request to settle it.
+After a held Chat or Responses client disconnect, the SSE owner stops client
+delivery and waits up to 15 seconds for terminal usage. Once the atomic
+settlement starts, it may complete beyond the drain deadline. If the terminal
+evidence does not arrive in time, the hold stays `unknown`. The owner closes
+upstream before releasing the SSE slot. Each held settlement attempt with valid
+token counts logs only the reservation ID and reported counts versus their bounds.
+
+### OpenAI Images funding policy
+
+The [OpenAI Images guide](https://developers.openai.com/api/docs/guides/image-generation.md)
+and [pricing](https://developers.openai.com/api/docs/pricing) govern the direct
+token tariffs. An active native API-key route with a ready asset pipeline can
+use bundled rates without a manual price. `billing_basis: "tokens"` is explicit;
+an operator may still set a positive whole-request `reservation_usd` to replace
+the computed hold. GPT Image 2/2.5 cached rates are for the Responses image tool,
+not direct Images. GPT Image 2.6 direct cache billing is not documented; Lumen
+rejects unexpected modern Images cache usage rather than guessing.
+
+The default hold is **not** a tariff or hard provider limit. Lumen computes:
+
+- For each GPT Image 2+ output, choose the [official calculator](https://developers.openai.com/api/docs/guides/image-generation)
+  grid `L`: GPT Image 2 uses 16/48/96 for low/medium/high; 2.5/2.6 use
+  16/24/48/64/96 for low/medium/high/xhigh/max. Round `q = L × short / long`
+  half-to-even; `base = ceil(L × q × (2,000,000 + W×H) / 4,000,000)`.
+  For 2.6 round `base × 4.2` (low) or `base × 3.3` (medium) to nearest,
+  with halves up. Use 2880×2880 for `size:auto`, and high (2) or max
+  (2.5/2.6) for `quality:auto`. These maximize modeled cost independently.
+- Older preset models use their published image output estimates (per
+  size/quality, worst legal when auto), plus $0.001 to cover price rounding,
+  converted to tokens using the published image output rate.
+- Reserve `ceil(1.5 × estimate)` tokens per image, or per GIF frame. The 50%
+  headroom allows estimator variance; only actual aggregate provider usage
+  bills. Multiply by `n` and for GIF by `frame_count` (default 9).
+- Reserve one text input token per UTF-8 prompt byte plus 256 for hidden
+  request framing. For edits add `8192 + 512 × ceil(Wsrc/256) × ceil(Hsrc/256)`
+  input-image tokens per scanned source or overlay, using the scanner's
+  validated dimensions. OpenAI does not publish GPT Image edit-input token counts. This Lumen policy budgets
+  more than its historical tile/fidelity overhead without treating that old
+  tariff as the current model's formula.
+- For SVG, add an authoring envelope for `prompt_bytes + 65,536` input
+  tokens and 32,768 output tokens. This covers space for the prompt, reference
+  image and hidden input, plus a vector document and reasoning. Admission
+  freezes exact native text model IDs and published rates (including context
+  tiers). When the caller omits `svg_model`, reserve at the highest combined
+  candidate cost. When the caller selects one, require an exact nonrestricted
+  native catalog ID registered on the image provider and authorized by the
+  image route's fixed account and credential; reserve at its resolved rates
+  and require either the selected ID or a frozen exact alias of the same
+  native catalog entry in `svg_usage`. Both use the selected route's frozen
+  rates; an independently configured model route is not consulted. Reasoning
+  is already included in output.
+- Sum each quantity × its matching USD/token rate; round the derived USD
+  envelope up to 10 decimal places. Apply frozen margin and credit conversion.
+  Admission checks available headroom without charging; the worker atomically
+  rechecks and records the actual reservation before the one provider call.
+
+With a four-byte prompt `Draw`, before margin/credit conversion: 2.5
+high 1024×1024 (`n=1`) holds 2,634 output tokens → **$0.080320**;
+2.6 `auto:auto`, `n=2`, holds 71,158 output tokens → **$2.136040**;
+the first request as an edit with a 1024×1024 source additionally holds
+16,384 image-input tokens → **$0.211392** total.
+
+Settlement multiplies observed token categories by frozen rates, never debits
+the hold itself, and fails closed on missing, inconsistent, unpriced or
+over-hold usage. Keep an unknown hold for reconciliation; never retry a paid
+operation automatically. Project-level SVG/GIF preview access, actual
+estimator variance, and invoice parity require separate provider acceptance.
+`svg_usage` carries no cache split, so authoring tokens settle at the frozen
+author input rate. If OpenAI applies a GPT-6.x/5.6 cache-write premium to
+authoring input (unverified), that premium is not billed.
+
+### Gemini Decisions catalog
 
 For Gemini Decisions, review the [model card](https://aistudio.google.com/docs/models/gemini-decision-1),
 [API contract](https://aistudio.google.com/docs/decisions-api) and
@@ -742,6 +880,8 @@ tariffs unset. The output limit is not an output tariff; do not turn a live
 between provider-published modalities and Lumen's text/image-only execution scope.
 Re-read sources and advance `catalog_version` when updating this entry. Do not
 copy Gemini 4/3 image token counts or defaults into the Decision 1 entry.
+
+### Catalog precedence, cache slots and overrides
 
 Runtime prices use stored administrator rates first, then exact native catalog rates,
 then no rate. Stored historical `price_source` strings remain provenance only. Runtime

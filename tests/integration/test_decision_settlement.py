@@ -19,7 +19,7 @@ from lumen.models.chat_runs import ChatModelCallReservation, ChatRun
 from lumen.models.decision_contracts import DecisionRequest
 from lumen.models.gemini_decision_contracts import CONTEXT_TOKENS, GeminiDecisionRequest
 from lumen.models.stateless_reservations import StatelessCallReservation
-from lumen.services import credit, decisions, gemini_decisions, stateless_credit
+from lumen.services import completion_api, credit, decisions, gemini_decisions, stateless_credit
 from lumen.services.providers import routing
 
 pytestmark = pytest.mark.integration
@@ -47,6 +47,125 @@ async def sql_owner(monkeypatch):
             await session.execute(delete(ChatApiKey).where(ChatApiKey.owner_user_id == user))
             await session.execute(delete(UserWallet).where(UserWallet.user_id == user))
         await close_db()
+
+
+@pytest.mark.parametrize("outcome", ["settled", "missing", "tier", "over_hold", "tool_over_cap", "no_container_id", "low"])
+async def test_openai_hosted_text_stateless_hold_and_atomic_ledger(sql_owner, monkeypatch, outcome):
+    from test_openai_text_protocol import MODEL, OUTPUT, TOOLS, input_details, route_for
+
+    factory, user, project = sql_owner
+    route = route_for()
+    monkeypatch.setattr(completion_api.get_settings(), "chat_credit_per_usd", Decimal(1))
+    monkeypatch.setattr(completion_api, "_authorize_completion", AsyncMock())
+    totals = 272001
+    payload = {
+        "status": "completed", "service_tier": "default", "output": OUTPUT,
+        "usage": {"input_tokens": totals, "output_tokens": 20, "total_tokens": totals + 20,
+                  "input_tokens_details": input_details()},
+    }
+    if outcome == "missing":
+        payload.pop("usage")
+    elif outcome == "tier":
+        payload["service_tier"] = "fast"
+    elif outcome == "tool_over_cap":
+        payload["output"] = [{"type": "web_search_call"}] * 11
+    elif outcome == "no_container_id":
+        payload["output"] = [{"type": "shell_call"}]
+    cap = credit.call_credit_bound(
+        {**route, "chat_credit_per_usd": Decimal(1)}, input_tokens=922000, output_tokens=64,
+    ) + Decimal("1.30")
+    if outcome == "over_hold":
+        # Exercise transaction rollback, not only the earlier count fence.
+        cap = Decimal("1.30")
+        monkeypatch.setattr(credit, "call_credit_bound", lambda *_args, **_kwargs: Decimal("0"))
+    async with factory() as session, session.begin():
+        wallet = await session.get(UserWallet, user)
+        wallet.max_quota_monthly = cap - Decimal("0.01") if outcome == "low" else cap
+    upstream = AsyncMock(return_value=payload)
+    monkeypatch.setattr(completion_api.provider_client, "aresponses", upstream)
+
+    async def dispatch():
+        return await completion_api.complete_responses(
+            resolved=route, input="not persisted", stream=False, user_id=user, project_id=project,
+            api_key_id=None, options={"tools": TOOLS, "max_output_tokens": 64, "service_tier": "auto",
+                                     "prompt_cache_key": "test-cache", "prompt_cache_options": {"ttl": "12h"}},
+        )
+
+    if outcome == "settled":
+        assert await dispatch() == payload
+    else:
+        with pytest.raises(completion_api.CompletionError) as failure:
+            await dispatch()
+        assert failure.value.status_code == (429 if outcome == "low" else 502)
+        if outcome != "low":
+            assert failure.value.code == "provider_result_unknown"
+    if outcome == "low":
+        upstream.assert_not_awaited()
+    else:
+        upstream.assert_awaited_once()
+        assert upstream.await_args.kwargs["service_tier"] == "default"
+        assert upstream.await_args.kwargs["max_tool_calls"] == 10
+        assert upstream.await_args.kwargs["prompt_cache_options"] == {"ttl": "12h"}
+    async with factory() as session:
+        hold = (await session.scalars(select(StatelessCallReservation).where(
+            StatelessCallReservation.user_id == user))).one_or_none()
+        ledger = (await session.scalars(select(ChatUsageLog).where(ChatUsageLog.user_id == user))).one_or_none()
+        wallet = await session.get(UserWallet, user)
+        if outcome == "low":
+            assert hold is ledger is None and wallet.used_quota_this_month == 0
+        else:
+            assert hold.bound_credits == cap
+            if outcome == "settled":
+                assert hold.status == "settled" and hold.event_id == ledger.event_id
+                assert wallet.used_quota_this_month == hold.actual_credits == ledger.credited_cost
+                assert ledger.model_name == MODEL and ledger.raw_cost == Decimal("1.339924")
+                assert ledger.cache_read_input_tokens == 100
+                assert ledger.cache_creation_5m_input_tokens == 200
+                assert ledger.cache_creation_1h_input_tokens == 300
+                assert "first" not in str(ledger.pricing_snapshot)
+                assert ledger.pricing_snapshot["hosted_tools"]["container"]["blocks"] == 2
+            else:
+                assert hold.status == "unknown" and ledger is None and wallet.used_quota_this_month == 0
+
+
+@pytest.mark.parametrize("provider_input_tokens", [20, 5_000])
+async def test_small_openai_text_prompt_fits_low_credit_wallet(sql_owner, monkeypatch, provider_input_tokens):
+    from test_openai_text_protocol import route_for
+
+    factory, user, project = sql_owner
+    monkeypatch.setattr(completion_api.get_settings(), "chat_credit_per_usd", 1.0)
+    monkeypatch.setattr(completion_api, "_authorize_completion", AsyncMock())
+    reply = {"status": "completed", "output": [], "usage": {"input_tokens": provider_input_tokens, "output_tokens": 10}}
+    upstream = AsyncMock(return_value=reply)
+    monkeypatch.setattr(completion_api.provider_client, "aresponses", upstream)
+    async with factory() as session, session.begin():
+        (await session.get(UserWallet, user)).max_quota_monthly = Decimal("0.02")
+
+    async def dispatch():
+        return await completion_api.complete_responses(
+            resolved=route_for(), input="test", stream=False, user_id=user, project_id=project,
+            api_key_id=None, options={"max_output_tokens": 128},
+        )
+
+    if provider_input_tokens == 20:
+        assert await dispatch() == reply
+    else:
+        with pytest.raises(completion_api.CompletionError) as failure:
+            await dispatch()
+        assert (failure.value.status_code, failure.value.code, failure.value.message) == (
+            502, "provider_result_unknown", "usage_exceeds_reservation",
+        )
+    upstream.assert_awaited_once()
+    async with factory() as session:
+        hold = (await session.scalars(select(StatelessCallReservation).where(
+            StatelessCallReservation.user_id == user))).one()
+        assert hold.bound_credits < Decimal("0.02")
+        if provider_input_tokens == 20:
+            assert hold.status == "settled" and hold.actual_credits == Decimal("0.00014")
+        else:
+            assert hold.status == "unknown" and hold.actual_credits is None
+            assert await session.scalar(select(ChatUsageLog.id).where(ChatUsageLog.event_id == hold.event_id)) is None
+            assert (await session.get(UserWallet, user)).used_quota_this_month == 0
 
 
 def _route():

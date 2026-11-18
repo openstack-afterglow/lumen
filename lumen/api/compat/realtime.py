@@ -150,7 +150,7 @@ async def _compat_socket(websocket: WebSocket, *, wire: str, kind: str = "conver
             {"model_id": model, "voice": voice, "instructions": instructions, **options},
             project_id=principal["project_id"], user_id=principal["user_id"],
             client_request_id=str(uuid4()), source="api", api_key_id=principal["api_key_id"], provider_type=wire,
-            kind=kind)
+            kind=kind, wire=wire)
     except RealtimeKindMismatch:
         # A model of another realtime kind: the client picked the wrong endpoint for it.
         await websocket.close(code=4400)

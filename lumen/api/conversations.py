@@ -114,7 +114,6 @@ async def get_chat_capabilities(
     token_info: dict = Depends(require_scopes("models:read")),
 ):
     """Expose selected-model and deployment runtime gates without secrets."""
-    del token_info
     try:
         resolved = (
             await routing.resolve_model_by_id(model_id)
@@ -138,6 +137,20 @@ async def get_chat_capabilities(
         routable = image_gate.get("available") is True
         result["available_image_variants"] = image_transport.available_image_variants(resolved) if routable else []
         result["max_image_count"] = image_transport.max_image_count(resolved) if routable else 0
+        if routable:
+            result.update(image_transport.available_image_options(resolved))
+            if "svg" in result.get("image_output_formats", ()):
+                from lumen.policy import authorize
+
+                if authorize("native:runs:write", token_info):
+                    try:
+                        authors = await routing.resolve_image_svg_authors(resolved)
+                    except errors.ChatStorageUnavailable as exc:
+                        raise HTTPException(status_code=503, detail="chat model configuration is unavailable") from exc
+                    result["image_svg_author_models"] = [
+                        {"model": row["api_model_name"], "reasoning_efforts": list(row["svg_reasoning_efforts"])}
+                        for row in authors
+                    ]
     if model_kind == "tts":
         audio_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("audio_output") or {}
         if audio_gate.get("available") is True:
@@ -155,14 +168,17 @@ async def get_chat_capabilities(
         gates = (resolved.get("capabilities") or {}).get("feature_gates") or {}
         kind = realtime_transport.realtime_kind(resolved) if realtime_transport.realtime_route_ready(resolved) else None
         result["realtime_kind"] = kind
-        # Native transcription needs input only; translation/live keep their compatible wires.
+        # Native transcription needs input only; every other kind also speaks audio back.
         if ((gates.get("audio_input") or {}).get("available") is True and (
-                kind == "transcription" or kind == "conversation"
+                kind == "transcription" or kind is not None
                 and (gates.get("audio_output") or {}).get("available") is True)):
             result.update(realtime_transport.available_realtime_options(resolved))
         else:
             result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,
-                          output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0)
+                          output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0,
+                          realtime_session_fields=[], available_reasoning_efforts=[],
+                          default_reasoning_effort=None, realtime_image_input=False,
+                          realtime_function_calling=False)
     if model_kind == "embedding":
         from lumen.services.embeddings import embedding_metadata
 

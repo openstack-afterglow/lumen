@@ -1017,7 +1017,7 @@ class TestConfigFingerprint:
             return chunks()
 
         monkeypatch.setattr(completion_api.provider_client, "acompletion_stream", complete_stream)
-        events = [event async for event in completion_api.complete_stream(
+        events = [event async for event in await completion_api.complete_stream(
             resolved=resolved, messages=[{"role": "user", "content": "hello"}],
             user_id="u1", project_id="p1", api_key_id=7,
             max_tokens=16, temperature=None,

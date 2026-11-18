@@ -14,22 +14,33 @@ frozen run ledger with event ``run:<run_id>``.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from typing import Any, Literal, NoReturn
 
 import anyio
 
 from lumen.config import get_settings
-from lumen.services import context_manager, credit, native_compaction, provider_client, provider_metadata
+from lumen.services import (
+    context_manager,
+    credit,
+    native_compaction,
+    openai_tool_policy,
+    provider_client,
+    provider_metadata,
+    stateless_credit,
+)
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
 from lumen.services.capabilities import reasoning_can_be_disabled
 from lumen.services.inference_authority import authorize_new_io, completion_scopes
-from lumen.services.provider_errors import BadRequestError
+from lumen.services.provider_errors import BadRequestError, OpenAIServiceTierMismatch, OpenAIUsageInvalid, ProviderError
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
 from lumen.services.providers.pricing import frozen_token_pricing
@@ -56,9 +67,10 @@ def select_api_provider(body_provider: str | None, header_provider: str | None) 
 class CompletionError(Exception):
     """포맷 무관 완료 오류 — 엔드포인트가 status_code 로 매핑."""
 
-    def __init__(self, status_code: int, message: str):
+    def __init__(self, status_code: int, message: str, *, code: str | None = None):
         self.status_code = status_code
         self.message = message
+        self.code = code
         super().__init__(message)
 
 
@@ -120,6 +132,247 @@ def clamp_max_tokens(requested: int | None) -> int:
     return value
 
 
+def _official_openai(resolved: dict) -> bool:
+    # Routing, validation and tariff selection share the same exact endpoint check.
+    return resolved.get("provider_type") == "openai" and provider_metadata.direct_provider_route(
+        "openai", resolved.get("api_base")
+    )
+
+
+def chat_provider_options(options: dict[str, Any], *, resolved: dict) -> dict[str, Any]:
+    validated = _openai_provider_options(options, resolved=resolved, effort=options.get("reasoning_effort"))
+    return validated if _official_openai(resolved) else {}
+
+
+def _openai_provider_options(options: dict[str, Any], *, resolved: dict, effort: Any) -> dict[str, Any]:
+    options = dict(options)
+    if options.pop("service_tier", None) not in (None, "default", "auto"):
+        raise CompletionError(422, "Only Standard processing is supported.", code="service_tier_unsupported")
+    if not _official_openai(resolved):
+        options.pop("prompt_cache_options", None)
+        options.pop("prompt_cache_retention", None)
+        options.pop("max_tool_calls", None)
+        return options
+    if "comparison_response_id" in (options.get("prompt_cache_options") or {}):
+        raise CompletionError(
+            422, "References to provider-side objects are not supported.", code="provider_reference_unsupported",
+        )
+    options["service_tier"] = "default"
+    catalog = provider_metadata.native_catalog_entry(resolved["model_name"], "openai", resolved.get("api_base"))
+    caps = resolved.get("capabilities") or {}
+    # The native model contract is authoritative where it publishes choices.
+    reasoning_options = catalog.get("reasoning_options") or caps.get("reasoning_options") or []
+    efforts = {value for option in reasoning_options if option["type"] == "effort" for value in option["values"]}
+    if effort is not None and (
+        not isinstance(effort, str)
+        or (efforts and effort not in efforts)
+        or (not efforts and effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+    ):
+        raise CompletionError(422, "Unsupported reasoning effort for this model.", code="reasoning_effort_unsupported")
+    if "prompt_cache_options" in options and "prompt_cache_retention" in options:
+        raise CompletionError(422, "Specify only one prompt-cache lifetime field.", code="prompt_cache_options_conflict")
+    pricing = catalog.get("token_pricing") or {}
+    if pricing.get("cache_write_ttl") == "30m" and "prompt_cache_retention" in options:
+        del options["prompt_cache_retention"]
+        options["prompt_cache_options"] = {"ttl": "30m"}
+    elif options.get("prompt_cache_retention") == "in-memory":
+        options["prompt_cache_retention"] = "in_memory"
+    return options
+
+
+def validate_openai_input(resolved: dict, messages: str | list[dict]) -> None:
+    if not _official_openai(resolved):
+        return
+    try:
+        openai_tool_policy.validate_input(messages)
+    except openai_tool_policy.UnsupportedProviderReference:
+        raise CompletionError(
+            422, "References to provider-side objects are not supported.", code="provider_reference_unsupported",
+        ) from None
+    except openai_tool_policy.UnsupportedHostedTool:
+        raise CompletionError(422, "Unsupported hosted tool in input.", code="hosted_tool_unsupported") from None
+
+
+def _bounded_openai_model(route: dict) -> dict:
+    return provider_metadata.bounded_openai_text_model(
+        route["model_name"], route.get("provider_type"), route.get("api_base"),
+    )
+
+
+def _chat_wire_budget(resolved: dict, requested: int | None) -> int | None:
+    if requested is None and (_official_openai(resolved) or resolved.get("provider_type") == "chatgpt"):
+        return None
+    return clamp_max_tokens(requested)
+
+
+def _chat_hold_output_budget(resolved: dict, wire_budget: int | None) -> int:
+    return wire_budget if wire_budget is not None else (
+        _bounded_openai_model(resolved).get("max_output_tokens") or _DEFAULT_MAX_TOKENS
+    )
+
+
+# Published patch caps multiplied and rounded up; see OpenAI's vision guide.
+_OPENAI_PATCH_IMAGE_CAPS = {
+    **dict.fromkeys(("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"), (308, 3_000, 36_000, 36_000)),
+    "gpt-5.5": (308, 3_000, 12_000, 12_000),
+    **dict.fromkeys(("gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"), (7_373, 3_000, 12_000, 3_000)),
+    "gpt-5.2": (7_373, 7_373, None, 7_373),
+}
+_OPENAI_TILED_IMAGE_RATES = {
+    "gpt-5.1": (70, 140), "gpt-5": (70, 140),
+    "gpt-4o": (85, 170), "gpt-4.1": (85, 170), "gpt-4o-mini": (2833, 5667), "o3": (75, 150),
+}
+
+
+def _openai_image_bound(model: str, detail: object) -> int | None:
+    levels = ("low", "high", "original", "auto")
+    if detail is None:
+        detail = "auto"
+    if detail not in levels:
+        return None
+    if patch_caps := _OPENAI_PATCH_IMAGE_CAPS.get(model):
+        return patch_caps[levels.index(detail)]
+    if detail != "original" and (tile_rates := _OPENAI_TILED_IMAGE_RATES.get(model)):
+        base, tile = tile_rates
+        return base if detail == "low" else base + 16 * tile  # at most 4×4 tiles after 2048px fit
+    return None
+
+
+def _request_input_bound(
+    route: dict, model: dict, *, messages: list[dict], tools: list[dict] | None, max_output: int,
+    prompt_options: dict, content_growth: bool,
+) -> tuple[int, bool]:
+    if max_output > model["max_output_tokens"]:
+        raise CompletionError(422, "Output token budget exceeds the model limit.", code="max_output_tokens_exceeded")
+    ceiling = model.get("max_input_tokens") or model["context_window"]
+    if ceiling <= 0:
+        raise CompletionError(422, "Input exceeds the model input limit.", code="context_length_exceeded")
+    prompt = {
+        "messages": messages,
+        "tools": tools or [],
+        **{name: prompt_options[name] for name in ("text", "response_format", "tool_choice") if name in prompt_options},
+    }
+    may_write_long = (prompt_options.get("prompt_cache_options") or {}).get("ttl") == "12h"
+    pending: list[Any] = [prompt]
+    image_tokens = image_wire_bytes = 0
+    while pending:
+        item = pending.pop()
+        if isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, dict):
+            kind = item.get("type")
+            if kind in ("input_image", "image_url", "computer_screenshot") and not content_growth:
+                url = item.get("image_url")
+                detail = url.get("detail") if isinstance(url, dict) else item.get("detail")
+                image_bound = _openai_image_bound(model["id"], detail)
+                if image_bound is None:
+                    content_growth = True
+                else:
+                    image_tokens += image_bound
+                    url = url.get("url") if isinstance(url, dict) else url
+                    if isinstance(url, str):
+                        # The JSON envelope includes the pixels/URL, which are not prompt text.
+                        image_wire_bytes += len(json.dumps(url, ensure_ascii=False).encode("utf-8", errors="surrogatepass")) - 2
+            elif kind in ("image", "file", "input_file", "input_audio", "audio_url"):
+                content_growth = True
+            breakpoint = item.get("prompt_cache_breakpoint")
+            if isinstance(breakpoint, dict) and breakpoint.get("ttl") == "12h":
+                may_write_long = True
+            if kind in ("mcp", "tool_search"):
+                content_growth = True
+            pending.extend(value for key, value in item.items() if key not in ("input_schema", "parameters", "schema"))
+    # Framing is a Lumen allowance, not a vendor tokenizer guarantee. Count
+    # encrypted reasoning bytes assuming ciphertext bytes >= replayed tokens.
+    # Usage over the bound cannot settle.
+    bound = ceiling
+    if not content_growth:
+        try:
+            size = len(json.dumps(prompt, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+        except (ValueError, UnicodeError):
+            raise CompletionError(422, "Invalid OpenAI request content.", code="invalid_request_body") from None
+        bound = min(ceiling, size - image_wire_bytes + image_tokens + 4_096 + 16 * (len(messages) + len(tools or ())))
+    # A full funding envelope does not exempt countable input from admission.
+    if bound == ceiling and model.get("max_input_tokens") is not None:
+        count = provider_metadata.count_context_tokens(route["model_name"], messages, tools).tokens
+        if count is not None and count > ceiling:
+            raise CompletionError(422, "Input exceeds the model input limit.", code="context_length_exceeded")
+    return bound, may_write_long
+
+
+@dataclass
+class _OnlineReservation:
+    event_id: str
+    credit_per_usd: Decimal
+    input_bound: int
+    output_bound: int
+    dispatched: bool = False
+    settled: bool = False
+    settling: bool = False
+
+    async def aclose(self) -> None:
+        if not self.settled:
+            with anyio.CancelScope(shield=True):
+                await stateless_credit.finish(self.event_id, uncertain=self.dispatched)
+            self.settled = True
+
+
+def _provider_rejected(hold: _OnlineReservation | None, exc: Exception) -> None:
+    if hold is not None and (
+        isinstance(exc, ProviderError) and exc.known_rejection or isinstance(exc, errors.ProviderSubscriptionError)
+    ):
+        hold.dispatched = False
+
+
+async def _reserve_online(
+    route: dict, *, messages: list[dict], tools: list[dict] | None, max_output: int,
+    user_id: str, project_id: str, api_key_id: int | None,
+    tool_bound_usd: Decimal = Decimal("0"),
+    prompt_options: dict | None = None,
+) -> _OnlineReservation | None:
+    model = _bounded_openai_model(route)
+    if not model:
+        if tool_bound_usd:
+            raise CompletionError(422, "Hosted tool pricing requires a bounded model.", code="pricing_unavailable")
+        return None
+    input_bound, may_write_long = _request_input_bound(
+        route, model, messages=messages, tools=tools, max_output=max_output,
+        prompt_options=prompt_options or {}, content_growth=bool(tool_bound_usd),
+    )
+    pricing = frozen_token_pricing(route)
+    if pricing["input_price_per_token"] is None or pricing["output_price_per_token"] is None:
+        raise CompletionError(422, "Model pricing unavailable.", code="pricing_unavailable")
+    if input_bound <= pricing["long_context_threshold_tokens"]:
+        pricing = {key: value for key, value in pricing.items() if not key.endswith("_above_200k")}
+    if (model.get("token_pricing") or {}).get("cache_write_long_ttl") == "12h" and not may_write_long:
+        pricing.pop("cache_write_1h_price_per_token", None)
+        pricing.pop("cache_write_1h_price_per_token_above_200k", None)
+    conversion = Decimal(str(get_settings().chat_credit_per_usd))
+    bound = credit.call_credit_bound(
+        {**pricing, "chat_credit_per_usd": conversion, "margin_multiplier": route["margin_multiplier"]},
+        input_tokens=input_bound, output_tokens=max_output,
+    )
+    if tool_bound_usd:
+        # Round the fee envelope outward without relying on ledger rounding.
+        bound += (tool_bound_usd * Decimal(str(route["margin_multiplier"])) * conversion).quantize(
+            Decimal("0.00000001"), rounding=ROUND_CEILING,
+        )
+    hold = _OnlineReservation(str(uuid.uuid4()), conversion, input_bound, max_output)
+    try:
+        await stateless_credit.reserve(
+            event_id=hold.event_id, user_id=user_id, project_id=project_id, api_key_id=api_key_id, bound=bound,
+        )
+    except credit.QuotaExceeded as exc:
+        raise CompletionError(429, str(exc)) from exc
+    except credit.ChatStorageUnavailable as exc:
+        raise CompletionError(503, "Credit reservation unavailable.") from exc
+    return hold
+
+
+def _unknown_provider_result(exc: ProviderError) -> CompletionError:
+    return CompletionError(502, exc.code, code="provider_result_unknown")
+
+
+
 def billing_route(
     resolved: dict, messages: list[dict], *, protocol: str, options: dict | None = None
 ) -> dict:
@@ -127,8 +380,7 @@ def billing_route(
 
     The chat allowlist is evidence about its transport, not a model-name guess.
     Native protocol adapters do not establish equivalent modality metering.
-    Online compatibility APIs hold no durable reservation; durable Batch
-    preparation reuses this freeze and adds its own frozen bound and hold.
+    Durable Batch and online official OpenAI routes with known limits add a hold.
     """
 
     route = deepcopy(resolved)
@@ -140,6 +392,23 @@ def billing_route(
     except errors.ProviderValidationError as exc:
         raise CompletionError(422, "model token pricing is invalid") from exc
     output_modalities = list((options or {}).get("modalities") or [])
+    if protocol == "chat":
+        validate_openai_input(route, messages)
+    if protocol == "anthropic" and _official_openai(route):
+        if (options or {}).get("container") is not None or any(
+            tool.get("type") not in (None, "custom") for tool in (options or {}).get("tools") or ()
+        ):
+            raise CompletionError(422, "hosted_tool_unsupported", code="hosted_tool_unsupported")
+        validate_openai_input(route, messages)
+        if _bounded_openai_model(route):
+            # Messages SSE does not preserve the original Responses accounting evidence.
+            raise CompletionError(422, "messages_accounting_unsupported", code="messages_accounting_unsupported")
+    if protocol == "chat" and _official_openai(route) and any(
+        tool.get("type") not in ("function", "custom") for tool in (options or {}).get("tools") or ()
+    ):
+        raise CompletionError(
+            422, "Use Responses for hosted tools.", code="hosted_tool_unsupported",
+        )
     if any(tool.get("type") == "image_generation" for tool in (options or {}).get("tools") or []):
         output_modalities.append("image")
     required = required_modalities_for_request(
@@ -209,6 +478,8 @@ async def _bill(
     user_id: str,
     project_id: str,
     api_key_id: int | None,
+    hold: _OnlineReservation | None = None,
+    tool_charges: dict | None = None,
 ) -> tuple[int, int, Decimal]:
     """extract_usage → cost_from_usage → apply_usage(source="api"). (pt, ct, credited) 반환.
 
@@ -228,11 +499,22 @@ async def _bill(
     required = resolved.get("required_token_modalities")
     if required is None:
         required = required_modalities_for_request(token_rates, messages=messages)
+    if hold is not None:
+        reported = UsageBreakdown.from_runtime(final_usage)
+        if reported is None or reported.modality_usage_invalid:
+            raise _unknown_provider_result(OpenAIUsageInvalid())
     breakdown = usage_breakdown_for_billing(
         model_name, token_rates=token_rates, required=required, messages=messages, text=text,
         final_usage=final_usage,
     )
     pt, ct = breakdown.input_tokens, breakdown.output_tokens
+    if hold is not None:
+        logger.info(
+            "OpenAI held usage reservation_id=%s input_tokens=%d input_bound=%d output_tokens=%d output_bound=%d",
+            hold.event_id, pt, hold.input_bound, ct, hold.output_bound,
+        )
+        if pt > hold.input_bound or ct > hold.output_bound:
+            raise CompletionError(502, "usage_exceeds_reservation", code="provider_result_unknown")
     try:
         usage_cost = provider_metadata.cost_from_usage(
             model_name,
@@ -262,25 +544,49 @@ async def _bill(
             required_modalities=required,
         )
     except ValueError as exc:
+        if hold is not None:
+            raise _unknown_provider_result(OpenAIUsageInvalid()) from exc
         if token_rates or required:
             raise CompletionError(502, "modality_usage_unavailable") from exc
         raise
-    credited = await credit.apply_usage(
-        event_id=event_id,
-        user_id=user_id,
-        project_id=project_id,
-        model_name=model_name,
-        provider=resolved.get("provider_name"),
-        prompt_tokens=pt,
-        completion_tokens=ct,
-        usage_cost=usage_cost,
-        margin_multiplier=resolved["margin_multiplier"],
-        conversation_id=None,
-        source="api",
-        api_key_id=api_key_id,
-        execution_route=resolved,
-        breakdown=breakdown,
-    )
+    if hold is not None and usage_cost.pricing_status != "priced":
+        raise _unknown_provider_result(OpenAIUsageInvalid())
+    if tool_charges:
+        fee = sum(Decimal(charge["cost"]) for charge in tool_charges.values())
+        usage_cost = replace(
+            usage_cost, raw_cost=usage_cost.raw_cost + fee,
+            pricing_snapshot={**usage_cost.pricing_snapshot, "hosted_tools": tool_charges},
+        )
+    settle = stateless_credit.settle if hold is not None else credit.apply_usage
+    if hold is not None:
+        hold.settling = True
+    try:
+        # Once we have terminal accounting evidence, finish the atomic write.
+        with anyio.CancelScope(shield=hold is not None):
+            credited = await settle(
+                event_id=event_id,
+                user_id=user_id,
+                project_id=project_id,
+                model_name=model_name,
+                provider=resolved.get("provider_name"),
+                prompt_tokens=pt,
+                completion_tokens=ct,
+                usage_cost=usage_cost,
+                margin_multiplier=resolved["margin_multiplier"],
+                conversation_id=None,
+                source="api",
+                api_key_id=api_key_id,
+                execution_route=resolved,
+                breakdown=breakdown,
+                **({"credit_per_usd": hold.credit_per_usd} if hold is not None else {}),
+            )
+    except stateless_credit.ChargeExceedsReservation as exc:
+        raise CompletionError(502, "charge_exceeds_reservation", code="provider_result_unknown") from exc
+    finally:
+        if hold is not None:
+            hold.settling = False
+    if hold is not None:
+        hold.settled = True
     return pt, ct, credited
 
 
@@ -344,6 +650,7 @@ async def invoke_chat_once(
     temperature: float | None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
+    options: dict | None = None,
     provider_once: bool = False,
 ) -> ChatInvocation:
     """Send one nonstreaming chat request on an already frozen route; no billing.
@@ -351,7 +658,7 @@ async def invoke_chat_once(
     Provider exceptions propagate unchanged so each caller keeps its own error
     contract. ``provider_once`` disables every transport retry/re-send layer.
     """
-    extra_kwargs: dict[str, Any] = {"capabilities_override": resolved.get("capabilities") or {}}
+    extra_kwargs: dict[str, Any] = {**(options or {}), "capabilities_override": resolved.get("capabilities") or {}}
     if tool_choice is not None:
         extra_kwargs["tool_choice"] = tool_choice
     resp = await provider_client.acompletion(
@@ -367,6 +674,8 @@ async def invoke_chat_once(
         provider_auth=resolved.get("provider_auth"),
         **({"provider_once": True} if provider_once else {}),
     )
+    if _official_openai(resolved) and isinstance(resp, dict):
+        provider_client.check_openai_tier(resp)
     choice = resp.choices[0]
     msg = choice.message
     return ChatInvocation(
@@ -390,32 +699,46 @@ async def complete_once(
     temperature: float | None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
+    options: dict | None = None,
 ) -> dict:
     """비스트리밍 완료 — 전체 응답 반환 + 과금. tool_calls 는 릴레이(서버 미실행)."""
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
     await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
+    options = chat_provider_options(options or {}, resolved=resolved)
+    max_output = _chat_wire_budget(resolved, max_tokens)
+    hold = await _reserve_online(
+        resolved, messages=messages, tools=tools, max_output=_chat_hold_output_budget(resolved, max_output),
+        user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+        prompt_options={**options, "tool_choice": tool_choice},
+    )
     try:
+        if hold is not None:
+            hold.dispatched = True
         invocation = await invoke_chat_once(
             resolved=resolved,
             messages=messages,
-            max_tokens=(None if resolved.get("provider_type") == "chatgpt" and max_tokens is None
-                        else clamp_max_tokens(max_tokens)),
+            max_tokens=max_output,
             temperature=temperature,
             tools=tools,
             tool_choice=tool_choice,
+            options=options,
+        )
+        pt, ct, credited = await _bill(
+            resolved, messages, invocation.content, invocation.usage,
+            event_id=hold.event_id if hold else str(uuid.uuid4()), user_id=user_id, project_id=project_id,
+            api_key_id=api_key_id, hold=hold,
         )
     except errors.ProviderSubscriptionError as exc:
+        _provider_rejected(hold, exc)
         raise CompletionError(exc.status_code, exc.message) from None
-    pt, ct, credited = await _bill(
-        resolved,
-        messages,
-        invocation.content,
-        invocation.usage,
-        event_id=str(uuid.uuid4()),
-        user_id=user_id,
-        project_id=project_id,
-        api_key_id=api_key_id,
-    )
+    except (OpenAIServiceTierMismatch, OpenAIUsageInvalid) as exc:
+        raise _unknown_provider_result(exc) from None
+    except ProviderError as exc:
+        _provider_rejected(hold, exc)
+        raise
+    finally:
+        if hold is not None:
+            await hold.aclose()
     return {
         "model": invocation.model,
         "content": invocation.content,
@@ -423,14 +746,13 @@ async def complete_once(
         "finish_reason": invocation.finish_reason,
         "prompt_tokens": pt,
         "completion_tokens": ct,
-        "cache_read_input_tokens": (
-            UsageBreakdown.from_runtime(invocation.usage) or UsageBreakdown(0, 0)
-        ).cache_read_input_tokens,
+        **(UsageBreakdown.from_runtime(invocation.usage) or UsageBreakdown(0, 0)).cache_fields(),
+        "openai_cache_ttl": _official_openai(resolved),
         "credited_cost": float(credited),
     }
 
 
-def complete_stream(
+async def complete_stream(
     *,
     resolved: dict,
     messages: list[dict],
@@ -441,14 +763,24 @@ def complete_stream(
     temperature: float | None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
+    options: dict | None = None,
 ) -> AsyncIterator[dict]:
     """Validate/freeze before HTTP streaming starts, then return the completion iterator."""
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
-    return _complete_stream(
-        resolved=resolved, messages=messages, user_id=user_id, project_id=project_id,
-        api_key_id=api_key_id, max_tokens=max_tokens, temperature=temperature,
-        tools=tools, tool_choice=tool_choice,
+    options = chat_provider_options(options or {}, resolved=resolved)
+    max_output = _chat_wire_budget(resolved, max_tokens)
+    await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
+    hold = await _reserve_online(
+        resolved, messages=messages, tools=tools, max_output=_chat_hold_output_budget(resolved, max_output),
+        user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+        prompt_options={**options, "tool_choice": tool_choice},
     )
+    events = _complete_stream(
+        resolved=resolved, messages=messages, user_id=user_id, project_id=project_id,
+        api_key_id=api_key_id, max_tokens=max_output, temperature=temperature,
+        tools=tools, tool_choice=tool_choice, options=options, hold=hold,
+    )
+    return _ProviderEvents(events, None, hold) if hold is not None else events
 
 
 @receipt_owner
@@ -463,6 +795,8 @@ async def _complete_stream(
     temperature: float | None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
+    options: dict,
+    hold: _OnlineReservation | None,
 ) -> AsyncIterator[dict]:
     """스트리밍 완료 — 정규화 델타 yield 후 최종 done. 종료 시 과금(정확히 1회).
 
@@ -472,34 +806,36 @@ async def _complete_stream(
       {"type":"error", "message":str}
     """
     text_parts: list[str] = []
-    await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
     final_usage = None
     finish_reason = "stop"
     charged = False
     gen = None
-    event_id = str(uuid.uuid4())  # 요청당 1개 — 정상/finally 재과금 모두 재사용(멱등, 이중과금 방지)
-    extra_kwargs: dict[str, Any] = {"capabilities_override": resolved.get("capabilities") or {}}
+    event_id = hold.event_id if hold is not None else str(uuid.uuid4())
+    extra_kwargs: dict[str, Any] = {**options, "capabilities_override": resolved.get("capabilities") or {}}
     if tool_choice is not None:
         extra_kwargs["tool_choice"] = tool_choice
     # One finally owns the provider stream and partial billing: a consumer close
     # (GeneratorExit) at any delta yield must still close upstream and bill.
     try:
         try:
+            if hold is not None:
+                hold.dispatched = True
             gen = await provider_client.acompletion_stream(
                 resolved["model_name"],
                 messages,
                 api_base=resolved.get("api_base"),
                 api_key=resolved.get("api_key"),
                 custom_llm_provider=resolved.get("provider_type"),
-                max_tokens=(None if resolved.get("provider_type") == "chatgpt" and max_tokens is None
-                            else clamp_max_tokens(max_tokens)),
+                max_tokens=max_tokens,
                 temperature=temperature,
                 tools=tools,
                 extra=extra_kwargs or None,
-                reasoning_effort=_reasoning_effort(None, resolved),
+                reasoning_effort=_reasoning_effort(options.get("reasoning_effort"), resolved),
                 provider_auth=resolved.get("provider_auth"),
             )
             async for chunk in gen:
+                if _official_openai(resolved) and isinstance(chunk, dict):
+                    provider_client.check_openai_tier(chunk)
                 u = getattr(chunk, "usage", None)
                 if u is not None:
                     final_usage = u
@@ -525,24 +861,35 @@ async def _complete_stream(
                         "finish_reason": fr,
                     }
         except errors.ProviderSubscriptionError as exc:
+            _provider_rejected(hold, exc)
             logger.warning("API 구독 스트리밍 실패 model=%s code=%s", resolved.get("model_name"), exc.code)
             yield {"type": "error", "code": exc.code, "message": exc.message}
+            return
+        except ProviderError as exc:
+            _provider_rejected(hold, exc)
+            if isinstance(exc, (OpenAIServiceTierMismatch, OpenAIUsageInvalid)):
+                # The HTTP consumer closes immediately after receiving the error.
+                text_parts.clear()
+            if hold is not None and hold.dispatched:
+                yield {"type": "error", "code": "provider_result_unknown", "message": exc.code}
+            else:
+                yield {"type": "error", "message": "생성 중 오류가 발생했습니다"}
             return
         except Exception:
             logger.warning("API 스트리밍 실패 model=%s", resolved.get("model_name"), exc_info=True)
             yield {"type": "error", "message": "생성 중 오류가 발생했습니다"}
             return
 
-        pt, ct, credited = await _bill(
-            resolved,
-            messages,
-            "".join(text_parts),
-            final_usage,
-            event_id=event_id,
-            user_id=user_id,
-            project_id=project_id,
-            api_key_id=api_key_id,
-        )
+        try:
+            pt, ct, credited = await _bill(
+                resolved, messages, "".join(text_parts), final_usage, event_id=event_id,
+                user_id=user_id, project_id=project_id, api_key_id=api_key_id, hold=hold,
+            )
+        except CompletionError as exc:
+            if hold is None:
+                raise
+            yield {"type": "error", "code": exc.code, "message": exc.message}
+            return
         charged = True
         yield {
             "type": "done",
@@ -550,9 +897,8 @@ async def _complete_stream(
             "completion_tokens": ct,
             "finish_reason": finish_reason,
             "credited_cost": float(credited),
-            "cache_read_input_tokens": (
-                UsageBreakdown.from_runtime(final_usage) or UsageBreakdown(0, 0)
-            ).cache_read_input_tokens,
+            **(UsageBreakdown.from_runtime(final_usage) or UsageBreakdown(0, 0)).cache_fields(),
+            "openai_cache_ttl": _official_openai(resolved),
         }
     finally:
         # An ASGI disconnect is a level-triggered AnyIO cancel that can land at the
@@ -561,7 +907,9 @@ async def _complete_stream(
             try:
                 await _close_provider_stream(gen)
             finally:
-                if not charged and text_parts and not resolved.get("token_rates"):
+                if hold is not None:
+                    await hold.aclose()
+                elif not charged and text_parts and not resolved.get("token_rates"):
                     try:
                         await _bill(
                             resolved,
@@ -592,6 +940,9 @@ async def _close_provider_stream(stream: Any) -> None:
         logger.warning("provider stream close failed", exc_info=True)
 
 
+_HELD_STREAM_DRAIN_SECONDS = 15.0
+
+
 class _ProviderEvents:
     """Native events that release their eagerly opened provider stream even if never iterated.
 
@@ -599,25 +950,74 @@ class _ProviderEvents:
     response body generator never starts. ``aclose`` is idempotent.
     """
 
-    def __init__(self, events: AsyncIterator[dict], provider_stream: Any):
+    def __init__(self, events: AsyncIterator[dict], provider_stream: Any, hold: _OnlineReservation | None = None):
         self._events = events
         self._provider_stream = provider_stream
+        self._hold = hold
+        self._pending: asyncio.Task | None = None
+        self._ended = False
         self._closed = False
+
+    @property
+    def owns_disconnect_drain(self) -> bool:
+        return self._hold is not None
 
     def __aiter__(self) -> _ProviderEvents:
         return self
 
     async def __anext__(self) -> dict:
-        return await self._events.__anext__()
+        if self._closed or self._ended:
+            raise StopAsyncIteration
+        if self._hold is None:
+            return await anext(self._events)
+        return await self._next_held()
+
+    async def _next_held(self) -> dict:
+        # Client cancellation must not be injected into an active provider read.
+        if self._pending is None:
+            self._pending = asyncio.create_task(anext(self._events))
+        try:
+            item = await asyncio.shield(self._pending)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._pending = None
+            self._ended = True
+            raise
+        self._pending = None
+        return item
+
+    async def _drain_held(self) -> None:
+        if self._hold is None or not self._hold.dispatched or self._hold.settled or self._ended:
+            return
+        with anyio.move_on_after(_HELD_STREAM_DRAIN_SECONDS), suppress(StopAsyncIteration):
+            while not self._hold.settled:
+                await self._next_held()
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
-        try:
-            await self._events.aclose()  # a started stream settles billing here
-        finally:
-            await _close_provider_stream(self._provider_stream)
+        with anyio.CancelScope(shield=True):
+            try:
+                await self._drain_held()
+            except Exception:
+                logger.warning("provider stream failed after client disconnect")
+            finally:
+                if self._pending is not None:
+                    # The drain deadline stops provider reads, not terminal settlement.
+                    if self._hold is None or not self._hold.settling:
+                        self._pending.cancel()
+                    await asyncio.gather(self._pending, return_exceptions=True)
+                    self._pending = None
+                try:
+                    await self._events.aclose()
+                finally:
+                    try:
+                        await _close_provider_stream(self._provider_stream)
+                    finally:
+                        if self._hold is not None:
+                            await self._hold.aclose()
 
 
 def _native_dict(value: Any) -> dict:
@@ -725,7 +1125,8 @@ def responses_input_messages(input_value: str | list[dict]) -> list[dict]:
 
 def responses_provider_options(options: dict[str, Any], *, resolved: dict) -> dict[str, Any]:
     """Drop reasoning only for a model an operator/catalog explicitly marked unsupported."""
-    options = dict(options)
+    reasoning = options.get("reasoning") or {}
+    options = _openai_provider_options(options, resolved=resolved, effort=reasoning.get("effort"))
     if resolved.get("reasoning_unsupported") is True:
         options.pop("reasoning", None)
         if include := options.get("include"):
@@ -761,13 +1162,17 @@ async def invoke_responses_once(
         **({"provider_once": True} if provider_once else {}),
         **options,
     )
+    if _official_openai(resolved) and isinstance(response, dict):
+        provider_client.check_openai_tier(response)
     return _native_dict(response)
 
 
-def _raise_responses_error(exc: Exception, resolved: dict) -> NoReturn:
+def _raise_responses_error(exc: Exception, resolved: dict, hold: _OnlineReservation | None) -> NoReturn:
     """Map one Responses provider failure to the online compatibility error contract."""
     if isinstance(exc, CompletionError):
         raise exc
+    if hold is not None and hold.dispatched and isinstance(exc, (OpenAIServiceTierMismatch, OpenAIUsageInvalid)):
+        raise _unknown_provider_result(exc) from None
     if isinstance(exc, errors.ProviderSubscriptionError):
         raise CompletionError(exc.status_code, exc.message) from None
     if isinstance(exc, BadRequestError):
@@ -789,31 +1194,74 @@ async def complete_responses(
     options: dict[str, Any],
 ) -> dict | AsyncIterator[dict]:
     """Execute the native Responses protocol and preserve every upstream item/event."""
-    messages = responses_input_messages(input)
-    resolved = billing_route(resolved, messages, protocol="responses", options=options)
-    event_id = str(uuid.uuid4())
+    official = _official_openai(resolved)
+    catalog = provider_metadata.native_catalog_entry(
+        resolved["model_name"], "openai", resolved.get("api_base"),
+    ) if official else {}
     options = responses_provider_options(
         _with_passthrough_compaction(options, resolved=resolved, protocol="responses"), resolved=resolved
     )
+    try:
+        meter = openai_tool_policy.admit(
+            input, options, metered=catalog.get("id") in openai_tool_policy.METERED_MODELS,
+        ) if official else None
+    except openai_tool_policy.UnsupportedProviderReference:
+        raise CompletionError(
+            422, "References to provider-side objects are not supported.", code="provider_reference_unsupported",
+        ) from None
+    except openai_tool_policy.UnsupportedHostedTool:
+        raise CompletionError(
+            422, "Tool configuration uses unsupported provider-side state or fees.", code="hosted_tool_unsupported",
+        ) from None
+    messages = responses_input_messages(input)
+    if options.get("instructions"):
+        messages = [{"role": "system", "content": options["instructions"]}, *messages]
+    resolved = billing_route(resolved, messages, protocol="responses", options=options)
     await _authorize_completion(user_id, project_id, api_key_id, options, resolved)
+    hold = await _reserve_online(
+        resolved, messages=messages, tools=options.get("tools"),
+        max_output=options.get("max_output_tokens") or catalog.get("max_output_tokens") or _DEFAULT_MAX_TOKENS,
+        user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+        tool_bound_usd=meter.bound_usd if meter is not None else Decimal("0"), prompt_options=options,
+    )
+    event_id = hold.event_id if hold is not None else str(uuid.uuid4())
+
+    async def settle(payload: dict, streamed_text: str = "") -> None:
+        try:
+            if hold is not None and payload.get("status") not in ("completed", "incomplete"):
+                raise OpenAIUsageInvalid()
+            if meter is not None:
+                provider_client.check_openai_tier(payload)
+                tool_charges = meter.charges(payload.get("output"))
+            else:
+                tool_charges = None
+        except (OpenAIServiceTierMismatch, OpenAIUsageInvalid) as exc:
+            if hold is not None and hold.dispatched:
+                raise _unknown_provider_result(exc) from None
+            raise CompletionError(502, "upstream model error") from None
+        text, usage = responses_usage(payload, strict=hold is not None or bool(resolved.get("token_rates")))
+        await _bill(
+            resolved, messages, streamed_text or text, usage,
+            event_id=event_id, user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+            hold=hold, tool_charges=tool_charges,
+        )
+
     if not stream:
         try:
+            if hold is not None:
+                hold.dispatched = True
             payload = await invoke_responses_once(resolved=resolved, input=input, options=options)
+            await settle(payload)
+            return payload
         except Exception as exc:
-            _raise_responses_error(exc, resolved)
-        text, usage = responses_usage(payload, strict=bool(resolved.get("token_rates")))
-        await _bill(
-            resolved,
-            messages,
-            text,
-            usage,
-            event_id=event_id,
-            user_id=user_id,
-            project_id=project_id,
-            api_key_id=api_key_id,
-        )
-        return payload
+            _provider_rejected(hold, exc)
+            _raise_responses_error(exc, resolved, hold)
+        finally:
+            if hold is not None:
+                await hold.aclose()
     try:
+        if hold is not None:
+            hold.dispatched = True
         response = await provider_client.aresponses(
             model=resolved["model_name"],
             input=input,
@@ -825,7 +1273,14 @@ async def complete_responses(
             **options,
         )
     except Exception as exc:
-        _raise_responses_error(exc, resolved)
+        if hold is not None:
+            _provider_rejected(hold, exc)
+            await hold.aclose()
+        _raise_responses_error(exc, resolved, hold)
+    except BaseException:
+        if hold is not None:
+            await hold.aclose()
+        raise
 
     async def events() -> AsyncIterator[dict]:
         charged = False
@@ -838,26 +1293,23 @@ async def complete_responses(
                 if event_type == "response.output_text.delta" and isinstance(event.get("delta"), str):
                     text_parts.append(event["delta"])
                 if event_type == "response.completed" and isinstance(event.get("response"), dict):
-                    completed = event["response"]
                     settlement_attempted = True
-                    await _bill(
-                        resolved,
-                        messages,
-                        "".join(text_parts) or _native_text(completed.get("output", [])),
-                        _native_usage(completed, protocol="responses", strict=bool(resolved.get("token_rates"))),
-                        event_id=event_id,
-                        user_id=user_id,
-                        project_id=project_id,
-                        api_key_id=api_key_id,
-                    )
+                    await settle(event["response"], "".join(text_parts))
                     charged = True
                 yield event
+        except (OpenAIServiceTierMismatch, OpenAIUsageInvalid) as exc:
+            text_parts.clear()
+            if hold is not None and hold.dispatched:
+                raise _unknown_provider_result(exc) from None
+            raise CompletionError(502, "upstream model error") from None
         finally:
             # Stop upstream generation first; close failures are logged, never skip billing.
             await _close_provider_stream(response)
-            if (
+            if hold is not None:
+                await hold.aclose()
+            elif (
                 not charged and text_parts and not resolved.get("required_token_modalities")
-                and not (resolved.get("token_rates") and settlement_attempted)
+                and not (settlement_attempted and (official or resolved.get("token_rates")))
             ):
                 try:
                     await _bill(
@@ -873,7 +1325,7 @@ async def complete_responses(
                 except Exception:
                     logger.warning("Responses partial-stream accounting failed", exc_info=True)
 
-    return _ProviderEvents(events(), response)
+    return _ProviderEvents(events(), response, hold)
 
 
 @receipt_owner

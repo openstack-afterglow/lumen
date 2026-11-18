@@ -8,8 +8,10 @@ import httpx
 import pytest
 
 from lumen.services import credit
+from lumen.services.provider_metadata import native_catalog_entry
 from lumen.services.providers import image_transport, pricing
 from lumen.services.providers.errors import ProviderValidationError
+from lumen.services.providers.image_billing import output_token_bound
 
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/"
@@ -141,7 +143,7 @@ def test_capability_variant_projection_omits_unexecutable_prices():
 ])
 async def test_openai_rejects_urls_invalid_and_oversized_output(monkeypatch, body):
     _mock_provider(monkeypatch, lambda request: httpx.Response(200, json=body))
-    route = _route("openai", "gpt-image-1", {"auto:auto": "0.10"})
+    route = _route("openai", "gpt-image-2", {"auto:auto": "0.10"})
     with pytest.raises(image_transport.ImageTransportError):
         await image_transport.generate_images(route, prompt="draw", size="auto", quality="auto", n=1)
 
@@ -366,3 +368,339 @@ def test_complexity_is_fingerprinted_only_when_requested():
     assert "complexity" not in durable_images._intent(base)
     assert "complexity" not in durable_images._intent({**base, "complexity": None})
     assert durable_images._intent({**base, "complexity": "low"})["complexity"] == "low"
+
+
+def _catalog_route(model):
+    catalog = native_catalog_entry(model, "openai")
+    route = _route("openai", model, {})
+    return {**route, "media_pricing": catalog["media_pricing"],
+            "input_price_per_token": Decimal(catalog["token_pricing"]["input"]) / 1_000_000}
+
+
+@pytest.mark.parametrize("model,image_input,image_output,image_cache", [
+    ("gpt-image-2", "8", "30", None),
+    ("gpt-image-2-2026-04-21", "8", "30", None),
+    ("gpt-image-2.5-sunburst", "8", "30", None),
+    ("gpt-image-2.5-sunburst-2026-09-08", "8", "30", None),
+    ("gpt-image-2.5-flare", "8", "30", None),
+    ("gpt-image-2.5-flare-2026-09-08", "8", "30", None),
+    ("gpt-image-2.6-sunburst", "8", "30", None),
+    ("gpt-image-2.6-flare", "8", "30", None),
+    ("gpt-image-1.5", "8", "32", "2"),
+    ("gpt-image-1.5-2025-12-16", "8", "32", "2"),
+    ("gpt-image-1-mini", "2.5", "8", "0.25"),
+    ("chatgpt-image-latest", "8", "32", "2"),
+])
+def test_catalog_image_routes_are_priced_without_manual_reservation(model, image_input, image_output, image_cache):
+    route = _catalog_route(model)
+    rates = pricing.route_token_rates(route)["image"]
+    assert (rates["input_per_million"], rates["output_per_million"], rates.get("cache_read_per_million")) == (
+        image_input, image_output, image_cache,
+    )
+    assert "reservation_usd" not in route["media_pricing"]
+    assert image_transport.image_route_ready(route)
+    assert image_transport.available_image_options(route)["image_output_price_per_million"] == image_output
+    assert not image_transport.image_route_ready({**route, "api_base": "https://proxy.example/v1"})
+
+
+def test_retired_image_id_is_not_directly_executable():
+    assert not image_transport.image_route_ready(_route("openai", "gpt-image-1", {"auto:auto": "0.10"}))
+
+
+@pytest.mark.parametrize("model,size,quality,tokens", [
+    ("gpt-image-2-2026-04-21", "auto", "auto", 35579),
+    ("gpt-image-2", "1024x1536", "high", 8232),
+    ("gpt-image-2.5-sunburst", "1024x1024", "high", 2634),
+    ("gpt-image-2.6-sunburst", "1024x1024", "low", 1235),
+    ("gpt-image-2.6-flare", "1024x1536", "medium", 1698),
+    ("gpt-image-2.6-flare", "2880x2880", "max", 35579),
+    ("gpt-image-1.5", "auto", "auto", 9423),
+    ("gpt-image-1-mini", "1024x1024", "low", 1125),
+])
+def test_image_output_token_bounds(model, size, quality, tokens):
+    assert output_token_bound(model, size, quality) == tokens
+
+
+def test_request_hold_scales_with_count_frames_utf8_and_scanned_source():
+    route_25 = _catalog_route("gpt-image-2.5-sunburst")
+    route_26 = _catalog_route("gpt-image-2.6-flare")
+    basic = {"size": "1024x1024", "quality": "high", "prompt": "Draw", "n": 1, "edit": False}
+    assert image_transport.validate_image_request(route_25, **basic) == Decimal("0.080320")
+    assert image_transport.validate_image_request(
+        route_26, **{**basic, "size": "auto", "quality": "auto", "n": 2},
+    ) == Decimal("2.136040")
+    assert image_transport.validate_image_request(
+        route_25, **{**basic, "edit": True}, source_dimensions=(1024, 1024),
+    ) == Decimal("0.211392")
+    assert image_transport.validate_image_request(
+        route_26, **{**basic, "n": 2, "prompt": "그려"}, output_format="gif", frame_count=3,
+    ) == Decimal("0.475430")
+    with pytest.raises(ProviderValidationError, match="scanned source image dimensions"):
+        image_transport.validate_image_request(route_25, **{**basic, "edit": True})
+
+
+@pytest.mark.parametrize("model,changes", [
+    ("gpt-image-2.5-sunburst", {"output_format": "gif"}),
+    ("gpt-image-2.5-sunburst", {"output_format": "svg"}),
+    ("gpt-image-2.6-flare", {"output_format": "svg", "n": 2}),
+    ("gpt-image-2.6-flare", {"output_format": "svg", "edit": True}),
+    ("gpt-image-2.6-flare", {"output_format": "jpeg", "background": "transparent"}),
+    ("gpt-image-2.6-flare", {"output_compression": 100}),
+    ("gpt-image-2.6-flare", {"output_format": "jpeg", "output_compression": 101}),
+    ("gpt-image-2.6-flare", {"output_format": "webp", "frame_count": 4}),
+    ("gpt-image-2.6-flare", {"output_format": "gif", "frame_count": 1}),
+    ("gpt-image-2.6-flare", {"output_format": "gif", "frame_duration_ms": 2001}),
+    ("gpt-image-2.6-flare", {"output_format": "gif", "size": "2880x2880", "n": 2}),
+])
+def test_image_format_validation_rejects_unsupported_combinations(model, changes):
+    with pytest.raises(ProviderValidationError):
+        image_transport.validate_image_request(
+            _catalog_route(model), **{"size": "1024x1024", "quality": "high", "n": 1, "edit": False, **changes},
+        )
+
+
+@pytest.mark.asyncio
+async def test_images_wire_forwards_raster_options_and_parses_image_only_usage(monkeypatch):
+    route = _catalog_route("gpt-image-2.6-flare")
+    options = {"background": "transparent", "output_format": "webp", "output_compression": 0, "complexity": "high"}
+    encoded = base64.b64encode(b"RIFF0123WEBP").decode()
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200, json={"data": [{"b64_json": encoded}], "usage": {
+            "input_tokens": 13, "input_tokens_details": {"image_tokens": 0, "text_tokens": 13},
+            "output_tokens": 58, "total_tokens": 71,
+        }})
+
+    _mock_provider(monkeypatch, handle)
+    args = {"prompt": "Draw", "size": "1024x1024", "quality": "high", "n": 1}
+    result = await image_transport.generate_images(route, **args, **options)
+    assert result.images == [(b"RIFF0123WEBP", "image/webp")]
+    assert result.usage.modality_tokens["image"].output_tokens == 58
+    assert json.loads(requests[0].content) == {"model": "gpt-image-2.6-flare", **args, **options}
+    await image_transport.generate_images(route, **args, **options, source_image=_PNG,
+                                          source_mime="image/png", source_dimensions=(1, 1))
+    for key, value in options.items():
+        assert f'name="{key}"\r\n\r\n{value}\r\n'.encode() in requests[1].content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_format,bytes_,mime", [
+    ("gif", b"GIF89a\x01", "image/gif"),
+    ("svg", b'<svg xmlns="http://www.w3.org/2000/svg"/>', "image/svg+xml"),
+])
+async def test_gif_svg_wire_preserves_authoring_and_format(monkeypatch, output_format, bytes_, mime):
+    author_usage = {"model": "gpt-4.1-mini", "input_tokens": 20, "output_tokens": 200,
+                    "total_tokens": 220, "reasoning_tokens": 40}
+    frames = {"frame_count": 4, "frame_duration_ms": 250} if output_format == "gif" else {}
+
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["output_format"] == output_format and "svg" not in body
+        for name, value in frames.items():
+            assert body[name] == value
+        data = {"data": [{"b64_json": base64.b64encode(bytes_).decode()}],
+                "usage": {"input_tokens": 13, "output_tokens": 58, "total_tokens": 71,
+                          "input_tokens_details": {"text_tokens": 13, "image_tokens": 0}}}
+        if output_format == "svg":
+            data["svg_usage"] = author_usage
+        return httpx.Response(200, json=data)
+
+    _mock_provider(monkeypatch, handler)
+    result = await image_transport.generate_images(
+        _catalog_route("gpt-image-2.6-flare"), prompt="Draw", size="1024x1024", quality="low", n=1,
+        output_format=output_format, **frames,
+    )
+    assert result.images == [(bytes_, mime)]
+    assert result.svg_usage == (author_usage if output_format == "svg" else None)
+
+
+@pytest.mark.parametrize("size,count,frames,accepted", [
+    ("1024x1024", 2, 5, True),
+    ("1040x1024", 2, 5, False),
+    ("auto", 1, 2, False),
+])
+def test_gif_budget_is_bounded_by_the_output_byte_policy(size, count, frames, accepted):
+    route = _catalog_route("gpt-image-2.6-flare")
+    if accepted:
+        assert image_transport.validate_image_request(
+            route, size=size, quality="low", n=count, edit=False, output_format="gif", frame_count=frames,
+        ) > 0
+    else:
+        with pytest.raises(ProviderValidationError, match="GIF"):
+            image_transport.validate_image_request(
+                route, size=size, quality="low", n=count, edit=False, output_format="gif", frame_count=frames,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.6-flare"])
+async def test_direct_openai_image_cached_usage_fails_closed(monkeypatch, model):
+    _mock_provider(monkeypatch, lambda request: httpx.Response(200, json={
+        "data": [{"b64_json": base64.b64encode(_PNG).decode()}],
+        "usage": {"input_tokens": 12, "output_tokens": 50, "total_tokens": 62,
+                  "input_tokens_details": {"text_tokens": 12, "image_tokens": 0, "cached_tokens": 1}},
+    }))
+    with pytest.raises(image_transport.ImageTransportError, match="usage"):
+        await image_transport.generate_images(
+            _catalog_route(model), prompt="Draw", size="1024x1024", quality="high", n=1,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inconsistent_usage", [False, True])
+async def test_svg_author_selection_wire_and_inconsistent_usage(monkeypatch, inconsistent_usage):
+    from lumen.services.providers.image_billing import svg_author_pricing
+
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["svg"] == {"model": "gpt-5", "reasoning": {"effort": "low"}}
+        assert "svg_model" not in body and "svg_reasoning_effort" not in body
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(b'<svg xmlns="http://www.w3.org/2000/svg"/>').decode()}],
+            "usage": {"input_tokens": 12, "output_tokens": 50, "total_tokens": 62,
+                      "input_tokens_details": {"text_tokens": 12, "image_tokens": 0}},
+            "svg_usage": {"model": "gpt-5", "input_tokens": 20, "output_tokens": 200,
+                          "total_tokens": 221 if inconsistent_usage else 220, "reasoning_tokens": 40},
+        })
+
+    _mock_provider(monkeypatch, handler)
+    kwargs = dict(prompt="Draw", size="1024x1024", quality="high", n=1, output_format="svg",
+                  svg_model="gpt-5", svg_reasoning_effort="low", author_prices={"gpt-5": svg_author_pricing()["gpt-5"]})
+    route = _catalog_route("gpt-image-2.6-flare")
+    if inconsistent_usage:
+        with pytest.raises(image_transport.ImageTransportError, match="SVG authoring usage"):
+            await image_transport.generate_images(route, **kwargs)
+    else:
+        assert (await image_transport.generate_images(route, **kwargs)).svg_usage["model"] == "gpt-5"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["mask", "markup"])
+async def test_openai_edit_forwards_ordered_sources_overlay_and_moderation(monkeypatch, field):
+    def handler(request):
+        assert request.url.path.endswith("/images/edits")
+        assert request.content.count(b'name="image[]"') == 2
+        assert request.content.index(_PNG) < request.content.index(b"\xff\xd8\xffmock")
+        assert f'name="{field}"'.encode() in request.content
+        assert b'name="moderation"\r\n\r\nlow\r\n' in request.content
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(_PNG).decode()}],
+            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+                      "input_tokens_details": {"text_tokens": 5, "image_tokens": 95}},
+        })
+
+    _mock_provider(monkeypatch, handler)
+    route = _catalog_route("gpt-image-2.5-flare")
+    args = dict(prompt="Draw", size="1024x1024", quality="high", n=1, source_dimensions=(1, 1),
+                additional_dimensions=[[1, 1], [1, 1]], moderation="low")
+    hold = image_transport.validate_image_request(route, edit=True, source_count=2, overlay=field, **args)
+    assert hold == Decimal("0.289216")  # $0.080320 + (3 × 8704 × $8/1M).
+    result = await image_transport.generate_images(
+        route, source_image=_PNG, source_mime="image/png",
+        additional_sources=[(b"\xff\xd8\xffmock", "image/jpeg")],
+        overlay_data=(field, _PNG, "image/png"), **args,
+    )
+    assert result.usage.modality_tokens["image"].input_tokens == 95
+
+
+@pytest.mark.parametrize("model,fidelity,accepted", [
+    ("gpt-image-1.5", "high", True), ("gpt-image-1-mini", "low", True),
+    ("gpt-image-1-mini", "high", False), ("gpt-image-2", "low", False),
+])
+def test_image_input_fidelity_is_model_scoped(model, fidelity, accepted):
+    route = _catalog_route(model)
+    if accepted:
+        assert image_transport.validate_image_request(
+            route, size="1024x1024", quality="high", n=1, edit=True,
+            input_fidelity=fidelity, source_dimensions=[1, 1],
+        ) > 0
+    else:
+        with pytest.raises(ProviderValidationError, match="fidelity"):
+            image_transport.validate_image_request(
+                route, size="1024x1024", quality="high", n=1, edit=True,
+                input_fidelity=fidelity, source_dimensions=[1, 1],
+            )
+
+
+@pytest.mark.parametrize("count,overlay", [(2, None), (1, "mask"), (1, "markup")])
+def test_unit_price_does_not_admit_unmetered_advanced_edits(count, overlay):
+    route = _route("openai", "gpt-image-2.6-flare", {"1024x1024:high": "0.10"})
+    with pytest.raises(ProviderValidationError, match="token-billed"):
+        image_transport.validate_image_request(
+            route, size="1024x1024", quality="high", n=1, edit=True, source_count=count, overlay=overlay,
+        )
+    caps = image_transport.available_image_options(route)
+    assert caps["max_image_input_count"] == 1
+    assert not caps["image_mask_supported"] and not caps["image_markup_supported"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mime,metadata", [
+    ("image/jpeg", {"width": 2, "height": 2, "has_transparency": 1}),
+    ("image/png", {"width": 2, "height": 2}),
+    ("image/png", {"width": 2, "height": 3, "has_transparency": 1}),
+])
+async def test_edit_admission_rejects_wrong_overlay_type_or_geometry(monkeypatch, mime, metadata):
+    from lumen.services.durable_runs import images
+
+    async def resolve(*_args, **_kwargs):
+        return _catalog_route("gpt-image-2.6-flare")
+
+    async def asset(*, asset_id, **_owner):
+        return {"status": "clean", "size_bytes": 100,
+                "mime_type": "image/png" if asset_id == "source" else mime,
+                "media_metadata": {"width": 2, "height": 2} if asset_id == "source" else metadata}
+
+    monkeypatch.setattr(images.routing, "resolve_api_model", resolve)
+    monkeypatch.setattr(images.assets, "get_asset", asset)
+    with pytest.raises(images.DurableRunInputError, match="transparent PNG matching the first image"):
+        await images.prepare_image_run({"model_id": "image", "prompt": "Draw", "input_asset_id": "source",
+            "markup_asset_id": "overlay"}, project_id="p", user_id="u")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("available,error", [(False, "not available"), (True, "unsupported reasoning effort")])
+async def test_svg_author_admission_rejects_unavailable_author_and_effort(monkeypatch, available, error):
+    from lumen.services.durable_runs import images
+
+    async def resolve(*_args, **_kwargs):
+        return _catalog_route("gpt-image-2.6-flare")
+
+    async def authors(_route, *, model_name):
+        assert model_name == "gpt-5"
+        return [{"svg_reasoning_efforts": ("low",)}] if available else []
+
+    monkeypatch.setattr(images.routing, "resolve_api_model", resolve)
+    monkeypatch.setattr(images.routing, "resolve_image_svg_authors", authors)
+    with pytest.raises(images.DurableRunInputError, match=error):
+        await images.prepare_image_run({"model_id": "image", "prompt": "Draw", "output_format": "svg",
+            "svg_model": "gpt-5", "svg_reasoning_effort": "max"}, project_id="p", user_id="u")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-image-1.5", "chatgpt-image-latest"])
+async def test_legacy_direct_images_settle_with_optional_output_split_missing(monkeypatch, model):
+    from lumen.services.durable_runs.images import _image_usage_payload, _price_token_image
+
+    def handler(_request):
+        return httpx.Response(200, json={
+            "data": [{"b64_json": base64.b64encode(_PNG).decode()}],
+            "usage": {"input_tokens": 13, "output_tokens": 4200, "total_tokens": 4213,
+                      "input_tokens_details": {"text_tokens": 13, "image_tokens": 0}},
+        })
+
+    _mock_provider(monkeypatch, handler)
+    route = {**_catalog_route(model), "output_price_per_token": Decimal("0.000010")}
+    args = {"prompt": "Draw", "size": "1024x1024", "quality": "high", "n": 1}
+    observed = await image_transport.generate_images(route, **args)
+    hold = image_transport.validate_image_request(route, **args, edit=False)
+    prices = {**pricing.frozen_token_pricing(route), "reservation_usd": str(hold), "count": 1,
+              "size": args["size"], "quality": args["quality"]}
+    evidence = _image_usage_payload(1, observed.usage)
+    _, cost, components = _price_token_image(prices, evidence, model_name=model)
+    assert cost.raw_cost == Decimal("0.134465")
+    assert any(part["kind"] == "image_output_tokens" and part["cost_usd"] == "0.1344000000" for part in components)
+    with pytest.raises(ValueError, match="exceeds reservation"):
+        _price_token_image({**prices, "reservation_usd": "0.10"}, evidence, model_name=model)

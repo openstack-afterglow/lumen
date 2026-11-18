@@ -41,6 +41,13 @@ def test_media_pricing_keeps_omission_distinct_from_zero_and_rejects_ambiguous_n
     assert pricing.validate_media_pricing("text", {"token_rates": {"image": {"input_per_million": "1.5"}}}) == {
         "token_rates": {"image": {"input_per_million": "1.5"}},
     }
+    image = {"billing_basis": "tokens", "token_rates": {"image": {"output_per_million": "32"}}}
+    assert pricing.validate_media_pricing("image", image, provider_type="openai") == image
+    assert pricing.media_pricing_available("image", image, text_input_priced=True, provider_type="openai")
+    assert not pricing.media_pricing_available("image", image, text_input_priced=True, provider_type="gemini")
+    with pytest.raises(ProviderValidationError, match="reservation_usd"):
+        pricing.validate_media_pricing("image", image, provider_type="gemini")
+    assert pricing.validate_media_pricing("image", {**image, "reservation_usd": "1"}, provider_type="gemini")
     for kind, value in (
         ("text", {"token_rates": {"audio": {"input_per_million": 0.1}}}),
         ("text", {"token_rates": {"audio": {"input_per_million": " 1"}}}),
@@ -49,7 +56,7 @@ def test_media_pricing_keeps_omission_distinct_from_zero_and_rejects_ambiguous_n
         ("text", {"image_per_unit": "0.04"}),
         ("stt", {"audio_input_per_hour": "0.36", "audio_per_minute": "0.007"}),
         ("realtime", {"realtime_session_per_minute": "0.05", "realtime_session_per_second": "0.001"}),
-        ("image", {"billing_basis": "tokens", "token_rates": {"image": {"output_per_million": "32"}}}),
+        ("image", {**image, "reservation_usd": "0"}),
         ("image", {"reservation_usd": "1", "image_per_unit": "0.04"}),
         ("tts", {"billing_basis": "session"}),
     ):

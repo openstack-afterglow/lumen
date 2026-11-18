@@ -455,16 +455,16 @@ async def test_image_registration_persists_prices_without_becoming_a_chat_route(
     add_provider(provider_type="openai")
     created = await repository.create_model(
         provider_id=1,
-        model_name="gpt-image-1",
+        model_name="gpt-image-2",
         model_kind="image",
         media_pricing={"image_per_unit": "0.04", "image_variants": {"1024x1024:high": "0.08"}},
     )
 
-    assert await routing.resolve_model("gpt-image-1") is None
-    assert await routing.resolve_api_model("gpt-image-1") is None
-    assert all(row["api_model_name"] != "gpt-image-1" for row in await routing.list_api_models())
+    assert await routing.resolve_model("gpt-image-2") is None
+    assert await routing.resolve_api_model("gpt-image-2") is None
+    assert all(row["api_model_name"] != "gpt-image-2" for row in await routing.list_api_models())
 
-    image = await routing.resolve_api_model("gpt-image-1", model_kind="image")
+    image = await routing.resolve_api_model("gpt-image-2", model_kind="image")
     assert image["model_id"] == created["id"]
     assert image["model_kind"] == "image"
     assert image["media_pricing"] == {
@@ -473,7 +473,97 @@ async def test_image_registration_persists_prices_without_becoming_a_chat_route(
     }
     assert image["capabilities"]["feature_gates"]["text"]["available"] is False
     assert image["capabilities"]["feature_gates"]["image_output"]["available"] is False
-    assert any(row["api_model_name"] == "gpt-image-1" for row in await routing.list_api_models(model_kind="image"))
+    assert any(row["api_model_name"] == "gpt-image-2" for row in await routing.list_api_models(model_kind="image"))
+
+
+async def test_catalog_image_registration_exposes_price_and_ready_options(provider_db, admin_client, monkeypatch):
+    from lumen.api.conversations import get_chat_capabilities
+    from lumen.services import assets
+
+    add_provider, _add_model, _model_name = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr(routing, "_effective_capabilities", pricing._effective_capabilities)
+    monkeypatch.setattr(routing, "_pricing_aware_capabilities", pricing._pricing_aware_capabilities)
+    created = await admin_client.post("/api/v1/chat/admin/models", json={
+        "provider_id": 1, "model_name": "gpt-image-2.6-sunburst", "model_kind": "image",
+    })
+    assert created.status_code == 201
+    model = created.json()
+    assert model["price_origin"] == "native_catalog"
+    assert model["effective_capabilities"]["feature_gates"]["image_output"] == {
+        "available": True, "mode": "native", "reason_code": None, "pricing_available": True,
+    }
+    capabilities = await get_chat_capabilities(model_id=model["id"], model_kind="image", token_info={})
+    assert capabilities["max_image_count"] == 10
+    assert "1024x1024:max" in capabilities["available_image_variants"]
+    assert capabilities["image_output_price_per_million"] == "30"
+    assert capabilities["image_output_formats"] == ["png", "jpeg", "webp", "gif", "svg"]
+    assert capabilities["image_backgrounds"] == ["auto", "opaque", "transparent"]
+    assert capabilities["image_complexities"] == ["low", "medium", "high"]
+    assert capabilities["image_custom_size"] == {
+        "min_pixels": 655360, "max_pixels": 8294400, "dimension_multiple": 16, "max_edge": 3840, "max_aspect_ratio": 3,
+    }
+    assert capabilities["image_gif"] == {
+        "min_frame_count": 2, "max_frame_count": 16, "default_frame_count": 9,
+        "min_frame_duration_ms": 20, "max_frame_duration_ms": 2000, "default_frame_duration_ms": 200,
+        "max_total_pixels": 10485760, "size_auto_supported": False,
+    }
+    monkeypatch.setattr(assets, "asset_pipeline_available", lambda: False)
+    unavailable = await get_chat_capabilities(model_id=model["id"], model_kind="image", token_info={})
+    assert unavailable["available_image_variants"] == [] and "image_output_formats" not in unavailable
+
+
+async def test_svg_author_requires_a_registered_unrestricted_route_on_the_image_credential(
+    provider_db, admin_client, monkeypatch,
+):
+    from lumen.api.conversations import get_chat_capabilities
+    from lumen.services import assets
+
+    add_provider, add_model, _model_name = provider_db
+    add_provider(provider_type="openai")
+    add_provider(provider_type="openai", provider_id=2, api_provider="other")
+    add_model("gpt-5", model_id=11)
+    add_model("gpt-4.1-mini", model_id=12, provider_id=2)
+    add_model("gpt-6-cyber", model_id=13)
+    add_model("gpt-5-mini", model_id=14, is_active=False)
+    add_model("gpt-4o", model_id=15)
+    monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr(routing, "_effective_capabilities", pricing._effective_capabilities)
+    monkeypatch.setattr(routing, "_pricing_aware_capabilities", pricing._pricing_aware_capabilities)
+    created = await repository.create_model(provider_id=1, model_name="gpt-image-2.6-flare", model_kind="image")
+    async with routing._require_db()() as session:
+        with session.sync.begin():
+            credential = session.sync.get(LlmProviderCredential, 1)
+            credential.allowed_model_ids = [created["id"], 11, 13, 14]
+    route = await routing.resolve_model_by_id(created["id"], model_kind="image")
+    for rejected in ("gpt-6-cyber", "gpt-4.1-mini", "gpt-4.1", "gpt-5-mini", "gpt-4o", "openai/gpt-5"):
+        assert await routing.resolve_image_svg_authors(route, model_name=rejected) == []
+    assert [row["api_model_name"] for row in await routing.resolve_image_svg_authors(route, model_name="gpt-5")] == [
+        "gpt-5",
+    ]
+    principal = {"user_id": "u", "project_id": "p", "auth_type": "api_key", "roles": ["member", "ai_inference_user"]}
+    restricted = await get_chat_capabilities(model_id=created["id"], model_kind="image",
+                                            token_info={**principal, "scopes": ("models:read",)})
+    assert "image_svg_author_models" not in restricted
+    allowed = await get_chat_capabilities(model_id=created["id"], model_kind="image",
+                                         token_info={**principal, "scopes": ("models:read", "native:runs:write")})
+    assert [author["model"] for author in allowed["image_svg_author_models"]] == ["gpt-5"]
+
+    from fastapi import HTTPException
+
+    from lumen.services.providers.errors import ChatStorageUnavailable
+
+    async def unavailable(*_args, **_kwargs):
+        raise ChatStorageUnavailable("storage unavailable")
+
+    monkeypatch.setattr(routing, "resolve_image_svg_authors", unavailable)
+    with pytest.raises(HTTPException) as error:
+        await get_chat_capabilities(model_id=created["id"], model_kind="image",
+                                    token_info={**principal, "scopes": ("models:read", "native:runs:write")})
+    assert error.value.status_code == 503
 
 
 async def test_media_registration_rejects_unsupported_transport_before_persistence(provider_db):
@@ -502,15 +592,15 @@ async def test_image_price_change_fences_existing_route_snapshot(provider_db):
     add_provider, _add_model, _model_name = provider_db
     add_provider(provider_type="openai")
     created = await repository.create_model(
-        provider_id=1, model_name="gpt-image-1", model_kind="image",
+        provider_id=1, model_name="gpt-image-2", model_kind="image",
         media_pricing={"image_variants": {"1024x1024:high": "0.08"}},
     )
-    before = await routing.resolve_api_model("gpt-image-1", model_kind="image")
+    before = await routing.resolve_api_model("gpt-image-2", model_kind="image")
 
     await repository.update_model(created["id"], {
         "media_pricing": {"image_variants": {"1024x1024:high": "0.12"}},
     })
-    after = await routing.resolve_api_model("gpt-image-1", model_kind="image")
+    after = await routing.resolve_api_model("gpt-image-2", model_kind="image")
 
     assert after["media_pricing"]["image_variants"]["1024x1024:high"] == "0.12"
     assert after["config_version_hash"] != before["config_version_hash"]
@@ -521,7 +611,7 @@ async def test_image_registration_rejects_invalid_price_without_persisting(provi
     add_provider(provider_type="openai")
     with pytest.raises(ProviderValidationError):
         await repository.create_model(
-            provider_id=1, model_name="gpt-image-1", model_kind="image",
+            provider_id=1, model_name="gpt-image-2", model_kind="image",
             media_pricing={"image_variants": {"1024x1024:high": "-0.08"}},
         )
     assert await routing.list_api_models(model_kind="image") == []
@@ -536,7 +626,7 @@ async def test_admin_media_registration_and_native_catalog_are_kind_scoped(provi
 
     created = await admin_client.post("/api/v1/chat/admin/models", json={
         "provider_id": 1,
-        "model_name": "gpt-image-1",
+        "model_name": "gpt-image-2",
         "model_kind": "image",
         "media_pricing": {"image_variants": {"1024x1024:high": "0.08"}},
     })
@@ -548,8 +638,8 @@ async def test_admin_media_registration_and_native_catalog_are_kind_scoped(provi
     text = await admin_client.get("/api/v1/chat/models")
     image = await admin_client.get("/api/v1/chat/models?model_kind=image")
     assert text.status_code == image.status_code == 200
-    assert all(row["model_name"] != "gpt-image-1" for row in text.json())
-    assert any(row["model_name"] == "gpt-image-1" for row in image.json())
+    assert all(row["model_name"] != "gpt-image-2" for row in text.json())
+    assert any(row["model_name"] == "gpt-image-2" for row in image.json())
 
     invalid = await admin_client.post("/api/v1/chat/admin/models", json={
         "provider_id": 1,
@@ -565,15 +655,15 @@ async def test_media_provider_cannot_switch_to_custom_base_or_subscription(provi
     add_provider, _add_model, _model_name = provider_db
     add_provider(provider_type="openai")
     await repository.create_model(
-        provider_id=1, model_name="gpt-image-1", model_kind="image",
+        provider_id=1, model_name="gpt-image-2", model_kind="image",
         media_pricing={"image_per_unit": "0.04"},
     )
-    original = await routing.resolve_api_model("gpt-image-1", model_kind="image")
+    original = await routing.resolve_api_model("gpt-image-2", model_kind="image")
 
     for patch in ({"api_base": "https://proxy.example/v1"}, {"auth_mode": "chatgpt_device"}):
         with pytest.raises(ProviderValidationError):
             await repository.update_provider(1, patch)
-    unchanged = await routing.resolve_api_model("gpt-image-1", model_kind="image")
+    unchanged = await routing.resolve_api_model("gpt-image-2", model_kind="image")
     assert unchanged["config_version_hash"] == original["config_version_hash"]
 
 

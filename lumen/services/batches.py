@@ -193,9 +193,12 @@ def _scopes(operation: str, contract: str, body: dict) -> tuple[str, ...]:
     if operation in {"chat.completions", "responses"}:
         return completion_scopes(body, base=(batch, "compat:completions:write"))
     if contract == "openai":
-        return (batch, "compat:images:write")
-    scope = "native:images:write" if operation.startswith("images.") else "native:audio:write"
-    return (batch, scope, *(("native:assets:read",) if body.get("source_asset_id") or body.get("input_asset_id") else ()))
+        scopes = (batch, "compat:images:write")
+    else:
+        scope = "native:images:write" if operation.startswith("images.") else "native:audio:write"
+        needs_asset = any(body.get(key) for key in ("source_asset_id", "input_asset_id", "input_asset_ids"))
+        scopes = (batch, scope, *(("native:assets:read",) if needs_asset else ()))
+    return (*scopes, images.svg_author_scope(scopes)) if operation.startswith("images.") and body.get("svg_model") else scopes
 
 
 def _check_scopes(scopes, required):

@@ -60,10 +60,20 @@ class FakeUpstream:
         self.incoming = incoming
         self.sent = []
         self.queue = asyncio.Queue()
+        self.limits = {}
+
+    async def ack_setup(self, frame):
+        if frame.get("type") != "session.update":
+            return
+        session = frame["session"]
+        self.limits.update({key: session[key] for key in ("max_output_tokens", "truncation") if key in session})
+        if self.limits:
+            await self.queue.put(json.dumps({"type": "session.updated", "session": {**session, **self.limits}}))
 
     async def send(self, message):
         parsed = json.loads(message)
         self.sent.append(parsed)
+        await self.ack_setup(parsed)
         if (parsed.get("type") == "input_audio_buffer.append" or "realtimeInput" in parsed
                 and "audio" in parsed["realtimeInput"]):
             if self.provider == "openai":
@@ -277,7 +287,7 @@ def test_session_basis_bills_connected_time_only_within_reserved_envelope():
             realtime._session_bill(_RUN, snapshot, {**usage, "connected_seconds": invalid})
 
 
-def _token_route(reservation="0.5"):
+def _token_route(reservation="5"):
     return {**_route(), "input_price_per_token": Decimal("0.000004"), "output_price_per_token": Decimal("0.000016"),
             "cache_read_price_per_token": Decimal("0.0000004"), "media_pricing": {
                 "billing_basis": "tokens", "reservation_usd": reservation, "token_rates": {"audio": {
@@ -294,9 +304,11 @@ def _openai_done(response_id, *, text_in, audio_in, cached_text, cached_audio, t
         "output_token_details": {"text_tokens": text_out, "audio_tokens": audio_out}}}}
 
 
-def _token_bill(meter, route=None, *, input_bytes=4800, output_bytes=4800):
+def _token_bill(meter, route=None, *, input_bytes=4800, output_bytes=4800, reservation=None):
     usage, state = meter.result()
     plan = realtime_transport.validate_realtime_request(route or _token_route(), max_duration_seconds=60)
+    if reservation is not None:
+        plan = {**plan, "reservation_usd": reservation}  # A frozen snapshot below the observed usage.
     checkpoint = realtime._checkpoint(AudioMeter(input_bytes, output_bytes, 24000, 24000, usage=usage,
                                                  usage_state=state), "tokens")
     # Settlement prices the durable JSON checkpoint, never the in-memory meter.
@@ -338,10 +350,131 @@ def test_token_basis_requires_text_audio_rates_and_envelope_before_io():
     audio_rates = _token_route()["media_pricing"]["token_rates"]["audio"]
     for change in ({"output_price_per_token": None}, {"input_price_per_token": None},
                    {"media_pricing": {**_token_route()["media_pricing"], "token_rates": {"audio": {
-                       key: value for key, value in audio_rates.items() if key != "output_per_million"}}}},
-                   {"media_pricing": {key: value for key, value in _token_route()["media_pricing"].items()
-                                      if key != "reservation_usd"}}):
+                       key: value for key, value in audio_rates.items() if key != "output_per_million"}}}}):
         assert not realtime_transport.realtime_route_ready({**_token_route(), **change})
+    # Gemini publishes no audio token rate per second, so it still needs a configured envelope.
+    unreserved = {key: value for key, value in _token_route()["media_pricing"].items() if key != "reservation_usd"}
+    gemini = {**_token_route(), **_route("gemini"), "media_pricing": unreserved,
+              "input_price_per_token": Decimal("0.000004"), "output_price_per_token": Decimal("0.000016")}
+    assert not realtime_transport.realtime_route_ready(gemini)
+    assert realtime_transport.realtime_route_ready({**gemini, "media_pricing": _token_route()["media_pricing"]})
+
+
+def test_openai_token_basis_without_configured_envelope_derives_a_duration_hold():
+    unreserved = {key: value for key, value in _token_route()["media_pricing"].items() if key != "reservation_usd"}
+    route = {**_token_route(), "media_pricing": unreserved}
+    plan = realtime_transport.validate_realtime_request(route, max_duration_seconds=300)
+    # One worst-case response under the pinned limits: (16384 instructions + 16384 tools + 512) text
+    # tokens at $4/M + 16384 post-instruction tokens at $32/M + 4096 output tokens at $64/M.
+    assert plan["response_bound_usd"] == "0.9195520000"
+    # Per second: 100 input tokens at $32/M (highest input) + 30 output tokens at $64/M (highest
+    # output), i.e. $1.536 for 300 s, plus two worst-case responses.
+    assert (plan["reservation_usd"], plan["reservation_source"]) == ("3.3751040000", "duration_policy")
+    assert realtime._envelope_usd(plan, 300) == Decimal("3.375104")
+    assert realtime_transport.validate_realtime_request(route, max_duration_seconds=10)["reservation_usd"] == (
+        "1.8903040000")
+    # The hold is re-derived identically before connection; a changed rate is a price change.
+    snapshot = {**plan, "max_duration_seconds": 300, "reservation_usd": "3.375104"}
+    assert realtime._plan_matches(snapshot, realtime_transport.validate_realtime_request(
+        route, max_duration_seconds=300) | {"reservation_usd": "3.375104"})
+    repriced = {**route, "output_price_per_token": Decimal("0.000024")}
+    assert not realtime._plan_matches(snapshot, realtime_transport.validate_realtime_request(
+        repriced, max_duration_seconds=300))
+    # An operator-configured envelope keeps precedence but must cover two worst-case responses.
+    configured = realtime_transport.validate_realtime_request(_token_route(), max_duration_seconds=300)
+    assert configured["reservation_usd"] == "5" and "reservation_source" not in configured
+    with pytest.raises(ProviderValidationError, match="two worst-case"):
+        realtime_transport.validate_realtime_request(_token_route(reservation="1.8"), max_duration_seconds=300)
+    # Derived-hold settlement: mixed usage within the hold is priced, usage beyond it stays unknown.
+    derived = {**route, "media_pricing": {**unreserved, "token_rates": {**unreserved["token_rates"], "image": {
+        "input_per_million": "5", "cache_read_per_million": "0.5"}}}}
+    cost, components, breakdown, _ = _token_bill(_openai_meter(_MIXED), derived)
+    # text 100*4 + 50*16; audio 100*32 + 100*0.4 + 100*64; image 800*5 + 200*0.5 (per M)
+    assert cost.raw_cost == Decimal("0.01494") and (breakdown.input_tokens, breakdown.output_tokens) == (1300, 150)
+    assert {item["kind"] for item in components} >= {"input_tokens", "output_tokens"}
+    with pytest.raises(DurableRunProviderResultUnknown, match="exceeds"):
+        _token_bill(_openai_meter(_huge_response()), derived)
+    with pytest.raises(DurableRunProviderResultUnknown, match="missing"):
+        _token_bill(_openai_meter(), derived)
+
+
+_MIXED = {"type": "response.done", "response": {"id": "resp_mixed", "status": "completed", "usage": {
+    "total_tokens": 1450, "input_tokens": 1300, "output_tokens": 150,
+    "input_token_details": {"text_tokens": 100, "audio_tokens": 200, "image_tokens": 1000, "cached_tokens": 300,
+                            "cached_tokens_details": {"text_tokens": 0, "audio_tokens": 100, "image_tokens": 200}},
+    "output_token_details": {"text_tokens": 50, "audio_tokens": 100}}}}
+
+
+def _huge_response():
+    # 60 s hold is $0.3072 + 2 * $0.919552; 40,000 output audio tokens alone cost $2.56.
+    return _openai_done("resp_huge", text_in=10, audio_in=10, cached_text=0, cached_audio=0,
+                        text_out=0, audio_out=40000)
+
+
+@pytest.mark.asyncio
+async def test_relay_ends_a_token_session_before_confirmed_usage_can_exhaust_the_hold(monkeypatch):
+    encoded = base64.b64encode(b"\0\1" * 160).decode()
+
+    class BudgetUpstream(FakeUpstream):
+        responses = 0
+
+        async def send(self, message):
+            parsed = json.loads(message)
+            self.sent.append(parsed)
+            await self.ack_setup(parsed)
+            if parsed.get("type") == "input_audio_buffer.append":
+                self.responses += 1
+                done = _openai_done(f"resp_{self.responses}", text_in=200, audio_in=800, cached_text=100,
+                                    cached_audio=300, text_out=100, audio_out=400)
+                await self.queue.put(json.dumps({"type": "response.created", "response": {"id": done["response"]["id"]}}))
+                await self.queue.put(json.dumps(done))
+
+    upstream = BudgetUpstream("openai", encoded)
+
+    class Connection:
+        async def __aenter__(self):
+            return upstream
+        async def __aexit__(self, *_):
+            return None
+
+    monkeypatch.setattr(realtime_protocol.websockets, "connect", lambda *_args, **_kwargs: Connection())
+
+    class StreamingBrowser(FakeBrowser):
+        # The user keeps talking in real-time-like chunks; only the hold guard can end this
+        # session before its deadline.
+        async def receive_text(self):
+            await asyncio.sleep(0.01)
+            return json.dumps({"type": "audio.input.append", "audio": encoded})
+
+    async def not_canceled():
+        return False
+
+    plan = realtime_transport.validate_realtime_request(_token_route(reservation="2"), max_duration_seconds=60)
+    price, hold, bound = realtime._token_hold({**plan, "max_duration_seconds": 60})
+    # One response: text 100*4 + 100*0.4 + 100*16, audio 500*32 + 300*0.4 + 400*64 (per M).
+    assert price(TokenUsageMeter("openai").observe(_FIRST)) == Decimal("0.04376")
+    assert (hold, bound) == (Decimal("2"), Decimal("0.919552"))
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(
+        StreamingBrowser("openai", encoded), _route(), session_id="session", voice="alloy", instructions=None,
+        max_duration_seconds=60, is_canceled=not_canceled, token_usage=True, token_hold=(price, hold, bound)),
+        timeout=5)
+    # Continue only while spent + 2 worst-case responses fits: 3 * 0.04376 + 1.839104 <= 2 < 4 * 0.04376 +
+    # 1.839104, so the guard trips at the fourth response, long before the 60 s deadline; responses already
+    # in flight are drained to final usage, never left unknown.
+    confirmed = meter.usage.output_tokens // 500
+    assert meter.usage_state == "complete" and 4 <= confirmed == upstream.responses <= 5
+    # The session pins the per-response limits the bound relies on.
+    assert upstream.sent[0]["session"]["max_output_tokens"] == 4096
+    assert upstream.sent[0]["session"]["truncation"] == {
+        "type": "retention_ratio", "retention_ratio": 0.8, "token_limits": {"post_instructions": 16384}}
+    assert realtime._token_hold({"billing_basis": "duration"}) is None
+    # A single response above the worst case voids the premise: stop at once.
+    upstream = BudgetUpstream("openai", encoded)
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(
+        StreamingBrowser("openai", encoded), _route(), session_id="session", voice="alloy", instructions=None,
+        max_duration_seconds=60, is_canceled=not_canceled, token_usage=True,
+        token_hold=(price, Decimal("100"), Decimal("0.04"))), timeout=5)
+    assert meter.usage.output_tokens // 500 == upstream.responses <= 2
 
 
 def test_token_basis_holds_unknown_for_conflicting_missing_incomplete_or_over_envelope_usage():
@@ -354,7 +487,7 @@ def test_token_basis_holds_unknown_for_conflicting_missing_incomplete_or_over_en
         with pytest.raises(DurableRunProviderResultUnknown):
             _token_bill(meter)
     with pytest.raises(DurableRunProviderResultUnknown, match="exceeds"):
-        _token_bill(_openai_meter(_FIRST, _SECOND), _token_route(reservation="0.05"))
+        _token_bill(_openai_meter(_FIRST, _SECOND), reservation="0.05")
     # Provider audio with no provider usage is never billed as zero.
     with pytest.raises(DurableRunProviderResultUnknown, match="missing"):
         _token_bill(_openai_meter())
@@ -400,6 +533,7 @@ async def test_token_relay_omits_separately_billed_transcription_and_drains_fina
         async def send(self, message):
             parsed = json.loads(message)
             self.sent.append(parsed)
+            await self.ack_setup(parsed)
             if parsed.get("type") == "input_audio_buffer.append":
                 await self.queue.put(json.dumps({"type": "response.created", "response": {"id": "resp_1"}}))
                 await self.queue.put(json.dumps({"type": "response.output_audio.delta", "delta": encoded}))
@@ -421,7 +555,7 @@ async def test_token_relay_omits_separately_billed_transcription_and_drains_fina
 
     meter = await realtime_protocol.relay_audio(FakeBrowser("openai", encoded), _route(), session_id="session",
         voice="alloy", instructions=None, max_duration_seconds=10, is_canceled=not_canceled, token_usage=True)
-    assert "transcription" not in upstream.sent[0]["session"]["audio"]["input"]
+    assert "transcription" not in upstream.sent[1]["session"]["audio"]["input"]
     assert {"type": "response.cancel"} in upstream.sent
     assert meter.usage_state == "complete" and meter.usage.output_tokens == 500
     assert meter.connected_seconds is not None and meter.connected_seconds >= 0
@@ -439,6 +573,7 @@ async def test_relay_failure_keeps_completed_usage_as_unsettleable_evidence(monk
         async def send(self, message):
             parsed = json.loads(message)
             self.sent.append(parsed)
+            await self.ack_setup(parsed)
             if parsed.get("type") == "input_audio_buffer.append":
                 await self.queue.put(json.dumps(_FIRST))
                 await self.queue.put(RuntimeError("secret-bearing provider failure"))
@@ -488,3 +623,59 @@ def test_rejected_empty_response_request_does_not_create_unknown_usage():
     meter.request_sent({"type": "response.create"})
     meter.observe({"type": "error", "error": {"code": "response_create_empty"}})
     assert _token_bill(meter, input_bytes=0, output_bytes=0)[0].raw_cost == Decimal(0)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_is_configurable_only_where_published_and_reaches_the_session(monkeypatch):
+    route = {**_token_route(), "api_model_name": "gpt-realtime-2.1"}
+    baseline = realtime_transport.validate_realtime_request(route)
+    for effort in ("minimal", "low", "medium", "high", "xhigh"):
+        # Effort changes neither the frozen rates nor the hold; reasoning settles as reported output.
+        assert realtime_transport.validate_realtime_request(route, reasoning_effort=effort) == baseline
+    for model, effort in (("gpt-realtime-2.1", "none"), ("gpt-realtime-2.1-mini", "low"), ("gpt-realtime", "low"),
+                          ("gpt-realtime-1.5", "high")):
+        with pytest.raises(ProviderValidationError, match="reasoning"):
+            realtime_transport.validate_realtime_request({**route, "api_model_name": model}, reasoning_effort=effort)
+    with pytest.raises(ProviderValidationError, match="reasoning"):
+        realtime_transport.validate_realtime_request({**_token_route(), **_route("gemini")}, reasoning_effort="low")
+    # Reasoning tokens absent from output_token_details settle as text output, never as unknown.
+    usage = realtime_protocol.TokenUsageMeter("openai")
+    usage.observe(_openai_done("resp_r", text_in=10, audio_in=0, cached_text=0, cached_audio=0,
+                               text_out=0, audio_out=0) | {"response": {"id": "resp_r", "usage": {
+        "total_tokens": 80, "input_tokens": 10, "output_tokens": 70,
+        "input_token_details": {"text_tokens": 10, "audio_tokens": 0, "image_tokens": 0, "cached_tokens": 0},
+        "output_token_details": {"text_tokens": 20, "audio_tokens": 30}}}})
+    cost, _, _, _ = _token_bill(usage, input_bytes=0, output_bytes=4800)
+    # text 10*4 + 40*16, audio 30*64 (per M)
+    assert cost.raw_cost == Decimal("0.0026")
+
+    upstream = FakeUpstream("openai", base64.b64encode(b"\0\1" * 160).decode())
+
+    class Connection:
+        async def __aenter__(self):
+            return upstream
+        async def __aexit__(self, *_):
+            return None
+
+    monkeypatch.setattr(realtime_protocol.websockets, "connect", lambda *_args, **_kwargs: Connection())
+
+    async def not_canceled():
+        return False
+
+    browser = FakeBrowser("openai", upstream.incoming)
+    await realtime_protocol.relay_audio(browser, route, session_id="session", voice="alloy", instructions=None,
+        max_duration_seconds=10, is_canceled=not_canceled, token_usage=True, reasoning_effort="high")
+    assert upstream.sent[1]["session"]["reasoning"] == {"effort": "high"}
+
+    def compat(session, model):
+        return realtime_protocol._client_event({"type": "session.update", "session": session}, "openai",
+                                               wire="openai", voice="alloy", model=model)
+
+    assert compat({"reasoning": {"effort": "xhigh"}}, "gpt-realtime-2")[0] == {
+        "type": "session.update", "session": {"reasoning": {"effort": "xhigh"}}}
+    for session, model in (({"reasoning": {"effort": "xhigh"}}, "gpt-realtime"),
+                           ({"reasoning": {"effort": "max"}}, "gpt-realtime-2"),
+                           ({"reasoning": {"effort": "low", "summary": "auto"}}, "gpt-realtime-2"),
+                           ({"tools": [{"type": "function", "name": "lookup"}]}, "gpt-realtime-2")):
+        with pytest.raises(realtime_transport.RealtimeTransportError):
+            compat(session, model)

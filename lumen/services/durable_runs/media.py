@@ -107,6 +107,14 @@ async def lock_media_source_in_transaction(
     return asset
 
 
+def image_input_ids(payload: dict) -> tuple[str, ...]:
+    """Ordered source IDs followed by the optional overlay ID."""
+    return tuple(asset_id for asset_id in (
+        payload.get("source_asset_id"), *(payload.get("additional_source_asset_ids") or ()),
+        payload.get("mask_asset_id"), payload.get("markup_asset_id"),
+    ) if asset_id is not None)
+
+
 def _blocked_reason(run: ChatRun, batch: ChatBatch | None, *, batch_open: bool) -> str | None:
     if run.cancel_requested_at is not None:
         return "canceled"
@@ -147,8 +155,9 @@ async def validate_batch_media_io_in_transaction(session: AsyncSession, run: Cha
     await authorize_media_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
         api_key_id=run.api_key_id, required_scopes=tuple(scopes),
         credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
-    source_id = payload.get("source_asset_id") if run.run_kind == "image" else payload.get("input_asset_id")
-    if source_id is not None:
+    source_ids = (image_input_ids(payload) if run.run_kind == "image" else
+                  (payload["input_asset_id"],) if payload.get("input_asset_id") is not None else ())
+    for source_id in sorted(set(source_ids)):
         await lock_media_source_in_transaction(session, asset_id=source_id, user_id=run.user_id,
             project_id=run.project_id, run_kind=run.run_kind, pricing=run.pricing_snapshot, run_id=run.id)
 

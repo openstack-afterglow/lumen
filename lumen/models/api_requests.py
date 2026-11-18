@@ -5,7 +5,41 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class OpenAIPromptCacheOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ttl: Literal["30m", "12h"] | None = None
+    mode: Literal["implicit", "explicit"] | None = None
+    comparison_response_id: str | None = None
+
+
+class ResponsesPromptCacheOptions(OpenAIPromptCacheOptions):
+    prewarm: bool | None = None
+
+
+class OpenAIJSONSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    description: str | None = None
+    schema_: dict[str, Any] = Field(alias="schema")
+    strict: bool | None = None
+
+
+class OpenAIJSONSchemaFormat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["json_schema"]
+    json_schema: OpenAIJSONSchema
+
+
+class OpenAIPlainFormat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["json_object", "text"]
 
 
 class OpenAIChatRequest(BaseModel):
@@ -20,11 +54,29 @@ class OpenAIChatRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
+    max_completion_tokens: int | None = Field(default=None, gt=0, strict=True)
+    reasoning_effort: str | None = None
+    response_format: OpenAIJSONSchemaFormat | OpenAIPlainFormat | None = Field(
+        default=None, discriminator="type"
+    )
+    service_tier: str | None = None
+    prompt_cache_key: str | None = None
+    prompt_cache_options: OpenAIPromptCacheOptions | None = None
+    prompt_cache_retention: Literal["in_memory", "in-memory", "24h"] | None = None
     tools: list[dict] | None = None
     tool_choice: Any = None
     stream_options: dict | None = None
 
     model_config = {"extra": "allow"}  # 미지원 OpenAI 파라미터는 무시(호환성)
+
+    def provider_options(self) -> dict[str, Any]:
+        return self.model_dump(
+            include={
+                "reasoning_effort", "response_format", "max_completion_tokens", "service_tier",
+                "prompt_cache_key", "prompt_cache_options", "prompt_cache_retention",
+            },
+            exclude_none=True, by_alias=True,
+        )
 
 
 class OpenAIChatChoiceMessage(BaseModel):
@@ -43,7 +95,7 @@ class OpenAIUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-    prompt_tokens_details: dict[str, int] = Field(default_factory=lambda: {"cached_tokens": 0})
+    prompt_tokens_details: dict[str, Any] = Field(default_factory=lambda: {"cached_tokens": 0})
 
 
 class OpenAIChatResponse(BaseModel):
@@ -62,12 +114,16 @@ class ResponsesRequest(BaseModel):
     stream: bool = False
     store: bool | None = None
     previous_response_id: str | None = None
+    conversation: str | dict[str, Any] | None = None
     background: bool | None = None
     include: list[str] | None = None
     prompt_cache_key: str | None = None
+    prompt_cache_options: ResponsesPromptCacheOptions | None = None
+    prompt_cache_retention: Literal["in_memory", "in-memory", "24h"] | None = None
     client_metadata: dict[str, Any] | None = None
     instructions: str | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)
+    max_tool_calls: int | None = Field(default=None, gt=0, strict=True)
     metadata: dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     reasoning: dict[str, Any] | None = None
@@ -87,11 +143,19 @@ class ResponsesRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
-class ImageGenerationRequest(BaseModel):
+class ImageOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model_id: str = Field(min_length=1, max_length=190)
-    provider_id: int | None = None
+    background: Literal["transparent", "opaque", "auto"] | None = None
+    output_format: Literal["png", "jpeg", "webp", "gif", "svg"] | None = None
+    output_compression: int | None = Field(default=None, ge=0, le=100, strict=True)
+    frame_count: int | None = Field(default=None, ge=2, le=16, strict=True)
+    frame_duration_ms: int | None = Field(default=None, ge=20, le=2000, strict=True)
+    stream: Literal[False] | None = None
+    partial_images: Literal[0] | None = None
+    moderation: Literal["auto", "low"] | None = None
+    svg_model: str | None = Field(default=None, min_length=1, max_length=190)
+    svg_reasoning_effort: str | None = Field(default=None, min_length=1, max_length=20)
     prompt: str = Field(min_length=1)
     size: str = "auto"
     quality: str = "auto"
@@ -99,23 +163,64 @@ class ImageGenerationRequest(BaseModel):
     complexity: Literal["low", "medium", "high"] | None = None
     n: int = Field(default=1, ge=1)
 
+    @field_validator("stream", "partial_images", mode="before")
+    @classmethod
+    def require_finite_output(cls, value, info):
+        disabled = value is False if info.field_name == "stream" else type(value) is int and value == 0
+        if value is not None and not disabled:
+            raise ValueError("image streaming and partial images are not supported")
+        return value
+
+
+class ImageGenerationRequest(ImageOptions):
+    model_id: str = Field(min_length=1, max_length=190)
+    provider_id: int | None = None
+
 
 class ImageEditRequest(ImageGenerationRequest):
-    input_asset_id: UUID
+    input_asset_id: UUID | None = None
+    input_asset_ids: list[UUID] | None = Field(default=None, min_length=1, max_length=16)
+    mask_asset_id: UUID | None = None
+    markup_asset_id: UUID | None = None
+    input_fidelity: Literal["low", "high"] | None = None
+
+    @model_validator(mode="after")
+    def validate_assets(self) -> ImageEditRequest:
+        if (self.input_asset_id is None) == (self.input_asset_ids is None):
+            raise ValueError("specify one of input_asset_id or input_asset_ids")
+        if self.mask_asset_id is not None and self.markup_asset_id is not None:
+            raise ValueError("mask and markup are mutually exclusive")
+        return self
 
 
-class OpenAIImageGenerationRequest(BaseModel):
+class OpenAIImageSvgReasoning(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    effort: str | None = Field(default=None, min_length=1, max_length=20)
+
+
+class OpenAIImageSvgOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str = Field(min_length=1, max_length=190)
+    reasoning: OpenAIImageSvgReasoning | None = None
+
+
+class OpenAIImageGenerationRequest(ImageOptions):
+    model: str = Field(min_length=1, max_length=190)
     provider: str | None = None
     provider_id: int | None = None
-    prompt: str = Field(min_length=1)
-    n: int = Field(default=1, ge=1)
-    size: str = "auto"
-    quality: str = "auto"
-    complexity: Literal["low", "medium", "high"] | None = None
     response_format: str = "b64_json"
+    svg: OpenAIImageSvgOptions | None = Field(default=None, exclude=True)
+
+    @model_validator(mode="after")
+    def normalize_svg(self) -> OpenAIImageGenerationRequest:
+        if self.svg is not None:
+            if self.svg_model is not None or self.svg_reasoning_effort is not None:
+                raise ValueError("specify either svg or flat SVG author options")
+            self.svg_model = self.svg.model
+            self.svg_reasoning_effort = self.svg.reasoning.effort if self.svg.reasoning else None
+        return self
 
 
 class SpeechRequest(BaseModel):

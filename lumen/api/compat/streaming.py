@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import anyio
@@ -42,7 +43,12 @@ async def events_with_ping(source: AsyncIterator[dict], *, ping_seconds: float =
         # read or its settlement. Keep the ASGI owner alive until both complete.
         with anyio.CancelScope(shield=True):
             try:
-                if pending is not None:
+                if getattr(iterator, "owns_disconnect_drain", False):
+                    if pending is not None:
+                        pending.cancel()
+                        with suppress(asyncio.CancelledError, StopAsyncIteration):
+                            await pending
+                elif pending is not None:
                     await _drain(pending, iterator)
             finally:
                 await close_stream_iterator(iterator)

@@ -224,7 +224,8 @@ async def create_lumen_temp_run(
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
     if context_limit is not None:
-        budget = ContextBudget(context_limit, effective_output_tokens)
+        budget = ContextBudget(context_limit, effective_output_tokens,
+                               max_input_tokens=capabilities.get("max_input_tokens"))
         token_count = count_context_tokens(resolved["model_name"], normalized_messages, None)
         if (
             token_count.tokens is not None

@@ -153,12 +153,27 @@ func prepare(parent context.Context, e Envelope) (*executionPlan, error) {
 		headers.Set("Authorization", "Bearer "+e.APIKey)
 	}
 
+	officialOpenAI := provider == "openai" && (base == "https://api.openai.com" || base == "https://api.openai.com/v1")
+	if officialOpenAI && (e.Protocol == "responses" || e.Protocol == "chat" || e.Protocol == "messages") {
+		if raw, ok := body["service_tier"]; ok && string(raw) != "null" {
+			var tier string
+			if json.Unmarshal(raw, &tier) != nil || (tier != "default" && tier != "auto") {
+				return nil, errUnsupported
+			}
+		}
+	}
+
 	// Native same-wire operations intentionally bypass typed round-tripping: unknown native
 	// fields, signed thinking/compaction items and cache-control TTL must survive unchanged.
 	native := (e.Protocol == "responses" && (provider == "openai" || provider == "azure" || (provider == "perplexity" && perplexityAgent(model, e.APIBase)) || provider == "openrouter" || provider == "xai")) ||
 		((e.Protocol == "messages" || e.Protocol == "count_tokens") && provider == "anthropic") ||
 		(e.Protocol == "embeddings" && provider != "anthropic" && provider != "gemini" && provider != "vertex" && provider != "bedrock" && provider != "cohere")
 	if native {
+		if officialOpenAI && e.Protocol == "responses" {
+			body["service_tier"] = json.RawMessage(`"default"`)
+			body["store"] = json.RawMessage(`false`)
+			p.body, _ = json.Marshal(body)
+		}
 		path := map[string]string{"responses": "responses", "messages": "messages", "count_tokens": "messages/count_tokens", "embeddings": "embeddings"}[e.Protocol]
 		p.target = appendPath(versioned(base, provider), path)
 		if provider == "anthropic" {
@@ -219,7 +234,6 @@ func prepare(parent context.Context, e Envelope) (*executionPlan, error) {
 		return result, err
 	}
 	wire := "chat"
-	officialOpenAI := provider == "openai" && (e.APIBase == "" || base == "https://api.openai.com" || base == "https://api.openai.com/v1")
 	agent := provider == "perplexity" && perplexityAgent(model, e.APIBase)
 	switch {
 	case provider == "cohere":
@@ -298,6 +312,10 @@ func prepare(parent context.Context, e Envelope) (*executionPlan, error) {
 			if e.Protocol != "chat" || params.Reasoning == nil || params.Reasoning.Effort == nil {
 				request.Reasoning = convertedReasoning
 			}
+		}
+		if officialOpenAI {
+			request.ServiceTier = schemas.Ptr(schemas.BifrostServiceTierDefault)
+			request.Store = schemas.Ptr(false)
 		}
 		// Chat has no typed fields for these native Responses extensions.
 		// Restore the original raw values instead of losing them in conversion.

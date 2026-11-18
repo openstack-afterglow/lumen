@@ -170,6 +170,13 @@ class TestAnthropicNativeContract:
 
 
 class TestCompletionCoreContract:
+    @pytest.fixture(autouse=True)
+    def no_credit_hold_in_transport_fixtures(self, monkeypatch):
+        async def reserve(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(core, "_reserve_online", reserve)
+
     async def test_failed_primary_billing_reuses_event_id_for_fallback(self, monkeypatch):
         async def fake_provider_stream(*_args, **_kwargs):
             async def chunks():
@@ -193,7 +200,7 @@ class TestCompletionCoreContract:
 
         events = []
         with pytest.raises(RuntimeError, match="first billing attempt failed"):
-            async for event in core.complete_stream(
+            async for event in await core.complete_stream(
                 resolved={"model_name": "test-model", "margin_multiplier": 1},
                 messages=[{"role": "user", "content": "hello"}],
                 user_id="u1",
@@ -232,7 +239,7 @@ class TestCompletionCoreContract:
 
         monkeypatch.setattr(core.provider_client, "acompletion_stream", fake_provider_stream)
         monkeypatch.setattr(core, "_bill", fake_bill)
-        stream = core.complete_stream(
+        stream = await core.complete_stream(
             resolved={"model_name": "test-model", "margin_multiplier": 1},
             messages=[{"role": "user", "content": "hello"}],
             user_id="u1", project_id="p1", api_key_id=7, max_tokens=32, temperature=None,
@@ -276,7 +283,7 @@ class TestCompletionCoreContract:
         async def consumer():
             with anyio.CancelScope() as scope:
                 scope_holder.append(scope)
-                async for _event in core.complete_stream(
+                async for _event in await core.complete_stream(
                     resolved={"model_name": "test-model", "margin_multiplier": 1},
                     messages=[{"role": "user", "content": "hello"}],
                     user_id="u1", project_id="p1", api_key_id=7, max_tokens=32, temperature=None,
@@ -295,7 +302,8 @@ class TestCompletionCoreContract:
         assert upstream["closed"] is True
         assert billed == ["first"]
 
-    async def test_responses_stream_close_releases_transport_and_bills_partial_text(self, monkeypatch):
+    @pytest.mark.parametrize("api_base", [None, "https://compatible.example"])
+    async def test_responses_stream_close_releases_transport_and_bills_partial_text(self, monkeypatch, api_base):
         state = _responses_runtime_wire(monkeypatch)
         billed = []
 
@@ -305,7 +313,8 @@ class TestCompletionCoreContract:
 
         monkeypatch.setattr(core, "_bill", fake_bill)
         events = await core.complete_responses(
-            resolved={"model_name": "gpt-5", "provider_type": "openai", "capabilities": {"reasoning": True}},
+            resolved={"model_name": "gpt-unlisted", "provider_type": "openai", "api_base": api_base,
+                      "capabilities": {"reasoning": True}},
             input="hello", stream=True, user_id="u1", project_id="p1", api_key_id=7, options={},
         )
         assert (await anext(events))["delta"] == "partial"
@@ -582,15 +591,14 @@ def _core(monkeypatch):
         }
 
     async def fake_stream(**kw):
-        yield {"type": "delta", "content": "he", "reasoning": "", "tool_calls": None, "finish_reason": None}
-        yield {"type": "delta", "content": "llo", "reasoning": "", "tool_calls": None, "finish_reason": "stop"}
-        yield {
-            "type": "done",
-            "prompt_tokens": 4,
-            "completion_tokens": 2,
-            "finish_reason": "stop",
-            "credited_cost": 0.02,
-        }
+        async def chunks():
+            yield {"type": "delta", "content": "he", "reasoning": "", "tool_calls": None, "finish_reason": None}
+            yield {"type": "delta", "content": "llo", "reasoning": "", "tool_calls": None, "finish_reason": "stop"}
+            yield {
+                "type": "done", "prompt_tokens": 4, "completion_tokens": 2,
+                "finish_reason": "stop", "credited_cost": 0.02,
+            }
+        return chunks()
 
     async def fake_anthropic(**kw):
         if not kw["stream"]:
@@ -784,7 +792,9 @@ class TestOpenAIEndpoint:
 
     async def test_provider_stream_error_has_no_success_terminal(self, client, _auth, _core, monkeypatch):
         async def failed_stream(**_kwargs):
-            yield {"type": "error", "message": "safe upstream failure"}
+            async def chunks():
+                yield {"type": "error", "message": "safe upstream failure"}
+            return chunks()
 
         monkeypatch.setattr(core, "complete_stream", failed_stream)
 
@@ -2017,7 +2027,7 @@ class TestResponsesEndpoint:
                 headers=_H,
             )
 
-            assert response.status_code == 400
+            assert response.status_code == (422 if "previous_response_id" in extra else 400)
             assert response.json()["error"]["type"] == "invalid_request_error"
 
     async def test_provider_header_conflict_and_positive_budget(self, client, _auth):
