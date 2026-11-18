@@ -3,6 +3,7 @@
 from contextlib import asynccontextmanager
 from itertools import count
 from types import SimpleNamespace
+from typing import get_args
 from unittest.mock import AsyncMock
 
 import pytest
@@ -202,9 +203,19 @@ async def test_only_current_domain_managers_manage_service_keys(key_db, director
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         for user in ("ordinary", "restricted", "sysadmin"):
             assert (await client.get(base, headers=session(user))).status_code == 403
+        assert (await client.get(f"{base}/issuance-policy", headers=session("ordinary"))).status_code == 403
         targeted_admin = {**session("sysadmin"), "X-Target-Project-Id": "project-b"}
         assert (await client.get(base, headers=targeted_admin)).status_code == 403
         owner = session("creator")
+        policy = await client.get(f"{base}/issuance-policy", headers=owner)
+        assert policy.status_code == 200, policy.text
+        assert policy.json()["domain_id"] == "domain-a"
+        assert policy.json()["allowed_scopes"] == sorted(MODEL_API_KEY_SCOPES)
+        assert set(policy.json()["default_scopes"]) <= MODEL_API_KEY_SCOPES
+        assert policy.json()["scope_routes"]["embeddings:write"] == ["POST /v1/chat/embeddings", "POST /v1/embeddings",
+            "POST /v1beta/models/{model}:batchEmbedContents", "POST /v1beta/models/{model}:embedContent"]
+        # POST /service-keys validates against exactly this vocabulary.
+        assert policy.json()["allowed_scopes"] == sorted(get_args(api_keys.ApiKeyScope))
         issued = await client.post(base, headers=owner, json={"name": "runner"})
         assert issued.status_code == 201, issued.text
         item = issued.json()
@@ -225,14 +236,15 @@ async def test_only_current_domain_managers_manage_service_keys(key_db, director
         assert inv.status_code == 200 and [key["id"] for key in inv.json()["items"]] == [item["id"]]
         assert "key" not in inv.json()["items"][0]
         grants.remove(("creator", "domain-a"))
-        for method, path in (("GET", base), ("POST", base), ("PATCH", f"{key_path}/limits"), ("DELETE", key_path)):
+        for method, path in (("GET", base), ("GET", f"{base}/issuance-policy"), ("POST", base),
+                             ("PATCH", f"{key_path}/limits"), ("DELETE", key_path)):
             data = {"monthly_credit_limit": "2"} if method == "PATCH" else {}
             assert (await client.request(method, path, headers=owner, json=data)).status_code == 403
         directory.users["creator"].enabled = False
         assert (await client.get("/v1/models", headers=_header(item["key"]))).status_code == 200
         assert (await client.delete(key_path, headers=session("successor"))).status_code == 204
         assert (await client.get("/v1/models", headers=_header(item["key"]))).status_code == 401
-    assert manager_check.await_count == 13
+    assert manager_check.await_count == 16
 
 
 @pytest.mark.parametrize("kind", ["personal", "service"])
@@ -270,10 +282,10 @@ async def test_legacy_scopes_cannot_access_nonmodel_routes_or_server_tools(key_d
             response = await client.post(path, headers=headers, json={})
             assert response.status_code == 403, (path, response.text)
         result = await client.post("/v1/chat/completions", headers=headers, json={
-            "model": "lumen", "messages": [{"role": "user", "content": "test"}],
-            "tools": [{"type": "function", "function": {"name": "server_tool", "parameters": {"type": "object"}}}],
+            "model": "test-model", "messages": [{"role": "user", "content": "test"}],
+            "web_search_options": {},
         })
-        assert result.status_code == 403 and "native:tools:execute" in result.text
+        assert result.status_code == 403 and result.json()["error"]["code"] == "server_tool_not_allowed_for_key"
 
 
 @pytest.mark.parametrize("kind", ["personal", "service"])
@@ -352,6 +364,120 @@ async def test_model_keys_receive_compat_images_audio_and_embeddings(key_db, dir
     owned.assert_awaited_with(run_id="completed-run", **actor)
     image.assert_awaited_once_with(run_id="completed-run", **actor)
     asset.assert_awaited_once_with(asset_id="owned-audio", **actor)
+
+
+_CODEX_TOOLS = [
+    {"type": "function", "name": "shell", "description": "Run a command",
+     "parameters": {"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}}}}},
+    {"type": "custom", "name": "apply_patch", "description": "Apply a patch",
+     "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}},
+    {"type": "local_shell"},
+]
+_CLAUDE_CODE_TOOLS = [
+    {"name": "Bash", "description": "Run a command",
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"type": "custom", "name": "Read", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+]
+
+
+@pytest.mark.parametrize("kind", ["personal", "service"])
+async def test_client_declared_tools_are_forwarded_for_model_keys(key_db, directory, monkeypatch, kind):
+    from lumen.services import completion_api, inference_authority
+
+    row, raw = await _key(key_db, kind, ["compat:completions:write"])
+    monkeypatch.setattr(inference_authority, "get_session_factory", lambda: key_db)
+    monkeypatch.setattr(completion_api, "resolve_api", AsyncMock(return_value={"model_name": "upstream-model"}))
+    monkeypatch.setattr(completion_api, "precheck", AsyncMock())
+    forwarded = {}
+
+    async def upstream(protocol, response, *, resolved, user_id, project_id, api_key_id, options, **_kwargs):
+        # The real pre-I/O check: a client tool declaration needs only completion authority.
+        await completion_api._authorize_completion(user_id, project_id, api_key_id, options, resolved)
+        forwarded[protocol] = options["tools"]
+        return response
+
+    async def responses_upstream(**kwargs):
+        return await upstream("responses", {"id": "resp_1", "object": "response", "status": "completed",
+                                            "output": [{"type": "function_call", "name": "shell", "call_id": "c1",
+                                                        "arguments": "{\"command\":[\"ls\"]}"}]}, **kwargs)
+
+    async def messages_upstream(**kwargs):
+        return await upstream("messages", {"id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+                                           "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                                        "input": {"command": "ls"}}],
+                                           "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 1}},
+                              **kwargs)
+
+    async def chat_upstream(*, resolved, user_id, project_id, api_key_id, tools, tool_choice, **_kwargs):
+        await completion_api._authorize_completion(
+            user_id, project_id, api_key_id, {"tools": tools, "tool_choice": tool_choice}, resolved)
+        forwarded["chat"] = tools
+        return {"model": "upstream-model", "content": None, "finish_reason": "tool_calls",
+                "prompt_tokens": 1, "completion_tokens": 1,
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}
+
+    monkeypatch.setattr(completion_api, "complete_responses", responses_upstream)
+    monkeypatch.setattr(completion_api, "complete_anthropic", messages_upstream)
+    monkeypatch.setattr(completion_api, "complete_once", chat_upstream)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        codex = await client.post("/v1/responses", headers=_header(raw), json={
+            "model": "gpt-codex", "input": "list files", "tools": _CODEX_TOOLS, "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        })
+        assert codex.status_code == 200, codex.text
+        assert codex.json()["output"][0]["type"] == "function_call"
+        claude = await client.post("/v1/messages", headers=_header(raw), json={
+            "model": "claude", "max_tokens": 64, "messages": [{"role": "user", "content": "list files"}],
+            "tools": _CLAUDE_CODE_TOOLS, "tool_choice": {"type": "auto"},
+        })
+        assert claude.status_code == 200, claude.text
+        assert claude.json()["content"][0]["type"] == "tool_use"
+        chat_tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+        chat = await client.post("/v1/chat/completions", headers=_header(raw), json={
+            "model": "gpt", "messages": [{"role": "user", "content": "x"}], "tool_choice": "required",
+            "tools": chat_tools,
+        })
+        assert chat.status_code == 200, chat.text
+        assert chat.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "f"
+    assert forwarded == {"responses": _CODEX_TOOLS, "messages": _CLAUDE_CODE_TOOLS, "chat": chat_tools}
+
+
+@pytest.mark.parametrize(("path", "body"), [
+    *[("/v1/responses", {"model": "m", "input": "x", "tools": [tool]}) for tool in (
+        {"type": "web_search"}, {"type": "web_search_preview"}, {"type": "file_search", "vector_store_ids": ["v"]},
+        {"type": "code_interpreter", "container": {"type": "auto"}}, {"type": "computer_use_preview"},
+        {"type": "image_generation"}, {"type": "mcp", "server_label": "s", "server_url": "https://mcp.example"},
+    )],
+    ("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "x"}], "web_search_options": {}}),
+    *[("/v1/messages", {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "x"}],
+                        "tools": [tool]}) for tool in (
+        {"type": "web_search_20250305", "name": "web_search"}, {"type": "web_fetch_20250910", "name": "web_fetch"},
+        {"type": "code_execution_20250825", "name": "code_execution"},
+        {"type": "computer_20250124", "name": "computer", "display_width_px": 1, "display_height_px": 1},
+    )],
+    ("/v1/messages", {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "x"}],
+                      "container": {"id": "c"}}),
+])
+@pytest.mark.parametrize("kind", ["personal", "service"])
+async def test_hosted_tools_are_rejected_for_model_keys(key_db, directory, monkeypatch, kind, path, body):
+    from lumen.services import completion_api
+
+    _, raw = await _key(key_db, kind, ["compat:completions:write"])
+    resolve = AsyncMock(side_effect=AssertionError("hosted tool request resolved a provider"))
+    monkeypatch.setattr(completion_api, "resolve_api", resolve)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(path, headers=_header(raw), json=body)
+    assert response.status_code == 403, response.text
+    assert "server_tool_not_allowed_for_key" in response.text
+    resolve.assert_not_awaited()
+
+
+def test_gemini_function_declarations_are_client_tools():
+    from lumen.services.inference_authority import hosted_tools
+
+    assert hosted_tools({"tools": [{"functionDeclarations": [{"name": "f"}]}]}) == ()
+    assert hosted_tools({"tools": [{"googleSearch": {}}, {"codeExecution": {}}, {"urlContext": {}}]}) == (
+        "googleSearch", "codeExecution", "urlContext")
 
 
 @pytest.mark.parametrize("kind", ["personal", "service"])

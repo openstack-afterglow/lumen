@@ -24,6 +24,11 @@ _HEADERS = {"Authorization": "Bearer sk-afgl-admission"}
 _GATEWAY_HEADERS = {"Authorization": "Bearer sk-afgl-gateway"}
 
 
+def _headers(protocol):
+    # model=lumen stays a Claude Gateway key capability; personal/service keys are rejected.
+    return _GATEWAY_HEADERS if protocol in {"gateway", "lumen"} else _HEADERS
+
+
 def _request(protocol, *, stream=True):
     if protocol == "responses":
         return "/v1/responses", {"model": "test-model", "input": "hello", "stream": stream}
@@ -155,8 +160,7 @@ async def _post(harness, protocol, *, stream=True, headers=None, body=None):
     path, default_body = _request(protocol, stream=stream)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=harness.app), base_url="http://test") as client:
         return await client.post(path, json=default_body if body is None else body,
-                                 headers=(_GATEWAY_HEADERS if protocol == "gateway" else _HEADERS)
-                                 if headers is None else headers)
+                                 headers=_headers(protocol) if headers is None else headers)
 
 
 def _start_stream(harness, protocol):
@@ -176,7 +180,7 @@ def _start_stream(harness, protocol):
              "http_version": "1.1", "method": "POST", "scheme": "http", "path": path,
              "raw_path": path.encode(), "query_string": b"", "root_path": "",
              "headers": [(b"host", b"test"), (b"content-type", b"application/json"),
-                         (b"authorization", (_GATEWAY_HEADERS if protocol == "gateway" else _HEADERS)["Authorization"].encode())],
+                         (b"authorization", _headers(protocol)["Authorization"].encode())],
              "client": ("127.0.0.1", 1234), "server": ("test", 80)}
     task = asyncio.create_task(harness.app(scope, incoming.get, send))
     return SimpleNamespace(task=task, incoming=incoming, messages=messages, first_text=first_text)
@@ -226,7 +230,7 @@ async def test_saturation_rejects_before_resolution_precheck_provider_or_run_row
 async def test_auth_and_schema_reject_before_any_sse_reservation(harness, protocol, occupied, rejection):
     slot = harness.capacity.reserve("sse") if occupied else None
     _, body = _request(protocol)
-    headers = _GATEWAY_HEADERS if protocol == "gateway" else _HEADERS
+    headers = _headers(protocol)
     expected = 401
     if rejection == "missing_auth":
         headers = {}
@@ -486,7 +490,7 @@ async def test_response_start_failure_closes_eager_provider_stream_before_releas
              "http_version": "1.1", "method": "POST", "scheme": "http", "path": path,
              "raw_path": path.encode(), "query_string": b"", "root_path": "",
              "headers": [(b"host", b"test"), (b"content-type", b"application/json"),
-                         (b"authorization", (_GATEWAY_HEADERS if protocol == "gateway" else _HEADERS)["Authorization"].encode())],
+                         (b"authorization", _headers(protocol)["Authorization"].encode())],
              "client": ("127.0.0.1", 1234), "server": ("test", 80)}
     await asyncio.gather(harness.app(scope, incoming.get, send), return_exceptions=True)
 

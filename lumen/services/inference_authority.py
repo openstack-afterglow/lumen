@@ -53,10 +53,41 @@ def native_run_scopes(payload: dict, *, agent_id: object = None) -> tuple[str, .
     return tuple(sorted(required | set(payload.get("required_scopes") or ())))
 
 
+# Client-declared tools: Lumen only forwards the declaration and returns the
+# model's call; the caller executes it. Every other tool runs on Lumen or the provider.
+_CLIENT_TOOL_TYPES = frozenset({"function", "custom", "local_shell", "shell", "apply_patch"})
+_CLIENT_TOOL_PREFIXES = ("bash_", "text_editor_", "memory_")  # Anthropic-defined, client-executed
+_GEMINI_CLIENT_TOOL_KEYS = frozenset({"functionDeclarations", "function_declarations"})
+_HOSTED_REQUEST_FIELDS = ("web_search_options", "mcp_servers", "container")
+HOSTED_TOOL_CODE = "server_tool_not_allowed_for_key"
+HOSTED_TOOL_MESSAGE = "Server-executed tools are unavailable to API keys; declare client tools instead."
+
+
+def hosted_tools(request: dict) -> tuple[str, ...]:
+    """Name every server- or provider-executed tool the request asks for.
+
+    Untyped Anthropic custom tools and Gemini function declarations are client tools;
+    any other untyped Gemini tool entry (googleSearch, codeExecution, ...) is hosted.
+    """
+    hosted = [field for field in _HOSTED_REQUEST_FIELDS if request.get(field) is not None]
+    for tool in request.get("tools") or ():
+        if not isinstance(tool, dict):
+            hosted.append("invalid")
+            continue
+        kind = tool.get("type")
+        if kind is None:
+            if "name" in tool or "input_schema" in tool:
+                continue  # Anthropic custom tool
+            hosted.extend(sorted(key for key in tool if key not in _GEMINI_CLIENT_TOOL_KEYS))
+        elif not isinstance(kind, str) or not (kind in _CLIENT_TOOL_TYPES or kind.startswith(_CLIENT_TOOL_PREFIXES)):
+            hosted.append(str(kind))
+    return tuple(dict.fromkeys(hosted))
+
+
 def completion_scopes(request: dict, *, base: tuple[str, ...] = ("compat:completions:write",), resolved: dict | None = None) -> tuple[str, ...]:
-    """Includes client functions and provider builtins/search, independent of tool_choice."""
+    """Hosted tools and provider search need tool authority; forwarded client tools do not."""
     required = set(base) | set(model_required_scopes(resolved))
-    if request.get("tools") or request.get("functions") or request.get("web_search_options"):
+    if hosted_tools(request):
         required.add("native:tools:execute")
     modalities = set(request.get("modalities") or request.get("output_modalities") or ())
     if modalities & {"image", "video"} or any(tool.get("type") == "image_generation" for tool in request.get("tools") or []):

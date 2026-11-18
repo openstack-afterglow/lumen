@@ -219,7 +219,7 @@ async def test_managed_settings_support_conditional_etag(client, gateway_auth, m
     assert second.headers["etag"] == etag
 
 
-async def test_gateway_fixed_scope_denies_client_tools_before_resolution(client, gateway_auth, monkeypatch):
+async def test_gateway_denies_server_tools_before_resolution(client, gateway_auth, monkeypatch):
     from unittest.mock import AsyncMock
 
     resolve = AsyncMock()
@@ -227,10 +227,10 @@ async def test_gateway_fixed_scope_denies_client_tools_before_resolution(client,
     response = await client.post(
         f"{_GATEWAY}/v1/messages", headers=_HEADERS,
         json={"model": "client-alias", "messages": [{"role": "user", "content": "hello"}],
-              "max_tokens": 100, "tools": [{"name": "read", "description": "read",
-                                           "input_schema": {"type": "object"}}]},
+              "max_tokens": 100, "tools": [{"type": "web_search_20250305", "name": "web_search"}]},
     )
     assert response.status_code == 403
+    assert "server_tool_not_allowed_for_key" in response.text
     resolve.assert_not_awaited()
 
 
@@ -273,6 +273,8 @@ async def test_gateway_messages_use_configured_route_and_preserve_native_blocks(
             "thinking": {"type": "enabled", "budget_tokens": 12000},
             "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
             "output_config": {"effort": "high"},
+            # Claude Code's own tools: forwarded declarations, executed by the client.
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
         },
     )
     assert response.status_code == 200
@@ -282,6 +284,7 @@ async def test_gateway_messages_use_configured_route_and_preserve_native_blocks(
     assert captured["options"]["thinking"]["budget_tokens"] == 12000
     assert captured["options"]["context_management"]["edits"][0]["keep"] == "all"
     assert captured["options"]["output_config"] == {"effort": "high"}
+    assert captured["options"]["tools"] == [{"name": "Bash", "input_schema": {"type": "object"}}]
     assert captured["options"]["anthropic_headers"] == {
         "anthropic-beta": "context-management-2025-06-27",
         "anthropic-version": "2023-06-01",

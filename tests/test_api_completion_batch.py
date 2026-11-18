@@ -170,7 +170,8 @@ async def test_responses_admission_sends_the_frozen_output_budget(route_catalog)
     )
     assert prepared.payload["options"]["max_output_tokens"] == 4096
     assert prepared.pricing_snapshot["max_output_tokens"] == 4096
-    assert prepared.required_scopes == ("compat:batches:write", "native:tools:execute")
+    # A forwarded client function is not Lumen tool execution.
+    assert prepared.required_scopes == ("compat:batches:write",)
 
 
 @pytest.mark.parametrize("input_tokens", [900_000, 922_001])
