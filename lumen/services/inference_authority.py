@@ -1,8 +1,82 @@
 """Request-derived inference actions; credentials always come from trusted owners."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from time import monotonic
+
 from lumen.db import get_session_factory
+from lumen.models.chat_runs import ChatRun, ChatRunSegment
+from lumen.services import api_key_store
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
+
+_DISPATCH_APPROVAL_SECONDS = 5
+
+
+def dispatch_deadline() -> float:
+    return monotonic() + _DISPATCH_APPROVAL_SECONDS
+
+
+def dispatch_expired(deadline: float) -> bool:
+    return monotonic() >= deadline
+
+
+def _dispatch_identity(run: ChatRun) -> tuple:
+    return (
+        run.id, run.user_id, run.project_id, run.api_key_id, run.agent_id, run.payer_domain_id,
+        run.request_fingerprint, run.capability_snapshot,
+    )
+
+
+@dataclass(frozen=True)
+class DispatchApproval:
+    """A process-local approval for one frozen run; never persisted or reused across calls."""
+
+    identity: tuple
+    required_scopes: tuple[str, ...]
+    expires_at: float
+
+    def require_fresh(self) -> None:
+        if monotonic() >= self.expires_at:
+            raise ApiKeyForbidden("stale inference authorization")
+
+    async def check(self, session, run: ChatRun) -> None:
+        """Recheck only local identity and current key state under the caller's locks."""
+        self.require_fresh()
+        if _dispatch_identity(run) != self.identity:
+            raise ApiKeyForbidden("stale inference authorization")
+        if run.api_key_id is not None:
+            scopes = await api_key_store.active_key_scopes_db(
+                session, run.api_key_id, user_id=run.user_id, project_id=run.project_id,
+            )
+            if scopes is None or not scopes.issuperset(self.required_scopes):
+                raise ApiKeyForbidden("API key no longer authorizes inference")
+        self.require_fresh()
+
+
+async def read_dispatch_candidate(session, run_id: str, segment_id: str) -> ChatRun | None:
+    """Read without row locks; a checkpointed boundary does not need fresh authority."""
+    run = await session.get(ChatRun, run_id)
+    if run is None or run.cancel_requested_at is not None:
+        return None
+    segment = await session.get(ChatRunSegment, (run_id, segment_id))
+    return run if segment is None or segment.status == "prepared" else None
+
+
+async def preflight_dispatch(session, run: ChatRun, scopes: tuple[str, ...]) -> DispatchApproval:
+    """Use live authority without any billing, run, provider or batch row locks."""
+    expires_at = dispatch_deadline()
+    await authorize_api_key_in_transaction(
+        session, api_key_id=run.api_key_id, user_id=run.user_id, project_id=run.project_id,
+        required_scopes=scopes, credential_authority=(run.capability_snapshot or {}).get("credential_authority"),
+    )
+    return DispatchApproval(_dispatch_identity(run), scopes, expires_at)
+
+
+async def check_dispatch(session, run: ChatRun, approval: DispatchApproval | None) -> DispatchApproval:
+    if approval is None:
+        raise ApiKeyForbidden("new inference is not preauthorized")
+    await approval.check(session, run)
+    return approval
 
 
 def model_required_scopes(resolved: dict | None) -> tuple[str, ...]:
@@ -107,12 +181,16 @@ async def authorize_tool_dispatch(ctx) -> None:
                            required_scopes=("native:tools:execute",), credential_authority=credential_authority)
 
 
-async def authorize_run_generation(session, run, *, resolved: dict | None = None) -> None:
-    """Auxiliary calls need current generation/history and their own intrinsic tools, not old selections."""
+def run_generation_scopes(run, *, resolved: dict | None = None) -> tuple[str, ...]:
+    """Auxiliary calls need generation/history and their own intrinsic tools."""
     generation = "compat:completions:write" if run.source == "api" and run.run_scope == "api" else "native:runs:write"
     history = "native:conversations:read" if getattr(run, "conversation_id", None) is not None else "native:runs:read"
+    return generation, history, *model_required_scopes(resolved)
+
+
+async def authorize_run_generation(session, run, *, resolved: dict | None = None) -> None:
     await authorize_api_key_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
-        api_key_id=run.api_key_id, required_scopes=(generation, history, *model_required_scopes(resolved)),
+        api_key_id=run.api_key_id, required_scopes=run_generation_scopes(run, resolved=resolved),
         credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
 
 

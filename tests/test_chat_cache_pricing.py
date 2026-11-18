@@ -576,6 +576,7 @@ class TestUsageComponents:
             model_name="summary-model",
             conversation_id="c1",
             api_key_id=None,
+            payer_domain_id=None,
             pricing_snapshot={
                 "margin_multiplier": "1",
                 "chat_credit_per_usd": "1",
@@ -1317,6 +1318,10 @@ async def _execute_with_usage_event(
         model_name="model",
         project_id="project-1",
         user_id="user-1",
+        api_key_id=None,
+        payer_domain_id=None,
+        source="web",
+        run_scope="temp",
         conversation_id=None,
         user_message_id=None,
         assistant_message_id=None,
