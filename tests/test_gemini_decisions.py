@@ -340,7 +340,7 @@ async def test_gemini_transport_failure_hold_outcomes(ledger, fake_http, monkeyp
     ledger.settle.assert_not_called()
 
 
-def client(*, auth_type="api_key", scopes=("native:runs:write", "compat:completions:write")):
+def client(*, auth_type="api_key", scopes=("decisions:write",)):
     app = FastAPI()
     app.include_router(native.router, prefix="/v1")
     app.include_router(compat.router, prefix="/v1")
@@ -354,7 +354,7 @@ def client(*, auth_type="api_key", scopes=("native:runs:write", "compat:completi
 
 
 @pytest.mark.parametrize("path,auth_type,expected_scope", [
-    ("/v1/chat/decisions", "keystone", "native:runs:write"), ("/v1beta/decisions", "api_key", "compat:completions:write"),
+    ("/v1/chat/decisions", "keystone", "decisions:write"), ("/v1beta/decisions", "api_key", "decisions:write"),
 ])
 def test_native_branch_and_google_compat(path, auth_type, expected_scope, monkeypatch):
     resolve = AsyncMock(return_value=route())

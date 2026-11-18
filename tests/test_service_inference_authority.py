@@ -28,9 +28,13 @@ def principal(role="member", *, key=False, scopes=("compat:completions:write", "
             "source": "api" if key else "web", "is_system_admin": False, "scopes": scopes}
 
 
-def active_key(*scopes):
-    return SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True,
-                           revoked_at=None, expires_at=None, scopes=list(scopes))
+def active_key(*scopes, **fields):
+    # A personal Claude Gateway key keeps the owner/project identity and live owner
+    # roles. Like every key, its stored scopes only ever count inside the model allowlist.
+    return SimpleNamespace(**{"id": 7, "key_kind": "personal", "credential_kind": "claude_gateway",
+                              "owner_user_id": "owner", "owner_project_id": "project", "owner_domain_id": None,
+                              "is_active": True, "revoked_at": None, "expires_at": None,
+                              "scopes": list(scopes), **fields})
 
 
 @pytest.mark.parametrize(("path", "body"), [
@@ -393,26 +397,22 @@ async def test_auxiliary_generation_does_not_require_old_selected_tools(monkeypa
 
 
 @pytest.mark.parametrize("required", [False, True])
-@pytest.mark.parametrize("tools_scope", [False, True])
-async def test_auxiliary_model_uses_its_own_intrinsic_key_scope(monkeypatch, required, tools_scope):
+async def test_key_backed_runs_never_authorize_auxiliary_generation(monkeypatch, required):
+    # Model keys never hold native generation, history or tool scopes, even as legacy stored scopes.
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={"roles": ["member"], "is_system_admin": False}))
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7, source="api",
                           run_scope="persistent", conversation_id="conv", capability_snapshot={})
-    session = Session(active_key("native:runs:write", "native:conversations:read",
-                                 *(("native:tools:execute",) if tools_scope else ())))
-    resolved = {"capabilities": {"web_search_required": required}}
-    if required and not tools_scope:
-        with pytest.raises(api_key_store.ApiKeyForbidden):
-            await inference_authority.authorize_run_generation(session, run, resolved=resolved)
-    else:
-        await inference_authority.authorize_run_generation(session, run, resolved=resolved)
+    session = Session(active_key("compat:completions:write", "native:runs:write", "native:conversations:read",
+                                 "native:tools:execute"))
+    with pytest.raises(api_key_store.ApiKeyForbidden):
+        await inference_authority.authorize_run_generation(
+            session, run, resolved={"capabilities": {"web_search_required": required}})
 
 
 async def test_auxiliary_intrinsic_search_preserves_key_scope_attenuation(monkeypatch):
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
         "roles": ["member"], "is_system_admin": False}))
-    key = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True, revoked_at=None,
-                          expires_at=None, scopes=["native:runs:write", "native:conversations:read"])
+    key = active_key("native:runs:write", "native:conversations:read")
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7, source="api",
                           run_scope="persistent", conversation_id="conv", capability_snapshot={})
     with pytest.raises(api_key_store.ApiKeyForbidden):
@@ -565,13 +565,12 @@ async def test_queued_key_expiration_rejects_new_tool_intent_before_provider_sta
     roles = ["member"]
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
         "roles": roles, "is_system_admin": False}))
-    key = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True,
-                          revoked_at=None, expires_at=datetime.now(UTC) + timedelta(days=1),
-                          scopes=["native:runs:write", "native:tools:execute"])
+    key = active_key("compat:completions:write", "native:runs:write", "native:tools:execute",
+                     expires_at=datetime.now(UTC) + timedelta(days=1))
     # Key is valid when work is admitted, but expires while waiting for a worker.
     await api_key_store.authorize_api_key_in_transaction(
         Session(key), user_id="owner", project_id="project", api_key_id=7,
-        required_scopes=("native:runs:write", "native:tools:execute"))
+        required_scopes=("compat:completions:write",))
     key.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     run = dispatch_run(id="run", user_id="owner", project_id="project", api_key_id=7, run_scope="temp",
                        capability_snapshot={})

@@ -244,7 +244,8 @@ async def test_current_tool_permission_loss_blocks_loaded_cloud_invocation(
     ctx = await _admitted_context()
     await _search(ctx, "컴퓨트")
     if authority == "key":
-        synthetic_inference_store.key.scopes.remove("native:tools:execute")
+        # Model API keys are model-only: a key-backed run never authorizes tools.
+        synthetic_inference_store.run.api_key_id = synthetic_inference_store.key.id
     else:
         synthetic_inference_store.authority.return_value["roles"] = ["reader"]
     request_count = len(bridge.requests)
