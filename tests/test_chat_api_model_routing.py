@@ -649,6 +649,87 @@ async def test_admin_image_leaf_variants_overlay_exact_keys(provider_db, admin_c
     assert model["effective_media_pricing"] == model["catalog_entry"]["media_pricing"]
 
 
+async def test_admin_unit_image_readiness_requires_an_executable_variant(provider_db, admin_client, monkeypatch):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr("lumen.services.assets.asset_pipeline_available", lambda: True)
+    path = "/v1/admin/models"
+
+    def image_gate(body):
+        return body["effective_capabilities"]["feature_gates"]["image_output"]
+
+    replace = await admin_client.post(path, json={
+        "provider_id": 1, "model_name": "gpt-image-2", "model_kind": "image",
+        "media_pricing": {"billing_basis": "unit", "image_per_unit": "0.04"},
+    })
+    assert replace.status_code == 201, replace.text
+    # The base rate stays stored, but no request can execute without an exact variant.
+    assert replace.json()["media_pricing"]["image_per_unit"] == "0.04"
+    assert image_gate(replace.json()) == {
+        "available": False, "mode": "none", "reason_code": "pricing_unavailable", "pricing_available": False,
+    }
+    assert replace.json()["image_pricing_readiness"] == {
+        "ready": False, "reason": "pricing_unavailable", "executable_variants": [], "unsupported_variants": [],
+        "supported_variants": replace.json()["image_pricing_readiness"]["supported_variants"],
+    }
+    assert "1024x1024:high" in replace.json()["image_pricing_readiness"]["supported_variants"]
+    with_variant = await admin_client.patch(f"{path}/{replace.json()['id']}", json={"media_pricing": {
+        "billing_basis": "unit", "image_per_unit": "0.04", "image_variants": {"1024x1024:high": "0.08"},
+    }})
+    assert with_variant.status_code == 200, with_variant.text
+    assert image_gate(with_variant.json())["available"] is True
+    assert with_variant.json()["image_pricing_readiness"]["ready"] is True
+    assert with_variant.json()["image_pricing_readiness"]["executable_variants"] == ["1024x1024:high"]
+
+    # Leaf mode: unit basis over a token-basis catalog has no variants until one is overlaid.
+    leaf = await admin_client.post(path, json={
+        "provider_id": 1, "model_name": "gpt-image-2.6-sunburst", "model_kind": "image",
+        "media_pricing": {"override_mode": "leaf", "billing_basis": "unit", "image_per_unit": "0.04"},
+    })
+    assert leaf.status_code == 201, leaf.text
+    assert image_gate(leaf.json())["reason_code"] == "pricing_unavailable"
+    overlaid = await admin_client.patch(f"{path}/{leaf.json()['id']}", json={"media_pricing": {
+        "image_variants": {"1024x1024:high": "0.08"},
+    }})
+    assert overlaid.status_code == 200, overlaid.text
+    assert overlaid.json()["effective_media_pricing"]["image_variants"] == {"1024x1024:high": "0.08"}
+    assert image_gate(overlaid.json())["available"] is True
+
+
+async def test_admin_unit_image_readiness_rejects_variants_the_model_cannot_execute(
+    provider_db, admin_client, monkeypatch,
+):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="gemini")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr("lumen.services.assets.asset_pipeline_available", lambda: True)
+    path = "/v1/admin/models"
+    # Gemini 2.5 accepts quality "auto" only; a syntactically valid high-quality key is not executable.
+    created = await admin_client.post(path, json={
+        "provider_id": 1, "model_name": "gemini-2.5-flash-image", "model_kind": "image",
+        "media_pricing": {"billing_basis": "unit", "image_variants": {"1024x1024:high": "0.08"}},
+    })
+    assert created.status_code == 201, created.text
+    readiness = created.json()["image_pricing_readiness"]
+    assert readiness["ready"] is False and readiness["reason"] == "unsupported_image_variants"
+    assert readiness["unsupported_variants"] == ["1024x1024:high"] and readiness["executable_variants"] == []
+    assert "1024x1024:high" not in readiness["supported_variants"]
+    assert "1024x1024:auto" in readiness["supported_variants"]
+    gate = created.json()["effective_capabilities"]["feature_gates"]["image_output"]
+    assert gate["available"] is False and gate["reason_code"] == "unsupported_image_variants"
+
+    fixed = await admin_client.patch(f"{path}/{created.json()['id']}", json={"media_pricing": {
+        "billing_basis": "unit", "image_variants": {"1024x1024:high": "0.08", "1024x1024:auto": "0.039"},
+    }})
+    assert fixed.status_code == 200, fixed.text
+    readiness = fixed.json()["image_pricing_readiness"]
+    assert readiness["ready"] is True and readiness["reason"] is None
+    assert readiness["executable_variants"] == ["1024x1024:auto"]
+    assert readiness["unsupported_variants"] == ["1024x1024:high"]
+    assert fixed.json()["effective_capabilities"]["feature_gates"]["image_output"]["available"] is True
+
+
 @pytest.mark.parametrize("model_name", ["no-matching-catalog", "gpt-4o"])
 async def test_admin_image_leaf_mode_starts_empty_without_matching_catalog(provider_db, admin_client, monkeypatch, model_name):
     add_provider, _, _ = provider_db
