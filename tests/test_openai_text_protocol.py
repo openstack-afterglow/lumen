@@ -507,3 +507,28 @@ async def test_chat_stream_unknown_code_requires_dispatched_unsettled_hold(monke
         assert finish.await_args.kwargs["uncertain"] is uncertain
     else:
         finish.assert_not_awaited()
+
+
+@pytest.mark.parametrize("invalid_usage", [False, True])
+async def test_unheld_openai_chat_close_at_accounting_error_never_debits(monkeypatch, invalid_usage):
+    async def chunks():
+        yield provider_client.provider_object({"choices": [{"delta": {"content": "partial text"}}]})
+        if invalid_usage:
+            raise OpenAIUsageInvalid()
+        yield provider_client.provider_object({"service_tier": "priority", "choices": []})
+
+    debit, reserve = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(core.credit, "apply_usage", debit)
+    monkeypatch.setattr(core.stateless_credit, "reserve", reserve)
+    monkeypatch.setattr(core, "_authorize_completion", AsyncMock())
+    monkeypatch.setattr(provider_client, "acompletion_stream", AsyncMock(return_value=chunks()))
+    stream = await core.complete_stream(
+        resolved=route_for("gpt-unlisted"), messages=MESSAGES, temperature=None, max_tokens=32, **OWNER,
+    )
+    async with aclosing(stream):
+        assert (await anext(stream))["type"] == "delta"
+        error = await anext(stream)
+        assert error["type"] == "error" and "code" not in error
+        # Match the HTTP consumer: do not advance the iterator past the error.
+    reserve.assert_not_awaited()
+    debit.assert_not_awaited()

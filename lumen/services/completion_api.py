@@ -846,12 +846,13 @@ async def _complete_stream(
             return
         except ProviderError as exc:
             _provider_rejected(hold, exc)
+            if isinstance(exc, (OpenAIServiceTierMismatch, OpenAIUsageInvalid)):
+                # The HTTP consumer closes immediately after receiving the error.
+                text_parts.clear()
             if hold is not None and hold.dispatched:
                 yield {"type": "error", "code": "provider_result_unknown", "message": exc.code}
             else:
                 yield {"type": "error", "message": "생성 중 오류가 발생했습니다"}
-            if isinstance(exc, (OpenAIServiceTierMismatch, OpenAIUsageInvalid)):
-                text_parts.clear()  # explicit invalid evidence must not fall back to an estimate
             return
         except Exception:
             logger.warning("API 스트리밍 실패 model=%s", resolved.get("model_name"), exc_info=True)
