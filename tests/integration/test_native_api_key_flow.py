@@ -1,4 +1,4 @@
-"""Real MariaDB/Redis coverage for the API-key durable-run path."""
+"""Real MariaDB/Redis coverage for native Keystone run and model-key boundaries."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ async def _fixed_text_worker(run_id: str, identity: str) -> str:
     )
 
 
-async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypatch):
+async def test_keystone_session_admits_executes_and_replays_a_native_run(monkeypatch):
     """Exercise HTTP admission, the durable journal, worker execution, and usage attribution."""
     database_url = os.environ["DATABASE_URL"]
     redis_url = os.environ["REDIS_URL"]
@@ -51,9 +51,15 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
     async def current_authority(owner_user_id, owner_project_id):
         assert (owner_user_id, owner_project_id) == (user_id, project_id)
         return {"roles": ["member", "lumen-inventory_reader", "lumen-history_reader", "lumen-chat_user",
-                          "lumen-tools_user", "lumen-keys_editor"], "is_system_admin": False}
+                          "lumen-tools_user", "lumen-keys_editor"], "is_system_admin": False, "domain_id": project_id}
 
     monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
+    def fake_validate_token(token: str, **_kwargs) -> dict:
+        assert token == "integration-owner-token"
+        return {"user_id": user_id, "project_id": project_id, "roles": ["member"], "is_system_admin": False}
+
+    monkeypatch.setattr("lumen.auth.validate_token", fake_validate_token)
+    owner_headers = {"X-Auth-Token": "integration-owner-token"}
     init_db(database_url, pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
@@ -83,13 +89,8 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
         finally:
             await redis.close()
 
-        key = await api_key_store.create_key(
-            user_id,
-            project_id,
-            "native integration",
-            ["models:read", "native:runs:read", "native:runs:write", "native:tools:execute", "usage:read"],
-            None,
-        )
+        key = await api_key_store.create_key(user_id, project_id, "integration", ["models:read"])
+        monkeypatch.setattr(api_key_store, "_verify_model_key_owner", lambda **kwargs: None)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
             unknown = await client.post(
@@ -107,7 +108,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
             first_idem_key = str(uuid.uuid4())
             admitted = await client.post(
                 "/v1/temp-completions",
-                headers={"X-Api-Key": key["key"], "Idempotency-Key": first_idem_key},
+                headers={**owner_headers, "Idempotency-Key": first_idem_key},
                 json={
                     "parts": [{"type": "text", "text": "run the integration check"}],
                     "model_id": model_name,
@@ -174,7 +175,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
             registration_id = await _fixed_text_worker(run_id, run_owner)
             assert await execution.execute_queued_run(run_id, owner=run_owner, registration_id=registration_id) is True
 
-            events = await client.get(f"/v1/runs/{run_id}/events", headers={"X-Api-Key": key["key"]})
+            events = await client.get(f"/v1/runs/{run_id}/events", headers=owner_headers)
             assert events.status_code == 200, events.text
             event_types = [
                 line.removeprefix("event: ") for line in events.text.splitlines() if line.startswith("event: ")
@@ -183,43 +184,19 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
             event_ids = [line.removeprefix("id: ") for line in events.text.splitlines() if line.startswith("id: ")]
             assert event_ids == [f"{run_id}:{index}" for index in range(1, len(event_ids) + 1)]
 
-            usage = await client.get("/v1/usage/records", headers={"X-Api-Key": key["key"]})
+            usage = await client.get("/v1/usage/records", headers=owner_headers)
             assert usage.status_code == 200, usage.text
             record = next(item for item in usage.json()["records"] if item["run_id"] == run_id)
-            assert record["source"] == "api"
-            assert record["api_key_id"] == key["id"]
+            assert record["source"] == "web"
+            assert record["api_key_id"] is None
             assert {"raw_cost", "pricing_snapshot", "usage_components"}.isdisjoint(record)
 
-            owner_project_id = project_id
-
-            def fake_validate_token(token: str, project_id: str = "") -> dict:
-                assert token == "integration-owner-token"
-                return {
-                    "user_id": user_id,
-                    "username": "integration-user",
-                    "project_id": project_id or owner_project_id,
-                    "roles": ["member", "lumen-inventory_reader", "lumen-history_reader", "lumen-chat_user",
-                              "lumen-tools_user", "lumen-keys_editor"],
-                    "is_system_admin": False,
-                }
-
-            monkeypatch.setattr("lumen.auth.validate_token", fake_validate_token)
-
-            owner_headers = {"X-Auth-Token": "integration-owner-token"}
-            api_keys_res = await client.get("/v1/api-keys", headers=owner_headers)
-            assert api_keys_res.status_code == 200, api_keys_res.text
-            found_key = next(item for item in api_keys_res.json() if item["id"] == key["id"])
-            assert found_key["month_credited_cost"] == record["credited_cost"]
-
-            patch_res = await client.patch(
-                f"/v1/api-keys/{key['id']}/limits",
-                headers=owner_headers,
+            limits = await client.patch(
+                f"/v1/api-keys/{key['id']}/limits", headers=owner_headers,
                 json={"monthly_credit_limit": record["credited_cost"]},
             )
-            assert patch_res.status_code == 200, patch_res.text
-            updated_key = patch_res.json()
-            assert updated_key["owner_monthly_credit_limit"] == record["credited_cost"]
-            assert updated_key["effective_monthly_credit_limit"] == record["credited_cost"]
+            assert limits.status_code == 200, limits.text
+            assert limits.json()["owner_monthly_credit_limit"] == record["credited_cost"]
 
             async with factory() as session:
                 runs_before = (await session.execute(select(func.count(ChatRun.id)))).scalar_one()
@@ -235,8 +212,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
                     "features": {"memory": False, "tool_policy": {"mode": "agent_default"}},
                 },
             )
-            assert blocked.status_code == 402, blocked.text
-            assert blocked.json()["detail"] == "API 키 월 사용 한도를 초과했습니다"
+            assert blocked.status_code == 403, blocked.text
 
             async with factory() as session:
                 runs_after = (await session.execute(select(func.count(ChatRun.id)))).scalar_one()
@@ -245,7 +221,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
 
             replayed = await client.post(
                 "/v1/temp-completions",
-                headers={"X-Api-Key": key["key"], "Idempotency-Key": first_idem_key},
+                headers={**owner_headers, "Idempotency-Key": first_idem_key},
                 json={
                     "parts": [{"type": "text", "text": "run the integration check"}],
                     "model_id": model_name,
@@ -434,7 +410,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
     async def current_authority(owner_user_id, owner_project_id):
         assert (owner_user_id, owner_project_id) == (user_id, project_id)
         # Explicitly verified current system authority, not a raw admin label.
-        return {"roles": ["admin"], "is_system_admin": True}
+        return {"roles": ["admin"], "is_system_admin": True, "domain_id": project_id}
 
     monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
@@ -511,13 +487,8 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
         fake_provider = ThreadingHTTPServer(("127.0.0.1", 0), FakeClaudeCatalog)
         fake_thread = Thread(target=fake_provider.serve_forever, daemon=True)
         fake_thread.start()
-        key = await api_key_store.create_key(
-            user_id,
-            project_id,
-            "onboarding",
-            ["models:read", "native:runs:read", "native:runs:write", "native:tools:execute", "usage:read"],
-            None,
-        )
+        key = await api_key_store.create_key(user_id, project_id, "onboarding", ["models:read"])
+        monkeypatch.setattr(api_key_store, "_verify_model_key_owner", lambda **kwargs: None)
         key_headers = {"X-Api-Key": key["key"]}
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
@@ -615,7 +586,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                 before_denial = await session.scalar(select(func.count(ChatRun.id)).where(ChatRun.user_id == user_id))
             denied = await client.post(
                 "/v1/temp-completions",
-                headers={**key_headers, "Idempotency-Key": str(uuid.uuid4())},
+                headers={**admin_headers, "Idempotency-Key": str(uuid.uuid4())},
                 json=native_request(unpriced_name, "unregistered model must deny"),
             )
             assert denied.status_code == 400, denied.text
@@ -623,7 +594,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
 
             advanced = await client.post(
                 "/v1/temp-completions",
-                headers={**key_headers, "Idempotency-Key": str(uuid.uuid4())},
+                headers={**admin_headers, "Idempotency-Key": str(uuid.uuid4())},
                 json=native_request(model_name, "unsupported search", search=True),
             )
             async with factory() as session:
@@ -635,7 +606,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
 
             admitted = await client.post(
                 "/v1/temp-completions",
-                headers={**key_headers, "Idempotency-Key": str(uuid.uuid4())},
+                headers={**admin_headers, "Idempotency-Key": str(uuid.uuid4())},
                 json=native_request(model_name, "priced text only"),
             )
             assert admitted.status_code == 202, admitted.text
@@ -695,17 +666,17 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                 assert ledger.pricing_status == "priced"
                 assert ledger.model_name == model_name
                 assert ledger.provider_id == provider_id
-                assert ledger.source == "api" and ledger.api_key_id == key["id"]
+                assert ledger.source == "web" and ledger.api_key_id is None
                 for field in ("input_price_per_token", "output_price_per_token", "price_source"):
                     assert ledger.pricing_snapshot[field] == admitted_pricing[field]
                 settled_pricing = dict(ledger.pricing_snapshot)
                 assert wallet is not None
                 assert wallet.used_quota_this_month == expected_credited
                 assert wallet.balance_credits == wallet.reserved_credits == Decimal("0")
-            usage = await client.get("/v1/usage/records", headers=key_headers)
+            usage = await client.get("/v1/usage/records", headers=admin_headers)
             assert usage.status_code == 200, usage.text
             record = next(item for item in usage.json()["records"] if item["run_id"] == run_id)
-            assert record["source"] == "api" and record["api_key_id"] == key["id"]
+            assert record["source"] == "web" and record["api_key_id"] is None
             assert record["total_tokens"] == 15
             assert Decimal(str(record["credited_cost"])) == expected_credited
 
@@ -752,9 +723,12 @@ async def test_persistent_tool_round_keeps_its_message_when_provider_advances(mo
     async def current_authority(owner_user_id, owner_project_id):
         assert (owner_user_id, owner_project_id) == (user_id, project_id)
         return {"roles": ["member", "lumen-chat_user", "lumen-tools_user", "lumen-history_reader",
-                          "lumen-inventory_reader", "lumen-keys_editor"], "is_system_admin": False}
+                          "lumen-inventory_reader", "lumen-keys_editor"], "is_system_admin": False, "domain_id": project_id}
 
     monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
+    monkeypatch.setattr("lumen.auth.validate_token", lambda *args, **kwargs: {
+        "user_id": user_id, "project_id": project_id, "roles": ["member"], "is_system_admin": False,
+    })
     init_db(os.environ["DATABASE_URL"], pool_size=2, max_overflow=0)
     factory = get_session_factory()
     second_turn_started = asyncio.Event()
@@ -843,11 +817,8 @@ async def test_persistent_tool_round_keeps_its_message_when_provider_advances(mo
             session.add(LlmModel(provider_id=provider.id, model_name=model_name, is_active=True,
                                 input_price=Decimal("0.000001"), output_price=Decimal("0.000002"),
                                 price_source="manual"))
-        key = await api_key_store.create_key(user_id, project_id, "turn ownership", ["models:read",
-            "native:conversations:read", "native:conversations:write", "native:runs:read",
-            "native:runs:write", "native:tools:execute"], None)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver",
-                               headers={"X-Api-Key": key["key"]}) as client:
+                               headers={"X-Auth-Token": "integration-turn-owner"}) as client:
             created = await client.post("/v1/conversations", json={"title": "Owned turn fixture"})
             assert created.status_code == 201, created.text
             conversation_id = created.json()["id"]

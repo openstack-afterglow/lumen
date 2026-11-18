@@ -20,12 +20,12 @@ google_router = APIRouter(route_class=ProviderDecisionRoute)
 
 @router.post("/decisions", openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]})
 async def create_decision(body: DecisionRequest,
-                          principal: Principal = Depends(require_api_key_scopes("compat:completions:write"))):
+                          principal: Principal = Depends(require_api_key_scopes("decisions:write"))):
     try:
         route = await decisions.resolve(body.model, openai_compat=True)
         result = await decisions.decide(
             route=route, body=body, user_id=principal["user_id"], project_id=principal["project_id"],
-            api_key_id=principal.get("api_key_id"), required_scopes=("compat:completions:write",), source="api",
+            api_key_id=principal.get("api_key_id"), required_scopes=("decisions:write",), source="api",
         )
     except decisions.DecisionError as exc:
         return openai_error_response(exc.status_code, exc.message, code="decision_error")
@@ -38,14 +38,14 @@ async def create_decision(body: DecisionRequest,
 }})
 async def create_gemini_decision(
     request: Request,
-    principal: Principal = Depends(require_api_key_scopes("compat:completions:write")),
+    principal: Principal = Depends(require_api_key_scopes("decisions:write")),
 ):
     body = parse_gemini_request(request, await request.body())
     try:
         route = await decisions.resolve(body.model.removeprefix("models/"), provider_type="gemini")
         return await gemini_decisions.decide(
             route=route, body=body, user_id=principal["user_id"], project_id=principal["project_id"],
-            api_key_id=principal.get("api_key_id"), required_scopes=("compat:completions:write",),
+            api_key_id=principal.get("api_key_id"), required_scopes=("decisions:write",),
         )
     except decisions.DecisionError as exc:
         raise HTTPException(exc.status_code, exc.message) from exc

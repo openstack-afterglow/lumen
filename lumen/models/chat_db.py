@@ -561,8 +561,11 @@ class ChatApiKey(Base):
     __tablename__ = "chat_api_keys"
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
-    owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
-    owner_project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    owner_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    key_kind: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="personal", server_default="personal")
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    created_by_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False, default="")
     key_prefix: Mapped[str] = mapped_column(VARCHAR(24), nullable=False)  # 표시용(시크릿 아님)
     key_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)  # SHA-256 hex
@@ -597,7 +600,15 @@ class ChatApiKey(Base):
             "credential_kind IN ('api_key', 'claude_gateway')",
             name="chk_chat_api_keys_credential_kind",
         ),
+        CheckConstraint(
+            "(key_kind = 'personal' AND owner_user_id IS NOT NULL AND owner_domain_id IS NULL)"
+            " OR (key_kind = 'service' AND credential_kind = 'api_key' AND owner_domain_id IS NOT NULL"
+            " AND owner_user_id IS NULL AND owner_project_id IS NULL AND created_by_user_id IS NOT NULL)",
+            name="chk_chat_api_keys_owner_kind",
+        ),
         Index("idx_chat_api_keys_owner", "owner_user_id", "owner_project_id"),
+        Index("idx_chat_api_keys_kind_user", "key_kind", "owner_user_id"),
+        Index("idx_chat_api_keys_kind_domain", "key_kind", "owner_domain_id"),
     )
 
 

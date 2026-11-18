@@ -1,4 +1,4 @@
-"""Keys attenuate current effective owner authority, never replace it."""
+"""Gateway credentials attenuate current roles; model keys have model-only authority."""
 
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -61,7 +61,7 @@ def key_row(**changes):
     fields = dict(
         id=7, owner_user_id="u", owner_project_id="p", is_active=True,
         revoked_at=None, expires_at=None, scopes=["models:read", _CHAT, "compat:images:write"],
-        key_hash=aks._hash_key(_RAW), credential_kind="api_key", last_used_at=None,
+        key_hash=aks._hash_key(_RAW), key_kind="personal", credential_kind="claude_gateway", last_used_at=None,
     )
     fields.update(changes)
     return SimpleNamespace(**fields)
@@ -82,10 +82,12 @@ def current_roles(monkeypatch, roles, *, system_admin=False):
 
 
 def test_issuable_scope_vocabulary_matches_shared_service_contract():
-    assert aks.API_KEY_SCOPES == frozenset(
-        scope for scope in service_authority.SCOPE_CAPABILITIES if not scope.startswith("native:keys:"))
-    assert {"native:conversations:delete", "native:assets:delete", "compat:files:delete",
-            "native:agents:read", "native:agents:write", "native:agents:delete", "native:mcp:write"} <= aks.API_KEY_SCOPES
+    assert aks.API_KEY_SCOPES == service_authority.MODEL_API_KEY_SCOPES
+    assert {"embeddings:write", "decisions:write"} <= aks.API_KEY_SCOPES
+    assert {"usage:read", "native:conversations:delete", "native:assets:delete", "compat:files:delete",
+            "native:agents:read", "native:agents:write", "native:agents:delete", "native:mcp:write"}.isdisjoint(
+                aks.API_KEY_SCOPES
+            )
 
 
 @pytest.mark.parametrize("roles", [
@@ -252,7 +254,8 @@ async def test_system_owner_key_has_service_authority_not_platform_admin(monkeyp
     assert principal["service_system_admin"] is True
     assert principal["is_system_admin"] is False
     auth.ensure_scopes(principal, _CHAT)
-    assert principal["credential_kind"] == "api_key"
+    assert principal["credential_kind"] == "claude_gateway"
+    assert principal["payer"] == auth.Payer("user", "u", None)
     assert principal["scopes"] == tuple(session.row.scopes)
     with pytest.raises(HTTPException) as error:
         auth.ensure_scopes(principal, _CHAT, "native:assets:delete")
@@ -263,9 +266,10 @@ async def test_system_owner_key_has_service_authority_not_platform_admin(monkeyp
 
 
 async def test_gemini_api_key_header_uses_regular_scoped_key_authority(monkeypatch):
-    current_roles(monkeypatch, ["member"])
-    session = stored_key(monkeypatch)
+    monkeypatch.setattr(aks, "_verify_model_key_owner", lambda **kwargs: None)
+    session = stored_key(monkeypatch, credential_kind="api_key", scopes=["embeddings:write"])
     request = Request({"type": "http", "method": "POST", "path": "/v1beta/models/test:embedContent",
+                       "route": SimpleNamespace(path="/v1beta/models/{model}:embedContent"),
                        "headers": [(b"x-goog-api-key", _RAW.encode())]})
     principal = await auth.get_principal(request)
     assert principal["auth_type"] == "api_key"
@@ -311,12 +315,12 @@ async def test_standard_roles_manage_keys_with_owner_context_and_reader_is_read_
                      await client.delete("/api-keys/7")]
     assert [response.status_code for response in responses] == expected
     if expected[0] == 200:
-        listing.assert_awaited_once_with("u", "p")
+        listing.assert_awaited_once_with("u")
     else:
         listing.assert_not_awaited()
     if expected[2] == 200:
-        rename.assert_awaited_once_with(7, "u", "p", "renamed")
-        limits.assert_awaited_once_with(7, "u", "p", {"weekly_credit_limit": None})
+        rename.assert_awaited_once_with(7, "u", "renamed")
+        limits.assert_awaited_once_with(7, "u", {"weekly_credit_limit": None})
     else:
         rename.assert_not_awaited()
         limits.assert_not_awaited()
@@ -325,13 +329,13 @@ async def test_standard_roles_manage_keys_with_owner_context_and_reader_is_read_
     else:
         create.assert_not_awaited()
     if expected[-1] == 204:
-        revoke.assert_awaited_once_with(7, "u", "p")
+        revoke.assert_awaited_once_with(7, "u")
     else:
         revoke.assert_not_awaited()
 
 
-async def test_member_cannot_revoke_another_owner_or_project(monkeypatch):
-    session = stored_key(monkeypatch)
+async def test_member_cannot_revoke_another_owners_key_but_can_manage_own_across_projects(monkeypatch):
+    session = stored_key(monkeypatch, credential_kind="api_key")
     test_app = FastAPI()
     test_app.include_router(api_keys.router)
     caller = {"user_id": "other", "project_id": "p", "roles": ["member"],
@@ -342,12 +346,9 @@ async def test_member_cannot_revoke_another_owner_or_project(monkeypatch):
 
     test_app.dependency_overrides[auth.get_token_info] = principal
     async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://test") as client:
-        for user_id, project_id in (("other", "p"), ("u", "other")):
-            caller.update(user_id=user_id, project_id=project_id)
-            response = await client.delete("/api-keys/7")
-            assert response.status_code == 403
-            assert session.row.is_active is True
-        caller.update(user_id="u", project_id="p")
+        response = await client.delete("/api-keys/7")
+        assert response.status_code == 403 and session.row.is_active
+        caller.update(user_id="u", project_id="other")
         response = await client.delete("/api-keys/7")
         assert response.status_code == 204
     assert session.row.is_active is False and session.row.revoked_at is not None
@@ -589,7 +590,7 @@ async def test_issuance_policy_rechecks_current_owner_without_authority_cache(mo
     monkeypatch.setattr(aks, "owner_issuance_policy", policy)
     token_info = {"user_id": "u", "project_id": "p", "roles": request_roles, "is_system_admin": False}
     first = await api_keys.get_api_key_issuance_policy(token_info)
-    assert "native:tools:execute" in first["allowed_scopes"]
+    assert "compat:completions:write" in first["allowed_scopes"]
     lookup.return_value = {"roles": ["member"], "is_system_admin": False}
     second = await api_keys.get_api_key_issuance_policy(token_info)
     assert second["allowed_scopes"] == first["allowed_scopes"]
@@ -616,7 +617,7 @@ async def test_issuance_policy_owner_authority_outage_is_503_without_quota_fallb
     ("native:runs:write", "native:conversations:read"),
     ("native:images:write", "native:assets:read"),
     ("native:audio:write", "native:assets:read"),
-    ("native:realtime:write",),
+    ("compat:realtime:write",),
     ("native:tools:execute", "native:extensions:read"),
     ("native:conversations:delete",),
 ])
@@ -625,6 +626,11 @@ async def test_zero_role_system_owner_before_new_io_preserves_key_attenuation(
 ):
     session = stored_key(monkeypatch, scopes=list(required_scopes))
     lookup = current_roles(monkeypatch, [], system_admin=True)
+    if api_key_id is not None and not set(required_scopes) <= aks.API_KEY_SCOPES:
+        with pytest.raises(aks.ApiKeyForbidden):
+            await aks.authorize_api_key_in_transaction(
+                session, api_key_id=api_key_id, user_id="u", project_id="p", required_scopes=required_scopes)
+        return
     await aks.authorize_api_key_in_transaction(
         session, api_key_id=api_key_id, user_id="u", project_id="p", required_scopes=required_scopes)
     lookup.assert_awaited_once_with("u", "p")
@@ -645,11 +651,11 @@ async def test_zero_role_system_owner_before_new_io_preserves_key_attenuation(
             session, api_key_id=api_key_id, user_id="u", project_id="p", required_scopes=required_scopes)
 
 
-async def test_zero_role_system_owner_key_native_routes_remain_scoped_and_tenant_bound(monkeypatch):
+async def test_system_owner_personal_key_cannot_access_native_agents_or_admin(monkeypatch):
     from lumen.api import agents, plugins
 
-    session = stored_key(monkeypatch, scopes=["native:agents:read"])
-    current_roles(monkeypatch, [], system_admin=True)
+    session = stored_key(monkeypatch, credential_kind="api_key", scopes=["native:agents:read"])
+    monkeypatch.setattr(aks, "_verify_model_key_owner", lambda **kwargs: None)
     application = FastAPI()
     application.include_router(agents.router, prefix="/v1")
     application.include_router(plugins.admin_router, prefix="/v1")
@@ -663,7 +669,7 @@ async def test_zero_role_system_owner_key_native_routes_remain_scoped_and_tenant
         monkeypatch.setattr(agents.ags, name, operation)
     headers = {"X-API-Key": _RAW, "X-Project-Id": "p", "X-Target-Project-Id": "p"}
     async with AsyncClient(transport=ASGITransport(application), base_url="http://synthetic") as client:
-        assert (await client.get("/v1/agents", headers=headers)).status_code == 200
+        assert (await client.get("/v1/agents", headers=headers)).status_code == 403
         assert (await client.get("/v1/agents?include_private=true", headers=headers)).status_code == 403
         assert (await client.get("/v1/agents/7", headers=headers)).status_code == 403
         assert (await client.post("/v1/agents", headers=headers, json={"name": "denied"})).status_code == 403
@@ -672,7 +678,7 @@ async def test_zero_role_system_owner_key_native_routes_remain_scoped_and_tenant
         # The owner is a system admin, but the credential is not a Keystone session.
         assert (await client.get("/v1/admin/plugins", headers=headers)).status_code == 401
         assert (await client.get("/v1/api-keys", headers=headers)).status_code == 401
-    listing.assert_awaited_once_with(user_id="u", project_id="p", include_private=False)
+    listing.assert_not_awaited()
     create.assert_not_awaited()
     detail.assert_not_awaited()
     delete.assert_not_awaited()
@@ -690,7 +696,7 @@ async def test_reduced_member_issuance_keeps_full_project_actions_without_system
                   "issued_role_ids": ["member-id"]}
     response = await api_keys.get_api_key_issuance_policy(token_info)
     assert response["allowed_scopes"] == sorted(aks.API_KEY_SCOPES)
-    assert "native:tools:execute" in response["allowed_scopes"]
+    assert "native:tools:execute" not in response["allowed_scopes"]
     policy.assert_awaited_once_with("u")
 
 
@@ -703,7 +709,7 @@ async def test_reduced_caller_cannot_mint_scope_from_unrestricted_owner_authorit
               "source_project_id": "p", "source_system_scope": "",
               "issued_role_ids": ["reader-id"]}
     with pytest.raises(HTTPException) as error:
-        await api_keys.create_api_key(api_keys.ApiKeyCreateBody(scopes=[_CHAT, "native:tools:execute"]), caller)
+        await api_keys.create_api_key(api_keys.ApiKeyCreateBody(scopes=[_CHAT]), caller)
     assert error.value.status_code == 403
     create.assert_not_awaited()
     lookup.assert_not_awaited()

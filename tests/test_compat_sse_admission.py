@@ -62,6 +62,8 @@ def harness(monkeypatch):
         if key == "sk-afgl-invalid":
             return None
         return {"user_id": "user", "project_id": "project", "api_key_id": 7,
+                "auth_type": "api_key", "source": "api",
+                "credential_class": "claude_gateway" if key == "sk-afgl-gateway" else "personal_key",
                 "roles": ["member", *SERVICE_CAPABILITIES], "service_system_admin": False,
                 "credential_kind": "claude_gateway" if key == "sk-afgl-gateway" else "api_key",
                 "scopes": ("models:read",) if key == "sk-afgl-no-scope" else ("compat:completions:write",)}

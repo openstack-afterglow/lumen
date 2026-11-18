@@ -155,7 +155,7 @@ def _openai_request(raw: object) -> DecisionRequest:
     ]}}},
 }})
 async def create_decision(request: Request,
-                          principal: Principal = Depends(require_scopes("native:runs:write"))):
+                          principal: Principal = Depends(require_scopes("decisions:write"))):
     content = await request.body()
     if not content:
         raise RequestValidationError([{"type": "missing", "loc": ("body",), "msg": "Field required"}])
@@ -182,7 +182,7 @@ async def create_decision(request: Request,
         _openai_request(raw)
         raise HTTPException(422, "invalid decision model")
     caller = dict(user_id=principal["user_id"], project_id=principal["project_id"],
-                  api_key_id=principal.get("api_key_id"), required_scopes=("native:runs:write",),
+                  api_key_id=principal.get("api_key_id"), required_scopes=("decisions:write",),
                   source="api" if principal.get("api_key_id") is not None else "web")
     try:
         route = await decisions.resolve(model)

@@ -38,7 +38,7 @@ def test_public_api_key_scope_schema_accepts_realtime_and_matches_store():
     from lumen.api.api_keys import ApiKeyCreateBody, ApiKeyScope
 
     assert set(get_args(ApiKeyScope)) == aks.API_KEY_SCOPES
-    scopes = ["compat:realtime:write", "native:realtime:write"]
+    scopes = ["compat:realtime:write"]
     issued = ApiKeyCreateBody.model_validate({"name": "realtime-client", "scopes": scopes})
     assert issued.scopes == scopes
 
@@ -59,6 +59,7 @@ class TestStorePureLogic:
 
     def test_expiry_serialization_includes_utc_for_mysql_datetime(self):
         row = SimpleNamespace(
+            key_kind="personal",
             id=1, name="n", key_prefix="sk-afgl-AbCd", scopes=["models:read"], is_active=True,
             owner_monthly_credit_limit=None, admin_monthly_credit_limit=None, owner_weekly_credit_limit=None,
             created_at=None, last_used_at=None, revoked_at=None,
@@ -70,6 +71,7 @@ class TestStorePureLogic:
 
     def test_public_never_leaks_hash(self):
         row = SimpleNamespace(
+            key_kind="personal",
             id=1,
             name="n",
             key_prefix="sk-afgl-AbCd",
@@ -105,6 +107,7 @@ class TestStorePureLogic:
 
     def test_public_admin_includes_owner_ids(self):
         row = SimpleNamespace(
+            key_kind="personal", owner_domain_id=None, created_by_user_id=None,
             id=1,
             name="n",
             key_prefix="sk-afgl-AbCd",
@@ -231,6 +234,7 @@ class TestStorePureLogic:
                 return False
 
         row = SimpleNamespace(
+            key_kind="personal", owner_domain_id=None, created_by_user_id=None,
             id=1,
             key_prefix="sk-afgl-test",
             name="test-key",
@@ -272,6 +276,7 @@ class TestStorePureLogic:
 
     async def test_update_owner_limits_rejects_weekly_limit_above_ceiling(self, monkeypatch):
         row = SimpleNamespace(
+            key_kind="personal", credential_kind="api_key",
             id=1,
             owner_user_id="u-owner",
             owner_project_id="p-owner",
@@ -306,12 +311,12 @@ class TestStorePureLogic:
             await aks.update_owner_limits(
                 1,
                 "u-owner",
-                "p-owner",
                 {"weekly_credit_limit": Decimal("21")},
             )
 
     async def test_update_owner_limits_preserves_omitted_weekly_limit(self, monkeypatch):
         row = SimpleNamespace(
+            key_kind="personal", credential_kind="api_key",
             id=1,
             name="n",
             key_prefix="sk-afgl-AbCd",
@@ -359,7 +364,6 @@ class TestStorePureLogic:
         result = await aks.update_owner_limits(
             1,
             "u-owner",
-            "p-owner",
             {"monthly_credit_limit": Decimal("25")},
         )
 
@@ -369,6 +373,7 @@ class TestStorePureLogic:
 
     async def test_rename_key_rejects_non_owner(self, monkeypatch):
         row = SimpleNamespace(
+            key_kind="personal", credential_kind="api_key",
             id=1,
             owner_user_id="another-user",
             owner_project_id="p-owner",
@@ -391,7 +396,7 @@ class TestStorePureLogic:
         monkeypatch.setattr(aks, "_require_db", lambda: lambda: session)
 
         with pytest.raises(aks.ApiKeyForbidden, match="소유자가 아닙니다"):
-            await aks.rename_key(1, "u-owner", "p-owner", "노트북")
+            await aks.rename_key(1, "u-owner", "노트북")
 
     def test_scope_validation_fails_closed(self):
         assert aks._valid_scopes([]) is None
@@ -425,6 +430,9 @@ class TestApiKeyAuthDependency:
         async def fake_verify(raw):
             assert raw == "sk-afgl-good"
             return {
+                "auth_type": "api_key",
+                "credential_class": "claude_gateway",
+                "source": "api",
                 "user_id": "u1",
                 "project_id": "p1",
                 "api_key_id": 7,
@@ -441,6 +449,9 @@ class TestApiKeyAuthDependency:
         async def fake_verify(raw):
             assert raw == "sk-afgl-viakey"
             return {
+                "auth_type": "api_key",
+                "credential_class": "claude_gateway",
+                "source": "api",
                 "user_id": "u1",
                 "project_id": "p1",
                 "api_key_id": 9,
@@ -455,10 +466,12 @@ class TestApiKeyAuthDependency:
 
 
 class TestPrincipalDependency:
-    async def test_api_key_principal_enforces_owner_project(self, monkeypatch):
+    async def test_claude_gateway_principal_retains_owner_project(self, monkeypatch):
         async def fake_verify(raw):
             assert raw == "sk-afgl-key"
             return {
+                "auth_type": "api_key",
+                "credential_class": "claude_gateway",
                 "user_id": "u1",
                 "project_id": "p1",
                 "api_key_id": 7,
@@ -657,11 +670,10 @@ class TestRouter:
     async def test_patch_renames_owner_key_and_rejects_blank_name(self, client, monkeypatch):
         captured = {}
 
-        async def fake_rename(key_id, user_id, project_id, name):
+        async def fake_rename(key_id, user_id, name):
             captured.update(
                 key_id=key_id,
                 user_id=user_id,
-                project_id=project_id,
                 name=name,
             )
             return {"id": key_id, "name": name}
@@ -672,7 +684,6 @@ class TestRouter:
         assert captured == {
             "key_id": 1,
             "user_id": "test-user-123",
-            "project_id": "test-project-123",
             "name": "노트북",
         }
 
@@ -685,13 +696,11 @@ class TestRouter:
         async def fake_update(
             key_id,
             user_id,
-            project_id,
             limits,
         ):
             captured.update(
                 key_id=key_id,
                 user_id=user_id,
-                project_id=project_id,
                 limits=limits,
             )
             monthly = limits.get("monthly_credit_limit")
@@ -733,7 +742,7 @@ class TestRouter:
         resp = await client.patch(f"{_USER_KEYS}/1/limits", json={})
         assert resp.status_code == 422
 
-        async def fake_admin_conflict(key_id, user_id, project_id, limits):
+        async def fake_admin_conflict(key_id, user_id, limits):
             raise aks.ApiKeyLimitConflict("API 키 월 한도는 관리자 한도를 초과할 수 없습니다")
 
         monkeypatch.setattr(aks, "update_owner_limits", fake_admin_conflict)
@@ -744,7 +753,7 @@ class TestRouter:
         assert resp.status_code == 409
         assert resp.json()["detail"] == "API 키 월 한도는 관리자 한도를 초과할 수 없습니다"
 
-        async def fake_sys_conflict(key_id, user_id, project_id, limits):
+        async def fake_sys_conflict(key_id, user_id, limits):
             raise aks.ApiKeyLimitConflict("API 키 월 한도는 시스템 월 쿼터를 초과할 수 없습니다")
 
         monkeypatch.setattr(aks, "update_owner_limits", fake_sys_conflict)
@@ -755,7 +764,7 @@ class TestRouter:
         assert resp.status_code == 409
         assert resp.json()["detail"] == "API 키 월 한도는 시스템 월 쿼터를 초과할 수 없습니다"
 
-        async def fake_forbidden(key_id, user_id, project_id, limits):
+        async def fake_forbidden(key_id, user_id, limits):
             raise aks.ApiKeyForbidden("소유자가 아닙니다")
 
         monkeypatch.setattr(aks, "update_owner_limits", fake_forbidden)
@@ -765,7 +774,7 @@ class TestRouter:
         )
         assert resp.status_code == 403
 
-        async def fake_not_found(key_id, user_id, project_id, limits):
+        async def fake_not_found(key_id, user_id, limits):
             raise aks.ApiKeyNotFound("100 를 찾을 수 없습니다")
 
         monkeypatch.setattr(aks, "update_owner_limits", fake_not_found)
@@ -880,7 +889,7 @@ class TestRouter:
         assert resp.json()["detail"] == "API 키 월 한도는 시스템 월 쿼터를 초과할 수 없습니다"
 
     async def test_list_graceful_empty_on_unavailable(self, client, monkeypatch):
-        async def fake_list(user_id, project_id):
+        async def fake_list(user_id):
             raise aks.ApiKeyStorageUnavailable("down")
 
         monkeypatch.setattr(aks, "list_keys", fake_list)
@@ -890,8 +899,8 @@ class TestRouter:
     async def test_revoke_passes_owner_context(self, client, monkeypatch):
         captured = {}
 
-        async def fake_revoke(key_id, user_id, project_id):
-            captured.update(key_id=key_id, user_id=user_id, project_id=project_id)
+        async def fake_revoke(key_id, user_id):
+            captured.update(key_id=key_id, user_id=user_id)
 
         monkeypatch.setattr(aks, "revoke_key", fake_revoke)
         resp = await client.delete(f"{_USER_KEYS}/5")
@@ -899,7 +908,7 @@ class TestRouter:
         assert captured["key_id"] == 5 and captured["user_id"] == "test-user-123"
 
     async def test_revoke_foreign_forbidden(self, client, monkeypatch):
-        async def fake_revoke(key_id, user_id, project_id):
+        async def fake_revoke(key_id, user_id):
             raise aks.ApiKeyForbidden("소유자가 아닙니다")
 
         monkeypatch.setattr(aks, "revoke_key", fake_revoke)

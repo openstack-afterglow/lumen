@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
-from lumen.auth import ensure_scopes
+from lumen.auth import ensure_model_key_route, ensure_scopes
 from lumen.config import get_settings
 from lumen.services import api_key_store
 from lumen.services.durable_runs.errors import RealtimeKindMismatch
@@ -43,10 +43,13 @@ async def _principal(websocket: WebSocket) -> dict | None:
     if len(keys) != 1:
         return None
     info = await api_key_store.verify_key(keys[0])
-    if info is None or "compat:realtime:write" not in info.get("scopes", ()):
+    if info is None:
         return None
     try:
-        ensure_scopes({**info, "auth_type": "api_key"}, "compat:realtime:write")
+        if info["credential_class"] == "claude_gateway":
+            ensure_scopes(info, "compat:realtime:write")
+        else:
+            ensure_model_key_route(info, "WEBSOCKET", getattr(websocket.scope.get("route"), "path", None))
     except HTTPException:
         return None
     return info

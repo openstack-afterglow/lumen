@@ -49,14 +49,12 @@ def test_normalize_base_url_invalid() -> None:
 
 def test_required_scope_rotation_predicate() -> None:
     assert "compat:completions:write" in _LOCAL_KEY_SCOPES
-    assert "native:conversations:read" in _LOCAL_KEY_SCOPES
-    assert "native:conversations:write" in _LOCAL_KEY_SCOPES
     assert "models:read" in _LOCAL_KEY_SCOPES
     assert {"compat:images:write", "compat:audio:write", "compat:realtime:write"} <= set(_LOCAL_KEY_SCOPES)
-    assert {"native:images:write", "native:audio:write", "native:realtime:write",
-            "native:assets:read", "native:assets:write"} <= set(_LOCAL_KEY_SCOPES)
-    assert {"native:batches:read", "native:batches:write", "compat:batches:read", "compat:batches:write",
-            "compat:files:read", "compat:files:write"} <= set(_LOCAL_KEY_SCOPES)
+    assert {"native:audio:write", "embeddings:write", "decisions:write"} <= set(_LOCAL_KEY_SCOPES)
+    assert {"native:conversations:read", "native:batches:write", "compat:batches:write",
+            "compat:files:read", "native:assets:write", "native:tools:execute", "native:images:write",
+            "native:realtime:write", "usage:read"}.isdisjoint(_LOCAL_KEY_SCOPES)
 
     # Complete current scopes -> satisfied
     assert is_scope_satisfied(_LOCAL_KEY_SCOPES, _LOCAL_KEY_SCOPES) is True
@@ -79,18 +77,18 @@ def test_required_scope_rotation_predicate() -> None:
     assert is_scope_satisfied(extra_scopes, _LOCAL_KEY_SCOPES) is True
 
 
-def test_seed_key_current_requires_local_owner_project_and_scopes() -> None:
+def test_seed_key_current_requires_personal_owner_and_scopes() -> None:
     current = {
         "user_id": "keystone-owner-id",
-        "project_id": "keystone-project-id",
+        "credential_class": "personal_key",
         "api_key_id": 1,
         "scopes": tuple(_LOCAL_KEY_SCOPES),
     }
-    assert is_seed_key_current(current, "keystone-owner-id", "keystone-project-id") is True
-    assert is_seed_key_current({**current, "user_id": "foreign-user"}, "keystone-owner-id", "keystone-project-id") is False
-    assert is_seed_key_current({**current, "project_id": "foreign-project"}, "keystone-owner-id", "keystone-project-id") is False
-    assert is_seed_key_current({**current, "scopes": ("models:read",)}, "keystone-owner-id", "keystone-project-id") is False
-    assert is_seed_key_current(None, "keystone-owner-id", "keystone-project-id") is False
+    assert is_seed_key_current(current, "keystone-owner-id") is True
+    assert is_seed_key_current({**current, "user_id": "foreign-user"}, "keystone-owner-id") is False
+    assert is_seed_key_current({**current, "credential_class": "service_key"}, "keystone-owner-id") is False
+    assert is_seed_key_current({**current, "scopes": ("models:read",)}, "keystone-owner-id") is False
+    assert is_seed_key_current(None, "keystone-owner-id") is False
 
 
 def test_write_connection_manifest_schema_and_permissions(tmp_path: Path) -> None:
@@ -310,13 +308,13 @@ async def test_seed_rotates_owned_outdated_key_with_current_delete_scope(monkeyp
     local, _, _, _, _ = _setup_seed(monkeypatch, tmp_path, {}, [])
     (tmp_path / "api-key").write_text("sk-afgl-old\n")
     local.api_key_store.verify_key.return_value = {
-        "user_id": "keystone-owner-id", "project_id": "keystone-project-id",
+        "user_id": "keystone-owner-id", "credential_class": "personal_key",
         "api_key_id": 7, "scopes": ("models:read",),
     }
     revoke = AsyncMock()
     monkeypatch.setattr(local.api_key_store, "revoke_key", revoke)
     await local.seed()
-    revoke.assert_awaited_once_with(7, "keystone-owner-id", "keystone-project-id")
+    revoke.assert_awaited_once_with(7, "keystone-owner-id")
     local.api_key_store.create_key.assert_awaited_once()
     assert (tmp_path / "api-key").read_text() == "sk-afgl-new\n"
 
@@ -327,14 +325,14 @@ async def test_seed_binds_idless_member_authority_for_policy_and_key_rotation(mo
     local.resolve_project_authority.return_value = native
     (tmp_path / "api-key").write_text("sk-afgl-old\n")
     local.api_key_store.verify_key.return_value = {
-        "user_id": "keystone-owner-id", "project_id": "keystone-project-id", "api_key_id": 7,
+        "user_id": "keystone-owner-id", "credential_class": "personal_key", "api_key_id": 7,
         "scopes": ("models:read",),
     }
     revoke = AsyncMock()
     monkeypatch.setattr(local.api_key_store, "revoke_key", revoke)
     await local.seed()
     assert native == {"roles": ["member"], "is_system_admin": False}
-    revoke.assert_awaited_once_with(7, "keystone-owner-id", "keystone-project-id")
+    revoke.assert_awaited_once_with(7, "keystone-owner-id")
     local.api_key_store.create_key.assert_awaited_once()
     assert (tmp_path / "api-key").read_text() == "sk-afgl-new\n"
 
@@ -408,8 +406,8 @@ async def test_seed_custom_fake_route_and_rotates_missing_media_scopes(
     old_key = tmp_path / "api-key"
     old_key.write_text("sk-afgl-legacy\n")
     local.api_key_store.verify_key.return_value = {
-        "user_id": "keystone-owner-id", "project_id": "keystone-project-id", "api_key_id": 7,
-        "scopes": tuple(scope for scope in _LOCAL_KEY_SCOPES if scope != "native:assets:read"),
+        "user_id": "keystone-owner-id", "credential_class": "personal_key", "api_key_id": 7,
+        "scopes": tuple(scope for scope in _LOCAL_KEY_SCOPES if scope != "compat:images:write"),
     }
     revoke = AsyncMock()
     monkeypatch.setattr(local.api_key_store, "revoke_key", revoke)
@@ -417,8 +415,8 @@ async def test_seed_custom_fake_route_and_rotates_missing_media_scopes(
     create_provider.assert_not_awaited()
     assert create_model.await_args.kwargs["provider_id"] == 3
     assert create_model.await_args.kwargs["model_name"] == "fake-gpt-4"
-    revoke.assert_awaited_once_with(7, "keystone-owner-id", "keystone-project-id")
-    assert "native:assets:read" in local.api_key_store.create_key.await_args.args[3]
+    revoke.assert_awaited_once_with(7, "keystone-owner-id")
+    assert "compat:images:write" in local.api_key_store.create_key.await_args.args[3]
     assert local.api_key_store.create_key.await_args.args[:2] == ("keystone-owner-id", "keystone-project-id")
     assert old_key.read_text() == "sk-afgl-new\n"
     assert json.loads((tmp_path / "connection.json").read_text())["model"] == "fake-gpt-4"

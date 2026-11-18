@@ -286,7 +286,7 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
         models_endpoint=f"{origin}/v1/models",
         features=[
             "model='lumen': text-only durable worker streaming (caller tools/memory 비활성화)",
-            "provider model ID: tools(function calling) pass-through 및 vision 지원",
+            "Model API keys support model inference and vision, but not server tools, Batch, Files, or run history.",
             "Finite audio: configured product USD/second rate times scanned media duration; provider invoice units may differ.",
             "Audio speech streams owned scanned MP3/WAV; transcription accepts project-owned scanned audio, returns real text.",
             "Idempotency-Key UUID 지원 (네이티브 202 멱등 재시도 및 쿼터 재검사 예외)",
@@ -308,7 +308,7 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
         },
         notes=[
             "OpenAI 호환 route에서 model='lumen'은 durable worker 실행으로 처리되며, provider model ID는 stateless 중계로 동작합니다.",
-            "사용량은 발급 사용자의 지갑·월 쿼터에서 차감됩니다.",
+            "Personal keys pay from the user wallet. Service keys pay from the owning domain's credit pool.",
             "사용량은 웹과 분리된 API 통계(키별)로 집계됩니다.",
             "Configured gateway metadata describes the legacy Lumen custom device protocol, not current Claude Apps Gateway login.",
             "OpenAI 호환 오류는 최상위 {error: {message, type, code}} 구조를 사용합니다.",

@@ -454,6 +454,7 @@ def custom_openapi() -> dict:
     )
     from lumen.models.chat_contracts import _CHAT_RUN_EVENT
     from lumen.models.gemini_decision_contracts import GeminiDecisionRequest
+    from lumen.service_authority import MODEL_API_KEY_ROUTE_SCOPES
 
     schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
     schema["x-contract-version"] = "1.0.0"
@@ -536,26 +537,10 @@ def custom_openapi() -> dict:
             schema["paths"][path]["post"]["security"] = [*api_key_security, {"GoogleApiKey": []}]
 
     route_scopes: dict[tuple[str, str], list[str]] = {
-        ("/v1/images/generations", "post"): ["compat:images:write"],
-        ("/v1/images/edits", "post"): ["compat:images:write", "native:assets:write"],
-        ("/v1/audio/speech", "post"): ["compat:audio:write"],
-        ("/v1/audio/transcriptions", "post"): ["compat:audio:write", "native:assets:write"],
-        ("/v1/chat/completions", "post"): ["compat:completions:write"],
-        ("/v1/embeddings", "post"): ["compat:completions:write"],
-        ("/v1/decisions", "post"): ["compat:completions:write"],
-        ("/v1beta/decisions", "post"): ["compat:completions:write"],
-        ("/v1beta/models/{model}:embedContent", "post"): ["compat:completions:write"],
-        ("/v1beta/models/{model}:batchEmbedContents", "post"): ["compat:completions:write"],
-        ("/v1/responses", "post"): ["compat:completions:write"],
-        ("/v1/messages", "post"): ["compat:completions:write"],
-        ("/v1/messages/count_tokens", "post"): ["compat:completions:write"],
         ("/v1/claude-gateway/v1/messages", "post"): ["compat:completions:write"],
         ("/v1/claude-gateway/v1/messages/count_tokens", "post"): ["compat:completions:write"],
         ("/v1/claude-gateway/v1/models", "get"): ["models:read"],
         ("/v1/claude-gateway/v1/managed-settings", "get"): ["models:read"],
-        ("/v1/models", "get"): ["models:read"],
-        ("/v1/cli/models", "get"): ["models:read"],
-        ("/v1/chat/models", "get"): ["models:read"],
         ("/v1/capabilities", "get"): ["models:read"],
         ("/v1/conversations", "post"): ["native:conversations:write"],
         ("/v1/conversations", "get"): ["native:conversations:read"],
@@ -571,10 +556,8 @@ def custom_openapi() -> dict:
             "native:runs:write",
         ],
         ("/v1/temp-completions", "post"): ["native:runs:write"],
-        ("/v1/chat/decisions", "post"): ["native:runs:write"],
         ("/v1/chat/images/generations", "post"): ["native:images:write"],
         ("/v1/chat/images/edits", "post"): ["native:images:write", "native:assets:read"],
-        ("/v1/chat/audio/speech", "post"): ["native:audio:write"],
         ("/v1/chat/audio/transcriptions", "post"): ["native:audio:write", "native:assets:read"],
         ("/v1/chat/realtime/sessions", "post"): ["native:realtime:write"],
         ("/v1/conversations/{conversation_id}/messages/{message_id}/regenerate", "post"): [
@@ -616,6 +599,12 @@ def custom_openapi() -> dict:
         ("/v1/batches/{batch_id}", "get"): ["compat:batches:read"],
         ("/v1/batches/{batch_id}/cancel", "post"): ["compat:batches:write"],
     }
+    model_key_scopes = {
+        (path, method.lower()): [scope]
+        for (method, path), scope in MODEL_API_KEY_ROUTE_SCOPES.items()
+        if method != "WEBSOCKET"
+    }
+    route_scopes.update(model_key_scopes)
     admission_posts = {
         ("/v1/conversations/{conversation_id}/completions", "post"),
         ("/v1/conversations/{conversation_id}/messages/{message_id}/regenerate", "post"),
@@ -633,6 +622,7 @@ def custom_openapi() -> dict:
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             op = schema["paths"][path][method]
             op["x-required-api-key-scopes"] = scopes
+            op["x-model-api-key-allowed"] = (path, method) in model_key_scopes
             if (path, method) in admission_posts:
                 op["x-conditional-api-key-scopes"] = conditional_scopes
     batch_conditional_scopes = {
