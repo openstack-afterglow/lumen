@@ -73,12 +73,12 @@ def test_member_admits_native_images_without_service_role(monkeypatch):
 
 @pytest.mark.parametrize(("router", "path", "body"), [
     (openai.router, "/chat/completions", {"model": "model", "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]}),
+        "web_search_options": {}}),
     (responses.router, "/responses", {"model": "model", "input": "hi", "tools": [{"type": "web_search"}]}),
     (anthropic.router, "/messages", {"model": "model", "max_tokens": 20,
         "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "web_search_20250305", "name": "web_search"}]}),
 ])
-def test_completion_key_denies_compat_tools_before_resolution(monkeypatch, router, path, body):
+def test_completion_key_denies_hosted_tools_before_resolution(monkeypatch, router, path, body):
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_principal] = lambda: principal(key=True)
@@ -87,6 +87,7 @@ def test_completion_key_denies_compat_tools_before_resolution(monkeypatch, route
     with TestClient(app) as client:
         response = client.post(path, json=body)
     assert response.status_code == 403
+    assert "server_tool_not_allowed_for_key" in response.text
     resolve.assert_not_awaited()
 
 

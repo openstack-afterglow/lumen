@@ -13,21 +13,27 @@ from fastapi import FastAPI
 from lumen.api import claude_gateway
 from lumen.api.compat import anthropic, openai, responses
 from lumen.service_authority import SERVICE_CAPABILITIES
-from lumen.services import api_key_store
+from lumen.services import api_key_store, openai_compat
 from lumen.services import completion_api as core
+from lumen.services.durable_runs import admission as run_admission
 from lumen.services.infrastructure.api_load import ApiAdmission, ApiAdmissionMiddleware, ApiLoadMeter, ApiLoadMiddleware
 
 pytestmark = pytest.mark.asyncio
 
-_PROTOCOLS = ("chat", "responses", "anthropic", "gateway")
+_PROTOCOLS = ("chat", "responses", "anthropic", "lumen", "gateway")
 _HEADERS = {"Authorization": "Bearer sk-afgl-admission"}
 _GATEWAY_HEADERS = {"Authorization": "Bearer sk-afgl-gateway"}
+
+
+def _headers(protocol):
+    # model=lumen stays a Claude Gateway key capability; personal/service keys are rejected.
+    return _GATEWAY_HEADERS if protocol in {"gateway", "lumen"} else _HEADERS
 
 
 def _request(protocol, *, stream=True):
     if protocol == "responses":
         return "/v1/responses", {"model": "test-model", "input": "hello", "stream": stream}
-    body = {"model": "test-model",
+    body = {"model": "lumen" if protocol == "lumen" else "test-model",
             "messages": [{"role": "user", "content": "hello"}], "stream": stream}
     if protocol in {"anthropic", "gateway"}:
         body["max_tokens"] = 16
@@ -97,9 +103,12 @@ def harness(monkeypatch):
                 yield {"type": "delta", "content": "hello"}
             elif protocol == "responses":
                 yield {"type": "response.output_text.delta", "delta": "hello"}
-            else:
+            elif protocol == "anthropic":
                 yield {"type": "content_block_delta", "index": 0,
                        "delta": {"type": "text_delta", "text": "hello"}}
+            else:
+                yield {"kind": "chunk", "data": {"object": "chat.completion.chunk",
+                       "choices": [{"index": 0, "delta": {"content": "hello"}, "finish_reason": None}]}}
             started.set()
             if control.block:
                 await finish.wait()
@@ -109,6 +118,8 @@ def harness(monkeypatch):
                 yield {"type": "response.completed", "response": {"status": "completed"}}
             elif protocol == "anthropic":
                 yield {"type": "message_stop"}
+            elif protocol == "lumen":
+                yield {"kind": "done"}
         finally:
             with anyio.CancelScope(shield=True):
                 cleanup_started.set()
@@ -135,6 +146,22 @@ def harness(monkeypatch):
                 "content": [{"type": "text", "text": "hello"}], "stop_reason": "end_turn",
                 "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1}}
 
+    async def create_temp_run(**_kwargs):
+        boundary("create_temp_run")
+        return SimpleNamespace(run_id="run-admission")
+
+    async def summary_route(resolved):
+        return resolved
+
+    # Keep the virtual route's real normalization, resolution, precheck and durable
+    # admission chain. Only its immutable snapshots and DB boundary are replaced.
+    monkeypatch.setattr(openai_compat, "get_configured_default_model", lambda: "test-model")
+    monkeypatch.setattr(openai_compat, "get_execution_protocol_version", lambda: 1)
+    monkeypatch.setattr(openai_compat, "resolve_summary_route", summary_route)
+    monkeypatch.setattr(openai_compat, "_run_snapshots", lambda *_args, **_kwargs: ({}, {}))
+    monkeypatch.setattr(run_admission, "create_temp_run", create_temp_run)
+    monkeypatch.setattr(openai_compat, "execute_lumen_stream", lambda **_kwargs: events("lumen"))
+    monkeypatch.setattr(openai_compat, "execute_lumen_nonstream", once)
     monkeypatch.setattr(core, "resolve", resolve)
     monkeypatch.setattr(core, "resolve_api", resolve)
     monkeypatch.setattr(core, "precheck", precheck)
@@ -155,8 +182,7 @@ async def _post(harness, protocol, *, stream=True, headers=None, body=None):
     path, default_body = _request(protocol, stream=stream)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=harness.app), base_url="http://test") as client:
         return await client.post(path, json=default_body if body is None else body,
-                                 headers=(_GATEWAY_HEADERS if protocol == "gateway" else _HEADERS)
-                                 if headers is None else headers)
+                                 headers=_headers(protocol) if headers is None else headers)
 
 
 def _start_stream(harness, protocol):
@@ -176,7 +202,7 @@ def _start_stream(harness, protocol):
              "http_version": "1.1", "method": "POST", "scheme": "http", "path": path,
              "raw_path": path.encode(), "query_string": b"", "root_path": "",
              "headers": [(b"host", b"test"), (b"content-type", b"application/json"),
-                         (b"authorization", (_GATEWAY_HEADERS if protocol == "gateway" else _HEADERS)["Authorization"].encode())],
+                         (b"authorization", _headers(protocol)["Authorization"].encode())],
              "client": ("127.0.0.1", 1234), "server": ("test", 80)}
     task = asyncio.create_task(harness.app(scope, incoming.get, send))
     return SimpleNamespace(task=task, incoming=incoming, messages=messages, first_text=first_text)
@@ -206,6 +232,8 @@ async def test_saturation_rejects_before_resolution_precheck_provider_or_run_row
         assert harness.capacity.snapshot()["reserved_sse"] == 1
         assert harness.meter.active_sse == harness.meter.active_requests == 1  # SSE is a subset, not two HTTP slots.
         assert harness.calls and all(reserved == 1 for _, reserved in harness.calls)
+        if protocol == "lumen":
+            assert sum(name == "create_temp_run" for name, _ in harness.calls) == 1
         before = list(harness.calls)
         # One occupied slot protects all compatibility protocols, not just itself.
         for rejected_protocol in _PROTOCOLS:
@@ -226,7 +254,7 @@ async def test_saturation_rejects_before_resolution_precheck_provider_or_run_row
 async def test_auth_and_schema_reject_before_any_sse_reservation(harness, protocol, occupied, rejection):
     slot = harness.capacity.reserve("sse") if occupied else None
     _, body = _request(protocol)
-    headers = _GATEWAY_HEADERS if protocol == "gateway" else _HEADERS
+    headers = _headers(protocol)
     expected = 401
     if rejection == "missing_auth":
         headers = {}
@@ -268,6 +296,8 @@ async def test_nonstream_bypasses_sse_capacity_while_stream_is_open(harness, pro
         assert "text/event-stream" not in response.headers["content-type"]
         assert harness.attempts.count("sse") == before
         assert harness.capacity.snapshot()["reserved_sse"] == harness.meter.active_sse == 1
+        if protocol == "lumen":
+            assert sum(name == "create_temp_run" for name, _ in harness.calls) == 2
     finally:
         await _stop_stream(harness, existing)
     _assert_idle(harness)
@@ -279,7 +309,7 @@ async def test_completion_releases_and_preserves_protocol_terminal_events(harnes
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert "hello" in response.text
-    terminal = {"chat": "data: [DONE]",
+    terminal = {"chat": "data: [DONE]", "lumen": "data: [DONE]",
                 "responses": "event: response.completed", "anthropic": "event: message_stop",
                 "gateway": "event: message_stop"}[protocol]
     assert terminal in response.text
@@ -320,13 +350,12 @@ async def test_precheck_error_response_releases_and_keeps_error_envelope(harness
     if protocol in {"anthropic", "gateway"}:
         assert response.json()["type"] == "error"
         assert response.json()["error"]["type"] == "permission_error"
-    assert not any(name.startswith("provider") or name == "stream" for name, _ in harness.calls)
+    assert not any(name.startswith("provider") or name in {"stream", "create_temp_run"} for name, _ in harness.calls)
     _assert_idle(harness)
 
 
 @pytest.mark.parametrize("stream", [True, False])
 async def test_model_key_virtual_model_rejects_before_any_reservation_or_run(harness, stream):
-    # model=lumen is the durable agent model; model API keys cannot select it.
     response = await _post(harness, "chat", stream=stream, body={
         "model": "lumen", "messages": [{"role": "user", "content": "hello"}], "stream": stream,
     })
@@ -347,7 +376,7 @@ async def test_stream_exit_releases_exactly_once(harness, protocol, exit_path):
         if exit_path == "stream_exception":
             harness.control.stream_error = True
             harness.finish.set()
-            if protocol == "chat":
+            if protocol in {"chat", "lumen"}:
                 with pytest.raises((RuntimeError, BaseExceptionGroup)) as failure:
                     await asyncio.wait_for(existing.task, 2)
                 errors = [failure.value]
@@ -486,7 +515,7 @@ async def test_response_start_failure_closes_eager_provider_stream_before_releas
              "http_version": "1.1", "method": "POST", "scheme": "http", "path": path,
              "raw_path": path.encode(), "query_string": b"", "root_path": "",
              "headers": [(b"host", b"test"), (b"content-type", b"application/json"),
-                         (b"authorization", (_GATEWAY_HEADERS if protocol == "gateway" else _HEADERS)["Authorization"].encode())],
+                         (b"authorization", _headers(protocol)["Authorization"].encode())],
              "client": ("127.0.0.1", 1234), "server": ("test", 80)}
     await asyncio.gather(harness.app(scope, incoming.get, send), return_exceptions=True)
 

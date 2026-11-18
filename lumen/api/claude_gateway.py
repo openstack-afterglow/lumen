@@ -24,7 +24,7 @@ from lumen.api.compat.streaming import events_with_ping
 from lumen.auth import Principal, ensure_scopes, require_api_key_scopes, require_token
 from lumen.services import claude_gateway as gateway
 from lumen.services import completion_api as core
-from lumen.services.inference_authority import completion_scopes
+from lumen.services.inference_authority import HOSTED_TOOL_CODE, HOSTED_TOOL_MESSAGE, completion_scopes, hosted_tools
 from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 
 public_router = APIRouter()
@@ -217,7 +217,10 @@ async def messages(
     request: Request,
     token_info: Principal = Depends(require_gateway_write),
 ):
-    ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
+    request_body = body.model_dump(exclude_none=True)
+    if hosted_tools(request_body):
+        return anthropic_error_response(403, f"{HOSTED_TOOL_MESSAGE} ({HOSTED_TOOL_CODE})")
+    ensure_scopes(token_info, *completion_scopes(request_body))
     try:
         _model, resolved = await _resolved_gateway_model()
         await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"))

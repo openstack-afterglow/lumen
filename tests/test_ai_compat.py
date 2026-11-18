@@ -1044,6 +1044,46 @@ class TestOpenAILumenVirtualModel:
         assert response.status_code == 403
         assert response.json()["error"]["code"] == "model_not_allowed_for_key"
 
+    async def test_claude_gateway_key_keeps_lumen_discovery_and_dispatch(self, client, monkeypatch):
+        from lumen.config import get_settings
+        from lumen.services.providers import routing
+
+        async def principal():
+            return {"auth_type": "api_key", "credential_class": "claude_gateway",
+                    "user_id": "u1", "project_id": "p1", "api_key_id": 7,
+                    "source": "api", "scopes": ("models:read", "compat:completions:write"),
+                    "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False}
+
+        async def list_models(model_kind=None):
+            return [] if model_kind == "embedding" else [
+                {"model_name": "gpt-4o", "api_model_name": "gpt-4o", "api_provider": "openai"},
+            ]
+
+        created = []
+
+        async def temp_run(**kwargs):
+            created.append(kwargs)
+            return "run-gateway", "gpt-4o"
+
+        async def run_result(**kwargs):
+            assert kwargs["run_id"] == "run-gateway"
+            return {"model": "lumen", "content": "hello", "tool_calls": None, "finish_reason": "stop",
+                    "prompt_tokens": 1, "completion_tokens": 1}
+
+        monkeypatch.setitem(app.dependency_overrides, get_principal, principal)
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+        monkeypatch.setattr(routing, "list_api_models", list_models)
+        monkeypatch.setattr(openai_compat, "create_lumen_temp_run", temp_run)
+        monkeypatch.setattr(openai_compat, "execute_lumen_nonstream", run_result)
+        listing = await client.get("/v1/models", headers=_H)
+        assert listing.status_code == 200
+        assert {item["id"] for item in listing.json()["data"]} == {"gpt-4o", "lumen"}
+        request = {"model": "lumen", "messages": [{"role": "user", "content": "hello"}]}
+        response = await client.post("/v1/chat/completions", headers=_H, json=request)
+        assert response.status_code == 200, response.text
+        assert response.json()["choices"][0]["message"]["content"] == "hello"
+        assert created[0]["user_id"] == "u1" and created[0]["api_key_id"] == 7
+
     async def test_lumen_model_hidden_when_unconfigured_or_inactive(self, client, _auth, monkeypatch):
         from lumen.config import get_settings
         from lumen.services.providers import routing
