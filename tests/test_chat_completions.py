@@ -332,7 +332,7 @@ async def test_context_planner_does_not_duplicate_saved_regenerate_input(monkeyp
         lambda *_args, **_kwargs: _return({"tools": [], "mcp": []}),
     )
     monkeypatch.setattr(chat_admission, "_resolve_feature_routes", lambda *_args, **_kwargs: _return({}))
-    monkeypatch.setattr(chat_admission, "resolve_summary_route", lambda route: _return(route))
+    monkeypatch.setattr(chat_admission, "resolve_summary_route", lambda route, *, domain_paid=False: _return(route))
     monkeypatch.setattr(chat_admission.memory_host, "recall_for_run", lambda *args, **kwargs: _return([]))
 
     parts = [{"type": "text", "text": "saved turn"}]

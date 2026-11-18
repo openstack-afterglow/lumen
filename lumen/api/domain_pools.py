@@ -106,14 +106,18 @@ async def configure_domain_pool(domain_id: DomainId, body: AdminPatch):
     return await retry_deadlocks(transaction)
 
 
+def _topup_reference(domain_id: str, idempotency_key: str) -> str:
+    # Namespace independently per domain; the length bound keeps the reference under 190.
+    return f"{len(domain_id)}:{domain_id}:{idempotency_key}"
+
+
 @router.post("/admin/domain-pools/{domain_id}/topups")
 async def top_up_domain_pool(
     domain_id: DomainId, body: TopUp,
     idempotency_key: Annotated[str, Header(min_length=1, max_length=120)],
     admin: dict = Depends(require_admin),
 ):
-    # Namespace independently per domain; the length bound keeps the reference under 190.
-    reference = f"{len(domain_id)}:{domain_id}:{idempotency_key}"
+    reference = _topup_reference(domain_id, idempotency_key)
 
     async def transaction():
         async with _factory()() as session, session.begin():
@@ -134,3 +138,29 @@ async def top_up_domain_pool(
             return domain_credit.public(pool, domain_id)
 
     return await retry_deadlocks(transaction)
+
+
+@router.get("/admin/domain-pools/{domain_id}/topups/{idempotency_key}", dependencies=[Depends(require_admin)])
+async def get_domain_pool_topup(
+    domain_id: DomainId, idempotency_key: Annotated[str, Path(min_length=1, max_length=120)],
+):
+    """Recover the outcome of a top-up whose response was lost.
+
+    An unknown key is ``200 {"found": false, "entry": null}``, not 404: the caller asked a valid
+    question and the answer is that no top-up committed, so retrying the POST with that key is safe.
+    """
+    async with _factory()() as session:
+        entry = await session.scalar(select(DomainCreditLedger).where(
+            DomainCreditLedger.kind == "topup",
+            DomainCreditLedger.reference == _topup_reference(domain_id, idempotency_key),
+        ))
+    if entry is None:
+        return {"found": False, "entry": None}
+    return {"found": True, "entry": {
+        "kind": entry.kind,
+        "amount_credits": format(entry.amount_credits, "f"),
+        "balance_after": format(entry.balance_after, "f"),
+        "note": entry.note,
+        "created_at": entry.created_at.isoformat(),
+        "actor_user_id": entry.actor_user_id,
+    }}

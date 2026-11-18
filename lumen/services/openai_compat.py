@@ -21,6 +21,7 @@ from lumen.services.chat_admission import (
     _capability_extension_snapshot,
     _run_snapshots,
     resolve_summary_route,
+    route_domain_billing,
 )
 from lumen.services.context_manager import ContextBudget
 from lumen.services.durable_runs import admission, lifecycle, queries
@@ -206,10 +207,18 @@ async def create_lumen_temp_run(
     except core.CompletionError as exc:
         raise OpenAICompatError(exc.status_code, exc.message, code=exc.code) from exc
 
+    domain_paid = payer is not None and payer.domain_id is not None
+    if domain_paid:
+        readiness = route_domain_billing(resolved)
+        if not readiness["ready"]:
+            raise OpenAICompatError(
+                422, f"Model 'lumen' is not available for domain billing ({readiness['reason_code']})",
+                code="domain_billing_unavailable",
+            )
     features_obj = ChatFeatureOptions(memory=False, tool_policy=ToolPolicy(mode="none"))
     features = features_obj.model_dump(mode="json", by_alias=True)
     try:
-        summary_route = await resolve_summary_route(resolved)
+        summary_route = await resolve_summary_route(resolved, domain_paid=domain_paid)
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, str) else "Summary model route is unavailable"
         raise OpenAICompatError(exc.status_code, detail) from exc
