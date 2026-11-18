@@ -86,6 +86,8 @@ def _parse_models(raw: str, providers: dict[str, dict]) -> list[dict]:
         kind = entry.get("model_kind")
         if not isinstance(kind, str) or kind not in MODEL_KINDS:
             raise ProviderValidationError(f"{label} has an unsupported model_kind")
+        if kind == "decision":
+            raise ProviderValidationError(f"{label} decision models must be registered in the admin model registry")
         allowed = _TEXT_FIELDS if kind == "text" else _EMBEDDING_FIELDS if kind == "embedding" else _MEDIA_FIELDS
         if set(entry) != allowed:
             raise ProviderValidationError(f"{label} must contain exactly: {', '.join(sorted(allowed))}")

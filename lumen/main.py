@@ -419,8 +419,9 @@ for router, tag in (
 ):
     app.include_router(router, prefix="/v1", tags=[tag], dependencies=[Depends(require_chat_api_host)])
 app.include_router(compat_realtime.router, tags=["Realtime Voice Compat"])
+compat_embeddings.google_router.include_router(compat_decisions.google_router, tags=["Gemini Decisions Compat"])
 app.include_router(
-    compat_embeddings.google_router, tags=["Gemini Embeddings Compat"],
+    compat_embeddings.google_router, tags=["Gemini Compat"],
     dependencies=[Depends(require_chat_api_host)],
 )
 
@@ -452,6 +453,7 @@ def custom_openapi() -> dict:
         batch_item_scopes,
     )
     from lumen.models.chat_contracts import _CHAT_RUN_EVENT
+    from lumen.models.gemini_decision_contracts import GeminiDecisionRequest
 
     schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
     schema["x-contract-version"] = "1.0.0"
@@ -462,6 +464,7 @@ def custom_openapi() -> dict:
         "openai_embeddings": "OpenAI-compatible stateless text embeddings (/v1/embeddings)",
         "openai_decisions": "OpenAI-compatible stateless typed decisions (/v1/decisions)",
         "gemini_embeddings": "Google Gemini-compatible text embeddings (/v1beta/models/{model}:embedContent, :batchEmbedContents)",
+        "gemini_decisions": "Google Gemini-compatible stateless typed decisions (/v1beta/decisions)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
         "openai_images": "OpenAI-compatible durable image generation and edits (/v1/images/generations, /v1/images/edits)",
         "openai_realtime": "OpenAI-compatible durable realtime WebSockets (/v1/realtime, /v1/realtime?intent=transcription, /v1/realtime/translations, /v1/live/sessions)",
@@ -528,7 +531,7 @@ def custom_openapi() -> dict:
     ):
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             schema["paths"][path][method]["security"] = api_key_security
-    for path in ("/v1beta/models/{model}:embedContent", "/v1beta/models/{model}:batchEmbedContents"):
+    for path in ("/v1beta/decisions", "/v1beta/models/{model}:embedContent", "/v1beta/models/{model}:batchEmbedContents"):
         if path in schema.get("paths", {}) and "post" in schema["paths"][path]:
             schema["paths"][path]["post"]["security"] = [*api_key_security, {"GoogleApiKey": []}]
 
@@ -540,6 +543,7 @@ def custom_openapi() -> dict:
         ("/v1/chat/completions", "post"): ["compat:completions:write"],
         ("/v1/embeddings", "post"): ["compat:completions:write"],
         ("/v1/decisions", "post"): ["compat:completions:write"],
+        ("/v1beta/decisions", "post"): ["compat:completions:write"],
         ("/v1beta/models/{model}:embedContent", "post"): ["compat:completions:write"],
         ("/v1beta/models/{model}:batchEmbedContents", "post"): ["compat:completions:write"],
         ("/v1/responses", "post"): ["compat:completions:write"],
@@ -567,6 +571,7 @@ def custom_openapi() -> dict:
             "native:runs:write",
         ],
         ("/v1/temp-completions", "post"): ["native:runs:write"],
+        ("/v1/chat/decisions", "post"): ["native:runs:write"],
         ("/v1/chat/images/generations", "post"): ["native:images:write"],
         ("/v1/chat/images/edits", "post"): ["native:images:write", "native:assets:read"],
         ("/v1/chat/audio/speech", "post"): ["native:audio:write"],
@@ -683,6 +688,12 @@ def custom_openapi() -> dict:
         for def_name, def_schema in model_schema.pop("$defs", {}).items():
             components_schemas.setdefault(def_name, def_schema)
         components_schemas[model.__name__] = model_schema
+    # The Gemini route decodes its bounded body only after auth. Give nested
+    # schemas distinct names from similarly named OpenAI Decisions types.
+    gemini_schema = GeminiDecisionRequest.model_json_schema(ref_template="#/components/schemas/GeminiDecision_{model}")
+    for def_name, def_schema in gemini_schema.pop("$defs", {}).items():
+        components_schemas[f"GeminiDecision_{def_name}"] = def_schema
+    components_schemas["GeminiDecisionRequest"] = gemini_schema
 
     def _fix_refs(obj: Any) -> None:
         if isinstance(obj, dict):

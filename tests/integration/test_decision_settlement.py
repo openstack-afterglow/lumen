@@ -8,15 +8,19 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
+from provider_fixtures import configured_provider
 from sqlalchemy import delete, func, select, text
 
 from lumen.db import close_db, get_session_factory, init_db
-from lumen.models.chat_db import ChatApiKey, ChatUsageLog, UserWallet
+from lumen.models.chat_db import ChatApiKey, ChatUsageLog, LlmModel, LlmProvider, UserWallet
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun
 from lumen.models.decision_contracts import DecisionRequest
+from lumen.models.gemini_decision_contracts import CONTEXT_TOKENS, GeminiDecisionRequest
 from lumen.models.stateless_reservations import StatelessCallReservation
-from lumen.services import credit, decisions, stateless_credit
+from lumen.services import credit, decisions, gemini_decisions, stateless_credit
+from lumen.services.providers import routing
 
 pytestmark = pytest.mark.integration
 
@@ -203,3 +207,113 @@ async def test_stateless_and_durable_holds_share_quota_both_directions(sql_owner
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
         with pytest.raises(credit.QuotaExceeded):
             await credit.reserve_call_credit_in_transaction(session, user_id=user, project_id=project, api_key_id=None, bound=Decimal("6"))
+
+
+@pytest.mark.parametrize("outcome", ["settled", "bad-answer", "unknown", "overspent", "released"])
+async def test_gemini_real_hold_and_wallet_with_synthetic_http(sql_owner, monkeypatch, outcome):
+    factory, user, project = sql_owner
+    configured = {**_route(), "model_name": "gemini/gemini-decision-1", "api_model_name": "gemini-decision-1",
+                  "model_kind": "decision", "provider_type": "gemini", "provider_name": "Gemini"}
+    body = GeminiDecisionRequest.model_validate({
+        "model": configured["model_name"], "input": "Private input not logged",
+        "questions": {"q": {"type": "noul", "instructions": "Private question"}},
+    })
+    total = CONTEXT_TOKENS + 1 if outcome == "overspent" else 100
+    reply = {
+        "answers": {"q": {"type": "noul", "noul": 0.8, "confidence": 0.8}},
+        "usage": {"total_input_tokens": total, "total_output_tokens": 0, "total_tokens": total,
+                  "input_tokens_by_modality": [{"modality": "text", "tokens": total}]},
+    }
+    if outcome == "bad-answer":
+        reply["answers"] = {}
+    elif outcome == "unknown":
+        reply.pop("usage")
+    elif outcome == "released":
+        reply = {"error": {"code": "safety", "message": "Private provider error"}}
+    status = 400 if outcome == "released" else 200
+    events = []
+
+    def upstream(request):
+        assert request.url == gemini_decisions.API_URL
+        events.append(request.method)
+        return httpx.Response(status, json=reply)
+
+    monkeypatch.setattr(gemini_decisions, "resolve_route_api_key", AsyncMock(return_value="synthetic-api-key"))
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **_: httpx.MockTransport(upstream))
+    bound = gemini_decisions.credit_bound(
+        configured["input_price_per_token"], Decimal(1), Decimal(str(gemini_decisions.get_settings().chat_credit_per_usd)),
+    )
+    async with factory() as session, session.begin():
+        wallet = await session.get(UserWallet, user)
+        wallet.max_quota_monthly = bound
+
+    async def execute():
+        return await gemini_decisions.decide(route=configured, body=body, user_id=user, project_id=project,
+                                             api_key_id=None, required_scopes=("native:runs:write",))
+
+    if outcome == "settled":
+        assert (await execute())["usage"] == reply["usage"]
+    else:
+        with pytest.raises(decisions.DecisionError) as exc:
+            await execute()
+        assert exc.value.status_code == (400 if outcome == "released" else 502)
+        assert "Private" not in exc.value.message
+    assert events == ["POST"]
+    async with factory() as session:
+        hold = (await session.scalars(select(StatelessCallReservation).where(
+            StatelessCallReservation.user_id == user))).one()
+        rows = (await session.scalars(select(ChatUsageLog).where(ChatUsageLog.user_id == user))).all()
+        wallet = await session.get(UserWallet, user)
+        assert hold.bound_credits == bound
+        if outcome in {"settled", "bad-answer"}:
+            assert hold.status == "settled" and len(rows) == 1
+            row = rows[0]
+            assert row.event_id == hold.event_id and row.provider == "Gemini"
+            assert (row.prompt_tokens, row.completion_tokens, row.raw_cost, row.pricing_status) == (
+                100, 0, Decimal("0.00001"), "priced",
+            )
+            assert row.usage_components[0]["input_tokens_by_modality"] == reply["usage"]["input_tokens_by_modality"]
+            assert "Private" not in str(row.usage_components) + str(row.pricing_snapshot)
+            assert wallet.used_quota_this_month == row.credited_cost == hold.actual_credits
+        else:
+            assert not rows and wallet.used_quota_this_month == 0
+            assert hold.status == ("released" if outcome == "released" else "unknown")
+    if outcome in {"unknown", "overspent"}:
+        with pytest.raises(credit.QuotaExceeded):
+            await stateless_credit.reserve(event_id=str(uuid.uuid4()), user_id=user, project_id=project,
+                                           api_key_id=None, bound=Decimal("0.00000001"))
+    elif outcome == "released":
+        await stateless_credit.reserve(event_id=str(uuid.uuid4()), user_id=user, project_id=project,
+                                       api_key_id=None, bound=bound)
+
+
+async def test_decision_kind_isolation_and_exact_catalog_price(sql_owner):
+    factory, user, _project = sql_owner
+    model_name = "gemini/gemini-decision-1"
+    async with factory() as session, session.begin():
+        provider = configured_provider(name=user, api_provider=user[:40], provider_type="gemini", is_active=True)
+        session.add(provider)
+        await session.flush()
+        model = LlmModel(provider_id=provider.id, model_name=model_name, model_kind="decision", is_active=True)
+        session.add(model)
+        await session.flush()
+        provider_id, model_id = provider.id, model.id
+    exact = f"lumen/{provider_id}/{model_id}"
+    try:
+        selected = await decisions.resolve(exact, provider_type="gemini")
+        assert selected["model_kind"] == "decision" and selected["model_name"] == model_name
+        assert selected["input_price_per_token"] == Decimal("0.0000001")
+        assert selected["output_price_per_token"] is None
+        assert selected["price_source"] == "native_catalog"
+        assert selected["provider_backend"] == "lumen-decisions-http"
+        assert await routing.resolve_model_by_id(model_id) is None
+        assert await routing.resolve_model(model_name) is None
+        for kind in ("text", "embedding", "image", "tts", "stt", "realtime"):
+            assert await routing.resolve_api_model(exact, model_kind=kind) is None
+            assert not any(row["provider_id"] == provider_id for row in await routing.list_api_models(model_kind=kind))
+        assert not any(row["provider_id"] == provider_id for row in await routing.list_cli_models())
+        with pytest.raises(decisions.DecisionError, match="/v1beta/decisions"):
+            await decisions.resolve(exact, openai_compat=True)
+    finally:
+        async with factory() as session, session.begin():
+            await session.execute(delete(LlmProvider).where(LlmProvider.id == provider_id))

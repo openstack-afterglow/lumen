@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -19,7 +20,7 @@ from lumen.auth import require_scopes
 from lumen.config import get_settings
 from lumen.services import capabilities
 from lumen.services import conversation_store as cs
-from lumen.services.provider_metadata import provider_family
+from lumen.services.provider_metadata import is_gemini_decision_model, provider_family
 from lumen.services.providers import audio_transport, errors, image_transport, realtime_transport, repository, routing
 
 router = APIRouter()
@@ -38,7 +39,7 @@ class AvailableModel(BaseModel):
     catalog_entry: dict | None = None
     provider_sort_order: int = 0
     sort_order: int = 0
-    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text"
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding", "decision"] = "text"
     display_name: str
     provider: str | None = None
     provider_api_key_configured: bool
@@ -48,13 +49,14 @@ class AvailableModel(BaseModel):
     context_limit: int | None = None
     # Whether reasoning_effort="none" passes chat admission for this model (same rule).
     reasoning_none_supported: bool = False
+    effective_input_price_per_million: Decimal | None = None
 
     model_config = {"protected_namespaces": ()}
 
 
-@router.get("/chat/models", response_model=list[AvailableModel])
+@router.get("/chat/models", response_model=list[AvailableModel], response_model_exclude_unset=True)
 async def list_available_models(
-    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text",
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding", "decision"] = "text",
     token_info: dict = Depends(require_scopes("models:read")),
 ):
     """사용자용 활성 모델 카탈로그(키·가격 미포함, provider명·능력 포함). 저장소 장애 시 빈 목록(graceful)."""
@@ -70,6 +72,8 @@ async def list_available_models(
         caps = m.get("effective_capabilities") or {}
         provider = providers.get(m["provider_id"])
         provider_type = m.get("provider_type") or (provider.get("provider_type", "") if provider else "")
+        if model_kind != "decision" and is_gemini_decision_model(m["model_name"], provider_type):
+            continue
         result.append(
             {
                 "id": m["id"],
@@ -96,6 +100,8 @@ async def list_available_models(
                     caps if isinstance(caps, dict) else None,
                     provider_type,
                 ),
+                **({"effective_input_price_per_million": m.get("effective_input_price_per_million")}
+                   if model_kind == "decision" else {}),
             }
         )
     return result
@@ -104,7 +110,7 @@ async def list_available_models(
 @router.get("/capabilities")
 async def get_chat_capabilities(
     model_id: int = Query(..., ge=1),
-    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text",
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding", "decision"] = "text",
     token_info: dict = Depends(require_scopes("models:read")),
 ):
     """Expose selected-model and deployment runtime gates without secrets."""

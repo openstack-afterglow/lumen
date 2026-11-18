@@ -1,5 +1,33 @@
 # 테스트
 
+## Gemini Decisions API local qualification
+
+`test-passed` on the reviewed `feat/gemini-decisions` source (`7e219b649d24b1f5559b18f51ae285cb013eac982f060776751c54b21fea68e5`, 643 source files):
+
+- `uv sync --extra service --extra dev --frozen` completed. `uv run --frozen lumen-test contract`: 8,170 service tests passed, 807 deselected; 145 SDK tests passed; service/SDK Ruff clean.
+- `uv run --frozen lumen-test integration`: 764 passed, 4 skipped, 8,209 deselected on disposable MariaDB/Redis. The Decisions tests verify real hold and wallet behavior, exact-kind route isolation, and catalog pricing.
+- `uv run --frozen lumen-test system`: 39 passed on isolated Compose. The Gemini case exercises scoped Keystone and Lumen `x-goog-api-key` ingress, admin registration, and outbound TLS to a synthetic server under the official Google hostname. It uses the published Google answer shape and checks sanitized safety rejection.
+- Python 3.11 architecture stamp and check passed. Canonical API, worker, and controller images were built and imported the Decisions module on `linux/arm64` and emulated `linux/amd64`. Only the arm64 process stack ran end-to-end.
+
+No live Gemini call, paid provider usage, tag, or deployment was made.
+
+### Official Google SDK compatibility
+
+`test-passed` on architecture source `924718a1406eedadc4c8298a807575b3696f2dbfae2ab7b1517a8d643b1925e4`. The dev-only `google-genai==3.5.0` system case calls real Lumen and checks both the SDK's outbound wire and its decoded answer/usage models. It uses `POST /v1beta/decisions`, `x-goog-api-key`, and an unchanged JSON `model` value. The bare, `models/`-prefixed, registered `gemini/`-prefixed, and exact numeric selectors all resolve; `lumen/gemini/gemini-decision-1` returns 404.
+
+- `uv sync --locked --extra service --extra dev` passed. `uv run --frozen lumen-test contract` passed 8,170 service tests (807 deselected), 145 SDK tests, and both Ruff checks.
+- `uv run --frozen lumen-test system` passed 39 with all positive SDK selectors. After the negative selector assertion was added, `uv run --frozen lumen-test system -q -k gemini_http_routes` passed the updated case (1 passed, 38 deselected).
+- `@google/genai` 3.5.0 emitted the same request shape and decoded fixture output against a local HTTP recorder. This was a wire check only, not a JavaScript end-to-end test against Lumen.
+
+### PR review follow-up
+
+`test-passed` on architecture source `e25098bce24f3d4651f59cc75197b35e9776a0670cb925a341a1ff85657b7175`.
+
+- `uv run --frozen lumen-test contract`: 8,180 service tests passed (807 deselected), 145 SDK tests passed, and both Ruff checks passed. Regressions cover the admin catalog-kind hint for legacy rows, Files API URI rejection, auth before JSON parsing, and hold states for connection, response-read, and invalid-response failures.
+- `uv run --frozen lumen-test integration`: 764 passed, 4 skipped, 8,219 deselected against disposable MariaDB/Redis.
+- `uv run --frozen lumen-test system -q -k gemini_http_routes`: 1 passed, 38 deselected against the isolated process stack. A registered Gemini Decision model returned HTTP 200 with an available, priced Decisions gate; selecting `text` for the same model returned 404.
+- Python 3.11 architecture stamp and guard passed. No live Gemini calls or deployment.
+
 ## 0.6.18 production rollout and smoke (2026-11-18 UTC)
 
 Deployed tag `0.6.18` (`c90d0664`; images amd64+arm64, revision label `c90d06646ff8`, tag digest = `latest`) with `--tags lumen --skip-tags haproxy` after a fail-closed drain (61 runs terminal, 0 model-call or stateless holds in flight) and an encrypted backup. Observed: API/worker on the pinned digests, `lumen.__version__` 0.6.18, protocol 2 on every API/worker, restarts 0, migrate status rc0, ledger row `035-mcp-domain-owner-check`, constraint `ck_chat_mcp_servers_domain_owner` present, direct `/v1/ready` 200 on each host, public health/ready/openapi 200, managed ClamAV unchanged (VERSION 28186). Census changed only `lumen_api`/`lumen_worker` per controller; VIP, protected-setting hashes and runtime=false unchanged.

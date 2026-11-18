@@ -8,10 +8,12 @@ import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from importlib.resources import files
+from typing import Literal, get_args
 from urllib.parse import urlsplit
 
 NATIVE_PROVIDER_TYPES = frozenset({"openai", "anthropic", "gemini", "perplexity"})
-_MODEL_KINDS = frozenset({"text", "image", "tts", "stt", "realtime", "embedding"})
+ModelKind = Literal["text", "image", "tts", "stt", "realtime", "embedding", "decision"]
+MODEL_KINDS = frozenset(get_args(ModelKind))
 _CAPABILITIES = frozenset({"vision", "tool_call", "reasoning", "prompt_caching", "structured_output", "web_search", "decisions"})
 _OFFICIAL_HOSTS = {
     "openai": {"developers.openai.com", "platform.openai.com", "openai.com"},
@@ -174,7 +176,7 @@ def validate_catalog(value: object) -> dict:
             if len(names) != len(set(names)) or identities.intersection(names):
                 raise ValueError(f"{provider}/{model_id}: duplicate ID or alias")
             identities.update(names)
-            if entry["kind"] not in _MODEL_KINDS or entry["status"] not in {"active", "preview", "deprecated"}:
+            if entry["kind"] not in MODEL_KINDS or entry["status"] not in {"active", "preview", "deprecated"}:
                 raise ValueError(f"{provider}/{model_id}: invalid kind or status")
             if entry.get("embedding") is not None and entry["kind"] != "embedding":
                 raise ValueError("embedding metadata is only valid for kind=embedding")
@@ -182,7 +184,13 @@ def validate_catalog(value: object) -> dict:
             validate_reasoning_options(entry.get("reasoning_options"))
             _string(entry["display_name"], "display_name")
             _positive_integer(entry["context_window"], "context_window")
-            _positive_integer(entry["max_output_tokens"], "max_output_tokens")
+            if entry["kind"] == "decision":
+                if provider != "gemini":
+                    raise ValueError(f"{provider}/{model_id}: decision kind requires Gemini")
+                if type(entry["max_output_tokens"]) is not int or entry["max_output_tokens"] != 0:
+                    raise ValueError(f"{provider}/{model_id}: decision max_output_tokens must be zero")
+            else:
+                _positive_integer(entry["max_output_tokens"], "max_output_tokens")
             for key in ("input_modalities", "output_modalities"):
                 if entry[key] is not None:
                     _strings(entry[key], key, nonempty=True)
@@ -190,6 +198,14 @@ def validate_catalog(value: object) -> dict:
             if any(type(flag) is not bool for flag in capabilities.values()):
                 raise ValueError("capabilities: boolean values required")
             token = entry["token_pricing"]
+            if entry["kind"] == "decision":
+                if not capabilities.get("decisions"):
+                    raise ValueError(f"{provider}/{model_id}: decision capability required")
+                if (
+                    not isinstance(token, dict) or set(token) != {"input"}
+                    or token["input"] is None or entry["media_pricing"] is not None
+                ):
+                    raise ValueError(f"{provider}/{model_id}: decision pricing must specify only input")
             if token is not None:
                 token = _object(token, _TOKEN_FIELDS | {"cache_write_ttl", "cache_write_long_ttl", "long_context"}, "token_pricing")
                 for key in _TOKEN_FIELDS:

@@ -640,6 +640,36 @@ async def test_gemini_image_generation_and_bidi_are_not_registered_as_text(monke
     ]
 
 
+async def test_gemini_create_decision_beats_chat_methods_and_stale_catalog(monkeypatch):
+    _provider(monkeypatch, provider_type="gemini")
+    entry = {
+        "id": "gemini-decision-1", "kind": "decision", "display_name": "Gemini Decision 1",
+        "context_window": 262144, "max_output_tokens": 0,
+        "token_pricing": {"input": "0.10"}, "capabilities": {"decisions": True},
+    }
+    _entries(monkeypatch, "gemini", {
+        entry["id"]: entry,
+        "opaque": {"id": "opaque", "kind": "text", "token_pricing": {"input": "1", "output": "2"}},
+    })
+    _transport(monkeypatch, lambda _: httpx.Response(200, json={"models": [
+        {"name": "models/gemini-decision-1", "supportedGenerationMethods": ["createDecision"]},
+        {"name": "models/opaque", "supportedGenerationMethods": ["generateContent", "bidiGenerateContent", "createDecision"],
+         "outputTokenLimit": 1},
+    ]}))
+
+    known, stale = (await model_discovery.discover_models(1))["candidates"]
+    for candidate in (known, stale):
+        assert candidate["model_kind"] == "decision"
+        assert candidate["purpose"] == "non_chat"
+    assert known["input_token_limit"] == 262144
+    assert known["output_token_limit"] == 0
+    assert known["capabilities"] == {"decisions": True}
+    assert known["token_pricing"] == {"input": "0.10"}
+    assert stale["output_token_limit"] == 1
+    assert stale["catalog_entry"] is None
+    assert stale["token_pricing"] is None
+
+
 async def test_realtime_transcription_discovery_uses_tracked_native_kind(monkeypatch):
     from lumen.services.providers import realtime_transport
 

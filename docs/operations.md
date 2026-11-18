@@ -25,6 +25,59 @@ Kolla 전환에는 항상 `--tags lumen --skip-tags haproxy`를 사용한다. �
 
 격리(gVisor RuntimeClass, PID 256, 기본 차단 CNI, controller·고정 worker mTLS, `list_owned` 2→1→0, 실행 간 파일·권한 격리)는 실제 cluster에서 확인했다. 그러나 gVisor 0.5/1.0 CPU에서 Markitdown 초기화가 6.5초~60초 이상으로 들쭉날쭉해(1.0 CPU에서도 60초 startup deadline 초과 관측) 첫 호출이 자주 실패하고, Playwright는 페이지 내용 증거를 얻지 못했다. 그래서 runtime을 켜지 않았다. 후속 조건: agent node의 gVisor rootfs/overlay/directfs 설정(노드 변경이므로 별도 승인), 또는 이미지 import 그래프 축소, 그리고 실제 Playwright 페이지 내용 증거. 같은 프로세스 그룹에서 `setsid`로 빠져나간 하위 프로세스는 재시작 fence가 확인하지 않으며, per-run Pod 경계(PID 256, 수명, 종료 시 삭제)로만 제한된다.
 
+## Gemini Decisions operations
+
+1. Use an active `gemini` provider with its official Gemini Developer API base and a
+   Gemini API-key credential. Use discovery to locate `gemini-decision-1` and confirm
+   `createDecision` in the generation methods. Discovery shows account visibility,
+   not an executable or paid request. Do not use a proxy base or subscription key.
+2. Store the model as `gemini/gemini-decision-1` with `model_kind="decision"`.
+   If the row already exists, explicitly change its kind.
+   Only the effective input price is required. Leave the stored input price null
+   to follow the official catalog, or set a deliberate per-million USD override.
+   Leave output, cache, and media rates unset. Do not treat an absent effective price
+   as free. No automatic model creation or reclassification occurs.
+3. Check the secret-free registered route and the explicit native
+   `GET /v1/chat/models?model_kind=decision` projection before enabling Decision Studio.
+   Use `lumen/<provider_id>/<model_id>` to target the exact row. Verify that the row
+   does not appear on ordinary chat, compat, CLI, embeddings, or media lists. Allow
+   20 MiB (20,971,520 bytes) for the Gemini Decisions request at each intended ingress
+   and BFF hop; inline base64 counts toward the cap. Do not relax unrelated route limits.
+
+The Gemini change adds no migration. It requires the existing migration 034 and a
+quota-writer cohort that counts stateless reservations. Do not enable new admission
+against quota writers that ignore those holds. To roll back, stop Decisions admission,
+drain in-flight calls, and preserve reservations and ledger events.
+
+For every Gemini call, the shared wallet admission reserves 262,144 input tokens at
+the frozen effective route price (stored input price before catalog). At the official
+[$0.10 per million input tokens](https://aistudio.google.com/docs/pricing#gemini-decision),
+the full-context bound is $0.0262144 before any local credit conversion. This is a
+quota reservation, not a flat charge or an image estimate. The
+[Decisions API](https://aistudio.google.com/docs/decisions-api) documents the context
+and image resolution labels. The
+[general media-resolution table](https://aistudio.google.com/docs/media-resolution#token-counts)
+does not establish token counts or a default for Decision 1. An omitted resolution
+is forwarded without a Lumen-supplied default.
+
+Lumen settles only validated provider input counts (with modality breakdown), zero
+output, and consistent totals within the context bound. Trusted usage remains settled
+if malformed answers cause a 502. Definite no-send failures and upstream
+400/401/403/404/413/415/422/429 rejections release the reservation; a possible send
+with missing, inconsistent, excessive, or otherwise untrusted usage does not. Do not
+automatically repeat a failed or uncertain call. The direct transport makes one
+attempt with one overall deadline. Inputs, image URLs, answers, credentials, and raw
+provider errors do not belong in logs or in reconciliation notes.
+
+For `unknown` or crash-left `reserved` rows, follow the existing
+[Decisions disposition procedure](api-reference.md#응답과-정산): correlate the event UUID
+with provider usage evidence before any settlement or definite-no-charge release.
+There is no automatic expiry or disposition endpoint.
+
+OpenSpec defines local contract, ASGI, fake-upstream HTTP, and real-MariaDB verification
+scenarios. Defined scenarios are not passing test receipts. An actual release,
+deployment, or paid-provider smoke call needs separate evidence.
+
 ## 0.6.17 롤아웃 메모
 
 - **Migration:** 033(MCP domain scope)과 034(`chat_stateless_call_reservations`)는 새 API/worker를 기동하기 전에 적용한다. 둘 다 additive이지만 기존 writer는 무상태 예약을 quota에 반영하지 않으므로, 새 Decisions admission과 기존 writer가 quota를 공유하며 함께 돌면 안 된다. 순서는 admission 중지·worker drain → 백업 → migrate → 새 cohort 기동이다.
@@ -670,6 +723,18 @@ administrators register their IDs and required rates explicitly.
    and gaps in the change evidence. Source/local tests do not establish provider or
    production acceptance, and a catalog edit does not authorize a deployment.
 
+For Gemini Decisions, review the [model card](https://aistudio.google.com/docs/models/gemini-decision-1),
+[API contract](https://aistudio.google.com/docs/decisions-api) and
+[paid price](https://aistudio.google.com/docs/pricing#gemini-decision) together. The
+exact catalog entry `gemini/gemini-decision-1` has kind `decision`,
+`capabilities.decisions=true`, a 262,144-token context, a published output limit of
+0, and input token price `"0.10"` per million USD. Keep output/cache rates and media
+tariffs unset. The output limit is not an output tariff; do not turn a live
+`outputTokenLimit` hint into a billed output allowance. Preserve the distinction
+between provider-published modalities and Lumen's text/image-only execution scope.
+Re-read sources and advance `catalog_version` when updating this entry. Do not
+copy Gemini 4/3 image token counts or defaults into the Decision 1 entry.
+
 Runtime prices use stored administrator rates first, then exact native catalog rates,
 then no rate. Stored historical `price_source` strings remain provenance only. Runtime
 capabilities use explicit administrator overrides, then catalog fields. On official native
@@ -710,8 +775,10 @@ the native execution gate is unavailable and unpriced until provider per-search/
 fees can be billed. Text token rates alone never activate a paid native search tool.
 Separately priced managed search providers remain supported for CRUD and search routing;
 the inference-only provider allowlist does not remove search adapters.
-Decisions can be enabled only for OpenAI-protocol text routes, including compatible
-endpoints; Anthropic/Gemini/Perplexity or subscription overrides cannot enable it.
+OpenAI Decisions can be enabled only for OpenAI-protocol API-key text routes, including
+compatible endpoints. Gemini Decisions requires a dedicated `decision` row on the
+official Gemini API-key route. An override alone cannot enable Decisions on another
+kind or transport; Anthropic, Perplexity, and subscription routes are not eligible.
 Perplexity Sonar's built-in search remains a separate, pre-existing behavior: its
 `web_search_required` authorization floor still requires `native:tools:execute`, even
 when the optional native-search gate is unavailable or an override disables that gate.

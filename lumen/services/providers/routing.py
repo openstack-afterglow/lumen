@@ -17,7 +17,12 @@ from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun, ChatRunProvider
 from lumen.services.bifrost_runtime import BIFROST_VERSION
 from lumen.services.capabilities import reasoning_explicitly_unsupported
-from lumen.services.provider_metadata import NATIVE_PROVIDER_TYPES, direct_provider_route, provider_family
+from lumen.services.provider_metadata import (
+    NATIVE_PROVIDER_TYPES,
+    direct_provider_route,
+    is_gemini_decision_model,
+    provider_family,
+)
 from lumen.services.run_store import NONTERMINAL
 
 from .accounts import default_credential, provenance, selected_credential
@@ -261,6 +266,8 @@ def _backend_identity(provider_type: str, kind: str = "text") -> dict[str, str]:
         return {"provider_backend": "lumen-search-http", "provider_backend_version": "1"}
     if kind == "embedding":
         return {"provider_backend": "bifrost", "provider_backend_version": BIFROST_VERSION}
+    if kind == "decision":
+        return {"provider_backend": "lumen-decisions-http", "provider_backend_version": "1"}
     if kind != "text":
         return {"provider_backend": "lumen-media-direct", "provider_backend_version": "1"}
     if provider_type == "chatgpt":
@@ -274,7 +281,11 @@ def _resolved_model(model: LlmModel, provider: LlmProvider, *, ref=None, require
     if ref is not None:
         required_capabilities = ref.get("required_capabilities", ())
     elif not required_capabilities:
-        required_capabilities = ({"text": "chat", "embedding": "embeddings"}.get(_kind(model), _kind(model)),)
+        required_capabilities = ({
+            "text": "chat", "embedding": "embeddings", "decision": "decisions",
+        }.get(_kind(model), _kind(model)),)
+    if "decisions" not in required_capabilities and is_gemini_decision_model(model.model_name, provider.provider_type):
+        raise ProviderConfigurationChangedError("decision-only model is not available on this route")
     account, credential = selected_credential(provider, model_id=model.id, required_capabilities=required_capabilities, ref=ref)
     provider_auth = _provider_auth_ref(provider, account, credential, model_id=model.id, required_capabilities=required_capabilities)
     api_key = None
@@ -442,9 +453,9 @@ async def resolve_model(model_name: str, *, required_capabilities=("chat",)) -> 
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def resolve_api_model(model_name: str, *, provider: str | None = None, model_kind: str = "text",
-                            provider_id: int | None = None, provider_type: str | None = None,
-                            required_capabilities=()) -> dict | None:
+async def resolve_api_model(model_name: str, *, provider: str | None = None,
+                            model_kind: str | tuple[str, ...] = "text", provider_id: int | None = None,
+                            provider_type: str | None = None, required_capabilities=()) -> dict | None:
     """Resolve one external API model/provider pair without exposing route encoding.
 
     ``provider`` is the administrator-editable public selector. ``provider_type``
@@ -484,7 +495,7 @@ async def resolve_api_model(model_name: str, *, provider: str | None = None, mod
                 .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
                 .where(
                     LlmModel.model_name.in_(candidates),
-                    LlmModel.model_kind == model_kind,
+                    _model_kind_filter(model_kind),
                     LlmModel.is_active.is_(True),
                     LlmProvider.is_active.is_(True),
                 )
@@ -572,10 +583,15 @@ async def list_api_models(*, model_kind: str = "text") -> list[dict]:
                     "sort_order": model.sort_order,
                 }
                 for model, provider in rows
+                if not is_gemini_decision_model(model.model_name, provider.provider_type) or model_kind == "decision"
             ]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+def _model_kind_filter(model_kind: str | tuple[str, ...]):
+    return LlmModel.model_kind == model_kind if isinstance(model_kind, str) else LlmModel.model_kind.in_(model_kind)
 
 
 async def _resolve_cli_route(
@@ -583,7 +599,7 @@ async def _resolve_cli_route(
     route_model_id: int,
     *,
     provider: str | None,
-    model_kind: str,
+    model_kind: str | tuple[str, ...],
     provider_id: int | None,
     provider_type: str | None,
     required_capabilities=(),
@@ -605,7 +621,7 @@ async def _resolve_cli_route(
                     LlmModel.id == route_model_id,
                     LlmModel.provider_id == route_provider_id,
                     LlmProvider.id == route_provider_id,
-                    LlmModel.model_kind == model_kind,
+                    _model_kind_filter(model_kind),
                     LlmModel.is_active.is_(True),
                     LlmProvider.is_active.is_(True),
                 )
@@ -762,7 +778,11 @@ async def list_cli_models() -> list[dict]:
                     .order_by(LlmProvider.sort_order, LlmProvider.id, LlmModel.sort_order, LlmModel.id)
                 )
             ).all()
-            return [_cli_model_row(model, provider) for model, provider in rows]
+            return [
+                _cli_model_row(model, provider)
+                for model, provider in rows
+                if not is_gemini_decision_model(model.model_name, provider.provider_type)
+            ]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
@@ -891,6 +911,8 @@ async def resolve_title_model() -> dict | None:
             if res is None:
                 return None
             model, provider = res
+            if is_gemini_decision_model(model.model_name, provider.provider_type):
+                return None
             return _resolved_model(model, provider)
     except OperationalError as exc:
         mark_db_unhealthy()
@@ -920,6 +942,8 @@ async def resolve_memory_model() -> dict | None:
             if res is None:
                 return None
             model, provider = res
+            if is_gemini_decision_model(model.model_name, provider.provider_type):
+                return None
             return _resolved_model(model, provider)
     except OperationalError as exc:
         mark_db_unhealthy()

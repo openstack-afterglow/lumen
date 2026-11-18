@@ -1,0 +1,117 @@
+"""Local API -> synthetic Keystone/MariaDB -> isolated TLS Gemini HTTP."""
+from __future__ import annotations
+
+import json
+import os
+from uuid import uuid4
+
+import httpx
+import pytest
+from google import genai
+from google.genai import types
+from system.fake_keystone import DIRECTORY_PROJECT_ID, DIRECTORY_TOKEN, OWNER_TOKEN, PROJECT_ID
+
+pytestmark = pytest.mark.system
+
+
+def test_gemini_http_routes_keep_provider_and_lumen_credentials_separate():
+    base = os.environ.get("LUMEN_API_BASE_URL", "http://localhost:8012")
+    admin = {"X-Auth-Token": DIRECTORY_TOKEN, "X-Project-Id": DIRECTORY_PROJECT_ID}
+    owner = {"X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID}
+    model = "gemini/gemini-decision-1"
+    registered_provider = None
+    registered_key = None
+    with httpx.Client(base_url=base, trust_env=False, timeout=30) as client:
+        try:
+            created = client.post("/v1/admin/providers", headers=admin, json={
+                "name": f"system-decision-{uuid4().hex[:12]}", "provider_type": "gemini",
+                "api_key": "system-gemini-decisions-fixture",
+            })
+            assert created.status_code == 201, created.text
+            registered_provider = created.json()["id"]
+            created = client.post("/v1/admin/models", headers=admin, json={
+                "provider_id": registered_provider, "model_name": model, "model_kind": "decision",
+            })
+            assert created.status_code == 201, created.text
+            model_id = created.json()["id"]
+            selector = f"lumen/{registered_provider}/{model_id}"
+
+            issued = client.post("/v1/api-keys", headers=owner, json={
+                "name": "system Gemini Decisions", "scopes": ["compat:completions:write", "models:read"],
+            })
+            assert issued.status_code == 201, issued.text
+            registered_key = issued.json()["id"]
+            headers = {"x-goog-api-key": issued.json()["key"]}
+            wire = {"model": selector, "input": "The package arrived damaged.", "questions": {
+                "is_defect": {"type": "noul", "instructions": "Is the customer reporting a product defect?"},
+            }}
+            response = client.post("/v1/chat/decisions", headers=owner, json=wire)
+            assert response.status_code == 200, response.text
+            expected_usage = {"total_input_tokens": 100, "input_tokens_by_modality": [{"modality": "text", "tokens": 100}],
+                              "total_output_tokens": 0, "total_tokens": 100}
+            assert response.json() == {
+                "model": model,
+                "answers": {"is_defect": {"type": "noul", "noul": 0.03, "confidence": 0.97}},
+                "usage": expected_usage,
+            }
+
+            sent_models = []
+
+            def record_request(request):
+                assert request.method == "POST" and str(request.url) == f"{base.rstrip('/')}/v1beta/decisions"
+                assert request.headers.get("x-goog-api-key") == headers["x-goog-api-key"]
+                assert "authorization" not in request.headers and "x-api-key" not in request.headers
+                body = json.loads(request.content)
+                assert body == {**wire, "model": body["model"]}
+                sent_models.append(body["model"])
+
+            aliases = ["gemini-decision-1", "models/gemini-decision-1", model, selector]
+            with genai.Client(
+                api_key=headers["x-goog-api-key"], vertexai=False,
+                http_options=types.HttpOptions(
+                    api_version="v1beta", base_url=base, retry_options=types.HttpRetryOptions(attempts=1),
+                    client_args={"trust_env": False, "event_hooks": {"request": [record_request]}},
+                ),
+            ) as sdk:
+                for alias in aliases:
+                    decision = sdk.decisions.create(model=alias, input=wire["input"], questions=wire["questions"])
+                    assert set(decision.answers) == {"is_defect"}
+                    assert decision.answers["is_defect"].model_dump(exclude_none=True) == {
+                        "type": "noul", "noul": 0.03, "confidence": 0.97,
+                    }
+                    assert decision.usage.model_dump(exclude_none=True) == expected_usage
+                invalid = "lumen/gemini/gemini-decision-1"
+                with pytest.raises(Exception, match=r"Error code: 404.*decision model not found"):
+                    sdk.decisions.create(model=invalid, input=wire["input"], questions=wire["questions"])
+            assert sent_models == [*aliases, invalid]
+            response = client.post("/v1/chat/decisions", headers=owner, json={**wire, "input": "synthetic safety rejection"})
+            assert response.status_code == 400 and response.json() == {"detail": "image_safety"}
+            visible = client.get("/v1/chat/models?model_kind=decision", headers=owner)
+            assert visible.status_code == 200, visible.text
+            registered = next(row for row in visible.json() if row["id"] == model_id)
+            assert registered["capabilities"]["decisions"]
+            assert float(registered["effective_input_price_per_million"]) == 0.10
+            capabilities = client.get("/v1/capabilities", headers=owner, params={
+                "model_id": model_id, "model_kind": "decision",
+            })
+            assert capabilities.status_code == 200, capabilities.text
+            available = capabilities.json()
+            assert (available["model_id"], available["model_name"], available["model_kind"]) == (model_id, model, "decision")
+            gate = available["model_capabilities"]["feature_gates"]["decisions"]
+            assert gate == {"available": True, "mode": "native", "reason_code": None, "pricing_available": True}
+            mismatch = client.get("/v1/capabilities", headers=owner, params={
+                "model_id": model_id, "model_kind": "text",
+            })
+            assert mismatch.status_code == 404, mismatch.text
+            assert model not in client.get("/v1/models", headers=headers).text
+            blocked = client.post("/v1/decisions", headers=headers, json={
+                "model": selector, "input": "text", "questions": [{"type": "predicate", "instructions": "yes?"}],
+            })
+            assert blocked.status_code == 422 and "/v1beta/decisions" in blocked.json()["error"]["message"]
+        finally:
+            if registered_key is not None:
+                revoked = client.delete(f"/v1/api-keys/{registered_key}", headers=owner)
+                assert revoked.status_code in (200, 204), revoked.text
+            if registered_provider is not None:
+                deleted = client.delete(f"/v1/admin/providers/{registered_provider}", headers=admin)
+                assert deleted.status_code == 204, deleted.text

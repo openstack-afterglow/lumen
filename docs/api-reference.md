@@ -79,6 +79,7 @@ API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만
 | Native runs/children | `POST /v1/temp-completions`; `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/events`, `/v1/runs/{id}/children`, `/v1/temp-threads/{id}`; approval/interaction/cancel POST routes |
 | Context | `POST /v1/conversations/{id}/context-preview`, `/compactions`; equivalent `POST /v1/temp-threads/{id}/context-preview`, `/compactions`. Preview is read-only; compaction requires `Idempotency-Key` and `expected_context_revision`, returns a durable `run_kind="compaction"` descriptor. |
 | Media and embeddings | Native `POST /v1/chat/images/generations`, `/edits`, `/v1/chat/audio/speech`, `/transcriptions`, `/v1/chat/embeddings`, `/v1/chat/realtime/sessions`; native realtime `WS /v1/chat/realtime/sessions/{session_id}/ws`; compat `POST /v1/images/generations`, `/edits`, `/v1/audio/speech`, `/transcriptions`, `/v1/embeddings`; Gemini `POST /v1beta/models/{model}:embedContent` and `:batchEmbedContents`; realtime compat WS remains `/v1/realtime`, `/v1/realtime/translations`, `/v1/live/sessions`, `/v1beta/realtime` |
+| Decisions | Native `POST /v1/chat/decisions` and opt-in `GET /v1/chat/models?model_kind=decision`; OpenAI `POST /v1/decisions`; Gemini `POST /v1beta/decisions` |
 | Batch | Native `POST/GET /v1/chat/batches`, `GET /v1/chat/batches/{id}`, `GET /v1/chat/batches/{id}/items`, `POST /v1/chat/batches/{id}/cancel`; compat `POST/GET /v1/files`, `GET/DELETE /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, `POST/GET /v1/batches`, `GET /v1/batches/{batch_id}`, `POST /v1/batches/{batch_id}/cancel` |
 | Extensions | `GET/POST/PATCH/DELETE /v1/custom-tools`, `/v1/mcp-servers`, `/v1/skills`; OAuth status/disconnect; OAuth start is Keystone-only |
 | Installed plugins | `GET /v1/admin/plugins`; `GET/POST/PATCH/DELETE /v1/admin/plugin-bindings` (verified system admin); `GET/POST/PATCH/DELETE /v1/plugin-bindings` (`native:extensions:read|write|delete`, selected user-configurable exports only). Inventory omits private config unless editor-authorized `include_private=true`; no HTTP wheel installer. |
@@ -275,6 +276,8 @@ Anthropic direct provider의 `provider_usage.token_breakdown`과 모든 provider
 
 Anthropic은 `GET /v1/models?limit=200&after_id=...`, Gemini는 `GET /v1beta/models?pageSize=200&pageToken=...`, OpenAI-compatible은 `/models`를 사용한다. Gemini의 `models/` resource prefix만 제거하고 opaque ID의 punctuation/case는 보존한다. Subscription credential은 이 live 경로에 전달하지 않는다. Custom `api_base`는 관리자가 지정한 trust boundary이며 redirect/environment proxy는 사용하지 않는다.
 
+Gemini `supportedGenerationMethods`에 `createDecision`이 있으면 discovery 후보의 `model_kind="decision"`을 반환한다. Live token limit은 공급자가 반환한 참고값이다. 예를 들어 `output_token_limit=1`이 보고되어도 Gemini Decision 1의 공시 출력 한도 및 정산 usage는 0이다. Discovery 결과는 자동 등록이나 실제 유료 호출의 증거가 아니다.
+
 한 조회는 20초, 25페이지, 2,000 unique 모델, 누적 5MB identity-encoded response로 제한한다. 정상 200 empty는 fallback 없이 `source=api, live_status=empty, complete=true`다. 중간 페이지 오류, 반복/누락 cursor, malformed ID/body, timeout 또는 한도 초과는 `source=none, live_status=error, complete=false, models=[], candidates=[]`다. 정적 fallback이나 부분 목록을 성공처럼 제공하지 않는다. 구독의 bundled 목록은 account entitlement의 증거가 아니다.
 
 후보 조회 뒤 기존 모델 POST/PATCH로 표시명·정확한 입력/출력 가격·명시 capability override·활성 상태를 저장한다. Compatible 모델은 비활성 생성 때도 관리자 입력·출력 가격을 모두 요구하며, embedding은 입력 가격만 요구한다. 활성화나 활성 상태의 가격 수정도 이 조건을 지켜야 한다(`compatible_model_prices_required`). Provider를 compatible base로 바꾸거나 다시 활성화할 때도 활성 모델의 저장 가격을 검사한다. Native는 등록되지 않은 public ID도 수동 추가할 수 있으나 실행에는 필요한 effective 가격이 있어야 한다. 빈 값은 무료가 아니다. Live context/token limit은 참고값이며 자동으로 capability를 활성화하지 않는다.
@@ -292,6 +295,8 @@ Anthropic은 `GET /v1/models?limit=200&after_id=...`, Gemini는 `GET /v1beta/mod
 ## 모델 단가와 prompt-cache 단가
 
 관리자 `POST /v1/admin/models`와 `PATCH /v1/admin/models/{model_id}`는 nullable `input_price_per_million`/`output_price_per_million`을 받는다. Native의 기존 text-kind 이미지·음성 모델은 한 방향만 저장할 수 있으며 모델명으로 종류를 추정하지 않는다. PATCH에서 key가 있으면 그 항목을 설정하고 `null`은 해당 수동 단가만 제거하며, key가 없으면 기존 값을 유지한다. 수동 텍스트 단가가 하나라도 남은 text 모델은 `price_source=manual`, 둘 다 없으면 미설정이며, 텍스트 key를 수정할 때 과거 import metadata를 해제한다. 캐시·미디어만 수정하면 텍스트 단가·출처·metadata를 보존한다. Native 모델의 모든 저장 단가를 null로 지우면 공시 catalog 가격을 따른다. Compatible의 필수 단가는 활성 상태에서 지울 수 없으며 비활성 모델은 null로 지운 뒤 가격을 채워야 재활성화할 수 있다. Native text admission은 fallback을 포함한 실제 입력·출력 가격을 모두 요구하고 media admission은 적용 텍스트 방향·모달리티 단가를 검사한다. 빈 값은 무료가 아니고 명시적인 `0`은 보존한다. 기존 nullable 열을 쓰므로 새 migration은 없다.
+
+Gemini Decisions는 `model_kind="decision"`으로 수동 등록하거나 변경할 수 있다. 실행에 필요한 단가는 input만이며, 수동 입력 단가가 없으면 official Gemini exact catalog를 사용한다. 출력·캐시·미디어 단가는 이 요청에 적용하지 않는다. `capabilities.decisions` override만으로 다른 모델 종류, 호환 공급자 또는 subscription route를 Gemini Decisions에 연결할 수 없다.
 
 선택적 `cache_read_price_per_million`, `cache_write_price_per_million`(short-TTL cache write), `cache_write_1h_price_per_million`(long-TTL 호환 field)도 서로 및 텍스트 단가와 독립이다. 유한한 0 이상 값만 허용하고 저장 정밀도(토큰당 10자리)보다 작은 0 아닌 값은 422/400으로 거부한다. 응답 projection은 per-million Decimal 문자열 또는 `null`로 반환한다. 실행 중인 run이 쓰는 모델의 cache 단가 변경도 다른 가격 변경과 같은 active-run lock(409)을 거친다.
 
@@ -418,8 +423,8 @@ Individual cancel은 미시작 run을 취소하지만 이미 provider 결과가 
 
 ## OpenAI Decisions
 
-- `POST /v1/decisions`: API-key 인증, `compat:completions:write`, 기존 compat host gate. OpenAI wire shape를 사용한다.
-- `POST /v1/chat/decisions`: 세션/BFF 인증 경로, `native:runs:write`. 같은 body를 받고 `cost_usd`, `credited_cost`, `usage_log_id`(immutable usage event UUID)를 추가한다. 기존 native 모델 사용과 같은 scope/현재 principal 검사를 적용한다.
+- `POST /v1/decisions`: API-key 인증, `compat:completions:write`, 기존 compat host gate. OpenAI wire shape를 사용하며 Gemini route를 거절한다.
+- `POST /v1/chat/decisions`: Keystone 세션/BFF 인증, `native:runs:write`. 활성 모델 route를 먼저 선택하고 공급자별 wire schema를 적용한다. OpenAI route는 아래 body를 받고 `cost_usd`, `credited_cost`, `usage_log_id`(immutable usage event UUID)를 추가한다. Gemini route는 [Gemini Decisions](#gemini-decisions) 계약을 사용한다.
 - `model`은 활성 등록 text 모델 이름이다. OpenAI 프로토콜/API-key provider와 effective `capabilities.decisions=true`가 필요하다. 공식 endpoint와 관리자 custom `api_base` 모두 지원한다. 공식 지원 모델은 현재 `gpt-6-luna`이며, compatible endpoint는 관리자가 capability와 가격을 명시해야 한다. 미등록/비활성 모델 404, ambiguous name 409, capability/protocol/입력 가격 누락 422다.
 
 ```json
@@ -489,6 +494,65 @@ Fresh provider credential 조회는 dispatch 경계보다 먼저 수행한다. �
 Migration **034**를 적용한 뒤 새 writer를 시작한다(동시 pending migration 033과 함께 사전 적용). Additive table이므로 old writer는 무시하지만 old writer는 stateless hold를 quota에 반영하지 않는다. 따라서 새 Decisions admission을 연 상태에서 quota를 공유하는 old/new writer를 혼용하지 않는다. Rollback은 새 admission 정지·in-flight drain 뒤 code rollback이며 hold table/ledger를 drop하지 않는다.
 
 공식 계약: [create reference](https://developers.openai.com/api/reference/resources/decisions/methods/create), [Decisions guide](https://developers.openai.com/api/docs/guides/decisions). 위 검증/transport/SQL 테스트는 source/local/synthetic 증거이며 production 또는 유료 provider 검증이 아니다.
+
+## Gemini Decisions
+
+| Route | Authentication and model selection |
+| --- | --- |
+| `POST /v1/chat/decisions` | Keystone session/BFF with `native:runs:write`. Resolves the active registered route before applying its provider-specific validation. |
+| `POST /v1beta/decisions` | Lumen API key with `compat:completions:write` and the existing compat host gate. Same headers as Google embeddings: `x-goog-api-key`, `x-api-key`, or API-key Bearer. Accepts only a Gemini Decision route and the Google wire format. |
+
+Register provider type `gemini` and stored model name `gemini/gemini-decision-1` with `model_kind="decision"`. On `/v1beta/decisions`, `gemini-decision-1`, `models/gemini-decision-1`, and `gemini/gemini-decision-1` select the same model name, subject to the ordinary ambiguity check. Use `lumen/<provider_id>/<model_id>` with decimal integer IDs to pin one active registered route; `lumen/gemini/gemini-decision-1` is not a route selector. Use the Lumen origin, without a `/v1` suffix, as the Google client base URL and select `v1beta`. Google Gen AI Python SDK 3.5.0 puts the selected model string unchanged in the JSON `model` field of `POST /v1beta/decisions` and sends the Lumen API key in `x-goog-api-key`. Do not send a Google provider key to Lumen. The gateway uses a separately configured provider credential for the official Gemini Developer API; custom bases and subscription transport are not supported.
+
+Decision Studio lists these routes with `GET /v1/chat/models?model_kind=decision` and the existing `models:read` scope. This opt-in projection includes `effective_input_price_per_million` as a decimal USD string or `null`. Ordinary model lists and chat, embeddings, media, and batch execution exclude Decision-only rows. The existing OpenAI `gpt-6-luna` text route is unchanged.
+
+Check the selected model with `GET /v1/capabilities?model_id=<model_id>&model_kind=decision` under `models:read`. The response includes `model_kind: "decision"` and `model_capabilities.feature_gates.decisions`; a mismatched model kind returns HTTP 404.
+
+For the administrator registry, `GET /v1/admin/models` reports `catalog_entry.kind: "decision"` for the exact native catalog entry, even when a legacy row still has `model_kind: "text"`. This field guides reclassification; it does not enable the legacy row.
+
+Send `model`, `input`, and `questions` in the request:
+
+```json
+{
+  "model": "gemini-decision-1",
+  "input": "The blue mug arrived cracked.",
+  "questions": {
+    "is_damaged": {
+      "type": "noul",
+      "instructions": "Did the item arrive damaged?"
+    }
+  }
+}
+```
+
+- `input` is a string, a content block, or an array of content blocks. Send JSON data serialized as a string or as a `{"type":"text","text":"..."}` block, not as an arbitrary JSON object.
+- An image block requires `type: "image"`, an official image `mime_type`, and exactly one of inline base64 `data` or an `https://` `uri`. The optional `resolution` is `low`, `medium`, `high`, or `ultra_high`. Lumen never fetches the URL. Do not pass YouTube, `gs://`, plain HTTP, or Gemini Files API URLs (`generativelanguage.googleapis.com`); Lumen does not permit references to files under the operator's provider key. Audio, video, and document/PDF input return HTTP 422 with `detail: "decision_input_modality_unsupported"`.
+  The accepted MIME types are `image/png`, `image/jpeg`, `image/webp`, `image/heic`, `image/heif`, `image/gif`, `image/bmp`, and `image/tiff`.
+- `questions` contains 1–1,000 keyed questions. Keys match `[A-Za-z0-9_-]{1,64}`. `instructions` accepts a string, text block, or array of text blocks. `noul` optionally defines `true_description` and `false_description` in `criteria`; `choice` maps 2–255 valid option keys to descriptions (which may be empty); `score` takes 2–255 ordered, non-empty rubric strings. See the official [limits](https://aistudio.google.com/docs/decisions-api#limits) for option key rules and the 100-level JSON nesting limit.
+- The raw request body, including inline base64, is capped at 20 MiB (20,971,520 bytes); exceeding it returns 413. Lumen authorizes the call before decoding Gemini-compatible JSON and validates structure before dispatch. Gemini enforces its exact tokenizer/context and fetched-image byte limits.
+
+Successful responses contain only `model`, `answers`, and `usage`. `model` is the registered Lumen model name. `answers` is keyed by the request's question IDs: `noul` returns a yes probability, `choice` returns the winning option and per-option probabilities, and `score` returns the weighted score, per-level probabilities, and legend. Each answer includes `type` and `confidence`. For example:
+
+```json
+{
+  "model": "gemini/gemini-decision-1",
+  "answers": {
+    "is_damaged": {"type": "noul", "noul": 0.99, "confidence": 0.99}
+  },
+  "usage": {
+    "total_input_tokens": 100,
+    "input_tokens_by_modality": [{"modality": "text", "tokens": 100}],
+    "total_output_tokens": 0,
+    "total_tokens": 100
+  }
+}
+```
+
+No Lumen cost or usage-event fields are added. Gemini errors use Lumen's `{"detail":"..."}` envelope, not Google's error object. The Keystone route can expose an upstream HTTP 400 safety code only if it is exactly `safety`, `prohibited_content`, `blocklist`, `image_safety`, or `content_blocked`; other upstream 400 responses use `upstream decision request rejected`. Lumen does not expose raw provider messages or echo request data.
+
+Gemini Decision 1 has a 262,144-token input context shared by input and questions. Lumen reserves the full context at the effective input rate for every call, even text-only calls and images with no explicit resolution. Google's [paid price](https://aistudio.google.com/docs/pricing#gemini-decision) is $0.10 per million input tokens. The full-context bound at that rate is $0.0262144 before local credit conversion, not a per-request charge. An administrator's stored rate overrides the catalog. Google's [Decisions API](https://aistudio.google.com/docs/decisions-api) documents the image resolution labels; its [general media-token table](https://aistudio.google.com/docs/media-resolution#token-counts) does not establish Decision 1-specific counts or a default.
+
+Only trusted input usage is charged. The modality counts and total must reconcile, output must be zero, and input usage must be within the reserved context. Trusted usage settles before answer validation: malformed answers return HTTP 502 with `detail: "invalid decision answers; reported usage was billed"`. Do not retry automatically. Untrustworthy usage leaves the hold uncertain and counted against quota. See [operations](operations.md#gemini-decisions-operations) for recovery boundaries.
 
 ## Catalog-backed embedding dimensions
 

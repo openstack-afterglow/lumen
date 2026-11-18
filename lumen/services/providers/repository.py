@@ -10,7 +10,12 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from lumen.crypto import encrypt_llm_provider_billing_admin_key, encrypt_llm_provider_key
 from lumen.db import mark_db_unhealthy
 from lumen.models.chat_db import LlmModel, LlmProvider
-from lumen.services.provider_metadata import NATIVE_PROVIDER_TYPES, direct_provider_route, provider_family
+from lumen.services.provider_metadata import (
+    NATIVE_PROVIDER_TYPES,
+    direct_provider_route,
+    native_catalog_entry,
+    provider_family,
+)
 
 from .accounts import _provider, create_default, default_credential, validate_selection_policy
 from .billing import billing_admin_key_supported, billing_capability_for
@@ -37,6 +42,7 @@ from .pricing import (
     _resolved_base_prices,
     _to_decimal,
     _validate_cache_prices,
+    decision_provider_supported,
     validate_media_pricing,
 )
 from .routing import _lock_mutable_route, _require_db
@@ -91,6 +97,10 @@ def validate_provider_name(value: str) -> str:
 def _validate_model_kind(provider: LlmProvider, kind: str) -> None:
     if kind not in MODEL_KINDS:
         raise ProviderValidationError("지원하지 않는 model_kind 입니다")
+    if kind == "decision":
+        if not decision_provider_supported(provider.provider_type, provider.api_base, provider.auth_mode):
+            raise ProviderValidationError("decision models require a direct Gemini API-key provider")
+        return
     compatible_embedding = (
         kind == "embedding"
         and provider.provider_type == "openai"
@@ -104,10 +114,18 @@ def _validate_model_kind(provider: LlmProvider, kind: str) -> None:
         raise ProviderValidationError("media models require supported direct API-key provider routes")
 
 
+def _validate_catalog_model_kind(provider_type: str, api_base: str | None, model_name: str, kind: str) -> None:
+    if (
+        kind != "decision" and provider_type == "gemini"
+        and native_catalog_entry(model_name, provider_type, api_base).get("kind") == "decision"
+    ):
+        raise ProviderValidationError("this Gemini model requires model_kind=decision")
+
+
 def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: tuple) -> dict | None:
-    """Media models may carry applicable text rates; embeddings are input-only."""
-    if kind == "embedding" and any(value is not None for value in token_prices[1:]):
-        raise ProviderValidationError("embedding models support input-token pricing only")
+    """Media models may carry applicable text rates; embeddings and decisions are input-only."""
+    if kind in {"embedding", "decision"} and any(value is not None for value in token_prices[1:]):
+        raise ProviderValidationError(f"{kind} models support input-token pricing only")
     if kind != "text" and any(value is not None for value in token_prices[3:]):
         raise ProviderValidationError("media 모델에는 cache write 가격을 설정할 수 없습니다")
     return validate_media_pricing(kind, media_pricing)
@@ -312,8 +330,9 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
         async with factory() as session, session.begin():
             if set(patch) <= {"api_key", "api_key_env", "selection_policy", "selected_credential_id"}:
                 row = await _provider(session, provider_id)
+                locked_models = []
             else:
-                row, _ = await _lock_mutable_route(session, provider_id=provider_id)
+                row, locked_models = await _lock_mutable_route(session, provider_id=provider_id)
             if row is None:
                 raise ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
             current_auth_mode = getattr(row, "auth_mode", "api_key")
@@ -324,18 +343,24 @@ async def update_provider(provider_id: int, patch: dict) -> dict:
             ):
                 raise ProviderValidationError("구독 인증 방식 또는 provider_type은 PATCH로 전환할 수 없습니다")
             if target_provider_type != row.provider_type or target_auth_mode != current_auth_mode or "api_base" in patch:
-                media_kinds = (await session.execute(select(LlmModel.model_kind).where(
-                    LlmModel.provider_id == provider_id, LlmModel.model_kind != "text"
-                ))).scalars().all()
-                for kind in media_kinds:
+                target_api_base = patch.get("api_base", row.api_base)
+                for model in locked_models:
+                    kind = model.model_kind
+                    _validate_catalog_model_kind(target_provider_type, target_api_base, model.model_name, kind)
+                    if kind == "text":
+                        continue
+                    if kind == "decision":
+                        if not decision_provider_supported(target_provider_type, target_api_base, target_auth_mode):
+                            raise ProviderValidationError("decision models require a direct Gemini API-key provider")
+                        continue
                     compatible_embedding = (
                         kind == "embedding" and target_provider_type == "openai"
-                        and provider_family(target_provider_type, patch.get("api_base", row.api_base), target_auth_mode) == "compatible"
+                        and provider_family(target_provider_type, target_api_base, target_auth_mode) == "compatible"
                     )
                     if not compatible_embedding and (
                         kind not in MODEL_KINDS or target_provider_type not in _MEDIA_PROVIDERS
                         or target_auth_mode != "api_key"
-                        or not direct_provider_route(target_provider_type, patch.get("api_base", row.api_base))
+                        or not direct_provider_route(target_provider_type, target_api_base)
                     ):
                         raise ProviderValidationError("media 모델이 있는 프로바이더는 지원하지 않는 인증/유형/base로 전환할 수 없습니다")
             validate_provider_auth_configuration(
@@ -486,6 +511,7 @@ async def create_model(
                 candidate.id for candidate in subscription_providers.values() if candidate.auth_mode == auth_mode
             )
             canonical_name = canonical_subscription_model_name(model_name, auth_mode)
+            _validate_catalog_model_kind(provider.provider_type, provider.api_base, canonical_name, model_kind)
             if provider.provider_type == "perplexity" and auth_mode == "api_key":
                 canonical_name = perplexity_route_model_name(canonical_name)
                 await _reject_duplicate_perplexity_model(
@@ -509,10 +535,11 @@ async def create_model(
                 output_price=output_price,
                 **cache_prices,
                 price_source=(
-                    ("manual" if media_pricing else None)
-                    if model_kind != "text"
-                    else "manual"
-                    if input_price is not None or output_price is not None
+                    "manual"
+                    if (
+                        (model_kind != "text" and media_pricing)
+                        or (model_kind in {"text", "decision"} and (input_price is not None or output_price is not None))
+                    )
                     else None
                 ),
                 capabilities=(capabilities or None),
@@ -684,6 +711,8 @@ async def update_model(model_id: int, patch: dict) -> dict:
                         current_model_id=model_id,
                     )
                     row.model_name = canonical_name
+            if "model_kind" in patch or "model_name" in patch:
+                _validate_catalog_model_kind(provider.provider_type, provider.api_base, row.model_name, target_kind)
             if "display_name" in patch:
                 row.display_name = patch["display_name"] or None
             if "sort_order" in patch:
@@ -705,6 +734,8 @@ async def update_model(model_id: int, patch: dict) -> dict:
                 if target_kind == "text":
                     row.price_source = "manual" if input_price is not None or output_price is not None else None
                     row.price_metadata = None
+            if target_kind == "decision":
+                row.price_source = "manual" if row.input_price is not None else None
             for column, price in cache_prices.items():
                 setattr(row, column, price)
             if "capabilities" in patch:

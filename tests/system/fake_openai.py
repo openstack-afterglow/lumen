@@ -918,6 +918,22 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
             self._handle_anthropic_messages(self._read_json_body())
             return
 
+        if path == "/v1beta/decisions":
+            request = self._read_json_body()
+            if self.headers.get("x-goog-api-key") != "system-gemini-decisions-fixture":
+                self._send_json(401, {"error": {"code": "unchecked_provider_key"}})
+            elif request.get("model") != "gemini-decision-1" or set(request.get("questions", {})) != {"is_defect"}:
+                self._send_json(400, {"error": {"code": "invalid_decision_wire"}})
+            elif request.get("input") == "synthetic safety rejection":
+                self._send_json(400, {"error": {"code": "image_safety", "message": "Do not relay this fixture message"}})
+            else:
+                self._send_json(200, {
+                    "answers": {"is_defect": {"type": "noul", "noul": 0.03, "confidence": 0.97}},
+                    "usage": {"total_input_tokens": 100, "input_tokens_by_modality": [{"modality": "text", "tokens": 100}],
+                              "total_output_tokens": 0, "total_tokens": 100},
+                })
+            return
+
         if path not in ("/chat/completions", "/v1/chat/completions"):
             self._send_json(404, {"error": "not found"})
             return
