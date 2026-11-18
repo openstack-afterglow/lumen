@@ -458,6 +458,29 @@ def test_distinct_modality_rate_requires_explicit_complete_tier(catalog):
         validate_catalog(catalog)
 
 
+def test_leaf_modality_rates_stay_flat_above_threshold_while_catalog_leaves_keep_tiers(catalog):
+    entry = catalog["providers"]["openai"]["models"][0]
+    entry["media_pricing"] = {"token_rates": {"audio": {"input_per_million": "9", "cache_read_per_million": "0.1"}}}
+    entry["token_pricing"]["long_context"]["token_rates"] = {"audio": {"input_per_million": "12"}}
+    validate_catalog(catalog)
+    row = model()
+    row.media_pricing = {"override_mode": "leaf", "token_rates": {"audio": {"input_per_million": "20"}}}
+    assert _effective_media_pricing(row, "openai", None) == {
+        "token_rates": {"audio": {"input_per_million": "20", "cache_read_per_million": "0.1"}},
+    }
+    tiers = _resolved_context_tiers(row, "openai", None)
+    # The manual leaf is flat above the threshold; the untouched catalog leaf keeps its tier.
+    assert tiers["token_rates_above_200k"] == {"audio": {
+        "input_per_million": "20", "cache_read_per_million": "0.2",
+    }}
+    assert tiers["token_rates_follow_text"] is False
+
+    row.media_pricing["token_rates"]["audio"]["cache_read_per_million"] = "0.5"
+    tiers = _resolved_context_tiers(row, "openai", None)
+    assert tiers["token_rates_above_200k"] == {}
+    assert tiers["token_rates_follow_text"] is False
+
+
 @pytest.mark.parametrize("manual", [
     {"cache_read_price": Decimal(0)}, {"input_price": Decimal(0)}, {},
 ])

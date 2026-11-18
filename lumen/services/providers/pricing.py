@@ -799,8 +799,10 @@ def _model_public(
             # Identify the supported registry kind even for legacy text rows.
             catalog_entry["kind"] = entry["kind"]
         if entry["kind"] == _kind(row) and _kind(row) in BILLING_BASES:
-            # Media editors need official leaves that a manual override may hide.
-            catalog_entry.update(token_pricing=entry.get("token_pricing"), media_pricing=entry.get("media_pricing"))
+            # Media editors need the kind and official leaves that a manual override may hide.
+            catalog_entry.update(
+                kind=entry["kind"], token_pricing=entry.get("token_pricing"), media_pricing=entry.get("media_pricing"),
+            )
     price_origin = resolved_source if resolved_source in {"manual", "native_catalog"} else None
     # Stored manual cache columns stay nullable; effective rates are projected separately.
     effective_cache, effective_cache_sources = _effective_cache_prices(
