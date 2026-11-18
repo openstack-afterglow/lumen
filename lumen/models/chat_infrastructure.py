@@ -256,6 +256,8 @@ class ChatAgentReservation(Base):
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     root_run_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("chat_runs.id", ondelete="RESTRICT"), nullable=False)
     run_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("chat_runs.id", ondelete="RESTRICT"), nullable=False)
+    payer_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    payer_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     kind: Mapped[str] = mapped_column(VARCHAR(20), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     settled_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
@@ -267,6 +269,7 @@ class ChatAgentReservation(Base):
     __table_args__ = (
         Index("uq_agent_reservation_run_kind", "run_id", "kind", unique=True),
         Index("idx_agent_reservation_root", "root_run_id", "status"),
+        Index("idx_agent_reservation_payer_domain", "payer_domain_id", "kind", "status"),
     )
 
 

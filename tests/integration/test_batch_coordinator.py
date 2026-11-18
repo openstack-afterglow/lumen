@@ -869,28 +869,27 @@ async def test_api_completion_settlement_observes_concurrent_wallet_delta(batch_
         session.add(ChatModelCallReservation(run_id=run_id, segment_id="api_completion:1",
             bound_credits=Decimal("0.1"), status="reserved"))
 
-    get_wallet = credit._get_or_create_wallet
+    lock_wallet = credit.lock_wallet
     interleaved = []
 
-    async def commit_rival_delta_after_wallet_read(session, user_id, project_id):
-        wallet = await get_wallet(session, user_id, project_id)
-        if user_id == db.user_id:
-            # Commit a real rival delta on every snapshot attempt. The old
-            # bounded DB retry can mask one conflict, but not sustained writes;
-            # READ COMMITTED must settle without resending provider work.
+    async def commit_rival_delta_before_wallet_lock(session, user_id, project_id):
+        if user_id == db.user_id and not interleaved:
+            # The run identity was read, but the new global order has not
+            # taken the wallet lock. A rival delta commits in that window.
             async with db.factory() as rival, rival.begin():
                 await rival.execute(text("UPDATE user_wallets SET used_quota_this_month = "
                     "used_quota_this_month + 3 WHERE user_id = :user_id"), {"user_id": user_id})
             interleaved.append(user_id)
-        return wallet
+        return await lock_wallet(session, user_id, project_id)
 
-    monkeypatch.setattr(credit, "_get_or_create_wallet", commit_rival_delta_after_wallet_read)
+    monkeypatch.setattr(credit, "lock_wallet", commit_rival_delta_before_wallet_lock)
     try:
         assert await api_completion._settle(run_id, owner=owner) == "completed"
         assert await api_completion._settle(run_id, owner=owner) == "completed"
         async with db.factory() as session:
             wallet = await session.get(UserWallet, db.user_id)
-            assert wallet.used_quota_this_month == Decimal("1.02") + Decimal("3") * len(interleaved)
+            assert interleaved == [db.user_id]
+            assert wallet.used_quota_this_month == Decimal("4.02")
             reservation = await session.get(ChatModelCallReservation, (run_id, "api_completion:1"))
             assert (reservation.status, reservation.actual_credits) == ("settled", Decimal("0.02"))
             usage = (await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))).scalars().all()

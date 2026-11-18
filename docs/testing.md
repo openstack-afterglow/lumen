@@ -1,5 +1,9 @@
 # 테스트
 
+## Prepaid domain billing (migration 037)
+
+`test-defined`: `tests/integration/test_domain_credit.py` uses the migrated, disposable MariaDB. It races two humans and a service-key-shaped hold against a dashboard provider intent, checks project-quota lock order from two sessions, and checks nested allocation accounting. It also covers duplicate settlement/release/top-up, ledger balance, live manager denial, and the effective admin ceiling. No paid provider calls run in these tests.
+
 ## Native catalog row selection (migration 039)
 
 `test-passed` on the model-identity slice: 1,066 focused pytest cases and Ruff on changed Python files. Coverage includes duplicate model names under separate provider connections, exact kind filters, native route assertions, legacy media decimal IDs, agent create/update/clone and child routing, retry after an agent model change, and unchanged OpenAI/Anthropic request schemas. Synthetic upstream tests confirm that local row IDs never enter the Decisions provider payload.

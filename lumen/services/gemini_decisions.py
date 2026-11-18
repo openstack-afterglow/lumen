@@ -10,6 +10,7 @@ from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 import httpx
 
 from lumen.config import get_settings
+from lumen.models.billing import Payer
 from lumen.models.gemini_decision_contracts import CONTEXT_TOKENS, GeminiDecisionRequest
 from lumen.services import decisions, provider_metadata, stateless_credit
 from lumen.services.durable_runs.api_completion import _REJECTION_STATUSES
@@ -214,7 +215,8 @@ async def transport(route: dict, body: GeminiDecisionRequest, *, on_dispatch: Ca
 
 
 async def decide(*, route: dict, body: GeminiDecisionRequest, user_id: str, project_id: str,
-                 api_key_id: int | None, required_scopes: tuple[str, ...], source: str = "api") -> dict:
+                 api_key_id: int | None, required_scopes: tuple[str, ...], source: str = "api",
+                 payer: Payer | None = None) -> dict:
     _validate_route(route)
     rate = decisions._rate(route, "input_price_per_token", required=True)
     margin = Decimal(str(route["margin_multiplier"]))
@@ -235,6 +237,7 @@ async def decide(*, route: dict, body: GeminiDecisionRequest, user_id: str, proj
             provider=route.get("provider_name") or "gemini", prompt_tokens=inputs, completion_tokens=0,
             usage_cost=cost, margin_multiplier=margin, credit_per_usd=credit_per_usd, source=source,
             api_key_id=api_key_id, breakdown=UsageBreakdown(input_tokens=inputs, output_tokens=0),
+            payer=payer,
             execution_route=route, usage_components=[{
                 "kind": "decision", "category": "decision", "unit": "request", "quantity": "1",
                 "cost_usd": format(amount, "f"), "input_tokens": inputs, "output_tokens": 0,
@@ -245,6 +248,7 @@ async def decide(*, route: dict, body: GeminiDecisionRequest, user_id: str, proj
 
     response, usage = await decisions.accounted_call(
         user_id=user_id, project_id=project_id, api_key_id=api_key_id, required_scopes=required_scopes,
+        payer=payer,
         bound=bound, dispatch=lambda mark: transport(route, body, on_dispatch=mark), account=account,
     )
     return {"model": route["model_name"], "answers": validate_answers(response.get("answers"), body), "usage": usage}

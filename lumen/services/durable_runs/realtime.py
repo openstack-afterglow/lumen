@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from lumen.cache import _get_redis
 from lumen.config import get_settings
 from lumen.crypto import encrypt_chat_content
+from lumen.models.billing import Payer
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import credit
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
@@ -314,6 +315,7 @@ async def consume_ticket(run_id: str, token: str) -> tuple[str, str]:
 async def admit_realtime_session(
     request: dict, *, project_id: str, user_id: str, client_request_id: str,
     source: str = "web", api_key_id: int | None = None, provider_type: str | None = None,
+    payer: Payer | None = None,
     credential_authority: dict | None = None, kind: str = "conversation", wire: str = "native",
 ) -> dict:
     """``provider_type`` is the transport a vendor wire fixes, never the editable public selector.
@@ -375,7 +377,7 @@ async def admit_realtime_session(
     required_scopes = ("compat:realtime:write",) if source == "api" else ("native:realtime:write",)
     # The admitting wire is frozen: translation and live sessions run only on it.
     payload = {**intent, "voice": voice, "required_scopes": list(required_scopes), "wire": wire}
-    await credit.precheck(user_id, project_id, api_key_id)
+    await credit.precheck(user_id, project_id, api_key_id, payer=payer)
     per_usd = Decimal(str(get_settings().chat_credit_per_usd))
     margin = Decimal(str(route["margin_multiplier"]))
     envelope = _envelope_usd(plan, intent["max_duration_seconds"])
@@ -420,9 +422,10 @@ async def admit_realtime_session(
                 run = ChatRun(id=str(uuid.uuid4()), run_scope="realtime", run_kind="realtime", workload_class="realtime",
                     project_id=project_id, user_id=user_id, model_name=route["model_name"], source=source,
                     api_key_id=api_key_id, client_request_id=client_request_id, request_fingerprint=_fingerprint(intent),
+                    payer_domain_id=payer.domain_id if payer is not None else None,
                     fingerprint_version=1, execution_protocol_version=1, capability_snapshot=capability,
                     pricing_snapshot=pricing, request_payload=encrypt_chat_content(json.dumps(payload)),
-                    status="queued", last_seq=0, current_ordinal=0, reserved_credits=bound)
+                    status="queued", last_seq=0, current_ordinal=0)
                 session.add(run)
                 session.add(ChatRunProvider(run_id=run.id, purpose="executor", provider_id=route["provider_id"],
                     model_id=route["model_id"], provider_label=route["provider_name"],
@@ -458,6 +461,7 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
     async def transaction():
         async with _factory()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await credit.lock_run_payer(session, run_id)
             run = await claim_realtime_run(session, run_id, owner=owner, lease_seconds=45)
             if run is None or run.user_id != user_id or run.project_id != project_id:
                 raise DurableRunNotFound("realtime session is unavailable")
@@ -476,11 +480,14 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
                 raise DurableRunInputError("inference_authority_revoked") from exc
             except ApiKeyAuthorityUnavailable as exc:
                 raise DurableRunError("inference_authority_unavailable") from exc
+            payer = credit.run_payer(run)
             await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id,
-                project_id=run.project_id, api_key_id=run.api_key_id,
+                project_id=run.project_id, api_key_id=run.api_key_id, payer=payer,
                 bound=Decimal(run.pricing_snapshot["bound_credits"]))
             session.add(ChatModelCallReservation(run_id=run.id, segment_id=_SEGMENT,
-                bound_credits=Decimal(run.pricing_snapshot["bound_credits"]), status="reserved"))
+                bound_credits=Decimal(run.pricing_snapshot["bound_credits"]), status="reserved", **payer.columns()))
+            await credit.refresh_domain_reserved(session, payer)
+            run.reserved_credits = Decimal(run.pricing_snapshot["bound_credits"])
             begin_segment_io(segment)
             run.provider_started_at = _now()
             await append_event(session, run, _event(run, "run.stage.changed", {"stage": "model_request"}))
@@ -526,6 +533,8 @@ async def _settle(run_id: str, *, owner: str, meter) -> dict[str, str]:
 
     async def transaction():
         async with _factory()() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await credit.lock_run_payer(session, run_id)
             run, segment, reservation = await _lock_settlement_rows(session, run_id, owner)
             if reservation.status == "settled":
                 return {}
@@ -540,8 +549,10 @@ async def _settle(run_id: str, *, owner: str, meter) -> dict[str, str]:
             complete_segment_io(segment, result_payload={"closed": True}, usage_payload=usage)
             prompt_tokens = breakdown.input_tokens if breakdown is not None else 0
             completion_tokens = breakdown.output_tokens if breakdown is not None else 0
+            payer = credit.run_payer(run)
             credited = await credit.apply_usage_in_transaction(session, event_id=f"run:{run.id}",
                 user_id=run.user_id, project_id=run.project_id, model_name=run.model_name,
+                payer=payer,
                 provider=run.capability_snapshot["provider_name"], prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens, usage_cost=usage_cost,
                 execution_route=run.capability_snapshot,
@@ -554,6 +565,7 @@ async def _settle(run_id: str, *, owner: str, meter) -> dict[str, str]:
             reservation.actual_credits = credited
             reservation.status = "settled"
             reservation.settled_at = _now()
+            await credit.refresh_domain_reserved(session, payer)
             run.usage_reconciled_at = _now()
             await append_event(session, run, _event(run, "usage.updated", {"components": components,
                 "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,

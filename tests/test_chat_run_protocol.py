@@ -497,6 +497,10 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
         model_name="model",
         project_id="project-1",
         user_id="user-1",
+        payer_domain_id=None,
+        source="web",
+        api_key_id=None,
+        run_scope="temp",
         conversation_id=None,
         user_message_id=None,
         assistant_message_id=None,
@@ -596,7 +600,10 @@ async def test_worker_flushes_small_delta_during_provider_pause_and_closes_itera
 
 
 async def test_summary_compactor_fences_map_and_reduce_segments_and_records_usage(monkeypatch):
-    run = SimpleNamespace(id="run-1", user_id="user-1", project_id="project-1", api_key_id=None, pricing_snapshot={})
+    run = SimpleNamespace(
+        id="run-1", user_id="user-1", project_id="project-1", api_key_id=None, payer_domain_id=None,
+        pricing_snapshot={},
+    )
 
     class _Result:
         def scalar_one(self):
@@ -717,6 +724,7 @@ async def test_summary_usage_keeps_the_originating_run_association(monkeypatch):
         project_id="project-1",
         conversation_id="conversation-1",
         api_key_id=None,
+        payer_domain_id=None,
         model_name="execution-model",
         pricing_snapshot={
             "summary_route": {
@@ -1285,6 +1293,9 @@ async def test_ordinary_chat_terminal_paths_settle_assigned_sandbox_before_relea
 
         def begin(self):
             return self
+        async def connection(self, **_kwargs):
+            return None
+
 
         async def execute(self, query):
             identity = run if query.column_descriptions[0]["name"] == "ChatRun" else None
@@ -1353,6 +1364,10 @@ def tool_result_worker(monkeypatch):
         },
         execution_protocol_version=1, status="queued", lease_owner="worker#1", assigned_resource_id=None,
         parent_run_id=None, credit_ceiling=None, sandbox_seconds_ceiling=None, depth=0, last_seq=0,
+        payer_domain_id=None,
+        source="web",
+        api_key_id=None,
+        run_scope="temp",
     )
     journal = []
     finished = []

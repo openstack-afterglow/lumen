@@ -576,7 +576,7 @@ def _core(monkeypatch):
             "provider_name": "openai",
         }
 
-    async def fake_precheck(u, p, api_key_id=None):
+    async def fake_precheck(u, p, api_key_id=None, *, payer=None):
         return None
 
     async def fake_once(**kw):
@@ -847,7 +847,7 @@ class TestOpenAIEndpoint:
     async def test_forwards_api_key_id_to_precheck(self, client, _auth, monkeypatch):
         calls = []
 
-        async def fake_precheck(user_id, project_id, api_key_id=None):
+        async def fake_precheck(user_id, project_id, api_key_id=None, *, payer=None):
             calls.append((user_id, project_id, api_key_id))
 
         async def fake_resolve(model, *, provider=None, operation="chat"):
@@ -883,7 +883,7 @@ class TestOpenAIEndpoint:
         assert calls[0] == ("u1", "p1", 7)
 
     async def test_key_quota_exceeded_returns_429_before_provider(self, client, _auth, monkeypatch):
-        async def quota_precheck(user_id, project_id, api_key_id=None):
+        async def quota_precheck(user_id, project_id, api_key_id=None, *, payer=None):
             raise core.CompletionError(429, "API 키 월 사용 한도를 초과했습니다")
 
         async def forbidden_provider(**kw):
@@ -1010,6 +1010,37 @@ class TestOpenAILumenVirtualModel:
         assert len(lumen_items) == 1
         assert lumen_items[0]["owned_by"] == "lumen"
         assert lumen_items[0]["providers"] == []
+
+    @pytest.mark.parametrize("credential_class", ["personal_key", "service_key"])
+    async def test_lumen_hidden_and_rejected_for_model_keys(self, client, monkeypatch, credential_class):
+        from lumen.config import get_settings
+        from lumen.services.providers import routing
+
+        async def principal():
+            return {"auth_type": "api_key", "credential_class": credential_class,
+                    "user_id": "u1", "project_id": "p1", "api_key_id": 7,
+                    "source": "api", "scopes": ("models:read", "compat:completions:write"),
+                    "roles": ["member", *SERVICE_CAPABILITIES]}
+
+        async def list_models(model_kind=None):
+            return [] if model_kind == "embedding" else [
+                {"model_name": "gpt-4o", "api_model_name": "gpt-4o", "api_provider": "openai"},
+            ]
+
+        async def forbidden_run(**kwargs):
+            pytest.fail("model-only credential entered durable agent runtime")
+
+        monkeypatch.setitem(app.dependency_overrides, get_principal, principal)
+        monkeypatch.setattr(get_settings(), "chat_default_model", "gpt-4o")
+        monkeypatch.setattr(routing, "list_api_models", list_models)
+        monkeypatch.setattr(openai_compat, "create_lumen_temp_run", forbidden_run)
+        listing = await client.get("/v1/models", headers=_H)
+        assert listing.status_code == 200
+        assert {item["id"] for item in listing.json()["data"]} == {"gpt-4o"}
+        request = {"model": "lumen", "messages": [{"role": "user", "content": "hello"}]}
+        response = await client.post("/v1/chat/completions", headers=_H, json=request)
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "model_not_allowed_for_key"
 
     async def test_lumen_model_hidden_when_unconfigured_or_inactive(self, client, _auth, monkeypatch):
         from lumen.config import get_settings

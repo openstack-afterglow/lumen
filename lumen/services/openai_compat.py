@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from lumen.config import get_settings
+from lumen.models.billing import Payer
 from lumen.models.chat_contracts import ChatFeatureOptions, ToolPolicy
 from lumen.services import completion_api as core
 from lumen.services.chat_admission import (
@@ -188,6 +189,7 @@ async def create_lumen_temp_run(
     project_id: str,
     api_key_id: int | None,
     source: str,
+    payer: Payer | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
 ) -> tuple[str, str]:
@@ -200,9 +202,9 @@ async def create_lumen_temp_run(
 
     try:
         resolved = await core.resolve(default_model)
-        await core.precheck(user_id, project_id, api_key_id=api_key_id)
+        await core.precheck(user_id, project_id, api_key_id=api_key_id, payer=payer)
     except core.CompletionError as exc:
-        raise OpenAICompatError(exc.status_code, exc.message) from exc
+        raise OpenAICompatError(exc.status_code, exc.message, code=exc.code) from exc
 
     features_obj = ChatFeatureOptions(memory=False, tool_policy=ToolPolicy(mode="none"))
     features = features_obj.model_dump(mode="json", by_alias=True)
@@ -274,6 +276,7 @@ async def create_lumen_temp_run(
             execution_protocol_version=protocol_version,
             source=source,
             api_key_id=api_key_id,
+            payer=payer,
         )
     except DurableRunError:
         raise OpenAICompatError(503, "Service temporarily unavailable")

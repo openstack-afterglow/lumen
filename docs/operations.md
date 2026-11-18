@@ -505,6 +505,14 @@ Original-token attenuation cutover는 새 SQL migration을 추가하지 않고 �
 
 적용된 SQL migration/checksum은 immutable이다. 유지보수 cutover는 admission 차단·API/worker/controller stop → backup/DB readiness → `lumen-migrate --apply` → 호환 API/worker/controller start 순서다. 적용 뒤 동일 command를 다시 실행해 pending migration이 없는지 확인한다. Kolla의 migration-before-start 자동화만으로 **기존 실행 중인 컨테이너를 중지했다는 뜻은 아니다**. rolling mixed-version deployment는 지원 전제가 아니다.
 
+### Prepaid domain pools (migration 037)
+
+After the schema-first cutover, a system administrator must fund each inference domain using `POST /v1/admin/domain-pools/{domain_id}/topups` with `Idempotency-Key` and `{amount_credits, note?}`. Use a fresh key for each distinct deposit; replay the same key and body after an uncertain response. `GET /v1/admin/domain-pools` lists provisioned pools. Admin PATCH accepts `admin_ceiling_credits` and `is_active`. Human domain managers use GET/PATCH `/v1/domain-pool` with `manager_monthly_limit_credits`; `null` clears a monthly limit, while `0` blocks paid work. All amounts support eight decimal places.
+
+No migration copies user balances or retroactively charges a domain. Unfunded domains fail closed with `domain_credit_insufficient`. Inactivating a pool or lowering its limit blocks new admissions without invalidating previously funded holds. Known zero-cost refusals release the hold; do not auto-expire `unknown` rows. Reconcile unknown amounts against provider evidence before changing the hold and ledger. Take the domain pool lock before changing either; do not edit the balance or reservation cache independently.
+
+Domain-billed text requires enforceable input/output bounds and known prices before dispatch. The prepaid envelope reserves the frozen context at the highest applicable input rate; ensure the pool and per-user guard can cover that envelope. Paid native web search without a provider-enforced request limit is unavailable on this path. A disconnect without complete provider usage retains an `unknown` hold; there is no automatic release or pool API for manual disposition.
+
 ### User/domain scope backfill (migration 036)
 
 Drain and stop the old API/workers and apply migration 036 with `lumen-migrate --apply` before starting compatible writers. Take a recoverable backup and retain the existing Lumen encryption key separately. For predictable migration timing, run `python -m lumen.scripts.backfill_domain_scope --apply` after schema migration with the configured MariaDB URL and Keystone admin identity, before opening ingress. New API processes also schedule the same job in their startup lifecycle; a MariaDB advisory lock admits one worker at a time. Readiness does not wait for the job. Do not mix schema-036 writers with previous versions.

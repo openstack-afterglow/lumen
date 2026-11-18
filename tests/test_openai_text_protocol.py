@@ -10,6 +10,7 @@ import pytest
 
 from lumen.api.compat.streaming import events_with_ping
 from lumen.models.api_requests import OpenAIChatRequest, ResponsesRequest
+from lumen.models.billing import Payer
 from lumen.services import completion_api as core
 from lumen.services import credit, openai_tool_policy, provider_client, provider_metadata
 from lumen.services.completion_format import prompt_token_details
@@ -170,6 +171,37 @@ def test_cache_and_chat_fields_serialize_and_normalize():
     with pytest.raises(core.CompletionError) as failure:
         core.responses_provider_options({"service_tier": "priority"}, resolved=route_for())
     assert (failure.value.status_code, failure.value.code) == (422, "service_tier_unsupported")
+
+
+@pytest.mark.parametrize("protocol", ["chat", "responses", "anthropic"])
+async def test_explicit_personal_payer_holds_before_provider_io(monkeypatch, protocol):
+    payer = Payer("user", OWNER["user_id"], None)
+    route = {
+        "model_name": "synthetic-model", "provider_type": "openai", "api_base": "https://example.invalid/v1",
+        "input_price_per_token": Decimal("0.001"), "output_price_per_token": Decimal("0.002"),
+        "capabilities": {"context_limit": 1024, "output_budget_enforced": True}, "margin_multiplier": Decimal(1),
+    }
+    reserve = AsyncMock(side_effect=credit.QuotaExceeded("actor quota"))
+    upstream = AsyncMock()
+    monkeypatch.setattr(core, "_authorize_completion", AsyncMock())
+    monkeypatch.setattr(core.stateless_credit, "reserve", reserve)
+    monkeypatch.setattr(core, "invoke_chat_once", upstream)
+    monkeypatch.setattr(provider_client, "aresponses", upstream)
+    monkeypatch.setattr(provider_client, "aanthropic_messages", upstream)
+    with pytest.raises(core.CompletionError, match="actor quota") as failure:
+        if protocol == "chat":
+            await core.complete_once(resolved=route, messages=MESSAGES, max_tokens=12,
+                                     temperature=None, payer=payer, **OWNER)
+        elif protocol == "responses":
+            await core.complete_responses(resolved=route, input="synthetic", stream=False,
+                                          options={"max_output_tokens": 12}, payer=payer, **OWNER)
+        else:
+            await core.complete_anthropic(resolved=route, messages=MESSAGES, max_tokens=12, stream=False,
+                                          options={}, payer=payer, **OWNER)
+    assert failure.value.status_code == 429
+    reserve.assert_awaited_once()
+    assert reserve.await_args.kwargs["payer"] == payer and reserve.await_args.kwargs["bound"] > 0
+    upstream.assert_not_awaited()
 
 
 @pytest.mark.parametrize("item", [
@@ -402,7 +434,7 @@ async def test_hosted_sse_uses_terminal_evidence(monkeypatch, outcome):
                 await anext(stream)
     if outcome != "settled":
         settle.assert_not_awaited()
-        finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True)
+        finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True, payer=None)
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -697,7 +729,7 @@ async def test_held_stream_drains_after_disconnect(monkeypatch, protocol, outcom
         finish.assert_not_awaited()
     else:
         settle.assert_not_awaited()
-        finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True)
+        finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True, payer=None)
 
 
 @pytest.mark.parametrize("protocol", ["responses", "chat"])
@@ -763,7 +795,7 @@ async def test_held_stream_settlement_outlives_drain_deadline(monkeypatch, caplo
     finish.assert_not_awaited()
     (record,) = (record for record in caplog.records if record.name == core.__name__ and record.levelname == "INFO")
     assert record.msg == (
-        "OpenAI held usage reservation_id=%s input_tokens=%d input_bound=%d output_tokens=%d output_bound=%d"
+        "Held usage reservation_id=%s input_tokens=%d input_bound=%d output_tokens=%d output_bound=%d"
     )
     event_id, input_tokens, input_bound, output_tokens, output_bound = record.args
     assert (event_id, input_tokens, output_tokens, output_bound) == (reserve.await_args.kwargs["event_id"], 5, 2, 32)

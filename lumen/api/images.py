@@ -65,6 +65,7 @@ async def admit(
             client_request_id=str(idempotency_key),
             source=principal.get("source", "web"),
             api_key_id=principal.get("api_key_id"),
+            payer=principal.get("payer"),
             required_scopes=required_scopes,
             credential_authority=credential_authority_snapshot(principal),
         )

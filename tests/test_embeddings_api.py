@@ -5,6 +5,7 @@ import copy
 import struct
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 from lumen.api import embeddings as native_embeddings
 from lumen.api.compat import embeddings as compat
 from lumen.auth import get_principal
+from lumen.models.billing import Payer
 from lumen.service_authority import SERVICE_CAPABILITIES
 
 
@@ -217,6 +219,29 @@ async def test_embedding_usage_settlement_marks_missing_usage_estimated(monkeypa
     assert result["credited_cost"] == 0.00001
     assert effects == ["precheck", ("authorize", ("compat:completions:write",)),
                        ("provider", "RETRIEVAL_QUERY", "context"), ("settle", 3, 0)]
+
+
+async def test_personal_key_embedding_reserves_before_provider_io(monkeypatch):
+    from lumen.services import credit, embeddings, provider_client, stateless_credit
+
+    payer = Payer("user", "user-1", None)
+    hold = AsyncMock(side_effect=credit.QuotaExceeded("actor quota"))
+    upstream = AsyncMock()
+    monkeypatch.setattr(embeddings, "authorize_new_io", AsyncMock())
+    monkeypatch.setattr(stateless_credit, "reserve", hold)
+    monkeypatch.setattr(provider_client, "aembedding", upstream)
+    route = {
+        "model_name": "synthetic-embedding", "api_model_name": "synthetic-embedding",
+        "input_price_per_token": Decimal("0.001"), "margin_multiplier": Decimal(1),
+        "capabilities": {"embedding": {}, "context_limit": 1024},
+    }
+    with pytest.raises(embeddings.EmbeddingError, match="actor quota") as failure:
+        await embeddings.embed(route=route, inputs=["synthetic"], user_id="user-1", project_id="lumen:key:7",
+                               api_key_id=7, required_scopes=("compat:completions:write",), payer=payer)
+    assert failure.value.status_code == 429
+    hold.assert_awaited_once()
+    assert hold.await_args.kwargs["payer"] == payer and hold.await_args.kwargs["bound"] > 0
+    upstream.assert_not_awaited()
 
 
 @pytest.mark.parametrize("model,provider", [

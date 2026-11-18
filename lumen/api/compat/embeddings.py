@@ -66,6 +66,7 @@ async def _run(model: str, inputs: list[str], *, principal: Principal, dimension
         return await embeddings.embed(
             route=route, inputs=inputs, user_id=principal["user_id"], project_id=principal["project_id"],
             api_key_id=principal.get("api_key_id"), required_scopes=("compat:completions:write",),
+            payer=principal.get("payer"),
             dimensions=dimensions, task_type=task_type, title=title,
         )
     except embeddings.EmbeddingError as exc:
@@ -82,7 +83,10 @@ async def openai_embeddings(body: OpenAIEmbeddingRequest,
         result = await _run(body.model, inputs, principal=principal, dimensions=body.dimensions,
                             max_inputs=2048, provider=body.provider)
     except HTTPException as exc:
-        return openai_error_response(exc.status_code, str(exc.detail), code="embedding_error")
+        return openai_error_response(
+            exc.status_code, str(exc.detail),
+            code="domain_credit_insufficient" if exc.detail == "domain_credit_insufficient" else "embedding_error",
+        )
     return {"object": "list", "data": _openai_vectors(result["embeddings"], body.encoding_format),
             "model": result["model"], "usage": {"prompt_tokens": result["usage"]["prompt_tokens"],
             "total_tokens": result["usage"]["total_tokens"]}}

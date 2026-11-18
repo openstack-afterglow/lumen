@@ -336,8 +336,12 @@ class ChatUsageLog(Base):
     __tablename__ = "chat_usage_logs"
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
-    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
-    user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    billing_scope: Mapped[str] = mapped_column(VARCHAR(10), server_default="user")
+    payer_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    payer_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     conversation_id: Mapped[str | None] = mapped_column(CHAR(36))  # 대화 삭제 후에도 원장 보존 — FK 없음
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     provider: Mapped[str | None] = mapped_column(VARCHAR(100))
@@ -370,6 +374,9 @@ class ChatUsageLog(Base):
     __table_args__ = (
         Index("idx_chat_usage_project_created", "project_id", "created_at"),
         Index("idx_chat_usage_user_created", "user_id", "created_at"),
+        Index("idx_chat_usage_domain_created", "domain_id", "created_at"),
+        Index("idx_chat_usage_payer_domain_created", "payer_domain_id", "created_at"),
+        Index("idx_chat_usage_payer_user_created", "payer_user_id", "created_at"),
         Index("idx_chat_usage_api_key_created", "api_key_id", "created_at"),
         Index("idx_chat_usage_run_id", "run_id"),
         Index("idx_chat_usage_provider_account", "provider_account_id", "created_at"),

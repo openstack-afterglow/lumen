@@ -14,6 +14,7 @@ ACCOUNT_ID = "028-provider-account-credentials"
 HISTORICAL_ID = "027-provider-account-credentials"
 HISTORICAL_PATH = "027_provider_account_credentials.sql"
 HISTORICAL_SHA256 = "ee01a94044de1c5466c9627bd25e21ba22ec5ef03abf63c8494818775700711a"
+DOMAIN_BILLING_ID = "037-domain-credit-pools"
 
 
 class AccountMigrationError(RuntimeError):
@@ -211,8 +212,8 @@ MATERIAL = {
 }
 
 
-def schema_for(mode: str) -> dict[str, str]:
-    """Derive only the two source-evidenced schema deltas, not arbitrary repairs."""
+def schema_for(mode: str, *, domain_billing: bool = False) -> dict[str, str]:
+    """Derive only source-evidenced schema deltas, not arbitrary repairs."""
     schema = dict(REPAIRED_SCHEMA)
     if mode == "repaired":
         return schema
@@ -222,6 +223,21 @@ def schema_for(mode: str) -> dict[str, str]:
         auth = auth.replace("PRIMARY KEY (`provider_id`)", "PRIMARY KEY (`credential_id`)")
         auth = "\n".join(line for line in auth.splitlines() if "uq_legacy_compat_auth_credential" not in line)
         schema["llm_provider_auth_attempts"] = auth
+        if domain_billing:
+            usage = schema["chat_usage_logs"].replace(
+                "`project_id` varchar(64) NOT NULL", "`project_id` varchar(64) DEFAULT NULL",
+            ).replace("`user_id` varchar(64) NOT NULL", "`user_id` varchar(64) DEFAULT NULL")
+            schema["chat_usage_logs"] = usage.replace(
+                "  PRIMARY KEY (`id`),",
+                "  `domain_id` varchar(64) DEFAULT NULL,\n"
+                "  `billing_scope` varchar(10) NOT NULL DEFAULT 'user',\n"
+                "  `payer_user_id` varchar(64) DEFAULT NULL,\n"
+                "  `payer_domain_id` varchar(64) DEFAULT NULL,\n"
+                "  KEY `idx_chat_usage_domain_created` (`domain_id`,`created_at`),\n"
+                "  KEY `idx_chat_usage_payer_domain_created` (`payer_domain_id`,`created_at`),\n"
+                "  KEY `idx_chat_usage_payer_user_created` (`payer_user_id`,`created_at`),\n"
+                "  PRIMARY KEY (`id`),",
+            )
         return schema
     _require(mode == "pristine", "unknown_schema_mode")
     for table in NEW_TABLES:
@@ -329,7 +345,7 @@ async def inspect_account_state(connection, migrations) -> str:
         actual_auth = (await connection.exec_driver_sql("SHOW CREATE TABLE llm_provider_auth_attempts")).one()[1]
         mode = "repaired" if canonical_schema(actual_auth, installation_default) == canonical_schema(REPAIRED_SCHEMA["llm_provider_auth_attempts"], installation_default) else "accounted"
         _require(not (ACCOUNT_ID in applied and mode == "repaired"), "028_receipt_with_legacy_writer_schema")
-    for table, expected in schema_for(mode).items():
+    for table, expected in schema_for(mode, domain_billing=DOMAIN_BILLING_ID in applied).items():
         _require(table in tables, "missing_target_table")
         actual = (await connection.exec_driver_sql("SHOW CREATE TABLE `" + table + "`")).one()[1]
         _require(canonical_schema(actual, installation_default) == canonical_schema(expected, installation_default), "schema_drift_" + table)

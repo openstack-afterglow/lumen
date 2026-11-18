@@ -179,7 +179,7 @@ async def create_completion(
     except cs.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     try:
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -273,6 +273,7 @@ async def create_completion(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
             expected_parent_id=expected_active_leaf_id,
             agent_budget=planned["agent_budget"],
             execution_mode=payload.execution_mode,
@@ -346,7 +347,7 @@ async def regenerate_message(
         raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
 
     try:
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -404,6 +405,7 @@ async def regenerate_message(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
             expected_parent_id=expected_active_leaf_id,
         )
     except durable_errors.DurableRunError as exc:
@@ -475,7 +477,7 @@ async def retry_failed_run(
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
     try:
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -636,6 +638,7 @@ async def retry_failed_run(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
             expected_parent_id=expected_active_leaf_id,
             agent_budget=planned["agent_budget"],
             execution_mode=source_run.execution_mode,
@@ -684,7 +687,7 @@ async def temp_completion(
         )
         if existing is not None:
             return existing
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
     except credit.QuotaExceeded as exc:
@@ -748,6 +751,7 @@ async def temp_completion(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
@@ -943,7 +947,7 @@ async def compact_conversation(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     try:
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -1038,6 +1042,7 @@ async def compact_conversation(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
@@ -1089,7 +1094,7 @@ async def compact_temp_thread(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     try:
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -1183,6 +1188,7 @@ async def compact_temp_thread(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc

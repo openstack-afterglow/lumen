@@ -29,6 +29,20 @@ def _without_secondary_keys(entry):
     return [line.rstrip(",") for line in ddl.splitlines() if not re.match(r"\s*(UNIQUE )?KEY ", line)], rows
 
 
+def _before_billing(entry, *, columns):
+    """Project only the exact 037 delta away when comparing historical rows."""
+    ddl, rows = _without_secondary_keys(entry)
+    ddl = [
+        line.replace("DEFAULT NULL", "NOT NULL") if line.lstrip().startswith((
+            "`project_id` varchar(64)", "`user_id` varchar(64)",
+        )) and "billing_scope" in columns else line
+        for line in ddl
+        if not any(line.lstrip().startswith(f"`{column}` ") for column in columns)
+    ]
+    return ddl, sorted((row[:-len(columns)] for row in rows), key=repr)
+
+
+
 pytestmark = pytest.mark.integration
 
 
@@ -72,6 +86,9 @@ class _Connection:
     async def execute(self, statement, parameters=None):
         return await self.connection.execute(statement, parameters or {})
 
+    async def scalar(self, statement, parameters=None):
+        return (await self.execute(statement, parameters)).scalar()
+
 
 def _pending_from_account() -> list[str]:
     """Every manifest migration from the account migration onward; later migrations are pending too."""
@@ -86,7 +103,8 @@ class _Database:
         self.migrations = runner.load_manifest()
 
     def namespace(self, connection, cursor, statement, parameters, context, executemany):
-        statement = re.sub(r"\b(chat_|llm_|user_wallets\b|schema_migrations\b)", lambda m: self.prefix + m[0], statement)
+        statement = re.sub(r"\b(chat_|llm_|domain_credit_|memory_vault_|user_wallets\b|schema_migrations\b)",
+                           lambda m: self.prefix + m[0], statement)
         statement = re.sub(r"\b(fk_|ck_|chk_|uq_)", lambda m: self.prefix + m[0], statement)
         self.statements.append(statement)
         return statement, parameters
@@ -243,10 +261,10 @@ async def test_pristine_published_upgrade_preserves_ciphertext_generations_attem
     assert after['chat_usage_logs'][1][0][:len(before['chat_usage_logs'][1][0])] == before['chat_usage_logs'][1][0]
     before_ddl, before_rows = before['chat_runs']
     after_ddl, after_rows = after['chat_runs']
-    assert after_rows == before_rows
-    # 028 leaves chat_runs alone; the only DDL differences are the later secondary indexes (030's idempotency key, 031).
+    assert after_rows == [(*row, None) for row in before_rows]
+    # 028 leaves chat_runs alone. Later migrations add indexes and a nullable payer column.
     assert "idempotency" not in before_ddl and "idempotency" in after_ddl
-    assert _without_secondary_keys(after['chat_runs']) == _without_secondary_keys(before['chat_runs'])
+    assert _before_billing(after['chat_runs'], columns=("payer_domain_id",)) == _without_secondary_keys(before['chat_runs'])
     assert after['chat_run_providers'][1][0][:len(before['chat_run_providers'][1][0])] == before['chat_run_providers'][1][0]
     for receipt in before['schema_migrations'][1]:
         assert receipt in after['schema_migrations'][1]
@@ -275,7 +293,10 @@ async def test_exact_historical_receipt_is_preserved_without_replaying027(databa
         actual_auth = (await connection.exec_driver_sql("SHOW CREATE TABLE llm_provider_auth_attempts")).one()[1]
         installation_default = tuple((await connection.exec_driver_sql("SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=DATABASE()")).one())
     assert account.canonical_schema(actual_auth, installation_default) == account.canonical_schema(account.schema_for("accounted")["llm_provider_auth_attempts"], installation_default)
-    for table in ('llm_provider_accounts','llm_provider_credentials','chat_provider_usage','chat_run_providers','chat_usage_logs','llm_models'):
+    usage_columns = ("domain_id", "billing_scope", "payer_user_id", "payer_domain_id")
+    assert _before_billing(after["chat_usage_logs"], columns=usage_columns) == _without_secondary_keys(before["chat_usage_logs"])
+    assert all(row[-4:] == (None, "user", None, None) for row in after["chat_usage_logs"][1])
+    for table in ('llm_provider_accounts','llm_provider_credentials','chat_provider_usage','chat_run_providers','llm_models'):
         assert _without_secondary_keys(after[table]) == _without_secondary_keys(before[table])
     for receipt in before['schema_migrations'][1]:
         assert receipt in after['schema_migrations'][1]
