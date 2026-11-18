@@ -1,9 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.6.18 — release preparation (not published or deployed)
 
 - **한국어 — 0.6.17 통합 누락분:** 0.6.17 통합 시점 뒤에 완료된 세 수정을 반영한다. 조직 MCP 활성화는 Keystone 구성원 조회를 행 잠금 밖에서 먼저 수행하고 잠금 안에서 도메인 변경을 재확인한다(토큰 갱신과 같은 잠금을 느린 디렉터리가 붙잡지 않음). 소유 도메인이 비어 있는 조직 행은 활성화를 거부한다. 멱등 템플릿 설치는 조회 연결을 놓은 뒤 유효 상태를 다시 읽는다. 기록 투영은 소비자 호환 `tool.call.progress`(최대 4,000자, 최근 32줄)를 활성 호출에만 보존한다. Emitter·프로토콜·스키마 변경은 없다. 운영 0.6.17에는 포함되지 않았다.
 - **English — Missed 0.6.17 slices:** Integrate three fixes completed after the 0.6.17 integration point. Organization MCP activation reads Keystone membership before the row lock and rechecks the domain inside it, so a slow directory no longer holds the lock shared with token refresh; a domain-scoped row without an owner domain is rejected. Idempotent template install releases its lookup connection before reading the effective view. History projection keeps consumer-compatible `tool.call.progress` (≤4,000 chars, newest 32 lines) only for an active matching call. No emitter, protocol or schema change. Not in the deployed 0.6.17.
+- **한국어 — 조직 MCP 소유권 CHECK:** 마이그레이션 035와 ORM에 `ck_chat_mcp_servers_domain_owner`를 추가해 `scope='domain'` 행의 `owner_domain_id IS NULL` 저장·갱신을 DB에서 거부한다. 개인·전역 연결의 nullable 소유권은 유지한다. 기존 위반 행이 있으면 데이터를 고치지 않고 마이그레이션을 실패시킨다. 사전 조회·writer drain·백업 후 새 writer보다 먼저 035를 적용해야 한다.
+- **English — Domain MCP ownership CHECK:** Migration 035 and the ORM add `ck_chat_mcp_servers_domain_owner`, rejecting inserts and updates of domain-scoped rows with a NULL owner domain at the database boundary. Personal/global nullable ownership stays unchanged. Existing violations fail migration without rewriting data. Precheck, drain writers and back up, then apply 035 before starting new writers.
+- **한국어 — Gemini 이미지 단가:** 공식 가격을 재확인하고 Gemini 2.5 Flash Image의 누락된 정확한 size:quality 단가를 추가한다. 지원하는 네 크기와 `quality=auto`, `n=1`은 모두 이미지당 $0.039다(1,290 출력 토큰 × $30/1M). 관리자 수동 단가 우선순위·다른 모델 가격·전송 검증은 바꾸지 않으며 실제 공급자 생성 성공을 주장하지 않는다.
+- **English — Gemini image pricing:** Recheck official pricing and add the missing exact size:quality rates for Gemini 2.5 Flash Image. All four supported sizes with quality auto and n=1 cost $0.039 per image (1,290 output tokens × $30/1M). Preserve administrator-rate precedence, other model prices and transport validation; this does not claim a live provider generation succeeded.
 
 ## 0.6.17 — 2026-11-18 (published and deployed; OpenAI paid paths unverified)
 

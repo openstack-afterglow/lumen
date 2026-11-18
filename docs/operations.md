@@ -1,5 +1,19 @@
 # 운영 가이드
 
+## 0.6.18 롤아웃 메모 (준비 중; 미발행·미배포)
+
+먼저 운영 DB에서 읽기 전용 사전 조회를 실행한다.
+
+```sql
+SELECT COUNT(*) FROM chat_mcp_servers WHERE scope='domain' AND owner_domain_id IS NULL;
+```
+
+결과가 0이 아니면 전환을 중단하고 소유 도메인을 운영자와 확인한다. 035는 위반 행을 자동 수정·삭제하지 않는다. MariaDB 11.4는 기존 행도 검사하며, 위반 시 `ck_chat_mcp_servers_domain_owner` 오류로 ALTER를 거부한다.
+
+순서: admission 차단 → 기존 실행·worker drain → writer 정지 → 백업 → 새 패키지의 `lumen-migrate --apply`로 035 적용 → 새 API·worker cohort 기동. 035는 새 writer보다 먼저 적용해야 한다. manifest checksum과 ledger를 사용하며, 적용된 SQL 수정이나 수동 ledger 삽입으로 우회하지 않는다. CHECK는 조직 행의 NULL 소유 도메인만 금지하며 개인·전역 행은 그대로 허용한다.
+
+Kolla 전환에는 항상 `--tags lumen --skip-tags haproxy`를 사용한다. 선택형 sandbox 활성화는 같은 drain된 전환에 묶되 별도 승인된 mTLS·고정 worker·기존 cluster/pool·정확한 image/manifest qualification을 먼저 완료한다. 이 메모는 발행·배포·sandbox 운영 검증의 증거가 아니다.
+
 ## 0.6.17 롤아웃 메모
 
 - **Migration:** 033(MCP domain scope)과 034(`chat_stateless_call_reservations`)는 새 API/worker를 기동하기 전에 적용한다. 둘 다 additive이지만 기존 writer는 무상태 예약을 quota에 반영하지 않으므로, 새 Decisions admission과 기존 writer가 quota를 공유하며 함께 돌면 안 된다. 순서는 admission 중지·worker drain → 백업 → migrate → 새 cohort 기동이다.
@@ -628,6 +642,13 @@ administrators register their IDs and required rates explicitly.
    the missing shape in `notes`; never invent a reservation or approximate a unit tariff.
    Additional provider search, storage, grounding or tool charges documented in notes are
    not silently included in token prices.
+   Unit-priced image entries must include exact `image_variants` for every supported
+   size:quality request, including `auto:auto`; `image_per_unit` alone does not make
+   a route executable. The 2026-11-18 review of [Gemini pricing](https://aistudio.google.com/docs/pricing#gemini-2.5-flash-image)
+   and the [model specification](https://aistudio.google.com/docs/models/gemini-2.5-flash-image)
+   confirms Gemini 2.5 Flash Image output costs 1,290 tokens × $30/1M = $0.039/image.
+   Its four Lumen aspect-ratio size presets with quality auto share that rate; no
+   other model price or administrator override changes in this catalog revision.
 5. Run `pytest tests/test_provider_catalog.py tests/test_chat_native_catalog_admin.py`
    in the service development environment, then the focused capability/pricing suites
    for affected models. The loader rejects unknown fields, bad kinds, duplicate IDs or

@@ -6,7 +6,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: package/runtime/lock/Kolla image default `0.6.17`은 불변 tag `0.6.17`(`c5b020be`)로 발행되어 2026-11-17 UTC에 DMS Lab 운영에 배포됐다(033·034 적용, 관리형 ClamAV, protocol 2; 수신증은 `docs/testing.md`). 직전 운영 버전은 `0.6.16`이며 immutable tag와 배포 기록은 CHANGELOG의 해당 절에 보존한다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. Schema 033과 034는 서비스 전환 전에 적용해야 하며 새 writer와 기존 writer의 혼합 실행을 승인하지 않는다.
+- 버전: package/runtime/lock/Kolla image default `0.6.18`은 release preparation이며 아직 발행·배포하지 않았다. 운영은 불변 tag `0.6.17`(`c5b020be`, 2026-11-17 UTC 배포; 033·034, 관리형 ClamAV, protocol 2)이다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 035의 조직 MCP 소유권 CHECK는 writer drain·백업 후 새 writer보다 먼저 적용한다. 033·034의 schema-first 전환 및 혼합 writer 금지 조건도 유지한다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
@@ -14,6 +14,10 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 ### Dashboard MCP and cloud-approval integration
 
 `mcp_domain_authority` resolves exact current project-domain membership and legitimate canonical-Default/direct-domain manager grants through native Keystone. It rejects reduced/API-key management and ignores Afterglow-derived manager projection grants. `ChatMcpServer` gains domain ownership and a scope-keyed uniqueness boundary in migration 033; the unmerged Drover migration 032 is independent and the loader permits the gap. Domain credentials are encrypted, shared only at execution, and absent from member responses. Personal activation, config fingerprint, credential version and current native membership are rechecked before frozen connections run. Activation reads Keystone membership before taking the published row lock (token refresh shares that lock) and fails closed inside the lock if the row's domain/scope changed; idempotent template install releases its lookup session before re-reading the effective view.
+
+Migration 035 adds `ck_chat_mcp_servers_domain_owner` to `chat_mcp_servers` and the ORM: `scope <> 'domain' OR owner_domain_id IS NOT NULL`. MariaDB rejects both invalid inserts/updates and constraint installation over existing violating rows; no backfill, scope conversion or automatic row deletion occurs. Personal/global rows retain nullable domain ownership. The immutable manifest checksum and normal migration ledger own application/reapplication, and the ledger-shaped schema snapshot includes the same constraint. Read-only precheck and stopped-writer rollout order are in `docs/operations.md`.
+
+Catalog revision `2026-11-18` adds Gemini 2.5 Flash Image's four exact unit-priced size:quality variants at the official $0.039/image rate. `image_per_unit` alone never bypasses the existing exact-variant transport gate. Runtime administrator overrides still win; other model prices and independent package versions remain unchanged. Offline catalog/transport tests are not live-provider acceptance.
 
 `GET /v1/mcp-settings` combines registry entries, personal/global/domain connection states and managed sandbox availability. Personal `/v1/mcp-connections` and exact-domain `/v1/domains/{id}/mcp-connections` reuse the existing OAuth/activation lifecycle. Featured installation uses the admin route and never makes a catalog connection implicitly selected. Playwright and Markitdown require real sandbox manifest/image qualification; their catalog presence does not enable execution.
 
@@ -584,9 +588,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "5f7ab2ed68d10493f8e7ffe72f6387c06b5be608781700068a637640219f798a",
-  "reviewed_at": "2026-11-17T21:27:07Z",
-  "summary": "Integrate missed 0.6.17 slices; MCP activation fails closed for domain rows without owner domain"
+  "source_sha256": "c6d1a4e0c445e28d7c440938a76dace5b3ad414ad2785627c72c445b85e030df",
+  "reviewed_at": "2026-11-18T03:18:24Z",
+  "summary": "Review 0.6.18 package/runtime/lock/Kolla defaults; immutable 035 CHECK, ORM/snapshot and real-SQL regression/ledger coverage; Gemini 2.5 Flash Image official unit-price variants and catalog validation; schema-first rollout and manual catalog procedure; SDK/plugin/sandbox versions unchanged"
 }
 ```
 <!-- architecture-review:end -->

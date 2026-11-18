@@ -178,3 +178,18 @@ def test_stateless_hold_migration_is_additive_content_free_and_registered():
     assert "idx_stateless_hold_owner (user_id, status)" in ddl
     assert "idx_stateless_hold_key (api_key_id, status)" in ddl
     assert all(word not in ddl.lower() for word in ("prompt", "content", "answer", "alter table", "drop table"))
+
+
+def test_domain_mcp_owner_check_matches_orm_and_is_registered():
+    from sqlalchemy import CheckConstraint
+
+    from lumen.models.chat_db import ChatMcpServer
+
+    migration = next(item for item in load_manifest() if item.logical_id == "035-mcp-domain-owner-check")
+    expression = "scope <> 'domain' OR owner_domain_id IS NOT NULL"
+    name = "ck_chat_mcp_servers_domain_owner"
+    assert _statements(MIGRATIONS / migration.relative_path) == [
+        f"ALTER TABLE chat_mcp_servers\n    ADD CONSTRAINT {name}\n    CHECK ({expression})"
+    ]
+    checks = [item for item in ChatMcpServer.__table__.constraints if isinstance(item, CheckConstraint)]
+    assert any(item.name == name and str(item.sqltext) == expression for item in checks)
