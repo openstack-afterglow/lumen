@@ -96,6 +96,8 @@ Each section lists the fields of one component schema referenced by this group's
 | `instructions` | string \| null | no | — | Instructions |
 | `output_language` | string \| null | no | — | Output Language |
 | `reasoning_effort` | enum: `minimal`, `low`, `medium`, `high`, `xhigh` \| null | no | — | Reasoning Effort |
+| `tools` | array of map of any \| null | no | — | Tools |
+| `tool_choice` | string \| map of any \| null | no | — | Tool Choice |
 | `max_duration_seconds` | integer | no | `300` | Max Duration Seconds (numeric lower bound) |
 
 ### SpeechRequest

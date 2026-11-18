@@ -122,13 +122,14 @@ def _validate_catalog_model_kind(provider_type: str, api_base: str | None, model
         raise ProviderValidationError("this Gemini model requires model_kind=decision")
 
 
-def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: tuple) -> dict | None:
+def _validate_kind_prices(kind: str, media_pricing: dict | None, token_prices: tuple,
+                          provider_type: str | None) -> dict | None:
     """Media models may carry applicable text rates; embeddings and decisions are input-only."""
     if kind in {"embedding", "decision"} and any(value is not None for value in token_prices[1:]):
         raise ProviderValidationError(f"{kind} models support input-token pricing only")
     if kind != "text" and any(value is not None for value in token_prices[3:]):
         raise ProviderValidationError("media 모델에는 cache write 가격을 설정할 수 없습니다")
-    return validate_media_pricing(kind, media_pricing)
+    return validate_media_pricing(kind, media_pricing, provider_type=provider_type)
 
 
 def _validate_text_prices(input_price_per_million, output_price_per_million):
@@ -478,10 +479,6 @@ async def create_model(
     if not model_name or not model_name.strip():
         raise ProviderValidationError("model_name 은 필수입니다")
     sort_order = validate_sort_order(sort_order)
-    media_pricing = _validate_kind_prices(model_kind, media_pricing, (
-        input_price_per_million, output_price_per_million, cache_read_price_per_million,
-        cache_write_price_per_million, cache_write_1h_price_per_million,
-    ))
     input_price, output_price = _validate_text_prices(input_price_per_million, output_price_per_million)
     # Cache rates are optional and independent of each other and of input/output prices.
     cache_prices = _validate_cache_prices(
@@ -503,6 +500,11 @@ async def create_model(
             if provider is None:
                 raise ProviderValidationError(f"프로바이더 {provider_id} 가 존재하지 않습니다")
             _validate_model_kind(provider, model_kind)
+            # Whether a token basis may omit reservation_usd depends on the provider.
+            media_pricing = _validate_kind_prices(model_kind, media_pricing, (
+                input_price_per_million, output_price_per_million, cache_read_price_per_million,
+                cache_write_price_per_million, cache_write_1h_price_per_million,
+            ), provider.provider_type)
             _validate_compatible_prices(
                 provider.provider_type, provider.api_base, provider.auth_mode, model_kind, input_price, output_price,
             )
@@ -674,7 +676,7 @@ async def update_model(model_id: int, patch: dict) -> dict:
                     ("cache_write_1h_price_per_million", "cache_write_1h_price"),
                 )),
             )
-            media_pricing = _validate_kind_prices(target_kind, media_pricing, token_prices)
+            media_pricing = _validate_kind_prices(target_kind, media_pricing, token_prices, provider.provider_type)
             target_active = row.is_active if patch.get("is_active") is None else bool(patch["is_active"])
             if target_active:
                 _validate_compatible_prices(

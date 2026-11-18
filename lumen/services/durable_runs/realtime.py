@@ -242,8 +242,8 @@ _BILLS = {"duration": _duration_bill, "session": _session_bill, "tokens": _token
 
 
 def _token_hold(pricing: dict):
-    """In-session guard for token plans: frozen per-response price and the reserved USD."""
-    if pricing.get("billing_basis") != "tokens":
+    """In-session guard for OpenAI token plans: frozen price, reserved USD, per-response bound."""
+    if pricing.get("billing_basis") != "tokens" or "response_bound_usd" not in pricing:
         return None
     snapshot = pricing["token_pricing"]
 
@@ -251,7 +251,7 @@ def _token_hold(pricing: dict):
         return credit.usage_cost_from_pricing_snapshot(snapshot, prompt_tokens=usage.input_tokens,
             completion_tokens=usage.output_tokens, breakdown=usage, required_modalities=()).raw_cost
 
-    return price, Decimal(pricing["reservation_usd"])
+    return price, Decimal(pricing["reservation_usd"]), Decimal(pricing["response_bound_usd"])
 
 
 def _intent(request: dict, kind: str = "conversation") -> dict:
@@ -267,6 +267,9 @@ def _intent(request: dict, kind: str = "conversation") -> dict:
         intent["output_language"] = request["output_language"]
     if request.get("reasoning_effort") is not None:
         intent["reasoning_effort"] = request["reasoning_effort"]
+    for key in ("tools", "tool_choice"):
+        if request.get(key) is not None:
+            intent[key] = request[key]
     return intent
 
 
@@ -369,7 +372,8 @@ async def admit_realtime_session(
     voice = intent["voice"] or voices["default_voice"]
     plan = realtime_transport.validate_realtime_request(route, voice=voice,
         instructions=intent["instructions"], max_duration_seconds=intent["max_duration_seconds"],
-        reasoning_effort=intent.get("reasoning_effort"))
+        reasoning_effort=intent.get("reasoning_effort"), tools=intent.get("tools"),
+        tool_choice=intent.get("tool_choice"))
     required_scopes = ("compat:realtime:write",) if source == "api" else ("native:realtime:write",)
     # The admitting wire is frozen: translation and live sessions run only on it.
     payload = {**intent, "voice": voice, "required_scopes": list(required_scopes), "wire": wire}
@@ -385,9 +389,13 @@ async def admit_realtime_session(
     capability["effective_features"] = {}
     if credential_authority is not None:
         capability["credential_authority"] = deepcopy(credential_authority)
+    image_input = (plan["billing_basis"] == "tokens"
+                   and realtime_transport.conversation_features(route)["image_input"])
     pricing = {**plan, "max_duration_seconds": intent["max_duration_seconds"],
                "reservation_usd": format(envelope, "f"), "bound_credits": format(bound, "f"),
-               "margin_multiplier": format(margin, "f"), "credit_per_usd": format(per_usd, "f")}
+               "margin_multiplier": format(margin, "f"), "credit_per_usd": format(per_usd, "f"),
+               # Frozen so the BFF can size its relay from Lumen, never from the browser.
+               "realtime_image_input": image_input}
     try:
         async with _factory()() as session, session.begin():
             # No gap locks: the unique idempotency index (migration 030) decides same-key races, and the
@@ -438,10 +446,14 @@ async def admit_realtime_session(
 
 
 async def _response(run: ChatRun, *, user_id: str, project_id: str) -> dict:
+    from lumen.services.providers.realtime_protocol import client_frame_limit
+
     token = await _issue_ticket(run.id, user_id=user_id, project_id=project_id)
+    image_input = (run.pricing_snapshot or {}).get("realtime_image_input") is True
     return {"session_id": run.id, "status": "ready", "model_name": run.model_name,
             "provider_type": run.capability_snapshot["provider_type"], "expires_in_seconds": _TICKET_TTL,
-            "connect_token": token}
+            "connect_token": token, "realtime_image_input": image_input,
+            "max_client_frame_bytes": client_frame_limit(image_input)}
 
 
 async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> tuple[dict, dict, dict, str]:
@@ -570,7 +582,8 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
     try:
         current_plan = realtime_transport.validate_realtime_request(route, voice=payload["voice"],
             instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"],
-            reasoning_effort=payload.get("reasoning_effort"))
+            reasoning_effort=payload.get("reasoning_effort"), tools=payload.get("tools"),
+            tool_choice=payload.get("tool_choice"))
     except ProviderValidationError:
         current_plan = None
     if not _plan_matches(pricing, current_plan):
@@ -609,7 +622,8 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
             wire=wire, is_canceled=is_canceled, token_usage=pricing.get("billing_basis", "duration") == "tokens",
             session_time=pricing.get("billing_basis", "duration") == "session",
             transcription=payload.get("transcription"), output_language=payload.get("output_language"),
-            reasoning_effort=payload.get("reasoning_effort"),
+            reasoning_effort=payload.get("reasoning_effort"), tools=payload.get("tools"),
+            tool_choice=payload.get("tool_choice"),
             token_hold=_token_hold(pricing))
         summary = await _settle(run_id, owner=owner, meter=meter)
         await _finish(run_id, status="canceled" if await is_canceled() else "completed", message_id=None, owner=owner)

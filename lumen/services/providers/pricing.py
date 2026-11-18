@@ -52,9 +52,16 @@ BILLING_BASES = {
     "stt": frozenset({"duration", "tokens"}),
     "realtime": frozenset({"duration", "session", "tokens"}),
 }
-# Token-basis kinds whose transport derives a request-specific Lumen hold, so an explicit
-# reservation_usd is optional; an operator-supplied value still takes precedence.
+# Token-basis kinds whose OpenAI transport derives a request-specific Lumen hold, so an
+# explicit reservation_usd is optional there; an operator-supplied value still takes
+# precedence. Other providers publish no basis for a derived hold and keep requiring one.
 DERIVED_HOLD_TOKEN_KINDS = frozenset({"realtime"})
+
+
+def derived_hold_allowed(kind: str, provider_type: str | None) -> bool:
+    return kind in DERIVED_HOLD_TOKEN_KINDS and provider_type == "openai"
+
+
 _DEFAULT_BASIS = {
     "text": "tokens", "image": "unit", "tts": "duration", "stt": "duration",
     "realtime": "duration", "embedding": "tokens", "decision": "tokens",
@@ -131,7 +138,7 @@ def _check_duration_aliases(pricing: dict, family: str) -> tuple[Decimal, int] |
     return rate, seconds
 
 
-def validate_media_pricing(model_kind: str, pricing: dict | None) -> dict | None:
+def validate_media_pricing(model_kind: str, pricing: dict | None, *, provider_type: str | None = None) -> dict | None:
     """Validate and serialize explicit per-kind USD rates without token-price fallback.
 
     Absent keys stay absent (unpriced); an explicit zero is a real free rate.
@@ -173,7 +180,7 @@ def validate_media_pricing(model_kind: str, pricing: dict | None) -> dict | None
             raise ProviderValidationError("reservation_usd는 tokens 과금 기준에서만 사용합니다")
         if Decimal(str(result["reservation_usd"])) <= 0:
             raise ProviderValidationError("reservation_usd는 0보다 커야 합니다")
-    elif basis == "tokens" and model_kind not in DERIVED_HOLD_TOKEN_KINDS:
+    elif basis == "tokens" and not derived_hold_allowed(model_kind, provider_type):
         raise ProviderValidationError("tokens 과금 기준에는 양수 reservation_usd가 필요합니다")
     return result or None
 
@@ -292,7 +299,7 @@ _TOKEN_BASIS_TEXT_DIRECTIONS = {
 
 def media_pricing_available(
     kind: str, pricing: dict | None, *, text_input_priced: bool = False, text_output_priced: bool = False,
-    duration_families: tuple[str, ...] | None = None,
+    duration_families: tuple[str, ...] | None = None, provider_type: str | None = None,
 ) -> bool:
     """Whether the selected billing basis has every rate its execution needs.
 
@@ -316,7 +323,7 @@ def media_pricing_available(
         text_priced = {"input": text_input_priced, "output": text_output_priced}
         return (
             bool(needed)
-            and (kind in DERIVED_HOLD_TOKEN_KINDS or media_reservation_usd(pricing) is not None)
+            and (derived_hold_allowed(kind, provider_type) or media_reservation_usd(pricing) is not None)
             and all(field in rates.get(modality, {}) for modality, field in needed)
             and all(text_priced[direction] for direction in _TOKEN_BASIS_TEXT_DIRECTIONS[kind])
         )
@@ -362,6 +369,7 @@ def route_media_pricing_available(route: dict) -> bool:
         text_input_priced=route.get("input_price_per_token") is not None,
         text_output_priced=route.get("output_price_per_token") is not None,
         duration_families=_realtime_duration_families(kind, route.get("api_model_name")),
+        provider_type=route.get("provider_type"),
     )
 
 
@@ -994,7 +1002,7 @@ def _resolved_model_prices(
         media = _effective_media_pricing(model, provider_type, api_base)
         priced = media_pricing_available(
             kind, media, text_input_priced=input_price is not None, text_output_priced=output_price is not None,
-            duration_families=_realtime_duration_families(kind, model.model_name),
+            duration_families=_realtime_duration_families(kind, model.model_name), provider_type=provider_type,
         )
     if priced:
         source = "manual" if manual else "native_catalog"

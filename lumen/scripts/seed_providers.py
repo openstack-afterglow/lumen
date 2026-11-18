@@ -119,7 +119,7 @@ def _parse_models(raw: str, providers: dict[str, dict]) -> list[dict]:
             planned.append({"provider": provider_name, "model_name": model_name, "model_kind": kind,
                             "input_price_per_million": entry["input_price_per_million"]})
         else:
-            pricing = validate_media_pricing(kind, entry["media_pricing"])
+            pricing = validate_media_pricing(kind, entry["media_pricing"], provider_type=provider["provider_type"])
             if not pricing:
                 raise ProviderValidationError(f"{label} needs explicit media_pricing")
             _validate_media_route(provider, model_name, kind, pricing)

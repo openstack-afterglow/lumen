@@ -164,7 +164,8 @@ async def get_chat_capabilities(
             result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,
                           output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0,
                           realtime_session_fields=[], available_reasoning_efforts=[],
-                          default_reasoning_effort=None)
+                          default_reasoning_effort=None, realtime_image_input=False,
+                          realtime_function_calling=False)
     if model_kind == "embedding":
         from lumen.services.embeddings import embedding_metadata
 

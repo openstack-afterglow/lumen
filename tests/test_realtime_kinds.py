@@ -37,7 +37,7 @@ _RUN = SimpleNamespace(model_name="kind-model")
 _TRANSCRIBE = {"realtime_input_per_minute": "0.017"}
 _TRANSLATE = {"realtime_input_per_minute": "0.034"}
 _LIVE = {"billing_basis": "session", "realtime_session_per_minute": "0.05"}
-_TOKENS = {"billing_basis": "tokens", "reservation_usd": "0.5", "token_rates": {"audio": {
+_TOKENS = {"billing_basis": "tokens", "reservation_usd": "5", "token_rates": {"audio": {
     "input_per_million": "32", "output_per_million": "64"}}}
 
 
@@ -1200,10 +1200,11 @@ def test_catalog_conversation_models_and_snapshots_settle_on_structured_token_ta
     from lumen.models.chat_db import LlmModel
     from lumen.services.providers import pricing
 
-    # Hold per 300 s: 100 input tokens/s at the highest input rate + 30 output tokens/s at the highest output rate.
-    holds = {"gpt-realtime-2.1": "1.536", "gpt-realtime-2": "1.536", "gpt-realtime-1.5": "1.536",
-             "gpt-realtime": "1.536", "gpt-realtime-2025-08-28": "1.536",
-             "gpt-realtime-2.1-mini": "0.48", "gpt-realtime-mini": "0.48", "gpt-realtime-mini-2025-12-15": "0.48"}
+    # Hold per 300 s: 100 input tokens/s at the highest input rate + 30 output tokens/s at the highest output
+    # rate ($1.536 full, $0.48 mini) plus two pinned worst-case responses ($0.919552 full, $0.265728 mini).
+    holds = {"gpt-realtime-2.1": "3.375104", "gpt-realtime-2": "3.375104", "gpt-realtime-1.5": "3.375104",
+             "gpt-realtime": "3.375104", "gpt-realtime-2025-08-28": "3.375104", "gpt-realtime-2.1-mini": "1.011456",
+             "gpt-realtime-mini": "1.011456", "gpt-realtime-mini-2025-12-15": "1.011456"}
     for model, hold in holds.items():
         row = LlmModel(model_name=model, model_kind="realtime", media_pricing=None)
         media = pricing._effective_media_pricing(row, "openai", None)
@@ -1219,3 +1220,75 @@ def test_catalog_conversation_models_and_snapshots_settle_on_structured_token_ta
     assert pricing._effective_media_pricing(LlmModel(model_name="gpt-realtime-mini-2025-10-06", model_kind="realtime",
                                                      media_pricing=None), "openai", None) is None
     assert not realtime_transport.realtime_route_ready(_route("gpt-realtime-mini-2025-10-06", media))
+
+
+@pytest.mark.asyncio
+async def test_gpt_transcribe_realtime_sessions_bill_their_own_measured_duration_tariff(monkeypatch):
+    from lumen.models.chat_db import LlmModel
+    from lumen.services.providers import pricing
+
+    route = _route("gpt-transcribe", {"realtime_input_per_minute": "0.0045"})
+    assert realtime_transport.realtime_kind(route) == "transcription"
+    options = realtime_transport.available_realtime_options(route)
+    assert (options["realtime_kind"], options["output_sample_rate_hz"], options["available_voices"]) == (
+        "transcription", 0, [])
+    plan = realtime_transport.validate_realtime_request(route, max_duration_seconds=300)
+    assert plan["realtime_kind"] == "transcription" and set(plan["duration_rates"]) == {"realtime_input"}
+    assert realtime._envelope_usd(plan, 300) == Decimal("0.0225")
+    checkpoint = json.loads(json.dumps(realtime._checkpoint(AudioMeter(2 * 24000 * 60, 0, 24000, 0), "duration")))
+    cost, components, _, summary = realtime._duration_bill(_RUN, {**plan, "max_duration_seconds": 300}, checkpoint)
+    assert cost.raw_cost == Decimal("0.0045") and summary == {"input_audio_seconds": "60"}
+    # The file-STT tariff never stands in: its key is not a realtime price, and the catalog's
+    # stt entry prices only the stt row.
+    assert not realtime_transport.realtime_route_ready(_route("gpt-transcribe", {"audio_input_per_minute": "0.0045"}))
+    assert pricing._effective_media_pricing(LlmModel(model_name="gpt-transcribe", model_kind="realtime",
+                                                     media_pricing=None), "openai", None) is None
+    assert pricing._effective_media_pricing(LlmModel(model_name="gpt-transcribe", model_kind="stt",
+                                                     media_pricing=None), "openai", None) == {
+        "billing_basis": "duration", "audio_input_per_minute": "0.0045"}
+    assert not pricing.route_media_pricing_available({**_route("gpt-transcribe", {}), "media_pricing": None})
+    # Official options: languages[] (not language), keywords and prompt; delay is Whisper-only.
+    assert _transcription("gpt-transcribe", prompt="p", keywords=["Lumen"], languages=["en", "ko"])[1] == {
+        "prompt": "p", "keywords": ["Lumen"], "languages": ["en", "ko"]}
+    for option in ({"language": "en"}, {"delay": "low"}):
+        with pytest.raises(RealtimeTransportError):
+            _transcription("gpt-transcribe", **option)
+
+    def react(sent):
+        if sent["type"] == "input_audio_buffer.commit":
+            return ({"type": "conversation.item.input_audio_transcription.completed", "item_id": "item_1",
+                     "transcript": "hello", "languages": ["en"], "usage": {"type": "duration", "seconds": 1}},)
+        return ()
+
+    upstream = ScriptedUpstream(react)
+    captured = _connect(monkeypatch, upstream)
+    browser = ScriptedBrowser([{"type": "audio.input.append", "audio": _PCM}, {"type": "audio.input.commit"},
+                               {"type": "session.close"}])
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(browser, route, session_id="session", voice=None,
+        instructions=None, max_duration_seconds=30, is_canceled=_not_canceled,
+        transcription={"languages": ["en"]}), timeout=5)
+    assert captured["url"] == "wss://api.openai.com/v1/realtime?intent=transcription"
+    assert upstream.sent[0]["session"]["audio"]["input"]["transcription"] == {
+        "model": "gpt-transcribe", "languages": ["en"]}
+    assert {"type": "transcript.input.completed", "item_id": "item_1", "text": "hello"} in browser.events
+    assert meter.input_bytes == 320
+
+
+@pytest.mark.asyncio
+async def test_live_idle_timeout_requests_session_closed_and_settles_provider_seconds(monkeypatch):
+    monkeypatch.setattr(realtime_protocol, "_IDLE_SECONDS", 0.2)
+
+    def react(sent):
+        if sent["type"] == "session.start":
+            return ({"type": "session.started"},)
+        if sent["type"] == "session.close":
+            return ({"type": "session.closed", "reason": "close_requested", "usage": {"seconds": 0.2}},)
+        return ()
+
+    upstream = ScriptedUpstream(react)
+    _connect(monkeypatch, upstream)
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(ScriptedBrowser([]), _route("gpt-live-1", _LIVE),
+        session_id="session", voice="marin", instructions=None, max_duration_seconds=30,
+        is_canceled=_not_canceled, session_time=True), timeout=5)
+    assert upstream.sent[-1] == {"type": "session.close"}
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (Decimal("0.2"), "complete")

@@ -15,6 +15,8 @@ has its own upstream endpoint, client event contract and permitted billing basis
 
 from __future__ import annotations
 
+import json
+import re
 from decimal import ROUND_CEILING, Decimal
 from urllib.parse import quote
 
@@ -38,6 +40,8 @@ _OPENAI_REALTIME_KINDS = {
     "gpt-4o-mini-realtime-preview": "conversation",
     "gpt-live-transcribe": "transcription",
     "gpt-realtime-whisper": "transcription",
+    # Realtime transcription sessions; its file-STT row keeps a separate stt tariff.
+    "gpt-transcribe": "transcription",
     "gpt-realtime-translate": "translation",
     "gpt-live-1": "live",
 }
@@ -85,12 +89,29 @@ def reasoning_configurable(model: object) -> bool:
     return model in _CONFIGURABLE_REASONING_MODELS
 
 
+# Conversation models whose published contract lists image input and function calling.
+# Both need token billing: images and tool text settle as reported modality tokens.
+_CONVERSATION_FEATURE_MODELS = frozenset({"gpt-realtime-2.1", "gpt-realtime-2.1-mini", "gpt-realtime-2",
+                                          "gpt-realtime-1.5"})
+MAX_FUNCTION_TOOLS = 16
+MAX_FUNCTION_TOOLS_BYTES = 16384
+_TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_MAX_TOOL_DESCRIPTION_CHARS = 1024
+# Per-response limits pinned in every OpenAI token-basis conversation session, so one
+# response has a known worst case: output is capped by max_output_tokens, and input by
+# the instruction part (instructions and tool definitions, each byte-bounded; a token is
+# assumed to cover at least one UTF-8 byte, plus fixed overhead) and the retention-ratio
+# truncation limit on the conversation after instructions (audio, text, image, tool items).
+RESPONSE_MAX_OUTPUT_TOKENS = 4096
+RESPONSE_POST_INSTRUCTION_TOKENS = 16384
+_INSTRUCTION_TOKEN_BOUND = 4 * _MAX_INSTRUCTIONS_CHARS + MAX_FUNCTION_TOOLS_BYTES + 512
 # Lumen-owned token-basis hold for OpenAI conversation models without a configured
 # reservation_usd. OpenAI documents realtime audio as 1 token per 100 ms of user audio
 # and 1 token per 50 ms of assistant audio. Each admitted second reserves the user-audio
 # tokens re-read as uncached input by up to 10 later responses, plus the assistant-audio
 # tokens and 10 transcript text tokens of output, each at the model's highest frozen rate
-# in that direction. The relay ends a session before confirmed usage can exhaust it.
+# in that direction. Two worst-case responses are added on top: the relay continues only
+# while confirmed usage plus two worst-case responses fits the hold.
 _HOLD_INPUT_TOKENS_PER_SECOND = 10 * 10
 _HOLD_OUTPUT_TOKENS_PER_SECOND = 20 + 10
 _USD_QUANTUM = Decimal("0.0000000001")
@@ -146,16 +167,30 @@ def _checked_rate(value: Decimal | None) -> Decimal:
     return value
 
 
-def _derived_token_hold(token_pricing: dict, max_duration_seconds: int) -> Decimal:
-    """The duration-proportional hold described at ``_HOLD_INPUT_TOKENS_PER_SECOND``."""
-    inputs = [Decimal(token_pricing["input_price_per_token"])]
-    outputs = [Decimal(token_pricing["output_price_per_token"])]
+def _direction_rates(token_pricing: dict) -> tuple[Decimal, Decimal, Decimal]:
+    """``(text input, highest input, highest output)`` per-token USD of a frozen token plan."""
+    text_input = Decimal(token_pricing["input_price_per_token"])
+    inputs, outputs = [text_input], [Decimal(token_pricing["output_price_per_token"])]
     for rates in (token_pricing.get("token_rates") or {}).values():
         for field, bucket in (("input_per_million", inputs), ("output_per_million", outputs)):
             if field in rates:
                 bucket.append(Decimal(rates[field]) / _PER_MILLION)
-    per_second = _HOLD_INPUT_TOKENS_PER_SECOND * max(inputs) + _HOLD_OUTPUT_TOKENS_PER_SECOND * max(outputs)
+    return text_input, max(inputs), max(outputs)
+
+
+def _derived_token_hold(token_pricing: dict, max_duration_seconds: int) -> Decimal:
+    """The duration-proportional part described at ``_HOLD_INPUT_TOKENS_PER_SECOND``."""
+    _, max_input, max_output = _direction_rates(token_pricing)
+    per_second = _HOLD_INPUT_TOKENS_PER_SECOND * max_input + _HOLD_OUTPUT_TOKENS_PER_SECOND * max_output
     return (per_second * max_duration_seconds).quantize(_USD_QUANTUM, rounding=ROUND_CEILING)
+
+
+def response_bound_usd(token_pricing: dict) -> Decimal:
+    """Worst-case USD of one response under the pinned per-response limits."""
+    text_input, max_input, max_output = _direction_rates(token_pricing)
+    worst = (_INSTRUCTION_TOKEN_BOUND * text_input + RESPONSE_POST_INSTRUCTION_TOKENS * max_input
+             + RESPONSE_MAX_OUTPUT_TOKENS * max_output)
+    return worst.quantize(_USD_QUANTUM, rounding=ROUND_CEILING)
 
 
 def _billing_plan(route: dict, max_duration_seconds: int) -> dict:
@@ -204,14 +239,68 @@ def _billing_plan(route: dict, max_duration_seconds: int) -> dict:
             or any(audio.get(key) is None for key in ("input_per_million", "output_per_million"))):
         raise ProviderValidationError("exact configured realtime token price is unavailable")
     plan: dict = {"billing_basis": "tokens", "token_pricing": token_pricing}
-    if envelope is None and provider == "openai":
-        # A configured reservation keeps precedence; only OpenAI documents the audio token
-        # rate the derived hold relies on.
-        envelope = _derived_token_hold(token_pricing, max_duration_seconds)
-        plan["reservation_source"] = "duration_policy"
+    if provider == "openai":
+        # OpenAI sessions pin per-response limits, so the guard has a real per-response bound.
+        bound = response_bound_usd(token_pricing)
+        plan["response_bound_usd"] = format(bound, "f")
+        if envelope is None:
+            # Only OpenAI documents the audio token rate the derived hold relies on.
+            envelope = _derived_token_hold(token_pricing, max_duration_seconds) + 2 * bound
+            plan["reservation_source"] = "duration_policy"
+        elif envelope < 2 * bound:
+            # A configured reservation keeps precedence but must cover two worst-case responses.
+            raise ProviderValidationError("configured realtime reservation is below two worst-case responses")
     if envelope is None or envelope <= 0 or envelope >= Decimal("100000000"):
         raise ProviderValidationError("realtime token billing requires a positive reservation_usd")
     return {**plan, "reservation_usd": format(envelope, "f")}
+
+
+def conversation_features(route: dict) -> dict[str, bool]:
+    """Image input and function calling: published for the model and settled as tokens."""
+    provider, model = _model(route)
+    pricing = route.get("media_pricing")
+    try:
+        tokens = media_billing_basis("realtime", pricing) == "tokens"
+    except (ProviderValidationError, ValueError):
+        tokens = False
+    enabled = (provider == "openai" and tokens and realtime_kind(route) == "conversation"
+               and model in _CONVERSATION_FEATURE_MODELS)
+    image_rates = ((pricing or {}).get("token_rates") or {}).get("image") or {}
+    return {"image_input": enabled and "input_per_million" in image_rates, "function_calling": enabled}
+
+
+def function_tools(tools: object, tool_choice: object = None) -> tuple[list[dict], object]:
+    """Validate client function tools; hosted, MCP and other tool types are refused."""
+    invalid = ProviderValidationError("unsupported realtime function tools")
+    if not isinstance(tools, list) or not tools or len(tools) > MAX_FUNCTION_TOOLS:
+        raise invalid
+    names: set[str] = set()
+    clean: list[dict] = []
+    for tool in tools:
+        if (not isinstance(tool, dict) or set(tool) - {"type", "name", "description", "parameters"}
+                or tool.get("type") != "function"):
+            raise invalid
+        name, description, parameters = tool.get("name"), tool.get("description"), tool.get("parameters")
+        if not isinstance(name, str) or not _TOOL_NAME.fullmatch(name) or name in names:
+            raise invalid
+        if description is not None and (not isinstance(description, str)
+                                        or len(description) > _MAX_TOOL_DESCRIPTION_CHARS):
+            raise invalid
+        if parameters is not None and not isinstance(parameters, dict):
+            raise invalid
+        names.add(name)
+        clean.append({key: tool[key] for key in ("type", "name", "description", "parameters") if key in tool})
+    try:
+        size = len(json.dumps(clean, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode())
+    except (TypeError, ValueError) as exc:
+        raise invalid from exc
+    if size > MAX_FUNCTION_TOOLS_BYTES:
+        raise invalid
+    if tool_choice is not None and tool_choice not in ("auto", "none", "required") and not (
+            isinstance(tool_choice, dict) and set(tool_choice) == {"type", "name"}
+            and tool_choice["type"] == "function" and tool_choice["name"] in names):
+        raise invalid
+    return clean, tool_choice
 
 
 def validate_realtime_request(
@@ -221,6 +310,8 @@ def validate_realtime_request(
     instructions: str | None = None,
     max_duration_seconds: int = _DEFAULT_MAX_DURATION_SECONDS,
     reasoning_effort: str | None = None,
+    tools: list | None = None,
+    tool_choice: object = None,
 ) -> dict:
     """Return the JSON-serializable billing plan to freeze before any provider I/O."""
     provider, model = _model(route)
@@ -232,6 +323,10 @@ def validate_realtime_request(
     if reasoning_effort is not None and (
             provider != "openai" or not reasoning_configurable(model) or reasoning_effort not in REASONING_EFFORTS):
         raise ProviderValidationError("unsupported realtime reasoning effort")
+    if tools is not None or tool_choice is not None:
+        if not conversation_features(route)["function_calling"]:
+            raise ProviderValidationError("realtime function calling is unavailable for this model")
+        function_tools(tools, tool_choice)
     if kind in {"transcription", "translation"}:
         # No speech output and no system prompt: nothing else may be frozen at admission.
         if voice is not None or instructions is not None:
@@ -271,6 +366,9 @@ def available_realtime_options(route: dict) -> dict[str, object]:
         voices = sorted(_GEMINI_VOICES if provider == "gemini" else _OPENAI_VOICES)
         default = "Kore" if provider == "gemini" else "alloy"
     reasoning = provider == "openai" and reasoning_configurable(model)
+    features = conversation_features(route)
+    fields = [*_SESSION_FIELDS[kind], *(["reasoning_effort"] if reasoning else []),
+              *(["tools", "tool_choice"] if features["function_calling"] else [])]
     return {
         "realtime_kind": kind,
         "available_voices": voices,
@@ -279,9 +377,11 @@ def available_realtime_options(route: dict) -> dict[str, object]:
         "output_sample_rate_hz": 0 if kind == "transcription" else 24000,
         "max_duration_seconds": _MAX_DURATION_SECONDS,
         "default_duration_seconds": _DEFAULT_MAX_DURATION_SECONDS,
-        "realtime_session_fields": [*_SESSION_FIELDS[kind], *(["reasoning_effort"] if reasoning else [])],
+        "realtime_session_fields": fields,
         "available_reasoning_efforts": list(REASONING_EFFORTS) if reasoning else [],
         "default_reasoning_effort": "low" if reasoning else None,
+        "realtime_image_input": features["image_input"],
+        "realtime_function_calling": features["function_calling"],
     }
 
 

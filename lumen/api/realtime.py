@@ -31,14 +31,18 @@ class RealtimeSessionRequest(BaseModel):
     output_language: str | None = Field(default=None, min_length=2, max_length=12)
     # Conversation models that advertise available_reasoning_efforts only.
     reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
+    # Function tools for models advertising realtime_function_calling; validated by the transport.
+    tools: list[dict] | None = Field(default=None, max_length=16)
+    tool_choice: str | dict | None = None
     max_duration_seconds: int = Field(default=300, ge=10, le=900)
 
     @model_validator(mode="after")
     def _kind_fields(self) -> RealtimeSessionRequest:
         if (self.kind == "translation") != (self.output_language is not None):
             raise ValueError("output_language is required for, and only for, translation sessions")
-        if self.reasoning_effort is not None and self.kind != "conversation":
-            raise ValueError("reasoning_effort applies only to conversation sessions")
+        if self.kind != "conversation" and any(
+                value is not None for value in (self.reasoning_effort, self.tools, self.tool_choice)):
+            raise ValueError("reasoning_effort and tools apply only to conversation sessions")
         return self
 
 
@@ -74,7 +78,8 @@ async def create_session(
     principal: Principal = Depends(require_scopes("native:realtime:write")),
 ):
     # Optional kind-specific fields are omitted when absent, keeping historical request shapes.
-    excluded = {"kind"} | {key for key in ("output_language", "reasoning_effort") if getattr(payload, key) is None}
+    excluded = {"kind"} | {key for key in ("output_language", "reasoning_effort", "tools", "tool_choice")
+                           if getattr(payload, key) is None}
     try:
         return await admit_realtime_session(payload.model_dump(exclude=excluded), kind=payload.kind,
             project_id=principal["project_id"],

@@ -12,6 +12,7 @@ import base64
 import binascii
 import json
 import re
+import struct
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -25,10 +26,15 @@ from websockets.exceptions import ConnectionClosed
 
 from lumen.services.usage_breakdown import UsageBreakdown
 
+from .errors import ProviderValidationError
 from .realtime_transport import (
     CLOSE_TIMEOUT_SECONDS,
     REASONING_EFFORTS,
+    RESPONSE_MAX_OUTPUT_TOKENS,
+    RESPONSE_POST_INSTRUCTION_TOKENS,
     RealtimeTransportError,
+    conversation_features,
+    function_tools,
     realtime_kind,
     reasoning_configurable,
     upstream_connection_spec,
@@ -36,6 +42,16 @@ from .realtime_transport import (
 
 _MAX_FRAME_BYTES = 64 * 1024
 _MAX_PCM_BYTES = 32 * 1024
+# Conversation image input (PNG/JPEG data URLs, the formats the Realtime item schema lists).
+# Image-enabled sessions accept larger frames in both directions so an image fits one event.
+MAX_INPUT_IMAGE_BYTES = 1024 * 1024
+MAX_INPUT_IMAGE_SIDE = 2048
+MAX_SESSION_IMAGES = 8
+_MAX_IMAGE_FRAME_BYTES = 2 * 1024 * 1024
+_IMAGE_DATA_URL = re.compile(r"data:(image/png|image/jpeg);base64,([A-Za-z0-9+/]+={0,2})")
+_IMAGE_DETAILS = frozenset({"auto", "low", "high"})
+_MAX_CALL_ID_CHARS = 128
+_MAX_FUNCTION_OUTPUT_CHARS = 32768
 _IDLE_SECONDS = 60
 _USAGE_DRAIN_SECONDS = 15
 _MAX_METERED_RESPONSES = 4096
@@ -46,7 +62,9 @@ _TRANSCRIPTION_LANGUAGE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z]{2,4})?")
 # Options each transcription-session model takes (probed against the provider 2026-11-10); other
 # models accept the full set.
 _TRANSCRIPTION_OPTIONS_ALL = frozenset({"prompt", "keywords", "languages", "language", "delay"})
-_TRANSCRIPTION_OPTIONS = {"gpt-realtime-whisper": frozenset({"language", "delay"})}
+_TRANSCRIPTION_OPTIONS = {"gpt-realtime-whisper": frozenset({"language", "delay"}),
+                          # Official: languages[] replaces language; delay is Whisper-only.
+                          "gpt-transcribe": frozenset({"prompt", "keywords", "languages"})}
 _TRANSLATION_LANGUAGE = re.compile(r"[a-z]{2,3}(-[A-Za-z0-9]{2,8})?")
 _MAX_TRANSCRIPTION_PROMPT_CHARS = 2048
 _MAX_KEYWORDS = 50
@@ -167,6 +185,11 @@ class TokenUsageMeter:
         """Provider work was observed whose final usage has not arrived yet."""
         return not self._invalid and (bool(self._in_flight) or self._pending)
 
+    @property
+    def in_flight(self) -> int:
+        """Responses created upstream whose final usage has not arrived yet."""
+        return len(self._in_flight)
+
     def request_sent(self, message: dict) -> None:
         # A client-requested response can start I/O before response.created reaches us.
         if self._provider == "openai" and message.get("type") in {"response.create", "input_audio_buffer.commit"}:
@@ -252,8 +275,8 @@ def _pcm(value: object) -> tuple[str, int]:
     return value, len(raw)
 
 
-def _object(value: str | bytes) -> dict[str, Any]:
-    if not isinstance(value, str) or len(value.encode("utf-8")) > _MAX_FRAME_BYTES:
+def _object(value: str | bytes, limit: int = _MAX_FRAME_BYTES) -> dict[str, Any]:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > limit:
         raise RealtimeTransportError("realtime frame exceeds limit")
     try:
         parsed = json.loads(value)
@@ -262,6 +285,87 @@ def _object(value: str | bytes) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise RealtimeTransportError("invalid realtime event")
     return parsed
+
+
+def _image_size(raw: bytes, mime: str) -> tuple[int, int] | None:
+    """Width and height read from the PNG IHDR or JPEG SOF header only; nothing is decoded."""
+    if mime == "image/png":
+        if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+            return None
+        return struct.unpack(">II", raw[16:24])
+    if raw[:2] != b"\xff\xd8":
+        return None
+    index = 2
+    while index + 4 <= len(raw):
+        if raw[index] != 0xFF:
+            return None
+        marker = raw[index + 1]
+        if marker == 0xFF:
+            index += 1
+            continue
+        if marker in {0x01, *range(0xD0, 0xD8)}:
+            index += 2
+            continue
+        length = struct.unpack(">H", raw[index + 2:index + 4])[0]
+        if length < 2:
+            return None
+        if marker in {*range(0xC0, 0xC4), *range(0xC5, 0xC8), *range(0xC9, 0xCC), *range(0xCD, 0xD0)}:
+            if index + 9 > len(raw):
+                return None
+            height, width = struct.unpack(">HH", raw[index + 5:index + 9])
+            return width, height
+        index += 2 + length
+    return None
+
+
+def client_frame_limit(image_input: bool) -> int:
+    """Largest client JSON frame a session accepts; only image-enabled sessions widen it."""
+    return _MAX_IMAGE_FRAME_BYTES if image_input else _MAX_FRAME_BYTES
+
+
+def input_image_content(image_url: object, detail: object = None) -> dict:
+    """Validate one data-URL image and return its ``input_image`` content part."""
+    match = _IMAGE_DATA_URL.fullmatch(image_url) if isinstance(image_url, str) else None
+    if match is None or len(image_url) > _MAX_IMAGE_FRAME_BYTES:
+        raise RealtimeTransportError("unsupported realtime image")
+    try:
+        raw = base64.b64decode(match.group(2), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RealtimeTransportError("unsupported realtime image") from exc
+    size = _image_size(raw, match.group(1)) if 0 < len(raw) <= MAX_INPUT_IMAGE_BYTES else None
+    if size is None or not all(0 < side <= MAX_INPUT_IMAGE_SIDE for side in size):
+        raise RealtimeTransportError("realtime image exceeds the supported size")
+    content = {"type": "input_image", "image_url": image_url}
+    if detail is not None:
+        if detail not in _IMAGE_DETAILS:
+            raise RealtimeTransportError("unsupported realtime image")
+        content["detail"] = detail
+    return content
+
+
+def _function_output_item(call_id: object, output: object) -> dict:
+    if (not isinstance(call_id, str) or not 0 < len(call_id) <= _MAX_CALL_ID_CHARS
+            or not isinstance(output, str) or len(output) > _MAX_FUNCTION_OUTPUT_CHARS):
+        raise RealtimeTransportError("invalid realtime function call output")
+    return {"type": "function_call_output", "call_id": call_id, "output": output}
+
+
+def _conversation_item(item: object, features: dict) -> dict:
+    """A client ``conversation.item.create`` item: one user image or one function call output."""
+    if not isinstance(item, dict):
+        raise RealtimeTransportError("unsupported realtime conversation item")
+    if item.get("type") == "function_call_output" and features.get("function_calling"):
+        if set(item) - {"type", "call_id", "output"}:
+            raise RealtimeTransportError("unsupported realtime conversation item")
+        return _function_output_item(item.get("call_id"), item.get("output"))
+    content = item.get("content")
+    if (item.get("type") == "message" and features.get("image_input") and set(item) <= {"type", "role", "content"}
+            and item.get("role") == "user" and isinstance(content, list) and len(content) == 1
+            and isinstance(content[0], dict) and set(content[0]) <= {"type", "image_url", "detail"}
+            and content[0].get("type") == "input_image"):
+        return {"type": "message", "role": "user",
+                "content": [input_image_content(content[0].get("image_url"), content[0].get("detail"))]}
+    raise RealtimeTransportError("unsupported realtime conversation item")
 
 
 def _string_list(value: object, *, limit: int, valid: Callable[[str], bool]) -> list[str]:
@@ -431,7 +535,8 @@ def _kind_client_event(message: dict, kind: str, model: str | None) -> tuple[dic
 
 def _client_event(message: dict, provider: str, *, wire: str, voice: str | None = None,
                   allow_transcription: bool = True, kind: str = "conversation",
-                  model: str | None = None) -> tuple[dict | None, int, bool]:
+                  model: str | None = None, features: dict | None = None) -> tuple[dict | None, int, bool]:
+    features = features or {}
     if kind != "conversation":
         if provider != "openai":
             raise RealtimeTransportError("unsupported realtime client event")
@@ -459,10 +564,14 @@ def _client_event(message: dict, provider: str, *, wire: str, voice: str | None 
             if event == "response.create" and message.get("response") not in (None, {}):
                 raise RealtimeTransportError("unsupported realtime response configuration")
             return {"type": event}, 0, False
+        if event == "conversation.item.create":
+            if set(message) - {"type", "event_id", "item"}:
+                raise RealtimeTransportError("unsupported realtime conversation item")
+            return {"type": event, "item": _conversation_item(message.get("item"), features)}, 0, False
         if event == "session.update":
             session = message.get("session")
             if not isinstance(session, dict) or set(session) - {
-                    "type", "instructions", "audio", "output_modalities", "reasoning"}:
+                    "type", "instructions", "audio", "output_modalities", "reasoning", "tools", "tool_choice"}:
                 raise RealtimeTransportError("unsupported realtime session update")
             if session.get("type", "realtime") != "realtime" or session.get("output_modalities", ["audio"]) != ["audio"]:
                 raise RealtimeTransportError("realtime model and modalities cannot change")
@@ -491,6 +600,16 @@ def _client_event(message: dict, provider: str, *, wire: str, voice: str | None 
                     or session["reasoning"]["effort"] not in REASONING_EFFORTS):
                 raise RealtimeTransportError("unsupported realtime reasoning effort")
             safe = {key: session[key] for key in ("instructions", "audio", "reasoning") if key in session}
+            if "tools" in session or "tool_choice" in session:
+                if not features.get("function_calling"):
+                    raise RealtimeTransportError("unsupported realtime function tools")
+                try:
+                    tools, choice = function_tools(session.get("tools"), session.get("tool_choice"))
+                except ProviderValidationError as exc:
+                    raise RealtimeTransportError("unsupported realtime function tools") from exc
+                safe["tools"] = tools
+                if choice is not None:
+                    safe["tool_choice"] = choice
             return {"type": "session.update", "session": safe}, 0, False
         if event == "session.close":
             return None, 0, True
@@ -511,6 +630,14 @@ def _client_event(message: dict, provider: str, *, wire: str, voice: str | None 
         if event == "audio.input.commit":
             return ({"type": "input_audio_buffer.commit"} if provider == "openai"
                     else {"realtimeInput": {"audioStreamEnd": True}}), 0, False
+        if event == "conversation.input_image" and features.get("image_input"):
+            if set(message) - {"type", "image_url", "detail"}:
+                raise RealtimeTransportError("unsupported realtime image")
+            return {"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [
+                input_image_content(message.get("image_url"), message.get("detail"))]}}, 0, False
+        if event == "function_call.output" and features.get("function_calling"):
+            return {"type": "conversation.item.create", "item": _function_output_item(
+                message.get("call_id"), message.get("output"))}, 0, False
         if event == "response.cancel":
             if provider == "openai":
                 return {"type": "response.cancel"}, 0, False
@@ -610,6 +737,14 @@ def _provider_events(message: dict, provider: str, *, wire: str,
                 events.append({"type": "transcript.output.delta", "delta": message["delta"]})
         elif event in {"input_audio_buffer.speech_started", "response.cancelled"}:
             events.append({"type": "session.interrupted"})
+        elif event == "response.function_call_arguments.delta":
+            if isinstance(message.get("call_id"), str) and isinstance(message.get("delta"), str):
+                events.append({"type": "function_call.arguments.delta", "call_id": message["call_id"],
+                               "delta": message["delta"]})
+        elif event == "response.function_call_arguments.done":
+            if all(isinstance(message.get(key), str) for key in ("call_id", "name", "arguments")):
+                events.append({"type": "function_call.arguments.done", "call_id": message["call_id"],
+                               "name": message["name"], "arguments": message["arguments"]})
         elif event == "error":
             events.append({"type": "error", "code": "upstream_error", "message": "Realtime provider returned an error"})
     else:
@@ -643,7 +778,8 @@ def _provider_events(message: dict, provider: str, *, wire: str,
 
 
 async def _drain_final_usage(upstream, server: asyncio.Task, meter: TokenUsageMeter, *, provider: str,
-                             wire: str, outgoing: int, output_limit: int) -> tuple[asyncio.Task, int]:
+                             wire: str, outgoing: int, output_limit: int,
+                             frame_limit: int = _MAX_FRAME_BYTES) -> tuple[asyncio.Task, int]:
     """After the client stops, wait a bounded time for in-flight provider usage; never retry."""
     if server.done() and isinstance(server.exception(), ConnectionClosed):
         return server, outgoing
@@ -665,7 +801,7 @@ async def _drain_final_usage(upstream, server: asyncio.Task, meter: TokenUsageMe
             response = server.result()
         except ConnectionClosed:
             break
-        parsed = _object(response)
+        parsed = _object(response, frame_limit)
         meter.observe(parsed)
         # The client has already stopped: count provider audio against the bound, forward nothing.
         _, size = _provider_events(parsed, provider, wire=wire)
@@ -729,15 +865,20 @@ async def relay_audio(
     transcription: dict | None = None,
     output_language: str | None = None,
     reasoning_effort: str | None = None,
-    token_hold: tuple[Callable[[UsageBreakdown], Decimal], Decimal] | None = None,
+    tools: list | None = None,
+    tool_choice: object = None,
+    token_hold: tuple[Callable[[UsageBreakdown], Decimal], Decimal, Decimal] | None = None,
 ) -> AudioMeter:
     """Relay strictly bounded frames and return PCM byte counts; never log or persist audio.
 
     ``token_usage`` sessions additionally meter provider-reported token usage. OpenAI's
     input transcription is a separately billed model whose rates are not frozen, so it is
-    neither configured nor accepted for token-basis sessions. ``token_hold`` pairs the
-    frozen per-response price with the reserved USD: the session stops once confirmed
-    usage plus twice the largest response so far reaches the hold.
+    neither configured nor accepted for token-basis sessions. OpenAI token sessions pin
+    ``max_output_tokens`` and retention-ratio truncation so one response has a known worst
+    case; ``token_hold`` is ``(frozen per-response price, reserved USD, that worst case)``
+    and the session stops once confirmed usage plus the in-flight and two further
+    worst-case responses would exceed the hold, or one response exceeds the worst case.
+    Image input and function calling are relayed only where ``conversation_features`` allows.
 
     Native and compatible non-conversation kinds use the same admitted upstream setup.
     ``transcription`` holds pre-validated tuning options and a GPT-Live ``session.start``
@@ -765,7 +906,13 @@ async def relay_audio(
     finished_transcriptions: set[str] = set()
     tokens = TokenUsageMeter(provider) if token_usage else None
     live = LiveUsageMeter() if kind == "live" else None
-    spent = largest = Decimal(0)
+    features = (conversation_features({**route, "api_key": api_key})
+                if tokens is not None and kind == "conversation" and provider == "openai" else {})
+    if (tools is not None or tool_choice is not None) and not features.get("function_calling"):
+        raise RealtimeTransportError("realtime function calling is unavailable for this session")
+    frame_limit = client_frame_limit(features.get("image_input") is True)
+    images = 0
+    spent = Decimal(0)
     hold_reached = False
     loop = asyncio.get_running_loop()
     connected_ns: int | None = None
@@ -785,7 +932,7 @@ async def relay_audio(
 
     try:
         async with asyncio.timeout(None) as deadline, websockets.connect(
-            url, additional_headers=headers, max_size=_MAX_FRAME_BYTES,
+            url, additional_headers=headers, max_size=frame_limit,
             open_timeout=10, close_timeout=CLOSE_TIMEOUT_SECONDS,
         ) as upstream:
             from .relay_history import record_dispatch
@@ -821,6 +968,15 @@ async def relay_audio(
                     session["instructions"] = instructions
                 if reasoning_effort is not None:
                     session["reasoning"] = {"effort": reasoning_effort}
+                if tokens is not None:
+                    # Per-response limits that make the hold guard's worst case real.
+                    session["max_output_tokens"] = RESPONSE_MAX_OUTPUT_TOKENS
+                    session["truncation"] = {"type": "retention_ratio", "retention_ratio": 0.8, "token_limits": {
+                        "post_instructions": RESPONSE_POST_INSTRUCTION_TOKENS}}
+                if tools is not None:
+                    session["tools"] = tools
+                if tool_choice is not None:
+                    session["tool_choice"] = tool_choice
                 await upstream.send(json.dumps({"type": "session.update", "session": session}))
             else:
                 config = {"responseModalities": ["AUDIO"], "speechConfig": {
@@ -857,12 +1013,12 @@ async def relay_audio(
                         continue
                     if client in done:
                         try:
-                            request = _object(client.result())
+                            request = _object(client.result(), frame_limit)
                         except WebSocketDisconnect:
                             break
                         message, size, close = _client_event(request, provider, wire=wire, voice=voice,
                                                              allow_transcription=tokens is None, kind=kind,
-                                                             model=model)
+                                                             model=model, features=features)
                         if close and kind == "transcription" and pending_transcriptions:
                             last_activity = loop.time()
                             closing_until = last_activity + _USAGE_DRAIN_SECONDS
@@ -876,9 +1032,25 @@ async def relay_audio(
                         else:
                             if incoming + size > 2 * input_rate * max_duration_seconds:
                                 raise RealtimeTransportError("session input exceeds duration bound")
+                            item_type = (message.get("item") or {}).get("type")
+                            starts_response = message.get("type") in {"response.create", "input_audio_buffer.commit"} or (
+                                wire == "native" and item_type == "function_call_output")
+                            if (starts_response and token_hold is not None
+                                    and spent + (tokens.in_flight + 2) * token_hold[2] > token_hold[1]):
+                                # A response the hold could not cover is never started.
+                                hold_reached = True
+                                break
                             if tokens is not None:
                                 tokens.request_sent(message)
+                            if item_type == "message":
+                                images += 1
+                                if images > MAX_SESSION_IMAGES:
+                                    raise RealtimeTransportError("too many realtime images")
                             await upstream.send(json.dumps(message, separators=(",", ":")))
+                            if wire == "native" and item_type == "function_call_output":
+                                # The native function result continues the model's turn.
+                                tokens.request_sent({"type": "response.create"})
+                                await upstream.send(json.dumps({"type": "response.create"}))
                             last_activity = loop.time()
                             incoming += size
                             if kind == "transcription" and message["type"] == "input_audio_buffer.commit":
@@ -893,20 +1065,20 @@ async def relay_audio(
                             if exc.code != 1000:
                                 raise RealtimeTransportError("upstream realtime connection closed unexpectedly") from exc
                             break
-                        parsed = _object(response)
+                        parsed = _object(response, frame_limit)
                         if live is not None:
                             live.observe(parsed)
                         if tokens is not None:
                             added = tokens.observe(parsed)
                             if added is not None and token_hold is not None:
-                                price, hold = token_hold
+                                price, hold, bound = token_hold
                                 try:
                                     cost = price(added)
                                 except ValueError:
                                     cost = hold  # Unpriceable usage: stop now; settlement decides.
                                 spent += cost
-                                largest = max(largest, cost)
-                                hold_reached = spent + 2 * largest >= hold
+                                # A response above the pinned worst case voids the guard's premise.
+                                hold_reached = cost > bound or spent + (tokens.in_flight + 2) * bound > hold
                         if kind == "transcription" and parsed.get("type") in {
                             "conversation.item.input_audio_transcription.completed",
                             "conversation.item.input_audio_transcription.failed",
@@ -936,7 +1108,7 @@ async def relay_audio(
                             break
                 if tokens is not None and tokens.pending:
                     server, outgoing = await _drain_final_usage(upstream, server, tokens, provider=provider,
-                        wire=wire, outgoing=outgoing, output_limit=output_limit)
+                        wire=wire, outgoing=outgoing, output_limit=output_limit, frame_limit=frame_limit)
                 if live is not None and live.final is None and not live.invalid:
                     # Only the provider's session.closed settles GPT-Live: request it on every
                     # Lumen-side exit and drain inside the funded close window.

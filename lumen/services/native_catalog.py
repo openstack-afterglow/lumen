@@ -225,7 +225,7 @@ def validate_catalog(value: object) -> dict:
                 from lumen.services.providers.pricing import validate_media_pricing
 
                 try:
-                    validate_media_pricing(entry["kind"], entry["media_pricing"])
+                    validate_media_pricing(entry["kind"], entry["media_pricing"], provider_type=provider)
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"{provider}/{model_id}: invalid media_pricing: {exc}") from exc
             _validate_modality_tiers(entry)
