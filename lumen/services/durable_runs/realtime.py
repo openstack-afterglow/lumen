@@ -259,6 +259,8 @@ def _intent(request: dict, kind: str = "conversation") -> dict:
               "voice": request.get("voice"), "instructions": request.get("instructions"),
               "max_duration_seconds": request.get("max_duration_seconds", 300)}
     # Conversation intents keep their historical fingerprint; other kinds add only what they carry.
+    if request.get("model_row_id") is not None:
+        intent["model_row_id"] = request["model_row_id"]
     if kind != "conversation":
         intent["realtime_kind"] = kind
     if request.get("transcription") is not None:
@@ -332,20 +334,16 @@ async def admit_realtime_session(
         async with _factory()() as session:
             row = (await session.execute(select(ChatRun).where(ChatRun.id == previous.run_id))).scalar_one()
             return await _response(row, user_id=user_id, project_id=project_id)
-    model_id, provider_id = intent["model_id"], intent["provider_id"]
-    if not isinstance(model_id, str) or not model_id or (provider_id is not None and not isinstance(provider_id, (str, int))):
+    model_id, model_row_id, provider_id = intent["model_id"], intent.get("model_row_id"), intent["provider_id"]
+    if ((model_id is not None and not isinstance(model_id, str)) or (not model_id and model_row_id is None)
+            or (provider_id is not None and not isinstance(provider_id, (str, int)))):
         raise DurableRunInputError("realtime model is required")
-    provider_number = int(provider_id) if provider_id is not None and str(provider_id).isdecimal() else None
-    api_provider = str(provider_id) if provider_id is not None and provider_number is None else None
     try:
-        route = (await routing.resolve_model_by_id(int(model_id), model_kind="realtime") if model_id.isdecimal()
-                 else await routing.resolve_api_model(model_id, provider=api_provider, provider_id=provider_number,
-                                                       provider_type=provider_type, model_kind="realtime"))
+        route = await routing.resolve_media_model(model_id, model_row_id=model_row_id, provider_id=provider_id,
+                                                  provider_type=provider_type, model_kind="realtime")
     except AmbiguousModelRouteError as exc:
         raise DurableRunInputError("realtime provider selection is ambiguous") from exc
-    if route is None or (provider_number is not None and route["provider_id"] != provider_number) or (
-        api_provider is not None and route["api_provider"] != api_provider
-    ) or (provider_type is not None and route["provider_type"] != provider_type):
+    if route is None:
         raise DurableRunInputError("realtime provider or model is unavailable")
     route_kind = realtime_transport.realtime_kind(route)
     if route_kind != kind:

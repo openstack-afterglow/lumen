@@ -756,6 +756,8 @@ class ChatAgent(Base):
     # AES-256-GCM(chat_content) 암호문. 시스템 프롬프트로 주입되는 지침.
     instructions: Mapped[str | None] = mapped_column(MEDIUMTEXT)
     model_name: Mapped[str | None] = mapped_column(VARCHAR(190))
+    # Keep the exact selection even if the catalog row is removed; never fall back to its name.
+    model_row_id: Mapped[int | None] = mapped_column(BIGINT)
     params: Mapped[dict | None] = mapped_column(JSON)  # {temperature, max_tokens, ...}
     mcp_ids: Mapped[list | None] = mapped_column(JSON)  # 바인딩된 ChatMcpServer id 목록
     tool_ids: Mapped[list | None] = mapped_column(JSON)  # 바인딩된 ChatCustomTool id 목록

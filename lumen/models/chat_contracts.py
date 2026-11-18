@@ -17,6 +17,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter, field_validator, model_validator
 
+from lumen.models.api_requests import ModelRowId
+
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_PROVIDER_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_TEXT_PART_CHARS = 100_000
@@ -554,10 +556,14 @@ class AgentBudget(_StrictModel):
         return format(Decimal(value), "f")
 
 
-class _CompletionSelectionRequest(_ReasoningEffortRequest):
+class _ChatModelSelectionRequest(_ReasoningEffortRequest):
+    model_id: str | None = Field(default=None, min_length=1, max_length=190)
+    model_row_id: ModelRowId | None = None
+
+
+class _CompletionSelectionRequest(_ChatModelSelectionRequest):
     """Selection fields shared by completion, preview, and compaction requests."""
 
-    model_id: str = Field(min_length=1, max_length=190)
     features: ChatFeatureOptions = Field(default_factory=ChatFeatureOptions)
     agent_id: str | None = Field(default=None, max_length=36)
     execution_mode: Literal["chat", "plan", "code"] = "chat"
@@ -581,6 +587,8 @@ class _CompletionSelectionRequest(_ReasoningEffortRequest):
 
     @model_validator(mode="after")
     def validate_execution_mode(self) -> _CompletionSelectionRequest:
+        if self.model_id is None and self.model_row_id is None and self.agent_id is None:
+            raise ValueError("model_id, model_row_id or agent_id is required")
         if self.execution_mode == "chat" and (
             self.code_workspace_id is not None or self.features.tool_policy.workspace_write_mode != "ask"
         ):
@@ -619,9 +627,18 @@ class CompactionRequest(_CompletionSelectionRequest):
     expected_context_revision: str = Field(min_length=1, max_length=190)
 
 
-class RegenerateRequest(_ReasoningEffortRequest):
-    model_id: str = Field(min_length=1, max_length=190)
+class RegenerateRequest(_ChatModelSelectionRequest):
     features: ChatFeatureOptions = Field(default_factory=ChatFeatureOptions)
+
+    @model_validator(mode="after")
+    def require_model(self):
+        if self.model_id is None and self.model_row_id is None:
+            raise ValueError("model_id or model_row_id is required")
+        return self
+
+
+class RetryRequest(_StrictModel):
+    model_row_id: ModelRowId | None = None
 
 
 class ChatRunDescriptor(_StrictModel):
@@ -1228,7 +1245,8 @@ class TempCompletionRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     parts: list[UserInputPart] = Field(min_length=1, max_length=32)
-    model_id: str = Field(min_length=1, max_length=190)
+    model_id: str | None = Field(default=None, min_length=1, max_length=190)
+    model_row_id: ModelRowId | None = None
     features: ChatFeatureOptions = Field(default_factory=ChatFeatureOptions)
     reasoning_effort: ReasoningEffort = "auto"
     execution_mode: str = Field(default="chat", pattern="^(chat|plan|code)$")
@@ -1252,6 +1270,8 @@ class TempCompletionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_execution_mode(self) -> TempCompletionRequest:
+        if self.model_id is None and self.model_row_id is None:
+            raise ValueError("model_id or model_row_id is required")
         if self.execution_mode == "chat" and (
             self.code_workspace_id is not None or self.features.tool_policy.workspace_write_mode != "ask"
         ):

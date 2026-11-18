@@ -280,14 +280,19 @@ async def _prepare_child_inputs(
             "can_delegate_write": False,
         }
     )
-    route = None
-    if agent.get("model_name"):
+    model_row_id = agent.get("model_row_id")
+    if model_row_id is not None or agent.get("model_name"):
         try:
-            route = await ps.resolve_model(str(agent["model_name"]))
+            route = (await ps.resolve_model_by_id(model_row_id, model_kind="text") if model_row_id is not None
+                     else await ps.resolve_model(agent["model_name"]))
         except AmbiguousModelRouteError as exc:
             raise ChildFailure("child_route_ambiguous", "child agent model route is ambiguous") from exc
         if route is None:
             raise ChildFailure("child_route_unavailable", "child agent model is not available")
+        if model_row_id is not None:
+            gate = chat_admission._capability_gate("text", route)
+            if not gate["available"] or not gate["pricing_available"]:
+                raise ChildFailure("child_route_unavailable", "child agent model cannot serve priced text")
     else:
         route = await ps.resolve_model_snapshot(parent.capability_snapshot or {})
         if route is None:

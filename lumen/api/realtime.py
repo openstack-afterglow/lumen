@@ -7,10 +7,11 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 
 from lumen.auth import Principal, credential_authority_snapshot, require_scopes
 from lumen.config import get_settings
+from lumen.models.api_requests import NativeMediaModelSelection
 from lumen.services import credit
 from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.durable_runs.realtime import admit_realtime_session, run_realtime_session
@@ -20,9 +21,8 @@ from lumen.services.providers.errors import ProviderValidationError
 router = APIRouter()
 
 
-class RealtimeSessionRequest(BaseModel):
+class RealtimeSessionRequest(NativeMediaModelSelection):
     model_config = ConfigDict(extra="forbid")
-    model_id: str = Field(min_length=1, max_length=190)
     provider_id: str | int | None = None
     kind: Literal["conversation", "transcription", "translation", "live"] = "conversation"
     voice: str | None = Field(default=None, max_length=100)
@@ -78,8 +78,10 @@ async def create_session(
     principal: Principal = Depends(require_scopes("native:realtime:write")),
 ):
     # Optional kind-specific fields are omitted when absent, keeping historical request shapes.
-    excluded = {"kind"} | {key for key in ("output_language", "reasoning_effort", "tools", "tool_choice")
-                           if getattr(payload, key) is None}
+    excluded = {"kind"} | {
+        key for key in ("output_language", "reasoning_effort", "tools", "tool_choice", "model_row_id")
+        if getattr(payload, key) is None
+    }
     try:
         return await admit_realtime_session(payload.model_dump(exclude=excluded), kind=payload.kind,
             project_id=principal["project_id"],

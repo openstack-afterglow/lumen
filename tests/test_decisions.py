@@ -18,7 +18,7 @@ from pydantic import ValidationError
 from lumen.api import decisions as native
 from lumen.api.compat import decisions as compat
 from lumen.auth import get_principal
-from lumen.models.decision_contracts import DecisionRequest, InputJSON
+from lumen.models.decision_contracts import DecisionRequest, InputJSON, NativeDecisionRequest
 from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import credit, decisions, stateless_credit
 from lumen.services.api_key_store import ApiKeyForbidden
@@ -352,13 +352,18 @@ async def test_real_synthetic_http_success_all_answer_types(lifecycle, monkeypat
     monkeypatch.setenv("NO_PROXY", "")
     monkeypatch.setenv("no_proxy", "")
     with fake_provider(payload) as (base, calls):
-        result = await run(body, route(api_base=base))
+        result = await decisions.decide(
+            route=route(api_base=base),
+            body=NativeDecisionRequest.model_validate({**body, "model": None, "model_row_id": 12}),
+            user_id="u", project_id="p", api_key_id=3, required_scopes=("native:runs:write",),
+        )
     assert result["model"] == "gpt-6-luna"
     assert [a["type"] for a in result["answers"]] == ["predicate", "choice", "score", "refusal"]
     assert result["cost_usd"] == 0.00000845
     assert len(calls) == 1 and calls[0][0] == "/v1/decisions"
     assert calls[0][1]["Authorization"] == f"Bearer {route()['api_key']}"
     assert calls[0][2]["model"] == "upstream-luna"
+    assert "model_row_id" not in calls[0][2]
     settled = lifecycle["settle"].call_args.kwargs
     assert settled["usage_components"][0]["category"] == "decision"
     assert "Package" not in str(settled) and "damaged" not in str(settled)
@@ -410,6 +415,27 @@ def test_compat_and_native_routes(path, auth_type, native_result, monkeypatch):
     assert reply.json() == (result if native_result else {key: result[key] for key in ("model", "answers", "usage")})
     assert call.call_args.kwargs["required_scopes"] == (("native:runs:write",) if native_result else ("compat:completions:write",))
     assert call.call_args.kwargs["source"] == ("api" if auth_type == "api_key" else "web")
+
+
+def test_native_http_exact_row_checks_name_without_changing_openai_wire(monkeypatch):
+    selected = route(model_id=12, provider_id=2)
+    exact = AsyncMock(return_value=selected)
+    legacy = AsyncMock(side_effect=decisions.errors.AmbiguousModelRouteError("duplicate model"))
+    monkeypatch.setattr(decisions.routing, "resolve_model_by_id", exact)
+    monkeypatch.setattr(decisions.routing, "resolve_api_model", legacy)
+    run = AsyncMock(return_value=response())
+    monkeypatch.setattr(decisions, "decide", run)
+    http = client()
+    assert http.post("/v1/chat/decisions", json=request(model=None, model_row_id=12)).status_code == 200
+    exact.assert_awaited_once_with(12, model_kind=("text", "decision"), required_capabilities=("decisions",))
+    assert run.await_args.kwargs["route"]["provider_id"] == 2
+    legacy.assert_not_called()
+    wrong = http.post("/v1/chat/decisions", json=request(model="different", model_row_id=12))
+    assert (wrong.status_code, wrong.json()["detail"]) == (422, "model_selection_mismatch")
+    assert http.post("/v1/chat/decisions", json=request()).status_code == 409
+    assert http.post("/v1/decisions", json=request(model_row_id=12)).status_code == 422
+    assert http.post("/v1/decisions", json=request()).status_code == 409
+    run.assert_awaited_once()
 
 
 def test_routes_reject_wrong_auth_or_scopes_before_resolve(monkeypatch):

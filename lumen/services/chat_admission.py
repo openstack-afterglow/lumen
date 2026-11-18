@@ -534,10 +534,17 @@ async def _load_owned_conv(conversation_id: str, user_id: str, project_id: str) 
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-async def _resolve_model(model_name: str) -> dict:
-    if not model_name:
+async def _resolve_model(model_name: str | None, *, model_row_id: int | None = None) -> dict:
+    if not model_name and model_row_id is None:
         raise HTTPException(status_code=400, detail="모델이 지정되지 않았습니다")
     try:
+        if model_row_id is not None:
+            resolved = await ps.resolve_model_by_id(model_row_id, model_kind="text")
+            if resolved is None:
+                raise HTTPException(status_code=422, detail="model_row_unavailable")
+            if model_name is not None and model_name != resolved["model_name"]:
+                raise HTTPException(status_code=422, detail="model_selection_mismatch")
+            return resolved
         resolved = await ps.resolve_model(model_name)
     except errors.AmbiguousModelRouteError as exc:
         raise HTTPException(status_code=409, detail="model_route_ambiguous") from exc
@@ -546,6 +553,26 @@ async def _resolve_model(model_name: str) -> dict:
     if resolved is None:
         raise HTTPException(status_code=400, detail=f"허용되지 않은 모델입니다: {model_name}")
     return resolved
+
+
+async def _resolve_run_model(
+    model_name: str | None, model_row_id: int | None, agent: dict | None,
+) -> dict:
+    """A configured agent pins the primary chat route; otherwise use the request."""
+    agent_model_name = (agent or {}).get("model_name")
+    agent_model_row_id = (agent or {}).get("model_row_id")
+    if agent_model_row_id is None and not agent_model_name:
+        return await _resolve_model(model_name, model_row_id=model_row_id)
+
+    route = await _resolve_model(
+        agent_model_name if agent_model_row_id is None else None,
+        model_row_id=agent_model_row_id,
+    )
+    if (model_row_id is not None and model_row_id != route["model_id"]) or (
+        model_name is not None and model_name != route["model_name"]
+    ):
+        raise HTTPException(status_code=422, detail="model_selection_mismatch")
+    return route
 
 
 def _validated_reasoning_effort(value: str, resolved: dict) -> str:
@@ -1090,7 +1117,9 @@ async def prepare_context_input(
     conversation_id: str | None = None,
     temp_thread_id: str | None = None,
     leaf_id: int | None = None,
-    model_id: str,
+    model_id: str | None,
+    model_row_id: int | None = None,
+    use_agent_model: bool = True,
     parts: list[UserInputPart] | None = None,
     features: ChatFeatureOptions,
     agent_id: int | None = None,
@@ -1174,7 +1203,7 @@ async def prepare_context_input(
         if is_preview or is_context_operation
         else await _validate_agent_budget(agent_budget, execution_mode=execution_mode, project_id=project_id, agent=agent)
     )
-    resolved = await _resolve_model(model_id)
+    resolved = await _resolve_run_model(model_id, model_row_id, agent if use_agent_model else None)
     extension_selection = await _resolve_extension_selection(agent, features, user_id=user_id, project_id=project_id)
     selected_plugin_tool_ids = (
         []

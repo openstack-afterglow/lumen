@@ -458,6 +458,65 @@ async def resolve_model(model_name: str, *, required_capabilities=("chat",)) -> 
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
+def matches_api_model_selector(route: dict, selector: str) -> bool:
+    """Check a public selector against an already-selected catalog row."""
+    route_ids = parse_cli_route_id(selector)
+    if route_ids is not None:
+        return route_ids == (route["provider_id"], route["model_id"])
+    model_name = route["model_name"]
+    provider_type = route["provider_type"]
+    api_name = route["api_model_name"]
+    short_name = short_model_name(model_name, provider_type)
+    if selector in (model_name, api_name, short_name):
+        return True
+    if provider_type == "gemini":
+        return selector.removeprefix("gemini/") in (api_name, short_name)
+    if provider_type == "perplexity":
+        return selector.removeprefix("perplexity/").removeprefix("perplexity/") in (
+            short_name, api_name.removeprefix("perplexity/"),
+        )
+    return False
+
+
+async def resolve_media_model(
+    model_id: str | None, *,
+    model_row_id: int | None = None,
+    model_kind: str,
+    provider_id: int | str | None = None,
+    provider_type: str | None = None,
+) -> dict | None:
+    """Resolve a native media row or its legacy decimal, name and provider selectors."""
+    provider_number = int(provider_id) if provider_id is not None and str(provider_id).isdecimal() else None
+    api_provider = str(provider_id) if provider_id is not None and provider_number is None else None
+    legacy_row_id = int(model_id) if model_id is not None and model_id.isdecimal() else None
+    row_id = model_row_id if model_row_id is not None else legacy_row_id
+    if row_id is not None:
+        if legacy_row_id is not None and legacy_row_id != row_id:
+            raise ProviderValidationError("model_selection_mismatch")
+        route = await resolve_model_by_id(row_id, model_kind=model_kind)
+    elif model_id is not None:
+        filters = {"provider_type": provider_type} if provider_type is not None or model_kind == "realtime" else {}
+        route = await resolve_api_model(
+            model_id, provider=api_provider, provider_id=provider_number, model_kind=model_kind, **filters,
+        )
+    else:
+        return None
+    if route is None:
+        return None
+    if (model_row_id is not None and model_id is not None and legacy_row_id is None
+            and not matches_api_model_selector(route, model_id)):
+        raise ProviderValidationError("model_selection_mismatch")
+    if (
+        (provider_number is not None and provider_number != route["provider_id"])
+        or (api_provider is not None and api_provider != route["api_provider"])
+        or (provider_type is not None and provider_type != route["provider_type"])
+    ):
+        if model_row_id is not None:
+            raise ProviderValidationError("model_selection_mismatch")
+        return None
+    return route
+
+
 async def resolve_api_model(model_name: str, *, provider: str | None = None,
                             model_kind: str | tuple[str, ...] = "text", provider_id: int | None = None,
                             provider_type: str | None = None, required_capabilities=()) -> dict | None:
@@ -795,7 +854,9 @@ async def list_cli_models() -> list[dict]:
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def resolve_model_by_id(model_id: int, *, model_kind: str = "text") -> dict | None:
+async def resolve_model_by_id(
+    model_id: int, *, model_kind: str | tuple[str, ...] = "text", required_capabilities=(),
+) -> dict | None:
     """Resolve one active configured model by its stable local identifier."""
 
     factory = _require_db()
@@ -809,7 +870,7 @@ async def resolve_model_by_id(model_id: int, *, model_kind: str = "text") -> dic
                         LlmModel.id == model_id,
                         LlmModel.is_active.is_(True),
                         LlmProvider.is_active.is_(True),
-                        LlmModel.model_kind == model_kind,
+                        _model_kind_filter(model_kind),
                     )
                 )
             ).first()
@@ -817,7 +878,7 @@ async def resolve_model_by_id(model_id: int, *, model_kind: str = "text") -> dic
                 return None
             model, provider = row
             try:
-                return _resolved_model(model, provider)
+                return _resolved_model(model, provider, required_capabilities=required_capabilities)
             except ProviderConfigurationChangedError:
                 return None
     except OperationalError as exc:
