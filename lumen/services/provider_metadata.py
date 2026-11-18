@@ -83,6 +83,14 @@ def native_catalog_entry(model: str, provider_type: str | None, api_base: str | 
                 return copy.deepcopy(entry)
     return {}
 
+def bounded_openai_text_model(model: str, provider_type: str | None, api_base: str | None) -> dict[str, Any]:
+    """Official text catalog entry with enough published limits to reserve credit."""
+    if provider_type != "openai":
+        return {}
+    entry = native_catalog_entry(model, provider_type, api_base)
+    return entry if entry.get("kind") == "text" and entry.get("context_window") and entry.get("max_output_tokens") else {}
+
+
 
 def catalog_model_metadata(model: str, provider_type: str | None = None, api_base: str | None = None) -> dict[str, Any]:
     """Project tracked native fields into the executor's existing metadata vocabulary."""

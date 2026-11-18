@@ -50,12 +50,16 @@ class ContextBudget:
     context_limit: int | None
     output_reserve: int
     safety_reserve: int = _SAFETY_RESERVE
+    max_input_tokens: int | None = None
 
     @property
     def input_budget(self) -> int | None:
         if self.context_limit is None:
             return None
-        return self.context_limit - self.output_reserve - self.safety_reserve
+        remaining = self.context_limit - self.output_reserve - self.safety_reserve
+        if type(self.max_input_tokens) is int and self.max_input_tokens > 0:
+            return min(self.max_input_tokens, remaining)
+        return remaining
 
 
 @dataclass(frozen=True)
@@ -148,6 +152,7 @@ def context_state(
     context_limit: int | None,
     output_reserve: int,
     revision: str,
+    max_input_tokens: int | None = None,
     checkpoint_id: str | None = None,
     active_compaction_run_id: str | None = None,
     plan: dict[str, Any] | None = None,
@@ -164,7 +169,8 @@ def context_state(
         if isinstance(output_reserve, int) and not isinstance(output_reserve, bool) and output_reserve >= 0
         else None
     )
-    budget = ContextBudget(valid_limit, valid_reserve if valid_reserve is not None else 0)
+    budget = ContextBudget(valid_limit, valid_reserve if valid_reserve is not None else 0,
+                           max_input_tokens=max_input_tokens)
     count = count_context_tokens(model_name, messages, tool_schemas)
     input_budget = budget.input_budget
     _retained, older = _required_messages(messages)
@@ -269,14 +275,9 @@ def _chunk_messages(
     older: list[dict[str, Any]],
     *,
     counter: Callable,
-    summary_limit: int,
-    summary_output: int,
+    chunk_budget: int,
     system_prompt: str,
 ) -> list[str]:
-    chunk_budget = summary_limit - summary_output - _SAFETY_RESERVE
-    if chunk_budget <= 0:
-        raise ContextLimitExceeded("context input budget is nonpositive")
-
     def fits(lines: list[str]) -> bool:
         count, _ = _count_result(_summary_messages(lines, system_prompt=system_prompt), [], counter)
         return count is not None and count <= chunk_budget
@@ -404,11 +405,12 @@ async def prepare_model_messages(
     effective_max_output_tokens: int,
     run_context: dict[str, Any],
     *,
+    max_input_tokens: int | None = None,
     token_counter: Callable[[list[dict[str, Any]], list[dict[str, Any]]], int | ContextTokenCount] = _default_count,
     compactor: Callable[[list[str], dict[str, Any]], Awaitable[Any]] | None = None,
 ) -> PreparedContext:
     """Prepare provider messages, failing closed whenever a known budget is unsafe."""
-    budget = ContextBudget(context_limit, effective_max_output_tokens)
+    budget = ContextBudget(context_limit, effective_max_output_tokens, max_input_tokens=max_input_tokens)
     if (
         not isinstance(context_limit, int)
         or isinstance(context_limit, bool)
@@ -463,13 +465,18 @@ async def prepare_model_messages(
     if isinstance(summary_output_value, bool) or summary_output <= 0:
         raise ContextLimitExceeded("context_request_invalid", code="context_request_invalid")
     summary_output = min(_MAX_SUMMARY_OUTPUT, summary_output)
+    summary_max_input = run_context.get(
+        "summary_max_input_tokens", max_input_tokens if "summary_context_limit" not in run_context else None,
+    )
+    summary_budget = ContextBudget(summary_limit, summary_output, max_input_tokens=summary_max_input).input_budget
+    if summary_budget is None or summary_budget <= 0:
+        raise ContextLimitExceeded("context input budget is nonpositive")
     system_prompt = str(run_context.get("summary_system_prompt") or _SUMMARY_SYSTEM)
     summary_counter = _summary_counter(run_context, token_counter)
     chunks = _chunk_messages(
         older,
         counter=summary_counter,
-        summary_limit=summary_limit,
-        summary_output=summary_output,
+        chunk_budget=summary_budget,
         system_prompt=system_prompt,
     )
     try:
@@ -505,7 +512,7 @@ async def prepare_model_messages(
         framed_map_count, _ = _count_result(
             _summary_messages([chunk], system_prompt=system_prompt), [], summary_counter
         )
-        if framed_map_count is None or framed_map_count > summary_limit - summary_output - _SAFETY_RESERVE:
+        if framed_map_count is None or framed_map_count > summary_budget:
             raise ContextLimitExceeded("compaction_failed", code="compaction_failed")
         result = await compactor(
             [chunk],
@@ -530,9 +537,6 @@ async def prepare_model_messages(
     for reduce_round in range(1, _MAX_ROUNDS + 1):
         # Each reduce call receives all source summaries that fit its own fully
         # framed route window. Order is never changed and no summary is dropped.
-        summary_budget = summary_limit - summary_output - _SAFETY_RESERVE
-        if summary_budget <= 0:
-            raise ContextLimitExceeded("context input budget is nonpositive")
         repacked: list[str] = []
         for part in parts:
             repacked.extend(

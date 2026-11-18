@@ -82,7 +82,7 @@ def validate_input(source: str | list[dict], *, tool_search: bool = False) -> No
             tools = item.get("tools")
             if not tool_search or not isinstance(tools, list) or not all(_token_only(tool) for tool in tools):
                 unsupported_tool = True
-        pending.extend(item.values())
+        pending.extend(value for key, value in item.items() if key not in {"input_schema", "parameters", "schema"})
     if unsupported_tool:
         raise UnsupportedHostedTool()
 
