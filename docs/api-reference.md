@@ -25,7 +25,7 @@ Domain identity and management authority come from current native Keystone, not 
 
 Keystone/API key는 fresh enabled owner/project, exact native effective roles와 service-local oslo.policy를 요구한다. Standard project admin/manager/member는 owned resource를 관리하고 reader는 nonsecret read만 한다. Dedicated Lumen grades/leaves와 personal-project marker는 필요하지 않다. Custom/group/domain/inherited 및 retained legacy native implication은 exact standard role에 도달하면 그대로 유효하다. API key는 `X-API-Key`/Bearer로 전송하며 stored scope는 추가 ceiling이다. Compat text/model route는 API-key-only다. Original source/issued-ID, foreign target, ownership와 downstream credential 경계는 policy override와 독립적이다.
 
-Compat text/model routes include `/v1/models`, `/v1/cli/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages` and `/v1/messages/count_tokens`; Keystone credentials receive 401 there. Multiple credentials receive 400 except identical API keys in `X-API-Key` and Bearer. `X-Lumen-Provider` is the configured public `api_provider` selector, not a transport alias; a conflicting body `provider` receives 400.
+Compat text/model routes include `/v1/models`, `/v1/cli/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and the [Gemini Models API](#gemini-models-api). Keystone credentials receive 401 there. OpenAI/Anthropic routes reject multiple credentials except identical API keys in `X-API-Key` and Bearer. `X-Lumen-Provider` is the configured public `api_provider` selector, not a transport alias; where a body `provider` field is accepted, a conflict with the header receives 400.
 
 Native project action은 registered policy가 current native roles를 평가한다. Verified human raw `system:all` global admin은 기본 alternative이지만 모든 admin route는 별도로 verified system authority와 `system:admin` policy를 요구한다. Project `admin` 및 `lumen_admin`은 system identity가 아니다. Caller original `X-Auth-Token`/Bearer와 connection scope의 `X-Project-Id`를 유지하며 다른 logical target은 verified human만 `X-Target-Project-Id`로 선택한다. Key는 foreign project/target/admin route를 사용할 수 없고 user/project ownership과 provider prerequisites는 유지한다.
 
@@ -47,6 +47,8 @@ Authenticated `GET /v1/policy/capabilities` has no service-entitlement prerequis
 | --- | --- | --- |
 | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities` | `models:read` | 아니오 |
 | `POST /v1/chat/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` | `compat:completions:write` | API-key routes reject Keystone credentials |
+| Gemini Models API `GET /v1beta/models` and `GET /v1beta/models/{id}` | `models:read` | API-key routes reject Keystone credentials |
+| Gemini Models API `POST /v1beta/models/{id}:generateContent`, `:streamGenerateContent`, `:countTokens`, `:embedContent`, `:batchEmbedContents` | `compat:completions:write` | API-key routes reject Keystone credentials |
 | conversations read/write | `native:conversations:read` / `native:conversations:write` | 아니오 |
 | native run read/write | `native:runs:read` / `native:runs:write` | 아니오 |
 | `GET /v1/runs/{id}/children` | `native:runs:read` (same user/project parent) | 아니오 |
@@ -73,7 +75,7 @@ API-key 일반 completion run은 text `execution_mode="chat"`만 허용하지만
 | 그룹 | Route |
 | --- | --- |
 | Discovery/health | `GET /`, `/v1/` (both advertise `rel=models` for `/v1/models`), `/v1/health`, `/v1/ready`, compat `GET /v1/compat` |
-| Compat | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`; Gemini `POST /v1beta/models/{model}:embedContent` and `:batchEmbedContents` |
+| Compat | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities`; `POST /v1/chat/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`; [Gemini Models API](#gemini-models-api) at `/v1beta/models` |
 | Legacy Lumen device gateway | `/.well-known/oauth-authorization-server`, `/oauth/device/code`, `/oauth/token`, `/v1/managed-settings`, `/v1/models`, `/v1/messages`, `/v1/messages/count_tokens` under the configured `/v1/claude-gateway` base; not the current Claude Apps Gateway protocol |
 | Conversations | `POST/GET /v1/conversations`, `GET/DELETE /v1/conversations/{id}`, projected message pages/search/fork/workspace/active-leaf, completion/regenerate/retry/runs subroutes |
 | Native runs/children | `POST /v1/temp-completions`; `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/events`, `/v1/runs/{id}/children`, `/v1/temp-threads/{id}`; approval/interaction/cancel POST routes |
@@ -159,6 +161,49 @@ Keystone-only `GET /v1/api-keys/issuance-policy`는 fresh keys-editor/current ow
 
 인증 없는 `GET /v1/compat`는 현재 요청 origin을 기준으로 OpenAI `sdk_base_url` (`/v1` 포함), Anthropic `sdk_base_url` (Origin), `/v1/responses`, `/v1/messages/count_tokens`, legacy Lumen device base/metadata를 제공한다. 모델 목록과 completion 호출 자체에는 `models:read`, `compat:completions:write` scope를 가진 API key가 필요하다. 런타임 전체 스펙은 `/openapi.json` (`x-required-api-key-scopes` 포함)을 참조한다.
 
+### Python SDK recipes
+
+Use an ordinary scoped Lumen API key. Set `LUMEN_ORIGIN` to the Lumen origin, `LUMEN_API_KEY` to the key, and `LUMEN_MODEL` to an active public model ID supported by the endpoint. Set `LUMEN_PROVIDER` to the registered `api_provider` only if you need to narrow selection. Install the corresponding package (`python -m pip install openai` or `python -m pip install anthropic`).
+
+**OpenAI:** Include `/v1` in the SDK base URL; the SDK appends `/chat/completions`.
+
+```python
+import os
+from openai import OpenAI
+
+origin = os.environ["LUMEN_ORIGIN"].rstrip("/")
+provider = os.getenv("LUMEN_PROVIDER")
+headers = {"X-Lumen-Provider": provider} if provider else {}
+with OpenAI(base_url=f"{origin}/v1", api_key=os.environ["LUMEN_API_KEY"],
+            default_headers=headers, max_retries=0) as client:
+    result = client.chat.completions.create(
+        model=os.environ["LUMEN_MODEL"],
+        messages=[{"role": "user", "content": "Say hello in one sentence."}],
+    )
+    print(result.choices[0].message.content)
+```
+
+**Anthropic:** Pass the origin without `/v1`; the SDK appends `/v1/messages` itself. A base ending in `/v1` would request `/v1/v1/messages`. Use a Messages-enabled model, such as a registered Anthropic text model. When `GET /v1/models` carries the `anthropic-version` header that the SDK sends, Lumen lists only Messages-eligible models. Official OpenAI models that require holds are hidden there.
+
+```python
+import os
+from anthropic import Anthropic
+
+origin = os.environ["LUMEN_ORIGIN"].rstrip("/")
+provider = os.getenv("LUMEN_PROVIDER")
+headers = {"X-Lumen-Provider": provider} if provider else {}
+with Anthropic(base_url=origin, api_key=os.environ["LUMEN_API_KEY"],
+               default_headers=headers, max_retries=0) as client:
+    result = client.messages.create(
+        model=os.environ["LUMEN_MODEL"],
+        max_tokens=128,
+        messages=[{"role": "user", "content": "Say hello in one sentence."}],
+    )
+    for block in result.content:
+        if block.type == "text":
+            print(block.text)
+```
+
 ### Text embeddings
 
 Embedding models are registered with `model_kind="embedding"` and the existing input-price-per-million field. They are not chat models or durable media runs. Model discovery marks exact catalog mode `embedding` as a non-chat candidate; an administrator must register the provider/model and configure a supported direct OpenAI or Gemini API-key route.
@@ -203,6 +248,103 @@ Claude Code auto mode는 `ANTHROPIC_BASE_URL` gateway에도 server-side classifi
 Configured `${claude_gateway_base_url}`의 device routes는 Lumen custom protocol이다. `POST /oauth/device/code`는 exact fixed scopes의 10-minute grant를 만들고 Redis rate limit을 fail-closed로 적용한다. Afterglow authenticated approval 뒤 interval-valid poll이 grant를 한 번 consume해 hashed-at-rest `credential_kind="claude_gateway"` API key를 24시간 발급한다. Pending, fast polling, denial, expiry, replay, store outage는 credential 없이 OAuth 오류를 반환한다. Gateway Messages/models/settings route는 이 credential kind만 허용한다.
 
 Current Claude Apps Gateway login은 administrator-managed `forceLoginGatewayUrl`, official `/protocol`, OIDC device authorization, refresh session을 요구한다. Lumen custom protocol은 그 계약을 구현하지 않으므로 current Claude Code `/login` 경로로 advertise하지 않는다. Afterglow의 legacy approval shell은 custom clients에만 해당하며 current Claude Code 사용자는 direct ordinary API-key path를 사용한다.
+
+## Gemini Models API
+
+Point the Google Gen AI SDK at the **Lumen origin**, without `/v1` or `/v1beta`, and set the SDK API version to `v1beta`. Use Gemini Developer API mode, not Vertex AI. Pass a scoped **Lumen** API key, not a Google key. Lumen formats errors as `{"error":{"code":<HTTP status>,"message":"...","status":"..."}}`.
+
+| Credential | Result |
+| --- | --- |
+| One of `x-goog-api-key` (sent by the SDK), `X-API-Key`, or `Authorization: Bearer <Lumen API key>` | Accepted. |
+| Key header plus a Bearer with the identical key | Accepted. |
+| Both `x-goog-api-key` and `X-API-Key`, a key header plus a different Bearer, or any other combination | 400. |
+| `?key=` query parameter only | 401; Lumen does not read the query parameter. |
+| Keystone token | 401; these routes require an API key. |
+
+| Request | Required key scope | Request and response |
+| --- | --- | --- |
+| `GET /v1beta/models` | `models:read` | Local model catalog. Pass `pageSize` and the returned `nextPageToken` as `pageToken` for the next page. Returns `models` with Google-style `name`, `supportedGenerationMethods` and, when known, `inputTokenLimit`/`outputTokenLimit`. Text models are listed when they are active, priced, have a configured chat credential and accept text; tools and streaming are not required. `streamGenerateContent` is advertised only for streaming-capable models; streaming a model without it returns 400. |
+| `GET /v1beta/models/{id}` | `models:read` | Returns one registered model's Google-style metadata. Pass the `name` returned by listing directly to the SDK. |
+| `POST /v1beta/models/{id}:generateContent` | `compat:completions:write` | Send Gemini `contents`; accepted fields depend on the selected provider (below). Returns a Google-style generation response with `candidates` and available `usageMetadata`. |
+| `POST /v1beta/models/{id}:streamGenerateContent?alt=sse` | `compat:completions:write` | Same request as `generateContent`. Reads a `text/event-stream` of Google-style JSON events. The SDK sets `alt=sse`; no other streaming format is supported. |
+| `POST /v1beta/models/{id}:countTokens` | `compat:completions:write` | Returns HTTP 501 `UNIMPLEMENTED`; Lumen does not substitute an estimate for a provider token count. |
+| `POST /v1beta/models/{id}:embedContent` or `:batchEmbedContents` | `compat:completions:write` | Gemini embedding contract; Gemini-provider embedding models only. Accepts the same exact `models/lumen/<provider_id>/<model_id>` names and `X-Lumen-Provider` as generation. See [Text embeddings](#text-embeddings) for request limits. |
+
+**Model names and provider selection.** A catalog `name` is `models/<public id>` when that ID is unique among listed text routes (or, separately, among Gemini embedding routes). When several providers expose the same public ID, the catalog lists each as the exact route `models/lumen/<provider_id>/<model_id>`. Both official SDKs pass those slashes through for get, generation, streaming and embeddings. Alternatively, pass the bare public ID with `X-Lumen-Provider: <api_provider>`; the selector is the administrator-configured public `api_provider`, not a display name or transport type. A bare ambiguous ID returns HTTP 409 `FAILED_PRECONDITION`. Lumen never resolves ambiguity by sort order or falls back to another provider. List and get read Lumen's configured catalog, not Google's public catalog; an entry is not a provider health check. Filter the list client-side by `supportedGenerationMethods` (`supported_actions` in Python, `supportedActions` in JavaScript).
+
+| Request field | Gemini provider (native) | OpenAI, Anthropic, Perplexity text models (translated) |
+| --- | --- | --- |
+| Content parts | `text`; `inlineData` image (`image/png`, `image/jpeg`, `image/webp`, `image/heic`, `image/heif`); `functionCall`; `functionResponse` | `text`; `inlineData` image (`image/png`, `image/jpeg`, `image/webp`, `image/gif`); `functionCall` and `functionResponse` in history |
+| Instructions and safety | `systemInstruction`; `safetySettings` passed through | `systemInstruction`; `safetySettings` gets 400 `INVALID_ARGUMENT` |
+| Function calling | `tools.functionDeclarations`; `toolConfig.functionCallingConfig` | `tools.functionDeclarations`, with model calls returned as `functionCall`; `toolConfig.functionCallingConfig` mode `AUTO`, `ANY` or `NONE`, and `allowedFunctionNames` only as exactly one name with `ANY` |
+| `generationConfig` | `temperature`, `topP`, `topK`, `maxOutputTokens`, `stopSequences`, `candidateCount=1`, `responseMimeType` (including `text/x.enum`), `responseSchema`, `responseJsonSchema`, `presencePenalty`, `frequencyPenalty`, `seed`, `thinkingConfig` | `temperature`, `topP`, `maxOutputTokens`, `stopSequences`, `candidateCount=1`; `responseMimeType` `text/plain` or `application/json`; `responseSchema` or `responseJsonSchema` only with `application/json`. `topK`, `presencePenalty`, `frequencyPenalty`, `seed`, `thinkingConfig` and other MIME types (including `text/x.enum`) get 400 `INVALID_ARGUMENT` |
+
+Every provider rejects these with HTTP 400: `googleSearch`, `codeExecution`, `urlContext` and other server tools; `cachedContent`; `fileData`; audio, video and PDF parts; `responseModalities` other than `TEXT`; and `candidateCount` greater than 1. No server tool ever runs. The virtual `lumen` model, stored conversations and memory are also unavailable. Supply prior turns inline in `contents`; this does not create a Lumen conversation or durable run. Decisions and Live have separate contracts; a model advertised for one operation is not necessarily valid for another.
+
+### Python (`google-genai`)
+
+Install `python -m pip install google-genai`. Set `LUMEN_ORIGIN`, `LUMEN_API_KEY`, and `LUMEN_MODEL` (a catalog `name`, for example `models/gemini-2.5-flash` or `models/lumen/3/42`). Both `models:read` and `compat:completions:write` are needed for this example. Optionally set `LUMEN_PROVIDER` when `LUMEN_MODEL` is a bare public ID.
+
+```python
+import os
+from google import genai
+from google.genai import types
+
+provider = os.getenv("LUMEN_PROVIDER")
+with genai.Client(
+    api_key=os.environ["LUMEN_API_KEY"],
+    vertexai=False,
+    http_options=types.HttpOptions(
+        base_url=os.environ["LUMEN_ORIGIN"].rstrip("/"),
+        api_version="v1beta",
+        headers={"X-Lumen-Provider": provider} if provider else {},
+        retry_options=types.HttpRetryOptions(attempts=1),
+    ),
+) as client:
+    for entry in client.models.list(config={"page_size": 20}):
+        if "generateContent" in (entry.supported_actions or []):
+            print(entry.name)
+    model = client.models.get(model=os.environ["LUMEN_MODEL"]).name
+    prompt = "Say hello in one sentence."
+    print(client.models.generate_content(model=model, contents=prompt).text)
+    for chunk in client.models.generate_content_stream(model=model, contents=prompt):
+        if chunk.text:
+            print(chunk.text, end="", flush=True)
+    print()
+```
+
+### Node.js (`@google/genai`)
+
+Install `npm install @google/genai`, use the same environment variables, and save the example as `lumen-gemini.mjs`. Run `node lumen-gemini.mjs` on a trusted server or workstation, not in a browser that would expose the key.
+
+```javascript
+import { GoogleGenAI } from "@google/genai";
+
+const { LUMEN_ORIGIN, LUMEN_API_KEY, LUMEN_MODEL, LUMEN_PROVIDER } = process.env;
+if (!LUMEN_ORIGIN || !LUMEN_API_KEY || !LUMEN_MODEL) {
+  throw new Error("Set LUMEN_ORIGIN, LUMEN_API_KEY, and LUMEN_MODEL.");
+}
+const client = new GoogleGenAI({
+  apiKey: LUMEN_API_KEY,
+  vertexai: false,
+  apiVersion: "v1beta",
+  httpOptions: {
+    baseUrl: LUMEN_ORIGIN.replace(/\/+$/, ""),
+    headers: LUMEN_PROVIDER ? { "X-Lumen-Provider": LUMEN_PROVIDER } : {},
+  },
+});
+
+for await (const entry of await client.models.list({ config: { pageSize: 20 } })) {
+  if (entry.supportedActions?.includes("generateContent")) console.log(entry.name);
+}
+const { name: model } = await client.models.get({ model: LUMEN_MODEL });
+const contents = "Say hello in one sentence.";
+console.log((await client.models.generateContent({ model, contents })).text);
+for await (const chunk of await client.models.generateContentStream({ model, contents })) {
+  if (chunk.text) process.stdout.write(chunk.text);
+}
+process.stdout.write("\n");
+```
 
 ## 이미지·유한 오디오·실시간 음성
 

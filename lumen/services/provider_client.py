@@ -224,7 +224,7 @@ class ProviderStream:
         try:
             payload = await self._source.__anext__()
             if payload == "[DONE]":
-                if self._protocol == "chat":
+                if self._protocol in {"chat", "gemini_generate"}:
                     if self._require_usage and not self._usage_reported:
                         raise OpenAIUsageInvalid()
                     self.completed = True
@@ -341,7 +341,7 @@ async def _execute(
         upstream_status = response.headers.get("X-Lumen-Upstream-Status", "")
         if response.headers.get("X-Lumen-Upstream-Endpoint"):
             record_dispatch(provider_auth, endpoint=response.headers.get("X-Lumen-Upstream-Endpoint"),
-                            model=body.get("model"), operation=protocol,
+                            model=body.get("model"), operation="chat" if protocol == "gemini_generate" else protocol,
                             status_code=int(upstream_status) if upstream_status.isdecimal() else None)
         if response.status_code >= 300:
             # Only a runtime-attested upstream rejection may fence a credential
@@ -384,7 +384,10 @@ async def _execute(
                 isinstance(choice, dict) and isinstance(choice.get("message"), dict) for choice in choices
             ):
                 raise APIConnectionError()
-        elif protocol == "responses" and not isinstance(value.get("output"), list) or protocol == "messages" and not isinstance(value.get("content"), list) or protocol == "embeddings" and not isinstance(value.get("data"), list):
+        elif protocol == "responses" and not isinstance(value.get("output"), list) or protocol == "messages" and not isinstance(value.get("content"), list) or protocol == "embeddings" and not isinstance(value.get("data"), list) or protocol == "gemini_generate" and not (
+            isinstance(value.get("candidates"), list) and value["candidates"]
+            or isinstance(value.get("promptFeedback"), dict) and value["promptFeedback"].get("blockReason")
+        ):
             raise APIConnectionError()
         return provider_object(value)
     except (httpx.TimeoutException, httpx.HTTPError, ProviderError) as exc:
@@ -538,6 +541,17 @@ async def aanthropic_messages(
     body.update(model=_model(model, provider), messages=messages, max_tokens=max_tokens, stream=stream)
     return await _execute("messages", provider, body, api_base=api_base, api_key=api_key,
                           provider_auth=provider_auth, headers=anthropic_headers)
+
+
+async def agemini_generate(
+    *, model: str, payload: dict, stream: bool, api_base: str | None,
+    api_key: str | None, provider_auth: ProviderAuthRef | None,
+) -> ProviderObject | ProviderStream:
+    return await _execute(
+        "gemini_generate", "gemini",
+        {"model": _model(model, "gemini"), "request": payload, "stream": stream},
+        api_base=api_base, api_key=api_key, provider_auth=provider_auth,
+    )
 
 
 async def aembedding(

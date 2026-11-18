@@ -11,8 +11,10 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import aclosing
+from datetime import UTC, datetime
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -24,6 +26,8 @@ from lumen.services.completion_format import nonstream_response, prompt_token_de
 from lumen.services.inference_authority import completion_scopes
 from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 from lumen.services.providers import errors, routing
+
+from .anthropic import anthropic_error_response
 
 router = APIRouter()
 
@@ -39,6 +43,20 @@ class OpenAIModelItem(BaseModel):
 class OpenAIModelListResponse(BaseModel):
     object: str = "list"
     data: list[OpenAIModelItem]
+
+
+class AnthropicModelItem(BaseModel):
+    id: str
+    type: Literal["model"] = "model"
+    display_name: str
+    created_at: datetime = datetime.fromtimestamp(0, UTC)
+
+
+class AnthropicModelListResponse(BaseModel):
+    data: list[AnthropicModelItem]
+    first_id: str | None
+    last_id: str | None
+    has_more: bool
 
 
 # ── 순수 변환 함수 (단위 테스트 대상) ──────────────────────────────────────
@@ -126,6 +144,35 @@ def models_list(models: list[dict], include_lumen: bool = False) -> dict:
         "object": "list",
         "data": data,
     }
+
+
+def _anthropic_models_page(
+    models: list[dict], *, limit: int, after_id: str | None, before_id: str | None
+) -> AnthropicModelListResponse:
+    if not 1 <= limit <= 1000 or (after_id is not None and before_id is not None):
+        raise ValueError("Use a limit from 1 to 1000 and at most one pagination cursor.")
+    model_ids = list(dict.fromkeys(
+        model["api_model_name"] for model in models
+        if model["api_model_name"].strip().lower() != openai_compat.VIRTUAL_MODEL_ID
+    ))
+    cursor = before_id if before_id is not None else after_id
+    if cursor is not None and cursor not in model_ids:
+        raise ValueError("Unknown model pagination cursor.")
+    position = model_ids.index(cursor) if cursor is not None else -1
+    if before_id is not None:
+        start = max(0, position - limit)
+        page_ids = model_ids[start:position]
+        has_more = start > 0
+    else:
+        start = position + 1
+        page_ids = model_ids[start:start + limit]
+        has_more = start + limit < len(model_ids)
+    return AnthropicModelListResponse(
+        data=[AnthropicModelItem(id=model_id, display_name=model_id) for model_id in page_ids],
+        first_id=page_ids[0] if page_ids else None,
+        last_id=page_ids[-1] if page_ids else None,
+        has_more=has_more,
+    )
 
 
 # ── 엔드포인트 ──────────────────────────────────────────────────────────────
@@ -315,10 +362,15 @@ async def chat_completions(
 
 @router.get(
     "/models",
-    response_model=OpenAIModelListResponse,
+    response_model=OpenAIModelListResponse | AnthropicModelListResponse,
     openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
 )
 async def list_models(
+    response: Response,
+    anthropic_version: str | None = Header(default=None, alias="Anthropic-Version"),
+    limit: str = Query(default="20"),
+    after_id: str | None = Query(default=None),
+    before_id: str | None = Query(default=None),
     x_lumen_provider: str | None = Header(
         default=None,
         alias="X-Lumen-Provider",
@@ -328,13 +380,32 @@ async def list_models(
     ),
     token_info: dict = Depends(require_api_key_scopes("models:read")),
 ):
+    vary = "Anthropic-Version, X-Lumen-Provider"
+    response.headers.append("Vary", vary)
     try:
-        models = await routing.list_api_models()
-        models.extend(await routing.list_api_models(model_kind="embedding"))
+        if anthropic_version is None:
+            models = await routing.list_api_models()
+            models.extend(await routing.list_api_models(model_kind="embedding"))
+        else:
+            # Messages SDKs list only rows /v1/messages can execute; bounded official
+            # OpenAI rows lack Messages accounting evidence (see billing_route).
+            models = [{"api_model_name": row["api_model_name"], "api_provider": row["provider"]}
+                      for row in await routing.list_cli_models() if "messages" in row["protocols"]]
     except errors.ChatStorageUnavailable:
         models = []
     if x_lumen_provider is not None:
         models = [model for model in models if model.get("api_provider") == x_lumen_provider]
+    if anthropic_version is not None:
+        try:
+            page_limit = int(limit)
+        except ValueError:
+            page_limit = 0
+        try:
+            return _anthropic_models_page(models, limit=page_limit, after_id=after_id, before_id=before_id)
+        except ValueError as exc:
+            error = anthropic_error_response(400, str(exc))
+            error.headers.append("Vary", vary)
+            return error
     include_lumen = (
         x_lumen_provider is None
         and token_info.get("credential_class") not in {"personal_key", "service_key"}

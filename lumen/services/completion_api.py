@@ -434,7 +434,7 @@ def billing_route(
     route["required_token_modalities"] = required
     reporting = (
         MODALITY_INPUT_REPORTING_PROVIDERS.get(str(route.get("provider_type") or ""), frozenset())
-        if protocol == "chat" and (route.get("provider_auth") or {}).get("auth_mode", "api_key") == "api_key"
+        if protocol in {"chat", "gemini"} and (route.get("provider_auth") or {}).get("auth_mode", "api_key") == "api_key"
         else frozenset()
     )
     for item in required:
@@ -628,6 +628,15 @@ def _norm_tool_calls(raw: Any) -> list[dict] | None:
     return out
 
 
+def _completion_provider_options(
+    options: dict | None, *, resolved: dict, client_functions_only: bool,
+) -> dict:
+    if client_functions_only and not _official_openai(resolved):
+        # The Gemini adapter closed-validates and translates the option vocabulary.
+        return options or {}
+    return chat_provider_options(options or {}, resolved=resolved)
+
+
 def _reasoning_effort(explicit: str | None, resolved: dict | None = None) -> str | None:
     """Explicit effort, else the operator default.
 
@@ -718,11 +727,12 @@ async def complete_once(
     tools: list[dict] | None = None,
     tool_choice: Any = None,
     options: dict | None = None,
+    client_functions_only: bool = False,
 ) -> dict:
     """비스트리밍 완료 — 전체 응답 반환 + 과금. tool_calls 는 릴레이(서버 미실행)."""
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
-    await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
-    options = chat_provider_options(options or {}, resolved=resolved)
+    await _authorize_completion(user_id, project_id, api_key_id, {} if client_functions_only else {"tools": tools}, resolved)
+    options = _completion_provider_options(options, resolved=resolved, client_functions_only=client_functions_only)
     max_output = _chat_wire_budget(resolved, max_tokens)
     if payer is not None and max_output is None:
         max_output = _chat_hold_output_budget(resolved, None)
@@ -786,14 +796,15 @@ async def complete_stream(
     tools: list[dict] | None = None,
     tool_choice: Any = None,
     options: dict | None = None,
+    client_functions_only: bool = False,
 ) -> AsyncIterator[dict]:
     """Validate/freeze before HTTP streaming starts, then return the completion iterator."""
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
-    options = chat_provider_options(options or {}, resolved=resolved)
+    options = _completion_provider_options(options, resolved=resolved, client_functions_only=client_functions_only)
     max_output = _chat_wire_budget(resolved, max_tokens)
     if payer is not None and max_output is None:
         max_output = _chat_hold_output_budget(resolved, None)
-    await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
+    await _authorize_completion(user_id, project_id, api_key_id, {} if client_functions_only else {"tools": tools}, resolved)
     hold = await _reserve_online(
         resolved, messages=messages, tools=tools, max_output=_chat_hold_output_budget(resolved, max_output),
         user_id=user_id, project_id=project_id, api_key_id=api_key_id,
@@ -1555,6 +1566,77 @@ async def complete_anthropic(
                     logger.warning("Anthropic partial-stream accounting failed", exc_info=True)
 
     return _ProviderEvents(events(), upstream, hold)
+
+
+async def _bill_gemini(
+    resolved: dict, messages: list[dict], usage: Any, *,
+    user_id: str, project_id: str, api_key_id: int | None, hold: _OnlineReservation | None,
+) -> None:
+    breakdown = UsageBreakdown.from_gemini(usage)
+    if breakdown is None or breakdown.modality_usage_invalid:
+        raise CompletionError(502, "gemini_usage_invalid", code="provider_result_unknown")
+    await _bill(
+        resolved, messages, "", breakdown.as_usage_dict(),
+        event_id=hold.event_id if hold else str(uuid.uuid4()), user_id=user_id, project_id=project_id,
+        api_key_id=api_key_id, hold=hold,
+    )
+
+
+@receipt_owner
+async def complete_gemini(
+    *, resolved: dict, payload: dict, messages: list[dict], max_tokens: int, stream: bool,
+    user_id: str, project_id: str, api_key_id: int | None, payer: Payer | None = None,
+) -> dict | AsyncIterator[dict]:
+    """Keep native Gemini parts/usage intact while using the normal stateless ledger."""
+    resolved = billing_route(resolved, messages, protocol="gemini")
+    # Only client functions are allowed in this closed request. Intrinsic server
+    # tools still require their own scope even when no tool declarations are sent.
+    await _authorize_completion(user_id, project_id, api_key_id, {}, resolved)
+    hold = await _reserve_online(
+        resolved, messages=messages, tools=None, max_output=max_tokens, user_id=user_id,
+        project_id=project_id, api_key_id=api_key_id, payer=payer,
+    )
+    try:
+        if hold is not None:
+            hold.dispatched = True
+        response = await provider_client.agemini_generate(
+            model=resolved["model_name"], payload=payload, stream=stream,
+            api_base=resolved.get("api_base"), api_key=resolved.get("api_key"),
+            provider_auth=resolved.get("provider_auth"),
+        )
+        if not stream:
+            await _bill_gemini(
+                resolved, messages, response.get("usageMetadata"), user_id=user_id,
+                project_id=project_id, api_key_id=api_key_id, hold=hold,
+            )
+            return response
+    except BaseException as exc:
+        if isinstance(exc, Exception):
+            _provider_rejected(hold, exc)
+        if hold is not None:
+            await hold.aclose()
+        raise
+    finally:
+        if not stream and hold is not None:
+            await hold.aclose()
+
+    async def events() -> AsyncIterator[dict]:
+        usage = None
+        try:
+            async for frame in response:
+                if "usageMetadata" in frame:
+                    usage = frame.pop("usageMetadata")
+                if frame:
+                    yield frame
+            await _bill_gemini(
+                resolved, messages, usage, user_id=user_id, project_id=project_id, api_key_id=api_key_id, hold=hold,
+            )
+            yield {"usageMetadata": usage}
+        finally:
+            if hold is not None:
+                await hold.aclose()
+
+    return _ProviderEvents(events(), response, hold)
 
 
 async def count_anthropic_tokens(

@@ -86,6 +86,8 @@ For held Chat and Responses streams, the SSE owner retains the pending upstream 
 
 The official Google Gen AI Python SDK exercise lives in the isolated system stack. The pinned SDK is a dev extra only; service images do not depend on it. `/v1beta/decisions` uses the existing selector ambiguity check and accepts the unmodified model string sent by the SDK, including the exact Lumen route selector.
 
+`lumen/api/compat/gemini.py` serves the Gemini API `v1beta` model surface for the official Google Gen AI SDKs: `GET /v1beta/models` (offset `pageToken`), `GET /v1beta/models/{model:path}`, `:generateContent`, `:streamGenerateContent?alt=sse`, and an explicit 501 `:countTokens`; the embedding handlers also take `{model:path}` and `X-Lumen-Provider`. The catalog uses `routing.list_gemini_api_models()` (active, priced, chat credential configured, text I/O; unlike the coding-CLI gate, tools and streaming are not required, and streaming only decides whether `streamGenerateContent` is advertised) plus Gemini embedding rows. A public ID served by several providers, text or embedding, is listed only as its exact `models/lumen/<provider_id>/<model_id>` route; a bare ambiguous ID returns 409 unless `X-Lumen-Provider` narrows it. Gemini routes stay native: the closed, allowlisted request goes through the private Bifrost `gemini_generate` protocol unchanged except for an injected `maxOutputTokens` matching the hold. `completion_api.complete_gemini` settles from native `usageMetadata` via `UsageBreakdown.from_gemini`. The runtime marks a stream terminal only once a finish reason has been seen and usage is present, then emits the private `[DONE]` that Lumen consumes. OpenAI, Anthropic and Perplexity text routes translate to Chat messages and call `complete_once`/`complete_stream` with `client_functions_only=True`. Caller function declarations are relayed as `functionCall` parts without requiring `native:tools:execute`; server tools, cached content, file references and non-image media are rejected with 400. Both paths reuse precheck, stateless holds, payer and settlement. `api/compat/google.GoogleModelRoute` converts auth, validation, completion and provider failures on every `/v1beta/models` route, embeddings included, to `{error:{code,message,status}}`. The Anthropic-Version branch of `GET /v1/models` lists only `list_cli_models()` rows whose transport protocols include Messages, so bounded official OpenAI rows stay hidden.
+
 Decision Studio checks an active row using `GET /v1/capabilities?model_kind=decision&model_id=<id>`; a mismatched kind does not resolve. The compat request wrapper enforces the raw body cap before auth. The Gemini handler decodes and validates JSON only after auth and reuses the native Gemini validation path. The image contract disallows Gemini Files API URLs so caller-supplied references cannot use the provider credential to resolve private files.
 
 Admin model rows expose `catalog_entry.kind` for native Decision entries even if the stored kind is still `text`. Only `model_kind` selects routing; the catalog field lets the registry offer a valid reclassification.
@@ -653,9 +655,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "168a0b7e03eb7b3d1a93666e1d92beacaafa9d6a0a36e6fbbed893d84947117d",
-  "reviewed_at": "2026-11-18T10:48:23Z",
-  "summary": "Release preparation 0.6.20: OpenAI Images catalog token billing with request-sized holds, GPT-6.2 Sol/Astra with standard-tier, cache-TTL and hosted-tool policy, OpenAI Realtime token tariffs with pinned limits, translation/GPT-Live/image/function sessions; integration review doc fixes; no migration; sandbox runtime remains off."
+  "source_sha256": "572959cf575a732c3904905366013207afd02a1fdf180ca015e99ac4497e42e1",
+  "reviewed_at": "2026-11-18T16:46:14Z",
+  "summary": "Gemini v1beta models/generate/stream compat (lumen/api/compat/gemini.py, google.py), native gemini_generate Bifrost protocol, chat-eligible Gemini catalog, exact embedding names, Anthropic listing limited to Messages routes, official Gen AI/OpenAI/Anthropic SDK tests"
 }
 ```
 <!-- architecture-review:end -->

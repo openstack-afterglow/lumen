@@ -220,6 +220,36 @@ func nativeEvent(protocol string) func([]byte) ([][]byte, bool, error) {
 	}
 }
 
+// Gemini's terminal candidate can precede the final usage frame. Only an
+// explicit finish or blocked prompt followed by usage can confirm settlement.
+func geminiNativeEvent() func([]byte) ([][]byte, bool, error) {
+	finished := false
+	return func(raw []byte) ([][]byte, bool, error) {
+		var event struct {
+			Candidates []struct {
+				FinishReason string `json:"finishReason"`
+			} `json:"candidates"`
+			PromptFeedback struct {
+				BlockReason string `json:"blockReason"`
+			} `json:"promptFeedback"`
+			Usage map[string]json.RawMessage `json:"usageMetadata"`
+			Error json.RawMessage            `json:"error"`
+		}
+		if json.Unmarshal(raw, &event) != nil || event.Error != nil {
+			return nil, false, errUnsupported
+		}
+		if reason := event.PromptFeedback.BlockReason; reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
+			finished = true
+		}
+		for _, candidate := range event.Candidates {
+			if reason := candidate.FinishReason; reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {
+				finished = true
+			}
+		}
+		return [][]byte{raw}, finished && event.Usage != nil, nil
+	}
+}
+
 func eventConverter(ctx *schemas.BifrostContext, wire, protocol string, p *executionPlan) func([]byte) ([][]byte, bool, error) {
 	var anthropicState *anthropic.AnthropicStreamState
 	var geminiState *gemini.GeminiStreamState
@@ -498,8 +528,8 @@ func (p *executionPlan) streamResponse(w http.ResponseWriter, reader io.Reader) 
 	if scanner.Err() != nil || len(data) != 0 || !terminal {
 		return
 	}
-	// Only chat clients use the OpenAI sentinel. Native protocols already carried
-	// their provider terminal event, untouched, and must not receive an invented one.
+	// Chat and the private native Gemini bridge use a terminal sentinel.
+	// Lumen consumes it; the public Google SDK sees only native data events.
 	if p.kind != "messages" && p.kind != "responses" {
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 		if flusher != nil {

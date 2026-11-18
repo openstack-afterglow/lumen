@@ -1,5 +1,24 @@
 # 테스트
 
+## Gemini Models API and SDK compatibility
+
+`test-passed` locally (2026-11-19, CPython 3.13.12, `google-genai==3.5.0`, `openai==2.53.0`, `anthropic==0.125.0`). `tests/test_gemini_sdk_compat.py`, `tests/test_official_sdk_compat.py`, `tests/test_embeddings_api.py` and `tests/test_cli_model_catalog.py`: 138 passed. The official clients call the real mounted ASGI app. Only the API-key lookup, credential decryption, credit precheck/settlement, an in-memory SQLite catalog and the private Bifrost endpoint are synthetic.
+
+Gen AI coverage:
+- discovery: models.list paging through `pageToken`; exact text and embedding names for duplicated public IDs; chat-eligibility discovery (tools- and streaming-disabled priced model listed with `generateContent` only and callable; unpriced model hidden); models.get bare/exact/ambiguous-409/`X-Lumen-Provider`;
+- native Gemini: `generate_content` with system instruction, `topK` and pass-through `safetySettings`, plus an injected `maxOutputTokens` equal to the hold bound; inline PNG; `generate_content_stream` (`alt=sse`, usage in the final chunk);
+- translated routes: OpenAI with function declarations returned as `functionCall`; streaming through an Anthropic route;
+- embeddings: `embed_content`;
+- errors and policy: Google error envelopes for 404, the virtual `lumen` model, server tools, `candidateCount`, translated-only rejections, upstream 429, 401, missing-scope 403 and `countTokens` 501; one settlement row per successful call.
+
+The OpenAI SDK covers model list, chat, Responses and base64 embeddings; the Anthropic SDK covers paged model list and Messages. A mixed catalog (custom OpenAI, Claude, Gemini, bounded official `gpt-6.2-sol`) lists only Messages-eligible IDs; each listed ID succeeds through `messages.create`, and the hidden ID returns `messages_accounting_unsupported`.
+
+`go vet ./...` and `go test ./...` in `runtime/bifrost` passed, including the native `gemini_generate` wire, response passthrough and usage-terminal test. The full root `-m "not integration and not system"` suite had the same 82 failures on this branch and on the base `37ab4b1` (identical failure lists; for example, `tests/test_gemini_decisions.py` payer assertions and `tests/test_service_inference_authority.py`).
+
+A `@google/genai` wire probe confirmed the Node.js SDK sends `x-goog-api-key` and keeps `models/lumen/<p>/<m>` slashes raw for list/get/generate/stream. It ran against a stubbed fetch, not Lumen.
+
+Not verified: payer-specific holds through persisted personal/service keys (needs the migration 038 key branch), live providers, JavaScript end-to-end against Lumen, deployment.
+
 ## Prepaid domain billing (migration 037)
 
 `test-defined`: `tests/integration/test_domain_credit.py` uses the migrated, disposable MariaDB. It races two humans and a service-key-shaped hold against a dashboard provider intent, checks project-quota lock order from two sessions, and checks nested allocation accounting. It also covers duplicate settlement/release/top-up, ledger balance, live manager denial, and the effective admin ceiling. No paid provider calls run in these tests.
