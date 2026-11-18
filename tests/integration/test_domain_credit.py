@@ -35,7 +35,10 @@ pytestmark = pytest.mark.integration
 async def test_domain_billing_migration_rechecks_without_replaying():
     # The immutable 028 preflight still checks the exact usage-table shape.
     # It must accept this verified 037 delta on both dry-run and API bootstrap.
+    # Only apply projects unready histories, and other tests leave some behind. Converge them
+    # with an apply that must replay nothing, so the dry-run measures migration state, not test order.
     database_url = os.environ["DATABASE_URL"]
+    assert await migrate(database_url, apply=True, repair_schema_drift=False) == ([], 0)
     assert await migrate(database_url, apply=False, repair_schema_drift=False) == ([], 0)
     assert await migrate(database_url, apply=True, repair_schema_drift=False) == ([], 0)
 

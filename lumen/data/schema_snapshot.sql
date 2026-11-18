@@ -15,9 +15,12 @@ CREATE TABLE `chat_agent_reservations` (
   `settled_at` datetime(6) DEFAULT NULL,
   `released_at` datetime(6) DEFAULT NULL,
   `created_at` datetime(6) NOT NULL DEFAULT current_timestamp(6),
+  `payer_user_id` varchar(64) DEFAULT NULL,
+  `payer_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_agent_reservation_run_kind` (`run_id`,`kind`),
   KEY `idx_agent_reservation_root` (`root_run_id`,`status`),
+  KEY `idx_agent_reservation_payer_domain` (`payer_domain_id`,`kind`,`status`),
   CONSTRAINT `fk_agent_reservation_root` FOREIGN KEY (`root_run_id`) REFERENCES `chat_runs` (`id`),
   CONSTRAINT `fk_agent_reservation_run` FOREIGN KEY (`run_id`) REFERENCES `chat_runs` (`id`)
 ) ENGINE=InnoDB;
@@ -50,18 +53,20 @@ CREATE TABLE `chat_agents` (
   `updated_at` datetime NOT NULL,
   `plugin_tool_ids` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`plugin_tool_ids`)),
   `plugin_skill_ids` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`plugin_skill_ids`)),
+  `domain_id` varchar(64) DEFAULT NULL,
   `model_row_id` bigint DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_chat_agents_owner` (`owner_user_id`),
   KEY `idx_chat_agents_project` (`project_id`),
   KEY `idx_chat_agents_project_active` (`project_id`,`is_active`),
-  KEY `idx_chat_agents_visibility` (`visibility`)
+  KEY `idx_chat_agents_visibility` (`visibility`),
+  KEY `idx_chat_agents_domain` (`domain_id`,`owner_user_id`,`updated_at`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_api_keys` (
   `id` bigint NOT NULL AUTO_INCREMENT,
-  `owner_user_id` varchar(64) NOT NULL,
-  `owner_project_id` varchar(64) NOT NULL,
+  `owner_user_id` varchar(64) DEFAULT NULL,
+  `owner_project_id` varchar(64) DEFAULT NULL,
   `name` varchar(100) NOT NULL,
   `key_prefix` varchar(24) NOT NULL,
   `key_hash` char(64) NOT NULL,
@@ -76,13 +81,19 @@ CREATE TABLE `chat_api_keys` (
   `owner_weekly_credit_limit` decimal(18,8) DEFAULT NULL,
   `expires_at` datetime(6) DEFAULT NULL,
   `credential_kind` varchar(32) NOT NULL DEFAULT 'api_key',
+  `key_kind` varchar(16) NOT NULL DEFAULT 'personal',
+  `owner_domain_id` varchar(64) DEFAULT NULL,
+  `created_by_user_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_chat_api_keys_hash` (`key_hash`),
   KEY `idx_chat_api_keys_owner` (`owner_user_id`,`owner_project_id`),
+  KEY `idx_chat_api_keys_kind_user` (`key_kind`,`owner_user_id`),
+  KEY `idx_chat_api_keys_kind_domain` (`key_kind`,`owner_domain_id`),
   CONSTRAINT `chk_chat_api_keys_owner_monthly_credit_limit` CHECK (`owner_monthly_credit_limit` is null or `owner_monthly_credit_limit` > 0),
   CONSTRAINT `chk_chat_api_keys_admin_monthly_credit_limit` CHECK (`admin_monthly_credit_limit` is null or `admin_monthly_credit_limit` > 0),
   CONSTRAINT `chk_chat_api_keys_owner_weekly_credit_limit` CHECK (`owner_weekly_credit_limit` is null or `owner_weekly_credit_limit` > 0),
-  CONSTRAINT `chk_chat_api_keys_credential_kind` CHECK (`credential_kind` in ('api_key','claude_gateway'))
+  CONSTRAINT `chk_chat_api_keys_credential_kind` CHECK (`credential_kind` in ('api_key','claude_gateway')),
+  CONSTRAINT `chk_chat_api_keys_owner_kind` CHECK (`key_kind` = 'personal' and `owner_user_id` is not null and `owner_domain_id` is null or `key_kind` = 'service' and `credential_kind` = 'api_key' and `owner_domain_id` is not null and `owner_user_id` is null and `owner_project_id` is null and `created_by_user_id` is not null)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_assets` (
@@ -220,6 +231,7 @@ CREATE TABLE `chat_batches` (
   `cancelling_at` datetime(6) DEFAULT NULL,
   `cancelled_at` datetime(6) DEFAULT NULL,
   `expired_at` datetime(6) DEFAULT NULL,
+  `payer_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_chat_batches_idempotency` (`project_id`,`user_id`,`contract`,`idempotency_key_hash`),
   KEY `idx_chat_batches_owner_cursor` (`project_id`,`user_id`,`created_at`,`id`),
@@ -380,12 +392,14 @@ CREATE TABLE `chat_conversations` (
   `history_revision` bigint NOT NULL DEFAULT 0,
   `history_index_ready` tinyint NOT NULL DEFAULT 0,
   `graph_id` char(36) NOT NULL,
+  `domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `code_workspace_id` (`code_workspace_id`),
   KEY `idx_chat_conversations_graph` (`graph_id`),
   KEY `idx_chat_conversations_owner` (`project_id`,`user_id`),
   KEY `idx_chat_conversations_updated` (`updated_at`),
   KEY `idx_chat_conversations_user_updated` (`user_id`,`updated_at`),
+  KEY `idx_chat_conversations_domain` (`domain_id`,`user_id`,`updated_at`),
   CONSTRAINT `chat_conversations_ibfk_1` FOREIGN KEY (`code_workspace_id`) REFERENCES `chat_code_workspaces` (`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_chat_conversations_graph` FOREIGN KEY (`graph_id`) REFERENCES `chat_message_graphs` (`id`)
 ) ENGINE=InnoDB;
@@ -411,10 +425,16 @@ CREATE TABLE `chat_custom_tools` (
   `load_policy` varchar(16) NOT NULL DEFAULT 'on_demand',
   `created_at` datetime NOT NULL,
   `updated_at` datetime NOT NULL,
+  `domain_id` varchar(64) DEFAULT NULL,
+  `owner_domain_id` varchar(64) DEFAULT NULL,
+  `legacy_domain_group` char(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_chat_custom_tools_project` (`project_id`),
   KEY `idx_chat_tool_owner` (`owner_user_id`),
-  KEY `idx_chat_tool_scope` (`scope`)
+  KEY `idx_chat_tool_scope` (`scope`),
+  KEY `idx_chat_tool_user_domain` (`domain_id`,`owner_user_id`,`updated_at`),
+  KEY `idx_chat_tool_domain` (`owner_domain_id`,`scope`),
+  CONSTRAINT `ck_chat_tool_domain_owner` CHECK (`scope` <> 'domain' or `owner_domain_id` is not null)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_delegation_calls` (
@@ -453,6 +473,23 @@ CREATE TABLE `chat_delegation_groups` (
   UNIQUE KEY `uq_delegation_group_join` (`join_segment_id`),
   KEY `idx_delegation_group_state` (`state`,`parent_run_id`),
   CONSTRAINT `fk_delegation_group_parent` FOREIGN KEY (`parent_run_id`) REFERENCES `chat_runs` (`id`)
+) ENGINE=InnoDB;
+
+CREATE TABLE `chat_extension_archives` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `kind` varchar(10) NOT NULL,
+  `entry_type` varchar(20) NOT NULL DEFAULT 'extension',
+  `original_id` bigint NOT NULL,
+  `canonical_id` bigint NOT NULL,
+  `owner_user_id` varchar(64) DEFAULT NULL,
+  `domain_id` varchar(64) NOT NULL,
+  `name` varchar(100) NOT NULL,
+  `encrypted_snapshot` mediumtext NOT NULL,
+  `archived_at` datetime NOT NULL,
+  `restored_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_chat_extension_archive_original` (`kind`,`original_id`,`entry_type`),
+  KEY `idx_chat_extension_archive_owner` (`domain_id`,`owner_user_id`,`restored_at`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_extension_package_components` (
@@ -605,8 +642,11 @@ CREATE TABLE `chat_mcp_activations` (
   `generation` bigint NOT NULL DEFAULT 1,
   `created_at` datetime NOT NULL DEFAULT current_timestamp(),
   `updated_at` datetime NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
+  `owner_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`mcp_server_id`,`owner_user_id`,`owner_project_id`),
+  UNIQUE KEY `uq_chat_mcp_activation_domain` (`mcp_server_id`,`owner_user_id`,`owner_domain_id`),
   KEY `idx_chat_mcp_activation_owner` (`owner_user_id`,`owner_project_id`),
+  KEY `idx_chat_mcp_activation_domain` (`owner_domain_id`,`owner_user_id`),
   CONSTRAINT `fk_chat_mcp_activation_server` FOREIGN KEY (`mcp_server_id`) REFERENCES `chat_mcp_servers` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
@@ -635,9 +675,12 @@ CREATE TABLE `chat_mcp_oauth_connections` (
   `server_config_version` bigint NOT NULL,
   `created_at` datetime NOT NULL,
   `updated_at` datetime NOT NULL,
+  `owner_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_chat_mcp_oauth_connection` (`mcp_server_id`,`owner_user_id`,`owner_project_id`),
-  KEY `idx_chat_mcp_oauth_connection_owner` (`owner_user_id`,`owner_project_id`,`status`)
+  UNIQUE KEY `uq_chat_mcp_oauth_domain` (`mcp_server_id`,`owner_user_id`,`owner_domain_id`),
+  KEY `idx_chat_mcp_oauth_connection_owner` (`owner_user_id`,`owner_project_id`,`status`),
+  KEY `idx_chat_mcp_oauth_domain` (`owner_domain_id`,`owner_user_id`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_mcp_oauth_requests` (
@@ -652,6 +695,7 @@ CREATE TABLE `chat_mcp_oauth_requests` (
   `expires_at` datetime NOT NULL,
   `completed_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL,
+  `owner_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `state_hash` (`state_hash`),
   KEY `idx_chat_mcp_oauth_request_expiry` (`expires_at`,`status`)
@@ -691,6 +735,7 @@ CREATE TABLE `chat_mcp_servers` (
   `owner_domain_id` varchar(64) DEFAULT NULL,
   `connection_scope_key` varchar(200) NOT NULL DEFAULT 'global',
   `implicit_selection` tinyint NOT NULL DEFAULT 1,
+  `legacy_domain_group` char(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_chat_mcp_scoped_template_label` (`connection_scope_key`,`template_key`,`connection_label`),
   KEY `idx_chat_mcp_owner` (`owner_user_id`),
@@ -715,16 +760,19 @@ CREATE TABLE `chat_memories` (
   `is_active` tinyint NOT NULL,
   `created_at` datetime NOT NULL,
   `updated_at` datetime NOT NULL,
+  `vault_migration_status` varchar(16) DEFAULT NULL,
+  `vault_migration_retry_at` datetime(6) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_chat_memories_scope` (`user_id`,`project_id`,`workspace_id`,`status`,`is_active`),
   KEY `idx_chat_memories_user` (`user_id`),
+  KEY `idx_chat_memories_vault_pending` (`vault_migration_status`,`vault_migration_retry_at`,`id`),
   CONSTRAINT `chk_chat_memory_scope` CHECK (`scope` = 'account' and `project_id` is null and `workspace_id` is null or `scope` = 'project' and `project_id` is not null and `workspace_id` is null or `scope` = 'workspace' and `project_id` is not null and `workspace_id` is not null)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_memory_outbox` (
   `change_seq` bigint NOT NULL AUTO_INCREMENT,
   `event_key` varchar(190) NOT NULL,
-  `memory_id` bigint NOT NULL,
+  `memory_id` bigint DEFAULT NULL,
   `mutation` varchar(20) NOT NULL,
   `content_hash` char(64) NOT NULL,
   `required_generations` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL CHECK (json_valid(`required_generations`)),
@@ -736,12 +784,15 @@ CREATE TABLE `chat_memory_outbox` (
   `error_code` varchar(100) DEFAULT NULL,
   `created_at` datetime NOT NULL,
   `updated_at` datetime NOT NULL,
+  `vault_note_id` bigint DEFAULT NULL,
   PRIMARY KEY (`change_seq`),
   UNIQUE KEY `event_key` (`event_key`),
   KEY `memory_id` (`memory_id`),
   KEY `idx_chat_memory_outbox_owner_lease` (`lease_owner`,`status`,`lease_expires_at`),
   KEY `idx_chat_memory_outbox_claim` (`status`,`change_seq`),
-  CONSTRAINT `chat_memory_outbox_ibfk_1` FOREIGN KEY (`memory_id`) REFERENCES `chat_memories` (`id`)
+  KEY `fk_chat_memory_outbox_vault` (`vault_note_id`),
+  CONSTRAINT `chat_memory_outbox_ibfk_1` FOREIGN KEY (`memory_id`) REFERENCES `chat_memories` (`id`),
+  CONSTRAINT `fk_chat_memory_outbox_vault` FOREIGN KEY (`vault_note_id`) REFERENCES `memory_vault_notes` (`id`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_memory_owner_locks` (
@@ -782,8 +833,10 @@ CREATE TABLE `chat_message_graphs` (
   `id` char(36) NOT NULL,
   `user_id` varchar(64) NOT NULL,
   `project_id` varchar(64) NOT NULL,
+  `domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
-  KEY `idx_chat_message_graphs_owner` (`project_id`,`user_id`)
+  KEY `idx_chat_message_graphs_owner` (`project_id`,`user_id`),
+  KEY `idx_chat_message_graphs_domain` (`domain_id`,`user_id`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_messages` (
@@ -825,7 +878,10 @@ CREATE TABLE `chat_model_call_reservations` (
   `status` varchar(20) NOT NULL DEFAULT 'reserved',
   `created_at` datetime(6) NOT NULL DEFAULT current_timestamp(6),
   `settled_at` datetime(6) DEFAULT NULL,
+  `payer_user_id` varchar(64) DEFAULT NULL,
+  `payer_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`run_id`,`segment_id`),
+  KEY `idx_model_call_payer_domain` (`payer_domain_id`,`status`),
   CONSTRAINT `fk_model_call_reservation_run` FOREIGN KEY (`run_id`) REFERENCES `chat_runs` (`id`),
   CONSTRAINT `ck_model_call_bound` CHECK (`bound_credits` >= 0),
   CONSTRAINT `ck_model_call_actual` CHECK (`actual_credits` is null or `actual_credits` >= 0)
@@ -1066,6 +1122,7 @@ CREATE TABLE `chat_runs` (
   `worker_pool_id` char(36) DEFAULT NULL,
   `worker_registration_id` char(36) DEFAULT NULL,
   `batch_id` char(36) DEFAULT NULL,
+  `payer_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_chat_runs_idempotency` (`project_id`,`user_id`,`client_request_id`),
   UNIQUE KEY `uq_chat_runs_parent_delegation` (`parent_run_id`,`delegation_call_id`),
@@ -1243,6 +1300,26 @@ CREATE TABLE `chat_skills` (
   KEY `idx_chat_skill_scope` (`scope`)
 ) ENGINE=InnoDB;
 
+CREATE TABLE `chat_stateless_call_reservations` (
+  `event_id` char(36) NOT NULL,
+  `user_id` varchar(64) DEFAULT NULL,
+  `project_id` varchar(64) DEFAULT NULL,
+  `api_key_id` bigint DEFAULT NULL,
+  `bound_credits` decimal(18,8) NOT NULL,
+  `actual_credits` decimal(18,8) DEFAULT NULL,
+  `status` varchar(20) NOT NULL,
+  `created_at` datetime(6) NOT NULL,
+  `settled_at` datetime(6) DEFAULT NULL,
+  `payer_user_id` varchar(64) DEFAULT NULL,
+  `payer_domain_id` varchar(64) DEFAULT NULL,
+  PRIMARY KEY (`event_id`),
+  KEY `idx_stateless_hold_owner` (`user_id`,`status`),
+  KEY `idx_stateless_hold_key` (`api_key_id`,`status`),
+  KEY `idx_stateless_hold_payer_domain` (`payer_domain_id`,`status`),
+  CONSTRAINT `ck_stateless_bound` CHECK (`bound_credits` >= 0),
+  CONSTRAINT `ck_stateless_actual` CHECK (`actual_credits` is null or `actual_credits` >= 0)
+) ENGINE=InnoDB;
+
 CREATE TABLE `chat_temp_threads` (
   `id` char(36) NOT NULL,
   `project_id` varchar(64) NOT NULL,
@@ -1284,8 +1361,8 @@ CREATE TABLE `chat_tool_approvals` (
 
 CREATE TABLE `chat_usage_logs` (
   `id` bigint NOT NULL AUTO_INCREMENT,
-  `project_id` varchar(64) NOT NULL,
-  `user_id` varchar(64) NOT NULL,
+  `project_id` varchar(64) DEFAULT NULL,
+  `user_id` varchar(64) DEFAULT NULL,
   `conversation_id` char(36) DEFAULT NULL,
   `model_name` varchar(190) NOT NULL,
   `provider` varchar(100) DEFAULT NULL,
@@ -1311,6 +1388,10 @@ CREATE TABLE `chat_usage_logs` (
   `provider_credential_generation` bigint DEFAULT NULL,
   `provider_backend` varchar(40) DEFAULT NULL,
   `provider_backend_version` varchar(100) DEFAULT NULL,
+  `domain_id` varchar(64) DEFAULT NULL,
+  `billing_scope` varchar(10) NOT NULL DEFAULT 'user',
+  `payer_user_id` varchar(64) DEFAULT NULL,
+  `payer_domain_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `event_id` (`event_id`),
   KEY `idx_chat_usage_api_key_id` (`api_key_id`,`id`),
@@ -1318,7 +1399,10 @@ CREATE TABLE `chat_usage_logs` (
   KEY `idx_chat_usage_run_id` (`run_id`),
   KEY `idx_chat_usage_provider_account` (`provider_account_id`,`created_at`),
   KEY `idx_chat_usage_project_created` (`project_id`,`created_at`),
-  KEY `idx_chat_usage_user_created` (`user_id`,`created_at`)
+  KEY `idx_chat_usage_user_created` (`user_id`,`created_at`),
+  KEY `idx_chat_usage_domain_created` (`domain_id`,`created_at`),
+  KEY `idx_chat_usage_payer_domain_created` (`payer_domain_id`,`created_at`),
+  KEY `idx_chat_usage_payer_user_created` (`payer_user_id`,`created_at`)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_worker_registrations` (
@@ -1363,6 +1447,41 @@ CREATE TABLE `chat_workspaces` (
   `updated_at` datetime NOT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_chat_workspaces_owner` (`owner_user_id`)
+) ENGINE=InnoDB;
+
+CREATE TABLE `domain_credit_ledger` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `domain_id` varchar(64) NOT NULL,
+  `kind` varchar(20) NOT NULL,
+  `amount_credits` decimal(18,8) NOT NULL,
+  `balance_after` decimal(18,8) NOT NULL,
+  `actor_user_id` varchar(64) DEFAULT NULL,
+  `reference` varchar(190) NOT NULL,
+  `note` text DEFAULT NULL,
+  `created_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_domain_ledger_reference` (`kind`,`reference`),
+  KEY `idx_domain_ledger_domain_id` (`domain_id`,`id`),
+  KEY `idx_domain_ledger_actor_charge` (`actor_user_id`,`kind`,`created_at`),
+  CONSTRAINT `ck_domain_ledger_kind` CHECK (`kind` in ('topup','adjustment','charge','refund'))
+) ENGINE=InnoDB;
+
+CREATE TABLE `domain_credit_pools` (
+  `domain_id` varchar(64) NOT NULL,
+  `balance_credits` decimal(18,8) NOT NULL DEFAULT 0.00000000,
+  `reserved_credits` decimal(18,8) NOT NULL DEFAULT 0.00000000,
+  `monthly_used_credits` decimal(18,8) NOT NULL DEFAULT 0.00000000,
+  `period_start` date NOT NULL,
+  `manager_monthly_limit_credits` decimal(18,8) DEFAULT NULL,
+  `admin_ceiling_credits` decimal(18,8) DEFAULT NULL,
+  `is_active` tinyint NOT NULL DEFAULT 1,
+  `updated_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`domain_id`),
+  CONSTRAINT `ck_domain_pool_balance` CHECK (`balance_credits` >= 0),
+  CONSTRAINT `ck_domain_pool_reserved` CHECK (`reserved_credits` >= 0),
+  CONSTRAINT `ck_domain_pool_month` CHECK (`monthly_used_credits` >= 0),
+  CONSTRAINT `ck_domain_pool_limit` CHECK (`manager_monthly_limit_credits` >= 0),
+  CONSTRAINT `ck_domain_pool_ceiling` CHECK (`admin_ceiling_credits` >= 0)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `llm_models` (
@@ -1485,6 +1604,143 @@ CREATE TABLE `llm_providers` (
   CONSTRAINT `chk_llm_providers_sort_order` CHECK (`sort_order` >= 0)
 ) ENGINE=InnoDB;
 
+CREATE TABLE `memory_vault_activity` (
+  `scope_key` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `user_id` varchar(64) NOT NULL,
+  `domain_id` varchar(64) DEFAULT NULL,
+  `project_key` varchar(80) DEFAULT NULL,
+  `role` varchar(24) DEFAULT NULL,
+  `read_count` bigint NOT NULL DEFAULT 0,
+  `write_count` bigint NOT NULL DEFAULT 0,
+  `updated_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`scope_key`),
+  KEY `idx_memory_vault_activity_scope` (`user_id`,`domain_id`,`project_key`)
+) ENGINE=InnoDB;
+
+CREATE TABLE `memory_vault_feedback` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `review_id` bigint NOT NULL,
+  `source_hash` char(64) NOT NULL,
+  `trigger_kind` varchar(32) NOT NULL,
+  `body_ciphertext` mediumtext NOT NULL,
+  `created_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_memory_vault_feedback` (`review_id`,`source_hash`),
+  CONSTRAINT `fk_memory_vault_feedback_review` FOREIGN KEY (`review_id`) REFERENCES `memory_vault_reviews` (`id`)
+) ENGINE=InnoDB;
+
+CREATE TABLE `memory_vault_notes` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `user_id` varchar(64) NOT NULL,
+  `domain_id` varchar(64) DEFAULT NULL,
+  `project_key` varchar(80) DEFAULT NULL,
+  `scope_key` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `kind` varchar(24) NOT NULL,
+  `role` varchar(24) DEFAULT NULL,
+  `slug` varchar(128) NOT NULL,
+  `title` varchar(200) NOT NULL,
+  `body_ciphertext` mediumtext NOT NULL,
+  `body_hash` char(64) NOT NULL,
+  `metadata` longtext NOT NULL CHECK (json_valid(`metadata`)),
+  `status` varchar(20) NOT NULL,
+  `revision` int NOT NULL,
+  `supersedes_id` bigint DEFAULT NULL,
+  `project_id` varchar(64) DEFAULT NULL,
+  `workspace_id` bigint DEFAULT NULL,
+  `category` varchar(32) DEFAULT NULL,
+  `confidence` decimal(5,4) DEFAULT NULL,
+  `expires_at` datetime(6) DEFAULT NULL,
+  `is_active` tinyint NOT NULL DEFAULT 1,
+  `created_at` datetime(6) NOT NULL,
+  `updated_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_memory_vault_note_scope` (`scope_key`),
+  KEY `idx_memory_vault_notes_scope` (`user_id`,`domain_id`,`status`,`kind`,`updated_at`),
+  KEY `fk_memory_vault_supersedes` (`supersedes_id`),
+  CONSTRAINT `fk_memory_vault_supersedes` FOREIGN KEY (`supersedes_id`) REFERENCES `memory_vault_notes` (`id`),
+  CONSTRAINT `ck_memory_vault_project_domain` CHECK (`project_key` is null or `domain_id` is not null),
+  CONSTRAINT `ck_memory_vault_workspace_owner` CHECK (`workspace_id` is null or `project_id` is not null and `domain_id` is not null)
+) ENGINE=InnoDB;
+
+CREATE TABLE `memory_vault_projects` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `user_id` varchar(64) NOT NULL,
+  `domain_id` varchar(64) NOT NULL,
+  `project_key` varchar(80) NOT NULL,
+  `title` varchar(200) NOT NULL,
+  `metadata` longtext NOT NULL CHECK (json_valid(`metadata`)),
+  `status` varchar(20) NOT NULL,
+  `created_at` datetime(6) NOT NULL,
+  `updated_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_memory_vault_project` (`user_id`,`domain_id`,`project_key`)
+) ENGINE=InnoDB;
+
+CREATE TABLE `memory_vault_reviews` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `user_id` varchar(64) NOT NULL,
+  `domain_id` varchar(64) DEFAULT NULL,
+  `project_key` varchar(80) DEFAULT NULL,
+  `note_id` bigint NOT NULL,
+  `status` varchar(20) NOT NULL,
+  `expected_hash` char(64) NOT NULL,
+  `assessment_ciphertext` mediumtext DEFAULT NULL,
+  `ready_at` datetime(6) DEFAULT NULL,
+  `resolved_at` datetime(6) DEFAULT NULL,
+  `created_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_memory_vault_review_scope` (`user_id`,`domain_id`,`project_key`,`status`,`ready_at`),
+  KEY `fk_memory_vault_review_note` (`note_id`),
+  CONSTRAINT `fk_memory_vault_review_note` FOREIGN KEY (`note_id`) REFERENCES `memory_vault_notes` (`id`)
+) ENGINE=InnoDB;
+
+CREATE TABLE `memory_vault_revisions` (
+  `note_id` bigint NOT NULL,
+  `revision` int NOT NULL,
+  `body_ciphertext` mediumtext NOT NULL,
+  `body_hash` char(64) NOT NULL,
+  `title` varchar(200) NOT NULL,
+  `metadata` longtext NOT NULL CHECK (json_valid(`metadata`)),
+  `status` varchar(20) NOT NULL,
+  `change_kind` varchar(20) NOT NULL,
+  `created_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`note_id`,`revision`),
+  CONSTRAINT `fk_memory_vault_revision_note` FOREIGN KEY (`note_id`) REFERENCES `memory_vault_notes` (`id`)
+) ENGINE=InnoDB;
+
+CREATE TABLE `memory_vault_tasks` (
+  `scope_key` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `user_id` varchar(64) NOT NULL,
+  `domain_id` varchar(64) DEFAULT NULL,
+  `project_key` varchar(80) DEFAULT NULL,
+  `task_id` varchar(128) NOT NULL,
+  `parent_scope_key` char(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+  `resume_scope_key` char(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+  `status` varchar(20) NOT NULL,
+  `week_key` varchar(12) NOT NULL,
+  `timezone` varchar(64) NOT NULL,
+  `started_at` datetime(6) NOT NULL,
+  `finished_at` datetime(6) DEFAULT NULL,
+  PRIMARY KEY (`scope_key`),
+  KEY `idx_memory_vault_task_scope` (`user_id`,`domain_id`,`project_key`,`status`),
+  KEY `parent_scope_key` (`parent_scope_key`),
+  KEY `resume_scope_key` (`resume_scope_key`),
+  CONSTRAINT `memory_vault_tasks_ibfk_1` FOREIGN KEY (`parent_scope_key`) REFERENCES `memory_vault_tasks` (`scope_key`),
+  CONSTRAINT `memory_vault_tasks_ibfk_2` FOREIGN KEY (`resume_scope_key`) REFERENCES `memory_vault_tasks` (`scope_key`)
+) ENGINE=InnoDB;
+
+CREATE TABLE `memory_vault_weekly_exports` (
+  `scope_key` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `user_id` varchar(64) NOT NULL,
+  `domain_id` varchar(64) DEFAULT NULL,
+  `project_key` varchar(80) DEFAULT NULL,
+  `week_key` varchar(12) NOT NULL,
+  `content_hash` char(64) NOT NULL,
+  `exported_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`scope_key`),
+  KEY `idx_memory_vault_week_scope` (`user_id`,`domain_id`,`project_key`,`week_key`)
+) ENGINE=InnoDB;
+
 CREATE TABLE `user_wallets` (
   `user_id` varchar(64) NOT NULL,
   `project_id` varchar(64) DEFAULT NULL,
@@ -1498,21 +1754,4 @@ CREATE TABLE `user_wallets` (
   `updated_at` datetime NOT NULL,
   `max_quota_weekly` decimal(18,8) DEFAULT NULL,
   PRIMARY KEY (`user_id`)
-) ENGINE=InnoDB;
-
-CREATE TABLE `chat_stateless_call_reservations` (
-  `event_id` char(36) NOT NULL,
-  `user_id` varchar(64) NOT NULL,
-  `project_id` varchar(64) NOT NULL,
-  `api_key_id` bigint DEFAULT NULL,
-  `bound_credits` decimal(18,8) NOT NULL,
-  `actual_credits` decimal(18,8) DEFAULT NULL,
-  `status` varchar(20) NOT NULL,
-  `created_at` datetime(6) NOT NULL,
-  `settled_at` datetime(6) DEFAULT NULL,
-  PRIMARY KEY (`event_id`),
-  KEY `idx_stateless_hold_owner` (`user_id`,`status`),
-  KEY `idx_stateless_hold_key` (`api_key_id`,`status`),
-  CONSTRAINT `ck_stateless_bound` CHECK (`bound_credits` >= 0),
-  CONSTRAINT `ck_stateless_actual` CHECK (`actual_credits` is null or `actual_credits` >= 0)
 ) ENGINE=InnoDB;

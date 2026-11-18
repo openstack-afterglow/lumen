@@ -123,7 +123,6 @@ def _token_info(*, is_system_admin: bool) -> dict[str, object]:
         "project_id": "test-project-123",
         "domain_id": "test-domain-123",
         "project_name": "test-project",
-        "domain_id": "test-domain-123",
         "roles": ["admin", "member"] if is_system_admin else ["member"],
         "is_system_admin": is_system_admin,
     }

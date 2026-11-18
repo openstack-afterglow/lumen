@@ -57,6 +57,24 @@ Each section lists the fields of one component schema referenced by this group's
 | `stop_sequence` | string \| null | no | — | Stop Sequence |
 | `usage` | [AnthropicUsage](#anthropicusage) | yes | — |  |
 
+### AnthropicModelItem
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `id` | string | yes | — | Id |
+| `type` | const `model` | no | `"model"` | Type |
+| `display_name` | string | yes | — | Display Name |
+| `created_at` | string (date-time) | no | `"1970-01-01T00:00:00Z"` | Created At |
+
+### AnthropicModelListResponse
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `data` | array of [AnthropicModelItem](#anthropicmodelitem) | yes | — | Data |
+| `first_id` | string \| null | yes | — | First Id |
+| `last_id` | string \| null | yes | — | Last Id |
+| `has_more` | boolean | yes | — | Has More |
+
 ### AnthropicUsage
 
 | Field | Type | Required | Default | Notes |
@@ -65,6 +83,15 @@ Each section lists the fields of one component schema referenced by this group's
 | `output_tokens` | integer | no | `0` | Output Tokens |
 | `cache_creation_input_tokens` | integer \| null | no | — | Cache Creation Input Tokens |
 | `cache_read_input_tokens` | integer \| null | no | — | Cache Read Input Tokens |
+
+### AssistantMessage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `message` | no | `"message"` | Type |
+| `role` | const `assistant` | yes | — | Role |
+| `content` | string \| array of [OutputText](#outputtext) \| [RefusalText](#refusaltext) | yes | — | Content |
+| `phase` | enum: `commentary`, `final_answer` \| null | no | — | Phase |
 
 ### BatchRequestCounts
 
@@ -79,6 +106,28 @@ Each section lists the fields of one component schema referenced by this group's
 | `cancelled` | integer | no | `0` | Cancelled (numeric lower bound) |
 | `expired` | integer | no | `0` | Expired (numeric lower bound) |
 | `unknown` | integer | no | `0` | Unknown (numeric lower bound) |
+
+### CacheBreakpoint
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `mode` | const `explicit` | no | `"explicit"` | Mode |
+
+### Choice
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `value` | string \| boolean | yes | — | Value |
+| `description` | string \| null | no | — | Description |
+
+### ChoiceQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `choice` | yes | — | Type |
+| `name` | string \| null | no | — | Name |
+| `instructions` | string \| array of [QuestionText](#questiontext) \| [QuestionImage](#questionimage) \| [InputJSON](#inputjson) | yes | — | Instructions |
+| `choices` | array of [Choice](#choice) | yes | — | Choices (max 255 items) |
 
 ### CliModelItem
 
@@ -247,11 +296,178 @@ Each section lists the fields of one component schema referenced by this group's
 | `responses` | string | no | `"event: response.created|response.output_text.delta|response.completed \\n data: { ... }"` | Responses |
 | `error_note` | string | no | `"Compat streams report post-handshake failures as in-band SSE errors; native durable failures use the terminal run.failed event."` | Error Note |
 
+### CustomToolCall
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `custom_tool_call` | yes | — | Type |
+| `input` | string | yes | — | Input (max 1048576 chars) |
+| `call_id` | string | yes | — | Call Id (max 64 chars) |
+| `name` | string | yes | — | Name (max 64 chars) |
+| `id` | string \| null | no | — | Id |
+| `namespace` | string \| null | no | — | Namespace |
+| `status` | enum: `in_progress`, `completed`, `incomplete` \| null | no | — | Status |
+
+### DecisionRequest
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `model` | string | yes | — | Model (max 190 chars) |
+| `input` | string \| array of [UserMessage](#usermessage) \| [InstructionMessage](#instructionmessage) \| [AssistantMessage](#assistantmessage) \| [FunctionCall](#functioncall) \| [CustomToolCall](#customtoolcall) \| [ToolOutput](#tooloutput) | yes | — | Input |
+| `questions` | array of [PredicateQuestion](#predicatequestion) \| [ChoiceQuestion](#choicequestion) \| [ScoreQuestion](#scorequestion) | yes | — | Questions (max 400 items) |
+| `prompt_cache_key` | string \| null | no | — | Prompt Cache Key |
+| `prompt_cache_options` | [PromptCacheOptions](#promptcacheoptions) \| null | no | — |  |
+| `safety_identifier` | string \| null | no | — | Safety Identifier |
+
+### FunctionCall
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `function_call` | yes | — | Type |
+| `arguments` | string | yes | — | Arguments (max 1048576 chars) |
+| `call_id` | string | yes | — | Call Id (max 64 chars) |
+| `name` | string | yes | — | Name (max 128 chars) |
+| `id` | string \| null | no | — | Id |
+| `namespace` | string \| null | no | — | Namespace |
+| `status` | enum: `in_progress`, `completed`, `incomplete` \| null | no | — | Status |
+
+### GeminiContent
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `parts` | array of [GeminiPart](#geminipart) | yes | — | Parts (max 1 items) |
+| `role` | string \| null | no | — | Role |
+
+### GeminiDecisionRequest
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `model` | string \| null | no | `null` | Model |
+| `model_row_id` | integer \| null | no | `null` | Model Row Id |
+| `input` | string \| [GeminiDecision_TextContent](#geminidecision_textcontent) \| [GeminiDecision_ImageContent](#geminidecision_imagecontent) \| array of [GeminiDecision_TextContent](#geminidecision_textcontent) \| [GeminiDecision_ImageContent](#geminidecision_imagecontent) | yes | — | Input |
+| `questions` | map of [GeminiDecision_NoulQuestion](#geminidecision_noulquestion) \| [GeminiDecision_ChoiceQuestion](#geminidecision_choicequestion) \| [GeminiDecision_ScoreQuestion](#geminidecision_scorequestion) | yes | — | Questions |
+
+### GeminiDecision_ChoiceQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `instructions` | string \| [GeminiDecision_TextContent](#geminidecision_textcontent) \| array of [GeminiDecision_TextContent](#geminidecision_textcontent) | yes | — | Instructions |
+| `type` | const `choice` | yes | — | Type |
+| `criteria` | map of string | yes | — | Criteria |
+
+### GeminiDecision_ImageContent
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `image` | yes | — | Type |
+| `mime_type` | enum: `image/png`, `image/jpeg`, `image/webp`, `image/heic`, `image/heif`, `image/gif`, `image/bmp`, `image/tiff` | yes | — | Mime Type |
+| `data` | string \| null | no | `null` | Data |
+| `uri` | string \| null | no | `null` | Uri |
+| `resolution` | enum: `low`, `medium`, `high`, `ultra_high` \| null | no | `null` | Resolution |
+
+### GeminiDecision_NoulCriteria
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `true_description` | string \| null | no | `null` | True Description |
+| `false_description` | string \| null | no | `null` | False Description |
+
+### GeminiDecision_NoulQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `instructions` | string \| [GeminiDecision_TextContent](#geminidecision_textcontent) \| array of [GeminiDecision_TextContent](#geminidecision_textcontent) | yes | — | Instructions |
+| `type` | const `noul` | yes | — | Type |
+| `criteria` | [GeminiDecision_NoulCriteria](#geminidecision_noulcriteria) \| null | no | `null` |  |
+
+### GeminiDecision_ScoreQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `instructions` | string \| [GeminiDecision_TextContent](#geminidecision_textcontent) \| array of [GeminiDecision_TextContent](#geminidecision_textcontent) | yes | — | Instructions |
+| `type` | const `score` | yes | — | Type |
+| `criteria` | array of string | yes | — | Criteria (max 255 items) |
+
+### GeminiDecision_TextContent
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `text` | yes | — | Type |
+| `text` | string | yes | — | Text |
+
+### GeminiEmbedRequest
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `model` | string \| null | no | — | Model |
+| `content` | [GeminiContent](#geminicontent) | yes | — |  |
+| `taskType` | enum: `RETRIEVAL_QUERY`, `RETRIEVAL_DOCUMENT`, `SEMANTIC_SIMILARITY`, `CLASSIFICATION`, `CLUSTERING`, `QUESTION_ANSWERING`, `FACT_VERIFICATION`, `CODE_RETRIEVAL_QUERY` \| null | no | — | Tasktype |
+| `title` | string \| null | no | — | Title |
+| `outputDimensionality` | integer \| null | no | — | Outputdimensionality |
+
+### GeminiGenerateRequest
+
+Closed request: ``cachedContent`` and other unsupported fields are named in a 400.
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `contents` | array of map of any | yes | — | Contents |
+| `systemInstruction` | map of any \| null | no | — | Systeminstruction |
+| `generationConfig` | map of any \| null | no | — | Generationconfig |
+| `safetySettings` | array of map of any \| null | no | — | Safetysettings |
+| `tools` | array of map of any \| null | no | — | Tools |
+| `toolConfig` | map of any \| null | no | — | Toolconfig |
+
+### GeminiPart
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `text` | string | yes | — | Text |
+
 ### HTTPValidationError
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `detail` | array of [ValidationError](#validationerror) | no | — | Detail |
+
+### InputImage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `input_image` | no | `"input_image"` | Type |
+| `image_url` | string | yes | — | Image Url (max 1073741824 chars) |
+| `detail` | enum: `low`, `high`, `auto`, `original` \| null | no | `"auto"` | Detail |
+| `prompt_cache_breakpoint` | [CacheBreakpoint](#cachebreakpoint) \| null | no | — |  |
+
+### InputJSON
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `input_json` | no | `"input_json"` | Type |
+| `data` | map of any \| array of map of any | yes | — | Data |
+
+### InputText
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `input_text` | no | `"input_text"` | Type |
+| `text` | string | yes | — | Text (max 10485760 chars) |
+| `prompt_cache_breakpoint` | [CacheBreakpoint](#cachebreakpoint) \| null | no | — |  |
+
+### InstructionMessage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `message` | no | `"message"` | Type |
+| `role` | enum: `developer`, `system` | yes | — | Role |
+| `content` | string \| array of [InputText](#inputtext) | yes | — | Content |
+
+### Level
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `label` | string | yes | — | Label (max 1048576 chars) |
+| `description` | string \| null | no | — | Description |
 
 ### NativeBatchCreateRequest
 
@@ -404,6 +620,13 @@ Each section lists the fields of one component schema referenced by this group's
 | `stream` | boolean | no | `false` | Stream |
 | `temperature` | number \| null | no | — | Temperature |
 | `max_tokens` | integer \| null | no | — | Max Tokens |
+| `max_completion_tokens` | integer \| null | no | — | Max Completion Tokens |
+| `reasoning_effort` | string \| null | no | — | Reasoning Effort |
+| `response_format` | [OpenAIJSONSchemaFormat](#openaijsonschemaformat) \| [OpenAIPlainFormat](#openaiplainformat) \| null | no | — | Response Format |
+| `service_tier` | string \| null | no | — | Service Tier |
+| `prompt_cache_key` | string \| null | no | — | Prompt Cache Key |
+| `prompt_cache_options` | [OpenAIPromptCacheOptions](#openaipromptcacheoptions) \| null | no | — |  |
+| `prompt_cache_retention` | enum: `in_memory`, `in-memory`, `24h` \| null | no | — | Prompt Cache Retention |
 | `tools` | array of map of any \| null | no | — | Tools |
 | `tool_choice` | any | no | — | Tool Choice |
 | `stream_options` | map of any \| null | no | — | Stream Options |
@@ -418,6 +641,17 @@ Each section lists the fields of one component schema referenced by this group's
 | `model` | string | yes | — | Model |
 | `choices` | array of [OpenAIChatChoice](#openaichatchoice) | yes | — | Choices |
 | `usage` | [OpenAIUsage](#openaiusage) | yes | — |  |
+
+### OpenAIEmbeddingRequest
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `model` | string | yes | — | Model (max 190 chars) |
+| `input` | string \| array of string | yes | — | Input |
+| `dimensions` | integer \| null | no | — | Dimensions |
+| `encoding_format` | enum: `float`, `base64` | no | `"float"` | Encoding Format |
+| `user` | string \| null | no | — | User |
+| `provider` | string \| null | no | — | Provider |
 
 ### OpenAIFileDeleted
 
@@ -451,6 +685,22 @@ Each section lists the fields of one component schema referenced by this group's
 | `status_details` | string \| null | no | — | Status Details |
 | `expires_at` | integer \| null | yes | — | Expires At |
 
+### OpenAIJSONSchema
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `name` | string | yes | — | Name (max 64 chars) |
+| `description` | string \| null | no | — | Description |
+| `schema` | map of any | yes | — | Schema |
+| `strict` | boolean \| null | no | — | Strict |
+
+### OpenAIJSONSchemaFormat
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `json_schema` | yes | — | Type |
+| `json_schema` | [OpenAIJSONSchema](#openaijsonschema) | yes | — |  |
+
 ### OpenAIModelItem
 
 | Field | Type | Required | Default | Notes |
@@ -468,6 +718,20 @@ Each section lists the fields of one component schema referenced by this group's
 | `object` | string | no | `"list"` | Object |
 | `data` | array of [OpenAIModelItem](#openaimodelitem) | yes | — | Data |
 
+### OpenAIPlainFormat
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | enum: `json_object`, `text` | yes | — | Type |
+
+### OpenAIPromptCacheOptions
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `ttl` | enum: `30m`, `12h` \| null | no | — | Ttl |
+| `mode` | enum: `implicit`, `explicit` \| null | no | — | Mode |
+| `comparison_response_id` | string \| null | no | — | Comparison Response Id |
+
 ### OpenAIUsage
 
 | Field | Type | Required | Default | Notes |
@@ -475,7 +739,7 @@ Each section lists the fields of one component schema referenced by this group's
 | `prompt_tokens` | integer | no | `0` | Prompt Tokens |
 | `completion_tokens` | integer | no | `0` | Completion Tokens |
 | `total_tokens` | integer | no | `0` | Total Tokens |
-| `prompt_tokens_details` | map of integer | no | — | Prompt Tokens Details |
+| `prompt_tokens_details` | map of any | no | — | Prompt Tokens Details |
 
 ### OutputExpiresAfter
 
@@ -483,6 +747,59 @@ Each section lists the fields of one component schema referenced by this group's
 | --- | --- | --- | --- | --- |
 | `anchor` | const `created_at` | yes | — | Anchor |
 | `seconds` | integer | yes | — | Seconds (numeric lower bound) |
+
+### OutputText
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `output_text` | no | `"output_text"` | Type |
+| `text` | string | yes | — | Text (max 10485760 chars) |
+
+### PredicateQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `predicate` | yes | — | Type |
+| `name` | string \| null | no | — | Name |
+| `instructions` | string \| array of [QuestionText](#questiontext) \| [QuestionImage](#questionimage) \| [InputJSON](#inputjson) | yes | — | Instructions |
+
+### PromptCacheOptions
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `mode` | enum: `implicit`, `explicit` \| null | no | — | Mode |
+| `ttl` | const `30m` | no | `"30m"` | Ttl |
+
+### QuestionImage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `input_image` | no | `"input_image"` | Type |
+| `image_url` | string | yes | — | Image Url (max 1073741824 chars) |
+| `detail` | enum: `low`, `high`, `auto`, `original` \| null | no | `"auto"` | Detail |
+
+### QuestionText
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `input_text` | no | `"input_text"` | Type |
+| `text` | string | yes | — | Text (max 10485760 chars) |
+
+### RefusalText
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `refusal` | no | `"refusal"` | Type |
+| `refusal` | string | yes | — | Refusal (max 10485760 chars) |
+
+### ResponsesPromptCacheOptions
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `ttl` | enum: `30m`, `12h` \| null | no | — | Ttl |
+| `mode` | enum: `implicit`, `explicit` \| null | no | — | Mode |
+| `comparison_response_id` | string \| null | no | — | Comparison Response Id |
+| `prewarm` | boolean \| null | no | — | Prewarm |
 
 ### ResponsesRequest
 
@@ -494,12 +811,16 @@ Each section lists the fields of one component schema referenced by this group's
 | `stream` | boolean | no | `false` | Stream |
 | `store` | boolean \| null | no | — | Store |
 | `previous_response_id` | string \| null | no | — | Previous Response Id |
+| `conversation` | string \| map of any \| null | no | — | Conversation |
 | `background` | boolean \| null | no | — | Background |
 | `include` | array of string \| null | no | — | Include |
 | `prompt_cache_key` | string \| null | no | — | Prompt Cache Key |
+| `prompt_cache_options` | [ResponsesPromptCacheOptions](#responsespromptcacheoptions) \| null | no | — |  |
+| `prompt_cache_retention` | enum: `in_memory`, `in-memory`, `24h` \| null | no | — | Prompt Cache Retention |
 | `client_metadata` | map of any \| null | no | — | Client Metadata |
 | `instructions` | string \| null | no | — | Instructions |
 | `max_output_tokens` | integer \| null | no | — | Max Output Tokens |
+| `max_tool_calls` | integer \| null | no | — | Max Tool Calls |
 | `metadata` | map of any \| null | no | — | Metadata |
 | `parallel_tool_calls` | boolean \| null | no | — | Parallel Tool Calls |
 | `reasoning` | map of any \| null | no | — | Reasoning |
@@ -513,6 +834,33 @@ Each section lists the fields of one component schema referenced by this group's
 | `service_tier` | string \| null | no | — | Service Tier |
 | `safety_identifier` | string \| null | no | — | Safety Identifier |
 | `context_management` | array of map of any \| null | no | — | Context Management |
+
+### ScoreQuestion
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `score` | yes | — | Type |
+| `name` | string \| null | no | — | Name |
+| `instructions` | string \| array of [QuestionText](#questiontext) \| [QuestionImage](#questionimage) \| [InputJSON](#inputjson) | yes | — | Instructions |
+| `levels` | array of [Level](#level) | yes | — | Levels (max 10 items) |
+
+### ToolOutput
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | enum: `function_call_output`, `custom_tool_call_output` | yes | — | Type |
+| `call_id` | string | yes | — | Call Id (max 64 chars) |
+| `output` | string \| array of [InputText](#inputtext) \| [InputImage](#inputimage) | yes | — | Output |
+| `id` | string \| null | no | — | Id |
+| `status` | enum: `in_progress`, `completed`, `incomplete` \| null | no | — | Status |
+
+### UserMessage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `type` | const `message` | no | `"message"` | Type |
+| `role` | const `user` | yes | — | Role |
+| `content` | string \| array of [InputText](#inputtext) \| [InputImage](#inputimage) \| [InputJSON](#inputjson) | yes | — | Content |
 
 ### ValidationError
 

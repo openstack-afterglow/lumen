@@ -28,6 +28,8 @@ GROUPS: dict[str, tuple[str, str]] = {
     "Health": ("auth", "reference.md"),
     "AI Compat Discovery": ("compat", "reference.md"),
     "Chat Completions": ("chat", "reference.md"),
+    "Decisions": ("chat", "reference.md"),
+    "Embeddings": ("chat", "reference.md"),
     "Chat Conversations": ("chat", "reference.md"),
     "Agent Runtime": ("chat", "reference.md"),
     "Chat Agents": ("agents-workspaces", "reference.md"),
@@ -35,6 +37,7 @@ GROUPS: dict[str, tuple[str, str]] = {
     "Chat Workspaces": ("agents-workspaces", "reference.md"),
     "Chat Code Workspaces": ("agents-workspaces", "reference.md"),
     "Chat Assets": ("agents-workspaces", "reference.md"),
+    "Agent Vault": ("agents-workspaces", "reference.md"),
     "Images": ("media", "reference.md"),
     "Audio": ("media", "reference.md"),
     "Realtime Voice": ("media", "reference.md"),
@@ -45,9 +48,13 @@ GROUPS: dict[str, tuple[str, str]] = {
     "Anthropic Compat": ("compat", "reference.md"),
     "OpenAI Files Compat": ("compat", "reference.md"),
     "OpenAI Batch Compat": ("compat", "reference.md"),
+    "OpenAI Decisions Compat": ("compat", "reference.md"),
+    "OpenAI and Gemini Embeddings Compat": ("compat", "reference.md"),
+    "Gemini Compat": ("compat", "reference.md"),
     "Batches": ("compat", "reference.md"),
     "Coding CLI Model Catalog": ("compat", "reference.md"),
     "Chat Extensions": ("tools-mcp", "reference.md"),
+    "Chat Extension Archives": ("tools-mcp", "reference.md"),
     "Plugin Catalogue": ("tools-mcp", "reference.md"),
     "Chat MCP OAuth": ("tools-mcp", "reference.md"),
     "Chat Extensions Admin": ("tools-mcp", "reference-admin.md"),
@@ -57,6 +64,7 @@ GROUPS: dict[str, tuple[str, str]] = {
     "Chat Usage": ("billing", "reference.md"),
     "Chat Stats": ("billing", "reference.md"),
     "Chat Quotas": ("billing", "reference.md"),
+    "Domain Credits": ("billing", "reference.md"),
     "Chat Administration": ("admin", "reference.md"),
     "Agent Runtime Administration": ("admin", "reference.md"),
 }
@@ -66,6 +74,7 @@ AUTH_LABELS = {
     "XApiKey": "API key (x-api-key)",
     "KeystoneToken": "Keystone (X-Auth-Token)",
     "KeystoneBearer": "Keystone (Bearer)",
+    "GoogleApiKey": "API key (x-goog-api-key)",
 }
 
 

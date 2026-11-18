@@ -13,6 +13,7 @@ Each section lists the fields of one component schema referenced by this group's
 | `avatar` | string \| null | no | — | Avatar |
 | `instructions` | string \| null | no | — | Instructions |
 | `model_name` | string \| null | no | — | Model Name |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 | `params` | map of any \| null | no | — | Params |
 | `mcp_ids` | array of integer \| null | no | — | Mcp Ids |
 | `tool_ids` | array of integer \| null | no | — | Tool Ids |
@@ -30,6 +31,7 @@ Each section lists the fields of one component schema referenced by this group's
 | `avatar` | string \| null | no | — | Avatar |
 | `instructions` | string \| null | no | — | Instructions |
 | `model_name` | string \| null | no | — | Model Name |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 | `params` | map of any \| null | no | — | Params |
 | `mcp_ids` | array of integer \| null | no | — | Mcp Ids |
 | `tool_ids` | array of integer \| null | no | — | Tool Ids |
@@ -126,6 +128,38 @@ Each section lists the fields of one component schema referenced by this group's
 | `content` | string \| null | no | — | Content |
 | `is_active` | boolean \| null | no | — | Is Active |
 | `category` | enum: `interest`, `development`, `habit`, `preference`, `general` \| null | no | — | Category |
+| `expectedHash` | string \| null | no | — | Expectedhash |
+
+### NoteReplace
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `content` | string | yes | — | Content (max 100000 chars) |
+| `title` | string \| null | no | — | Title |
+| `expectedHash` | string | yes | — | Expectedhash |
+
+### NoteWrite
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `kind` | enum: `user_note`, `profile`, `coding_standards`, `short_term`, `long_term`, `role_memory`, `handoff`, `log`, `worktree`, `knowledge`, `project`, `spec`, `change`, `wiki`, `persona` | yes | — | Kind |
+| `slug` | string | yes | — | Slug |
+| `title` | string | yes | — | Title (max 200 chars) |
+| `content` | string | yes | — | Content (max 100000 chars) |
+| `mode` | enum: `create`, `append`, `replace` | no | `"create"` | Mode |
+| `expectedHash` | string \| null | no | — | Expectedhash |
+| `scope` | enum: `domain`, `global` | no | `"domain"` | Scope |
+| `project_key` | string \| null | no | — | Project Key |
+| `role` | enum: `coordinator`, `builder`, `investigator`, `reviewer` \| null | no | — | Role |
+| `metadata` | map of any \| null | no | — | Metadata |
+| `workspace_id` | integer \| null | no | — | Workspace Id |
+
+### SlotWrite
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `content` | string | yes | — | Content (max 100000 chars) |
+| `expectedHash` | string \| null | no | — | Expectedhash |
 
 ### ValidationError
 

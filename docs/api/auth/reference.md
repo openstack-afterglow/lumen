@@ -8,6 +8,7 @@
 | GET | `/v1/` | V1 Discovery | none (public) | — | — | 200 | `v1_discovery_v1__get` |
 | GET | `/v1/admin/api-keys` | List Admin Api Keys | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `list_admin_api_keys_v1_admin_api_keys_get` |
 | PATCH | `/v1/admin/api-keys/{key_id}/limits` | Update Admin Api Key Limits | Keystone (X-Auth-Token), Keystone (Bearer) | — | [ApiKeyLimitUpdateBody](schemas.md#apikeylimitupdatebody) | 200 | `update_admin_api_key_limits_v1_admin_api_keys__key_id__limits_patch` |
+| GET | `/v1/admin/service-keys` | List Admin Service Keys | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `list_admin_service_keys_v1_admin_service_keys_get` |
 | GET | `/v1/api-keys` | List Api Keys | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `list_api_keys_v1_api_keys_get` |
 | POST | `/v1/api-keys` | Create Api Key | Keystone (X-Auth-Token), Keystone (Bearer) | — | [ApiKeyCreateBody](schemas.md#apikeycreatebody) | 201 | `create_api_key_v1_api_keys_post` |
 | GET | `/v1/api-keys/issuance-policy` | Get Api Key Issuance Policy | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `get_api_key_issuance_policy_v1_api_keys_issuance_policy_get` |
@@ -17,3 +18,8 @@
 | GET | `/v1/health` | Health | none (public) | — | — | 200 | `health_v1_health_get` |
 | GET | `/v1/policy/capabilities` | Policy Capabilities | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `policy_capabilities_v1_policy_capabilities_get` |
 | GET | `/v1/ready` | Ready | none (public) | — | — | 200 | `ready_v1_ready_get` |
+| GET | `/v1/service-keys` | List Service Keys | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `list_service_keys_v1_service_keys_get` |
+| POST | `/v1/service-keys` | Create Service Key | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | [ApiKeyCreateBody](schemas.md#apikeycreatebody) | 201 | `create_service_key_v1_service_keys_post` |
+| GET | `/v1/service-keys/issuance-policy` | Get Service Key Issuance Policy | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 200 | `get_service_key_issuance_policy_v1_service_keys_issuance_policy_get` |
+| DELETE | `/v1/service-keys/{key_id}` | Revoke Service Key | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | — | 204 | `revoke_service_key_v1_service_keys__key_id__delete` |
+| PATCH | `/v1/service-keys/{key_id}/limits` | Update Service Key Limits | Keystone (X-Auth-Token), Keystone (Bearer), API key (Bearer), API key (x-api-key) | — | [ApiKeyOwnerLimitUpdateBody](schemas.md#apikeyownerlimitupdatebody) | 200 | `update_service_key_limits_v1_service_keys__key_id__limits_patch` |
