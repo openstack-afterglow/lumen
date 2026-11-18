@@ -160,6 +160,9 @@ async def test_identical_dual_headers_work_but_mismatch_is_rejected(client, gate
 
     async def verify(raw):
         return {
+            "credential_class": "claude_gateway",
+            "auth_type": "api_key",
+            "source": "api",
             "user_id": "user-1",
             "project_id": "project-1",
             "api_key_id": 19,

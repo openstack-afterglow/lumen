@@ -234,6 +234,7 @@ def _resolve_domain_authority(
 async def resolve_domain_authority(
     user_id: str, project_id: str, domain_id: str | None = None, *, credential_authority: dict | None = None,
     compute_manage: bool = True, unrestricted_human: bool = False,
+    allow_system_admin: bool = True,
 ) -> DomainAuthority:
     """Resolve exact domain access using fresh identity and native role provenance.
 
@@ -248,7 +249,10 @@ async def resolve_domain_authority(
     )
     return await run_in_threadpool(
         _resolve_domain_authority, user_id, project_id, domain_id,
-        is_system_admin=unrestricted_human and credential_authority is None and current["is_system_admin"] is True,
+        is_system_admin=(
+            allow_system_admin and unrestricted_human and credential_authority is None
+            and current["is_system_admin"] is True
+        ),
         issued_role_ids=issued, compute_manage=compute_manage and unrestricted_human,
     )
 

@@ -66,7 +66,7 @@ async def _run(model: str, inputs: list[str], *, principal: Principal, dimension
         route = await embeddings.resolve(model.removeprefix("models/"), provider=provider, provider_type=provider_type)
         return await embeddings.embed(
             route=route, inputs=inputs, user_id=principal["user_id"], project_id=principal["project_id"],
-            api_key_id=principal.get("api_key_id"), required_scopes=("compat:completions:write",),
+            api_key_id=principal.get("api_key_id"), required_scopes=("embeddings:write",),
             payer=principal.get("payer"),
             dimensions=dimensions, task_type=task_type, title=title,
         )
@@ -76,7 +76,7 @@ async def _run(model: str, inputs: list[str], *, principal: Principal, dimension
 
 @router.post("/embeddings", openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]})
 async def openai_embeddings(body: OpenAIEmbeddingRequest,
-        principal: Principal = Depends(require_api_key_scopes("compat:completions:write"))):
+        principal: Principal = Depends(require_api_key_scopes("embeddings:write"))):
     try:
         inputs = [body.input] if isinstance(body.input, str) else body.input
         if not isinstance(inputs, list) or not all(isinstance(item, str) for item in inputs):
@@ -97,7 +97,7 @@ async def openai_embeddings(body: OpenAIEmbeddingRequest,
 async def gemini_embed(model: str, body: GeminiEmbedRequest,
         x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider", min_length=1, max_length=40,
                                               pattern=r"^[a-z0-9][a-z0-9_-]*$"),
-        principal: Principal = Depends(require_api_key_scopes("compat:completions:write"))):
+        principal: Principal = Depends(require_api_key_scopes("embeddings:write"))):
     result = await _run(model, [body.content.parts[0].text], principal=principal,
                         dimensions=body.outputDimensionality, max_inputs=1, provider_type="gemini",
                         provider=x_lumen_provider,
@@ -109,7 +109,7 @@ async def gemini_embed(model: str, body: GeminiEmbedRequest,
 async def gemini_batch_embed(model: str, request: Request,
         x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider", min_length=1, max_length=40,
                                               pattern=r"^[a-z0-9][a-z0-9_-]*$"),
-        principal: Principal = Depends(require_api_key_scopes("compat:completions:write"))):
+        principal: Principal = Depends(require_api_key_scopes("embeddings:write"))):
     try:
         payload: Any = await request.json()
         requests = [GeminiEmbedRequest.model_validate(row) for row in payload["requests"]]

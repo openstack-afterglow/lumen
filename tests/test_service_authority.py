@@ -221,7 +221,7 @@ async def test_actual_fastapi_auth_revalidates_current_roles_and_ignores_role_he
         "is_system_admin": False, "auth_token": "synthetic"})
     current_roles = ["member"]
     async def current(user_id, project_id):
-        return {"roles": list(current_roles), "is_system_admin": False}
+        return {"roles": list(current_roles), "is_system_admin": False, "domain_id": "project-domain"}
     monkeypatch.setattr(auth, "resolve_project_authority", current)
     async with AsyncClient(transport=ASGITransport(application), base_url="http://synthetic") as client:
         headers = {"X-Auth-Token": "synthetic", "X-Roles": "admin", "X-Is-System-Admin": "true"}
@@ -255,7 +255,7 @@ async def test_current_member_authorizes_without_service_graph_and_revokes_with_
     _keystone(monkeypatch, assignments=assignments, rules=[],
               role_rows=[SimpleNamespace(id="member", name="member", domain_id=None)])
     current = await auth.resolve_project_authority("user", "project")
-    assert current == {"roles": ["member"], "is_system_admin": False}
+    assert current == {"roles": ["member"], "is_system_admin": False, "domain_id": "project-domain"}
     assert allowed_scopes(principal(current["roles"])) == frozenset(SCOPE_CAPABILITIES)
     assignments.clear()
     with pytest.raises(HTTPException) as error:
@@ -320,7 +320,7 @@ async def test_domain_privileged_label_does_not_add_global_or_service_authority(
               role_rows=[SimpleNamespace(id="reader", name="reader", domain_id=None),
                          SimpleNamespace(id="domain-privileged", name=label, domain_id="domain")])
     current = await auth.resolve_project_authority("user", "project")
-    assert current == {"roles": ["reader"], "is_system_admin": False}
+    assert current == {"roles": ["reader"], "is_system_admin": False, "domain_id": "project-domain"}
     with pytest.raises(HTTPException):
         auth.ensure_scopes(principal(current["roles"]), "compat:completions:write")
 
@@ -345,7 +345,7 @@ def zero_role_system_token(monkeypatch):
         "user_id": "user", "project_id": "target", "connection_project_id": "home",
         "roles": [], "is_system_admin": True, "auth_token": "synthetic-home-token",
     })
-    authority = AsyncMock(return_value={"roles": [], "is_system_admin": True})
+    authority = AsyncMock(return_value={"roles": [], "is_system_admin": True, "domain_id": "target-domain"})
     monkeypatch.setattr(auth, "validate_token", validation)
     monkeypatch.setattr(auth, "resolve_project_authority", authority)
     return validation, authority
@@ -383,13 +383,12 @@ async def test_native_agent_crud_zero_role_system_admin_preserves_owner_namespac
         delete.side_effect = agents.ags.AgentForbidden("not owned")
         assert (await client.get("/v1/agents/8", headers=headers)).status_code == 403
         assert (await client.delete("/v1/agents/8", headers=headers)).status_code == 403
-    create.assert_awaited_once_with(owner_user_id="user", project_id="target", **agents.AgentCreate(name="owned").model_dump())
-    listing.assert_awaited_once_with(user_id="user", project_id="target", include_private=True)
-    assert detail.await_args_list == [
-        ((7,), {"user_id": "user", "project_id": "target"}),
-        ((8,), {"user_id": "user", "project_id": "target"}),
-    ]
-    update.assert_awaited_once_with(7, user_id="user", project_id="target", patch={"name": "renamed"})
+    owner = {"user_id": "user", "project_id": "target", "domain_id": "target-domain"}
+    create.assert_awaited_once_with(owner_user_id="user", project_id="target", domain_id="target-domain",
+                                    **agents.AgentCreate(name="owned").model_dump())
+    listing.assert_awaited_once_with(**owner, include_private=True)
+    assert detail.await_args_list == [((7,), owner), ((8,), owner)]
+    update.assert_awaited_once_with(7, **owner, patch={"name": "renamed"})
     assert delete.await_args_list == detail.await_args_list
     validation, authority = zero_role_system_token
     assert validation.call_count == authority.await_count == 7
@@ -483,7 +482,9 @@ async def test_raw_group_system_grant_and_current_membership_are_both_required(m
                         group_assignments={"operators": [row]},
                         role_rows=[SimpleNamespace(id="parent", name="platform-owner", domain_id=None),
                                    SimpleNamespace(id="admin", name="admin", domain_id=None)])
-    assert await auth.resolve_project_authority("user", "project") == {"roles": [], "is_system_admin": True}
+    assert await auth.resolve_project_authority("user", "project") == {
+        "roles": [], "is_system_admin": True, "domain_id": "project-domain",
+    }
     assert queries == [{"user": "user", "project": "project", "effective": True},
                        {"user": "user", "system": "all"}, {"group": "operators", "system": "all"}]
     rules[0].implies = []
@@ -534,11 +535,11 @@ async def test_reduced_issued_ids_are_a_ceiling_not_an_inference_root(monkeypatc
                         role_rows=catalog, rules=rules,
                         system_assignments=[_assignment("admin", scope={"system": {"all": True}})])
     current = auth._resolve_project_authority("user", "project", issued_role_ids=("reader", "manager"))
-    assert current == {"roles": ["manager", "reader"], "is_system_admin": False}
+    assert current == {"roles": ["manager", "reader"], "is_system_admin": False, "domain_id": "project-domain"}
     assert queries == [{"user": "user", "project": "project", "effective": True}]
     auth.ensure_scopes(principal(current["roles"]), "compat:completions:write")
     current = auth._resolve_project_authority("user", "project", issued_role_ids=("reader", "member"))
-    assert current == {"roles": ["reader"], "is_system_admin": False}
+    assert current == {"roles": ["reader"], "is_system_admin": False, "domain_id": "project-domain"}
     with pytest.raises(HTTPException):
         auth.ensure_scopes(principal(current["roles"]), "compat:completions:write")
 
