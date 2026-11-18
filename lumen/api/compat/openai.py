@@ -20,9 +20,9 @@ from lumen.auth import ensure_scopes, require_api_key_scopes
 from lumen.models.api_requests import OpenAIChatRequest, OpenAIChatResponse
 from lumen.services import completion_api as core
 from lumen.services import openai_compat
-from lumen.services.completion_format import nonstream_response
+from lumen.services.completion_format import nonstream_response, prompt_token_details
 from lumen.services.inference_authority import completion_scopes
-from lumen.services.infrastructure.api_load import admit_sse
+from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 from lumen.services.providers import errors, routing
 
 router = APIRouter()
@@ -84,7 +84,7 @@ def usage_chunk(done: dict, *, cmpl_id: str, created: int, model: str) -> dict:
             "prompt_tokens": done["prompt_tokens"],
             "completion_tokens": done["completion_tokens"],
             "total_tokens": done["prompt_tokens"] + done["completion_tokens"],
-            "prompt_tokens_details": {"cached_tokens": done.get("cache_read_input_tokens", 0)},
+            "prompt_tokens_details": prompt_token_details(done),
         },
     }
 
@@ -152,7 +152,7 @@ async def chat_completions(
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
     ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
-    if body.max_tokens is not None and body.max_tokens <= 0:
+    if body.max_completion_tokens is None and body.max_tokens is not None and body.max_tokens <= 0:
         return openai_error_response(400, "max_tokens must be positive", code="invalid_max_tokens")
     user_id, project_id = token_info["user_id"], token_info["project_id"]
     api_key_id = token_info.get("api_key_id")
@@ -163,6 +163,9 @@ async def chat_completions(
         return openai_error_response(exc.status_code, exc.message)
 
     if openai_compat.is_lumen_virtual_model(body.model):
+        if body.provider_options():
+            return openai_error_response(422, "Provider options are not supported for model=lumen",
+                                         code="provider_options_not_supported_for_lumen")
         if selected_provider is not None:
             return openai_error_response(
                 400,
@@ -239,6 +242,8 @@ async def chat_completions(
         return openai_error_response(exc.status_code, exc.message)
 
     cmpl_id, created = _completion_id(), int(time.time())
+    options = body.provider_options()
+    max_output = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
     include_usage = bool((body.stream_options or {}).get("include_usage"))
 
     if not body.stream:
@@ -249,33 +254,36 @@ async def chat_completions(
                 user_id=user_id,
                 project_id=project_id,
                 api_key_id=api_key_id,
-                max_tokens=body.max_tokens,
+                max_tokens=max_output,
                 temperature=body.temperature,
                 tools=body.tools,
                 tool_choice=body.tool_choice,
+                options=options,
             )
         except core.CompletionError as exc:
-            return openai_error_response(exc.status_code, exc.message)
+            return openai_error_response(exc.status_code, exc.message, code=exc.code)
         except Exception:
             return openai_error_response(502, "업스트림 모델 오류")
         return nonstream_response(result, cmpl_id=cmpl_id, created=created)
 
     try:
-        stream = core.complete_stream(
+        stream = await core.complete_stream(
             resolved=resolved,
             messages=body.messages,
             user_id=user_id,
             project_id=project_id,
             api_key_id=api_key_id,
-            max_tokens=body.max_tokens,
+            max_tokens=max_output,
             temperature=body.temperature,
             tools=body.tools,
             tool_choice=body.tool_choice,
+            options=options,
         )
     except core.CompletionError as exc:
-        return openai_error_response(exc.status_code, exc.message)
+        return openai_error_response(exc.status_code, exc.message, code=exc.code)
     except Exception:
         return openai_error_response(502, "업스트림 모델 오류")
+    register_sse_resource(request, stream)
 
     async def gen() -> AsyncIterator[str]:
         async with aclosing(stream):
@@ -286,7 +294,7 @@ async def chat_completions(
                     if include_usage:
                         yield _sse(usage_chunk(ev, cmpl_id=cmpl_id, created=created, model=resolved["api_model_name"]))
                 elif ev["type"] == "error":
-                    yield _sse(openai_error_dict(ev.get("message", "오류"), type_="api_error"))
+                    yield _sse(openai_error_dict(ev.get("message", "오류"), type_="api_error", code=ev.get("code")))
                     return
         yield "data: [DONE]\n\n"
 

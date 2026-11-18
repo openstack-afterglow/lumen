@@ -22,7 +22,8 @@ _OFFICIAL_HOSTS = {
     "perplexity": {"docs.perplexity.ai", "www.perplexity.ai", "perplexity.ai"},
 }
 _TOKEN_FIELDS = frozenset({"input", "output", "cache_read", "cache_write", "cache_write_long"})
-_ENTRY_FIELDS = frozenset({"id", "aliases", "kind", "display_name", "status", "context_window", "max_output_tokens", "input_modalities", "output_modalities", "capabilities", "token_pricing", "media_pricing", "source_urls", "verified_at", "notes", "embedding", "reasoning_options"})
+_OPTIONAL_ENTRY_FIELDS = frozenset({"embedding", "reasoning_options", "max_input_tokens"})
+_ENTRY_FIELDS = _OPTIONAL_ENTRY_FIELDS | {"id", "aliases", "kind", "display_name", "status", "context_window", "max_output_tokens", "input_modalities", "output_modalities", "capabilities", "token_pricing", "media_pricing", "source_urls", "verified_at", "notes"}
 _EMBEDDING_FIELDS = frozenset({"default_dimensions", "supports_dimensions", "min_dimensions", "max_dimensions", "allowed_dimensions"})
 
 
@@ -170,7 +171,7 @@ def validate_catalog(value: object) -> dict:
             raise ValueError(f"{provider}.models: list required")
         identities: set[str] = set()
         for entry in record["models"]:
-            entry = _object(entry, _ENTRY_FIELDS, f"{provider}.model", _ENTRY_FIELDS - {"embedding", "reasoning_options"})
+            entry = _object(entry, _ENTRY_FIELDS, f"{provider}.model", _ENTRY_FIELDS - _OPTIONAL_ENTRY_FIELDS)
             model_id = _string(entry["id"], "id")
             names = [model_id, *_strings(entry["aliases"], "aliases")]
             if len(names) != len(set(names)) or identities.intersection(names):
@@ -184,6 +185,10 @@ def validate_catalog(value: object) -> dict:
             validate_reasoning_options(entry.get("reasoning_options"))
             _string(entry["display_name"], "display_name")
             _positive_integer(entry["context_window"], "context_window")
+            if "max_input_tokens" in entry:
+                _positive_integer(entry["max_input_tokens"], "max_input_tokens", nullable=False)
+                if entry["context_window"] is None or entry["max_input_tokens"] > entry["context_window"]:
+                    raise ValueError("max_input_tokens cannot exceed context_window")
             if entry["kind"] == "decision":
                 if provider != "gemini":
                     raise ValueError(f"{provider}/{model_id}: decision kind requires Gemini")

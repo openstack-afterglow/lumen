@@ -12,6 +12,8 @@ Invariants:
 - ``uncached_input_tokens`` is derived and never negative.
 - When cache creation is known but its TTL split is missing, all of it is
   attributed to the 5 minute bucket (Anthropic's default TTL).
+- The persisted short/long slots also carry OpenAI's 30m/12h writes.
+  OpenAI write totals must have a consistent TTL split; never guess a TTL.
 - ``modality_tokens`` carries provider-REPORTED image/audio shares of those
   aggregates. A direction that is ``None`` was not reported; ``0`` was. A
   modality's ``input_tokens`` includes its own cache read. Cache creation is
@@ -109,6 +111,27 @@ def _split_creation(total: int | None, reported_1h: int | None, reported_5m: int
         return (reported_5m or 0), (reported_1h or 0)
     one_hour = min(reported_1h, total) if reported_1h is not None else 0
     return total - one_hour, one_hour
+
+
+def _openai_cache_writes(details: Any) -> tuple[int, int] | None:
+    """Return OpenAI short/long writes; reject ambiguous or inconsistent evidence."""
+    total = _reported(details, "cache_write_tokens")
+    split = _field(details, "cache_write_tokens_details")
+    if total is None and split is None:
+        return 0, 0
+    if not isinstance(total, int):
+        return None
+    if split is None:
+        return (0, 0) if total == 0 else None
+    if not isinstance(split, Mapping):
+        return None
+    short = _reported(split, "ttl_30m_tokens")
+    long = _reported(split, "ttl_12h_tokens")
+    if _MALFORMED in (short, long):
+        return None
+    short, long = short or 0, long or 0
+    return (short, long) if short + long == total else None
+
 
 
 def _sum_optional(left: int | None, right: int | None) -> int | None:
@@ -446,12 +469,18 @@ class UsageBreakdown:
         creation = _count(_field(details, "cache_creation_tokens"))
         if creation is None:
             creation = _count(_field(usage, "cache_creation_input_tokens"))
-        if creation is None:
-            creation = _count(_field(details, "cache_write_tokens"))
+        openai_writes = _field(details, "cache_write_tokens_details") is not None or (
+            creation is None and _field(details, "cache_write_tokens") is not None
+        )
         split = _field(details, "cache_creation_token_details")
         reported_1h = _count(_field(split, "ephemeral_1h_input_tokens"))
         reported_5m = _count(_field(split, "ephemeral_5m_input_tokens"))
-        five_minute, one_hour = _split_creation(creation, reported_1h, reported_5m)
+        if openai_writes:
+            split_writes = _openai_cache_writes(details)
+            invalid = invalid or split_writes is None or creation is not None or split is not None
+            five_minute, one_hour = split_writes or (0, 0)
+        else:
+            five_minute, one_hour = _split_creation(creation, reported_1h, reported_5m)
         counters = (
             _field(details, "cached_tokens"), _field(usage, "cache_read_input_tokens"),
             _field(details, "cache_creation_tokens"), _field(usage, "cache_creation_input_tokens"),
@@ -529,18 +558,34 @@ class UsageBreakdown:
             output = _count(usage.get("output_tokens"))
             if input_tokens is None or output is None:
                 return None
+            total = _reported(usage, "total_tokens")
+            if total is _MALFORMED or (total is not None and total != input_tokens + output):
+                return None
         details = usage.get("input_tokens_details")
-        cached = _count(details.get("cached_tokens")) if isinstance(details, Mapping) else None
-        base = cls.from_totals(input_tokens, output, cache_read_input_tokens=cached or 0)
+        cached = _reported(details, "cached_tokens")
+        writes = _openai_cache_writes(details)
+        invalid = (
+            details is not None and not isinstance(details, Mapping)
+            or cached is _MALFORMED
+            or writes is None
+        )
+        short, long = writes or (0, 0)
+        read = cached if isinstance(cached, int) else 0
+        invalid = invalid or read + short + long > input_tokens
+        base = cls.from_totals(
+            input_tokens, output, cache_read_input_tokens=read,
+            cache_creation_5m_input_tokens=short, cache_creation_1h_input_tokens=long,
+        )
         if iteration_totals is not None:
             # Top-level details do not cover the compaction iteration: modality shares are unknown.
-            return base
+            return replace(base, modality_usage_invalid=invalid or bool(short or long))
         cached_split = _field(details, "cached_tokens_details")
         return cls._with_reported(
             base,
             cls._openai_details(details),
             cls._openai_details(usage.get("output_tokens_details")),
             cls._openai_details(cached_split) if cached_split is not None else None,
+            invalid=invalid,
         )
 
     @classmethod
