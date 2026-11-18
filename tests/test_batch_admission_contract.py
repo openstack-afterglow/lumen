@@ -268,3 +268,27 @@ async def test_result_jsonl_routes_success_http_failure_and_unknown(monkeypatch)
     assert errors[1]["response"] is None and errors[1]["error"]["code"] == "provider_result_unknown"
     assert output[0]["id"] == "batch_req_" + uuid5(UUID(batch_id), "success").hex
     assert all(set(row) == {"id", "custom_id", "response", "error"} for row in output + errors)
+
+
+def test_batches_normalize_svg_author_and_require_text_authority():
+    from lumen.models.batch_contracts import validate_batch_body
+
+    source = {"model": "gpt-image-2.6-flare", "prompt": "Draw", "output_format": "svg",
+              "svg": {"model": "gpt-5", "reasoning": {"effort": "low"}}}
+    body = validate_batch_body("images.generations", source, contract="openai")
+    assert body["svg_model"] == "gpt-5" and body["svg_reasoning_effort"] == "low" and "svg" not in body
+    assert batches._scopes("images.generations", "openai", body) == (
+        "compat:batches:write", "compat:images:write", "compat:completions:write",
+    )
+
+
+@pytest.mark.parametrize("extra", [{"input_asset_ids": [str(uuid4()), str(uuid4())]},
+                                  {"mask_asset_id": str(uuid4())}, {"markup_asset_id": str(uuid4())}])
+def test_native_batch_image_edits_only_pin_a_single_unadorned_source(extra):
+    from lumen.models.batch_contracts import validate_batch_body
+
+    body = {"model_id": "gpt-image-2.6-flare", "prompt": "Draw"}
+    if "input_asset_ids" not in extra:
+        body["input_asset_id"] = str(uuid4())
+    with pytest.raises(ValueError, match="Batch image edits support only one source"):
+        validate_batch_body("images.edits", {**body, **extra}, contract="native")

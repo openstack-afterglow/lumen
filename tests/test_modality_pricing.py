@@ -42,7 +42,12 @@ def test_media_pricing_keeps_omission_distinct_from_zero_and_rejects_ambiguous_n
         "token_rates": {"image": {"input_per_million": "1.5"}},
     }
     image = {"billing_basis": "tokens", "token_rates": {"image": {"output_per_million": "32"}}}
-    assert pricing.validate_media_pricing("image", image) == image
+    assert pricing.validate_media_pricing("image", image, provider_type="openai") == image
+    assert pricing.media_pricing_available("image", image, text_input_priced=True, provider_type="openai")
+    assert not pricing.media_pricing_available("image", image, text_input_priced=True, provider_type="gemini")
+    with pytest.raises(ProviderValidationError, match="reservation_usd"):
+        pricing.validate_media_pricing("image", image, provider_type="gemini")
+    assert pricing.validate_media_pricing("image", {**image, "reservation_usd": "1"}, provider_type="gemini")
     for kind, value in (
         ("text", {"token_rates": {"audio": {"input_per_million": 0.1}}}),
         ("text", {"token_rates": {"audio": {"input_per_million": " 1"}}}),

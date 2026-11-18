@@ -42,7 +42,7 @@ _POLL_INTERVAL_SECONDS = 0.25
 _EDIT_FIELDS = frozenset({
     "image", "image[]", "mask", "markup", "prompt", "model", "n", "size", "quality",
     "response_format", "provider", "provider_id",
-    "stream", "partial_images", *IMAGE_OPTION_KEYS,
+    "stream", "partial_images", *(key for key in IMAGE_OPTION_KEYS if not key.startswith("svg_")),
 })
 
 

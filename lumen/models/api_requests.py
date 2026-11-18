@@ -193,11 +193,34 @@ class ImageEditRequest(ImageGenerationRequest):
         return self
 
 
+class OpenAIImageSvgReasoning(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    effort: str | None = Field(default=None, min_length=1, max_length=20)
+
+
+class OpenAIImageSvgOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1, max_length=190)
+    reasoning: OpenAIImageSvgReasoning | None = None
+
+
 class OpenAIImageGenerationRequest(ImageOptions):
     model: str = Field(min_length=1, max_length=190)
     provider: str | None = None
     provider_id: int | None = None
     response_format: str = "b64_json"
+    svg: OpenAIImageSvgOptions | None = Field(default=None, exclude=True)
+
+    @model_validator(mode="after")
+    def normalize_svg(self) -> OpenAIImageGenerationRequest:
+        if self.svg is not None:
+            if self.svg_model is not None or self.svg_reasoning_effort is not None:
+                raise ValueError("specify either svg or flat SVG author options")
+            self.svg_model = self.svg.model
+            self.svg_reasoning_effort = self.svg.reasoning.effort if self.svg.reasoning else None
+        return self
 
 
 class SpeechRequest(BaseModel):

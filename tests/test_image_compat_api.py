@@ -293,9 +293,10 @@ def test_compat_explicit_svg_author_requires_text_scope(monkeypatch):
     app.dependency_overrides[get_principal] = _principal
     client = TestClient(app)
     body = {"model": "gpt-image-2.6-flare", "prompt": "Draw", "output_format": "svg",
-            "svg_model": "gpt-5", "svg_reasoning_effort": "low"}
+            "svg": {"model": "gpt-5", "reasoning": {"effort": "low"}}}
     assert client.post("/v1/images/generations", json=body).status_code == 403
     app.dependency_overrides[get_principal] = lambda: {
         **_principal(), "scopes": (*_principal()["scopes"], "compat:completions:write"),
     }
     assert client.post("/v1/images/generations", json=body).status_code == 200
+    assert client.post("/v1/images/generations", json={**body, "svg_model": "gpt-5"}).status_code == 422
