@@ -216,6 +216,7 @@ async def test_agent_routes_forward_only_verified_domain(client, monkeypatch, re
         assert (await client.request(method, path, json=body)).is_success
     assert len(forwarded) == len(requests)
     for kwargs in forwarded:
-        assert kwargs["domain_id"] == (None if restricted else "verified-domain")
+        # Unverified callers use the store default: exact selected-project legacy rows only.
+        assert kwargs.get("domain_id") == (None if restricted else "verified-domain")
         assert kwargs["project_id"] == "test-project-123"
         assert "domain_id" not in kwargs.get("patch", {})
