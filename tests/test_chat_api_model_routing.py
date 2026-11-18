@@ -547,8 +547,12 @@ async def test_admin_image_leaf_override_merges_validates_and_clears(provider_db
     assert model["effective_text_price_sources"] == {
         "input_price_per_million": "manual", "cache_read_price_per_million": "catalog",
     }
+    assert model["catalog_entry"]["kind"] == "image"
+    assert model["catalog_entry"]["id"] == "gpt-image-2.6-sunburst"
     assert model["catalog_entry"]["token_pricing"] == {"input": "5.00", "cache_read": "1.25"}
-    assert model["catalog_entry"]["media_pricing"]["token_rates"]["image"]["output_per_million"] == "30.00"
+    assert model["catalog_entry"]["media_pricing"] == {
+        "billing_basis": "tokens", "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}},
+    }
     assert model["effective_capabilities"]["feature_gates"]["image_output"]["available"]
 
     # A manual image cache rate is valid because effective pricing has catalog image input.
@@ -574,14 +578,20 @@ async def test_admin_image_leaf_override_merges_validates_and_clears(provider_db
         }}},
     })
     assert cleared.status_code == 200, cleared.text
-    model = cleared.json()
+    listed = await admin_client.get(path)
+    assert listed.status_code == 200, listed.text
+    model = next(row for row in listed.json() if row["id"] == model_id)
     assert model["media_pricing"] == {"override_mode": "leaf"}
     assert model["price_origin"] == "native_catalog" and model["price_source"] is None
+    assert model["catalog_entry"]["kind"] == "image"
+    assert model["catalog_entry"]["token_pricing"] == {"input": "5.00", "cache_read": "1.25"}
     assert model["effective_media_pricing"] == model["catalog_entry"]["media_pricing"]
-    assert model["effective_media_price_sources"]["token_rates"]["image"] == {
-        "input_per_million": "catalog", "output_per_million": "catalog",
+    assert model["effective_media_price_sources"] == {
+        "billing_basis": "catalog", "token_rates": {"image": {"input_per_million": "catalog", "output_per_million": "catalog"}},
     }
-    assert model["effective_text_price_sources"]["input_price_per_million"] == "catalog"
+    assert model["effective_text_price_sources"] == {
+        "input_price_per_million": "catalog", "cache_read_price_per_million": "catalog",
+    }
     assert Decimal(model["effective_input_price_per_million"]) == 5
 
 
