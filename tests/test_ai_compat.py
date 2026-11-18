@@ -1056,7 +1056,7 @@ class TestOpenAILumenVirtualModel:
 
         async def list_models(model_kind=None):
             return [] if model_kind == "embedding" else [
-                {"model_name": "gpt-4o", "api_model_name": "gpt-4o", "api_provider": "openai"},
+                {"model_name": "gpt-4o", "api_model_name": "gpt-4o", "api_provider": "openai", "required_scopes": []},
             ]
 
         created = []
