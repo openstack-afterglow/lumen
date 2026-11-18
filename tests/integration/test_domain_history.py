@@ -157,6 +157,7 @@ async def test_history_http_resolves_current_project_domain_without_principal_ov
     foreign = {"user_id": user_id, "project_id": str(uuid4()), "domain_id": str(uuid4())}
     projects = {scope["project_id"]: scope["domain_id"] for scope in (origin, current, foreign)}
     roles = [{"id": "member-id", "name": "member", "domain_id": None}]
+    revoked: set[str] = set()
 
     def token_data(token, *, include_catalog):
         assert include_catalog is False
@@ -177,7 +178,7 @@ async def test_history_http_resolves_current_project_domain_without_principal_ov
         query = parse_qs(urlsplit(path).query)
         project_id, = query["scope.project.id"]
         assert project_id in projects and query["user.id"] == [user_id]
-        return None, {"role_assignments": [{
+        return None, {"role_assignments": [] if project_id in revoked else [{
             "scope": {"project": {"id": project_id}}, "user": {"id": user_id}, "role": {"id": "member-id"},
         }]}
 
@@ -214,6 +215,16 @@ async def test_history_http_resolves_current_project_domain_without_principal_ov
                 assert [item["id"] for item in listed.json()] == ([] if scope is foreign else [conversation_id])
                 detail = await client.get(f"/v1/conversations/{conversation_id}", headers=headers)
                 assert detail.status_code == (403 if scope is foreign else 200), detail.text
+            # Live membership revocation in the selected project denies the domain-shared paths.
+            revoked.add(current["project_id"])
+            headers = {"X-Auth-Token": current["project_id"], "X-Project-Id": current["project_id"]}
+            for path in ("/v1/conversations", f"/v1/conversations/{conversation_id}", "/v1/agents",
+                         "/v1/mcp-servers", "/v1/archived-connections"):
+                denied = await client.get(path, headers=headers)
+                assert denied.status_code == 403, (path, denied.text)
+            origin_headers = {"X-Auth-Token": origin["project_id"], "X-Project-Id": origin["project_id"]}
+            still_member = await client.get(f"/v1/conversations/{conversation_id}", headers=origin_headers)
+            assert still_member.status_code == 200, still_member.text
             for raw in credentials:
                 headers = {"X-API-Key": raw, "X-Project-Id": origin["project_id"]}
                 assert (await client.get("/v1/models", headers=headers)).status_code == 200
