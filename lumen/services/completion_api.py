@@ -14,10 +14,12 @@ frozen run ledger with event ``run:<run_id>``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, Decimal
@@ -197,11 +199,15 @@ def _bounded_openai_model(route: dict) -> dict:
     )
 
 
-def _chat_output_budget(resolved: dict, requested: int | None) -> int | None:
-    if resolved.get("provider_type") == "chatgpt" and requested is None:
+def _chat_wire_budget(resolved: dict, requested: int | None) -> int | None:
+    if requested is None and (_official_openai(resolved) or resolved.get("provider_type") == "chatgpt"):
         return None
-    return clamp_max_tokens(
-        requested if requested is not None else _bounded_openai_model(resolved).get("max_output_tokens"),
+    return clamp_max_tokens(requested)
+
+
+def _chat_hold_output_budget(resolved: dict, wire_budget: int | None) -> int:
+    return wire_budget if wire_budget is not None else (
+        _bounded_openai_model(resolved).get("max_output_tokens") or _DEFAULT_MAX_TOKENS
     )
 
 
@@ -238,7 +244,7 @@ def _request_input_bound(
 ) -> tuple[int, bool]:
     if max_output > model["max_output_tokens"]:
         raise CompletionError(422, "Output token budget exceeds the model limit.", code="max_output_tokens_exceeded")
-    ceiling = min(model.get("max_input_tokens", model["context_window"]), model["context_window"] - max_output)
+    ceiling = model.get("max_input_tokens") or model["context_window"]
     if ceiling <= 0:
         raise CompletionError(422, "Input exceeds the model input limit.", code="context_length_exceeded")
     prompt = {
@@ -255,9 +261,11 @@ def _request_input_bound(
             pending.extend(item)
         elif isinstance(item, dict):
             kind = item.get("type")
-            if kind in ("input_image", "image_url") and not content_growth:
+            if kind in ("input_image", "image_url", "computer_screenshot") and not content_growth:
                 url = item.get("image_url")
                 detail = url.get("detail") if isinstance(url, dict) else item.get("detail")
+                if kind == "computer_screenshot":
+                    detail = "auto"
                 image_bound = _openai_image_bound(model["id"], detail)
                 if image_bound is None:
                     content_growth = True
@@ -272,11 +280,12 @@ def _request_input_bound(
             breakpoint = item.get("prompt_cache_breakpoint")
             if isinstance(breakpoint, dict) and breakpoint.get("ttl") == "12h":
                 may_write_long = True
-            if item.get("type") in ("mcp", "tool_search") or item.get("encrypted_content"):
+            if kind in ("mcp", "tool_search"):
                 content_growth = True
             pending.extend(value for key, value in item.items() if key not in ("input_schema", "parameters", "schema"))
-    # Lumen's framing allowance is not a vendor tokenizer guarantee. Reported
-    # usage over the estimate cannot settle against this reservation.
+    # Framing is a Lumen allowance, not a vendor tokenizer guarantee. Count
+    # encrypted reasoning bytes assuming ciphertext bytes >= replayed tokens.
+    # Usage over the bound cannot settle.
     if content_growth:
         return ceiling, may_write_long
     try:
@@ -684,9 +693,9 @@ async def complete_once(
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
     await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
     options = chat_provider_options(options or {}, resolved=resolved)
-    max_output = _chat_output_budget(resolved, max_tokens)
+    max_output = _chat_wire_budget(resolved, max_tokens)
     hold = await _reserve_online(
-        resolved, messages=messages, tools=tools, max_output=max_output or _DEFAULT_MAX_TOKENS,
+        resolved, messages=messages, tools=tools, max_output=_chat_hold_output_budget(resolved, max_output),
         user_id=user_id, project_id=project_id, api_key_id=api_key_id,
         prompt_options={**options, "tool_choice": tool_choice},
     )
@@ -747,10 +756,10 @@ async def complete_stream(
     """Validate/freeze before HTTP streaming starts, then return the completion iterator."""
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
     options = chat_provider_options(options or {}, resolved=resolved)
-    max_output = _chat_output_budget(resolved, max_tokens)
+    max_output = _chat_wire_budget(resolved, max_tokens)
     await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
     hold = await _reserve_online(
-        resolved, messages=messages, tools=tools, max_output=max_output or _DEFAULT_MAX_TOKENS,
+        resolved, messages=messages, tools=tools, max_output=_chat_hold_output_budget(resolved, max_output),
         user_id=user_id, project_id=project_id, api_key_id=api_key_id,
         prompt_options={**options, "tool_choice": tool_choice},
     )
@@ -846,12 +855,13 @@ async def _complete_stream(
             return
         except ProviderError as exc:
             _provider_rejected(hold, exc)
+            if isinstance(exc, (OpenAIServiceTierMismatch, OpenAIUsageInvalid)):
+                # The HTTP consumer closes immediately after receiving the error.
+                text_parts.clear()
             if hold is not None and hold.dispatched:
                 yield {"type": "error", "code": "provider_result_unknown", "message": exc.code}
             else:
                 yield {"type": "error", "message": "생성 중 오류가 발생했습니다"}
-            if isinstance(exc, (OpenAIServiceTierMismatch, OpenAIUsageInvalid)):
-                text_parts.clear()  # explicit invalid evidence must not fall back to an estimate
             return
         except Exception:
             logger.warning("API 스트리밍 실패 model=%s", resolved.get("model_name"), exc_info=True)
@@ -918,6 +928,9 @@ async def _close_provider_stream(stream: Any) -> None:
         logger.warning("provider stream close failed", exc_info=True)
 
 
+_HELD_STREAM_DRAIN_SECONDS = 15.0
+
+
 class _ProviderEvents:
     """Native events that release their eagerly opened provider stream even if never iterated.
 
@@ -929,26 +942,68 @@ class _ProviderEvents:
         self._events = events
         self._provider_stream = provider_stream
         self._hold = hold
+        self._pending: asyncio.Task | None = None
+        self._ended = False
         self._closed = False
+
+    @property
+    def owns_disconnect_drain(self) -> bool:
+        return self._hold is not None
 
     def __aiter__(self) -> _ProviderEvents:
         return self
 
     async def __anext__(self) -> dict:
-        return await self._events.__anext__()
+        if self._closed or self._ended:
+            raise StopAsyncIteration
+        if self._hold is None:
+            return await anext(self._events)
+        # Client cancellation must not be injected into an active provider read.
+        if self._pending is None:
+            self._pending = asyncio.create_task(anext(self._events))
+        try:
+            item = await asyncio.shield(self._pending)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._pending = None
+            self._ended = True
+            raise
+        self._pending = None
+        return item
+
+    async def _drain_held(self) -> None:
+        if self._hold is None or not self._hold.dispatched or self._hold.settled or self._ended:
+            return
+        with anyio.move_on_after(_HELD_STREAM_DRAIN_SECONDS), suppress(StopAsyncIteration):
+            if self._pending is not None:
+                await asyncio.shield(self._pending)
+                self._pending = None
+            while not self._hold.settled:
+                await anext(self._events)
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
-        try:
-            await self._events.aclose()  # a started stream settles billing here
-        finally:
+        with anyio.CancelScope(shield=True):
             try:
-                await _close_provider_stream(self._provider_stream)
+                await self._drain_held()
+            except Exception:
+                logger.warning("provider stream failed after client disconnect")
             finally:
-                if self._hold is not None:
-                    await self._hold.aclose()
+                if self._pending is not None:
+                    self._pending.cancel()
+                    await asyncio.gather(self._pending, return_exceptions=True)
+                    self._pending = None
+                try:
+                    await self._events.aclose()
+                finally:
+                    try:
+                        await _close_provider_stream(self._provider_stream)
+                    finally:
+                        if self._hold is not None:
+                            await self._hold.aclose()
 
 
 def _native_dict(value: Any) -> dict:

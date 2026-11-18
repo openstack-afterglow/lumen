@@ -754,11 +754,14 @@ cache-write rates remain unavailable, not copies of the short-context rate.
 The online hold uses UTF-8 bytes of compact JSON for prompt messages, tool
 definitions and output schemas, plus 4,096 tokens of framing, 16 per message
 or tool definition, and the published per-image token cap when available.
-This framing allowance is Lumen policy, not a provider guarantee. For media
-without a published cap (including GPT-6.2 image input), encrypted history,
-or tools that add server-side context, use the available input ceiling instead.
-The ceiling is the smaller of the input limit and context less output reserve.
-The output reserve is the explicit caller cap, or the model's published maximum.
+This framing allowance is Lumen policy, not a provider guarantee. Encrypted
+reasoning replay contributes its encoded UTF-8 bytes, assuming ciphertext bytes
+are at least the replayed token count. Computer-use screenshots follow image
+rules at automatic detail. For media without a published cap (including GPT-6.2
+images), files/audio, or tools that add server-side context, use the published
+input limit, or the context window if no separate input limit exists.
+The output reserve is independent: use the explicit caller cap or the published
+output maximum. An omitted cap stays omitted when sent to official OpenAI.
 
 Choose the maximum frozen applicable input rate, including cache writes.
 Default 30m writes count; reserve the 12h rate if the request or an input
@@ -783,6 +786,10 @@ have the metered hosted tool policy here; no explicit container or provider file
 reuse is permitted. Missing usage, missing container IDs, a nonstandard tier
 or tracking beyond the held bound leaves a content-free `unknown` reservation
 for operator disposition; do not retry the original request to settle it.
+After a held Chat or Responses client disconnect, the SSE owner stops client
+delivery and drains upstream for up to 15 seconds. It settles only from the
+terminal evidence. Failure, missing usage, or a drain deadline leaves the hold
+`unknown`; the owner closes upstream before releasing its SSE capacity slot.
 
 ### OpenAI Images funding policy
 
