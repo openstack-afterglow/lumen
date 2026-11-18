@@ -32,7 +32,8 @@ async def test_indexed_history_restores_work_log_on_final_assistant_and_owned_fo
             run = ChatRun(
                 id=run_id, run_scope="persistent", conversation_id=conv["id"], **owner,
                 user_message_id=user["id"], assistant_message_id=answer["id"], model_name="synthetic",
-                capability_snapshot={}, pricing_snapshot={}, client_request_id=str(uuid.uuid4()),
+                capability_snapshot={"model_id": 12, "provider_id": 2}, pricing_snapshot={},
+                client_request_id=str(uuid.uuid4()),
                 request_fingerprint=nonce, fingerprint_version=1, status="completed",
             )
             session.add(run)
@@ -112,8 +113,10 @@ async def test_indexed_history_restores_work_log_on_final_assistant_and_owned_fo
                 assert message["content"] == "done"
                 assert message["execution"]["run_id"] == run_id
                 assert set(message["execution"]) == {
-                    "run_id", "status", "last_seq", "started_at", "activity", "activity_status", "activity_error_code",
+                    "run_id", "status", "model_row_id", "last_seq", "started_at", "activity",
+                    "activity_status", "activity_error_code",
                 }
+                assert message["execution"]["model_row_id"] == 12
                 legacy = await store.list_messages(conversation_id, limit=1, offset=1, **owner)
                 assert legacy[0]["content"] == "done"
                 for key in message["execution"]:

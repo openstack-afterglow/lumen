@@ -1679,6 +1679,7 @@ async def stream(
     sandbox_lease: tuple[str, int] | None = None,
     sandbox_tools: list[dict[str, str]] | None = None,
     plugin_tool_snapshots: tuple[dict[str, Any], ...] = (),
+    vault_domain_id: str | None = None,
 ) -> AsyncIterator[dict]:
     """Stream chat events while awaiting durable execution-boundary hooks."""
     from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
@@ -1726,6 +1727,7 @@ async def stream(
         managed_advisor=managed_advisor,
         binding_session=contracts.ToolBindingSession(),
         plugin_tool_snapshots=tuple(plugin_tool_snapshots),
+        vault_domain_id=vault_domain_id,
     )
     if execution_protocol_version == 2:
         initial_bindings = await bindings.v2_tool_bindings(ctx)

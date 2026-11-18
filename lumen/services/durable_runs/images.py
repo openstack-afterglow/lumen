@@ -46,6 +46,7 @@ from .errors import (
     DurableRunInputError,
     DurableRunNotFound,
     DurableRunProviderResultUnknown,
+    MediaModelAmbiguous,
 )
 from .lifecycle import _cancel_requested, _require_owned_running_lease
 from .media import (
@@ -85,6 +86,8 @@ def _intent(request: dict) -> dict:
               "n": request.get("n", 1), "source_asset_id": request.get("source_asset_id", request.get("input_asset_id"))}
     # Added only when requested so every pre-existing request keeps its idempotency fingerprint.
     intent.update(image_transport.image_options(request))
+    if request.get("model_row_id") is not None:
+        intent["model_row_id"] = request["model_row_id"]
     ordered = request.get("input_asset_ids")
     if ordered is not None:
         if (not isinstance(ordered, list) or not 1 <= len(ordered) <= image_transport.MAX_OPENAI_IMAGE_INPUT_COUNT
@@ -132,23 +135,19 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
         request = {**request, "model_id": request["model"],
                    "provider_id": request.get("provider_id") if request.get("provider") is None else request["provider"]}
     intent = _intent_with_credential_authority(_intent(request), credential_authority)
-    model_id = request.get("model_id")
-    provider_id = request.get("provider_id")
-    if (not isinstance(model_id, str) or not model_id or not isinstance(request.get("prompt"), str)
-            or not request["prompt"].strip() or len(request["prompt"]) > 32000):
+    model_id, model_row_id, provider_id = intent["model_id"], intent.get("model_row_id"), intent["provider_id"]
+    if ((model_id is not None and not isinstance(model_id, str)) or (not model_id and model_row_id is None)
+            or not isinstance(request.get("prompt"), str) or not request["prompt"].strip()
+            or len(request["prompt"]) > 32000):
         raise DurableRunInputError("image model and bounded prompt are required")
     if provider_id is not None and not isinstance(provider_id, (str, int)):
         raise DurableRunInputError("invalid image provider")
-    provider_number = int(provider_id) if provider_id is not None and str(provider_id).isdecimal() else None
-    api_provider = str(provider_id) if provider_id is not None and provider_number is None else None
     try:
-        route = (await routing.resolve_model_by_id(int(model_id), model_kind="image") if model_id.isdecimal()
-                 else await routing.resolve_api_model(model_id, provider=api_provider,
-                                                       provider_id=provider_number, model_kind="image"))
+        route = await routing.resolve_media_model(model_id, model_row_id=model_row_id, provider_id=provider_id,
+                                                  model_kind="image")
     except AmbiguousModelRouteError as exc:
-        raise DurableRunInputError("image provider selection is ambiguous") from exc
-    if (route is None or (provider_number is not None and provider_number != route["provider_id"])
-            or (api_provider is not None and api_provider != route["api_provider"])):
+        raise MediaModelAmbiguous("image provider selection is ambiguous") from exc
+    if route is None:
         raise DurableRunInputError("image provider or model is unavailable")
     source_asset_id = intent["source_asset_id"]
     inputs = image_input_ids(intent)

@@ -149,6 +149,7 @@ async def generate_image(
             idempotency_key=idempotency_key or uuid.uuid4(),
             api_provider=body.provider,
             required_scopes=("compat:images:write",),
+            compat=True,
         )
     except HTTPException as exc:
         return _compat_error(exc)
@@ -250,6 +251,7 @@ async def edit_image(
             input_asset_id=primary,
             api_provider=provider,
             required_scopes=("compat:images:write",),
+            compat=True,
         )
     except HTTPException as exc:
         return _compat_error(exc)

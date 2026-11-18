@@ -10,10 +10,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.auth import credential_authority_snapshot
-from lumen.models.chat_db import ChatMcpOAuthConnection, ChatMcpServer
+from lumen.models.chat_db import ChatMcpServer
 from lumen.services import extensions_store as es
 from lumen.services import mcp_connections
 from lumen.services import mcp_registry_catalog as catalog
+from lumen.services.domain_scope import history_domain_id
 from lumen.services.mcp_domain_authority import resolve_domain_authority
 from lumen.services.mcp_registry_model import AUTH_MODES, McpRegistryError
 
@@ -47,13 +48,18 @@ def managed_profiles() -> dict[str, dict]:
 
 def human(principal: dict) -> bool:
     """Unrestricted human Keystone session: the only actor that may manage organization state or reach other domains."""
-    return principal.get("auth_type") == "keystone" and not principal.get("credential_restricted")
+    return (
+        principal.get("credential_class", principal.get("auth_type")) == "keystone"
+        and not principal.get("credential_restricted")
+    )
 
 
 @contextmanager
 def actor(principal: dict) -> Iterator[None]:
-    """Bind the request's humanness for every store/OAuth domain check beneath it."""
-    with es.actor_scope(human=human(principal)):
+    """Bind verified request ownership and humanness for store/OAuth checks."""
+    domain_id = history_domain_id(principal)
+    owner = (principal["user_id"], principal["project_id"], domain_id) if domain_id else None
+    with es.actor_scope(human=human(principal), owner=owner):
         yield
 
 
@@ -96,13 +102,14 @@ async def _caller_effective(principal: dict, domain_id: str, item_id: int | None
             if item_id is not None:
                 query = query.where(ChatMcpServer.id == item_id)
             rows = (await session.execute(query)).scalars().all()
-            activations = await es._owner_activations(session, principal["user_id"], principal["project_id"])
-            shared = {
-                row.mcp_server_id: row for row in (await session.execute(select(ChatMcpOAuthConnection).where(
-                    ChatMcpOAuthConnection.owner_user_id == domain_id,
-                    ChatMcpOAuthConnection.owner_project_id == domain_id,
-                ))).scalars()
-            }
+            ids = [row.id for row in rows]
+            activations = await es._owner_activations(
+                session, principal["user_id"], principal["project_id"], history_domain_id(principal),
+                server_ids=ids,
+            )
+            shared = await es._mcp_connections(
+                session, rows, principal["user_id"], principal["project_id"], None, domain_id,
+            )
             result = []
             for row in rows:
                 activation = activations.get(row.id)
@@ -135,9 +142,9 @@ async def scoped_connection(principal: dict, item_id: int, domain_id: str | None
             if domain_id is not None:
                 if row.scope != "domain" or row.owner_domain_id != domain_id:
                     raise es.ExtensionNotFound("MCP connection not found")
-            elif row.scope != "user" or (
-                row.owner_user_id, row.owner_project_id
-            ) != (principal["user_id"], principal["project_id"]):
+            elif row.scope != "user" or not es.personal_matches(
+                row, principal["user_id"], principal["project_id"], domain_id=history_domain_id(principal),
+            ):
                 raise es.ExtensionForbidden("Personal connection ownership required")
             return es._public_mcp(row)
     except OperationalError as exc:
@@ -163,14 +170,25 @@ async def create(principal: dict, template_id: str, *, domain_id: str | None = N
     url = catalog._fill_url(candidate, variables)
     connection_label = mcp_connections._label(label, candidate["name"])
     scope = "domain" if domain_id is not None else "user"
-    scope_key = f"domain:{domain_id}" if domain_id is not None else f"user:{principal['user_id']}:{principal['project_id']}"
+    scope_key = es.connection_scope_key(
+        scope, principal["user_id"], principal["project_id"], domain_id or history_domain_id(principal),
+    )
     factory = es._require_db()
     try:
         async with factory() as session:
-            existing = (await session.execute(select(ChatMcpServer).where(
-                ChatMcpServer.connection_scope_key == scope_key,
+            matching = select(ChatMcpServer).where(
                 ChatMcpServer.template_key == template_id, ChatMcpServer.connection_label == connection_label,
-            ))).scalar_one_or_none()
+            )
+            if scope == "domain":
+                matching = matching.where(
+                    ChatMcpServer.scope == "domain", ChatMcpServer.owner_domain_id == domain_id,
+                    ChatMcpServer.connection_scope_key == scope_key,
+                )
+            else:
+                matching = matching.where(es.personal_clause(
+                    "mcp", principal["user_id"], principal["project_id"], history_domain_id(principal),
+                )).order_by(ChatMcpServer.owner_domain_id.is_not(None).desc(), ChatMcpServer.id.desc())
+            existing = (await session.execute(matching.limit(1))).scalar_one_or_none()
             existing_view = es._public_mcp(existing) if existing is not None else None
         # _view opens a session of its own; release the lookup connection before re-reading effective activation.
         if existing_view is not None:

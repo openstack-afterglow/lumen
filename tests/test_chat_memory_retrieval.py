@@ -12,6 +12,7 @@ async def test_candidate_ids_delegates_one_exact_namespace_semantic_recall(monke
         captured["strategy"] = strategy
         captured["query"] = query
         captured["limit"] = limit
+        captured["vector_scopes"] = _kwargs["vector_scopes"]
         return [4, 2]
 
     monkeypatch.setattr(memory_retrieval.memory_host, "recall_candidate_ids", fake_recall_candidate_ids)
@@ -22,6 +23,7 @@ async def test_candidate_ids_delegates_one_exact_namespace_semantic_recall(monke
             user_id="user",
             project_id="project",
             workspace_id=7,
+            domain_id="domain",
             limit=20,
         )
         == [4, 2]
@@ -33,3 +35,4 @@ async def test_candidate_ids_delegates_one_exact_namespace_semantic_recall(monke
     assert captured["namespace"].project_id == "project"
     assert captured["namespace"].workspace_id == 7
     assert captured["namespace"].include_account is False
+    assert captured["vector_scopes"] == (("domain", 7),)

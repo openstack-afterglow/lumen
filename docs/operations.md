@@ -1,5 +1,11 @@
 # 운영 가이드
 
+## Agent Vault cutover (040)
+
+Migration 040 changes the chat-memory writer and vector source; never run a pre-040 writer alongside a Vault worker. Drain existing runs, stop old writers, take an encrypted backup, apply the manifest-verified migration, and start the new online-text worker. Keep admission closed until the legacy-memory import has caught up. Use the metadata-only query `SELECT vault_migration_status, COUNT(*) FROM chat_memories GROUP BY vault_migration_status` to inspect progress; NULL rows are pending or waiting for directory or encryption recovery. Missing or disabled origins, unowned or deleted workspaces, malformed rows and credential-shaped content are not imported. Do not collapse them into global notes or expose their ciphertext.
+
+The importer is idempotent, retains original legacy rows, and assigns new Vault records IDs at or above 2^40 to avoid colliding with imported vector IDs. Semantic recall catches up through the configured vector outbox after SQL import. Rolling back old code after Vault accepts writes would hide those writes; preserve both the Vault and legacy tables and reconcile explicitly before reopening traffic.
+
 ## 0.6.20 롤아웃 메모
 
 - **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.
@@ -503,6 +509,17 @@ No migration copies user balances or retroactively charges a domain. Unfunded do
 
 Domain-billed text requires enforceable input/output bounds and known prices before dispatch. The prepaid envelope reserves the frozen context at the highest applicable input rate; ensure the pool and per-user guard can cover that envelope. Paid native web search without a provider-enforced request limit is unavailable on this path. A disconnect without complete provider usage retains an `unknown` hold; there is no automatic release or pool API for manual disposition.
 
+### User/domain scope backfill (migration 036)
+
+Drain and stop the old API/workers and apply migration 036 with `lumen-migrate --apply` before starting compatible writers. Take a recoverable backup and retain the existing Lumen encryption key separately. For predictable migration timing, run `python -m lumen.scripts.backfill_domain_scope --apply` after schema migration with the configured MariaDB URL and Keystone admin identity, before opening ingress. New API processes also schedule the same job in their startup lifecycle; a MariaDB advisory lock admits one worker at a time. Readiness does not wait for the job. Do not mix schema-036 writers with previous versions.
+
+The job pages distinct origin projects, asks Keystone for each exact enabled project ID and domain, and stages verified pairs in a connection-local MariaDB temporary table. The database account needs `CREATE TEMPORARY TABLES`. The job reports counts only. Unresolved origins and rows that conflict with a live configuration remain origin-only, under current live membership. The command exits nonzero if another job holds the lock, any projects are unresolved, or any rows conflicted. Correct the cause and rerun the same command; it does not repeat committed work. Historical timestamps and project provenance are kept. Organization MCP server rows and shared OAuth bundles are not converted.
+
+The job groups personal MCP rows by template or normalized URL, and HTTP tools by normalized URL. Newest update time, then highest ID, wins. When a project already had several labels for the same identity, the job preserves those groups and matches cross-project rows by label, using the newest group if no label matches. It archives the full losing configuration and its original activation, OAuth state and encrypted credentials, and updates private agent bindings to the winner. A previous activation never approves a different configuration. For shared published MCP server IDs it also archives losing per-project OAuth/activation state; it never discards their tokens or timestamps.
+
+Use `GET /v1/archived-connections` and `POST /v1/archived-connections/{archive_id}/restore` as the owning user with current domain membership. Organization-owned archives use `/v1/domains/{id}/archived-connections` and require live domain manager authority. Lists return metadata only, newest first, with bounded `limit` and optional `before_id`. Restoring an extension reuses its original ID, disambiguates colliding labels or tool names, and keeps agent bindings on their canonical IDs. Pending OAuth states do not revive. Restoring a prior OAuth bundle or activation on a published server swaps it into the user/domain slot, archives any displaced live state, and advances the revision fence. A stale archived configuration revision does not become consent for the current server revision.
+
+### Earlier migrations
 
 Elastic/Batch 후보의 additive migration은 022(runtime routing), 023(trusted identity), 024(batch ledger), 025(batch expiry default)다. 025는 이미 적용한 024를 수정하지 않고 MariaDB의 column-reference DEFAULT zero-date 오류를 교정한다. 모두 적용한 뒤 동일 `lumen-migrate --apply`를 재실행한다. `api_completion`과 Batch 상태를 모르는 구 worker를 신 schema의 실행자와 섞지 않는다. Runtime/Batch 활성화는 고정 worker 수용, managed guest/ingress 수용 및 별도 운영 cutover 승인 이후다.
 

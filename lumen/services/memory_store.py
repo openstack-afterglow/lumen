@@ -1,9 +1,4 @@
-"""Encrypted MySQL memory source of truth and semantic-index mutation outbox.
-
-Memory namespaces are enforced before plaintext hydration.  Account memories are
-the only scope shared across OpenStack projects; project and workspace memories
-are never returned outside their owning project.
-"""
+"""Chat recall and automatic extraction over encrypted Agent Vault user notes."""
 
 from __future__ import annotations
 
@@ -14,18 +9,19 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import or_, select
+from sqlalchemy import false, or_, select
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.exc import OperationalError
 
-from lumen.crypto import decrypt_chat_content, derive_encryption_subkey, encrypt_chat_content
+from lumen.crypto import decrypt_chat_content, derive_encryption_subkey
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
-from lumen.models.chat_db import ChatMemory, ChatMemoryOwnerLock
+from lumen.models.chat_db import ChatMemoryOwnerLock
 from lumen.models.chat_jobs import ChatMemoryOutbox
+from lumen.models.vault import VaultNote
+from lumen.services import vault_store as vs
 
 logger = logging.getLogger(__name__)
 
-_MAX_INJECT = 30  # 컨텍스트 주입 시 메모리 개수 상한(비용 방어)
 _SCOPES = frozenset({"account", "project", "workspace"})
 _CATEGORIES = frozenset({"interest", "development", "habit", "preference", "general"})
 _CATEGORY_HEADINGS = (
@@ -99,7 +95,7 @@ def _iso(dt) -> str | None:
     return dt.isoformat() if dt else None
 
 
-def _public(row: ChatMemory) -> dict:
+def _public(row: VaultNote) -> dict:
     return {
         "id": row.id,
         "user_id": row.user_id,
@@ -108,6 +104,7 @@ def _public(row: ChatMemory) -> dict:
         "scope": row.scope,
         "category": row.category,
         "content": decrypt_chat_content(row.content) if row.content else None,
+        "expectedHash": row.body_hash,
         "confidence": str(row.confidence) if row.confidence is not None else None,
         "expires_at": _iso(row.expires_at),
         "status": row.status,
@@ -173,68 +170,35 @@ def _validate_category(category: str) -> None:
         raise MemoryValidationError("지원하지 않는 메모리 category 입니다")
 
 
-def _visible_in_project(row: ChatMemory, project_id: str | None) -> bool:
-    return row.scope == "account" or (project_id is not None and row.project_id == project_id)
-
-
-def _scope_predicate(*, project_id: str | None, workspace_id: int | None):
-    predicates = [(ChatMemory.scope == "account") & ChatMemory.project_id.is_(None) & ChatMemory.workspace_id.is_(None)]
-    if project_id is not None:
-        predicates.append(
-            (ChatMemory.scope == "project") & (ChatMemory.project_id == project_id) & ChatMemory.workspace_id.is_(None)
-        )
-        if workspace_id is not None:
-            predicates.append(
-                (ChatMemory.scope == "workspace")
-                & (ChatMemory.project_id == project_id)
-                & (ChatMemory.workspace_id == workspace_id)
+def _visible(user_id, domain_id, workspace_id, include_account, *, direct=False):
+    choices = [VaultNote.domain_id.is_(None)] if include_account else []
+    if domain_id:
+        choices.append((VaultNote.domain_id == domain_id) & VaultNote.workspace_id.is_(None))
+        if workspace_id or direct:
+            choices.append(
+                (VaultNote.domain_id == domain_id) & vs.workspace_owner(user_id).exists()
+                & (VaultNote.workspace_id.is_not(None) if direct else VaultNote.workspace_id == workspace_id)
             )
-    return or_(*predicates)
+    return or_(false(), *choices)
 
 
-def _project_scope_predicate(*, project_id: str | None, workspace_id: int | None):
-    predicates = [
-        (ChatMemory.scope == "project") & (ChatMemory.project_id == project_id) & ChatMemory.workspace_id.is_(None)
-    ]
-    if workspace_id is not None:
-        predicates.append(
-            (ChatMemory.scope == "workspace")
-            & (ChatMemory.project_id == project_id)
-            & (ChatMemory.workspace_id == workspace_id)
-        )
-    return or_(*predicates)
-
-
-def _exact_scope_predicate(*, scope: str, project_id: str | None, workspace_id: int | None):
-    _validate_namespace(scope=scope, project_id=project_id, workspace_id=workspace_id)
-    return (
-        (ChatMemory.scope == scope)
-        & (ChatMemory.project_id.is_(None) if project_id is None else ChatMemory.project_id == project_id)
-        & (ChatMemory.workspace_id.is_(None) if workspace_id is None else ChatMemory.workspace_id == workspace_id)
+def _notes(user_id):
+    return select(VaultNote).where(
+        VaultNote.user_id == user_id, VaultNote.kind == "user_note", VaultNote.project_key.is_(None),
+        VaultNote.status == "active", or_(VaultNote.expires_at.is_(None), VaultNote.expires_at > datetime.now(UTC)),
     )
 
 
-def _not_expired_predicate():
-    return or_(ChatMemory.expires_at.is_(None), ChatMemory.expires_at > datetime.now(UTC))
+async def _owned(session, memory_id, user_id, project_id, domain_id, include_account, *, lock=False):
+    stmt = _notes(user_id).where(VaultNote.id == memory_id,
+                                _visible(user_id, domain_id, None, include_account, direct=True))
+    note = await session.scalar(stmt.with_for_update() if lock else stmt)
+    if note is None:
+        raise MemoryNotFound("memory_not_found")
+    return note
 
 
-async def _load_owned(
-    session, memory_id: int, user_id: str, project_id: str | None, *, include_account: bool = True
-) -> ChatMemory:
-    row = await session.get(ChatMemory, memory_id)
-    if row is None:
-        raise MemoryNotFound(f"메모리 {memory_id} 를 찾을 수 없습니다")
-    if row.user_id != user_id or not _visible_in_project(row, project_id):
-        raise MemoryForbidden("메모리에 접근할 권한이 없습니다")
-    if not include_account and row.scope == "account":
-        raise MemoryForbidden("계정 메모리에 접근할 권한이 없습니다")
-    if row.expires_at is not None and row.expires_at <= datetime.now(UTC):
-        # Expired rows are already invisible to list/hydrate; treat direct access the same way.
-        raise MemoryNotFound(f"메모리 {memory_id} 를 찾을 수 없습니다")
-    return row
-
-
-async def _queue_semantic_mutation(session, *, row: ChatMemory, mutation: str, plaintext: str) -> None:
+async def queue_semantic_mutation(session, *, row: VaultNote, mutation: str, plaintext: str) -> None:
     """Always preserve the source mutation; freeze generations when the index is ready."""
     from lumen.services.semantic_memory import configured_memory_index, semantic_memory_available
 
@@ -250,7 +214,7 @@ async def _queue_semantic_mutation(session, *, row: ChatMemory, mutation: str, p
     session.add(
         ChatMemoryOutbox(
             event_key=f"memory:{row.id}:{mutation}:{digest}:{uuid.uuid4()}",
-            memory_id=row.id,
+            vault_note_id=row.id,
             mutation=mutation,
             content_hash=digest,
             required_generations=required_generations,
@@ -260,346 +224,183 @@ async def _queue_semantic_mutation(session, *, row: ChatMemory, mutation: str, p
     )
 
 
-async def create_memory(
-    *,
-    user_id: str,
-    content: str,
-    scope: str = "account",
-    project_id: str | None = None,
-    workspace_id: int | None = None,
-    category: str = "general",
-) -> dict:
-    if not content or not content.strip():
-        raise MemoryValidationError("content 는 필수입니다")
+def _checked_content(value: str) -> str:
+    try:
+        vs.check_payload(value)
+    except vs.VaultError as exc:
+        raise MemoryValidationError(exc.code) from exc
+    return value.strip()
+
+
+def _new_chat_note(user_id, domain_id, project_id, category, workspace_id=None):
+    return vs.new_note(
+        user_id=user_id, domain_id=domain_id, project_id=project_id, workspace_id=workspace_id,
+        slug=f"chat-{uuid.uuid4().hex}", title="Chat memory", kind="user_note", category=category,
+    )
+
+
+async def create_memory(*, user_id: str, content: str, scope: str = "account", project_id: str | None = None,
+                        workspace_id: int | None = None, category: str = "general", domain_id: str | None = None) -> dict:
     _validate_namespace(scope=scope, project_id=project_id, workspace_id=workspace_id)
     _validate_category(category)
-    factory = _require_db()
-    row = ChatMemory(
-        user_id=user_id,
-        project_id=project_id,
-        workspace_id=workspace_id,
-        scope=scope,
-        category=category,
-        content=encrypt_chat_content(content.strip()),
-    )
+    content = _checked_content(content)
+    if scope != "account" and not domain_id:
+        raise MemoryForbidden("vault_domain_unavailable")
+    note = _new_chat_note(user_id, domain_id if scope != "account" else None, project_id, category, workspace_id)
     try:
-        async with factory() as session, session.begin():
-            session.add(row)
-            await session.flush()
-            await _queue_semantic_mutation(session, row=row, mutation="upsert", plaintext=content.strip())
-            return _public(row)
+        async with _require_db()() as session, session.begin():
+            session.add(note)
+            await vs.revise(session, note, plaintext=content, change="create", vector_event="upsert")
+            return _public(note)
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def list_memories(
-    *, user_id: str, project_id: str | None = None, workspace_id: int | None = None, include_account: bool = True
-) -> list[dict]:
-    factory = _require_db()
+async def list_memories(*, user_id: str, project_id: str | None = None, workspace_id: int | None = None,
+                        include_account: bool = True, domain_id: str | None = None) -> list[dict]:
     try:
-        async with factory() as session:
-            rows = (
-                (
-                    await session.execute(
-                        select(ChatMemory)
-                        .where(
-                            ChatMemory.user_id == user_id,
-                            ChatMemory.status == "active",
-                            _not_expired_predicate(),
-                            (
-                                _scope_predicate(project_id=project_id, workspace_id=workspace_id)
-                                if include_account
-                                else _project_scope_predicate(project_id=project_id, workspace_id=workspace_id)
-                            ),
-                        )
-                        .order_by(ChatMemory.updated_at.desc())
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            return [_public(r) for r in rows]
+        async with _require_db()() as session:
+            rows = await session.scalars(_notes(user_id).where(
+                _visible(user_id, domain_id, workspace_id, include_account),
+            ).order_by(VaultNote.updated_at.desc(), VaultNote.id.desc()))
+            return [_public(row) for row in rows]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def _hydrate_where(*, ids: list[int], user_id: str, predicate) -> list[dict]:
-    """Rehydrate candidate IDs only after repeating exact MySQL namespace/authorization checks."""
+async def _hydrate(ids, user_id, predicate):
     if not ids:
         return []
-    factory = _require_db()
     try:
-        async with factory() as session:
-            rows = (
-                (
-                    await session.execute(
-                        select(ChatMemory).where(
-                            ChatMemory.id.in_(set(ids)),
-                            ChatMemory.user_id == user_id,
-                            ChatMemory.status == "active",
-                            ChatMemory.is_active.is_(True),
-                            _not_expired_predicate(),
-                            predicate,
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
+        async with _require_db()() as session:
+            rows = await session.scalars(_notes(user_id).where(
+                VaultNote.id.in_(set(ids)), VaultNote.is_active.is_(True), predicate,
+            ))
             by_id = {row.id: _public(row) for row in rows}
-            return [by_id[memory_id] for memory_id in ids if memory_id in by_id]
+            return [by_id[note_id] for note_id in ids if note_id in by_id]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def hydrate_candidate_ids(
-    *,
-    ids: list[int],
-    user_id: str,
-    scope: str,
-    project_id: str | None,
-    workspace_id: int | None,
-) -> list[dict]:
-    """Rehydrate vector candidates for one exact requested scope (used by the search API)."""
-    predicate = _exact_scope_predicate(scope=scope, project_id=project_id, workspace_id=workspace_id)
-    return await _hydrate_where(ids=ids, user_id=user_id, predicate=predicate)
+async def hydrate_candidate_ids(*, ids: list[int], user_id: str, scope: str, project_id: str | None,
+                               workspace_id: int | None, domain_id: str | None = None) -> list[dict]:
+    _validate_namespace(scope=scope, project_id=project_id, workspace_id=workspace_id)
+    if scope == "account":
+        predicate = VaultNote.domain_id.is_(None)
+    elif not domain_id:
+        return []
+    elif scope == "project":
+        predicate = (VaultNote.domain_id == domain_id) & VaultNote.workspace_id.is_(None)
+    else:
+        predicate = (VaultNote.domain_id == domain_id) & (VaultNote.workspace_id == workspace_id) & (
+            vs.workspace_owner(user_id).exists()
+        )
+    return await _hydrate(ids, user_id, predicate)
 
 
-async def hydrate_namespace_ids(
-    *,
-    ids: list[int],
-    user_id: str,
-    project_id: str | None,
-    workspace_id: int | None,
-    include_account: bool = True,
-) -> list[dict]:
-    """Re-authorize provider-selected candidates across the full visible namespace before disclosure."""
-    predicate = (
-        _scope_predicate(project_id=project_id, workspace_id=workspace_id)
-        if include_account
-        else _project_scope_predicate(project_id=project_id, workspace_id=workspace_id)
-    )
-    return await _hydrate_where(ids=ids, user_id=user_id, predicate=predicate)
+async def hydrate_namespace_ids(*, ids: list[int], user_id: str, project_id: str | None, workspace_id: int | None,
+                               include_account: bool = True, domain_id: str | None = None) -> list[dict]:
+    return await _hydrate(ids, user_id, _visible(user_id, domain_id, workspace_id, include_account))
 
 
-async def get_memory(
-    memory_id: int, *, user_id: str, project_id: str | None = None, include_account: bool = True
-) -> dict:
-    factory = _require_db()
+async def get_memory(memory_id: int, *, user_id: str, project_id: str | None = None,
+                     include_account: bool = True, domain_id: str | None = None) -> dict:
     try:
-        async with factory() as session:
-            row = await _load_owned(session, memory_id, user_id, project_id, include_account=include_account)
-            return _public(row)
+        async with _require_db()() as session:
+            return _public(await _owned(session, memory_id, user_id, project_id, domain_id, include_account))
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def update_memory(
-    memory_id: int,
-    *,
-    user_id: str,
-    project_id: str | None = None,
-    patch: dict,
-    include_account: bool = True,
-) -> dict:
-    factory = _require_db()
+async def update_memory(memory_id: int, *, user_id: str, patch: dict, project_id: str | None = None,
+                        include_account: bool = True, domain_id: str | None = None,
+                        expected_hash: str | None = None) -> dict:
     try:
-        async with factory() as session, session.begin():
-            row = await _load_owned(session, memory_id, user_id, project_id, include_account=include_account)
-            if "content" in patch:
-                content = (patch["content"] or "").strip()
-                if not content:
-                    raise MemoryValidationError("content 는 필수입니다")
-                row.content = encrypt_chat_content(content)
-                await _queue_semantic_mutation(session, row=row, mutation="upsert", plaintext=content)
+        async with _require_db()() as session, session.begin():
+            row = await _owned(session, memory_id, user_id, project_id, domain_id, include_account, lock=True)
+            vs.check_replace(row, expected_hash)
+            content = _checked_content(patch["content"]) if "content" in patch else decrypt_chat_content(row.content)
             if "category" in patch:
-                category = patch["category"]
-                if not isinstance(category, str):
-                    raise MemoryValidationError("category 가 올바르지 않습니다")
-                _validate_category(category)
-                row.category = category
+                _validate_category(patch["category"])
+                row.category = patch["category"]
             if patch.get("is_active") is not None:
                 row.is_active = bool(patch["is_active"])
+            await vs.revise(session, row, plaintext=content, change="replace",
+                            vector_event="upsert" if row.is_active else "delete")
             return _public(row)
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def delete_memory(
-    memory_id: int, *, user_id: str, project_id: str | None = None, include_account: bool = True
-) -> None:
-    factory = _require_db()
+async def _archive(session, row, plaintext):
+    row.status = "archived"
+    row.is_active = False
+    await vs.revise(session, row, plaintext=plaintext, change="archive", vector_event="delete")
+
+
+async def delete_memory(memory_id: int, *, user_id: str, project_id: str | None = None,
+                        include_account: bool = True, domain_id: str | None = None) -> None:
     try:
-        async with factory() as session, session.begin():
-            row = await _load_owned(session, memory_id, user_id, project_id, include_account=include_account)
-            row.status = "deleting"
-            row.is_active = False
-            plaintext = decrypt_chat_content(row.content) if row.content else ""
-            await _queue_semantic_mutation(session, row=row, mutation="delete", plaintext=plaintext)
+        async with _require_db()() as session, session.begin():
+            row = await _owned(session, memory_id, user_id, project_id, domain_id, include_account, lock=True)
+            await _archive(session, row, decrypt_chat_content(row.content))
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
 
-async def apply_automatic_ops_in_transaction(
-    session,
-    *,
-    ops: list[dict],
-    user_id: str,
-    project_id: str,
-) -> dict[str, int]:
-    """Apply only project-scoped, unchanged automatic deltas in the caller's transaction."""
+async def apply_automatic_ops_in_transaction(session, *, ops: list[dict], user_id: str,
+                                             project_id: str, domain_id: str) -> dict[str, int]:
+    """Accept only unchanged automatic deltas in this caller's domain chat notes."""
     applied = {"add": 0, "update": 0, "delete": 0}
-    await session.execute(
-        insert(ChatMemoryOwnerLock).values(user_id=user_id, project_id=project_id).prefix_with("IGNORE")
-    )
-    await session.execute(
-        select(ChatMemoryOwnerLock)
-        .where(
-            ChatMemoryOwnerLock.user_id == user_id,
-            ChatMemoryOwnerLock.project_id == project_id,
-        )
-        .with_for_update()
-    )
+    if not domain_id:
+        return applied
+    await session.execute(insert(ChatMemoryOwnerLock).values(user_id=user_id, project_id=domain_id).prefix_with("IGNORE"))
+    await session.execute(select(ChatMemoryOwnerLock).where(
+        ChatMemoryOwnerLock.user_id == user_id, ChatMemoryOwnerLock.project_id == domain_id,
+    ).with_for_update())
     for op in ops:
         if not isinstance(op, dict):
             continue
-        kind = op.get("op")
-        memory_id = op.get("id")
-        category = op.get("category")
+        kind, category, content = op.get("op"), op.get("category"), op.get("content")
+        if kind in {"add", "update"}:
+            if not isinstance(content, str) or not isinstance(category, str):
+                continue
+            try:
+                _validate_category(category)
+                content = _checked_content(content)
+            except MemoryValidationError:
+                continue
         if kind == "add":
-            content = op.get("content")
-            if not isinstance(content, str) or not content.strip() or not isinstance(category, str):
+            note = _new_chat_note(user_id, domain_id, project_id, category)
+            session.add(note)
+            await vs.revise(session, note, plaintext=content, change="extract", vector_event="upsert")
+        elif kind in {"update", "delete"} and type(op.get("id")) is int:
+            expected = op.get("expected_state_fingerprint")
+            if not isinstance(expected, str) or not expected.isascii():
                 continue
-            try:
-                _validate_category(category)
-            except MemoryValidationError:
+            note = await session.scalar(_notes(user_id).where(
+                VaultNote.id == op["id"], VaultNote.domain_id == domain_id, VaultNote.workspace_id.is_(None),
+                VaultNote.is_active.is_(True),
+            ).with_for_update())
+            if note is None:
                 continue
-            row = ChatMemory(
-                user_id=user_id,
-                project_id=project_id,
-                scope="project",
-                category=category,
-                content=encrypt_chat_content(content.strip()),
-            )
-            session.add(row)
-            await session.flush()
-            await _queue_semantic_mutation(session, row=row, mutation="upsert", plaintext=content.strip())
-            applied["add"] += 1
-            continue
-        if kind not in {"update", "delete"} or not isinstance(memory_id, int):
-            continue
-        expected_state_fingerprint = op.get("expected_state_fingerprint")
-        if not isinstance(expected_state_fingerprint, str):
-            continue
-        row = (
-            await session.execute(select(ChatMemory).where(ChatMemory.id == memory_id).with_for_update())
-        ).scalar_one_or_none()
-        if (
-            row is None
-            or row.user_id != user_id
-            or row.scope != "project"
-            or row.project_id != project_id
-            or row.status != "active"
-            or row.is_active is not True
-            or (row.expires_at is not None and row.expires_at <= datetime.now(UTC))
-        ):
-            continue
-        plaintext = decrypt_chat_content(row.content) if row.content else ""
-        current_state_fingerprint = memory_state_fingerprint(
-            plaintext,
-            category=row.category,
-            status=row.status,
-            is_active=row.is_active,
-        )
-        if not hmac.compare_digest(expected_state_fingerprint, current_state_fingerprint):
-            continue
-        if kind == "update":
-            content = op.get("content")
-            if not isinstance(content, str) or not content.strip() or not isinstance(category, str):
+            plaintext = decrypt_chat_content(note.content)
+            if not hmac.compare_digest(expected, memory_state_fingerprint(
+                plaintext, category=note.category, status=note.status, is_active=note.is_active,
+            )):
                 continue
-            try:
-                _validate_category(category)
-            except MemoryValidationError:
-                continue
-            row.content = encrypt_chat_content(content.strip())
-            row.category = category
-            await _queue_semantic_mutation(session, row=row, mutation="upsert", plaintext=content.strip())
-            applied["update"] += 1
+            if kind == "update":
+                note.category = category
+                await vs.revise(session, note, plaintext=content, change="extract", vector_event="upsert")
+            else:
+                await _archive(session, note, plaintext)
         else:
-            row.status = "deleting"
-            row.is_active = False
-            await _queue_semantic_mutation(session, row=row, mutation="delete", plaintext=plaintext)
-            applied["delete"] += 1
+            continue
+        applied[kind] += 1
     return applied
-
-
-async def apply_automatic_ops(
-    *,
-    ops: list[dict],
-    user_id: str,
-    project_id: str,
-) -> dict[str, int]:
-    """Apply model-derived deltas atomically after serializing one owner/project."""
-    factory = _require_db()
-    try:
-        async with factory() as session, session.begin():
-            return await apply_automatic_ops_in_transaction(
-                session,
-                ops=ops,
-                user_id=user_id,
-                project_id=project_id,
-            )
-    except OperationalError as exc:
-        mark_db_unhealthy()
-        raise ChatStorageUnavailable("chat DB 오류") from exc
-
-
-async def active_contents_for_run(
-    *,
-    user_id: str,
-    project_id: str | None,
-    workspace_id: int | None = None,
-    include_account: bool = True,
-) -> list[str]:
-    """Hydrate only active MySQL rows in the caller's exact visible namespaces."""
-    if not is_db_available():
-        return []
-    factory = get_session_factory()
-    if factory is None:
-        return []
-    try:
-        async with factory() as session:
-            rows = (
-                (
-                    await session.execute(
-                        select(ChatMemory)
-                        .where(
-                            ChatMemory.user_id == user_id,
-                            ChatMemory.is_active.is_(True),
-                            ChatMemory.status == "active",
-                            _not_expired_predicate(),
-                            (
-                                _scope_predicate(project_id=project_id, workspace_id=workspace_id)
-                                if include_account
-                                else _project_scope_predicate(project_id=project_id, workspace_id=workspace_id)
-                            ),
-                        )
-                        .order_by(ChatMemory.updated_at.desc())
-                        .limit(_MAX_INJECT)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            return [
-                plaintext for row in rows if (plaintext := decrypt_chat_content(row.content) if row.content else None)
-            ]
-    except Exception:
-        logger.warning("메모리 주입 조회 실패", exc_info=True)
-        return []

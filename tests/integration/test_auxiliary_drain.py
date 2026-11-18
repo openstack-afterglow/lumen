@@ -63,7 +63,8 @@ async def auxiliary_db(request):
         await session.flush()
         session.add(ChatRun(
             id=run_id, conversation_id=graph_id, run_scope="persistent", status="completed",
-            model_name="auxiliary-test", capability_snapshot={}, pricing_snapshot={}, **owner,
+            model_name="auxiliary-test", capability_snapshot={"vault_domain_id": "test-domain-123"},
+            pricing_snapshot={}, **owner,
             client_request_id=str(uuid.uuid4()), request_fingerprint=nonce, fingerprint_version=1,
         ))
 

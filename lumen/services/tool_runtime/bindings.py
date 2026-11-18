@@ -15,6 +15,7 @@ from lumen.services import mcp_adapter as mcp_lumen
 from lumen.services import mcp_adapter as mcp_registry
 from lumen.services import mcp_client
 from lumen.services.tools import ToolContext
+from lumen.services.vault_tools import bindings as vault_bindings
 
 from .contracts import (
     ToolBindingSession,
@@ -533,6 +534,10 @@ async def v2_tool_bindings(
             raise ValueError(f"duplicate v2 tool name: {binding.definition.name}")
         bindings[binding.definition.name] = binding
 
+    if include_platform:
+        for binding in vault_bindings(ctx).values():
+            add(binding)
+
     if include_managed or extension_load_policy == "on_demand":
         for binding in await _lumen_registry_bindings(ctx):
             # Legacy chat has no managed mutation approval boundary. Delegated
@@ -541,6 +546,12 @@ async def v2_tool_bindings(
                 add(binding)
 
     for custom in await _load_custom(ctx):
+        # Domain HTTP tools are explicit, on-demand and use the v2 approval boundary for mutations.
+        if (
+            custom.get("scope") == "domain" and extension_load_policy is not None
+            and not include_managed and custom.get("effect") != "read"
+        ):
+            continue
         if extension_load_policy is not None and custom.get("load_policy") != extension_load_policy:
             continue
         identifier = custom.get("id")
@@ -713,6 +724,7 @@ async def _legacy_dynamic_bindings(ctx: ToolContext) -> dict[str, ToolBinding]:
             extension_load_policy="preloaded",
             include_platform=False,
         )
+        preloaded.update(vault_bindings(ctx))
         session.legacy_bindings.update(
             (name, binding)
             for name, binding in preloaded.items()

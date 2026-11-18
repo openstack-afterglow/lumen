@@ -7,8 +7,9 @@ import asyncio
 import logging
 
 from lumen_plugin_api.database import DatabaseConfig
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.orm import load_only
 
 from lumen.config import get_settings
 from lumen.models import ChatConversation, ChatConversationActivePath
@@ -20,6 +21,14 @@ logger = logging.getLogger(__name__)
 
 class HistoryBackfillError(RuntimeError):
     """A conversation graph cannot be projected safely."""
+
+
+async def has_history_domain_scope(connection) -> bool:
+    return (await connection.scalar(text("""
+        SELECT COUNT(*) FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME = 'domain_id'
+          AND TABLE_NAME IN ('chat_conversations', 'chat_message_graphs')
+    """))) == 2
 
 
 async def count_unready(engine: AsyncEngine) -> int:
@@ -46,6 +55,9 @@ async def backfill_history(
     if not 1 <= insert_batch_size <= 1000:
         raise ValueError("insert_batch_size must be between 1 and 1000")
 
+    async with engine.connect() as connection:
+        domain_scope = await has_history_domain_scope(connection)
+
     completed = 0
     after_id = ""
     while True:
@@ -70,7 +82,10 @@ async def backfill_history(
             async with AsyncSession(engine, expire_on_commit=False) as session, session.begin():
                 conversation = (
                     await session.execute(
-                        select(ChatConversation).where(ChatConversation.id == conversation_id).with_for_update()
+                        select(ChatConversation)
+                        .options(load_only(ChatConversation.active_leaf_id, ChatConversation.history_index_ready))
+                        .where(ChatConversation.id == conversation_id)
+                        .with_for_update()
                     )
                 ).scalar_one_or_none()
                 if conversation is None or conversation.history_index_ready:
@@ -80,6 +95,7 @@ async def backfill_history(
                         session,
                         conversation_id=conversation_id,
                         leaf_id=conversation.active_leaf_id,
+                        domain_scope=domain_scope,
                     )
                 except MessageGraphError as exc:
                     logger.error("history projection failed for conversation_id=%s", conversation_id)

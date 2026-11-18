@@ -169,6 +169,7 @@ def provider_db(monkeypatch):
         provider_id: int = 1,
         is_active: bool = True,
         sort_order: int = 0,
+        model_kind: str = "text",
     ):
         with sync_factory.begin() as session:
             session.add(
@@ -176,6 +177,7 @@ def provider_db(monkeypatch):
                     id=model_id,
                     provider_id=provider_id,
                     model_name=model_name,
+                    model_kind=model_kind,
                     sort_order=sort_order,
                     input_price=Decimal("0"),
                     output_price=Decimal("0"),
@@ -928,6 +930,95 @@ async def test_ambiguous_native_admission_and_completion_fail_with_conflict(prov
         await completion_api.resolve("ambiguous-native-model")
     assert compat.value.status_code == 409
     assert compat.value.message == "model_route_ambiguous"
+
+
+@pytest.mark.parametrize("kind", ["image", "tts", "stt", "realtime"])
+async def test_media_selector_exact_row_keeps_legacy_decimal_and_checks_assertions(provider_db, kind):
+    add_provider, add_model, _ = provider_db
+    for provider_id in (1, 2):
+        add_provider(provider_id=provider_id, provider_type="openai", api_provider=f"endpoint-{provider_id}")
+        add_model("duplicate-model", provider_id=provider_id, model_id=provider_id + 10, model_kind=kind)
+    add_model("wrong-kind", model_id=13)
+    with pytest.raises(routing.AmbiguousModelRouteError):
+        await routing.resolve_media_model("duplicate-model", model_kind=kind)
+    for legacy in (None, "duplicate-model", "12", "lumen/2/12"):
+        selected = await routing.resolve_media_model(
+            legacy, model_row_id=12, provider_id="endpoint-2", model_kind=kind,
+        )
+        assert (selected["model_id"], selected["provider_id"]) == (12, 2)
+    for legacy, provider in (("wrong", 2), ("11", 2), ("lumen/1/11", 2), (None, 1), (None, "endpoint-1")):
+        with pytest.raises(ProviderValidationError, match="model_selection_mismatch"):
+            await routing.resolve_media_model(legacy, model_row_id=12, provider_id=provider, model_kind=kind)
+    for legacy, provider in (("12", None), ("duplicate-model", 2)):
+        selected = await routing.resolve_media_model(legacy, provider_id=provider, model_kind=kind)
+        assert (selected["model_id"], selected["provider_id"]) == (12, 2)
+    assert await routing.resolve_media_model(None, model_row_id=13, model_kind=kind) is None
+
+
+@pytest.mark.parametrize("provider_type,stored_name,selector", [
+    ("openai", "shared-model", "perplexity/shared-model"),
+    ("perplexity", "perplexity/perplexity/search", "search"),
+    ("gemini", "gemini/shared-model", "shared-model"),
+])
+async def test_legacy_selector_and_exact_row_accept_same_alias(provider_db, provider_type, stored_name, selector):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type=provider_type)
+    add_model(stored_name, model_id=12)
+    route = await routing.resolve_api_model(selector)
+    assert route["model_id"] == 12
+    assert routing.matches_api_model_selector(route, selector)
+
+
+async def test_root_agent_model_requires_exact_or_unambiguous_selection(provider_db):
+    from fastapi import HTTPException
+
+    from lumen.services.chat_admission import _resolve_run_model
+
+    add_provider, add_model, _ = provider_db
+    for provider_id in (1, 2):
+        add_provider(provider_id=provider_id, provider_type="openai")
+        add_model("duplicate-model", provider_id=provider_id, model_id=provider_id + 10)
+    add_model("unique-model", model_id=13)
+    pinned = {"model_name": "duplicate-model", "model_row_id": 12}
+    for name, row_id in ((None, None), ("duplicate-model", None), (None, 12)):
+        route = await _resolve_run_model(name, row_id, pinned)
+        assert (route["model_id"], route["provider_id"]) == (12, 2)
+    for name, row_id in (("unique-model", None), (None, 11)):
+        with pytest.raises(HTTPException) as conflict:
+            await _resolve_run_model(name, row_id, pinned)
+        assert conflict.value.status_code == 422
+    with pytest.raises(HTTPException) as ambiguous:
+        await _resolve_run_model(None, None, {"model_name": "duplicate-model"})
+    assert (ambiguous.value.status_code, ambiguous.value.detail) == (409, "model_route_ambiguous")
+    assert (await _resolve_run_model(None, None, {"model_name": "unique-model"}))["model_id"] == 13
+    for legacy_default in ("duplicate-model", "unavailable"):
+        agent = {"model_name": legacy_default}
+        assert (await _resolve_run_model("unique-model", None, agent))["model_id"] == 13
+        assert (await _resolve_run_model(None, 12, agent))["provider_id"] == 2
+
+
+@pytest.mark.parametrize("kind,provider_type,name", [
+    ("text", "openai", "gpt-6-luna"), ("decision", "gemini", "gemini/gemini-decision-1"),
+])
+async def test_decisions_select_exact_catalog_model_kind_and_keep_name_routing(provider_db, kind, provider_type, name):
+    from lumen.services import decisions
+
+    add_provider, add_model, _ = provider_db
+    for provider_id in (1, 2):
+        add_provider(provider_id=provider_id, provider_type=provider_type)
+        add_model(name, provider_id=provider_id, model_id=provider_id + 10, model_kind=kind)
+    add_model("wrong-kind", model_id=13, model_kind="image")
+    with pytest.raises(decisions.DecisionError) as ambiguous:
+        await decisions.resolve(name)
+    assert ambiguous.value.status_code == 409
+    selected = await decisions.resolve(name, model_row_id=12, provider_type=provider_type)
+    assert (selected["model_id"], selected["provider_id"]) == (12, 2)
+    with pytest.raises(decisions.DecisionError) as mismatch:
+        await decisions.resolve("wrong", model_row_id=12)
+    assert mismatch.value.status_code == 422
+    with pytest.raises(decisions.DecisionError) as wrong_kind:
+        await decisions.resolve(None, model_row_id=13)
+    assert wrong_kind.value.status_code == 404
 
 
 async def test_renamed_api_selector_is_independent_of_existing_gemini_model_prefix(provider_db):

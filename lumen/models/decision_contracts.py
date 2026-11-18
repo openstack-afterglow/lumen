@@ -16,6 +16,8 @@ from pydantic import (
     model_validator,
 )
 
+from lumen.models.api_requests import ModelRowId
+
 MAX_DECISION_BODY_BYTES = 16 * 1024 * 1024
 Text = Annotated[StrictStr, Field(max_length=10485760)]
 ShortText = Annotated[StrictStr, Field(max_length=1048576)]
@@ -248,4 +250,15 @@ class DecisionRequest(WireModel):
                 calls.add((item.type.removesuffix("_call"), item.call_id))
             elif isinstance(item, ToolOutput) and (item.type.removesuffix("_call_output"), item.call_id) not in calls:
                 raise ValueError("tool output must follow a matching call_id")
+        return self
+
+
+class NativeDecisionRequest(DecisionRequest):
+    model: Annotated[StrictStr, Field(min_length=1, max_length=190)] | None = None
+    model_row_id: ModelRowId | None = None
+
+    @model_validator(mode="after")
+    def require_model(self):
+        if self.model is None and self.model_row_id is None:
+            raise ValueError("model or model_row_id is required")
         return self
