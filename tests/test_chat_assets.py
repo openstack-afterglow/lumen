@@ -628,7 +628,8 @@ def test_generated_svg_inspector_rejects_nonstatic_content(tmp_path, markup):
 def test_generated_svg_inspector_accepts_static_utf8_vector_with_local_paint(tmp_path):
     path = tmp_path / "content"
     path.write_text(
-        '<svg xmlns="http://www.w3.org/2000/svg" version="1.1" baseProfile="full" viewBox="0 0 1 1"><title>그림</title>'
+        '<svg xmlns="http://www.w3.org/2000/svg" version="1.1" baseProfile="full" viewBox="0 0 1 1" '
+        'aria-label="Product image (front)"><title>그림</title>'
         '<defs><linearGradient id="paint"><stop stop-color="#abc"/></linearGradient></defs>'
         '<path d="M0 0L1 1" fill="url(#paint)"/></svg>', encoding="utf-8",
     )

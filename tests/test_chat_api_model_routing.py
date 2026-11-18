@@ -537,7 +537,7 @@ async def test_svg_author_requires_a_registered_unrestricted_route_on_the_image_
     async with routing._require_db()() as session:
         with session.sync.begin():
             credential = session.sync.get(LlmProviderCredential, 1)
-            credential.allowed_model_ids = [created["id"], 11]
+            credential.allowed_model_ids = [created["id"], 11, 13, 14]
     route = await routing.resolve_model_by_id(created["id"], model_kind="image")
     for rejected in ("gpt-6-cyber", "gpt-4.1-mini", "gpt-4.1", "gpt-5-mini", "gpt-4o", "openai/gpt-5"):
         assert await routing.resolve_image_svg_authors(route, model_name=rejected) == []
@@ -551,6 +551,19 @@ async def test_svg_author_requires_a_registered_unrestricted_route_on_the_image_
     allowed = await get_chat_capabilities(model_id=created["id"], model_kind="image",
                                          token_info={**principal, "scopes": ("models:read", "native:runs:write")})
     assert [author["model"] for author in allowed["image_svg_author_models"]] == ["gpt-5"]
+
+    from fastapi import HTTPException
+
+    from lumen.services.providers.errors import ChatStorageUnavailable
+
+    async def unavailable(*_args, **_kwargs):
+        raise ChatStorageUnavailable("storage unavailable")
+
+    monkeypatch.setattr(routing, "resolve_image_svg_authors", unavailable)
+    with pytest.raises(HTTPException) as error:
+        await get_chat_capabilities(model_id=created["id"], model_kind="image",
+                                    token_info={**principal, "scopes": ("models:read", "native:runs:write")})
+    assert error.value.status_code == 503
 
 
 async def test_media_registration_rejects_unsupported_transport_before_persistence(provider_db):

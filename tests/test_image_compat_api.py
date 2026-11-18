@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 from types import SimpleNamespace
 from uuid import uuid4
 
-from fastapi import FastAPI
+import pytest
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -300,3 +302,70 @@ def test_compat_explicit_svg_author_requires_text_scope(monkeypatch):
     }
     assert client.post("/v1/images/generations", json=body).status_code == 200
     assert client.post("/v1/images/generations", json={**body, "svg_model": "gpt-5"}).status_code == 422
+
+
+def test_native_edit_accepts_the_ordered_input_ids(monkeypatch):
+    source_ids = [str(uuid4()), str(uuid4())]
+    markup_id = str(uuid4())
+    seen = []
+
+    async def admit_image_run(body, **_owner):
+        seen.append(body)
+        run_id = str(uuid4())
+        return {"run_id": run_id, "status": "queued", "run_kind": "image",
+                "events_url": f"/v1/runs/{run_id}/events", "cancel_url": f"/v1/runs/{run_id}/cancel"}
+
+    monkeypatch.setattr(native_images, "admit_image_run", admit_image_run)
+    app = FastAPI()
+    app.include_router(native_images.router, prefix="/v1")
+    app.dependency_overrides[get_principal] = lambda: {
+        **_principal(), "scopes": ("native:images:write", "native:assets:read"),
+    }
+    client = TestClient(app)
+    response = client.post("/v1/chat/images/edits", headers={"Idempotency-Key": str(uuid4())}, json={
+        "model_id": "gpt-image-2.6-flare", "prompt": "Draw", "input_asset_ids": source_ids, "markup_asset_id": markup_id,
+    })
+    assert response.status_code == 202, response.text
+    assert seen[0]["input_asset_ids"] == source_ids and seen[0]["markup_asset_id"] == markup_id
+
+
+@pytest.mark.parametrize("outcome", ["match", "wrong_role", "wrong_order", "wrong_digest"])
+async def test_edit_replay_preserves_roles_order_and_digests(tmp_path, monkeypatch, outcome):
+    contents = [b"first", b"other", b"mask!"]
+    paths = [tmp_path / str(i) for i in range(3)]
+    for path, content in zip(paths, contents, strict=True):
+        path.write_bytes(content)
+    ids = [str(uuid4()) for _ in paths]
+    rows = [SimpleNamespace(id=id_, size_bytes=len(content), sha256=hashlib.sha256(content).hexdigest())
+            for id_, content in zip(ids, contents, strict=True)]
+    # SQL ordering is deliberately unrelated to request ordering.
+    rows.reverse()
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def scalar(self, _query):
+            return SimpleNamespace(id="prior-run", run_kind="image")
+
+        async def scalars(self, _query):
+            return SimpleNamespace(all=lambda: rows)
+
+    monkeypatch.setattr(image_api, "get_session_factory", lambda: Session)
+    monkeypatch.setattr(image_api, "_payload", lambda _run: {
+        "source_asset_id": ids[0], "additional_source_asset_ids": [ids[1]], "mask_asset_id": ids[2],
+    })
+    overlay = "markup" if outcome == "wrong_role" else "mask"
+    if outcome == "wrong_order":
+        paths[0], paths[1] = paths[1], paths[0]
+    if outcome == "wrong_digest":
+        paths[0].write_bytes(b"third")
+    if outcome == "match":
+        assert await image_api._replayed_sources(paths, uuid4(), _principal(), overlay=overlay) == ids
+    else:
+        with pytest.raises(HTTPException) as err:
+            await image_api._replayed_sources(paths, uuid4(), _principal(), overlay=overlay)
+        assert err.value.status_code == 409

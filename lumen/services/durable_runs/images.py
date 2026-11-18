@@ -24,7 +24,7 @@ from lumen.services.provider_metadata import UsageCost
 from lumen.services.providers import image_transport, routing
 from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.errors import AmbiguousModelRouteError
-from lumen.services.providers.image_billing import parse_svg_usage, svg_author_pricing
+from lumen.services.providers.image_billing import parse_svg_usage, svg_author_aliases, svg_author_pricing
 from lumen.services.providers.pricing import frozen_token_pricing
 from lumen.services.run_store import (
     append_event,
@@ -215,6 +215,10 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
                 pricing["additional_dimensions"] = dimensions[1:]
         if author_prices is not None:
             pricing["svg_author_pricing"] = deepcopy(author_prices)
+            if author_route is not None:
+                # A provider-reported snapshot of this same entry uses the
+                # selected route's frozen rates, never a different local route.
+                pricing["svg_author_aliases"] = list(svg_author_aliases(options["svg_model"]))
     else:
         pricing["image_per_unit"] = format(unit_price, "f")
     pricing["bound_credits"] = format(bound, "f")
@@ -404,8 +408,11 @@ def _price_token_image(pricing: dict, usage: object, *, model_name: str) -> tupl
     if author_prices is not None:
         author = parse_svg_usage(usage.get("svg_usage"))
         author_model = author["model"]
+        priced_author = author_model
+        if len(author_prices) == 1 and author_model in pricing.get("svg_author_aliases", ()):
+            priced_author = next(iter(author_prices))
         author_cost = credit.usage_cost_from_pricing_snapshot(
-            author_prices[author_model], prompt_tokens=author["input_tokens"], completion_tokens=author["output_tokens"],
+            author_prices[priced_author], prompt_tokens=author["input_tokens"], completion_tokens=author["output_tokens"],
         )
         if author_cost.pricing_status != "priced":
             raise ValueError("SVG authoring usage is unpriced")

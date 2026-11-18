@@ -831,7 +831,10 @@ The default hold is **not** a tariff or hard provider limit. Lumen computes:
   candidate cost. When the caller selects one, require an exact nonrestricted
   native catalog ID registered on the image provider and authorized by the
   image route's fixed account and credential; reserve at its resolved rates
-  and require exact ID equality in `svg_usage`. Reasoning is already included in output.
+  and require either the selected ID or a frozen exact alias of the same
+  native catalog entry in `svg_usage`. Both use the selected route's frozen
+  rates; an independently configured model route is not consulted. Reasoning
+  is already included in output.
 - Sum each quantity × its matching USD/token rate; round the derived USD
   envelope up to 10 decimal places. Apply frozen margin and credit conversion.
   Admission checks available headroom without charging; the worker atomically

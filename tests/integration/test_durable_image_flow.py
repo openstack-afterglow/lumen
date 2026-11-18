@@ -362,7 +362,7 @@ async def test_media_start_does_not_block_another_users_text_start(monkeypatch, 
 @pytest.mark.parametrize("outcome", [
     "observed", "missing", "over_envelope", "invalid", "storage_failure",
     "catalog_edited", "catalog_missing", "catalog_over_hold", "catalog_low_credit", "svg_known", "svg_unknown",
-    "svg_selected", "svg_mismatch", "catalog_multi_edit",
+    "svg_selected", "svg_alias", "svg_mismatch", "catalog_multi_edit",
 ])
 async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, outcome):
     nonce = uuid.uuid4().hex
@@ -372,7 +372,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
     svg = outcome.startswith("svg_")
     edit = outcome in {"catalog_edited", "catalog_multi_edit"}
     multi = outcome == "catalog_multi_edit"
-    selected = outcome in {"svg_selected", "svg_mismatch"}
+    selected = outcome in {"svg_selected", "svg_alias", "svg_mismatch"}
     count = 2 if edit else 1
     expected_svg = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>'
     factory = get_session_factory()
@@ -450,8 +450,8 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
             observed = UsageBreakdown(100, image_output, modality_tokens={"image": ModalityTokens(
                 input_tokens=50 if edit else 0, output_tokens=image_output,
             )})
-        author = {"model": ("gpt-4.1-mini" if outcome in {"svg_known", "svg_selected"} else
-                            "gpt-4.1" if outcome == "svg_mismatch" else "unlisted-author"),
+        author = {"model": {"svg_known": "gpt-4.1-mini", "svg_selected": "gpt-4.1-mini",
+                            "svg_alias": "gpt-4.1-mini-2025-04-14", "svg_mismatch": "gpt-4.1"}.get(outcome, "unlisted-author"),
                   "input_tokens": 500, "output_tokens": 200, "reasoning_tokens": 100, "total_tokens": 700}
 
         async def provider_call(route, **kwargs):
@@ -532,7 +532,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
             segment = (await session.execute(select(ChatRunSegment).where(ChatRunSegment.run_id == run.id))).scalar_one()
             assert hold.bound_credits == credit.credits_for_cost(
                 Decimal(frozen["reservation_usd"]), Decimal("2"), Decimal(frozen["credit_per_usd"]))
-            success = outcome in {"catalog_edited", "catalog_multi_edit", "svg_known", "svg_selected"}
+            success = outcome in {"catalog_edited", "catalog_multi_edit", "svg_known", "svg_selected", "svg_alias"}
             if multi:
                 input_ids = (await session.scalars(select(ChatRunAsset.asset_id).where(
                     ChatRunAsset.run_id == run.id, ChatRunAsset.purpose == "input"))).all()
@@ -546,7 +546,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
                 assert ledger[0].completion_tokens == (400 if svg else 200)
                 if svg:
                     assert images.load_segment_payload(segment.usage_payload)["svg_usage"] == author
-                    assert any(c["model_name"] == "gpt-4.1-mini" for c in ledger[0].usage_components)
+                    assert any(c["model_name"] == author["model"] for c in ledger[0].usage_components)
             elif not catalog:
                 assert Decimal(frozen["reservation_usd"]) == Decimal("0.01")
             if outcome == "observed":

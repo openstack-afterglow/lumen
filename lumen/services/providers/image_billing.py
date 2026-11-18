@@ -108,6 +108,17 @@ def selectable_svg_authors() -> dict[str, tuple[str, ...]]:
     return authors
 
 
+def svg_author_aliases(model: str) -> tuple[str, ...]:
+    """Other exact IDs for the same priced native entry, never a model family."""
+    if model not in selectable_svg_authors():
+        return ()
+    for entry in native_catalog()["providers"]["openai"]["models"]:
+        names = (entry["id"], *entry["aliases"])
+        if model in names:
+            return tuple(name for name in names if name != model)
+    return ()
+
+
 def svg_author_hold(prices: dict[str, dict], prompt_bytes: int) -> Decimal:
     if not prices:
         raise ProviderValidationError("SVG authoring rates are unavailable")

@@ -761,11 +761,17 @@ async def _confirmed_session_update(upstream, config: dict, limits: dict, frame_
     """Require a matching acknowledgement before the next setup phase or any client traffic."""
     async with asyncio.timeout(_REALTIME_SETUP_SECONDS):
         await upstream.send(json.dumps({"type": "session.update", "session": config}))
-        message = _object(await upstream.recv(), frame_limit)
-        if message.get("type") == "session.created":
+        # Each documented creation event may precede the ACK once. Any repeat or
+        # unrelated event reaches the strict ACK check below and fails setup.
+        creation_events = {"session.created", "conversation.created"}
+        while True:
+            message = _object(await upstream.recv(), frame_limit)
+            event = message.get("type")
+            if not isinstance(event, str) or event not in creation_events:
+                break
+            creation_events.remove(event)
             if compat_events is not None:
                 compat_events.append(message)
-            message = _object(await upstream.recv(), frame_limit)
         session = message.get("session")
         if (message.get("type") != "session.updated" or not isinstance(session, dict)
                 or any(session.get(key) != value for key, value in limits.items())):
