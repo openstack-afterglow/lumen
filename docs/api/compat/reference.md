@@ -16,6 +16,8 @@
 | POST | `/v1/chat/completions` | Chat Completions | API key (Bearer), API key (x-api-key) | `compat:completions:write` | [OpenAIChatRequest](schemas.md#openaichatrequest) | 200 | `chat_completions_v1_chat_completions_post` |
 | GET | `/v1/cli/models` | List Cli Models | API key (Bearer), API key (x-api-key) | `models:read` | — | 200 | `list_cli_models_v1_cli_models_get` |
 | GET | `/v1/compat` | Discovery | none (public) | — | — | 200 | `discovery_v1_compat_get` |
+| POST | `/v1/decisions` | Create Decision | API key (Bearer), API key (x-api-key) | `decisions:write` | [DecisionRequest](schemas.md#decisionrequest) | 200 | `create_decision_v1_decisions_post` |
+| POST | `/v1/embeddings` | Openai Embeddings | API key (Bearer), API key (x-api-key) | `embeddings:write` | [OpenAIEmbeddingRequest](schemas.md#openaiembeddingrequest) | 200 | `openai_embeddings_v1_embeddings_post` |
 | GET | `/v1/files` | List Files | API key (Bearer), API key (x-api-key) | `compat:files:read` | — | 200 | `list_files_v1_files_get` |
 | POST | `/v1/files` | Upload File | API key (Bearer), API key (x-api-key) | `compat:files:write` | multipart/form-data | 200 | `upload_file_v1_files_post` |
 | DELETE | `/v1/files/{file_id}` | Delete File | API key (Bearer), API key (x-api-key) | `compat:files:write` | — | 200 | `delete_file_v1_files__file_id__delete` |
@@ -25,3 +27,11 @@
 | POST | `/v1/messages/count_tokens` | Count Tokens | API key (Bearer), API key (x-api-key) | `compat:completions:write` | [AnthropicCountTokensRequest](schemas.md#anthropiccounttokensrequest) | 200 | `count_tokens_v1_messages_count_tokens_post` |
 | GET | `/v1/models` | List Models | API key (Bearer), API key (x-api-key) | `models:read` | — | 200 | `list_models_v1_models_get` |
 | POST | `/v1/responses` | Responses | API key (Bearer), API key (x-api-key) | `compat:completions:write` | [ResponsesRequest](schemas.md#responsesrequest) | 200 | `responses_v1_responses_post` |
+| POST | `/v1beta/decisions` | Create Gemini Decision | API key (Bearer), API key (x-api-key), API key (x-goog-api-key) | `decisions:write` | [GeminiDecisionRequest](schemas.md#geminidecisionrequest) | 200 | `create_gemini_decision_v1beta_decisions_post` |
+| GET | `/v1beta/models` | List Models | API key (Bearer), API key (x-api-key), API key (x-goog-api-key) | `models:read` | — | 200 | `list_models_v1beta_models_get` |
+| GET | `/v1beta/models/{model}` | Get Model | API key (Bearer), API key (x-api-key), API key (x-goog-api-key) | `models:read` | — | 200 | `get_model_v1beta_models__model__get` |
+| POST | `/v1beta/models/{model}:batchEmbedContents` | Gemini Batch Embed | API key (Bearer), API key (x-api-key), API key (x-goog-api-key) | `embeddings:write` | — | 200 | `gemini_batch_embed_v1beta_models__model__batchEmbedContents_post` |
+| POST | `/v1beta/models/{model}:countTokens` | Count Tokens | API key (Bearer), API key (x-api-key), API key (x-goog-api-key) | `compat:completions:write` | — | 200 | `count_tokens_v1beta_models__model__countTokens_post` |
+| POST | `/v1beta/models/{model}:embedContent` | Gemini Embed | API key (Bearer), API key (x-api-key), API key (x-goog-api-key) | `embeddings:write` | [GeminiEmbedRequest](schemas.md#geminiembedrequest) | 200 | `gemini_embed_v1beta_models__model__embedContent_post` |
+| POST | `/v1beta/models/{model}:generateContent` | Generate Content | API key (Bearer), API key (x-api-key), API key (x-goog-api-key) | `compat:completions:write` | [GeminiGenerateRequest](schemas.md#geminigeneraterequest) | 200 | `generate_content_v1beta_models__model__generateContent_post` |
+| POST | `/v1beta/models/{model}:streamGenerateContent` | Stream Generate Content | API key (Bearer), API key (x-api-key), API key (x-goog-api-key) | `compat:completions:write` | [GeminiGenerateRequest](schemas.md#geminigeneraterequest) | 200 | `stream_generate_content_v1beta_models__model__streamGenerateContent_post` |
