@@ -691,6 +691,18 @@ def test_domain_billing_reports_unknown_context_limit_until_admin_override(nativ
     assert overridden["domain_billing"] == {"ready": True, "reason_code": None}
 
 
+def test_malformed_stored_token_rates_mark_one_model_unready_without_breaking_catalog(native_catalog, monkeypatch):
+    native_catalog()
+
+    def invalid(_route):
+        raise provider_pricing.ProviderValidationError("token_rates invalid")
+
+    monkeypatch.setattr(provider_pricing, "route_token_rates", invalid)
+    public = _model_public(_priced_compatible_model({"context_limit": 32_000}, "override"),
+                           provider_type="openai", api_provider="openai", api_base="https://compatible.example/v1")
+    assert public["domain_billing"] == {"ready": False, "reason_code": "pricing_unavailable"}
+
+
 @pytest.mark.parametrize(("capabilities", "prices", "reason"), [
     ({"context_limit": 8000}, (None, Decimal("1")), "pricing_unavailable"),
     ({"context_limit": 8000, "output_budget_enforced": False}, (Decimal("1"), Decimal("1")), "output_budget_unenforced"),
@@ -720,6 +732,28 @@ def test_domain_paid_admission_rejects_unready_model_before_run(capabilities, pr
     # Unpriced text is already refused by the text gate for every payer.
     expected = "text (pricing_unavailable)" if reason == "pricing_unavailable" else f"domain_billing ({reason})"
     assert error.value.detail.endswith(expected)
+
+
+@pytest.mark.parametrize("advisor_limit", [None, 4000])
+def test_domain_paid_advisor_route_needs_frozen_bounds(advisor_limit):
+    from fastapi import HTTPException
+
+    from lumen.models.chat_contracts import ChatFeatureOptions
+    from lumen.services.chat_admission import _require_execution_capability
+
+    gates = {"text": {"available": True, "mode": "native", "reason_code": None, "pricing_available": True}}
+    resolved = {"capabilities": {"context_limit": 8000, "function_calling": True, "feature_gates": gates},
+                "input_price_per_token": Decimal("0.000001"), "output_price_per_token": Decimal("0.000002")}
+    routes = {"advisor": {"provider_id": 7, "model_id": 9, "input_price_per_token": "0.0003",
+                          "output_price_per_token": "0.0004", "capabilities": {"context_limit": advisor_limit}}}
+    features = ChatFeatureOptions(advisor={"enabled": True, "model_id": 9})
+    _require_execution_capability(features, resolved, feature_routes=routes)
+    if advisor_limit is not None:
+        _require_execution_capability(features, resolved, feature_routes=routes, domain_paid=True)
+        return
+    with pytest.raises(HTTPException) as error:
+        _require_execution_capability(features, resolved, feature_routes=routes, domain_paid=True)
+    assert error.value.detail.endswith("advisor (context_limit_unknown)")
 
 
 def test_zero_base_input_with_priced_cache_still_needs_context_limit():

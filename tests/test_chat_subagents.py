@@ -100,7 +100,7 @@ async def test_child_uses_pinned_model_and_rejects_ambiguous_legacy_name(monkeyp
     from lumen.services.durable_runs import children
     from lumen.services.providers import routing
 
-    parent = SimpleNamespace(user_id="u", project_id="p", capability_snapshot={
+    parent = SimpleNamespace(user_id="u", project_id="p", payer_domain_id=None, capability_snapshot={
         "model_id": 11, "provider_id": 1, "execution_policy": _policy().model_dump(mode="json"),
     })
     child = children.DelegationCall("call", 4, "Inspect", "read", Decimal("1"), 1)
@@ -125,3 +125,32 @@ async def test_child_uses_pinned_model_and_rejects_ambiguous_legacy_name(monkeyp
     assert ambiguous.value.code == "child_route_ambiguous"
     inherited_route = await children._prepare_child_inputs(parent, {}, child, {})
     assert (inherited_route["capability_snapshot"]["model_id"], inherited_route["capability_snapshot"]["provider_id"]) == (11, 1)
+
+
+@pytest.mark.parametrize("context_limit", [None, 8000])
+async def test_domain_paid_child_rejects_unbounded_agent_model_before_spawn(monkeypatch, context_limit):
+    from lumen.services import chat_admission
+    from lumen.services.durable_runs import children
+    from lumen.services.providers import routing
+
+    parent = SimpleNamespace(user_id="u", project_id="p", payer_domain_id="domain-a", capability_snapshot={
+        "model_id": 11, "provider_id": 1, "execution_policy": _policy().model_dump(mode="json"),
+    })
+    child = children.DelegationCall("call", 4, "Inspect", "read", Decimal("1"), 1)
+    selected = {
+        "model_name": "agent-model", "provider_name": "second", "model_id": 12, "provider_id": 2,
+        "config_version_hash": "a" * 64, "input_price_per_token": "0.1", "output_price_per_token": "0.2",
+        "capabilities": {"context_limit": context_limit},
+    }
+    monkeypatch.setattr(routing, "resolve_model_by_id", AsyncMock(return_value=selected))
+    monkeypatch.setattr(chat_admission, "_resolve_extension_selection", AsyncMock(return_value={"tools": [], "mcp": []}))
+    monkeypatch.setattr(chat_admission, "_load_skill_snapshot", AsyncMock(return_value=([], [])))
+    agent = {"model_name": "agent-model", "model_row_id": 12}
+    if context_limit is None:
+        with pytest.raises(children.ChildFailure) as failure:
+            await children._prepare_child_inputs(parent, {}, child, agent)
+        assert failure.value.code == "child_route_unavailable"
+        assert "context_limit_unknown" in str(failure.value)
+    else:
+        prepared = await children._prepare_child_inputs(parent, {}, child, agent)
+        assert prepared["capability_snapshot"]["model_id"] == 12
