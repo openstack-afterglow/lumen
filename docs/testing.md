@@ -1,5 +1,20 @@
 # 테스트
 
+## Lumen 0.6.19 — 발행·운영 배포·Gemini SDK 확인
+
+- `live-verified`: `0.6.19` tag는 `2637d252c29f6719156ff91c5dbcb5dafc978322`이다. `dev` CI [`44253879223`](https://github.com/openstack-afterglow/lumen/actions/runs/44253879223), tag 이미지 [`44255458441`](https://github.com/openstack-afterglow/lumen/actions/runs/44255458441), 패키지 [`44255458415`](https://github.com/openstack-afterglow/lumen/actions/runs/44255458415)가 통과했다. [한영 GitHub Release](https://github.com/openstack-afterglow/lumen/releases/tag/0.6.19)와 휠 8개를 확인했다.
+- 각 OCI index에서 tag와 `latest`가 일치하고, amd64(에뮬레이션)와 arm64에서 child digest·revision label·실제 실행 버전(서비스 0.6.19, sandbox wheel 0.1.2)을 확인했다.
+
+| OCI image | Index digest |
+| --- | --- |
+| `lumen-api` | `sha256:3db6f322641532b18167c948827bab40a3c139528deb3e96fb3c977641f976a9` |
+| `lumen-worker` | `sha256:a896d40ec6e06b834f795db3c33fd47dc1f398b2c011fa6bfe85a7cb71f8132f` |
+| `lumen-controller` | `sha256:4553093ef780a545349038e2e6d331272b1152e5b0537f48390a2477864cfd6a` |
+| `lumen-sandbox` | `sha256:8113eb8a323987d67f6a3ac072f3531a22b642c708ffe05bcfe636530f96d9b1` |
+
+- 2026-11-18 07:21:14–07:22:18 UTC에 `kolla-ansible reconfigure -i /etc/kolla/multinode --tags lumen --skip-tags haproxy`를 실행했다. Drain 결과 62개 run 모두 종료, 처리 중인 예약 0건. MariaDB 67개 테이블과 PostgreSQL dump 헤더를 암호화 백업에서 검증했다(복원은 실행하지 않음). 새 migration은 없다. 세 컨트롤러의 status 검사·준비 확인과 공개 `/v1/health`, `/v1/ready`가 통과했다. 총 647개 컨테이너 중 `lumen_api`·`lumen_worker`만 교체됐고 재시작 0회, VIP·보호 설정은 유지됐다. Sandbox runtime은 꺼져 있다.
+- 공식 Gemini API 키 공급자 14의 `gemini-decision-1`(모델 130)을 판정 전용으로 등록했다. `google-genai==3.5.0`으로 운영 `POST /v1beta/decisions`에 요청 1건을 보냈다. 예/아니요·선택·점수 응답, 입력 210·출력 0토큰을 확인했다. 예약 26.2144 credits는 0.021에 정산됐고 사용량 원장 기록은 1건($0.000021)이다. 임시 키를 폐기했고 다시 사용하면 401을 반환한다. 이 실측은 텍스트뿐이며 운영 이미지 입력과 대시보드 실행을 검증하지 않았다.
+
 ## Gemini Decisions API local qualification
 
 `test-passed` on the reviewed `feat/gemini-decisions` source (`7e219b649d24b1f5559b18f51ae285cb013eac982f060776751c54b21fea68e5`, 643 source files):
