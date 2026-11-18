@@ -619,9 +619,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "93df620961fcd946a06bac2c012ac344e409d6f4ce5888643bbeeadbc91ba79f",
-  "reviewed_at": "2026-11-18T10:14:56Z",
-  "summary": "OpenAI realtime handshake: tolerate one documented session.created and conversation.created before each limits ACK; preserve the two-phase readiness fence and add native/compat coverage and attributed setup evidence"
+  "source_sha256": "075bb00c17b3bf2fa4d41c91f350eed478541ed97bc980996402a19c6cd1b27e",
+  "reviewed_at": "2026-11-18T10:20:19Z",
+  "summary": "Realtime review hardening: hold and admin floor use maximum payable text/audio/image input rates including cache-read overrides; regression coverage and updated billing documentation; no migration"
 }
 ```
 <!-- architecture-review:end -->

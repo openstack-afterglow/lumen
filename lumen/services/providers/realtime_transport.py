@@ -168,11 +168,15 @@ def _checked_rate(value: Decimal | None) -> Decimal:
 
 
 def _direction_rates(token_pricing: dict) -> tuple[Decimal, Decimal, Decimal]:
-    """``(text input, highest input, highest output)`` per-token USD of a frozen token plan."""
+    """Worst payable USD per text input, any input, and any output token."""
     text_input = Decimal(token_pricing["input_price_per_token"])
+    cached_text = token_pricing.get("cache_read_price_per_token")
+    if cached_text is not None:
+        text_input = max(text_input, Decimal(cached_text))
     inputs, outputs = [text_input], [Decimal(token_pricing["output_price_per_token"])]
     for rates in (token_pricing.get("token_rates") or {}).values():
-        for field, bucket in (("input_per_million", inputs), ("output_per_million", outputs)):
+        for field, bucket in (("input_per_million", inputs), ("cache_read_per_million", inputs),
+                              ("output_per_million", outputs)):
             if field in rates:
                 bucket.append(Decimal(rates[field]) / _PER_MILLION)
     return text_input, max(inputs), max(outputs)

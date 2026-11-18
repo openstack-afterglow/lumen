@@ -1026,8 +1026,10 @@ def _resolved_model_prices(
             duration_families=_realtime_duration_families(kind, model.model_name), provider_type=provider_type,
         )
         if priced and kind == "realtime":
+            cache_rates, _ = _resolved_cache_prices(model, provider_type, api_base)
             priced = not _realtime_reservation_too_small({"model_kind": kind, "provider_type": provider_type,
-                "media_pricing": media, "input_price_per_token": input_price, "output_price_per_token": output_price})
+                "media_pricing": media, "input_price_per_token": input_price, "output_price_per_token": output_price,
+                "cache_read_price_per_token": cache_rates["cache_read_price_per_token"]})
     if priced:
         source = "manual" if manual else "native_catalog"
     else:
