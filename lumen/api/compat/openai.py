@@ -190,6 +190,7 @@ async def chat_completions(
                 user_id=user_id,
                 project_id=project_id,
                 api_key_id=api_key_id,
+                payer=token_info.get("payer"),
                 source=source,
                 max_tokens=capped_max_tokens,
                 temperature=validated_temp,
@@ -239,9 +240,9 @@ async def chat_completions(
 
     try:
         resolved = await core.resolve_api(body.model, provider=selected_provider)
-        await core.precheck(user_id, project_id, api_key_id=api_key_id)
+        await core.precheck(user_id, project_id, api_key_id=api_key_id, payer=token_info.get("payer"))
     except core.CompletionError as exc:
-        return openai_error_response(exc.status_code, exc.message)
+        return openai_error_response(exc.status_code, exc.message, code=exc.code)
 
     cmpl_id, created = _completion_id(), int(time.time())
     options = body.provider_options()
@@ -260,6 +261,7 @@ async def chat_completions(
                 user_id=user_id,
                 project_id=project_id,
                 api_key_id=api_key_id,
+                payer=token_info.get("payer"),
                 max_tokens=max_output,
                 temperature=body.temperature,
                 tools=body.tools,
@@ -279,6 +281,7 @@ async def chat_completions(
             user_id=user_id,
             project_id=project_id,
             api_key_id=api_key_id,
+            payer=token_info.get("payer"),
             max_tokens=max_output,
             temperature=body.temperature,
             tools=body.tools,

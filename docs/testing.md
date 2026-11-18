@@ -1,5 +1,9 @@
 # 테스트
 
+## Prepaid domain billing (migration 037)
+
+`test-defined`: `tests/integration/test_domain_credit.py` uses the migrated, disposable MariaDB. It races two humans and a service-key-shaped hold against a dashboard provider intent, checks project-quota lock order from two sessions, and checks nested allocation accounting. It also covers duplicate settlement/release/top-up, ledger balance, live manager denial, and the effective admin ceiling. No paid provider calls run in these tests.
+
 ## Lumen 0.6.20 — 발행·운영 배포·OpenAI 유료 확인
 
 - `live-verified`: `0.6.20` tag는 `d2751b6d76d34e58dfa04a0a405652ea3b2d154f`(검토한 `ed1e77d`와 트리 동일)이다. PR CI [`44288865371`](https://github.com/openstack-afterglow/lumen/actions/runs/44288865371), `dev` CI [`44290416680`](https://github.com/openstack-afterglow/lumen/actions/runs/44290416680), tag 이미지 [`44290538562`](https://github.com/openstack-afterglow/lumen/actions/runs/44290538562), 패키지 [`44290538570`](https://github.com/openstack-afterglow/lumen/actions/runs/44290538570)가 통과했다. 패키지 workflow가 미리 만든 [한영 GitHub Release](https://github.com/openstack-afterglow/lumen/releases/tag/0.6.20) 초안을 휠 8개와 함께 11:05:42 UTC에 게시했고(배포 전, 배포 대기로 표기), 배포 후 수신증으로 본문을 갱신했다.

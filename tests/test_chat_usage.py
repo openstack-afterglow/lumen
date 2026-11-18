@@ -1,6 +1,6 @@
 """빌트인 AI 채팅 사용량 엔드포인트(/api/v1/chat/usage) 단위 테스트.
 
-chat_usage_logs 원장 집계를 user_usage_summary 로 위임 — token_info 의 user_id/project_id 로만 스코프.
+Usage routes delegate to payer-scoped ledger queries.
 """
 
 import pytest
@@ -33,7 +33,8 @@ async def test_get_chat_usage_summary(client, monkeypatch):
         "request_count": 7,
     }
 
-    async def fake_summary(user_id, project_id):
+    async def fake_summary(user_id, project_id, *, payer):
+        assert payer is None
         return summary
 
     monkeypatch.setattr(usage_mod, "user_usage_summary", fake_summary)
@@ -46,7 +47,8 @@ async def test_get_chat_usage_summary(client, monkeypatch):
 async def test_get_chat_usage_scoped_to_token(client, monkeypatch):
     captured = {}
 
-    async def fake_summary(user_id, project_id):
+    async def fake_summary(user_id, project_id, *, payer):
+        assert payer is None
         captured["user_id"] = user_id
         captured["project_id"] = project_id
         return {
@@ -70,7 +72,8 @@ async def test_usage_timeseries(client, monkeypatch):
 
     captured = {}
 
-    async def fake_ts(bucket, rng, pid, *, user_id, include_system):
+    async def fake_ts(bucket, rng, pid, *, user_id, include_system, payer):
+        assert payer is None
         captured.update(bucket=bucket, rng=rng, user_id=user_id, include_system=include_system)
         return [{"bucket": "2026-07-21", "source": "api", "total_tokens": 10, "credited_cost": 0.1, "request_count": 2}]
 
@@ -89,7 +92,8 @@ async def test_usage_timeseries_bucket_normalized(client, monkeypatch):
 
     seen = {}
 
-    async def fake_ts(bucket, rng, pid, *, user_id, include_system):
+    async def fake_ts(bucket, rng, pid, *, user_id, include_system, payer):
+        assert payer is None
         seen["bucket"] = bucket
         return []
 
@@ -104,7 +108,8 @@ async def test_usage_keys(client, monkeypatch):
 
     captured = {}
 
-    async def fake_keys(rng, pid, *, user_id, limit=50):
+    async def fake_keys(rng, pid, *, user_id, payer):
+        assert payer is None
         captured["user_id"] = user_id
         return [{"api_key_id": 3, "name": "k", "total_tokens": 5}]
 

@@ -85,6 +85,7 @@ async def create_session(
             project_id=principal["project_id"],
             user_id=principal["user_id"], client_request_id=str(idempotency_key),
             source=principal.get("source", "web"), api_key_id=principal.get("api_key_id"),
+            payer=principal.get("payer"),
             credential_authority=credential_authority_snapshot(principal))
     except (durable_errors.DurableRunError, credit.QuotaExceeded, ProviderValidationError) as exc:
         raise _error(exc) from exc
@@ -105,6 +106,8 @@ async def realtime_socket(websocket: WebSocket, session_id: UUID):
         await run_realtime_session(websocket, run_id=str(session_id), token=token)
     except (durable_errors.DurableRunNotFound, durable_errors.DurableRunConflict):
         await websocket.close(code=4404)
+    except credit.DomainCreditInsufficient as exc:
+        await websocket.close(code=4429, reason=exc.code)
     except WebSocketDisconnect:
         pass
     except Exception:

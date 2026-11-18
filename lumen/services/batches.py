@@ -33,12 +33,13 @@ from lumen.models.batch_contracts import (
     OpenAIBatchRow,
     validate_batch_body,
 )
+from lumen.models.billing import Payer
 from lumen.models.chat_assets import ChatAsset
 from lumen.models.chat_batches import ChatBatch, ChatBatchFile, ChatBatchItem, ChatBatchProjectQueue
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunEventRow, ChatRunSegment
 from lumen.services import auxiliary
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, current_api_key_scopes
-from lumen.services.credit import QuotaExceeded
+from lumen.services.credit import DomainCreditInsufficient, QuotaExceeded, run_payer
 from lumen.services.durable_runs import api_completion, audio, images, lifecycle
 from lumen.services.durable_runs.admission import _intent_with_credential_authority
 from lumen.services.durable_runs.budgets import retry_deadlocks
@@ -220,7 +221,7 @@ async def _owned(session, *, project_id, user_id, batch_id, contract=None, lock=
 
 
 async def _create(*, project_id, user_id, api_key_id, contract, key_hash, request, input_file_id=None,
-                  credential_authority=None):
+                  credential_authority=None, payer: Payer | None = None):
     fingerprint = _hash(_json(_intent_with_credential_authority(request.model_dump(mode="json"), credential_authority)))
 
     async def transaction():
@@ -245,6 +246,7 @@ async def _create(*, project_id, user_id, api_key_id, contract, key_hash, reques
                     raise BatchInputError("input_file_unavailable")
             now = _now()
             row = ChatBatch(id=str(uuid4()), project_id=project_id, user_id=user_id, api_key_id=api_key_id,
+                            payer_domain_id=payer.domain_id if payer is not None else None,
                             contract=contract, endpoint=getattr(request, "endpoint", None),
                             metadata_json=request.metadata, idempotency_key_hash=key_hash,
                             request_fingerprint=fingerprint, input_file_id=input_file_id,
@@ -297,7 +299,8 @@ def _public_service(function):
 @_public_service
 async def create_native_batch(*, project_id, user_id, api_key_id, scopes, source,
                               idempotency_key: str, request: NativeBatchCreateRequest,
-                              credential_authority: dict | None = None) -> tuple[BatchView, bool]:
+                              credential_authority: dict | None = None, payer: Payer | None = None,
+                              ) -> tuple[BatchView, bool]:
     _factory()
     settings = get_settings()
     if len(request.items) > settings.batch_native_max_items:
@@ -309,16 +312,18 @@ async def create_native_batch(*, project_id, user_id, api_key_id, scopes, source
     if idempotency_key is None:
         raise BatchInputError("invalid_idempotency_key")
     return await _create(project_id=project_id, user_id=user_id, api_key_id=api_key_id, contract="native",
-                         key_hash=_key_hash(idempotency_key), request=request, credential_authority=credential_authority)
+                         key_hash=_key_hash(idempotency_key), request=request,
+                         credential_authority=credential_authority, payer=payer)
 
 
 @_public_service
 async def create_openai_batch(*, project_id, user_id, api_key_id, scopes, source,
-                              request: OpenAIBatchCreateRequest, idempotency_key: str | None) -> BatchView:
+                              request: OpenAIBatchCreateRequest, idempotency_key: str | None,
+                              payer: Payer | None = None) -> BatchView:
     _factory()
     _check_scopes(scopes, _scopes(BATCH_ENDPOINTS[request.endpoint], "openai", {}))
     view, _ = await _create(project_id=project_id, user_id=user_id, api_key_id=api_key_id, contract="openai",
-                            key_hash=_key_hash(idempotency_key), request=request,
+                            key_hash=_key_hash(idempotency_key), request=request, payer=payer,
                             input_file_id=str(UUID(request.input_file_id.removeprefix("file-"))))
     return view
 
@@ -511,7 +516,7 @@ async def _prepare(batch, operation, body, allowed: frozenset[str], credential_a
         raise BatchInputError("api_key_unauthorized")
     kwargs = dict(project_id=batch.project_id, user_id=batch.user_id,
                   source="api" if batch.api_key_id is not None else "web",
-                  api_key_id=batch.api_key_id, required_scopes=required)
+                  api_key_id=batch.api_key_id, required_scopes=required, payer=run_payer(batch))
     if operation in {"chat.completions", "responses"}:
         prepared = await api_completion.prepare_api_completion_run(body, operation=operation, **kwargs)
         if credential_authority is not None:
@@ -538,7 +543,7 @@ def _prepared(batch, item):
 
 def _input_fault(exc):
     # Never persist exception text: it can contain prompts, provider URLs or credentials.
-    return exc.code if isinstance(exc, BatchError) else "invalid_batch_input"
+    return exc.code if isinstance(exc, (BatchError, DomainCreditInsufficient)) else "invalid_batch_input"
 
 
 async def _validate(lease):
@@ -852,6 +857,7 @@ async def _materialize(lease):
                         run = await persist(session, prepared, project_id=batch.project_id, user_id=batch.user_id,
                             client_request_id=str(uuid5(UUID(batch.id), item.custom_id)),
                             source="api" if batch.api_key_id is not None else "web", api_key_id=batch.api_key_id,
+                            payer=run_payer(batch),
                             workload_class="batch", batch_id=batch.id, allowed_scopes=allowed)
                         # No ORM relationship orders this foreign key for us.
                         await session.flush()

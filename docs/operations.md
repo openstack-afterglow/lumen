@@ -495,6 +495,13 @@ Original-token attenuation cutover는 새 SQL migration을 추가하지 않고 �
 
 적용된 SQL migration/checksum은 immutable이다. 유지보수 cutover는 admission 차단·API/worker/controller stop → backup/DB readiness → `lumen-migrate --apply` → 호환 API/worker/controller start 순서다. 적용 뒤 동일 command를 다시 실행해 pending migration이 없는지 확인한다. Kolla의 migration-before-start 자동화만으로 **기존 실행 중인 컨테이너를 중지했다는 뜻은 아니다**. rolling mixed-version deployment는 지원 전제가 아니다.
 
+### Prepaid domain pools (migration 037)
+
+After the schema-first cutover, a system administrator must fund each inference domain using `POST /v1/admin/domain-pools/{domain_id}/topups` with `Idempotency-Key` and `{amount_credits, note?}`. Use a fresh key for each distinct deposit; replay the same key and body after an uncertain response. `GET /v1/admin/domain-pools` lists provisioned pools. Admin PATCH accepts `admin_ceiling_credits` and `is_active`. Human domain managers use GET/PATCH `/v1/domain-pool` with `manager_monthly_limit_credits`; `null` clears a monthly limit, while `0` blocks paid work. All amounts support eight decimal places.
+
+No migration copies user balances or retroactively charges a domain. Unfunded domains fail closed with `domain_credit_insufficient`. Inactivating a pool or lowering its limit blocks new admissions without invalidating previously funded holds. Known zero-cost refusals release the hold; do not auto-expire `unknown` rows. Reconcile unknown amounts against provider evidence before changing the hold and ledger. Take the domain pool lock before changing either; do not edit the balance or reservation cache independently.
+
+
 Elastic/Batch 후보의 additive migration은 022(runtime routing), 023(trusted identity), 024(batch ledger), 025(batch expiry default)다. 025는 이미 적용한 024를 수정하지 않고 MariaDB의 column-reference DEFAULT zero-date 오류를 교정한다. 모두 적용한 뒤 동일 `lumen-migrate --apply`를 재실행한다. `api_completion`과 Batch 상태를 모르는 구 worker를 신 schema의 실행자와 섞지 않는다. Runtime/Batch 활성화는 고정 worker 수용, managed guest/ingress 수용 및 별도 운영 cutover 승인 이후다.
 
 MCP opt-in 변경은 additive `026_mcp_owner_activation.sql`을 API/worker보다 먼저 적용한다. 기존 global source의 owner activation은 backfill하지 않으므로 배포 뒤 사용자가 각 현재 configuration을 명시 승인한다. Ordinary API-key expiry 발급은 기존013 column을 재사용하며 중복 expiry DDL·기존 무만료 키의 만료 backfill은 없다. Fresh `issuance-policy`를 모르는 구 API와 새 frontend를 혼합하지 않는다. Afterglow cloud consent는 별도 Afterglow086 migration과 호환 BFF를 요구한다.

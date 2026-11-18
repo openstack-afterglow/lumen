@@ -12,6 +12,7 @@ from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 import httpx
 
 from lumen.config import get_settings
+from lumen.models.billing import Payer
 from lumen.models.decision_contracts import DecisionRequest
 from lumen.services import credit, provider_metadata, stateless_credit
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
@@ -294,7 +295,9 @@ async def transport(route: dict, body: DecisionRequest, *, on_dispatch: Callable
 
 
 async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id: str,
-                 api_key_id: int | None, required_scopes: tuple[str, ...], source: str = "api") -> dict:
+                 api_key_id: int | None, required_scopes: tuple[str, ...], source: str = "api",
+                 payer: Payer | None = None,
+                 ) -> dict:
     _validate_route(route)
     tokens = input_token_bound(body)
     bound = credit_bound(route, tokens)
@@ -312,6 +315,7 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
             provider=route.get("provider_name"), prompt_tokens=usage["input_tokens"],
             completion_tokens=usage["output_tokens"], usage_cost=cost,
             margin_multiplier=route["margin_multiplier"], source=source, api_key_id=api_key_id,
+            payer=payer,
             breakdown=breakdown, execution_route=route,
             usage_components=[{"kind": "decision", "category": "decision", "unit": "request", "quantity": "1",
                                "cost_usd": str(cost.raw_cost), "input_tokens": usage["input_tokens"],
@@ -322,6 +326,7 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
 
     response, settled = await accounted_call(
         user_id=user_id, project_id=project_id, api_key_id=api_key_id, required_scopes=required_scopes,
+        payer=payer,
         bound=bound, dispatch=lambda mark: transport(route, body, on_dispatch=mark), account=account,
     )
     answers = validate_answers(response.get("answers"), body)
@@ -330,6 +335,7 @@ async def decide(*, route: dict, body: DecisionRequest, user_id: str, project_id
 
 async def accounted_call(*, user_id: str, project_id: str, api_key_id: int | None,
                          required_scopes: tuple[str, ...], bound: Decimal,
+                         payer: Payer | None = None,
                          dispatch: Callable[[Callable[[], None]], Awaitable[dict]],
                          account: Callable[[str, dict], Awaitable[dict]]) -> tuple[dict, dict]:
     """Fence caller, hold shared credit, dispatch once, and account trusted usage."""
@@ -344,7 +350,7 @@ async def accounted_call(*, user_id: str, project_id: str, api_key_id: int | Non
         await authorize_new_io(user_id=user_id, project_id=project_id, api_key_id=api_key_id,
                                required_scopes=required_scopes)
         await stateless_credit.reserve(event_id=event_id, user_id=user_id, project_id=project_id,
-                                       api_key_id=api_key_id, bound=bound)
+                                       api_key_id=api_key_id, bound=bound, payer=payer)
         reserved = True
         response = await dispatch(mark_dispatched)
         settled = await account(event_id, response)
@@ -372,6 +378,6 @@ async def accounted_call(*, user_id: str, project_id: str, api_key_id: int | Non
     finally:
         if reserved:
             try:
-                await asyncio.shield(stateless_credit.finish(event_id, uncertain=sent))
+                await asyncio.shield(stateless_credit.finish(event_id, uncertain=sent, payer=payer))
             except Exception:
                 logger.exception("Decision reservation cleanup failed event_id=%s", event_id)

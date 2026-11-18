@@ -17,7 +17,9 @@ from decimal import Decimal
 from sqlalchemy import case, func, select
 
 from lumen.db import get_session_factory, is_db_available
+from lumen.models.billing import Payer
 from lumen.models.chat_db import ChatApiKey, ChatUsageLog
+from lumen.services.usage import payer_filter
 
 logger = logging.getLogger(__name__)
 
@@ -443,6 +445,7 @@ async def timeseries(
     model_name: str | None = None,
     include_system: bool = True,
     api_key_id: int | None = None,
+    payer: Payer | None = None,
 ) -> list[dict]:
     """시간버킷(hour/day/month)별 × source(web/api/system)별 시계열(오름차순).
 
@@ -456,7 +459,9 @@ async def timeseries(
     fine_window_days = {"5m": 1, "15m": 7}.get(_norm_bucket(bucket))
     if fine_window_days is not None:
         conds.append(ChatUsageLog.created_at >= datetime.now(UTC) - timedelta(days=fine_window_days))
-    if user_id:
+    if payer is not None:
+        conds.append(payer_filter(payer))
+    elif user_id:
         conds.append(ChatUsageLog.user_id == user_id)
     if model_name:
         conds.append(ChatUsageLog.model_name == model_name)
@@ -506,6 +511,7 @@ async def by_api_key(
     user_id: str | None = None,
     limit: int = 50,
     api_key_id: int | None = None,
+    payer: Payer | None = None,
 ) -> list[dict]:
     """API 키별 집계(토큰 desc) — source="api" 만. 폐기된 키도 원장 보존(name None 가능).
 
@@ -515,7 +521,9 @@ async def by_api_key(
     if factory is None:
         return []
     conds = [*_base_conds(range_key, project_id), ChatUsageLog.source == "api", ChatUsageLog.api_key_id.isnot(None)]
-    if user_id:
+    if payer is not None:
+        conds.append(payer_filter(payer))
+    elif user_id:
         conds.append(ChatUsageLog.user_id == user_id)
     if api_key_id is not None:
         conds.append(ChatUsageLog.api_key_id == api_key_id)

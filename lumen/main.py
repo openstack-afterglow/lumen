@@ -354,6 +354,7 @@ from lumen.api import (
     chat_workspaces_router,
     claude_gateway,
 )
+from lumen.api import domain_pools as domain_pool_routes
 from lumen.api import plugins as plugin_routes
 from lumen.api import policy as policy_routes
 from lumen.api.compat import anthropic as compat_anthropic
@@ -396,6 +397,7 @@ for router, tag in (
     (chat_extensions_admin_router, "Chat Extensions Admin"),
     (chat_extensions_user_router, "Chat Extensions"),
     (chat_usage_router, "Chat Usage"),
+    (domain_pool_routes.router, "Domain Credits"),
     (chat_stats_router, "Chat Stats"),
     (chat_quotas_router, "Chat Quotas"),
     (chat_admin_router, "Chat Administration"),

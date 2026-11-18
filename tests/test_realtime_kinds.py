@@ -896,7 +896,7 @@ async def test_native_transcription_matching_priced_kind_reaches_credit_boundary
     with pytest.raises(DurableRunInputError, match="credit boundary"):
         await realtime.admit_realtime_session({"model_id": "gpt-live-transcribe"},
             project_id="p", user_id="u", client_request_id=str(uuid4()), kind="transcription")
-    precheck.assert_awaited_once_with("u", "p", None)
+    precheck.assert_awaited_once_with("u", "p", None, payer=None)
     intent = admission.existing_run_for_intent.await_args.kwargs["intent"]
     assert intent["realtime_kind"] == "transcription"
     assert "kind" not in intent

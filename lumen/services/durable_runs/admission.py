@@ -12,6 +12,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from lumen.crypto import encrypt_chat_content
+from lumen.models.billing import Payer
 from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
 from lumen.models.chat_contracts import ChatRunDescriptor, validate_user_input_parts
 from lumen.models.chat_db import ChatConversation, ChatMessage
@@ -408,6 +409,7 @@ async def create_persistent_run(
     run_kind: Literal["completion", "compaction"] = "completion",
     source: str = "web",
     api_key_id: int | None = None,
+    payer: Payer | None = None,
     expected_parent_id: int | None = None,
     agent_budget: dict[str, Any] | None = None,
     execution_mode: str = "chat",
@@ -547,6 +549,7 @@ async def create_persistent_run(
             model_name=model_name,
             source=source,
             api_key_id=api_key_id,
+            payer_domain_id=payer.domain_id if payer is not None else None,
             agent_id=agent_id,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
@@ -616,6 +619,7 @@ async def create_run(
     run_kind: Literal["completion", "compaction"] = "completion",
     source: str = "web",
     api_key_id: int | None = None,
+    payer: Payer | None = None,
     expected_parent_id: int | None = None,
     agent_budget: dict[str, Any] | None = None,
     execution_mode: str = "chat",
@@ -754,6 +758,7 @@ async def create_run(
             agent_id=agent_id,
             source=source,
             api_key_id=api_key_id,
+            payer_domain_id=payer.domain_id if payer is not None else None,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
             required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
@@ -820,6 +825,7 @@ async def create_temp_run(
     run_kind: Literal["completion", "compaction"] = "completion",
     source: str = "web",
     api_key_id: int | None = None,
+    payer: Payer | None = None,
 ) -> ChatRunDescriptor:
     """Atomically create/reuse a temporary thread and its first durable run."""
     try:
@@ -910,6 +916,7 @@ async def create_temp_run(
             model_name=model_name,
             source=source,
             api_key_id=api_key_id,
+            payer_domain_id=payer.domain_id if payer is not None else None,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
             required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
@@ -1001,6 +1008,7 @@ async def create_compaction_run(
     execution_protocol_version: int = 1,
     source: str = "web",
     api_key_id: int | None = None,
+    payer: Payer | None = None,
 ) -> ChatRunDescriptor:
     """Admit a manual compaction run with strict parent->run->checkpoint locking and revision fence."""
     try:
@@ -1116,6 +1124,7 @@ async def create_compaction_run(
             model_name=model_name,
             source=source,
             api_key_id=api_key_id,
+            payer_domain_id=payer.domain_id if payer is not None else None,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
             required_plugin_digest=capability_snapshot.get("required_plugin_digest"),

@@ -31,7 +31,8 @@ _TRANSCRIPTION_FIELDS = frozenset({"file", "model", "provider", "provider_id", "
 
 def _compat_error(exc: HTTPException) -> JSONResponse:
     code = {402: 429, 422: 400}.get(exc.status_code, exc.status_code)
-    return openai_error_response(code, str(exc.detail), type_="timeout_error" if code == 504 else None)
+    return openai_error_response(code, str(exc.detail), type_="timeout_error" if code == 504 else None,
+                                 code="domain_credit_insufficient" if exc.detail == "domain_credit_insufficient" else None)
 
 
 async def _replayed_source(path: Path, key: uuid.UUID, principal: Principal) -> str | None:

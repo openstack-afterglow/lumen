@@ -236,7 +236,8 @@ async def test_preview_tool_schemas_match_the_first_provider_request(monkeypatch
     )
 
 
-async def _ok_precheck(user_id, project_id=None, api_key_id=None):
+async def _ok_precheck(user_id, project_id=None, api_key_id=None, *, payer=None):
+    del payer
     return None
 
 
@@ -1230,7 +1231,8 @@ class TestRetryFailedRun:
     async def test_retry_rejects_quota_exceeded_before_creating_run(self, client, monkeypatch):
         await _patch_text_execution(monkeypatch)
 
-        async def quota_exceeded(user_id, project_id=None, api_key_id=None):
+        async def quota_exceeded(user_id, project_id=None, api_key_id=None, *, payer=None):
+            del payer
             raise credit.QuotaExceeded("월간 사용량 쿼터를 초과했습니다")
 
         monkeypatch.setattr(credit, "precheck", quota_exceeded)
@@ -1351,7 +1353,8 @@ class TestApiKeyLimitAdmission:
         await _patch_text_execution(monkeypatch)
         recorded = []
 
-        async def spy_precheck(user_id, project_id=None, api_key_id=None):
+        async def spy_precheck(user_id, project_id=None, api_key_id=None, *, payer=None):
+            del payer
             recorded.append((user_id, project_id, api_key_id))
             raise HTTPException(status_code=418, detail="stop after precheck")
 

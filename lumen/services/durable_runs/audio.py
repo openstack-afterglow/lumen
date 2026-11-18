@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumen.config import get_settings
 from lumen.crypto import encrypt_chat_content
+from lumen.models.billing import Payer
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import assets, credit
@@ -195,6 +196,7 @@ class PreparedAudioRun:
 
 async def prepare_audio_run(request: dict, *, project_id: str, user_id: str,
                             source: str = "web", api_key_id: int | None = None,
+                            payer: Payer | None = None,
                             operation: str | None = None,
                             required_scopes: tuple[str, ...] | None = None,
                             credential_authority: dict | None = None) -> PreparedAudioRun:
@@ -249,7 +251,7 @@ async def prepare_audio_run(request: dict, *, project_id: str, user_id: str,
                         else audio_transport._MAX_INPUT_BYTES)
         if asset["status"] != "clean" or asset["size_bytes"] > source_limit or asset["mime_type"] not in audio_transport._INPUT_FORMATS:
             raise DurableRunInputError("source audio exceeds provider input limits")
-    await credit.precheck(user_id, project_id, api_key_id)
+    await credit.precheck(user_id, project_id, api_key_id, payer=payer)
     per_usd = Decimal(str(get_settings().chat_credit_per_usd))
     margin = Decimal(str(route["margin_multiplier"]))
     pricing = _freeze_pricing(route, kind=kind, duration_ms=duration_ms, input_text=intent.get("input"), margin=margin, per_usd=per_usd)
@@ -272,6 +274,7 @@ async def prepare_audio_run(request: dict, *, project_id: str, user_id: str,
 async def persist_audio_run_in_transaction(
     session: AsyncSession, prepared: PreparedAudioRun, *, project_id: str, user_id: str,
     client_request_id: str, source: str = "web", api_key_id: int | None = None,
+    payer: Payer | None = None,
     workload_class: str | None = None, batch_id: str | None = None,
     allowed_scopes: frozenset[str] | None = None,
 ) -> ChatRun:
@@ -303,6 +306,7 @@ async def persist_audio_run_in_transaction(
         credential_authority=capability.get("credential_authority"))
     run = ChatRun(id=str(uuid.uuid4()), run_scope="audio", run_kind=kind, project_id=project_id,
         user_id=user_id, model_name=capability["model_name"], source=source, api_key_id=api_key_id,
+        payer_domain_id=payer.domain_id if payer is not None else None,
         workload_class=route.workload_class, worker_pool_id=route.worker_pool_id, batch_id=batch_id,
         client_request_id=client_request_id, request_fingerprint=_fingerprint(intent), fingerprint_version=1,
         execution_protocol_version=1, capability_snapshot=capability, pricing_snapshot=pricing,
@@ -327,6 +331,7 @@ async def persist_audio_run_in_transaction(
 
 async def admit_audio_run(request: dict, *, project_id: str, user_id: str, client_request_id: str,
                           source: str = "web", api_key_id: int | None = None,
+                          payer: Payer | None = None,
                           required_scopes: tuple[str, ...] | None = None,
                           credential_authority: dict | None = None):
     from .admission import existing_run_for_intent
@@ -338,6 +343,7 @@ async def admit_audio_run(request: dict, *, project_id: str, user_id: str, clien
         return previous
     prepared = await prepare_audio_run(request, project_id=project_id, user_id=user_id, source=source,
                                        api_key_id=api_key_id, required_scopes=required_scopes,
+                                       payer=payer,
                                        credential_authority=credential_authority)
     try:
         async with _factory()() as session, session.begin():
@@ -345,7 +351,7 @@ async def admit_audio_run(request: dict, *, project_id: str, user_id: str, clien
             # IntegrityError replay below returns the winner. Gap locks deadlocked concurrent admissions.
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             run = await persist_audio_run_in_transaction(session, prepared, project_id=project_id, user_id=user_id,
-                client_request_id=client_request_id, source=source, api_key_id=api_key_id)
+                client_request_id=client_request_id, source=source, api_key_id=api_key_id, payer=payer)
             created = descriptor(run)
     except IntegrityError:
         previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
@@ -393,6 +399,7 @@ async def _start(run_id: str, *, owner: str, bound: Decimal, kind: str) -> str:
     async def transaction():
         async with _factory()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await credit.lock_run_payer(session, run_id)
             run, blocked = await lock_media_run_for_io(session, run_id, owner=owner)
             segment = await prepare_segment(session, run, segment_id=f"{kind}:1", ordinal=1, endpoint=f"audio_{kind}")
             await session.flush()
@@ -405,9 +412,12 @@ async def _start(run_id: str, *, owner: str, bound: Decimal, kind: str) -> str:
             await validate_batch_media_io_in_transaction(session, run)
             if "bound_credits" in run.pricing_snapshot and bound != Decimal(run.pricing_snapshot["bound_credits"]):
                 raise DurableRunInputError("audio credit reservation changed")
+            payer = credit.run_payer(run)
             await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id,
-                project_id=run.project_id, api_key_id=run.api_key_id, bound=bound)
-            session.add(ChatModelCallReservation(run_id=run.id, segment_id=f"{kind}:1", bound_credits=bound, status="reserved"))
+                project_id=run.project_id, api_key_id=run.api_key_id, bound=bound, payer=payer)
+            session.add(ChatModelCallReservation(run_id=run.id, segment_id=f"{kind}:1", bound_credits=bound,
+                                                 status="reserved", **payer.columns()))
+            await credit.refresh_domain_reserved(session, payer)
             run.reserved_credits = bound
             begin_segment_io(segment)
             run.provider_started_at = _now()
@@ -434,6 +444,8 @@ async def _checkpoint(run_id: str, *, owner: str, kind: str, result: dict | None
 async def _settle(run_id: str, *, owner: str, kind: str) -> None:
     async def transaction():
         async with _factory()() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await credit.lock_run_payer(session, run_id)
             run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
                 .with_for_update().execution_options(populate_existing=True))).scalar_one()
             _require_owned_running_lease(run, owner)
@@ -473,8 +485,10 @@ async def _settle(run_id: str, *, owner: str, kind: str) -> None:
                 Decimal(run.pricing_snapshot["credit_per_usd"]))
             if expected_credits > Decimal(str(reservation.bound_credits)):
                 raise DurableRunProviderResultUnknown("audio usage exceeds reserved price")
+            payer = credit.run_payer(run)
             credited = await credit.apply_usage_in_transaction(session, event_id=f"run:{run.id}",
                 user_id=run.user_id, project_id=run.project_id, model_name=run.model_name,
+                payer=payer,
                 provider=run.capability_snapshot["provider_name"], prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                 usage_cost=usage_cost, breakdown=breakdown,
                 execution_route=run.capability_snapshot,
@@ -484,6 +498,7 @@ async def _settle(run_id: str, *, owner: str, kind: str) -> None:
             reservation.actual_credits = credited
             reservation.status = "settled"
             reservation.settled_at = _now()
+            await credit.refresh_domain_reserved(session, payer)
             run.usage_reconciled_at = _now()
             await append_event(session, run, _event(run, "usage.updated", {"components": components,
                 "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "raw_cost": str(total), "credited_cost": str(credited)}))
@@ -608,6 +623,9 @@ async def _execute(run_id: str, *, owner: str, payload: dict, capability_snapsho
         canceled = await _cancel_requested(run_id)
         await _finish(run_id, status="canceled" if canceled else "completed", message_id=None, owner=owner,
             error_code="canceled" if canceled else None, safe_message="audio run canceled" if canceled else None)
+    except credit.QuotaExceeded as exc:
+        await _finish(run_id, status="failed", message_id=None, owner=owner,
+                      error_code=getattr(exc, "code", "quota_exceeded"), safe_message="credit quota is exhausted")
     except MediaAuthorizationRevoked:
         # Raised before any reservation or provider I/O committed: definite, not unknown.
         try:

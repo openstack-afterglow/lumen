@@ -402,7 +402,7 @@ async def test_hosted_sse_uses_terminal_evidence(monkeypatch, outcome):
                 await anext(stream)
     if outcome != "settled":
         settle.assert_not_awaited()
-        finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True)
+        finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True, payer=None)
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -697,7 +697,7 @@ async def test_held_stream_drains_after_disconnect(monkeypatch, protocol, outcom
         finish.assert_not_awaited()
     else:
         settle.assert_not_awaited()
-        finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True)
+        finish.assert_awaited_once_with(reserve.await_args.kwargs["event_id"], uncertain=True, payer=None)
 
 
 @pytest.mark.parametrize("protocol", ["responses", "chat"])
@@ -763,7 +763,7 @@ async def test_held_stream_settlement_outlives_drain_deadline(monkeypatch, caplo
     finish.assert_not_awaited()
     (record,) = (record for record in caplog.records if record.name == core.__name__ and record.levelname == "INFO")
     assert record.msg == (
-        "OpenAI held usage reservation_id=%s input_tokens=%d input_bound=%d output_tokens=%d output_bound=%d"
+        "Held usage reservation_id=%s input_tokens=%d input_bound=%d output_tokens=%d output_bound=%d"
     )
     event_id, input_tokens, input_bound, output_tokens, output_bound = record.args
     assert (event_id, input_tokens, output_tokens, output_bound) == (reserve.await_args.kwargs["event_id"], 5, 2, 32)

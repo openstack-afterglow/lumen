@@ -28,6 +28,7 @@ from lumen.models.chat_db import ChatAgent
 from lumen.models.chat_infrastructure import ChatDelegationCall, ChatDelegationGroup, ChatRuntimeResource
 from lumen.models.chat_runs import ChatRun
 from lumen.plugins.registry import get_registry
+from lumen.services import credit, worker_routing
 from lumen.services.providers.errors import AmbiguousModelRouteError
 from lumen.services.run_protocol_v2 import transition_allowed
 from lumen.services.run_store import NONTERMINAL, TERMINAL, append_event
@@ -377,6 +378,11 @@ async def prepare_delegations(
     async def transaction() -> dict[str, Any]:
         order = budgets.LockOrder()
         async with factory() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            payer = credit.run_payer(parent_identity)
+            if payer.domain_id is not None:
+                await credit.lock_payer(session, payer, user_id=parent_identity.user_id,
+                                        project_id=parent_identity.project_id, api_key_id=parent_identity.api_key_id)
             quota, root, ancestors = await _lock_lineage(session, parent_identity, order)
             parent = root if parent_identity.id == root.id else ancestors[-1] if ancestors and ancestors[-1].id == parent_identity.id else None
             if parent is None:
@@ -498,6 +504,7 @@ async def prepare_delegations(
                     model_name=prepared["route"]["model_name"],
                     source=parent.source,
                     api_key_id=parent.api_key_id,
+                    payer_domain_id=parent.payer_domain_id,
                     agent_id=call.agent_id,
                     execution_protocol_version=2,
                     execution_mode="code" if call.access == "write" else "plan",
@@ -538,6 +545,8 @@ async def prepare_delegations(
                         session, quota=quota, root=root, run_id=child_id, kind="sandbox_seconds", amount=call.sandbox_seconds, order=order
                     )
                 except budgets.BudgetExceeded as exc:
+                    raise ChildFailure(exc.code, str(exc)) from exc
+                except credit.DomainCreditInsufficient as exc:
                     raise ChildFailure(exc.code, str(exc)) from exc
                 row = ChatDelegationCall(
                     id=str(uuid.uuid4()),
