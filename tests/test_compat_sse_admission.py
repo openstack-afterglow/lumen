@@ -150,7 +150,7 @@ def harness(monkeypatch):
         boundary("create_temp_run")
         return SimpleNamespace(run_id="run-admission")
 
-    async def summary_route(resolved):
+    async def summary_route(resolved, *, domain_paid=False):
         return resolved
 
     # Keep the virtual route's real normalization, resolution, precheck and durable
