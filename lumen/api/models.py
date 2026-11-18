@@ -462,6 +462,8 @@ class ModelResponse(BaseModel):
     model_kind: ModelKind = "text"
     media_pricing: dict | None = None
     effective_media_pricing: dict | None = None
+    effective_media_price_sources: dict = Field(default_factory=dict)
+    effective_text_price_sources: dict[str, Literal["manual", "catalog"]] = Field(default_factory=dict)
     api_model_name: str
     api_provider: str
     provider_type: str | None = None
