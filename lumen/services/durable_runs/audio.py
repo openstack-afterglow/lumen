@@ -61,7 +61,9 @@ from .media import (
     lock_media_run_for_io,
     lock_media_source_in_transaction,
     media_io_allowed,
+    prepare_media_dispatch,
     rejection_message,
+    require_media_dispatch_fresh,
     validate_batch_media_io_in_transaction,
 )
 
@@ -395,6 +397,8 @@ async def _read_source(asset_id: str, *, user_id: str, project_id: str, expected
 
 
 async def _start(run_id: str, *, owner: str, bound: Decimal, kind: str) -> str:
+    approval = await prepare_media_dispatch(_factory(), run_id, owner=owner, segment_id=f"{kind}:1")
+
     async def transaction():
         async with _factory()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
@@ -408,7 +412,7 @@ async def _start(run_id: str, *, owner: str, bound: Decimal, kind: str) -> str:
                 return "unknown"
             if blocked is not None:
                 return blocked
-            await validate_batch_media_io_in_transaction(session, run)
+            verified = await validate_batch_media_io_in_transaction(session, run, approval)
             if "bound_credits" in run.pricing_snapshot and bound != Decimal(run.pricing_snapshot["bound_credits"]):
                 raise DurableRunInputError("audio credit reservation changed")
             payer = credit.run_payer(run)
@@ -418,6 +422,7 @@ async def _start(run_id: str, *, owner: str, bound: Decimal, kind: str) -> str:
                                                  status="reserved", **payer.columns()))
             await credit.refresh_domain_reserved(session, payer)
             run.reserved_credits = bound
+            require_media_dispatch_fresh(verified)
             begin_segment_io(segment)
             run.provider_started_at = _now()
             await append_event(session, run, _event(run, "run.stage.changed", {"stage": "model_request"}))

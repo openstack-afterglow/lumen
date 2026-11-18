@@ -22,9 +22,10 @@ from lumen.models.chat_infrastructure import ChatAgentReservation, ChatProjectAg
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment
 from lumen.models.stateless_reservations import StatelessCallReservation
 from lumen.scripts.migrate import migrate
-from lumen.services import credit, domain_credit, stateless_credit
+from lumen.services import credit, domain_credit, inference_authority, stateless_credit
 from lumen.services.chat_admission import _run_snapshots
 from lumen.services.durable_runs import budgets, execution
+from lumen.services.durable_runs.errors import DurableRunInputError
 from lumen.services.provider_metadata import UsageCost
 from lumen.services.usage import user_usage_summary
 
@@ -41,7 +42,7 @@ async def test_domain_billing_migration_rechecks_without_replaying():
 
 @pytest.fixture
 async def pool_scope(monkeypatch):
-    monkeypatch.setattr(execution, "authorize_api_key_in_transaction", AsyncMock())
+    monkeypatch.setattr(inference_authority, "authorize_api_key_in_transaction", AsyncMock())
     init_db(os.environ["DATABASE_URL"], pool_size=8, max_overflow=0)
     factory = get_session_factory()
     scope = SimpleNamespace(id=uuid4().hex, factory=factory)
@@ -248,6 +249,52 @@ async def test_service_shaped_stateless_and_dashboard_provider_hold_race(pool_sc
     async with scope.factory() as session:
         row = await session.scalar(select(ChatUsageLog).where(ChatUsageLog.event_id == key_event))
         assert (row.user_id, row.project_id, row.api_key_id, row.payer_domain_id) == (None, None, 901, scope.id)
+
+
+@pytest.mark.parametrize("expired", [False, True])
+async def test_slow_keystone_does_not_block_other_actor_billing(pool_scope, monkeypatch, expired):
+    scope = pool_scope
+    await _fund(scope, "10")
+    run_id = await _run(scope)
+    entered, release = asyncio.Event(), asyncio.Event()
+    clock = [100]
+    monkeypatch.setattr(inference_authority, "monotonic", lambda: clock[0])
+
+    async def blocked_authority(*args, **kwargs):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(inference_authority, "authorize_api_key_in_transaction", blocked_authority)
+
+    async def start():
+        if expired:
+            with pytest.raises(DurableRunInputError, match="inference_authority_revoked"):
+                await _durable_hold(run_id)
+        else:
+            await _durable_hold(run_id)
+
+    async with asyncio.TaskGroup() as group:
+        group.create_task(start())
+        await asyncio.wait_for(entered.wait(), 3)
+        try:
+            event_id = await asyncio.wait_for(_hold(scope, scope.users[1], "3"), 3)
+            assert await asyncio.wait_for(
+                stateless_credit.settle(**_usage(scope, event_id, actor=scope.users[1])), 3,
+            ) == 3
+            assert not release.is_set()
+            if expired:
+                clock[0] += 6
+        finally:
+            release.set()
+    async with scope.factory() as session:
+        pool = await session.get(DomainCreditPool, scope.id)
+        assert pool.balance_credits == 7
+        assert pool.reserved_credits == (0 if expired else 6)
+        segment = await session.get(ChatRunSegment, (run_id, "provider:0:0"))
+        if expired:
+            assert segment is None
+        else:
+            assert segment.status == "provider_started"
 
 
 async def test_domain_lock_precedes_quota_in_real_dashboard_transaction(pool_scope, monkeypatch):

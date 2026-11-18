@@ -25,6 +25,7 @@ from lumen.models.billing import Payer
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import credit
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
+from lumen.services.inference_authority import check_dispatch, preflight_dispatch, read_dispatch_candidate
 from lumen.services.provider_metadata import UsageCost
 from lumen.services.providers import pricing as provider_pricing
 from lumen.services.providers import realtime_transport, routing
@@ -458,6 +459,19 @@ async def _response(run: ChatRun, *, user_id: str, project_id: str) -> dict:
 
 
 async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> tuple[dict, dict, dict, str]:
+    async with _factory()() as session:
+        candidate = await read_dispatch_candidate(session, run_id, _SEGMENT)
+        if candidate is None or candidate.user_id != user_id or candidate.project_id != project_id:
+            raise DurableRunNotFound("realtime session is unavailable")
+        scopes = _payload(candidate).get("required_scopes") or [
+            "compat:realtime:write" if candidate.source == "api" else "native:realtime:write"]
+        try:
+            approval = await preflight_dispatch(session, candidate, tuple(scopes))
+        except ApiKeyForbidden as exc:
+            raise DurableRunInputError("inference_authority_revoked") from exc
+        except ApiKeyAuthorityUnavailable as exc:
+            raise DurableRunError("inference_authority_unavailable") from exc
+
     async def transaction():
         async with _factory()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
@@ -470,16 +484,10 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
             await session.flush()
             if segment.status != "prepared":
                 raise DurableRunProviderResultUnknown("realtime session cannot be resumed")
-            scopes = _payload(run).get("required_scopes") or [
-                "compat:realtime:write" if run.source == "api" else "native:realtime:write"]
             try:
-                await authorize_api_key_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
-                    api_key_id=run.api_key_id, required_scopes=tuple(scopes),
-                    credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
+                verified = await check_dispatch(session, run, approval)
             except ApiKeyForbidden as exc:
                 raise DurableRunInputError("inference_authority_revoked") from exc
-            except ApiKeyAuthorityUnavailable as exc:
-                raise DurableRunError("inference_authority_unavailable") from exc
             payer = credit.run_payer(run)
             await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id,
                 project_id=run.project_id, api_key_id=run.api_key_id, payer=payer,
@@ -488,6 +496,10 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
                 bound_credits=Decimal(run.pricing_snapshot["bound_credits"]), status="reserved", **payer.columns()))
             await credit.refresh_domain_reserved(session, payer)
             run.reserved_credits = Decimal(run.pricing_snapshot["bound_credits"])
+            try:
+                verified.require_fresh()
+            except ApiKeyForbidden as exc:
+                raise DurableRunInputError("inference_authority_revoked") from exc
             begin_segment_io(segment)
             run.provider_started_at = _now()
             await append_event(session, run, _event(run, "run.stage.changed", {"stage": "model_request"}))

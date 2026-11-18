@@ -1,9 +1,7 @@
-"""Finite media source pins and the Batch-only pre-I/O authorization fence.
+"""Finite media source pins and pre-I/O authority fences.
 
-Online runs keep their accepted-run authority: only the existing lease, cancel and
-wallet/key reservation checks apply before provider I/O. Batch runs additionally
-re-authorize the frozen scopes, provider configuration and pinned source under a
-batch→run lock order before any source read or provider request.
+Read Keystone before acquiring payer, batch, provider configuration or run locks.
+Recheck short-lived authority, key state and source pins before dispatch.
 """
 
 from __future__ import annotations
@@ -18,6 +16,12 @@ from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_batches import ChatBatch, ChatBatchItem
 from lumen.models.chat_runs import ChatRun
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
+from lumen.services.inference_authority import (
+    DispatchApproval,
+    check_dispatch,
+    preflight_dispatch,
+    read_dispatch_candidate,
+)
 from lumen.services.providers import audio_transport, image_transport
 from lumen.services.worker_routing import lock_open_batch
 
@@ -143,23 +147,53 @@ async def lock_media_run_for_io(session: AsyncSession, run_id: str, *, owner: st
     return run, _blocked_reason(run, batch, batch_open=batch_open)
 
 
-async def validate_batch_media_io_in_transaction(session: AsyncSession, run: ChatRun) -> None:
-    """Re-authorize every finite media call before new I/O, including non-batch runs."""
-    from .admission import _lock_run_configurations
-
-    await _lock_run_configurations(session, run.capability_snapshot, model_name=run.model_name)
-    payload = _payload(run)
-    scopes = payload.get("required_scopes")
+def _media_scopes(run: ChatRun) -> tuple[str, ...]:
+    scopes = _payload(run).get("required_scopes")
     if not isinstance(scopes, list) or not scopes:
         raise DurableRunInputError("batch media scopes are unavailable")
-    await authorize_media_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
-        api_key_id=run.api_key_id, required_scopes=tuple(scopes),
-        credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
+    return tuple(scopes)
+
+
+async def prepare_media_dispatch(factory, run_id: str, *, owner: str,
+                                 segment_id: str | None = None) -> DispatchApproval | None:
+    async with factory() as session:
+        run = (await read_dispatch_candidate(session, run_id, segment_id) if segment_id is not None
+               else await session.get(ChatRun, run_id))
+        if run is None or run.cancel_requested_at is not None:
+            return None
+        _require_owned_running_lease(run, owner)
+        try:
+            return await preflight_dispatch(session, run, _media_scopes(run))
+        except ApiKeyForbidden as exc:
+            raise MediaAuthorizationRevoked("media credential is no longer authorized") from exc
+        except ApiKeyAuthorityUnavailable as exc:
+            raise DurableRunInputError("inference_authority_unavailable") from exc
+
+
+async def validate_batch_media_io_in_transaction(session: AsyncSession, run: ChatRun,
+                                                 approval: DispatchApproval | None) -> DispatchApproval:
+    """Perform only DB checks while holding the dispatch locks."""
+    from .admission import _lock_run_configurations
+
+    try:
+        verified = await check_dispatch(session, run, approval)
+    except ApiKeyForbidden as exc:
+        raise MediaAuthorizationRevoked("media credential is no longer authorized") from exc
+    await _lock_run_configurations(session, run.capability_snapshot, model_name=run.model_name)
+    payload = _payload(run)
     source_ids = (image_input_ids(payload) if run.run_kind == "image" else
                   (payload["input_asset_id"],) if payload.get("input_asset_id") is not None else ())
     for source_id in sorted(set(source_ids)):
         await lock_media_source_in_transaction(session, asset_id=source_id, user_id=run.user_id,
             project_id=run.project_id, run_kind=run.run_kind, pricing=run.pricing_snapshot, run_id=run.id)
+    return verified
+
+
+def require_media_dispatch_fresh(approval: DispatchApproval) -> None:
+    try:
+        approval.require_fresh()
+    except ApiKeyForbidden as exc:
+        raise MediaAuthorizationRevoked("media credential is no longer authorized") from exc
 
 
 async def media_io_allowed(run_id: str, *, owner: str) -> tuple[str | None, bool]:
@@ -168,12 +202,15 @@ async def media_io_allowed(run_id: str, *, owner: str) -> tuple[str | None, bool
     The provider-start transaction repeats the fence; only Batch runs may read a
     source deleted after its accepted pin.
     """
+    approval = await prepare_media_dispatch(_factory(), run_id, owner=owner)
+
     async def transaction():
         async with _factory()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             run, blocked = await lock_media_run_for_io(session, run_id, owner=owner)
             if blocked is None:
-                await validate_batch_media_io_in_transaction(session, run)
+                verified = await validate_batch_media_io_in_transaction(session, run, approval)
+                require_media_dispatch_fresh(verified)
             return blocked, run.batch_id is not None
     return await budgets.retry_deadlocks(transaction)
 

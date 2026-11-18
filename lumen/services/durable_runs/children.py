@@ -16,6 +16,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from time import monotonic
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -32,6 +33,7 @@ from lumen.plugins.registry import get_registry
 from lumen.services import agent_store as ags
 from lumen.services import credit, worker_routing
 from lumen.services.domain_scope import history_domain_id
+from lumen.services.inference_authority import dispatch_deadline
 from lumen.services.providers.errors import AmbiguousModelRouteError
 from lumen.services.run_protocol_v2 import transition_allowed
 from lumen.services.run_store import NONTERMINAL, TERMINAL, append_event
@@ -361,7 +363,7 @@ async def _prepare_child_inputs(
     }
 
 
-async def _current_agent_domain(run: ChatRun) -> str | None:
+async def current_agent_domain(run: ChatRun) -> str | None:
     """Resolve domain scope from the run's selected project, never its frozen agent."""
     if run.api_key_id is not None or run.source != "web":
         return None
@@ -376,11 +378,10 @@ async def _current_agent_domain(run: ChatRun) -> str | None:
     return history_domain_id({"credential_class": "keystone", "domain_id": authority.get("domain_id")})
 
 
-async def require_frozen_agent(session: AsyncSession, run: ChatRun) -> None:
-    """Recheck current child agent scope before authorizing new I/O."""
+async def require_frozen_agent(session: AsyncSession, run: ChatRun, *, domain_id: str | None) -> None:
+    """Recheck the agent row using the caller's freshly verified domain scope."""
     if run.agent_id is None or run.run_scope != "child":
         return
-    domain_id = await _current_agent_domain(run)
     if await ags.load_active_agent(
         session, run.agent_id, user_id=run.user_id, project_id=run.project_id, domain_id=domain_id,
     ) is None:
@@ -409,7 +410,8 @@ async def prepare_delegations(
     async with factory() as session:
         parent_identity = (await session.execute(select(ChatRun).where(ChatRun.id == parent_run_id))).scalar_one()
     parent_payload = _payload(parent_identity)
-    domain_id = await _current_agent_domain(parent_identity)
+    scope_deadline = dispatch_deadline()
+    domain_id = await current_agent_domain(parent_identity)
     agent_rows: dict[int, dict[str, Any]] = {}
     prepared_inputs: dict[str, dict[str, Any]] = {}
     for call in calls:
@@ -474,6 +476,9 @@ async def prepare_delegations(
                     if by_call[call.call_id].fingerprint != call.fingerprint():
                         raise DurableRunConflict("replayed delegation call has a different fingerprint")
                 return _group_view(group, rows)
+            if domain_id is not None and (monotonic() >= scope_deadline or parent.project_id != parent_identity.project_id
+                                          or parent.user_id != parent_identity.user_id):
+                raise ChildFailure("child_agent_unavailable", "delegate agent authorization is stale")
             root_sandbox_deadline = None
             if (root.capability_snapshot or {}).get("sandbox_tools"):
                 # Only new groups need a live root Pod; frozen groups replay after expiry.
@@ -678,6 +683,8 @@ async def prepare_delegations(
                     raise ChildFailure(exc.code, str(exc)) from exc
             if root_sandbox_deadline is not None and root_sandbox_deadline <= _now():
                 raise ChildFailure("sandbox_expired", "root selected sandbox lifetime has expired")
+            if domain_id is not None and monotonic() >= scope_deadline:
+                raise ChildFailure("child_agent_unavailable", "delegate agent authorization is stale")
             return _group_view(group, rows)
 
     return await budgets.retry_deadlocks(transaction)

@@ -271,7 +271,7 @@ async def test_failure_releases_or_retains_unknown(lifecycle, monkeypatch, uncer
     with pytest.raises(decisions.DecisionError):
         await run()
     lifecycle["finish"].assert_awaited_once()
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": uncertain}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": uncertain, "payer": None}
     lifecycle["settle"].assert_not_called()
 
 
@@ -283,7 +283,7 @@ async def test_cancel_after_send_retains_unknown(lifecycle, monkeypatch):
     monkeypatch.setattr(decisions, "transport", cancel_after_dispatch)
     with pytest.raises(asyncio.CancelledError):
         await run()
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True, "payer": None}
 
 
 async def test_missing_cache_price_after_response_retains_unknown(lifecycle, monkeypatch):
@@ -291,7 +291,7 @@ async def test_missing_cache_price_after_response_retains_unknown(lifecycle, mon
     with pytest.raises(decisions.DecisionError) as caught:
         await run(selected_route=route(cache_write_price_per_token=None))
     assert caught.value.status_code == 502
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True, "payer": None}
 
 
 async def test_quota_failure_never_enters_provider(lifecycle, monkeypatch):
@@ -385,7 +385,7 @@ async def test_connection_failure_releases_hold(lifecycle):
         pass
     with pytest.raises(decisions.DecisionError):
         await run(selected_route=route(api_base=base))
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": False}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": False, "payer": None}
 
 
 def principal(auth_type="api_key", scopes=("compat:completions:write", "native:runs:write")):
@@ -496,7 +496,7 @@ async def test_oversized_upstream_response_keeps_unknown_hold(lifecycle, monkeyp
         with pytest.raises(decisions.DecisionError, match="size limit"):
             await run(selected_route=route(api_base=base))
     assert len(calls) == 1
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True, "payer": None}
 
 
 @pytest.mark.parametrize("base,expected", [
@@ -535,7 +535,7 @@ async def test_credential_resolution_failure_releases_before_dispatch(lifecycle,
     with pytest.raises(expected):
         await run()
     lifecycle["reserve"].assert_awaited_once()
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": False}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": False, "payer": None}
     transport.assert_not_called()
     lifecycle["settle"].assert_not_called()
 
@@ -609,7 +609,7 @@ async def test_real_compatible_input_only_route_refuses_inherited_cache_write(li
     with pytest.raises(decisions.DecisionError, match="no valid rate"):
         await run(selected_route=selected)
     lifecycle["settle"].assert_not_called()
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True, "payer": None}
     # The missing tier must not resurrect the inherited base rate above threshold.
     with pytest.raises(decisions.DecisionError, match="pricing unavailable"):
         decisions.decision_cost(selected, usage(inputs=272001, cached=0, written=10))
