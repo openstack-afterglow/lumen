@@ -523,6 +523,8 @@ uv run lumen-test integration
 uv run lumen-test system
 ```
 
+Migration 038 and model-key boundaries: run `pytest -q tests/test_model_api_keys.py tests/test_chat_api_keys.py tests/test_api_key_authority.py tests/test_policy.py tests/test_mcp_domain_authority.py`. Run `pytest -m integration tests/integration/test_model_api_key_migration.py` with disposable MariaDB to verify the immutable legacy key fields, new owner checks, and repeat execution. The HTTP tests use persisted fixture keys and synthetic identity, worker, and provider results. They do not verify paid model calls or production Keystone.
+
 `contract`/`integration`/`system`은 `.env`의 `OPENAI_API_KEY`/`GEMINI_API_KEY`를 live provider 호출에 사용하지 않는다. System은 fake HTTP provider를 사용한다. 실제 유료 호출은 로컬 Compose에서 별도로 migration→provider bootstrap→API/worker 기동, native model registry의 선택 kind·가격·credential 상태 확인 후 실행한다. 호환 `/v1/models`는 text 모델 목록이므로 media route readiness를 증명하지 않는다. OpenAI·Gemini의 짧은 text completion을 각각 1건씩, media는 명시된 `LUMEN_BOOTSTRAP_MODELS_JSON` 모델/가격·S3/scanner 준비가 있는 경우에만 경계별로 수행한다. 출력은 provider response/status와 Lumen ledger 사용량만 요약하고 key 또는 전체 `docker compose config`를 로그에 남기지 않는다. 실제 provider의 모델 접근 거절/과금 정책은 계정마다 다르며 synthetic green으로 실증을 대체하지 않는다.
 
 실제 미디어 transport 수용은 operator가 승인한 키로 지원 ID당 짧은 이미지·발화 1건을 직접 요청하고, 반환 PNG/JPEG를 decoder로 열고, TTS WAV의 RIFF/data 길이와 PCM duration을 확인한 뒤 그 WAV를 STT에 넣어 발화 문자열이 보존되는지 확인한다. 임시 in-memory rate는 전송 계층 실행 gate만 통과시키며 DB에 저장하거나 vendor 청구 단가로 광고하지 않는다. Durable HTTP/compat 수용은 **별도로** HTTPS S3, ClamAV, 명시된 가격, API/worker와 scan/download, reservation·usage ledger가 모두 준비된 환경에서 실행한다. 임시 격리 stack의 test-only 가격은 vendor rate 정확도를 증명하지 않으며 운영 승격에는 확인된 가격과 invoice 대조가 필요하다. `GET /models`에 ID가 있다는 사실만으로 해당 계정의 실제 호출 권한이나 Lumen route 지원을 증명하지 않는다.

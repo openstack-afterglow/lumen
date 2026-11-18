@@ -41,26 +41,15 @@ Restricted original authority는 native admission 이후의 queued execution에�
 
 ### Policy capabilities
 
-Authenticated `GET /v1/policy/capabilities` has no service-entitlement prerequisite. Response: `{"service":"lumen","capabilities":["lumen-inventory_reader"],"actions":["models:read"]}` (illustrative subset). Both lists are sorted/deterministic; enabled authenticated callers without allowed actions receive empty arrays. Actions are the registered exact scope names plus human-only `system:admin`; UI capabilities are singleton-action-family projections, not token roles and not proof that every action in a family is allowed. The same current YAML and stored-key ceiling authorize the actual route and worker. No file path, credentials or policy contents are returned. Native policy reload updates subsequent evaluations; BFFs must not reconstruct grades locally or authorize by coarse UI labels.
+Authenticated Keystone `GET /v1/policy/capabilities` returns sorted `capabilities` (UI projections) and `actions` from current policy. Model keys cannot access the route.
 
-| Surface | API-key scope | Keystone only |
-| --- | --- | --- |
-| `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1/capabilities` | `models:read` | 아니오 |
-| `POST /v1/chat/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` | `compat:completions:write` | API-key routes reject Keystone credentials |
-| conversations read/write | `native:conversations:read` / `native:conversations:write` | 아니오 |
-| native run read/write | `native:runs:read` / `native:runs:write` | 아니오 |
-| `GET /v1/runs/{id}/children` | `native:runs:read` (same user/project parent) | 아니오 |
-| custom tools/skills read/config/delete; MCP config | `native:extensions:read` / `native:extensions:write` / `native:extensions:delete`; MCP `native:mcp:write` | OAuth start만 Keystone-only |
-| memory read/write/delete | `native:memory:read` / `native:memory:write` / `native:memory:delete` | 아니오 |
-| usage endpoints | `usage:read` | 아니오 |
-| Native image/audio/realtime admission | `native:images:write` / `native:audio:write` / `native:realtime:write`; edit/transcribe also `native:assets:read` | 아니오 |
-| Compat images/audio/realtime | `compat:images:write` / `compat:audio:write` / `compat:realtime:write`; inline edit/transcribe upload는 별도 asset-editor 불필요 | API key만 허용 |
-| Native Batch | read `native:batches:read`; create/cancel `native:batches:write` plus each item operation scope (chat/Responses `compat:completions:write`, images `native:images:write`, audio `native:audio:write`, source asset `native:assets:read`) | 아니오 |
-| Compat Files/Batches | files `compat:files:read` / `compat:files:write` / `compat:files:delete`; batches `compat:batches:read` / `compat:batches:write` plus endpoint scope (`compat:completions:write` or `compat:images:write`) | API key만 허용 |
-| agents and code/Git management | `native:agents:read` / `native:agents:write` / `native:agents:delete` (private detail/clone/config uses write) | 아니오 |
-| workspaces | `native:conversations:read` / `native:conversations:write` / `native:conversations:delete` | 아니오 |
-| `/v1/api-keys` / owner limits / revoke | internal route actions `native:keys:read|write|delete` (not issuable key scopes) | 예 |
-| `/v1/admin/*` | human verified raw direct/group/inferred system `admin`, not reduced token or tenant/domain admin | 예 |
+See [Authentication and API keys](api/auth/README.md) for the exact model-key allowlist. Native conversations, runs, tools, MCP, agents, extensions, memory, assets, and Batch require a Keystone session, not a model key.
+
+| Surface | Authority |
+| --- | --- |
+| `/v1/api-keys` / owner limits / revoke | Keystone session with `native:keys:read\|write\|delete` |
+| `/v1/service-keys` / service-key limits / revoke | Current domain manager, verified live for every request |
+| `/v1/admin/*` | Verified human system administrator; not a reduced token or a tenant/domain admin |
 
 Stored key scope는 current owner와 original caller ceiling 안에서 허용된 registered action의 추가 ceiling이다. 발급은 `native:keys:write`와 requested scope 전체의 fresh allowed subset을 요구하며 기존 stored scopes를 자동 확대하지 않는다. `lumen/service_authority.py`의 service leaf/editor 명칭은 internal UI labels일 뿐 IAM roles가 아니다. Standard admin/manager/member는 owned action 전체, reader는 nonsecret `:read`만 eligible하며 oslo.policy는 이를 좁힐 수 있다. `@`도 reader mutation, legacy-only entitlement, foreign/private ownership 또는 global human boundary를 우회하지 못한다.
 
@@ -141,7 +130,7 @@ Keystone-only `GET /v1/api-keys/issuance-policy`는 fresh keys-editor/current ow
 
 ## Batch API
 
-`batch_enabled=false`가 기본값이며 이때 모든 Batch/Files route는 503 `batch_unavailable`이다. Batch/Files scope는 발급 가능하지만 `DEFAULT_API_KEY_SCOPES`에는 추가되지 않는다. 두 계약은 같은 `chat_batches` 원장과 기존 durable run/hold/usage ledger를 사용한다. 항목 실행은 batch-only worker의 일반 claim을 거치고, provider 호출은 한 번만 한다. 불명확한 결과는 `unknown`으로 남으며 자동 재호출하지 않는다. Upstream provider의 Batch API나 할인은 사용하지 않고 frozen Lumen 가격으로 정산한다.
+`batch_enabled=false`가 기본값이며, 유효한 인증을 통과한 Batch/Files route는 503 `batch_unavailable`을 반환한다. 개인·서비스 키에는 Batch 또는 Files scope를 발급하지 않는다. Keystone 세션의 Native mixed Batch는 기존 durable run/hold/usage ledger를 사용한다. 불명확한 provider 결과는 `unknown`으로 남으며 자동 재호출하지 않는다.
 
 **Native mixed Batch.** `POST /v1/chat/batches`는 `{items:[{custom_id, operation, body}], completion_window:"24h", metadata}`를 받는다. `operation`은 `chat.completions|responses|images.generations|images.edits|audio.speech|audio.transcriptions`이고 한 batch에서 섞을 수 있다. `Idempotency-Key`는 1–128 printable ASCII로 필수다(위반 422). 같은 key와 같은 요청은 원래 descriptor를 202로 반환하고 다른 요청은 409다. Body는 JSON parse 전에 `batch_native_max_bytes`(기본 10 MiB, 초과 413 `request_too_large`), 항목 수는 item 검증 전에 `batch_native_max_items`(기본 1,000, 초과 422 `too_many_items`)로 막는다. 응답 descriptor는 `id,status,created_at,expires_at,request_counts,metadata,links(self,items,cancel),errors`다. `GET /v1/chat/batches?after=<id>&limit=`(기본 20, 최대 100)는 최신순 `{batches,next_cursor}`를 반환한다. `GET .../items?after=<ordinal>&limit=`(기본 100, 최대 1,000)는 `custom_id,ordinal,operation,run_id,status,response,error,settlement_status`를 반환한다. Text 결과는 provider response body, image는 `{"data":[{"asset_id","mime_type","size_bytes"}]}`, speech는 asset reference, transcription은 `{"text","segments"?}`다. 항목 상태는 `pending|queued|running|completed|failed|cancelled|expired|unknown`이다. Cancel은 202 descriptor를 반환한다. Realtime, virtual `model=lumen`, streaming, provider built-in/server tool과 사용자 승인 대기는 허용하지 않는다. Function tool call 결과는 그대로 반환한다.
 
@@ -163,12 +152,12 @@ Keystone-only `GET /v1/api-keys/issuance-policy`는 fresh keys-editor/current ow
 
 Embedding models are registered with `model_kind="embedding"` and the existing input-price-per-million field. They are not chat models or durable media runs. Model discovery marks exact catalog mode `embedding` as a non-chat candidate; an administrator must register the provider/model and configure a supported direct OpenAI or Gemini API-key route.
 
-- `POST /v1/embeddings` requires `compat:completions:write` and accepts `{model, input, dimensions?, encoding_format?, provider?}`. `input` is a string or 1–2048 non-empty strings. Each input is limited by the selected model's input-token limit; OpenAI total input is capped at 300,000 tokens. `dimensions` is supported for OpenAI `text-embedding-3-*` and Gemini embedding models, and cannot exceed that model's default vector size. `encoding_format` is `float` or `base64`; base64 is little-endian float32. Response follows OpenAI `{object:"list",data:[{object:"embedding",index,embedding}],model,usage:{prompt_tokens,total_tokens}}`.
-- `POST /v1beta/models/{model}:embedContent` accepts Gemini `content`, `taskType`, `title`, and `outputDimensionality`; batch endpoint accepts 1–100 requests with the same model and dimensions/task metadata. Auth accepts `x-goog-api-key`, `x-api-key`, or API-key Bearer. Use Google GenAI `http_options.base_url` set to the Lumen origin (without `/v1`); model path is `/v1beta`.
-- `POST /v1/chat/embeddings` is a separate Keystone-session endpoint for the dashboard BFF. It accepts `{model_id,input:[...],dimensions?}` with at most16 inputs and returns indexed vectors, dimensions, usage estimate status and credited cost. It does not persist input or vectors.
+- `POST /v1/embeddings` requires `embeddings:write`. It accepts `{model, input, dimensions?, encoding_format?, provider?}`, with 1–2048 non-empty inputs. `dimensions` cannot exceed the configured model's default vector size. `encoding_format` is `float` or little-endian float32 `base64`.
+- `POST /v1beta/models/{model}:embedContent` and `:batchEmbedContents` require `embeddings:write`. They accept `x-goog-api-key`, `x-api-key`, or API-key Bearer. Use the Lumen origin (without `/v1`) as the Google GenAI client base URL.
+- `POST /v1/chat/embeddings` accepts a Keystone session or model key with `embeddings:write`. It returns indexed vectors, dimensions, usage estimate status and credited cost without persisting input or vectors.
 - All routes authorize the selected model's `embeddings` credential operation, perform quota checks, and settle input tokens through the existing usage ledger. Gemini's batch endpoint may omit usage metadata; Lumen uses an offline tokenizer estimate and labels it as estimated in the native response. It never claims vendor-reported usage in that case.
 
-Standalone Compose는 `seed-local`이 같은 scope와 native Console scope를 가진 local key를 발급하고 mode `0600` connection manifest에 저장한다. `docker compose run --rm --no-deps -T lumen-connection`을 명시적으로 실행할 때만 `/v1`로 끝나는 host `base_url`, Compose-network `container_base_url`, key, model을 출력한다. 생성 key를 반환하는 HTTP endpoint는 없다.
+Standalone Compose의 `seed-local`은 모델 호출 전용 개인 키를 mode `0600` connection manifest에 저장한다. `docker compose run --rm --no-deps -T lumen-connection`을 명시적으로 실행할 때만 host `base_url`, Compose `container_base_url`, key, model을 출력한다.
 
 OpenAI 비스트리밍/스트리밍 completion에서 `model="lumen"`을 사용하면 서버 설정 `chat_default_model`을 백엔드로 하는 Lumen durable run이 생성되어 worker에서 실행된다. 이 경로는 text-only, tools/memory 비활성 상태로 동작하며 응답 usage는 durable run 원장에 기록된다. `GET /v1/models`는 active `chat_default_model`이 구성되어 있을 때만 `owned_by="lumen"`인 `lumen` 모델을 표출한다. 일반 공개 provider model ID 지정 시에는 direct stateless 중계가 수행된다. 같은 공개 ID가 여러 provider에 있으면 선택적 `provider`가 없을 때 409이며, SDK는 `extra_body={"provider": "..."}` 또는 `X-Lumen-Provider`로 이를 전달할 수 있다. 스트리밍 usage는 요청에 `stream_options={"include_usage": true}`를 지정해야 마지막 usage chunk로 반환된다. 모든 경로가 API-key quota admission과 `source="api"` usage ledger를 거친다.
 
@@ -469,8 +458,8 @@ Individual cancel은 미시작 run을 취소하지만 이미 provider 결과가 
 
 ## OpenAI Decisions
 
-- `POST /v1/decisions`: API-key 인증, `compat:completions:write`, 기존 compat host gate. OpenAI wire shape를 사용하며 Gemini route를 거절한다.
-- `POST /v1/chat/decisions`: Keystone 세션/BFF 인증, `native:runs:write`. 활성 모델 route를 먼저 선택하고 공급자별 wire schema를 적용한다. OpenAI route는 아래 body를 받고 `cost_usd`, `credited_cost`, `usage_log_id`(immutable usage event UUID)를 추가한다. Gemini route는 [Gemini Decisions](#gemini-decisions) 계약을 사용한다.
+- `POST /v1/decisions`: 모델 API 키로 `decisions:write` 필요. Compat host gate와 OpenAI wire shape를 사용하며 Gemini route를 거절한다.
+- `POST /v1/chat/decisions`: Keystone 세션 또는 모델 키로 `decisions:write` 필요. 공급자별 wire schema를 적용하고 OpenAI route는 `cost_usd`, `credited_cost`, `usage_log_id`를 추가한다. Gemini route는 [Gemini Decisions](#gemini-decisions) 계약을 사용한다.
 - `model`은 활성 등록 text 모델 이름이다. OpenAI 프로토콜/API-key provider와 effective `capabilities.decisions=true`가 필요하다. 공식 endpoint와 관리자 custom `api_base` 모두 지원한다. 공식 지원 모델은 현재 `gpt-6-luna`이며, compatible endpoint는 관리자가 capability와 가격을 명시해야 한다. 미등록/비활성 모델 404, ambiguous name 409, capability/protocol/입력 가격 누락 422다.
 
 ```json
@@ -545,8 +534,8 @@ Migration **034**를 적용한 뒤 새 writer를 시작한다(동시 pending mig
 
 | Route | Authentication and model selection |
 | --- | --- |
-| `POST /v1/chat/decisions` | Keystone session/BFF with `native:runs:write`. Resolves the active registered route before applying its provider-specific validation. |
-| `POST /v1beta/decisions` | Lumen API key with `compat:completions:write` and the existing compat host gate. Same headers as Google embeddings: `x-goog-api-key`, `x-api-key`, or API-key Bearer. Accepts only a Gemini Decision route and the Google wire format. |
+| `POST /v1/chat/decisions` | Keystone session or model API key with `decisions:write`. Resolves the model route before provider-specific validation. |
+| `POST /v1beta/decisions` | Model API key with `decisions:write` and compat host gate. Accepts `x-goog-api-key`, `x-api-key`, or API-key Bearer and requires a Gemini route. |
 
 Register provider type `gemini` and stored model name `gemini/gemini-decision-1` with `model_kind="decision"`. On `/v1beta/decisions`, `gemini-decision-1`, `models/gemini-decision-1`, and `gemini/gemini-decision-1` select the same model name, subject to the ordinary ambiguity check. Use `lumen/<provider_id>/<model_id>` with decimal integer IDs to pin one active registered route; `lumen/gemini/gemini-decision-1` is not a route selector. Use the Lumen origin, without a `/v1` suffix, as the Google client base URL and select `v1beta`. Google Gen AI Python SDK 3.5.0 puts the selected model string unchanged in the JSON `model` field of `POST /v1beta/decisions` and sends the Lumen API key in `x-goog-api-key`. Do not send a Google provider key to Lumen. The gateway uses a separately configured provider credential for the official Gemini Developer API; custom bases and subscription transport are not supported.
 

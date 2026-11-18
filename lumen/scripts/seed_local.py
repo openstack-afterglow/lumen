@@ -18,33 +18,7 @@ from lumen.scripts.seed_providers import seed_environment_providers
 from lumen.services import api_key_store
 from lumen.services.providers import repository
 
-_LOCAL_KEY_SCOPES = [
-    "models:read",
-    "compat:completions:write",
-    "compat:images:write",
-    "compat:audio:write",
-    "compat:realtime:write",
-    "compat:batches:read",
-    "compat:batches:write",
-    "compat:files:read",
-    "compat:files:write",
-    "native:conversations:read",
-    "native:conversations:write",
-    "native:runs:read",
-    "native:runs:write",
-    "native:images:write",
-    "native:audio:write",
-    "native:realtime:write",
-    "native:assets:read",
-    "native:assets:write",
-    "native:batches:read",
-    "native:batches:write",
-    "native:extensions:read",
-    "native:tools:execute",
-    "native:memory:read",
-    "native:memory:write",
-    "usage:read",
-]
+_LOCAL_KEY_SCOPES = sorted(api_key_store.MODEL_API_KEY_SCOPES)
 
 
 def normalize_base_url(value: str) -> str:
@@ -79,11 +53,11 @@ def is_scope_satisfied(verified_scopes: Collection[str], required_scopes: Collec
     return set(required_scopes).issubset(verified_scopes)
 
 
-def is_seed_key_current(verified: dict | None, user_id: str, project_id: str) -> bool:
+def is_seed_key_current(verified: dict | None, user_id: str) -> bool:
     return bool(
         verified
         and verified.get("user_id") == user_id
-        and verified.get("project_id") == project_id
+        and verified.get("credential_class") == "personal_key"
         and is_scope_satisfied(verified.get("scopes", ()), _LOCAL_KEY_SCOPES)
     )
 
@@ -250,14 +224,10 @@ async def seed() -> None:
         raw_key = seed_path.read_text().strip() if seed_path.exists() else ""
         verified = await api_key_store.verify_key(raw_key) if raw_key else None
 
-        if verified is not None and not is_seed_key_current(verified, user_id, project_id):
-            if verified.get("user_id") == user_id and verified.get("project_id") == project_id:
+        if verified is not None and not is_seed_key_current(verified, user_id):
+            if verified.get("user_id") == user_id and verified.get("credential_class") == "personal_key":
                 ensure_scopes(authority, "native:keys:delete")
-                await api_key_store.revoke_key(
-                    verified["api_key_id"],
-                    user_id,
-                    project_id,
-                )
+                await api_key_store.revoke_key(verified["api_key_id"], user_id)
             verified = None
         if verified is None:
             issued = await api_key_store.create_key(

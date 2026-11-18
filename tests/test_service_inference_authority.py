@@ -310,8 +310,8 @@ async def test_compat_realtime_checks_current_project_writer_not_only_key_scope(
     monkeypatch.setattr(realtime, "get_settings", lambda: SimpleNamespace(chat_api_hosts=""))
     monkeypatch.setattr(realtime, "origin_allowed", lambda _: True)
     monkeypatch.setattr(realtime.api_key_store, "verify_key", AsyncMock(return_value={
-        **principal("reader", key=True), "scopes": ["compat:realtime:write"]}))
-    websocket = SimpleNamespace(headers={"authorization": "Bearer sk-afgl-synthetic"})
+        **principal("reader", key=True), "credential_class": "claude_gateway", "scopes": ["compat:realtime:write"]}))
+    websocket = SimpleNamespace(scope={}, headers={"authorization": "Bearer sk-afgl-synthetic"})
     assert await realtime._principal(websocket) is None
 
 

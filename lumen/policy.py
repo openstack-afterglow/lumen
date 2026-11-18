@@ -123,14 +123,17 @@ class _Enforcer(policy.Enforcer):
 
 
 def list_rules() -> list[policy.RuleDefault]:
-    from lumen.service_authority import PROJECT_WRITE_ROLES, SCOPE_CAPABILITIES
+    from lumen.service_authority import MODEL_API_KEY_SCOPES, PROJECT_WRITE_ROLES, SCOPE_CAPABILITIES
 
     rules = []
     for action in SCOPE_CAPABILITIES:
         roles = sorted(PROJECT_WRITE_ROLES)
         if action.endswith(":read"):
             roles.append("reader")
-        check = " or ".join(["is_system_admin:True", *(f"role:{role}" for role in roles)])
+        conditions = ["is_system_admin:True", *(f"role:{role}" for role in roles)]
+        if action in MODEL_API_KEY_SCOPES:
+            conditions.append("model_api_key:True")
+        check = " or ".join(conditions)
         rules.append(policy.RuleDefault(action, check, description=f"Lumen {action}; project/user ownership and credential ceilings are enforced separately."))
     rules.append(policy.RuleDefault("system:admin", "is_system_admin:True", description="Verified human system administrator only; independent hard boundary also enforced."))
     return rules
@@ -157,6 +160,14 @@ def get_enforcer() -> policy.Enforcer:
 
 def authorize(action: str, principal: dict) -> bool:
     """Unknown actions and malformed policies fail closed, never use stale allow."""
+    from lumen.service_authority import MODEL_API_KEY_SCOPES, PROJECT_WRITE_ROLES, SCOPE_CAPABILITIES
+
+    model_api_key = (
+        principal.get("auth_type") == "api_key"
+        and principal.get("credential_class") in {"personal_key", "service_key"}
+    )
+    if model_api_key and action not in MODEL_API_KEY_SCOPES:
+        return False
     if not principal.get("project_id") or not principal.get("user_id"):
         return False
     if action == "system:admin" and (
@@ -167,12 +178,11 @@ def authorize(action: str, principal: dict) -> bool:
     if principal.get("auth_type") == "api_key" and action not in principal.get("scopes", ()):
         return False
     if action != "system:admin":
-        from lumen.service_authority import PROJECT_WRITE_ROLES, SCOPE_CAPABILITIES
-
         if action not in SCOPE_CAPABILITIES:
             return False
         roles = set(principal.get("roles", ()))
         if not (
+            model_api_key or
             principal.get("is_system_admin") or principal.get("service_system_admin")
             or roles.intersection(PROJECT_WRITE_ROLES)
             or (action.endswith(":read") and "reader" in roles)
@@ -182,6 +192,7 @@ def authorize(action: str, principal: dict) -> bool:
         "roles": list(principal.get("roles", ())),
         "user_id": principal["user_id"], "project_id": principal["project_id"],
         "is_system_admin": bool(principal.get("is_system_admin") or principal.get("service_system_admin")),
+        "model_api_key": model_api_key,
     }
     target = {"user_id": principal["user_id"], "project_id": principal["project_id"]}
     with _LOCK:

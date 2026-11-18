@@ -64,6 +64,7 @@ def gateway(monkeypatch):
 
     app.dependency_overrides[get_principal] = principal
     verify = AsyncMock(return_value={"user_id": "owner", "project_id": "project", "api_key_id": 37,
+                                     "auth_type": "api_key", "credential_class": "personal_key",
                                      "scopes": ["compat:realtime:write"], "roles": ["member", *SERVICE_CAPABILITIES], "service_system_admin": False})
     create = AsyncMock(return_value={"session_id": _SESSION_ID, "connect_token": "compat-ticket"})
     consume = AsyncMock(side_effect=AssertionError("denial must not consume a ticket"))
