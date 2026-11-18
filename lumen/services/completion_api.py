@@ -638,9 +638,9 @@ def _norm_tool_calls(raw: Any) -> list[dict] | None:
 
 
 def _completion_provider_options(
-    options: dict | None, *, resolved: dict, client_functions_only: bool,
+    options: dict | None, *, resolved: dict, translated_options: bool,
 ) -> dict:
-    if client_functions_only and not _official_openai(resolved):
+    if translated_options and not _official_openai(resolved):
         # The Gemini adapter closed-validates and translates the option vocabulary.
         return options or {}
     return chat_provider_options(options or {}, resolved=resolved)
@@ -736,12 +736,12 @@ async def complete_once(
     tools: list[dict] | None = None,
     tool_choice: Any = None,
     options: dict | None = None,
-    client_functions_only: bool = False,
+    translated_options: bool = False,
 ) -> dict:
     """비스트리밍 완료 — 전체 응답 반환 + 과금. tool_calls 는 릴레이(서버 미실행)."""
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
-    await _authorize_completion(user_id, project_id, api_key_id, {} if client_functions_only else {"tools": tools}, resolved)
-    options = _completion_provider_options(options, resolved=resolved, client_functions_only=client_functions_only)
+    await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
+    options = _completion_provider_options(options, resolved=resolved, translated_options=translated_options)
     max_output = _chat_wire_budget(resolved, max_tokens)
     if payer is not None and max_output is None:
         max_output = _chat_hold_output_budget(resolved, None)
@@ -805,15 +805,15 @@ async def complete_stream(
     tools: list[dict] | None = None,
     tool_choice: Any = None,
     options: dict | None = None,
-    client_functions_only: bool = False,
+    translated_options: bool = False,
 ) -> AsyncIterator[dict]:
     """Validate/freeze before HTTP streaming starts, then return the completion iterator."""
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
-    options = _completion_provider_options(options, resolved=resolved, client_functions_only=client_functions_only)
+    options = _completion_provider_options(options, resolved=resolved, translated_options=translated_options)
     max_output = _chat_wire_budget(resolved, max_tokens)
     if payer is not None and max_output is None:
         max_output = _chat_hold_output_budget(resolved, None)
-    await _authorize_completion(user_id, project_id, api_key_id, {} if client_functions_only else {"tools": tools}, resolved)
+    await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
     hold = await _reserve_online(
         resolved, messages=messages, tools=tools, max_output=_chat_hold_output_budget(resolved, max_output),
         user_id=user_id, project_id=project_id, api_key_id=api_key_id,

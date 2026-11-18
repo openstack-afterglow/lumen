@@ -456,7 +456,7 @@ async def test_embed_content_uses_gemini_embedding_route(wire, boundary):
     ("missing-model", None, 404, "NOT_FOUND"),
     ("lumen", None, 404, "NOT_FOUND"),
     ("gemini-sdk", types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]),
-     400, "INVALID_ARGUMENT"),
+     403, "PERMISSION_DENIED"),
     ("gemini-sdk", types.GenerateContentConfig(candidate_count=2), 400, "INVALID_ARGUMENT"),
     ("sdk-chat", types.GenerateContentConfig(top_k=3), 400, "INVALID_ARGUMENT"),
     ("sdk-chat", types.GenerateContentConfig(
@@ -469,6 +469,23 @@ async def test_generate_errors_use_google_shape(wire, boundary, model, config, c
 
     assert (failure.value.code, failure.value.status) == (code, status)
     assert boundary.bifrost == [] and boundary.settled == []
+
+
+@pytest.mark.parametrize("model", ["gemini-sdk", "sdk-chat", "missing-model"])
+@pytest.mark.parametrize("tool", [
+    types.Tool(google_search=types.GoogleSearch()),
+    types.Tool(code_execution=types.ToolCodeExecution()),
+    types.Tool(url_context=types.UrlContext()),
+])
+async def test_hosted_tools_are_refused_before_resolution(wire, boundary, model, tool):
+    with pytest.raises(genai_errors.ClientError) as failure:
+        await _client(wire).aio.models.generate_content(
+            model=model, contents="hello", config=types.GenerateContentConfig(tools=[tool]))
+
+    # Shared key tool policy: refused before model resolution, so even an unknown model is 403.
+    assert (failure.value.code, failure.value.status) == (403, "PERMISSION_DENIED")
+    assert failure.value.message.startswith("server_tool_not_allowed_for_key")
+    assert boundary.bifrost == [] and boundary.holds == []
 
 
 @pytest.mark.parametrize("model", ["gemini-sdk", "sdk-chat"])
