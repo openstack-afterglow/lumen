@@ -6,7 +6,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: package/runtime/lock/Kolla image default는 `0.6.20`(OpenAI 이미지·GPT-6.2·실시간 확장; 릴리스 준비, 아직 발행·배포 전)이다. 현재 운영 버전은 불변 tag `0.6.19`(`2637d252`)이며 DMS Lab 컨트롤러 3대에 배포했다. protocol 2와 관리형 ClamAV는 유지하고 선택 도구 sandbox runtime은 끈 상태다. 0.6.20은 새 migration이 없고 기존 035 ledger와 CHECK를 보존한다. 운영 수신증과 유료 SDK 호출 범위는 `docs/testing.md`에 기록한다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 033–035 적용 시 schema-first 전환 및 혼합 writer 금지 조건은 그대로다.
+- 버전: package/runtime/lock/Kolla image default `0.6.20`은 불변 tag `0.6.20`(`d2751b6d`)으로 발행했고, DMS Lab 컨트롤러 3대에 배포했다(OpenAI 이미지·GPT-6.2·실시간 확장). protocol 2와 관리형 ClamAV는 유지하고 선택 도구 sandbox runtime은 끈 상태다. 새 migration은 없고 기존 035 ledger와 CHECK를 보존했다. 운영 수신증과 유료 SDK 호출 범위는 `docs/testing.md`에 기록한다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 033–035 적용 시 schema-first 전환 및 혼합 writer 금지 조건은 그대로다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.

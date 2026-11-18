@@ -1,5 +1,23 @@
 # 테스트
 
+## Lumen 0.6.20 — 발행·운영 배포·OpenAI 유료 확인
+
+- `live-verified`: `0.6.20` tag는 `d2751b6d76d34e58dfa04a0a405652ea3b2d154f`(검토한 `ed1e77d`와 트리 동일)이다. PR CI [`44288865371`](https://github.com/openstack-afterglow/lumen/actions/runs/44288865371), `dev` CI [`44290416680`](https://github.com/openstack-afterglow/lumen/actions/runs/44290416680), tag 이미지 [`44290538562`](https://github.com/openstack-afterglow/lumen/actions/runs/44290538562), 패키지 [`44290538570`](https://github.com/openstack-afterglow/lumen/actions/runs/44290538570)가 통과했다. 패키지 workflow가 미리 만든 [한영 GitHub Release](https://github.com/openstack-afterglow/lumen/releases/tag/0.6.20) 초안을 휠 8개와 함께 11:05:42 UTC에 게시했고(배포 전, 배포 대기로 표기), 배포 후 수신증으로 본문을 갱신했다.
+- 각 OCI index에서 tag와 `latest`가 일치하고, amd64(에뮬레이션)와 arm64에서 child digest·revision label·실제 실행 버전(서비스 0.6.20)과 새 모듈(`openai_tool_policy`, `image_billing`) import를 확인했다.
+
+| OCI image | Index digest |
+| --- | --- |
+| `lumen-api` | `sha256:c2558aca5d98ebcb4938ad696dddd011a16053e7baf655a076c516d3e6cd3b32` |
+| `lumen-worker` | `sha256:57f0e401fc183ea93697113fb42864ca26140a2c70074d652ca2b1d9379a1334` |
+| `lumen-controller` | `sha256:7114531fee6ee372efa8cc4750f677d86bae8b94d0c5fae9a9e52d0129d64eba` |
+| `lumen-sandbox` | `sha256:a7d26e05bb3783ebc3125504e673dc880f9c73dcdd423000fcff06eee725ada6` |
+
+- 로컬 release 후보(`3de899e`/`ed1e77d`): contract 8,433 서비스·145 SDK, Go `runtime/bifrost`, MariaDB/Redis integration 784 통과·4 skip, system 39 통과, 아키텍처 검사. 이미지·GPT-6.2·실시간 slice는 각각 독립 리뷰와 수정 재검증을 거쳤고 통합 리뷰도 blocker가 없었다.
+- 배포 전 운영 OpenAI 키 확인: `gpt-6.2-sol` Responses 최소 호출(입력 10·출력 5)의 `service_tier: "default"`와 `input_tokens_details.cache_write_tokens_details.{ttl_30m_tokens, ttl_12h_tokens}` 필드를 확인했다. `gpt-realtime-2.1`에 audio·`response.create` 없이 설정 `session.update` 두 개만 보내 `session.created` → `session.updated`(`max_output_tokens: 4096`, retention_ratio 0.8·post_instructions 16,384 truncation, VAD 없음) → `session.updated`(같은 한도, server VAD)를 받았다. `conversation.created`는 관측되지 않았다.
+- 2026-11-18 11:18:13–11:19:16 UTC에 `kolla-ansible reconfigure -i /etc/kolla/multinode --tags lumen --skip-tags haproxy`를 실행했다. 세 API의 admission을 닫고 drain 결과 nonterminal run 0, 처리 중 예약 0건을 확인한 뒤 worker를 정지했다. MariaDB 67개 테이블과 PostgreSQL dump 헤더를 암호화 백업 `/var/backups/lumen/pre-v0.6.20-20261118T111551Z`에서 검증했다(복원은 실행하지 않음). 새 migration은 없다. 세 컨트롤러의 `lumen_api`·`lumen_worker`가 고정 digest·revision label·재시작 0회·runtime 0.6.20이고, 공개 `/v1/health`, `/v1/ready`, OpenAPI의 새 이미지 옵션이 확인됐다. 총 647개 컨테이너 중 `lumen_api`·`lumen_worker`만 교체됐고 VIP·보호 설정은 유지됐다. 롤백·census 수신증은 `/etc/kolla/.afterglow-rollout-backups/lumen-0.6.20-20261118T111551Z`에 있다. Sandbox runtime은 꺼진 상태다.
+- 운영 행 139(`gpt-6.2-sol`)·142(`gpt-6.2-astra`)·97(`gpt-image-2`)·99(`gpt-image-2.5-flare`)는 저장값이 확인한 snapshot과 같음을 repository row lock 안에서 비교한 뒤 가격 필드와 `media_pricing`을 null로 바꿔 `price_origin=native_catalog`가 됐다(먼저 dry-run으로 비교만 수행).
+- `openai` SDK 3.55.0과 일회용 키(`models:read`, `compat:completions:write`, `compat:images:write`)로 운영 `https://lumen.dmslab.re.kr/v1`에 요청 2건을 보냈다. Responses `lumen/2/139`는 `completed`, 표준 등급, 입력 11·출력 5토큰, 무상태 예약 11.11 credits가 0.072에 정산됐다($0.000072). Images `lumen/2/99` 1024×1024 low는 684,138 byte PNG를 반환했고 사용량 원장은 텍스트 입력 17·이미지 출력 196토큰(계산식과 일치), $0.005965다. compat 이미지 응답에는 `usage` 객체가 없었다. 키를 폐기했고 다시 사용하면 401이다. GIF·SVG·편집, GPT Image 2.6(운영 등록 모델 없음), 실시간 대화·번역·GPT-Live 과금, 내장 도구, 제한 모델은 운영에서 실행하지 않았다.
+
 ## Lumen 0.6.19 — 발행·운영 배포·Gemini SDK 확인
 
 - `live-verified`: `0.6.19` tag는 `2637d252c29f6719156ff91c5dbcb5dafc978322`이다. `dev` CI [`44253879223`](https://github.com/openstack-afterglow/lumen/actions/runs/44253879223), tag 이미지 [`44255458441`](https://github.com/openstack-afterglow/lumen/actions/runs/44255458441), 패키지 [`44255458415`](https://github.com/openstack-afterglow/lumen/actions/runs/44255458415)가 통과했다. [한영 GitHub Release](https://github.com/openstack-afterglow/lumen/releases/tag/0.6.19)와 휠 8개를 확인했다.
