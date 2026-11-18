@@ -68,13 +68,17 @@ class TestCreateAndList:
             return [_public_conv(title="오래된 OpenStack 대화")]
 
         monkeypatch.setattr(cs, "search_conversations", fake_search)
-        resp = await client.get(f"{_URL}/search", params={"q": "OpenStack", "limit": 20})
+        # Domain authority comes only from the verified principal, never caller input.
+        resp = await client.get(
+            f"{_URL}/search", params={"q": "OpenStack", "limit": 20, "domain_id": "caller-domain"},
+            headers={"X-Domain-Id": "caller-domain"},
+        )
         assert resp.status_code == 200
         assert resp.json()[0]["title"] == "오래된 OpenStack 대화"
         assert captured == {
             "user_id": "test-user-123",
             "project_id": "test-project-123",
-            "domain_id": None,
+            "domain_id": "test-domain-123",
             "query": "OpenStack",
             "limit": 20,
         }
@@ -348,14 +352,17 @@ async def test_messages_uses_anchor_and_returns_signed_page_cursors(client, monk
     monkeypatch.setattr(conversations.cs, "get_conversation", fake_get)
     monkeypatch.setattr(conversations.cs, "list_message_page", fake_page)
 
-    response = await client.get(f"{_URL}/conv-1/messages?anchor=first&limit=40")
+    response = await client.get(
+        f"{_URL}/conv-1/messages?anchor=first&limit=40&domain_id=caller-domain",
+        headers={"X-Domain-Id": "caller-domain"},
+    )
 
     assert response.status_code == 200
     assert captured == {
         "conv_id": "conv-1",
         "user_id": "test-user-123",
         "project_id": "test-project-123",
-        "domain_id": None,
+        "domain_id": "test-domain-123",
         "anchor": "first",
         "cursor_direction": None,
         "cursor_position": None,
