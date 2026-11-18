@@ -27,8 +27,10 @@ from lumen.services.usage_breakdown import UsageBreakdown
 
 from .realtime_transport import (
     CLOSE_TIMEOUT_SECONDS,
+    REASONING_EFFORTS,
     RealtimeTransportError,
     realtime_kind,
+    reasoning_configurable,
     upstream_connection_spec,
 )
 
@@ -53,6 +55,18 @@ _MAX_LANGUAGES = 8
 # Kinds whose upstream must receive session.close and be drained until session.closed,
 # otherwise translated or spoken audio still in flight is dropped.
 _DRAINED_CLOSE_KINDS = frozenset({"translation", "live"})
+# Native ticketed Studio events -> vendor events for streamed translation and GPT-Live.
+# A translation's target language is fixed at admission, so no native session.update exists.
+_NATIVE_STREAM_CLIENT_EVENTS = {
+    "translation": {"audio.input.append": "session.input_audio_buffer.append"},
+    "live": {"audio.input.append": "session.input_audio.append", "audio.input.mute": "session.input_audio.mute",
+             "audio.input.unmute": "session.input_audio.unmute",
+             "instructions.append": "session.instructions.append"},
+}
+_NATIVE_STREAM_TRANSCRIPTS = {"session.input_transcript.delta": "transcript.input.delta",
+                              "session.output_transcript.delta": "transcript.output.delta"}
+# GPT-Live accepts audio only after session.started.
+_LIVE_START_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -113,42 +127,44 @@ class TokenUsageMeter:
         if self._provider == "openai" and message.get("type") in {"response.create", "input_audio_buffer.commit"}:
             self._pending = True
 
-    def observe(self, message: dict) -> None:
+    def observe(self, message: dict) -> UsageBreakdown | None:
+        """Record a provider frame; return a newly confirmed OpenAI per-response usage."""
         if self._invalid:
-            return
+            return None
         if self._provider == "openai":
-            self._observe_openai(message)
-        else:
-            self._observe_gemini(message)
+            return self._observe_openai(message)
+        self._observe_gemini(message)
+        return None
 
-    def _observe_openai(self, message: dict) -> None:
+    def _observe_openai(self, message: dict) -> UsageBreakdown | None:
         event = message.get("type")
         if event == "error":
             # A provider rejection acknowledges the attempted request without starting a response.
             # Any response already created remains tracked in _in_flight until response.done.
             self._pending = False
-            return
+            return None
         if event not in {"response.created", "response.done"}:
-            return
+            return None
         response = message.get("response")
         response_id = response.get("id") if isinstance(response, dict) else None
         if not isinstance(response_id, str) or not response_id or len(response_id) > 128:
             self._invalid = True
-            return
+            return None
         if event == "response.created":
             self._pending = False
             if response_id not in self._responses:
                 self._in_flight.add(response_id)
-            return
+            return None
         usage = UsageBreakdown.from_openai_media(response.get("usage"))
         previous = self._responses.get(response_id)
         if (usage is None or usage.modality_usage_invalid or (previous is not None and previous != usage)
                 or (previous is None and len(self._responses) >= _MAX_METERED_RESPONSES)):
             self._invalid = True
-            return
+            return None
         self._responses[response_id] = usage
         self._in_flight.discard(response_id)
         self._pending = False
+        return None if previous is not None else usage
 
     def _observe_gemini(self, message: dict) -> None:
         content = message.get("serverContent")
@@ -327,6 +343,11 @@ def _translation_update(session: object) -> dict:
     return {"type": "session.update", "session": {"audio": {"output": {"language": language}}}}
 
 
+def translation_language(value: object) -> str:
+    """A target language a translation ``session.update`` accepts; raises otherwise."""
+    return _translation_update({"audio": {"output": {"language": value}}})["session"]["audio"]["output"]["language"]
+
+
 def _kind_client_event(message: dict, kind: str, model: str | None) -> tuple[dict | None, int, bool]:
     """Whitelisted OpenAI transcription/translation/live client events, rebuilt from validated fields."""
     event = message.get("type")
@@ -375,6 +396,12 @@ def _client_event(message: dict, provider: str, *, wire: str, voice: str | None 
                 message = {**message, "type": event.replace("audio.input.", "input_audio_buffer.")}
             elif event != "session.close":
                 raise RealtimeTransportError("unsupported realtime client event")
+        elif wire == "native" and kind in _NATIVE_STREAM_CLIENT_EVENTS:
+            event = message.get("type")
+            if event in _NATIVE_STREAM_CLIENT_EVENTS[kind]:
+                message = {**message, "type": _NATIVE_STREAM_CLIENT_EVENTS[kind][event]}
+            elif event != "session.close":
+                raise RealtimeTransportError("unsupported realtime client event")
         elif wire != "openai":
             raise RealtimeTransportError("unsupported realtime client event")
         return _kind_client_event(message, kind, model)
@@ -389,7 +416,8 @@ def _client_event(message: dict, provider: str, *, wire: str, voice: str | None 
             return {"type": event}, 0, False
         if event == "session.update":
             session = message.get("session")
-            if not isinstance(session, dict) or set(session) - {"type", "instructions", "audio", "output_modalities"}:
+            if not isinstance(session, dict) or set(session) - {
+                    "type", "instructions", "audio", "output_modalities", "reasoning"}:
                 raise RealtimeTransportError("unsupported realtime session update")
             if session.get("type", "realtime") != "realtime" or session.get("output_modalities", ["audio"]) != ["audio"]:
                 raise RealtimeTransportError("realtime model and modalities cannot change")
@@ -413,7 +441,11 @@ def _client_event(message: dict, provider: str, *, wire: str, voice: str | None 
             if "transcription" in input_audio and (not allow_transcription
                                                     or input_audio["transcription"] != {"model": "gpt-4o-mini-transcribe"}):
                 raise RealtimeTransportError("unsupported realtime transcription")
-            safe = {key: session[key] for key in ("instructions", "audio") if key in session}
+            if "reasoning" in session and (not reasoning_configurable(model) or not isinstance(
+                    session["reasoning"], dict) or set(session["reasoning"]) != {"effort"}
+                    or session["reasoning"]["effort"] not in REASONING_EFFORTS):
+                raise RealtimeTransportError("unsupported realtime reasoning effort")
+            safe = {key: session[key] for key in ("instructions", "audio", "reasoning") if key in session}
             return {"type": "session.update", "session": safe}, 0, False
         if event == "session.close":
             return None, 0, True
@@ -483,11 +515,39 @@ def _native_transcription_events(message: dict) -> tuple[list[dict], int]:
     return [], 0
 
 
+def _native_stream_events(message: dict) -> tuple[list[dict], int]:
+    """Project translation/GPT-Live audio and transcripts; settlement owns session.closed."""
+    event = message.get("type")
+    if event == "error" or "error" in message:
+        return [{"type": "error", "code": "upstream_error", "message": "Realtime provider returned an error"}], 0
+    if event == "session.output_audio.delta":
+        delta, size = _pcm(message.get("delta"))
+        return [{"type": "audio.output.delta", "delta": delta, "sample_rate_hz": 24000}], size
+    target = _NATIVE_STREAM_TRANSCRIPTS.get(event)
+    text = message.get("delta")
+    if target is not None and isinstance(text, str) and len(text) <= _MAX_FRAME_BYTES:
+        return [{"type": target, "delta": text}], 0
+    return [], 0
+
+
+async def _await_live_started(upstream) -> None:
+    """Hold the native session.ready until GPT-Live confirms its session."""
+    async with asyncio.timeout(_LIVE_START_SECONDS):
+        while True:
+            message = _object(await upstream.recv())
+            if message.get("type") == "session.started":
+                return
+            if message.get("type") == "error" or "error" in message:
+                raise RealtimeTransportError("realtime live session did not start")
+
+
 def _provider_events(message: dict, provider: str, *, wire: str,
                      kind: str = "conversation") -> tuple[list[dict], int]:
     if kind != "conversation":
         if wire == "native" and kind == "transcription":
             return _native_transcription_events(message)
+        if wire == "native":
+            return _native_stream_events(message)
         return _kind_provider_events(message)
     events: list[dict] = []
     pcm_bytes = 0
@@ -584,17 +644,22 @@ async def relay_audio(
     token_usage: bool = False,
     session_time: bool = False,
     transcription: dict | None = None,
+    output_language: str | None = None,
+    reasoning_effort: str | None = None,
+    token_hold: tuple[Callable[[UsageBreakdown], Decimal], Decimal] | None = None,
 ) -> AudioMeter:
     """Relay strictly bounded frames and return PCM byte counts; never log or persist audio.
 
     ``token_usage`` sessions additionally meter provider-reported token usage. OpenAI's
     input transcription is a separately billed model whose rates are not frozen, so it is
-    neither configured nor accepted for token-basis sessions.
+    neither configured nor accepted for token-basis sessions. ``token_hold`` pairs the
+    frozen per-response price with the reserved USD: the session stops once confirmed
+    usage plus twice the largest response so far reaches the hold.
 
-    Native transcription and compatible non-conversation kinds use the same admitted
-    upstream setup. ``transcription`` holds pre-validated tuning options, a GPT-Live
-    ``session.start`` carries the admitted model, instructions and voice, and translation
-    waits for the client's language update.
+    Native and compatible non-conversation kinds use the same admitted upstream setup.
+    ``transcription`` holds pre-validated tuning options and a GPT-Live ``session.start``
+    carries the admitted model, instructions and voice. A compatible translation waits
+    for the client's language update; a native one sends the admitted ``output_language``.
     """
     provider = route["provider_type"]
     input_rate = 24000 if provider == "openai" else 16000
@@ -607,13 +672,17 @@ async def relay_audio(
     api_key = await resolve_route_api_key(route)
     url, headers = upstream_connection_spec({**route, "api_key": api_key})
     kind = realtime_kind({**route, "api_key": api_key})
-    if kind != "conversation" and wire != "openai" and not (wire == "native" and kind == "transcription"):
+    if kind != "conversation" and wire not in {"openai", "native"}:
         raise RealtimeTransportError("realtime model requires its compatible wire")
+    if wire == "native" and kind == "translation" and output_language is None:
+        raise RealtimeTransportError("realtime translation language is fixed at admission")
     model = route["api_model_name"]
     incoming = outgoing = 0
     pending_transcriptions = 0
     finished_transcriptions: set[str] = set()
     tokens = TokenUsageMeter(provider) if token_usage else None
+    spent = largest = Decimal(0)
+    hold_reached = False
     loop = asyncio.get_running_loop()
     connected_ns: int | None = None
     hard_close: asyncio.TimerHandle | None = None
@@ -648,8 +717,13 @@ async def relay_audio(
                 await upstream.send(json.dumps(transcription_update(model, transcription)))
             elif kind == "live":
                 await upstream.send(json.dumps(_live_start(model, instructions, voice)))
+                if wire == "native":
+                    await _await_live_started(upstream)
             elif kind == "translation":
-                pass  # The client selects the output language with its own session.update.
+                # A compatible client selects the output language with its own session.update.
+                if wire == "native":
+                    await upstream.send(json.dumps(_translation_update(
+                        {"audio": {"output": {"language": output_language}}})))
             elif provider == "openai":
                 input_config: dict = {"format": {"type": "audio/pcm", "rate": 24000}}
                 if tokens is None:
@@ -659,6 +733,8 @@ async def relay_audio(
                            "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": voice}}}
                 if instructions:
                     session["instructions"] = instructions
+                if reasoning_effort is not None:
+                    session["reasoning"] = {"effort": reasoning_effort}
                 await upstream.send(json.dumps({"type": "session.update", "session": session}))
             else:
                 config = {"responseModalities": ["AUDIO"], "speechConfig": {
@@ -733,7 +809,16 @@ async def relay_audio(
                             break
                         parsed = _object(response)
                         if tokens is not None:
-                            tokens.observe(parsed)
+                            added = tokens.observe(parsed)
+                            if added is not None and token_hold is not None:
+                                price, hold = token_hold
+                                try:
+                                    cost = price(added)
+                                except ValueError:
+                                    cost = hold  # Unpriceable usage: stop now; settlement decides.
+                                spent += cost
+                                largest = max(largest, cost)
+                                hold_reached = spent + 2 * largest >= hold
                         if kind == "transcription" and parsed.get("type") in {
                             "conversation.item.input_audio_transcription.completed",
                             "conversation.item.input_audio_transcription.failed",
@@ -758,6 +843,8 @@ async def relay_audio(
                         if kind in _DRAINED_CLOSE_KINDS and parsed.get("type") == "session.closed":
                             break
                         if kind == "transcription" and closing_until is not None and not pending_transcriptions:
+                            break
+                        if hold_reached:
                             break
                 if tokens is not None and tokens.pending:
                     server, outgoing = await _drain_final_usage(upstream, server, tokens, provider=provider,

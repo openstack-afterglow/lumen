@@ -155,14 +155,16 @@ async def get_chat_capabilities(
         gates = (resolved.get("capabilities") or {}).get("feature_gates") or {}
         kind = realtime_transport.realtime_kind(resolved) if realtime_transport.realtime_route_ready(resolved) else None
         result["realtime_kind"] = kind
-        # Native transcription needs input only; translation/live keep their compatible wires.
+        # Native transcription needs input only; every other kind also speaks audio back.
         if ((gates.get("audio_input") or {}).get("available") is True and (
-                kind == "transcription" or kind == "conversation"
+                kind == "transcription" or kind is not None
                 and (gates.get("audio_output") or {}).get("available") is True)):
             result.update(realtime_transport.available_realtime_options(resolved))
         else:
             result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,
-                          output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0)
+                          output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0,
+                          realtime_session_fields=[], available_reasoning_efforts=[],
+                          default_reasoning_effort=None)
     if model_kind == "embedding":
         from lumen.services.embeddings import embedding_metadata
 

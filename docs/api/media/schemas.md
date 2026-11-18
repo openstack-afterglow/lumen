@@ -91,8 +91,11 @@ Each section lists the fields of one component schema referenced by this group's
 | --- | --- | --- | --- | --- |
 | `model_id` | string | yes | — | Model Id (max 190 chars) |
 | `provider_id` | string \| integer \| null | no | — | Provider Id |
+| `kind` | enum: `conversation`, `transcription`, `translation`, `live` | no | `"conversation"` | Kind |
 | `voice` | string \| null | no | — | Voice |
 | `instructions` | string \| null | no | — | Instructions |
+| `output_language` | string \| null | no | — | Output Language |
+| `reasoning_effort` | enum: `minimal`, `low`, `medium`, `high`, `xhigh` \| null | no | — | Reasoning Effort |
 | `max_duration_seconds` | integer | no | `300` | Max Duration Seconds (numeric lower bound) |
 
 ### SpeechRequest

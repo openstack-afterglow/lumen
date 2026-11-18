@@ -52,6 +52,9 @@ BILLING_BASES = {
     "stt": frozenset({"duration", "tokens"}),
     "realtime": frozenset({"duration", "session", "tokens"}),
 }
+# Token-basis kinds whose transport derives a request-specific Lumen hold, so an explicit
+# reservation_usd is optional; an operator-supplied value still takes precedence.
+DERIVED_HOLD_TOKEN_KINDS = frozenset({"realtime"})
 _DEFAULT_BASIS = {
     "text": "tokens", "image": "unit", "tts": "duration", "stt": "duration",
     "realtime": "duration", "embedding": "tokens", "decision": "tokens",
@@ -170,7 +173,7 @@ def validate_media_pricing(model_kind: str, pricing: dict | None) -> dict | None
             raise ProviderValidationError("reservation_usd는 tokens 과금 기준에서만 사용합니다")
         if Decimal(str(result["reservation_usd"])) <= 0:
             raise ProviderValidationError("reservation_usd는 0보다 커야 합니다")
-    elif basis == "tokens":
+    elif basis == "tokens" and model_kind not in DERIVED_HOLD_TOKEN_KINDS:
         raise ProviderValidationError("tokens 과금 기준에는 양수 reservation_usd가 필요합니다")
     return result or None
 
@@ -313,7 +316,7 @@ def media_pricing_available(
         text_priced = {"input": text_input_priced, "output": text_output_priced}
         return (
             bool(needed)
-            and media_reservation_usd(pricing) is not None
+            and (kind in DERIVED_HOLD_TOKEN_KINDS or media_reservation_usd(pricing) is not None)
             and all(field in rates.get(modality, {}) for modality, field in needed)
             and all(text_priced[direction] for direction in _TOKEN_BASIS_TEXT_DIRECTIONS[kind])
         )

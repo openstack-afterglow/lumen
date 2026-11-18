@@ -225,6 +225,19 @@ def _token_bill(run: ChatRun, snapshot: dict, usage: dict):
 _BILLS = {"duration": _duration_bill, "session": _session_bill, "tokens": _token_bill}
 
 
+def _token_hold(pricing: dict):
+    """In-session guard for token plans: frozen per-response price and the reserved USD."""
+    if pricing.get("billing_basis") != "tokens":
+        return None
+    snapshot = pricing["token_pricing"]
+
+    def price(usage: UsageBreakdown) -> Decimal:
+        return credit.usage_cost_from_pricing_snapshot(snapshot, prompt_tokens=usage.input_tokens,
+            completion_tokens=usage.output_tokens, breakdown=usage, required_modalities=()).raw_cost
+
+    return price, Decimal(pricing["reservation_usd"])
+
+
 def _intent(request: dict, kind: str = "conversation") -> dict:
     intent = {"model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
               "voice": request.get("voice"), "instructions": request.get("instructions"),
@@ -234,6 +247,10 @@ def _intent(request: dict, kind: str = "conversation") -> dict:
         intent["realtime_kind"] = kind
     if request.get("transcription") is not None:
         intent["transcription"] = request["transcription"]
+    if request.get("output_language") is not None:
+        intent["output_language"] = request["output_language"]
+    if request.get("reasoning_effort") is not None:
+        intent["reasoning_effort"] = request["reasoning_effort"]
     return intent
 
 
@@ -276,12 +293,12 @@ async def consume_ticket(run_id: str, token: str) -> tuple[str, str]:
 async def admit_realtime_session(
     request: dict, *, project_id: str, user_id: str, client_request_id: str,
     source: str = "web", api_key_id: int | None = None, provider_type: str | None = None,
-    credential_authority: dict | None = None, kind: str = "conversation",
+    credential_authority: dict | None = None, kind: str = "conversation", wire: str = "native",
 ) -> dict:
     """``provider_type`` is the transport a vendor wire fixes, never the editable public selector.
 
-    ``kind`` is the realtime kind the calling endpoint speaks. Native sessions support
-    conversation and transcription; translation and live retain their compatible endpoints.
+    ``kind`` is the realtime kind the calling endpoint speaks. Native sessions support every
+    kind; translation and live also keep their compatible endpoints.
     """
     from .admission import _intent_with_credential_authority, _lock_run_configurations, existing_run_for_intent
 
@@ -324,12 +341,22 @@ async def admit_realtime_session(
                 raise DurableRunInputError("realtime transcription options are invalid")
         except realtime_transport.RealtimeTransportError as exc:
             raise DurableRunInputError("realtime transcription options are invalid") from exc
+    if "output_language" in intent:
+        from lumen.services.providers.realtime_protocol import translation_language
+
+        try:
+            if kind != "translation" or translation_language(intent["output_language"]) != intent["output_language"]:
+                raise DurableRunInputError("realtime translation language is invalid")
+        except realtime_transport.RealtimeTransportError as exc:
+            raise DurableRunInputError("realtime translation language is invalid") from exc
     voices = realtime_transport.available_realtime_options(route)
     voice = intent["voice"] or voices["default_voice"]
     plan = realtime_transport.validate_realtime_request(route, voice=voice,
-        instructions=intent["instructions"], max_duration_seconds=intent["max_duration_seconds"])
+        instructions=intent["instructions"], max_duration_seconds=intent["max_duration_seconds"],
+        reasoning_effort=intent.get("reasoning_effort"))
     required_scopes = ("compat:realtime:write",) if source == "api" else ("native:realtime:write",)
-    payload = {**intent, "voice": voice, "required_scopes": list(required_scopes)}
+    # The admitting wire is frozen: translation and live sessions run only on it.
+    payload = {**intent, "voice": voice, "required_scopes": list(required_scopes), "wire": wire}
     await credit.precheck(user_id, project_id, api_key_id)
     per_usd = Decimal(str(get_settings().chat_credit_per_usd))
     margin = Decimal(str(route["margin_multiplier"]))
@@ -526,15 +553,18 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
         raise DurableRunProviderResultUnknown("realtime provider changed before connection")
     try:
         current_plan = realtime_transport.validate_realtime_request(route, voice=payload["voice"],
-            instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"])
+            instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"],
+            reasoning_effort=payload.get("reasoning_effort"))
     except ProviderValidationError:
         current_plan = None
     if not _plan_matches(pricing, current_plan):
         await _finish(run_id, status="failed", message_id=None, owner=owner,
                       error_code="provider_result_unknown", safe_message="realtime price changed before connection")
         raise DurableRunProviderResultUnknown("realtime price changed before connection")
-    if pricing.get("realtime_kind", "conversation") not in {"conversation", "transcription"} and wire != "openai":
-        # Translation and live retain their own compatible wire.
+    kind = pricing.get("realtime_kind", "conversation")
+    if kind in {"translation", "live"} and payload.get("wire") != wire or (
+            wire == "native" and kind == "translation" and payload.get("output_language") is None):
+        # Translation and live run only on the wire that admitted them, with its frozen setup.
         await _finish(run_id, status="failed", message_id=None, owner=owner,
                       error_code="provider_result_unknown", safe_message="realtime model requires its compatible wire")
         raise DurableRunInputError("realtime model requires its compatible wire")
@@ -562,7 +592,9 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
             instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"],
             wire=wire, is_canceled=is_canceled, token_usage=pricing.get("billing_basis", "duration") == "tokens",
             session_time=pricing.get("billing_basis", "duration") == "session",
-            transcription=payload.get("transcription"))
+            transcription=payload.get("transcription"), output_language=payload.get("output_language"),
+            reasoning_effort=payload.get("reasoning_effort"),
+            token_hold=_token_hold(pricing))
         summary = await _settle(run_id, owner=owner, meter=meter)
         await _finish(run_id, status="canceled" if await is_canceled() else "completed", message_id=None, owner=owner)
         if wire == "native":

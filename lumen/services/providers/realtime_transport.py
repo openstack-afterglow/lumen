@@ -4,7 +4,8 @@ Realtime voice sessions connect directly to canonical upstream WebSocket endpoin
 using configured API keys only. Subscription auth and custom proxies are rejected.
 The explicit billing plan (separate PCM input/output duration rates, provider-connected
 session time, or token rates plus a funding envelope) is frozen at session admission
-and re-validated before connection.
+and re-validated before connection. OpenAI token-basis conversation models without a
+configured envelope get a Lumen-owned hold derived from the admitted duration.
 
 OpenAI realtime-family models have one fixed *kind* each: ``conversation`` (GA
 Realtime speech-to-speech), ``transcription`` (transcription-only sessions),
@@ -14,7 +15,7 @@ has its own upstream endpoint, client event contract and permitted billing basis
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from urllib.parse import quote
 
 from .audio_transport import _GEMINI_VOICES, _OPENAI_VOICES
@@ -25,7 +26,10 @@ from .pricing import exact_duration_price, frozen_token_pricing, media_billing_b
 # Model -> realtime kind. Every other OpenAI model is not a direct realtime route.
 _OPENAI_REALTIME_KINDS = {
     "gpt-realtime": "conversation",
+    # Dated snapshots resolve the same catalog entry through its declared alias.
+    "gpt-realtime-2025-08-28": "conversation",
     "gpt-realtime-mini": "conversation",
+    "gpt-realtime-mini-2025-12-15": "conversation",
     "gpt-realtime-1.5": "conversation",
     "gpt-realtime-2": "conversation",
     "gpt-realtime-2.1": "conversation",
@@ -64,6 +68,33 @@ _KIND_BASES: dict[str, dict[str, tuple[str, ...]]] = {
     "translation": {"duration": ("realtime_input",)},
     "live": {"session": ("realtime_session",)},
 }
+# Extra native session request fields each kind accepts (beyond model, provider, kind, duration).
+_SESSION_FIELDS = {
+    "conversation": ["voice", "instructions"],
+    "transcription": [],
+    "translation": ["output_language"],
+    "live": ["voice", "instructions"],
+}
+# OpenAI conversation models whose published contract makes reasoning effort configurable.
+# Reasoning tokens settle as reported output usage; the session default is "low".
+REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+_CONFIGURABLE_REASONING_MODELS = frozenset({"gpt-realtime-2", "gpt-realtime-2.1"})
+
+
+def reasoning_configurable(model: object) -> bool:
+    return model in _CONFIGURABLE_REASONING_MODELS
+
+
+# Lumen-owned token-basis hold for OpenAI conversation models without a configured
+# reservation_usd. OpenAI documents realtime audio as 1 token per 100 ms of user audio
+# and 1 token per 50 ms of assistant audio. Each admitted second reserves the user-audio
+# tokens re-read as uncached input by up to 10 later responses, plus the assistant-audio
+# tokens and 10 transcript text tokens of output, each at the model's highest frozen rate
+# in that direction. The relay ends a session before confirmed usage can exhaust it.
+_HOLD_INPUT_TOKENS_PER_SECOND = 10 * 10
+_HOLD_OUTPUT_TOKENS_PER_SECOND = 20 + 10
+_USD_QUANTUM = Decimal("0.0000000001")
+_PER_MILLION = Decimal(1_000_000)
 
 
 class RealtimeTransportError(RuntimeError):
@@ -115,8 +146,21 @@ def _checked_rate(value: Decimal | None) -> Decimal:
     return value
 
 
-def _billing_plan(route: dict) -> dict:
+def _derived_token_hold(token_pricing: dict, max_duration_seconds: int) -> Decimal:
+    """The duration-proportional hold described at ``_HOLD_INPUT_TOKENS_PER_SECOND``."""
+    inputs = [Decimal(token_pricing["input_price_per_token"])]
+    outputs = [Decimal(token_pricing["output_price_per_token"])]
+    for rates in (token_pricing.get("token_rates") or {}).values():
+        for field, bucket in (("input_per_million", inputs), ("output_per_million", outputs)):
+            if field in rates:
+                bucket.append(Decimal(rates[field]) / _PER_MILLION)
+    per_second = _HOLD_INPUT_TOKENS_PER_SECOND * max(inputs) + _HOLD_OUTPUT_TOKENS_PER_SECOND * max(outputs)
+    return (per_second * max_duration_seconds).quantize(_USD_QUANTUM, rounding=ROUND_CEILING)
+
+
+def _billing_plan(route: dict, max_duration_seconds: int) -> dict:
     """Freeze exactly one billing basis; never mix duration, session and token rates."""
+    provider, _ = _model(route)
     kind = realtime_kind(route)
     pricing = route.get("media_pricing")
     try:
@@ -151,8 +195,6 @@ def _billing_plan(route: dict) -> dict:
         token_pricing = frozen_token_pricing(route)
     except (ProviderValidationError, ValueError) as exc:
         raise ProviderValidationError("exact configured realtime token price is unavailable") from exc
-    if envelope is None or envelope <= 0 or envelope >= Decimal("100000000"):
-        raise ProviderValidationError("realtime token billing requires a positive reservation_usd")
     audio = (token_pricing.get("token_rates") or {}).get("audio") or {}
     # Realtime needs both text and audio directions, including explicit free rates.
     # Cache policy belongs to the shared calculator: optional modality cache uses its
@@ -161,7 +203,15 @@ def _billing_plan(route: dict) -> dict:
             "input_price_per_token", "output_price_per_token"))
             or any(audio.get(key) is None for key in ("input_per_million", "output_per_million"))):
         raise ProviderValidationError("exact configured realtime token price is unavailable")
-    return {"billing_basis": "tokens", "reservation_usd": format(envelope, "f"), "token_pricing": token_pricing}
+    plan: dict = {"billing_basis": "tokens", "token_pricing": token_pricing}
+    if envelope is None and provider == "openai":
+        # A configured reservation keeps precedence; only OpenAI documents the audio token
+        # rate the derived hold relies on.
+        envelope = _derived_token_hold(token_pricing, max_duration_seconds)
+        plan["reservation_source"] = "duration_policy"
+    if envelope is None or envelope <= 0 or envelope >= Decimal("100000000"):
+        raise ProviderValidationError("realtime token billing requires a positive reservation_usd")
+    return {**plan, "reservation_usd": format(envelope, "f")}
 
 
 def validate_realtime_request(
@@ -170,23 +220,27 @@ def validate_realtime_request(
     voice: str | None = None,
     instructions: str | None = None,
     max_duration_seconds: int = _DEFAULT_MAX_DURATION_SECONDS,
+    reasoning_effort: str | None = None,
 ) -> dict:
     """Return the JSON-serializable billing plan to freeze before any provider I/O."""
-    provider, _ = _model(route)
+    provider, model = _model(route)
     kind = realtime_kind(route)
     if type(max_duration_seconds) is not int or not _MIN_DURATION_SECONDS <= max_duration_seconds <= _MAX_DURATION_SECONDS:
         raise ProviderValidationError("unsupported realtime session duration")
     if instructions is not None and (not isinstance(instructions, str) or len(instructions) > _MAX_INSTRUCTIONS_CHARS):
         raise ProviderValidationError("realtime instructions are invalid or too long")
+    if reasoning_effort is not None and (
+            provider != "openai" or not reasoning_configurable(model) or reasoning_effort not in REASONING_EFFORTS):
+        raise ProviderValidationError("unsupported realtime reasoning effort")
     if kind in {"transcription", "translation"}:
         # No speech output and no system prompt: nothing else may be frozen at admission.
         if voice is not None or instructions is not None:
             raise ProviderValidationError(f"realtime {kind} sessions accept no voice or instructions")
-        return _billing_plan(route)
+        return _billing_plan(route, max_duration_seconds)
     allowed_voices = _LIVE_VOICES if kind == "live" else _OPENAI_VOICES if provider == "openai" else _GEMINI_VOICES
     if voice is not None and (not isinstance(voice, str) or voice not in allowed_voices):
         raise ProviderValidationError("unsupported realtime voice")
-    return _billing_plan(route)
+    return _billing_plan(route, max_duration_seconds)
 
 
 def realtime_route_ready(route: dict) -> bool:
@@ -201,12 +255,12 @@ def realtime_route_ready(route: dict) -> bool:
 
 
 def available_realtime_options(route: dict) -> dict[str, object]:
-    """Return executable voices, PCM16 sample rates and duration bounds for a ready route.
+    """Return executable voices, PCM16 sample rates, duration bounds and session fields.
 
     Transcription and translation sessions have no selectable voice; transcription
-    produces no audio output at all.
+    produces no audio output at all. Reasoning effort is advertised only where configurable.
     """
-    provider, _ = _model(route)
+    provider, model = _model(route)
     validate_realtime_request(route)
     kind = realtime_kind(route)
     if kind == "live":
@@ -216,6 +270,7 @@ def available_realtime_options(route: dict) -> dict[str, object]:
     else:
         voices = sorted(_GEMINI_VOICES if provider == "gemini" else _OPENAI_VOICES)
         default = "Kore" if provider == "gemini" else "alloy"
+    reasoning = provider == "openai" and reasoning_configurable(model)
     return {
         "realtime_kind": kind,
         "available_voices": voices,
@@ -224,6 +279,9 @@ def available_realtime_options(route: dict) -> dict[str, object]:
         "output_sample_rate_hz": 0 if kind == "transcription" else 24000,
         "max_duration_seconds": _MAX_DURATION_SECONDS,
         "default_duration_seconds": _DEFAULT_MAX_DURATION_SECONDS,
+        "realtime_session_fields": [*_SESSION_FIELDS[kind], *(["reasoning_effort"] if reasoning else [])],
+        "available_reasoning_efforts": list(REASONING_EFFORTS) if reasoning else [],
+        "default_reasoning_effort": "low" if reasoning else None,
     }
 
 
