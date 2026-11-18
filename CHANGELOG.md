@@ -8,6 +8,8 @@
 - **English — Domain MCP ownership CHECK:** Migration 035 and the ORM add `ck_chat_mcp_servers_domain_owner`, rejecting inserts and updates of domain-scoped rows with a NULL owner domain at the database boundary. Personal/global nullable ownership stays unchanged. Existing violations fail migration without rewriting data. Precheck, drain writers and back up, then apply 035 before starting new writers.
 - **한국어 — Gemini 이미지 단가:** 공식 가격을 재확인하고 Gemini 2.5 Flash Image의 누락된 정확한 size:quality 단가를 추가한다. 지원하는 네 크기와 `quality=auto`, `n=1`은 모두 이미지당 $0.039다(1,290 출력 토큰 × $30/1M). 관리자 수동 단가 우선순위·다른 모델 가격·전송 검증은 바꾸지 않으며 실제 공급자 생성 성공을 주장하지 않는다.
 - **English — Gemini image pricing:** Recheck official pricing and add the missing exact size:quality rates for Gemini 2.5 Flash Image. All four supported sizes with quality auto and n=1 cost $0.039 per image (1,290 output tokens × $30/1M). Preserve administrator-rate precedence, other model prices and transport validation; this does not claim a live provider generation succeeded.
+- **한국어 — Kubernetes LIST 타입:** 실제 API가 목록 항목의 `apiVersion`·`kind`를 생략할 때 enclosing typed List에서 누락 필드만 복원한다. 기존 sandbox의 소유 정책·Service가 있어도 다음 생성의 preflight와 Pod 재조정이 타입 불일치로 실패하지 않는다. 명시된 잘못된 타입·소유권·UID·명세는 계속 거부하며 삭제 경계도 유지한다.
+- **English — Kubernetes LIST types:** Restore only absent item `apiVersion`/`kind` from the enclosing typed List, matching real Kubernetes serialization. Existing owned sandbox policies and Services no longer cause the next create's preflight or Pod reconciliation to fail on missing types. Explicit wrong types, ownership, UID and specification drift still fail closed; deletion fences remain unchanged.
 
 ## 0.6.17 — 2026-11-18 (published and deployed; OpenAI paid paths unverified)
 

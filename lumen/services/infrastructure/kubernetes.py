@@ -294,6 +294,14 @@ class KubernetesProvider:
             items = page.get("items")
             if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
                 raise RuntimeError("Kubernetes list response invalid")
+            api_version, list_kind = page.get("apiVersion"), page.get("kind")
+            if (not isinstance(api_version, str) or not api_version
+                    or not isinstance(list_kind, str) or not list_kind.endswith("List") or len(list_kind) <= 4):
+                raise RuntimeError("Kubernetes list resource type invalid")
+            # Kubernetes LIST items omit TypeMeta; inherit only absent fields, never mask explicit type drift.
+            for item in items:
+                item.setdefault("apiVersion", api_version)
+                item.setdefault("kind", list_kind[:-4])
             result.extend(items)
             if len(result) > 12800:
                 raise RuntimeError("Kubernetes list exceeded finite inventory bound")

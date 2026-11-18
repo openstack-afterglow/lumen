@@ -25,6 +25,8 @@ Protocol-v2 cloud bindings consume the bridge's JSON preview and require human a
 
 The selected sandbox path uses `features.tool_policy.enabled_sandbox_tools` (default `[]`) rather than implicit bindings from every configured manifest. Admission freezes approved names and pool/image/manifest identity before resource holds or provider I/O. A selected run waits for the existing controller-owned resource, reuses that Pod, and releases it through the durable terminal/cancel/expiry lifecycle. Empty selection and history browsing create no resource. Pod disappearance does not prove full resource deletion: exact owned Service/Secret/NetworkPolicy absence must also be confirmed before occupancy is released.
 
+All Kubernetes collection consumers share bounded, paginated `_list` normalization: only absent item `apiVersion` and `kind` inherit from the enclosing typed List. Present fields remain authoritative and must match the expected resource type. Preflight inventories policies/Services and reconciliation inventories Pods through this path; auxiliary cleanup still uses exact-name GET and UID-bound deletion, never a broad Secret sweep. Existing owned objects therefore do not prevent a second resource admission solely because Kubernetes omits per-item TypeMeta.
+
 Selected sandboxes have their own `resource.deadline_at`, separate from the run's wall-clock deadline. A budgeted root reserves at most `min(300 s, ceiling/2, pool lifetime, wall time)` so children keep budget. On expiry the controller deletes the Pod with a fenced intent. Only never-started runs (`lease_fence == 0`) fail, and later sandbox calls or new delegations return `sandbox_expired` without reallocation. An already-settled delegation group still replays its joined child results. Code-mode runs with a sandbox-tool selection are refused with 422 `sandbox_code_combination_unsupported` before any hold or provider I/O.
 
 `lumen/services/native_catalog.py` strictly validates the bundled `native_model_catalog.json` for official OpenAI, Anthropic, Gemini and Perplexity routes. Developers update it manually from official pages (procedure in docs). Compatible OpenAI/Anthropic custom endpoints use only administrator model IDs, prices and capability overrides. Stored rates override catalog token and media rates; explicit capability overrides override catalog observations, with conservative defaults otherwise. Admission freezes the effective base, cache and context tiers and the per-model threshold. Legacy `_above_200k` fields remain storage slots, and old snapshots keep their 200000 default. Native discovery annotates authoritative live IDs; subscription modes read the bundled list. Historical models.dev SQL columns stay nullable and are no longer mapped.
@@ -588,9 +590,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c6d1a4e0c445e28d7c440938a76dace5b3ad414ad2785627c72c445b85e030df",
-  "reviewed_at": "2026-11-18T03:18:24Z",
-  "summary": "Review 0.6.18 package/runtime/lock/Kolla defaults; immutable 035 CHECK, ORM/snapshot and real-SQL regression/ledger coverage; Gemini 2.5 Flash Image official unit-price variants and catalog validation; schema-first rollout and manual catalog procedure; SDK/plugin/sandbox versions unchanged"
+  "source_sha256": "812e4af872e8f1b2b96464895046353965122ab288c15b6d3f282a9ec15333db",
+  "reviewed_at": "2026-11-18T03:29:29Z",
+  "summary": "Review Kubernetes paginated LIST TypeMeta inheritance with setdefault only, real-shaped API fixture, second create/preflight plus Pod/Secret listings and UID cleanup, explicit wrong/null type and invalid List refusal; no system test exercises Kubernetes provider; 0.6.18 changelog updated"
 }
 ```
 <!-- architecture-review:end -->
