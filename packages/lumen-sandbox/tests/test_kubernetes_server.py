@@ -5,6 +5,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import signal
 import sys
@@ -72,16 +73,23 @@ def fake_mcp_server(tmp_path: Path):
     requests_path = tmp_path / "requests.jsonl"
     result_path = tmp_path / "result.json"
     script.write_text('''import json
+import os
 import sys
+import signal
+import subprocess
+import time
 
 advertised = json.loads(sys.argv[1])
+behavior = json.loads(sys.argv[4])
 with open(sys.argv[3]) as source:
     fixed_result = json.load(source)
 for line in sys.stdin:
     request = json.loads(line)
     with open(sys.argv[2], "a") as log:
         log.write(json.dumps(request) + "\\n")
-    method = request["method"]
+    method = request.get("method")
+    if method is None:
+        continue
     if method == "notifications/initialized":
         continue
     if method == "initialize":
@@ -98,14 +106,79 @@ for line in sys.stdin:
         result = fixed_result if fixed_result is not None else {"content": [{"type": "text", "text": request["params"]["name"]}]}
     else:
         raise ValueError(method)
+    fault = behavior.get(method)
+    delay = behavior.get(method + ":delay", 0)
+    if delay:
+        time.sleep(delay)
+    if fault in {"ignore_term_once", "orphan_stderr_once"}:
+        with open(sys.argv[2]) as log:
+            calls = sum(json.loads(row).get("method") == "tools/call" for row in log)
+        if calls == 1:
+            if fault == "ignore_term_once":
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            else:
+                ready_file = sys.argv[2] + ".child"
+                child = "import pathlib,signal,sys,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);pathlib.Path(sys.argv[1]).touch();time.sleep(10)"
+                subprocess.Popen([sys.executable, "-c", child, ready_file],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                deadline = time.monotonic() + 2
+                while not os.path.exists(ready_file):
+                    assert time.monotonic() < deadline
+                    time.sleep(0.001)
+            time.sleep(10)
+    if fault in {"notification", "mixed", "slow_notifications", "notification_flood"}:
+        count = 129 if fault in {"slow_notifications", "notification_flood"} else 1
+        for _ in range(count):
+            print(json.dumps({"jsonrpc": "2.0", "method": "private-notification-" + "x" * 100,
+                              "params": {"secret": "PRIVATE_NOTIFICATION"}}), flush=True)
+            if fault == "slow_notifications":
+                time.sleep(0.03)
+    if fault in {"server_request", "mixed"}:
+        print(json.dumps({"jsonrpc": "2.0", "id": "server-request-id", "method": "private-server-method",
+                          "params": {"secret": "PRIVATE_SERVER_REQUEST"}}), flush=True)
+        response = json.loads(next(sys.stdin))
+        with open(sys.argv[2], "a") as log:
+            log.write(json.dumps(response) + "\\n")
+        assert response == {"jsonrpc": "2.0", "id": "server-request-id",
+                            "error": {"code": -32601, "message": "Method not found"}}
+    if fault == "stderr_flood":
+        sys.stderr.write("PRIVATE_STDERR" * 200_000)
+        sys.stderr.flush()
+    if fault == "invalid_json":
+        print("PRIVATE_INVALID_JSON", flush=True)
+        continue
+    if fault == "nonobject":
+        print("[]", flush=True)
+        continue
+    if fault == "oversized":
+        print("x" * (8 * 1024 * 1024 + 1), flush=True)
+        continue
+    if fault in {"missing_result", "both_result_error", "wrong_id", "bad_version", "nonobject_result", "rpc_error"}:
+        frame = {"jsonrpc": "2.0", "id": request["id"], "result": result}
+        if fault == "missing_result":
+            del frame["result"]
+        elif fault == "both_result_error":
+            frame["error"] = {"code": -1, "message": "PRIVATE_ERROR"}
+        elif fault == "wrong_id":
+            frame["id"] += 1
+        elif fault == "bad_version":
+            frame["jsonrpc"] = "1.0"
+        elif fault == "nonobject_result":
+            frame["result"] = None
+        elif fault == "rpc_error":
+            del frame["result"]
+            frame["error"] = {"code": -1, "message": "PRIVATE_ERROR"}
+        print(json.dumps(frame), flush=True)
+        continue
     print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
 ''')
 
-    def make_server(advertised: list[str], result=None):
+    def make_server(advertised: list[str], result=None, behavior=None):
         result_path.write_text(json.dumps(result))
         profile = replace(
             profiles["playwright"],
-            command=(sys.executable, str(script), json.dumps(advertised), str(requests_path), str(result_path)),
+            command=(sys.executable, str(script), json.dumps(advertised), str(requests_path), str(result_path),
+                     json.dumps(behavior or {})),
         )
         return SimpleNamespace(profile=profile, requests_path=requests_path)
 
@@ -168,6 +241,209 @@ def test_mcp_process_missing_approved_tools_fails_and_terminates(tmp_path, fake_
             process.kill()
             if process.proc is not None:
                 await asyncio.wait_for(process.proc.wait(), timeout=5)
+
+    asyncio.run(exercise())
+
+
+def test_mcp_correlates_all_exchanges_and_logs_only_metadata(tmp_path, fake_mcp_server, caplog):
+    caplog.set_level(logging.INFO, logger="lumen_sandbox_kubernetes")
+    methods = ("initialize", "tools/list", "tools/call")
+    expected = {"content": [{"type": "text", "text": "PRIVATE_RESULT"}]}
+    server = fake_mcp_server(["browser_navigate", "browser_snapshot"], expected,
+                             behavior=dict.fromkeys(methods, "mixed"))
+
+    async def exercise():
+        process = McpProcess(server.profile, tmp_path / "work")
+        try:
+            assert await process.call_tool("browser_navigate", {"url": "PRIVATE_ARGUMENT"}, timeout=5) == expected
+            requests = [json.loads(line) for line in server.requests_path.read_text().splitlines()]
+            answers = [row for row in requests if row.get("id") == "server-request-id"]
+            assert len(answers) == 3
+            assert all(row["error"]["code"] == -32601 for row in answers)
+        finally:
+            process.kill()
+            await asyncio.wait_for(process.proc.wait(), timeout=5)
+            await asyncio.wait_for(process._stderr_task, timeout=5)
+
+    asyncio.run(exercise())
+    logs = [record.getMessage() for record in caplog.records if record.name == "lumen_sandbox_kubernetes"]
+    assert len(logs) == 3
+    for identity, (method, message) in enumerate(zip(methods, logs, strict=True), 1):
+        assert f"profile=playwright method={method} request_id={identity}" in message
+        assert "notifications=1 server_requests=1 outcome=matched elapsed_ms=" in message
+    assert "PRIVATE_" not in caplog.text
+    assert "private-notification" not in caplog.text
+    assert "private-server-method" not in caplog.text
+    assert "browser_navigate" not in caplog.text
+
+
+@pytest.mark.parametrize("method", ["initialize", "tools/list", "tools/call"])
+@pytest.mark.parametrize("fault", [
+    "wrong_id", "bad_version", "invalid_json", "nonobject", "missing_result", "both_result_error", "nonobject_result",
+])
+def test_mcp_invalid_response_kills_subprocess(tmp_path, fake_mcp_server, caplog, method, fault):
+    caplog.set_level(logging.INFO, logger="lumen_sandbox_kubernetes")
+    server = fake_mcp_server(["browser_navigate", "browser_snapshot"], behavior={method: fault})
+
+    async def exercise():
+        process = McpProcess(server.profile, tmp_path / "work")
+        try:
+            with pytest.raises(RuntimeError, match="MCP"):
+                await process.call_tool("browser_navigate", {"secret": "PRIVATE_ARGUMENT"}, timeout=5)
+            assert await asyncio.wait_for(process.proc.wait(), timeout=5) == -signal.SIGTERM
+            await asyncio.wait_for(process._stderr_task, timeout=5)
+        finally:
+            process.kill()
+            await asyncio.wait_for(process.proc.wait(), timeout=5)
+
+    asyncio.run(exercise())
+    logs = [record.getMessage() for record in caplog.records if record.name == "lumen_sandbox_kubernetes"]
+    assert len(logs) == ("initialize", "tools/list", "tools/call").index(method) + 1
+    assert "outcome=protocol_error" in logs[-1]
+    assert "PRIVATE_" not in caplog.text
+
+
+@pytest.mark.parametrize("fault,error", [
+    ("slow_notifications", TimeoutError), ("notification_flood", RuntimeError), ("oversized", ValueError),
+])
+def test_mcp_bounds_whole_exchange_and_skipped_frames(tmp_path, fake_mcp_server, caplog, fault, error):
+    caplog.set_level(logging.INFO, logger="lumen_sandbox_kubernetes")
+    server = fake_mcp_server(["browser_navigate", "browser_snapshot"], behavior={"tools/call": fault})
+
+    async def exercise():
+        process = McpProcess(server.profile, tmp_path / "work")
+        try:
+            await process.start()
+            started = time.monotonic()
+            with pytest.raises(error):
+                await process.call_tool("browser_navigate", {}, timeout=0.12 if fault == "slow_notifications" else 5)
+            if fault == "slow_notifications":
+                assert time.monotonic() - started < 1
+            assert await asyncio.wait_for(process.proc.wait(), timeout=5) == -signal.SIGTERM
+            await asyncio.wait_for(process._stderr_task, timeout=5)
+        finally:
+            process.kill()
+            await asyncio.wait_for(process.proc.wait(), timeout=5)
+
+    asyncio.run(exercise())
+    logs = [record.getMessage() for record in caplog.records if record.name == "lumen_sandbox_kubernetes"]
+    assert len(logs) == 3
+    assert f"outcome={'timeout' if fault == 'slow_notifications' else 'protocol_error'}" in logs[-1]
+    assert "PRIVATE_" not in caplog.text
+
+
+def test_mcp_drains_stderr_without_blocking_stdout_or_logging_contents(tmp_path, fake_mcp_server, caplog):
+    caplog.set_level(logging.INFO, logger="lumen_sandbox_kubernetes")
+    server = fake_mcp_server(["browser_navigate", "browser_snapshot"], behavior={"initialize": "stderr_flood"})
+
+    async def exercise():
+        process = McpProcess(server.profile, tmp_path / "work")
+        try:
+            result = await process.call_tool("browser_snapshot", {}, timeout=5)
+            assert result["content"][0]["text"] == "browser_snapshot"
+        finally:
+            process.kill()
+            await asyncio.wait_for(process.proc.wait(), timeout=5)
+            await asyncio.wait_for(process._stderr_task, timeout=5)
+
+    asyncio.run(exercise())
+    assert "PRIVATE_STDERR" not in caplog.text
+
+
+def test_mcp_matching_error_is_not_empty_success(tmp_path, fake_mcp_server, caplog):
+    caplog.set_level(logging.INFO, logger="lumen_sandbox_kubernetes")
+    server = fake_mcp_server(["browser_navigate", "browser_snapshot"], behavior={"tools/call": "rpc_error"})
+
+    async def exercise():
+        process = McpProcess(server.profile, tmp_path / "work")
+        try:
+            result = await process.call_tool("browser_navigate", {}, timeout=5)
+            assert result["isError"] is True
+            assert "PRIVATE_ERROR" in result["content"][0]["text"]
+        finally:
+            process.kill()
+            await asyncio.wait_for(process.proc.wait(), timeout=5)
+            await asyncio.wait_for(process._stderr_task, timeout=5)
+
+    asyncio.run(exercise())
+    assert "PRIVATE_ERROR" not in caplog.text
+
+
+@pytest.mark.parametrize("startup,init_delay,list_delay,succeeds", [
+    (0.6, 0.15, 0, True),  # Scaled 60-second startup accepts initialization slower than the former 10-second bound.
+    (0.12, 0.25, 0, False),
+    (0.18, 0.11, 0.11, False),  # One startup deadline, not a fresh budget for tools/list.
+])
+def test_mcp_single_startup_deadline(tmp_path, fake_mcp_server, monkeypatch, startup, init_delay, list_delay, succeeds):
+    from lumen_sandbox import kubernetes_server
+
+    monkeypatch.setattr(kubernetes_server, "_MCP_STARTUP_TIMEOUT_SECONDS", startup)
+    server = fake_mcp_server(["browser_navigate", "browser_snapshot"], behavior={
+        "initialize:delay": init_delay, "tools/list:delay": list_delay,
+    })
+
+    async def exercise():
+        process = McpProcess(server.profile, tmp_path / "work")
+        try:
+            if succeeds:
+                await process.start()
+                assert (await process.call_tool("browser_navigate", {}, timeout=0.1))["content"]
+            else:
+                with pytest.raises(TimeoutError):
+                    await process.start()
+                assert await asyncio.wait_for(process.proc.wait(), timeout=5) == -signal.SIGTERM
+        finally:
+            process.kill()
+            await asyncio.wait_for(process.proc.wait(), timeout=5)
+            await asyncio.wait_for(process._stderr_task, timeout=5)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_mcp_startup_never_extends_tool_budget(tmp_path, fake_mcp_server, monkeypatch, warm):
+    from lumen_sandbox import kubernetes_server
+
+    monkeypatch.setattr(kubernetes_server, "_MCP_STARTUP_TIMEOUT_SECONDS", 0.6)
+    server = fake_mcp_server(["browser_navigate", "browser_snapshot"], behavior={
+        "initialize:delay": 0.15, "tools/call:delay": 0.15,
+    })
+
+    async def exercise():
+        process = McpProcess(server.profile, tmp_path / "work")
+        try:
+            if warm:
+                await process.start()
+            with pytest.raises(TimeoutError):
+                await process.call_tool("browser_navigate", {}, timeout=0.08 if warm else 0.24)
+            assert await asyncio.wait_for(process.proc.wait(), timeout=5) == -signal.SIGTERM
+        finally:
+            process.kill()
+            await asyncio.wait_for(process.proc.wait(), timeout=5)
+            await asyncio.wait_for(process._stderr_task, timeout=5)
+
+    asyncio.run(exercise())
+
+
+def test_mcp_timed_out_process_is_fenced_before_next_call(tmp_path, fake_mcp_server):
+    server = fake_mcp_server(["browser_navigate", "browser_snapshot"], behavior={"tools/call": "ignore_term_once"})
+
+    async def exercise():
+        process = McpProcess(server.profile, tmp_path / "work")
+        try:
+            await process.start()
+            old = process.proc
+            with pytest.raises(TimeoutError):
+                await process.call_tool("browser_navigate", {}, timeout=0.1)
+            assert old.returncode is None  # The test subprocess deliberately ignores SIGTERM.
+            result = await process.call_tool("browser_snapshot", {}, timeout=5)
+            assert result["content"][0]["text"] == "browser_snapshot"
+            assert process.proc.pid != old.pid
+            assert old.returncode == -signal.SIGKILL
+        finally:
+            process.kill()
+            await asyncio.wait_for(process.proc.wait(), timeout=5)
+            await asyncio.wait_for(process._stderr_task, timeout=5)
 
     asyncio.run(exercise())
 
@@ -510,6 +786,58 @@ def test_mcp_execution_replay_and_polling(sandbox_fixture, monkeypatch):
     assert replay_resp.status_code == 200
     assert replay_resp.json()["id"] == eid
     assert replay_resp.json()["mcp_result"] == mock_result
+
+
+def test_mcp_restart_with_inherited_stderr_keeps_http_journal_terminal(sandbox_fixture, fake_mcp_server, monkeypatch):
+    f = sandbox_fixture
+    server = fake_mcp_server(["browser_navigate", "browser_snapshot"], behavior={"tools/call": "orphan_stderr_once"})
+    f.config.profiles["playwright"] = server.profile
+    processes = []
+    original_start = McpProcess.start
+
+    async def track_start(process):
+        await original_start(process)
+        processes.append((process.proc, process._stderr_task))
+
+    monkeypatch.setattr(McpProcess, "start", track_start)
+
+    def execute(client, call_id, timeout, revision):
+        body = {"run_id": f.config.run_id, "call_id": call_id, "fence": 1,
+                "profile": "playwright", "tool": "browser_navigate", "arguments": {},
+                "timeout_seconds": timeout, "workspace_revision": revision}
+        response = client.post("/v1/mcp/executions", json=body, headers={
+            "Authorization": auth_header(f.config, "POST", "/v1/mcp/executions", body),
+        })
+        assert response.status_code == 202
+        path = "/v1/executions/" + response.json()["id"]
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            result = client.get(path, headers={"Authorization": auth_header(f.config, "GET", path)})
+            assert result.status_code == 200
+            if result.json()["state"] not in {"reserved", "running"}:
+                return result.json()
+            time.sleep(0.01)
+        pytest.fail("MCP execution journal remained nonterminal")
+
+    try:
+        with TestClient(create_kubernetes_app(f.config)) as client:
+            assert execute(client, "orphan-first", 1, 0)["state"] == "timeout"
+            old, drain = processes[0]
+            deadline = time.monotonic() + 1
+            while old.returncode is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert old.returncode == -signal.SIGTERM
+            assert not drain.done()  # A SIGTERM-ignoring descendant still holds the inherited stderr pipe.
+            assert execute(client, "fresh-second", 5, 1)["state"] == "succeeded"
+            assert len(processes) == 2 and processes[1][0].pid != old.pid
+            assert execute(client, "fresh-third", 5, 2)["state"] == "succeeded"
+            assert len(processes) == 2
+    finally:
+        for process, _ in processes:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):  # macOS reports EPERM for an all-zombie group.
+                pass
 
 
 def test_workspace_revision_survives_tools_and_daemon_resume(sandbox_fixture, fake_mcp_server):

@@ -11,6 +11,8 @@ import pytest
 from lumen.services import provider_metadata as metadata
 from lumen.services.capabilities import normalize_capabilities, provider_capabilities
 from lumen.services.native_catalog import native_catalog, validate_catalog
+from lumen.services.providers import image_transport
+from lumen.services.providers.errors import ProviderValidationError
 from lumen.services.providers.pricing import (
     _effective_capabilities,
     _effective_media_pricing,
@@ -458,3 +460,52 @@ def test_subscription_catalog_capabilities_do_not_enable_api_pricing(catalog):
     assert caps["vision"] is True
     assert caps["function_calling"] is True
     assert caps["output_budget_enforced"] is False
+
+
+def test_unit_priced_catalog_images_cover_every_supported_preset():
+    unit_images = []
+    sizes = tuple(image_transport._SIZES)
+    qualities = ("auto", "low", "medium", "high", "xhigh", "max", "1k", "2k", "4k")
+    for provider, block in native_catalog()["providers"].items():
+        for entry in block["models"]:
+            pricing = entry.get("media_pricing") or {}
+            if entry["kind"] != "image" or pricing.get("billing_basis") != "unit":
+                continue
+            unit_images.append((provider, entry["id"]))
+            route = {
+                "model_kind": "image", "provider_type": provider, "api_model_name": entry["id"],
+                "api_base": None, "provider_auth": None, "api_key": "synthetic-key", "media_pricing": pricing,
+            }
+            # Probe all transport-supported presets independently of the catalog's existing variant keys.
+            probe = {**route, "media_pricing": {"image_variants": {
+                f"{size}:{quality}": "1" for size in sizes for quality in qualities
+            }}}
+            accepted = set()
+            for size in sizes:
+                for quality in qualities:
+                    try:
+                        image_transport.validate_image_request(probe, size=size, quality=quality, n=1, edit=False)
+                    except ProviderValidationError:
+                        continue
+                    accepted.add(f"{size}:{quality}")
+                    assert image_transport.validate_image_request(
+                        route, size=size, quality=quality, n=1, edit=False,
+                    ) > 0, (provider, entry["id"], size, quality)
+            assert accepted
+            assert accepted <= pricing["image_variants"].keys()
+    assert unit_images, "the regression must exercise actual bundled unit-priced image entries"
+
+
+@pytest.mark.parametrize("size", ["auto", "1024x1024", "1536x1024", "1024x1536"])
+@pytest.mark.parametrize("edit", [False, True])
+def test_gemini_25_flash_image_catalog_route_passes_validation(size, edit):
+    row = model()
+    row.model_name = "gemini/gemini-2.5-flash-image"
+    row.model_kind = "image"
+    route = {
+        "model_kind": "image", "provider_type": "gemini", "api_model_name": "gemini-2.5-flash-image",
+        "api_base": None, "provider_auth": None, "api_key": "synthetic-key",
+        "media_pricing": _effective_media_pricing(row, "gemini", None),
+    }
+    assert image_transport.validate_image_request(route, size=size, quality="auto", n=1, edit=edit) == Decimal("0.039")
+    assert image_transport.image_route_ready(route)

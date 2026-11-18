@@ -695,7 +695,8 @@ CREATE TABLE `chat_mcp_servers` (
   KEY `idx_chat_mcp_owner` (`owner_user_id`),
   KEY `idx_chat_mcp_scope` (`scope`),
   KEY `idx_chat_mcp_servers_project` (`project_id`),
-  KEY `idx_chat_mcp_domain` (`owner_domain_id`,`scope`)
+  KEY `idx_chat_mcp_domain` (`owner_domain_id`,`scope`),
+  CONSTRAINT `ck_chat_mcp_servers_domain_owner` CHECK (`scope` <> 'domain' or `owner_domain_id` is not null)
 ) ENGINE=InnoDB;
 
 CREATE TABLE `chat_memories` (

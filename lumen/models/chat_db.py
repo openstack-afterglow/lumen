@@ -476,6 +476,10 @@ class ChatMcpServer(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
     __table_args__ = (
+        CheckConstraint(
+            "scope <> 'domain' OR owner_domain_id IS NOT NULL",
+            name="ck_chat_mcp_servers_domain_owner",
+        ),
         Index("idx_chat_mcp_scope", "scope"),
         Index("idx_chat_mcp_owner", "owner_user_id"),
         Index("idx_chat_mcp_servers_project", "project_id"),

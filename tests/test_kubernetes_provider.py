@@ -83,7 +83,16 @@ class API:
         if request.method == "GET":
             if name is None:
                 items = [copy.deepcopy(value) for (item_kind, _), value in self.objects.items() if item_kind == kind]
-                return httpx.Response(200, json={"items": items, "metadata": {}})
+                for item in items:
+                    # Real API LIST serializers keep TypeMeta only on the enclosing typed List.
+                    item.pop("apiVersion", None)
+                    item.pop("kind", None)
+                list_kind = {"pods": "PodList", "secrets": "SecretList",
+                             "networkpolicies": "NetworkPolicyList", "services": "ServiceList"}[kind]
+                api_version = "networking.k8s.io/v1" if kind == "networkpolicies" else "v1"
+                return httpx.Response(200, json={
+                    "apiVersion": api_version, "kind": list_kind, "items": items, "metadata": {},
+                })
             item = self.objects.get((kind, name))
             return httpx.Response(200, json=copy.deepcopy(item)) if item else httpx.Response(404, json={})
         if request.method == "POST":
@@ -322,6 +331,74 @@ def test_preflight_fails_closed_before_resource_writes(provider, failure):
     with pytest.raises((ValueError, RuntimeError)):
         result.create(_intent(result))
     assert not any(method == "POST" and not path.endswith("/selfsubjectrulesreviews") for method, path, _, _ in api.calls)
+
+
+def test_second_create_accepts_existing_owned_list_items_without_type_metadata(provider):
+    result, api, first_intent, first, first_ref = _create(provider)
+    second_intent = replace(first_intent, resource_id="00000000-0000-0000-0000-000000000002")
+    second = result.create(second_intent)
+    assert first.provider_id != second.provider_id
+    assert result.list_owned("mcp") == [first, second]
+    for kind in ("pods", "secrets", "networkpolicies", "services"):
+        rows = result._list(kind)
+        assert all(row["apiVersion"] and row["kind"] for row in rows)
+    second_ref = ResourceRef(second_intent.resource_id, second_intent.generation, second.provider_id, second_intent.pool_id)
+    for ref, remaining in ((first_ref, [second]), (second_ref, [])):
+        assert result.delete(ref).absent is False
+        assert result.delete(ref).absent is True
+        assert result.list_owned("mcp") == remaining
+    assert set(api.objects) == {("networkpolicies", "lumen-default-deny")}
+
+
+@pytest.mark.parametrize("resource", ["networkpolicies", "services", "pods"])
+@pytest.mark.parametrize("field,value", [
+    ("kind", "WrongKind"), ("kind", None), ("apiVersion", "wrong.example/v1"), ("apiVersion", None),
+])
+def test_list_preserves_explicit_type_mismatch_and_refuses_operation(provider, resource, field, value):
+    result, api, _, _, _ = _create(provider)
+    api.calls.clear()
+
+    def wrong_type(request):
+        response = api(request)
+        if request.method == "GET" and request.url.path.endswith("/" + resource):
+            body = response.json()
+            item = next(item for item in body["items"] if item["metadata"]["name"] != "lumen-default-deny")
+            item[field] = value
+            return httpx.Response(200, json=body)
+        return response
+
+    result.client.close()
+    result.client = httpx.Client(base_url=result.cluster.server, transport=httpx.MockTransport(wrong_type),
+                                 follow_redirects=False, trust_env=False)
+    with pytest.raises(RuntimeError, match="resource type mismatch"):
+        if resource == "pods":
+            result.list_owned("mcp")
+        else:
+            result.preflight()
+    assert not any(method == "DELETE" or method == "POST" and not path.endswith("/selfsubjectrulesreviews")
+                   for method, path, _, _ in api.calls)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("apiVersion", None), ("apiVersion", ""), ("kind", "List"), ("kind", "Pod"),
+])
+def test_list_rejects_missing_or_invalid_enclosing_type_metadata(provider, field, value):
+    result, api = provider
+
+    def invalid_list(request):
+        response = api(request)
+        if request.method == "GET" and request.url.path.endswith("/networkpolicies"):
+            body = response.json()
+            body[field] = value
+            return httpx.Response(200, json=body)
+        return response
+
+    result.client.close()
+    result.client = httpx.Client(base_url=result.cluster.server, transport=httpx.MockTransport(invalid_list),
+                                 follow_redirects=False, trust_env=False)
+    with pytest.raises(RuntimeError, match="list resource type invalid"):
+        result.preflight()
+    assert not any(method != "GET" for method, _, _, _ in api.calls)
 
 
 def test_create_secret_policy_and_service_precede_nonroot_bounded_pod_and_no_cloud_credential(provider):

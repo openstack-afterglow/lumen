@@ -12,7 +12,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi import HTTPException
 from lumen_plugin_api.contracts import Namespace
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_contracts import ChatFeatureOptions
@@ -177,12 +179,20 @@ async def test_activation_freezes_explicit_selection_and_invalidates_on_changes(
     assert (await selected(db, server_id))["mcp"][0]["id"] == server_id
 
 
-async def test_activation_rejects_domain_row_without_owner_domain(domain_db):
+async def test_activation_rejects_domain_row_without_owner_domain(domain_db, monkeypatch):
     db = domain_db
     _, created = await create_domain(db)
     server_id = created["server"]["id"]
-    async with db["factory"]() as session, session.begin():
-        await session.execute(update(ChatMcpServer).where(ChatMcpServer.id == server_id).values(owner_domain_id=None))
+    original_get = AsyncSession.get
+
+    async def legacy_get(session, model, identity, **kwargs):
+        row = await original_get(session, model, identity, **kwargs)
+        if model is ChatMcpServer and identity == server_id:
+            # 035 forbids storing this legacy state; still exercise the application guard on a corrupt read.
+            set_committed_value(row, "owner_domain_id", None)
+        return row
+
+    monkeypatch.setattr(AsyncSession, "get", legacy_get)
     with pytest.raises(es.ExtensionForbidden):
         await es.set_mcp_activation(server_id, **owner(db["member"]), is_active=True, config_version=1)
 

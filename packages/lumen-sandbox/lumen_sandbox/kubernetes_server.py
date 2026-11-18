@@ -44,6 +44,8 @@ logger = logging.getLogger("lumen_sandbox_kubernetes")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _PROFILE_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _MAX_MCP_FRAME_BYTES = 8 * 1024 * 1024
+_MAX_MCP_SKIPPED_FRAMES = 128
+_MCP_STARTUP_TIMEOUT_SECONDS = 60.0
 _MCP_POST_KEYS = frozenset({
     "run_id", "call_id", "fence", "profile", "tool", "arguments", "timeout_seconds", "workspace_revision",
 })
@@ -272,8 +274,33 @@ class McpProcess:
         self.proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._request_id = 0
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._poisoned = False
 
     async def start(self) -> None:
+        """Bound the complete cold handshake independently of the tools/call exchange."""
+        try:
+            async with asyncio.timeout(_MCP_STARTUP_TIMEOUT_SECONDS):
+                if self._poisoned and self.proc is not None:
+                    try:
+                        await asyncio.wait_for(self.proc.wait(), timeout=1.0)
+                    except TimeoutError:
+                        pass
+                    # The leader may exit while descendants still own its pipes. Fence the entire old group.
+                    try:
+                        os.killpg(self.proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await asyncio.wait_for(self.proc.wait(), timeout=1.0)
+                    if self._stderr_task is not None:
+                        self._stderr_task.cancel()
+                self._poisoned = False
+                await self._start()
+        except (Exception, asyncio.CancelledError):
+            self.kill()
+            raise
+
+    async def _start(self) -> None:
         """Perform MCP handshake, requiring approved tools and ignoring advertised extras."""
         clean_env = {
             **self.profile.environment,
@@ -291,6 +318,8 @@ class McpProcess:
             env=clean_env,
             start_new_session=True,
         )
+        assert self.proc.stderr is not None
+        self._stderr_task = asyncio.create_task(self._drain_stderr(self.proc.stderr))
 
         # 1. Initialize
         self._request_id += 1
@@ -301,13 +330,13 @@ class McpProcess:
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "lumen-sandbox", "version": "0.1.1"},
+                "clientInfo": {"name": "lumen-sandbox", "version": "0.1.2"},
             },
         }) + "\n"
-        init_resp = await self._send_and_read(init_req, timeout=10.0)
+        init_resp = await self._send_and_read(init_req, request_id=self._request_id, timeout=_MCP_STARTUP_TIMEOUT_SECONDS)
         if "error" in init_resp:
             self.kill()
-            raise RuntimeError(f"MCP server initialize error: {init_resp['error']}")
+            raise RuntimeError("MCP server initialize error")
 
         # 2. Initialized notification
         init_notif = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
@@ -318,8 +347,14 @@ class McpProcess:
         # 3. Require all manifest tools; advertised extras do not grant dispatch access.
         self._request_id += 1
         list_req = json.dumps({"jsonrpc": "2.0", "id": self._request_id, "method": "tools/list", "params": {}}) + "\n"
-        list_resp = await self._send_and_read(list_req, timeout=10.0)
-        tools_list = list_resp.get("result", {}).get("tools", [])
+        list_resp = await self._send_and_read(list_req, request_id=self._request_id, timeout=_MCP_STARTUP_TIMEOUT_SECONDS)
+        if "error" in list_resp or not isinstance(list_resp["result"], dict):
+            self.kill()
+            raise RuntimeError("MCP tools/list result must be an object")
+        tools_list = list_resp["result"].get("tools")
+        if not isinstance(tools_list, list):
+            self.kill()
+            raise RuntimeError("MCP tools/list tools must be an array")
         advertised = {t.get("name") for t in tools_list if isinstance(t, dict)}
         approved = {t.name for t in self.profile.tools}
         missing = approved - advertised
@@ -327,42 +362,98 @@ class McpProcess:
             self.kill()
             raise RuntimeError(f"missing approved tools from MCP server: {missing}")
 
-    async def _send_and_read(self, payload: str, timeout: float) -> dict[str, Any]:
+    @staticmethod
+    async def _drain_stderr(reader: asyncio.StreamReader) -> None:
+        # Do not retain or log tool stderr; draining fixed-size chunks prevents pipe backpressure.
+        while await reader.read(4096):
+            pass
+
+    async def _send_and_read(self, payload: str, *, request_id: int, timeout: float) -> dict[str, Any]:
         if self.proc is None or self.proc.stdin is None or self.proc.stdout is None:
             raise RuntimeError("MCP process not running")
-        self.proc.stdin.write(payload.encode("utf-8"))
-        await self.proc.stdin.drain()
-        line = await asyncio.wait_for(self.proc.stdout.readline(), timeout=timeout)
-        if not line:
-            raise RuntimeError("MCP process closed stdout unexpectedly")
-        if len(line) > _MAX_MCP_FRAME_BYTES:
-            raise RuntimeError("MCP response exceeds frame bound")
-        return json.loads(line.decode("utf-8"))
+        started = time.monotonic()
+        method = json.loads(payload)["method"][:64]
+        notifications = server_requests = 0
+        outcome = "protocol_error"
+        try:
+            async with asyncio.timeout(timeout):
+                self.proc.stdin.write(payload.encode("utf-8"))
+                await self.proc.stdin.drain()
+                skipped = 0
+                while True:
+                    line = await self.proc.stdout.readline()
+                    if not line:
+                        raise RuntimeError("MCP process closed stdout unexpectedly")
+                    if len(line) > _MAX_MCP_FRAME_BYTES:
+                        raise RuntimeError("MCP response exceeds frame bound")
+                    try:
+                        frame = json.loads(line)
+                    except (ValueError, UnicodeError) as exc:
+                        raise RuntimeError("MCP frame is not valid JSON") from exc
+                    if not isinstance(frame, dict) or frame.get("jsonrpc") != "2.0":
+                        raise RuntimeError("MCP frame must be a JSON-RPC 2.0 object")
+                    if "method" not in frame:
+                        if type(frame.get("id")) is not int or frame["id"] != request_id:
+                            raise RuntimeError("MCP response id mismatch")
+                        if ("result" in frame) == ("error" in frame):
+                            raise RuntimeError("MCP response requires exactly one result or error")
+                        if "result" in frame and not isinstance(frame["result"], dict):
+                            raise RuntimeError("MCP response result must be an object")
+                        outcome = "matched"
+                        return frame
+                    if not isinstance(frame["method"], str) or not frame["method"] or "result" in frame or "error" in frame:
+                        raise RuntimeError("MCP request or notification is invalid")
+                    skipped += 1
+                    if skipped > _MAX_MCP_SKIPPED_FRAMES:
+                        raise RuntimeError("MCP skipped frame bound exceeded")
+                    if "id" in frame:
+                        if type(frame["id"]) not in (int, str):
+                            raise RuntimeError("MCP server request id is invalid")
+                        response = {"jsonrpc": "2.0", "id": frame["id"],
+                                    "error": {"code": -32601, "message": "Method not found"}}
+                        self.proc.stdin.write((json.dumps(response) + "\n").encode("utf-8"))
+                        await self.proc.stdin.drain()
+                        server_requests += 1
+                    else:
+                        notifications += 1
+        except (TimeoutError, asyncio.CancelledError):
+            outcome = "timeout"
+            self.kill()
+            raise
+        except Exception:
+            self.kill()
+            raise
+        finally:
+            logger.info(
+                "mcp_exchange profile=%s method=%s request_id=%s notifications=%s server_requests=%s outcome=%s elapsed_ms=%d",
+                self.profile.id, method, request_id, notifications, server_requests, outcome,
+                int((time.monotonic() - started) * 1000),
+            )
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
         async with self._lock:
-            if self.proc is None or self.proc.returncode is not None:
-                await self.start()
-            self._request_id += 1
-            call_req = json.dumps({
-                "jsonrpc": "2.0",
-                "id": self._request_id,
-                "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
-            }) + "\n"
             try:
-                resp = await self._send_and_read(call_req, timeout=timeout)
-            except TimeoutError:
+                # Cold startup consumes, rather than extends, the caller's remaining tool/run budget.
+                async with asyncio.timeout(timeout):
+                    if self._poisoned or self.proc is None or self.proc.returncode is not None:
+                        await self.start()
+                    self._request_id += 1
+                    call_req = json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": self._request_id,
+                        "method": "tools/call",
+                        "params": {"name": tool_name, "arguments": arguments},
+                    }) + "\n"
+                    resp = await self._send_and_read(call_req, request_id=self._request_id, timeout=timeout)
+                    if "error" in resp:
+                        return {"isError": True, "content": [{"type": "text", "text": str(resp["error"])}]}
+                    return resp["result"]
+            except (Exception, asyncio.CancelledError):
                 self.kill()
                 raise
-            except Exception:
-                self.kill()
-                raise
-            if "error" in resp:
-                return {"isError": True, "content": [{"type": "text", "text": str(resp["error"])}]}
-            return resp.get("result", {"content": []})
 
     def kill(self) -> None:
+        self._poisoned = True
         if self.proc is not None and self.proc.returncode is None:
             try:
                 pgid = os.getpgid(self.proc.pid)
@@ -611,6 +702,9 @@ def create_kubernetes_app(config: SandboxConfig) -> Starlette:
 
 def main() -> None:
     """Entry point for lumen-sandbox-kubernetes daemon."""
+    logger.setLevel(logging.INFO)
+    logger.addHandler(logging.StreamHandler())
+    logger.propagate = False
     state = Path(os.environ["SANDBOX_STATE_DIR"])
     workspace = Path(os.environ["SANDBOX_WORKSPACE_DIR"])
     memory = int(os.environ["SANDBOX_MEMORY_BYTES"])

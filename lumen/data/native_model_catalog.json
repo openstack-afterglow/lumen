@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026-11-17",
+  "catalog_version": "2026-11-18",
   "providers": {
     "openai": {
       "display_name": "OpenAI",
@@ -4495,14 +4495,20 @@
           },
           "media_pricing": {
             "billing_basis": "unit",
-            "image_per_unit": "0.039"
+            "image_per_unit": "0.039",
+            "image_variants": {
+              "auto:auto": "0.039",
+              "1024x1024:auto": "0.039",
+              "1536x1024:auto": "0.039",
+              "1024x1536:auto": "0.039"
+            }
           },
           "source_urls": [
             "https://aistudio.google.com/docs/pricing",
             "https://aistudio.google.com/docs/models/gemini-2.5-flash-image"
           ],
-          "verified_at": "2026-11-17",
-          "notes": "Deprecated; shutdown March 15, 2027. Text generation is separately priced at Gemini 2.5 Flash rates; media_pricing expresses image output units only."
+          "verified_at": "2026-11-18",
+          "notes": "Deprecated; shutdown March 15, 2027. Official image output is 1290 tokens at $30.00/1M tokens = $0.039 per image. Each supported Lumen size (auto, 1024x1024, 1536x1024, 1024x1536) selects an aspect ratio, not guaranteed pixels; quality auto and n=1 share this unit rate. Text generation is separately priced at Gemini 2.5 Flash rates; media_pricing expresses image output units only."
         },
         {
           "id": "gemini-3.8-flash-tts",
