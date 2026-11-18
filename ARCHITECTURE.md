@@ -40,6 +40,10 @@ Selected sandboxes have their own `resource.deadline_at`, separate from the run'
 
 The official Google Gen AI Python SDK exercise lives in the isolated system stack. The pinned SDK is a dev extra only; service images do not depend on it. `/v1beta/decisions` uses the existing selector ambiguity check and accepts the unmodified model string sent by the SDK, including the exact Lumen route selector.
 
+Decision Studio checks an active row using `GET /v1/capabilities?model_kind=decision&model_id=<id>`; a mismatched kind does not resolve. The compat request wrapper enforces the raw body cap before auth. The Gemini handler decodes and validates JSON only after auth and reuses the native Gemini validation path. The image contract disallows Gemini Files API URLs so caller-supplied references cannot use the provider credential to resolve private files.
+
+Admin model rows expose `catalog_entry.kind` for native Decision entries even if the stored kind is still `text`. Only `model_kind` selects routing; the catalog field lets the registry offer a valid reclassification.
+
 `lumen/models/gemini_decision_contracts.py` validates bounded text/image input and typed questions before dispatch. The Gemini routes cap the raw request at 20 MiB. `lumen/services/gemini_decisions.py` uses the shared stateless credit lifecycle in `lumen/services/decisions.py`: recheck caller authority, resolve the current provider key, and send once to the official endpoint. Lumen does not fetch image URLs locally or assume a local token count. Gemini uses privacy-safe errors and returns only `model`, `answers`, and `usage` on success.
 
 `lumen/services/stateless_credit.py` owns content-free persistent holds (`chat_stateless_call_reservations`, migration 034) and atomic ledger/wallet settlement. Shared wallet admission counts durable and stateless reserved/unknown holds for user and API-key ceilings. Gemini reserves the full 262,144-token context at the frozen effective input rate (manual before catalog) for every request. Google's [Decisions API](https://aistudio.google.com/docs/decisions-api) documents the context and image resolution labels, but the [general media-token table](https://aistudio.google.com/docs/media-resolution#token-counts) does not establish Decision 1 per-image counts or a default. Settle trusted input usage before validating answers; reject malformed answers without undoing settlement. Missing, inconsistent, or over-bound usage leaves the hold uncertain. No new migration. OpenSpec defines local ASGI, fake-HTTP, and MariaDB verification scenarios; it does not establish their execution or production acceptance.
@@ -601,9 +605,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "924718a1406eedadc4c8298a807575b3696f2dbfae2ab7b1517a8d643b1925e4",
-  "reviewed_at": "2026-11-18T06:00:21Z",
-  "summary": "Pin official Google Gen AI Python SDK in dev extra only; verify Gemini Decisions accepted selectors, rejected nonnumeric selector, key header, and typed response against isolated Compose. Runtime routes and dependencies unchanged."
+  "source_sha256": "e25098bce24f3d4651f59cc75197b35e9776a0670cb925a341a1ff85657b7175",
+  "reviewed_at": "2026-11-18T06:15:25Z",
+  "summary": "Enable exact decision-kind Studio readiness and effective catalog-kind projection for admin reclassification. Authenticate before Gemini compat JSON parsing, reject operator-scoped Files API URLs, and verify transport failure settlement and scoped HTTP."
 }
 ```
 <!-- architecture-review:end -->

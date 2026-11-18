@@ -91,6 +91,18 @@ def test_gemini_http_routes_keep_provider_and_lumen_credentials_separate():
             registered = next(row for row in visible.json() if row["id"] == model_id)
             assert registered["capabilities"]["decisions"]
             assert float(registered["effective_input_price_per_million"]) == 0.10
+            capabilities = client.get("/v1/capabilities", headers=owner, params={
+                "model_id": model_id, "model_kind": "decision",
+            })
+            assert capabilities.status_code == 200, capabilities.text
+            available = capabilities.json()
+            assert (available["model_id"], available["model_name"], available["model_kind"]) == (model_id, model, "decision")
+            gate = available["model_capabilities"]["feature_gates"]["decisions"]
+            assert gate == {"available": True, "mode": "native", "reason_code": None, "pricing_available": True}
+            mismatch = client.get("/v1/capabilities", headers=owner, params={
+                "model_id": model_id, "model_kind": "text",
+            })
+            assert mismatch.status_code == 404, mismatch.text
             assert model not in client.get("/v1/models", headers=headers).text
             blocked = client.post("/v1/decisions", headers=headers, json={
                 "model": selector, "input": "text", "questions": [{"type": "predicate", "instructions": "yes?"}],

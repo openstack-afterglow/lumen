@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -111,8 +111,12 @@ def test_only_published_image_mimes(option):
         validate(input={**IMAGE, "mime_type": option})
 
 
-@pytest.mark.parametrize("uri", ["http://example.test/a", "gs://bucket/object", "https://youtu.be/x",
-                                 "https://www.youtube.com/x", "https://u:p@example.test/a", "https:///file"])
+@pytest.mark.parametrize("uri", [
+    "http://example.test/a", "gs://bucket/object", "https://youtu.be/x", "https://www.youtube.com/x",
+    "https://u:p@example.test/a", "https:///file",
+    "https://generativelanguage.googleapis.com/v1beta/files/synthetic-file",
+    "https://GenerativeLanguage.GOOGLEAPIS.com./v1beta/files/synthetic-file",
+])
 def test_image_uris_fail_closed(uri):
     with pytest.raises(ValidationError):
         validate(input={"type": "image", "mime_type": "image/png", "uri": uri})
@@ -246,13 +250,15 @@ async def test_invalid_routes_never_reserve_or_go_upstream(ledger, monkeypatch, 
 
 @pytest.fixture
 def fake_http(monkeypatch):
-    def install(status, payload):
+    def install(status=200, payload=None, *, responder=None):
         calls = []
         pin = AsyncMock(return_value="synthetic-current-key")
         monkeypatch.setattr(gemini_decisions, "resolve_route_api_key", pin)
 
         def handler(request):
             calls.append(request)
+            if responder is not None:
+                return responder(request)
             return httpx.Response(status, json=payload, headers={"location": "/must-not-follow"})
 
         def make_transport(**kwargs):
@@ -288,6 +294,49 @@ async def test_http_rejection_and_ambiguity_single_attempt(ledger, fake_http, st
     assert exc.value.status_code == (status if status in {400, 429} else 502)
     assert exc.value.message == (code if code in gemini_decisions.SAFETY_CODES else "upstream decision request rejected")
     assert ledger.finish.call_args.kwargs == {"uncertain": status not in decisions._REJECTION_STATUSES}
+    ledger.settle.assert_not_called()
+
+
+class _TimedOutBody(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b"{"
+        raise httpx.ReadTimeout("private upstream detail")
+
+
+@pytest.mark.parametrize(("failure", "status", "uncertain", "detail"), [
+    ("connect", 502, False, "upstream decision connection failed"),
+    ("read", 502, True, "upstream decision request failed"),
+    ("non-json", 502, True, "invalid decision response"),
+    ("duplicate-keys", 502, True, "invalid decision response"),
+    ("oversized", 502, True, "decision response exceeds size limit"),
+    ("400-body-read", 400, False, "upstream decision request rejected"),
+])
+async def test_gemini_transport_failure_hold_outcomes(ledger, fake_http, monkeypatch, failure, status, uncertain, detail):
+    if failure == "oversized":
+        monkeypatch.setattr(gemini_decisions, "MAX_RESPONSE_BYTES", 16)
+
+    def respond(request):
+        if failure == "connect":
+            raise httpx.ConnectError("private upstream detail", request=request)
+        if failure == "read":
+            return httpx.Response(200, stream=_TimedOutBody())
+        if failure == "400-body-read":
+            return httpx.Response(400, stream=_TimedOutBody())
+        content = {
+            "non-json": b"private upstream detail",
+            "duplicate-keys": b'{"usage":null,"usage":{"total_input_tokens":1}}',
+            "oversized": b'{"usage":"' + b"x" * 32 + b'"}',
+        }
+        return httpx.Response(200, content=content[failure])
+
+    calls, _ = fake_http(responder=respond)
+    with pytest.raises(decisions.DecisionError) as exc:
+        await call()
+    assert (exc.value.status_code, exc.value.uncertain, exc.value.message) == (status, uncertain, detail)
+    assert len(calls) == 1
+    ledger.reserve.assert_awaited_once()
+    ledger.finish.assert_awaited_once()
+    assert ledger.finish.call_args.kwargs == {"uncertain": uncertain}
     ledger.settle.assert_not_called()
 
 
@@ -429,6 +478,19 @@ def test_google_rejects_wrong_auth_or_scope(monkeypatch):
     resolve.assert_not_called()
 
 
+@pytest.mark.parametrize(("auth", "scopes", "expected"), [
+    ("keystone", ("compat:completions:write",), 401), ("api_key", (), 403),
+])
+def test_google_does_not_parse_json_before_authorizing(auth, scopes, expected, monkeypatch):
+    decode = Mock(side_effect=AssertionError("Unauthorized request entered the JSON decoder"))
+    monkeypatch.setattr(native, "_decision_json", decode)
+    resp = client(auth_type=auth, scopes=scopes).post(
+        "/v1beta/decisions", content=b'{"', headers={"content-type": "application/json"},
+    )
+    assert resp.status_code == expected
+    decode.assert_not_called()
+
+
 def test_openai_compat_explicitly_rejects_registered_gemini(monkeypatch):
     resolve = AsyncMock(side_effect=[None, route()])
     monkeypatch.setattr(routing, "resolve_api_model", resolve)
@@ -445,4 +507,8 @@ def test_main_registers_google_host_route_and_security():
 
     path = app.openapi()["paths"]["/v1beta/decisions"]["post"]
     assert path["security"] == [{"APIKeyBearer": []}, {"XApiKey": []}, {"GoogleApiKey": []}]
-    assert "GeminiDecisionRequest" in app.openapi()["components"]["schemas"]
+    assert path["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/GeminiDecisionRequest",
+    }
+    schemas = app.openapi()["components"]["schemas"]
+    assert {"GeminiDecisionRequest", "GeminiDecision_ChoiceQuestion"} <= schemas.keys()

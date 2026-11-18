@@ -721,6 +721,12 @@ def _model_public(
         output_price=effective_output,
     )
     entry = native_catalog_entry(row.model_name, provider_type, api_base)
+    catalog_entry = None
+    if entry:
+        catalog_entry = {key: entry[key] for key in ("id", "status", "verified_at", "source_urls")}
+        if entry["kind"] == "decision":
+            # Identify the supported registry kind even for legacy text rows.
+            catalog_entry["kind"] = entry["kind"]
     price_origin = resolved_source if resolved_source in {"manual", "native_catalog"} else None
     # Stored manual cache columns stay nullable; effective rates are projected separately.
     effective_cache, effective_cache_sources = _effective_cache_prices(
@@ -736,7 +742,7 @@ def _model_public(
         "provider_family": provider_family(provider_type, api_base, auth_mode),
         "price_origin": price_origin,
         "catalog_version": catalog_version() if entry else None,
-        "catalog_entry": {key: entry[key] for key in ("id", "status", "verified_at", "source_urls")} if entry else None,
+        "catalog_entry": catalog_entry,
         "provider_sort_order": provider_sort_order,
         "sort_order": row.sort_order,
         "model_kind": _kind(row),

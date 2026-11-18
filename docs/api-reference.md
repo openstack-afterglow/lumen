@@ -506,6 +506,10 @@ Register provider type `gemini` and stored model name `gemini/gemini-decision-1`
 
 Decision Studio lists these routes with `GET /v1/chat/models?model_kind=decision` and the existing `models:read` scope. This opt-in projection includes `effective_input_price_per_million` as a decimal USD string or `null`. Ordinary model lists and chat, embeddings, media, and batch execution exclude Decision-only rows. The existing OpenAI `gpt-6-luna` text route is unchanged.
 
+Check the selected model with `GET /v1/capabilities?model_id=<model_id>&model_kind=decision` under `models:read`. The response includes `model_kind: "decision"` and `model_capabilities.feature_gates.decisions`; a mismatched model kind returns HTTP 404.
+
+For the administrator registry, `GET /v1/admin/models` reports `catalog_entry.kind: "decision"` for the exact native catalog entry, even when a legacy row still has `model_kind: "text"`. This field guides reclassification; it does not enable the legacy row.
+
 Send `model`, `input`, and `questions` in the request:
 
 ```json
@@ -522,10 +526,10 @@ Send `model`, `input`, and `questions` in the request:
 ```
 
 - `input` is a string, a content block, or an array of content blocks. Send JSON data serialized as a string or as a `{"type":"text","text":"..."}` block, not as an arbitrary JSON object.
-- An image block requires `type: "image"`, an official image `mime_type`, and exactly one of inline base64 `data` or an `https://` `uri`. The optional `resolution` is `low`, `medium`, `high`, or `ultra_high`. Lumen never fetches the URL; do not pass YouTube, `gs://`, or plain HTTP URLs. Audio, video, and document/PDF input return HTTP 422 with `detail: "decision_input_modality_unsupported"`.
+- An image block requires `type: "image"`, an official image `mime_type`, and exactly one of inline base64 `data` or an `https://` `uri`. The optional `resolution` is `low`, `medium`, `high`, or `ultra_high`. Lumen never fetches the URL. Do not pass YouTube, `gs://`, plain HTTP, or Gemini Files API URLs (`generativelanguage.googleapis.com`); Lumen does not permit references to files under the operator's provider key. Audio, video, and document/PDF input return HTTP 422 with `detail: "decision_input_modality_unsupported"`.
   The accepted MIME types are `image/png`, `image/jpeg`, `image/webp`, `image/heic`, `image/heif`, `image/gif`, `image/bmp`, and `image/tiff`.
 - `questions` contains 1–1,000 keyed questions. Keys match `[A-Za-z0-9_-]{1,64}`. `instructions` accepts a string, text block, or array of text blocks. `noul` optionally defines `true_description` and `false_description` in `criteria`; `choice` maps 2–255 valid option keys to descriptions (which may be empty); `score` takes 2–255 ordered, non-empty rubric strings. See the official [limits](https://aistudio.google.com/docs/decisions-api#limits) for option key rules and the 100-level JSON nesting limit.
-- The raw request body, including inline base64, is capped at 20 MiB (20,971,520 bytes); exceeding it returns 413. Lumen validates structure before dispatch. Gemini enforces its exact tokenizer/context and fetched-image byte limits.
+- The raw request body, including inline base64, is capped at 20 MiB (20,971,520 bytes); exceeding it returns 413. Lumen authorizes the call before decoding Gemini-compatible JSON and validates structure before dispatch. Gemini enforces its exact tokenizer/context and fetched-image byte limits.
 
 Successful responses contain only `model`, `answers`, and `usage`. `model` is the registered Lumen model name. `answers` is keyed by the request's question IDs: `noul` returns a yes probability, `choice` returns the winning option and per-option probabilities, and `score` returns the weighted score, per-level probabilities, and legend. Each answer includes `type` and `confidence`. For example:
 

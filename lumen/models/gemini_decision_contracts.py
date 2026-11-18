@@ -20,6 +20,7 @@ _BASE64 = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
 _UNSAFE_URI_CHAR = re.compile(r"[\x00-\x20\x7f\\]")
 _YOUTUBE_DOMAINS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+_GEMINI_FILES_HOST = "generativelanguage.googleapis.com"
 
 
 def _unicode_text(value: str) -> str:
@@ -68,10 +69,14 @@ class ImageContent(WireModel):
             if _UNSAFE_URI_CHAR.search(self.uri):
                 raise ValueError("image uri must be an HTTPS URL")
             parsed = urlsplit(self.uri)
-            host = (parsed.hostname or "").rstrip(".")
-            if (parsed.scheme != "https" or not host or parsed.username is not None or parsed.password is not None
-                    or any(host == domain or host.endswith(f".{domain}") for domain in _YOUTUBE_DOMAINS)):
-                raise ValueError("image uri must be an HTTPS URL outside YouTube")
+            host = (parsed.hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
+            if parsed.scheme != "https" or not host or "%" in host or parsed.username is not None or parsed.password is not None:
+                raise ValueError("image uri must be an HTTPS URL")
+            if host == _GEMINI_FILES_HOST:
+                # Files API URIs must not be resolved with the operator's provider credential.
+                raise ValueError("Gemini Files API image URIs are not supported")
+            if any(host == domain or host.endswith(f".{domain}") for domain in _YOUTUBE_DOMAINS):
+                raise ValueError("YouTube image URIs are not supported")
             # Accessing port also validates a supplied numeric port and its range.
             _ = parsed.port
         return self

@@ -19,6 +19,15 @@ No live Gemini call, paid provider usage, tag, or deployment was made.
 - `uv run --frozen lumen-test system` passed 39 with all positive SDK selectors. After the negative selector assertion was added, `uv run --frozen lumen-test system -q -k gemini_http_routes` passed the updated case (1 passed, 38 deselected).
 - `@google/genai` 3.5.0 emitted the same request shape and decoded fixture output against a local HTTP recorder. This was a wire check only, not a JavaScript end-to-end test against Lumen.
 
+### PR review follow-up
+
+`test-passed` on architecture source `e25098bce24f3d4651f59cc75197b35e9776a0670cb925a341a1ff85657b7175`.
+
+- `uv run --frozen lumen-test contract`: 8,180 service tests passed (807 deselected), 145 SDK tests passed, and both Ruff checks passed. Regressions cover the admin catalog-kind hint for legacy rows, Files API URI rejection, auth before JSON parsing, and hold states for connection, response-read, and invalid-response failures.
+- `uv run --frozen lumen-test integration`: 764 passed, 4 skipped, 8,219 deselected against disposable MariaDB/Redis.
+- `uv run --frozen lumen-test system -q -k gemini_http_routes`: 1 passed, 38 deselected against the isolated process stack. A registered Gemini Decision model returned HTTP 200 with an available, priced Decisions gate; selecting `text` for the same model returned 404.
+- Python 3.11 architecture stamp and guard passed. No live Gemini calls or deployment.
+
 ## 0.6.18 production rollout and smoke (2026-11-18 UTC)
 
 Deployed tag `0.6.18` (`c90d0664`; images amd64+arm64, revision label `c90d06646ff8`, tag digest = `latest`) with `--tags lumen --skip-tags haproxy` after a fail-closed drain (61 runs terminal, 0 model-call or stateless holds in flight) and an encrypted backup. Observed: API/worker on the pinned digests, `lumen.__version__` 0.6.18, protocol 2 on every API/worker, restarts 0, migrate status rc0, ledger row `035-mcp-domain-owner-check`, constraint `ck_chat_mcp_servers_domain_owner` present, direct `/v1/ready` 200 on each host, public health/ready/openapi 200, managed ClamAV unchanged (VERSION 28186). Census changed only `lumen_api`/`lumen_worker` per controller; VIP, protected-setting hashes and runtime=false unchanged.

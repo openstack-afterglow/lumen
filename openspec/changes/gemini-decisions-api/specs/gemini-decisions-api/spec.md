@@ -10,11 +10,17 @@ Lumen SHALL recognize `model_kind="decision"` in administrator manual registrati
 - **THEN** discovery SHALL identify a Decision candidate and MAY preserve the live limit as a discovery hint
 - **AND** the catalog and settlement SHALL retain the published zero-output contract
 
+#### Scenario: An administrator reviews a legacy registration
+
+- **WHEN** an admin model row matches the native Gemini Decision 1 catalog entry, even with stored kind `text`
+- **THEN** its `catalog_entry.kind` SHALL be `decision` and its `model_kind` SHALL remain the stored kind until explicitly changed
+
 #### Scenario: Studio explicitly lists a Decision-only model
 
 - **WHEN** an authorized user calls `GET /v1/chat/models?model_kind=decision` for an active registered Decision model
 - **THEN** the native list SHALL expose the Decision projection with `effective_input_price_per_million` as a decimal string or null
 - **AND** ordinary customer model catalogs and non-Decision execution routes SHALL exclude the Decision-only row
+- **AND** `GET /v1/capabilities?model_kind=decision&model_id=<model_id>` SHALL resolve an active Decision row and return its Decision capability gate; a mismatched kind SHALL return 404
 
 ### Requirement: Provider-specific Decisions entrypoints
 
@@ -39,6 +45,8 @@ Keystone `POST /v1/chat/decisions` SHALL require `native:runs:write`, resolve th
 ### Requirement: Bounded Gemini request and response contract
 
 Lumen SHALL reject Gemini request bodies larger than 20 MiB with 413 and validate structural limits before dispatch. The Google request SHALL accept shared text, JSON serialized as text, and images with inline base64 or HTTPS URI and an allowed image MIME type. Images MAY select `low`, `medium`, `high`, or `ultra_high` resolution. The 1–1,000 question map SHALL conform to Gemini `noul`, `choice`, or `score` typing and key/criteria limits. Instructions SHALL be text only. Success SHALL return only `model`, validated `answers`, and Google-style `usage`, with no Lumen cost fields. Errors SHALL use privacy-safe `detail` strings without echoing request input or provider error messages.
+
+On `/v1beta/decisions`, Lumen SHALL enforce the raw body cap before authentication and require authentication and scope before JSON decoding or structural validation. Gemini Files API URIs on `generativelanguage.googleapis.com` SHALL be rejected rather than resolved under the operator's provider key.
 
 #### Scenario: Unsupported input is rejected before dispatch
 

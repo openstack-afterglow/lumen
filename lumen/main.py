@@ -453,6 +453,7 @@ def custom_openapi() -> dict:
         batch_item_scopes,
     )
     from lumen.models.chat_contracts import _CHAT_RUN_EVENT
+    from lumen.models.gemini_decision_contracts import GeminiDecisionRequest
 
     schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
     schema["x-contract-version"] = "1.0.0"
@@ -687,6 +688,12 @@ def custom_openapi() -> dict:
         for def_name, def_schema in model_schema.pop("$defs", {}).items():
             components_schemas.setdefault(def_name, def_schema)
         components_schemas[model.__name__] = model_schema
+    # The Gemini route decodes its bounded body only after auth. Give nested
+    # schemas distinct names from similarly named OpenAI Decisions types.
+    gemini_schema = GeminiDecisionRequest.model_json_schema(ref_template="#/components/schemas/GeminiDecision_{model}")
+    for def_name, def_schema in gemini_schema.pop("$defs", {}).items():
+        components_schemas[f"GeminiDecision_{def_name}"] = def_schema
+    components_schemas["GeminiDecisionRequest"] = gemini_schema
 
     def _fix_refs(obj: Any) -> None:
         if isinstance(obj, dict):

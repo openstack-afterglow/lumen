@@ -110,7 +110,7 @@ async def list_available_models(
 @router.get("/capabilities")
 async def get_chat_capabilities(
     model_id: int = Query(..., ge=1),
-    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding"] = "text",
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding", "decision"] = "text",
     token_info: dict = Depends(require_scopes("models:read")),
 ):
     """Expose selected-model and deployment runtime gates without secrets."""

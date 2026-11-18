@@ -1,17 +1,21 @@
 """API-key authenticated OpenAI and Gemini Decisions wire endpoints."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from lumen.api.compat.openai import openai_error_response
-from lumen.api.decisions import BoundedDecisionRoute, GeminiDecisionRoute
+from lumen.api.decisions import (
+    GEMINI_DECISION_BODY_SCHEMA,
+    BoundedDecisionRoute,
+    ProviderDecisionRoute,
+    parse_gemini_request,
+)
 from lumen.auth import Principal, require_api_key_scopes
 from lumen.models.decision_contracts import DecisionRequest
-from lumen.models.gemini_decision_contracts import GeminiDecisionRequest
 from lumen.services import decisions, gemini_decisions
 
 router = APIRouter(route_class=BoundedDecisionRoute)
-google_router = APIRouter(route_class=GeminiDecisionRoute)
+google_router = APIRouter(route_class=ProviderDecisionRoute)
 
 
 @router.post("/decisions", openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]})
@@ -28,11 +32,15 @@ async def create_decision(body: DecisionRequest,
     return {key: result[key] for key in ("model", "answers", "usage")}
 
 
-@google_router.post("/v1beta/decisions")
+@google_router.post("/v1beta/decisions", openapi_extra={"requestBody": {
+    "required": True,
+    "content": {"application/json": {"schema": GEMINI_DECISION_BODY_SCHEMA}},
+}})
 async def create_gemini_decision(
-    body: GeminiDecisionRequest,
+    request: Request,
     principal: Principal = Depends(require_api_key_scopes("compat:completions:write")),
 ):
+    body = parse_gemini_request(request, await request.body())
     try:
         route = await decisions.resolve(body.model.removeprefix("models/"), provider_type="gemini")
         return await gemini_decisions.decide(

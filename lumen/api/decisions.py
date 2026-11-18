@@ -36,9 +36,7 @@ def _redacted_validation(errors: list[dict]) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": errors}, headers={"Cache-Control": "no-store"})
 
 
-def _gemini_json_limits(content: bytes, duplicate_key: bool) -> None:
-    if duplicate_key:
-        raise HTTPException(422, _INVALID_GEMINI)
+def _enforce_gemini_json_depth(content: bytes) -> None:
     # Ignore punctuation and escaped quotes in string payloads (including JSON-as-text).
     depth = 0
     in_string = False
@@ -72,15 +70,42 @@ def _decision_json(content: bytes) -> tuple[object, bool]:
     return json.loads(content.decode("utf-8"), object_pairs_hook=collect), duplicate_key
 
 
+def parse_gemini_request(request: Request, content: bytes, *, decoded: tuple[object, bool] | None = None) -> GeminiDecisionRequest:
+    if not is_json_request(request):
+        raise HTTPException(422, _INVALID_GEMINI)
+    _enforce_gemini_json_depth(content)
+    if decoded is None:
+        try:
+            decoded = _decision_json(content)
+        except (ValueError, RecursionError):
+            raise HTTPException(422, _INVALID_GEMINI) from None
+    raw, duplicate_key = decoded
+    if duplicate_key:
+        raise HTTPException(422, _INVALID_GEMINI)
+    try:
+        return GeminiDecisionRequest.model_validate(raw, strict=True)
+    except ValidationError as exc:
+        unsupported = any(
+            isinstance(error.get("ctx", {}).get("error"), GeminiDecisionModalityUnsupported)
+            for error in exc.errors(include_input=False, include_url=False)
+        )
+        detail = "decision_input_modality_unsupported" if unsupported else _INVALID_GEMINI
+        raise HTTPException(422, detail, headers={"Cache-Control": "no-store"}) from None
+
+
+def is_json_request(request: Request) -> bool:
+    media_type = request.headers.get("content-type", "application/json").partition(";")[0].strip().lower()
+    return media_type == "application/json" or (
+        media_type.startswith("application/") and media_type.endswith("+json")
+    )
+
+
+GEMINI_DECISION_BODY_SCHEMA = {"$ref": "#/components/schemas/GeminiDecisionRequest"}
+
+
 class BoundedDecisionRoute(APIRoute):
     def body_limit(self) -> tuple[int, str]:
         return MAX_DECISION_BODY_BYTES, "decision request body exceeds 16 MiB"
-
-    async def prepare(self, request: Request) -> None:
-        pass
-
-    def validation_error(self, exc: RequestValidationError) -> JSONResponse:
-        return _redacted_validation(exc.errors())
 
     def get_route_handler(self):
         handler = super().get_route_handler()
@@ -97,37 +122,16 @@ class BoundedDecisionRoute(APIRoute):
                 content.extend(chunk)
             request._body = bytes(content)
             del content
-            await self.prepare(request)
             try:
                 return await handler(request)
             except RequestValidationError as exc:
-                return self.validation_error(exc)
+                return _redacted_validation(exc.errors())
         return bounded
 
 
 class ProviderDecisionRoute(BoundedDecisionRoute):
     def body_limit(self) -> tuple[int, str]:
         return MAX_GEMINI_DECISION_BODY_BYTES, "decision request body exceeds 20 MiB"
-
-
-class GeminiDecisionRoute(ProviderDecisionRoute):
-    async def prepare(self, request: Request) -> None:
-        content = await request.body()
-        try:
-            request._json, duplicate_key = _decision_json(content)
-        except (ValueError, RecursionError):
-            raise HTTPException(422, _INVALID_GEMINI) from None
-        _gemini_json_limits(content, duplicate_key)
-
-    def validation_error(self, exc: RequestValidationError) -> JSONResponse:
-        unsupported = any(
-            isinstance(error.get("ctx", {}).get("error"), GeminiDecisionModalityUnsupported)
-            for error in exc.errors()
-        )
-        return JSONResponse(
-            status_code=422, headers={"Cache-Control": "no-store"},
-            content={"detail": "decision_input_modality_unsupported" if unsupported else _INVALID_GEMINI},
-        )
 
 
 router = APIRouter(route_class=ProviderDecisionRoute)
@@ -147,7 +151,7 @@ def _openai_request(raw: object) -> DecisionRequest:
     "required": True,
     "content": {"application/json": {"schema": {"oneOf": [
         {"$ref": "#/components/schemas/DecisionRequest"},
-        {"$ref": "#/components/schemas/GeminiDecisionRequest"},
+        GEMINI_DECISION_BODY_SCHEMA,
     ]}}},
 }})
 async def create_decision(request: Request,
@@ -155,8 +159,7 @@ async def create_decision(request: Request,
     content = await request.body()
     if not content:
         raise RequestValidationError([{"type": "missing", "loc": ("body",), "msg": "Field required"}])
-    media_type = request.headers.get("content-type", "application/json").partition(";")[0].strip().lower()
-    if media_type != "application/json" and not (media_type.startswith("application/") and media_type.endswith("+json")):
+    if not is_json_request(request):
         _openai_request(content)
     try:
         raw, duplicate_key = _decision_json(content)
@@ -184,14 +187,7 @@ async def create_decision(request: Request,
     try:
         route = await decisions.resolve(model)
         if route.get("provider_type") == "gemini":
-            _gemini_json_limits(content, duplicate_key)
-            try:
-                gemini = GeminiDecisionRequest.model_validate(raw, strict=True)
-            except ValidationError as exc:
-                if any(isinstance(error.get("ctx", {}).get("error"), GeminiDecisionModalityUnsupported)
-                       for error in exc.errors(include_input=False, include_url=False)):
-                    raise HTTPException(422, "decision_input_modality_unsupported") from None
-                raise HTTPException(422, _INVALID_GEMINI) from None
+            gemini = parse_gemini_request(request, content, decoded=(raw, duplicate_key))
             return await gemini_decisions.decide(route=route, body=gemini, **caller)
         if len(content) > MAX_DECISION_BODY_BYTES:
             raise HTTPException(413, "decision request body exceeds 16 MiB")

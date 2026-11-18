@@ -205,6 +205,7 @@ async def test_decision_admin_registration_and_manual_price_clear(provider_db, a
     assert created.status_code == 201, created.text
     result = created.json()
     assert result["model_kind"] == "decision"
+    assert result["catalog_entry"]["kind"] == "decision"
     assert result["effective_price_source"] == result["price_origin"] == "native_catalog"
     assert Decimal(result["effective_input_price_per_million"]) == Decimal("0.10")
     assert result["effective_output_price_per_million"] is None
@@ -255,6 +256,11 @@ async def test_decision_kind_edit_requires_clearing_old_output_price(provider_db
     add_provider(provider_type="gemini")
     add_model("gemini-decision-1")
     monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    listed = await admin_client.get("/v1/admin/models")
+    assert listed.status_code == 200, listed.text
+    legacy = listed.json()[0]
+    assert legacy["id"] == 10
+    assert legacy["model_kind"] == "text" and legacy["catalog_entry"]["kind"] == "decision"
     path = "/v1/admin/models/10"
     denied = await admin_client.patch(path, json={"model_kind": "decision"})
     assert denied.status_code == 400, denied.text
