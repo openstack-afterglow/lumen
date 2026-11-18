@@ -44,11 +44,16 @@ class _ReadOnlyAccountConnection:
         self.corrupt_table = corrupt_table
         self.statements = []
 
+    def _schema(self):
+        ledger = self.ledger if self.ledger is not None else [(m.logical_id,) for m in migrate.load_manifest()]
+        # Migration 037 widens chat_usage_logs only after its receipt exists.
+        return account.schema_for(self.mode, domain_billing=account.DOMAIN_BILLING_ID in {row[0] for row in ledger})
+
     async def exec_driver_sql(self, sql):
         self.statements.append(sql)
         assert sql.lstrip().startswith(("SELECT", "SHOW")), sql
         if "information_schema.TABLES" in sql:
-            return _ReadResult([(name,) for name in (*account.schema_for(self.mode), "schema_migrations", "chat_runs")])
+            return _ReadResult([(name,) for name in (*self._schema(), "schema_migrations", "chat_runs")])
         if "SELECT logical_id" in sql:
             return _ReadResult(self.ledger if self.ledger is not None else [
                 (m.logical_id, m.relative_path, m.sha256) for m in migrate.load_manifest()
@@ -62,7 +67,7 @@ class _ReadOnlyAccountConnection:
             return _ReadResult([("utf8mb4", "utf8mb4_uca1400_ai_ci")])
         if sql.startswith("SHOW CREATE"):
             table = sql.split()[-1].strip("`")
-            ddl = account.schema_for(self.mode)[table]
+            ddl = self._schema()[table]
             if table == self.corrupt_table:
                 ddl = ddl.replace("`id` bigint(20)", "`id` int(11)")
             return _ReadResult([(table, ddl)])

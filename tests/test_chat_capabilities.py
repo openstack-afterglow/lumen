@@ -666,6 +666,60 @@ def test_public_model_marks_unpriced_text_route_unavailable():
     assert public["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is False
 
 
+def _priced_compatible_model(capabilities=None, capability_source=None):
+    return SimpleNamespace(
+        id=8, provider_id=3, model_name="custom-compatible-model", display_name=None, sort_order=0,
+        is_active=True, is_title_model=False, is_memory_model=False,
+        input_price=Decimal("0.000001"), output_price=Decimal("0.000002"), price_source="manual",
+        price_metadata=None, capabilities=capabilities, capability_source=capability_source,
+        models_dev_model_id=None, created_at=None, updated_at=None,
+    )
+
+
+def test_domain_billing_reports_unknown_context_limit_until_admin_override(native_catalog):
+    native_catalog()
+    public = _model_public(_priced_compatible_model(), provider_type="openai", api_provider="openai",
+                           api_base="https://compatible.example/v1")
+    assert public["effective_capabilities"]["context_limit"] is None
+    assert public["domain_billing"] == {"ready": False, "reason_code": "context_limit_unknown"}
+
+    overridden = _model_public(
+        _priced_compatible_model({"context_limit": 32_000}, "override"),
+        provider_type="openai", api_provider="openai", api_base="https://compatible.example/v1",
+    )
+    assert overridden["effective_capabilities"]["context_limit"] == 32_000
+    assert overridden["domain_billing"] == {"ready": True, "reason_code": None}
+
+
+@pytest.mark.parametrize(("capabilities", "prices", "reason"), [
+    ({"context_limit": 8000}, (None, Decimal("1")), "pricing_unavailable"),
+    ({"context_limit": 8000, "output_budget_enforced": False}, (Decimal("1"), Decimal("1")), "output_budget_unenforced"),
+    ({"context_limit": None}, (Decimal("1"), Decimal("1")), "context_limit_unknown"),
+    ({"context_limit": 8000}, (Decimal("1"), Decimal("1")), None),
+])
+def test_domain_paid_admission_rejects_unready_model_before_run(capabilities, prices, reason):
+    from fastapi import HTTPException
+
+    from lumen.models.chat_contracts import ChatFeatureOptions
+    from lumen.services.chat_admission import _require_execution_capability
+
+    gates = {"text": {"available": True, "mode": "native", "reason_code": None, "pricing_available": True}}
+    resolved = {"capabilities": {**capabilities, "feature_gates": gates},
+                "input_price_per_token": prices[0], "output_price_per_token": prices[1]}
+    if prices[0] is not None:
+        # A user-funded run keeps today's admission; only domain-paid calls need the prepaid bound.
+        _require_execution_capability(ChatFeatureOptions(), resolved)
+    if reason is None:
+        _require_execution_capability(ChatFeatureOptions(), resolved, domain_paid=True)
+        return
+    with pytest.raises(HTTPException) as error:
+        _require_execution_capability(ChatFeatureOptions(), resolved, domain_paid=True)
+    assert error.value.status_code == 422
+    # Unpriced text is already refused by the text gate for every payer.
+    expected = "text (pricing_unavailable)" if reason == "pricing_unavailable" else f"domain_billing ({reason})"
+    assert error.value.detail.endswith(expected)
+
+
 def test_chatgpt_subscription_uses_catalog_capabilities_without_api_prices(monkeypatch):
     original = capability_service.catalog_model_metadata
     observed = []
