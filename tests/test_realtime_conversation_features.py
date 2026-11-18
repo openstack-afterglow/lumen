@@ -462,30 +462,36 @@ async def test_compat_commit_during_inflight_vad_does_not_close_session(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_lumen_buffers_early_audio_until_both_setup_acknowledgements(monkeypatch):
-    browser = _Browser([{"type": "audio.input.append", "audio": _PCM}, {"type": "session.close"}])
+@pytest.mark.parametrize("wire", ["native", "openai"])
+async def test_lumen_buffers_early_audio_until_both_setup_acknowledgements(monkeypatch, wire):
+    append = "audio.input.append" if wire == "native" else "input_audio_buffer.append"
+    browser = _Browser([{"type": append, "audio": _PCM}, {"type": "session.close"}])
     upstream = _Upstream(auto_ack=False)
     _connect(monkeypatch, upstream)
     task = asyncio.create_task(realtime_protocol.relay_audio(browser, _route(), session_id="session", voice="alloy",
-        instructions=None, max_duration_seconds=30, is_canceled=_not_canceled, token_usage=True, tools=[_TOOL]))
+        instructions=None, max_duration_seconds=30, wire=wire, is_canceled=_not_canceled, token_usage=True, tools=[_TOOL]))
     async with asyncio.timeout(5):
         first = (await upstream.sent_frames.get())["session"]
         assert first["audio"]["input"]["turn_detection"] is None and "tools" not in first
         assert browser.events == [] and upstream.sent_frames.empty()
         await upstream.emit({"type": "session.created"})
+        await upstream.emit({"type": "conversation.created", "conversation": {"id": "conv_1"}})
         await upstream.ack(first)
         second = (await upstream.sent_frames.get())["session"]
         assert second["tools"] == [_TOOL] and second["audio"]["input"]["turn_detection"] == {"type": "server_vad"}
         assert browser.events == [] and upstream.sent_frames.empty()
         await upstream.ack(second)
-        assert (await browser.received.get())["type"] == "session.ready"
+        expected = (["session.ready"] if wire == "native" else
+                    ["session.created", "conversation.created", "session.updated", "session.updated"])
+        for event_type in expected:
+            assert (await browser.received.get())["type"] == event_type
         assert (await upstream.sent_frames.get())["type"] == "input_audio_buffer.append"
         assert (await task).input_bytes == 320
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", [1, 2])
-@pytest.mark.parametrize("failure", ["error", "mismatched_limits", "timeout"])
+@pytest.mark.parametrize("failure", ["error", "mismatched_limits", "unexpected", "repeated_creation", "timeout"])
 async def test_setup_failure_never_readies_session_or_sends_audio(monkeypatch, phase, failure):
     browser = _Browser([{"type": "audio.input.append", "audio": _PCM}])
     upstream = _Upstream(auto_ack=False)
@@ -502,6 +508,12 @@ async def test_setup_failure_never_readies_session_or_sends_audio(monkeypatch, p
             await upstream.emit({"type": "error", "error": {"message": "provider detail"}})
         elif failure == "mismatched_limits":
             await upstream.emit({"type": "session.updated", "session": {**first, "max_output_tokens": 8192}})
+        elif failure == "unexpected":
+            await upstream.emit({"type": "response.created"})
+        elif failure == "repeated_creation":
+            await upstream.emit({"type": "conversation.created"})
+            await upstream.emit({"type": "conversation.created"})
+            await upstream.ack(first)
         with pytest.raises(RealtimeTransportError, match="usage is incomplete") as error:
             await task
     assert browser.events == [] and error.value.meter.input_bytes == 0

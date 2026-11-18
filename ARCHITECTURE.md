@@ -615,9 +615,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "995ce6baf5b6bef82373c32f5e9ccabc4333debfed81843548d4f2a5adb76d89",
-  "reviewed_at": "2026-11-18T10:07:08Z",
-  "summary": "Realtime follow-up: verify both OpenAI setup acknowledgements before relay, guard explicit events without canceling active responses, correlate parallel native function outputs, validate and surface reservation floors, require image token splits; no schema changes"
+  "source_sha256": "93df620961fcd946a06bac2c012ac344e409d6f4ce5888643bbeeadbc91ba79f",
+  "reviewed_at": "2026-11-18T10:14:56Z",
+  "summary": "OpenAI realtime handshake: tolerate one documented session.created and conversation.created before each limits ACK; preserve the two-phase readiness fence and add native/compat coverage and attributed setup evidence"
 }
 ```
 <!-- architecture-review:end -->
