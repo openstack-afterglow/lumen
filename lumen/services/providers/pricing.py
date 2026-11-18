@@ -432,6 +432,9 @@ def _resolved_cache_prices(
     if _kind(model) == "decision":
         return prices, sources
     catalog = bundled_cache_rates(model.model_name, provider_type, api_base)
+    entry = native_catalog_entry(model.model_name, provider_type, api_base) if provider_type == "openai" else {}
+    token_pricing = entry.get("token_pricing") or {}
+    explicit_write_ttls = token_pricing.get("cache_write_ttl") == "30m" and "long_context" in token_pricing
     for category, (_, column, key) in zip(_CACHE_CATEGORIES, CACHE_PRICE_FIELDS, strict=True):
         manual = getattr(model, column, None)
         rate = Decimal(manual) if manual is not None else catalog.get(key)
@@ -442,6 +445,8 @@ def _resolved_cache_prices(
             tier.quantize(_PER_TOKEN_QUANTUM, rounding=ROUND_HALF_UP) if tier is not None else None
         )
         sources[category] = "manual" if manual is not None else "native_catalog" if rate is not None or tier is not None else None
+        if explicit_write_ttls and category != "cache_read" and rate is not None and tier is None and manual is None:
+            sources[f"{category}_above_200k"] = "unpublished"
     return prices, sources
 
 

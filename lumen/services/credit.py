@@ -189,6 +189,8 @@ def usage_cost_from_pricing_snapshot(
         tokens = getattr(text, token_field)
         rate, tier_rate = cache_prices[name]
         source = sources.get(name, "manual")
+        if tokens and breakdown.input_tokens > threshold and sources.get(f"{name}_above_200k") == "unpublished":
+            raise ValueError("long-context cache-write rate is unpublished")
         # Frozen tiers exist only for real catalog rates (own or inherited by a fallback write).
         if breakdown.input_tokens > threshold and source != "manual" and tier_rate is not None:
             rate = tier_rate

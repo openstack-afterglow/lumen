@@ -104,6 +104,28 @@ func preserveMetadata(converted, raw []byte, wire string) []byte {
 		out["usage_metadata"] = usage
 	}
 	if wire == "responses" {
+		if tier, ok := native["service_tier"]; ok {
+			out["service_tier"] = tier
+		} else {
+			// Bifrost may serialize an absent tier as null. Keep absence distinct.
+			delete(out, "service_tier")
+		}
+		if usage, ok := native["usage"].(map[string]any); ok {
+			if details, ok := usage["input_tokens_details"].(map[string]any); ok {
+				if normalized, ok := out["usage"].(map[string]any); ok {
+					prompt, _ := normalized["prompt_tokens_details"].(map[string]any)
+					for _, key := range []string{"cached_tokens", "cache_write_tokens", "cache_write_tokens_details"} {
+						if value, ok := details[key]; ok {
+							if prompt == nil {
+								prompt = make(map[string]any, 3)
+								normalized["prompt_tokens_details"] = prompt
+							}
+							prompt[key] = value
+						}
+					}
+				}
+			}
+		}
 		var reasoning []any
 		var annotations []any
 		if output, ok := native["output"].([]any); ok {

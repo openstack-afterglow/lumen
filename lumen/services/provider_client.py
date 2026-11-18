@@ -17,14 +17,17 @@ from lumen.services.bifrost_runtime import BifrostRuntimeError, get_bifrost_runt
 from lumen.services.provider_errors import (
     APIConnectionError,
     AuthenticationError,
+    OpenAIServiceTierMismatch,
+    OpenAIUsageInvalid,
     PermissionDeniedError,
     ProviderError,
     Timeout,
     error_for_status,
 )
-from lumen.services.provider_metadata import catalog_model_metadata
+from lumen.services.provider_metadata import catalog_model_metadata, direct_provider_route
 from lumen.services.providers.credentials import ProviderAuthRef, api_model_name, transport_model_name
 from lumen.services.providers.errors import ProviderSubscriptionError
+from lumen.services.usage_breakdown import UsageBreakdown
 
 _CONTRACT = "single-attempt-v1"
 _TIMEOUT = httpx.Timeout(90.0, connect=10.0, read=90.0, write=30.0, pool=10.0)
@@ -176,13 +179,27 @@ async def _sse_payloads(response: httpx.Response) -> AsyncIterator[dict[str, Any
         raise APIConnectionError()
 
 
+def check_openai_tier(payload: dict) -> None:
+    if "service_tier" in payload and payload["service_tier"] != "default":
+        raise OpenAIServiceTierMismatch()
+
+
+def _check_openai_usage(payload: dict, *, converted: bool, require_usage: bool) -> None:
+    raw = payload.get("provider_usage" if converted else "usage")
+    if raw is None and not require_usage:
+        return
+    usage = UsageBreakdown.from_responses(raw)
+    if usage is None or usage.modality_usage_invalid:
+        raise OpenAIUsageInvalid()
+
+
 class ProviderStream:
     """Owned HTTP stream; EOF requires a genuine protocol terminal."""
 
     def __init__(
         self, response: httpx.Response, client: httpx.AsyncClient, protocol: str,
         *, provider_auth: ProviderAuthRef | None = None, fingerprint: str | None = None,
-        subscription: bool = False,
+        subscription: bool = False, official_openai: bool = False, require_usage: bool = False,
     ) -> None:
         self._response = response
         self._client = client
@@ -191,6 +208,9 @@ class ProviderStream:
         self._ref = provider_auth
         self._fingerprint = fingerprint
         self._subscription = subscription
+        self._official_openai = official_openai
+        self._require_usage = require_usage
+        self._usage_reported = False
         self._closed = False
         self.completed = False
         self.completed_response: ProviderObject | None = None
@@ -205,6 +225,8 @@ class ProviderStream:
             payload = await self._source.__anext__()
             if payload == "[DONE]":
                 if self._protocol == "chat":
+                    if self._require_usage and not self._usage_reported:
+                        raise OpenAIUsageInvalid()
                     self.completed = True
                 await self.aclose()
                 if not self.completed:
@@ -213,9 +235,17 @@ class ProviderStream:
             kind = payload.get("type")
             if payload.get("error") is not None or kind in {"error", "response.failed"}:
                 raise APIConnectionError()
+            if self._official_openai and self._protocol != "responses":
+                check_openai_tier(payload)
+                if payload.get("provider_usage") is not None:
+                    _check_openai_usage(payload, converted=True, require_usage=True)
+                    self._usage_reported = True
             if self._protocol == "responses" and kind == "response.completed":
                 if payload.get("response", {}).get("status") != "completed":
                     raise APIConnectionError()
+                if self._official_openai:
+                    check_openai_tier(payload["response"])
+                    _check_openai_usage(payload["response"], converted=False, require_usage=self._require_usage)
                 self.completed = True
                 self.completed_response = provider_object(payload)
             elif self._protocol == "responses" and kind == "response.incomplete":
@@ -265,6 +295,11 @@ async def _execute(
     if any(name.lower() in {"authorization", "proxy-authorization", "x-api-key", "host", "chatgpt-account-id"}
            for name in (headers or {})):
         raise ValueError("provider_headers_reserved")
+    official_openai = (
+        provider == "openai" and protocol in {"chat", "responses", "messages"}
+        and direct_provider_route(provider, api_base)
+    )
+    require_usage = official_openai and body.get("model") in {"gpt-6.2-sol", "gpt-6.2-astra"}
     try:
         base_url, token = await get_bifrost_runtime()
     except BifrostRuntimeError:
@@ -332,13 +367,17 @@ async def _execute(
             if "text/event-stream" not in response.headers.get("content-type", ""):
                 raise APIConnectionError()
             return ProviderStream(response, client, protocol, provider_auth=provider_auth,
-                                  fingerprint=fingerprint, subscription=subscription)
+                                  fingerprint=fingerprint, subscription=subscription,
+                                  official_openai=official_openai, require_usage=require_usage)
         try:
             value = response.json()
         except (ValueError, UnicodeError):
             raise APIConnectionError() from None
         if not isinstance(value, dict) or value.get("error") is not None:
             raise APIConnectionError()
+        if official_openai:
+            check_openai_tier(value)
+            _check_openai_usage(value, converted=protocol != "responses", require_usage=require_usage)
         if protocol == "chat":
             choices = value.get("choices")
             if not isinstance(choices, list) or not choices or not all(
@@ -397,7 +436,7 @@ async def _completion(
         raise ValueError("provider_transport_options_reserved")
     if native_web_search is not None:
         options["web_search_options"] = dict(native_web_search)
-    if max_tokens is not None:
+    if max_tokens is not None and "max_completion_tokens" not in options:
         options["max_tokens"] = max_tokens
     if temperature is not None:
         options["temperature"] = temperature
@@ -456,8 +495,10 @@ async def aresponses(
     parallel_tool_calls: bool | None = None, prompt_cache_key: str | None = None,
     reasoning: dict | None = None, temperature: float | None = None, text: dict | None = None,
     tool_choice: Any = None, tools: list[dict] | None = None, top_p: float | None = None,
+    max_tool_calls: int | None = None,
     truncation: str | None = None, user: str | None = None, service_tier: str | None = None,
     safety_identifier: str | None = None, context_management: list[dict] | None = None,
+    prompt_cache_options: dict | None = None, prompt_cache_retention: str | None = None,
     provider_once: bool = False,
 ) -> Any:
     provider = _provider(model, custom_llm_provider)
@@ -470,6 +511,8 @@ async def aresponses(
                     reasoning=reasoning, temperature=temperature, text=text, tool_choice=tool_choice,
                     tools=tools, top_p=top_p, truncation=truncation, user=user, service_tier=service_tier,
                     safety_identifier=safety_identifier, context_management=context_management)
+    optional.update(prompt_cache_options=prompt_cache_options, prompt_cache_retention=prompt_cache_retention,
+                    max_tool_calls=max_tool_calls)
     body = {key: value for key, value in optional.items() if value is not None}
     body.update(model=_model(model, provider), input=input, stream=stream)
     return await _execute("responses", provider, body, api_base=api_base, api_key=api_key, provider_auth=provider_auth)

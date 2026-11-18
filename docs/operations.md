@@ -731,6 +731,26 @@ administrators register their IDs and required rates explicitly.
    and gaps in the change evidence. Source/local tests do not establish provider or
    production acceptance, and a catalog edit does not authorize a deployment.
 
+GPT-6.2 Sol and Astra use exact Standard and over-272,000 whole-request tariffs
+from [OpenAI pricing](https://developers.openai.com/api/docs/pricing). Keep
+`max_input_tokens` (922,000) distinct from the 1,050,000-token context window
+and the 128,000-token output limit. Explicit administrator rates still win.
+Clear a manual base rate to activate its catalog long-context tier; matching
+the catalog's short-context number does not turn a manual price into a tier.
+Published Cyber/Rosalind prices do not grant access. Unpublished long-context
+cache-write rates remain unavailable, not copies of the short-context rate.
+
+For official OpenAI text, use Standard processing. Online routes with known
+catalog limits reserve worst-case token cost before dispatch. Metered Responses
+tools add a bound based on `max_tool_calls` (default 10, maximum 20). Web Search
+is $0.01 per output call. Auto Code Interpreter/Shell containers are billed
+one full 20-minute block per distinct reported container at the request's
+memory tier. This may exceed OpenAI's per-minute invoice. Only GPT-6.2 Sol/Astra
+have the metered hosted tool policy here; no explicit container or provider file
+reuse is permitted. Missing usage, missing container IDs, a nonstandard tier
+or tracking beyond the held bound leaves a content-free `unknown` reservation
+for operator disposition; do not retry the original request to settle it.
+
 For Gemini Decisions, review the [model card](https://aistudio.google.com/docs/models/gemini-decision-1),
 [API contract](https://aistudio.google.com/docs/decisions-api) and
 [paid price](https://aistudio.google.com/docs/pricing#gemini-decision) together. The

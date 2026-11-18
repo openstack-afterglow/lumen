@@ -2266,7 +2266,7 @@ class TestStatelessModalityBilling:
         common = {"resolved": route, "user_id": "u1", "project_id": "p1", "api_key_id": 7}
         if protocol == "chat":
             if stream:
-                return [event async for event in core.complete_stream(
+                return [event async for event in await core.complete_stream(
                     **common, messages=messages, max_tokens=64, temperature=None,
                 )]
             return await core.complete_once(**common, messages=messages, max_tokens=64, temperature=None)
