@@ -976,7 +976,7 @@ class TestOpenAILumenVirtualModel:
     def _use_execution_route_for_summary(self, monkeypatch):
         """Keep virtual-model tests independent of provider-route persistence."""
 
-        async def resolve_summary_route(execution_route):
+        async def resolve_summary_route(execution_route, *, domain_paid=False):
             return execution_route
 
         monkeypatch.setattr(
@@ -1615,7 +1615,7 @@ class TestOpenAILumenVirtualModel:
         async def fake_precheck(*_args, **_kwargs):
             return None
 
-        async def unavailable_summary_route(_route):
+        async def unavailable_summary_route(_route, *, domain_paid=False):
             raise HTTPException(status_code=503, detail="summary storage unavailable")
 
         monkeypatch.setattr(core, "resolve", fake_resolve)

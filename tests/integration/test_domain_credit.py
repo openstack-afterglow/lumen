@@ -399,6 +399,39 @@ async def test_settle_release_replay_and_actor_quota(pool_scope):
     assert (summary["total_credited_cost"], summary["quota_used"], summary["quota_max"]) == (3, 3, 5)
 
 
+async def test_admin_topup_lookup_recovers_committed_outcome(pool_scope):
+    scope = pool_scope
+    app = FastAPI()
+    app.include_router(domain_pools.router, prefix="/v1")
+    app.dependency_overrides[require_admin] = lambda: {"user_id": "billing-admin"}
+    path = f"/v1/admin/domain-pools/{scope.id}/topups"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        posted = await client.post(path, json={"amount_credits": "12.5", "note": "invoice 7"},
+                                   headers={"Idempotency-Key": "recover-me"})
+        assert posted.status_code == 200
+        found = await client.get(f"{path}/recover-me")
+        assert found.status_code == 200
+        body = found.json()
+        assert body["found"] is True
+        entry = body["entry"]
+        assert set(entry) == {"kind", "amount_credits", "balance_after", "note", "created_at", "actor_user_id"}
+        assert (entry["kind"], Decimal(entry["amount_credits"]), Decimal(entry["balance_after"])) == (
+            "topup", Decimal("12.5"), Decimal("12.5"),
+        )
+        assert (entry["note"], entry["actor_user_id"]) == ("invoice 7", "billing-admin")
+        missing = await client.get(f"{path}/never-sent")
+        assert (missing.status_code, missing.json()) == (200, {"found": False, "entry": None})
+        # The key is namespaced per domain, so another domain never sees this top-up.
+        other = await client.get(f"/v1/admin/domain-pools/other-{scope.id}/topups/recover-me")
+        assert other.json() == {"found": False, "entry": None}
+
+        def forbidden():
+            raise HTTPException(403, "system administrator required")
+
+        app.dependency_overrides[require_admin] = forbidden
+        assert (await client.get(f"{path}/recover-me")).status_code == 403
+
+
 async def test_pool_routes_require_current_manager_and_serialize_admin_limits(pool_scope, monkeypatch):
     scope = pool_scope
     app = FastAPI()

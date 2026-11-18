@@ -18,7 +18,8 @@ from pydantic_core import PydanticCustomError
 from lumen.auth import require_admin
 from lumen.services import model_discovery
 from lumen.services.native_catalog import ModelKind, catalog_response, validate_embedding_metadata
-from lumen.services.providers import accounts, billing, credentials, errors, repository, subscriptions
+from lumen.services.providers import accounts, billing, credentials, errors, repository, routing, subscriptions
+from lumen.services.providers.pricing import domain_billing_readiness, frozen_token_pricing
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
@@ -870,6 +871,29 @@ async def list_models(active_only: bool = False):
 async def get_native_catalog(provider_type: Literal["openai", "anthropic", "gemini", "perplexity"] | None = None):
     """Return the bundled, reviewed official catalog without network or database I/O."""
     return catalog_response(provider_type=provider_type)
+
+
+@router.get("/admin/title-model")
+async def get_title_model():
+    """Configured title/compaction model and whether domain-paid compaction can use it.
+
+    Title and memory jobs stay system-funded. Only in-run compaction is domain-paid; when the
+    title model is not domain-billing ready, domain-paid runs compact with their own chat model.
+    """
+    try:
+        route = await routing.resolve_title_model()
+    except errors.ChatStorageUnavailable as exc:
+        raise _map_storage(exc) from exc
+    if route is None:
+        return {"model_id": None, "model_name": None, "domain_billing": None,
+                "domain_compaction_route": "execution_model"}
+    readiness = domain_billing_readiness(route.get("capabilities") or {}, frozen_token_pricing(route))
+    return {
+        "model_id": route["model_id"],
+        "model_name": route["model_name"],
+        "domain_billing": readiness,
+        "domain_compaction_route": "title_model" if readiness["ready"] else "execution_model",
+    }
 
 
 @router.put("/admin/title-model", status_code=204)
