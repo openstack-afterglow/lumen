@@ -37,7 +37,6 @@ logger = logging.getLogger(__name__)
 
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
-_MAX_IMAGE_PIXELS = 40_000_000
 _MAX_PDF_BYTES = 32 * 1024 * 1024
 _MAX_PDF_PAGES = 200
 _MAX_AUDIO_BYTES = 25 * 1024 * 1024
@@ -56,7 +55,8 @@ _GENERATED_TEXT_MIMES = {
     "text/markdown",
     "text/plain",
 }
-_ALLOWED_GENERATED_MIMES = _ALLOWED_MIMES | _GENERATED_TEXT_MIMES
+_GENERATED_IMAGE_MIMES = {"image/gif", "image/svg+xml"}
+_ALLOWED_GENERATED_MIMES = _ALLOWED_MIMES | _GENERATED_TEXT_MIMES | _GENERATED_IMAGE_MIMES
 _CONTROL_OR_PATH = re.compile(r"[\x00-\x1f\x7f/\\]+")
 _BUCKET_BASE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _MEDIA_TYPE = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
@@ -184,10 +184,10 @@ def asset_pipeline_available() -> bool:
 _MAX_PARSER_OUTPUT_BYTES = 64 * 1024
 
 
-def _inspect_with_bounded_child(path: Path) -> tuple[str, dict[str, int]]:
+def _inspect_with_bounded_child(path: Path, *, special_image: str | None = None) -> tuple[str, dict[str, int]]:
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "lumen.services.asset_inspector", str(path)],
+            [sys.executable, "-m", "lumen.services.asset_inspector", str(path), *([special_image] if special_image else [])],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -253,6 +253,13 @@ def inspect_generated_file(path: Path, *, original_name: str, media_type: str) -
         if inspected.mime_type != normalized_media_type:
             raise AssetError("생성 파일 형식이 선언된 MIME과 일치하지 않습니다")
         return inspected
+    if normalized_media_type in _GENERATED_IMAGE_MIMES:
+        detected, metadata = _inspect_with_bounded_child(path, special_image=normalized_media_type)
+        if detected != normalized_media_type:
+            raise AssetError("생성 파일 형식이 선언된 MIME과 일치하지 않습니다")
+        with path.open("rb") as source:
+            digest = hashlib.file_digest(source, "sha256").hexdigest()
+        return InspectedAsset(detected, size, digest, metadata, _sanitized_name(original_name))
 
     try:
         text = path.read_text(encoding="utf-8")
@@ -657,7 +664,7 @@ async def provider_content_for_input_parts(
         if (
             asset.status != "clean"
             or (expected_mime is not None and asset.mime_type != expected_mime)
-            or (expected_mime is None and not asset.mime_type.startswith("image/"))
+            or (expected_mime is None and asset.mime_type not in _IMAGE_MIMES)
         ):
             raise AssetError("input asset is not ready")
         url = await signed_download_url(asset_id=asset.id, user_id=user_id, project_id=project_id)

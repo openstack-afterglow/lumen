@@ -578,3 +578,56 @@ async def test_provider_input_materializes_clean_pdf_only_when_document_gate_is_
 
 def test_asset_error_maps_cross_project_access_to_forbidden():
     assert asset_api._map_error(assets.AssetError("asset forbidden")).status_code == 403
+
+
+@pytest.mark.parametrize("frames,accepted", [(1, False), (2, True), (16, True), (17, False)])
+def test_generated_gif_inspection_bounds_each_animation(tmp_path, frames, accepted):
+    from PIL import Image
+
+    path = tmp_path / "content"
+    images = [Image.new("RGB", (4, 4), (index * 10, 0, 0)) for index in range(frames)]
+    images[0].save(path, format="GIF", save_all=True, append_images=images[1:], duration=200, loop=0)
+    if accepted:
+        assert asset_inspector.inspect(path, "image/gif") == {
+            "mime_type": "image/gif", "metadata": {"width": 4, "height": 4, "frame_count": frames},
+        }
+        if sys.platform != "darwin":
+            result = assets.inspect_generated_file(path, original_name="image.gif", media_type="image/gif")
+            assert result.mime_type == "image/gif" and result.metadata["frame_count"] == frames
+    else:
+        with pytest.raises(ValueError, match="GIF"):
+            asset_inspector.inspect(path, "image/gif")
+
+
+@pytest.mark.parametrize("markup", [
+    b"<?xml-stylesheet href='https://example.invalid/theme.css'?>",
+    b"<!DOCTYPE svg>",
+    b"<script/>",
+    b"<style/>",
+    b"<foreignObject/>",
+    b"<image href='https://example.invalid/raster.png'/>",
+    b"<path onload=''/>",
+    b"<path fill='url(https://example.invalid/paint)'/>",
+])
+def test_generated_svg_inspector_rejects_nonstatic_content(tmp_path, markup):
+    path = tmp_path / "content"
+    if markup.startswith((b"<!", b"<?")):
+        path.write_bytes(markup + b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+    else:
+        path.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg">' + markup + b"</svg>")
+    with pytest.raises(ValueError, match="unsupported SVG"):
+        asset_inspector.inspect(path, "image/svg+xml")
+
+
+def test_generated_svg_inspector_accepts_static_utf8_vector_with_local_paint(tmp_path):
+    path = tmp_path / "content"
+    path.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><title>그림</title>'
+        '<defs><linearGradient id="paint"><stop stop-color="#abc"/></linearGradient></defs>'
+        '<path d="M0 0L1 1" fill="url(#paint)"/></svg>', encoding="utf-8",
+    )
+    assert asset_inspector.inspect(path, "image/svg+xml") == {"mime_type": "image/svg+xml", "metadata": {}}
+    if sys.platform != "darwin":
+        result = assets.inspect_generated_file(path, original_name="image.svg", media_type="image/svg+xml")
+        assert result.mime_type == "image/svg+xml"
+        assert result.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()

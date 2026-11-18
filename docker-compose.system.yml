@@ -262,7 +262,7 @@ services:
       CHAT_CLAMAV_HOST: clamav
       CHAT_CLAMAV_PORT: "3310"
       LUMEN_BOOTSTRAP_MODELS_JSON: >-
-        [{"provider":"openai","model_name":"gpt-image-1","model_kind":"image","media_pricing":{"image_variants":{"1024x1024:high":"0.05"}}},
+        [{"provider":"openai","model_name":"gpt-image-2","model_kind":"image","media_pricing":{"image_variants":{"1024x1024:high":"0.05"}}},
          {"provider":"openai","model_name":"tts-1","model_kind":"tts","media_pricing":{"billing_basis":"characters","audio_per_character":"0.000015"}},
          {"provider":"openai","model_name":"whisper-1","model_kind":"stt","media_pricing":{"audio_input_per_minute":"0.006"}}]
       REDIS_URL: redis://redis:6379/0

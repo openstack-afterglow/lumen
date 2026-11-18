@@ -425,9 +425,9 @@ Media reservation은 provider I/O 직전에 user wallet row lock으로 월·주�
 
 ### OpenAI image·음성·realtime 모델 커버리지 (2026-11-10, source only)
 
-지원 모델 ID와 kind별 wire는 [API reference](api-reference.md#이미지유한-오디오실시간-음성)가 정본이다. 배포 전에는 이 코드가 운영 API/worker에 없으므로 운영 `gpt-image-*` 모델 행은 관리자가 `billing_basis: "tokens"`와 양의 `reservation_usd`(및 text input 가격) 또는 정확한 `image_variants`를 설정해야 실행된다. `media_pricing`에 `token_rates`만 있고 기준이 없으면 기존처럼 unit 과금이며 variants가 없어 실행되지 않는다. Realtime 전사·번역은 입력 PCM 분 단가(`realtime_input_per_minute`), 라이브는 `realtime_session_per_minute`를 설정한다(공식 가격표 기준 gpt-live-1 0.05, gpt-realtime-translate 0.034, gpt-live-transcribe·gpt-realtime-whisper 0.017 USD/분이며 값은 운영자가 최신 표로 재확인한다). 2026-11-10에 운영 계정 키로 공식 OpenAI에 대해 실제 호출을 확인했다. 실행 방식은 검토 중인 `lumen/`을 실행 중인 worker 컨테이너의 임시 경로에 올려 Lumen 자신의 transport·relay 코드를 호출한 것이며 서비스 재시작과 DB 쓰기는 없었고 확인 후 임시 코드를 삭제했다. 관측 범위: 이미지 7개 모델 생성·편집, 사용자 지정 size, `xhigh`, `complexity`, `n=2`; TTS 3개; STT 4개; relay로 대화 6개, 전사 2개, 번역 1개, 라이브 1개와 kind별 whitelist 거절 3건. 운영 API·DB admission·과금을 통한 종단 확인은 배포 후 별도 smoke가 필요하다. 이미지 token 기준은 `gpt-image-2.6-*`의 `max` quality가 1024² 한 장에서도 수천 token을 쓸 수 있으므로 reservation을 충분히 잡아야 하고 큰 사용자 지정 size는 더 크게 필요하다.
+지원 모델 ID와 kind별 wire는 [API reference](api-reference.md#이미지유한-오디오실시간-음성)가 정본이다. 2026-11-10 운영 계정 키로 공식 OpenAI에 대해 transport 단독 호출을 확인했다. 실행 worker 컨테이너에 임시 `lumen/`을 올려 서비스 재시작·DB 쓰기 없이 호출하고 제거했다. 관측 범위: 이미지 7개 모델 생성·편집, 사용자 지정 size, `xhigh`, `complexity`, `n=2`; TTS 3개; STT 4개; relay 대화 6개, 전사 2개, 번역 1개, 라이브 1개와 kind별 whitelist 거절 3건. 이 기록은 새 catalog 과금, GIF/SVG entitlement 또는 배포를 검증한 것이 아니다.
 
-토큰 기준(`billing_basis: "tokens"`) 이미지·realtime 대화 모델은 provider usage에 캐시된 텍스트·오디오·이미지 token이 포함될 수 있다(예: realtime 응답의 `cached_tokens`는 반복되는 instructions 접두부에서 나온다). 해당 방향의 캐시 읽기 단가(모델의 `cache_read_price_per_million`과 `token_rates.<modality>.cache_read_per_million`)가 없으면 Lumen은 가격을 추정하지 않고 run을 `provider_result_unknown`/hold `unknown`으로 남긴다. 사용자 응답은 정상이어도 정산이 보류되므로 token 기준 모델은 캐시 읽기 단가를 함께 등록한다. 2026-11-10 로컬 실제 호출에서 캐시 단가 없는 `gpt-realtime`·`-mini`·`-1.5`가 반복 호출 시 간헐적으로 이 상태가 되었고 단가 추가 후 12회 모두 `completed`였다. 로컬 실제 공급자 스택(MariaDB·Redis·TLS MinIO·ClamAV·API·worker, 합성 Keystone)에서 이미지 8개 모델 중 `gpt-image-1`만 계정에 없는 모델(`The model 'gpt-image-1' does not exist.`)이라 실패했다.
+토큰 기준에서 미설정 단가의 캐시 사용량은 `provider_result_unknown`/hold `unknown`으로 남긴다. 2026-11-10 로컬 실제 호출에서 캐시 단가 없는 `gpt-realtime`·`-mini`·`-1.5`가 반복 호출 시 간헐적으로 이 상태가 되었고 단가 추가 후 12회 모두 `completed`였다. 당시 로컬 실제 공급자 스택에서 `gpt-image-1`만 계정에 없는 모델로 실패했다. 현재 종료된 `gpt-image-1`은 실행 allowlist에서 제거했다. Direct OpenAI Images의 cache 적용 범위와 예약 방법은 [이미지 자금 예약 정책](#openai-images-funding-policy)을 참조한다.
 
 **동시 admission·지갑·거절 정산 (이번 변경에서 수정).** (1) 마이그레이션 `030_chat_runs_idempotency_index.sql`이 `chat_runs (project_id, user_id, client_request_id)` unique 인덱스 `uq_chat_runs_idempotency`를 만든다. ORM 모델은 처음부터 선언했지만 baseline이 만들지 않아, 같은 멱등 키의 동시 admission은 `SELECT ... FOR UPDATE`의 gap 락으로만 직렬화됐고 같은 gap 락이 같은 provider 동시 admission을 MariaDB 1213 교착(HTTP 500)시켰다(로컬 동시 이미지 8건 중 7건). 이제 이미지·오디오·realtime admission은 READ COMMITTED로 실행하고 unique 인덱스가 권위가 된다. 경합한 중복은 1062로 실패하고 기존 `IntegrityError` 경로가 승자 run을 돌려준다. **인덱스 없이 READ COMMITTED만 적용하면 같은 키 12건이 run 12개로 admitted되므로(중복 실행·과금) API보다 migration을 먼저 적용해야 한다.** 중복 키가 있는 DB에서는 `1062`로 중단되므로 적용 전에 `SELECT project_id, user_id, client_request_id, COUNT(*) FROM chat_runs GROUP BY project_id, user_id, client_request_id HAVING COUNT(*) > 1;`를 확인한다(운영 DB는 2026-11-10 읽기 전용 조회에서 36행·중복 0건). (2) `credit._get_or_create_wallet`은 지갑이 없으면 no-op `INSERT ... ON DUPLICATE KEY UPDATE`와 잠금 재조회로 만들고, `credit.precheck`는 REPEATABLE READ 스냅샷을 쥐므로 잠금 충돌(1020/1205/1213)을 `budgets.retry_deadlocks`로 재시도한다. 신규 사용자의 동시 첫 요청이 더 이상 wallet 기본 키 중복이나 교착으로 실패하지 않는다. (3) 온라인 이미지·TTS·STT에서 provider 거절의 HTTP 상태가 기존 `_REJECTION_STATUSES`(400, 401, 403, 404, 413, 415, 422, 429)에 있으면 추론 이전의 거절로 보고 run을 `provider_rejected`로 실패시키며 hold를 같은 트랜잭션에서 0원으로 정산한다(이전에는 Batch만). 그 밖의 실패는 계속 `provider_result_unknown`/hold `unknown`이다. 호출자는 400(400/413/415/422), 429, 502(401/403/404, 운영자 설정 문제)를 받고 메시지에 provider 숫자 상태가 들어간다. **provider가 거절된 미디어 요청에 실제로 과금하는지는 확인하지 않았다(예: 생성 후 safety 차단).** 청구서와 대조하고, 과금이 확인되면 이 규칙을 좁혀야 한다.
 
@@ -709,9 +709,10 @@ administrators register their IDs and required rates explicitly.
    threshold can be represented by the preceding integer, with the source condition
    explained in `notes`. Never substitute a global 200K boundary.
 4. Use the existing media-pricing shape only when the published tariff fits it exactly.
-   Token-basis media requires a positive administrator funding reservation; a provider
-   tariff does not publish that envelope. Leave unsupported media prices null and explain
-   the missing shape in `notes`; never invent a reservation or approximate a unit tariff.
+   Published rates never define a funding hold. Direct OpenAI Images derives
+   a hold per request (below); transports without a derived policy require a
+   positive operator `reservation_usd`. Leave unsupported published rates null
+   and explain the missing evidence in `notes`; never approximate a unit tariff.
    Additional provider search, storage, grounding or tool charges documented in notes are
    not silently included in token prices.
    Unit-priced image entries must include exact `image_variants` for every supported
@@ -719,8 +720,8 @@ administrators register their IDs and required rates explicitly.
    a route executable. The 2026-11-18 review of [Gemini pricing](https://aistudio.google.com/docs/pricing#gemini-2.5-flash-image)
    and the [model specification](https://aistudio.google.com/docs/models/gemini-2.5-flash-image)
    confirms Gemini 2.5 Flash Image output costs 1,290 tokens × $30/1M = $0.039/image.
-   Its four Lumen aspect-ratio size presets with quality auto share that rate; no
-   other model price or administrator override changes in this catalog revision.
+   Its four Lumen aspect-ratio size presets with quality auto share that rate.
+   Stored administrator media prices retain precedence over bundled prices.
 5. Run `pytest tests/test_provider_catalog.py tests/test_chat_native_catalog_admin.py`
    in the service development environment, then the focused capability/pricing suites
    for affected models. The loader rejects unknown fields, bad kinds, duplicate IDs or
@@ -730,6 +731,65 @@ administrators register their IDs and required rates explicitly.
    prices, capabilities, cache rates and media availability. Record intentional changes
    and gaps in the change evidence. Source/local tests do not establish provider or
    production acceptance, and a catalog edit does not authorize a deployment.
+
+### OpenAI Images funding policy
+
+The [OpenAI Images guide](https://developers.openai.com/api/docs/guides/image-generation.md)
+and [pricing](https://developers.openai.com/api/docs/pricing) govern the direct
+token tariffs. An active native API-key route with a ready asset pipeline can
+use bundled rates without a manual price. `billing_basis: "tokens"` is explicit;
+an operator may still set a positive whole-request `reservation_usd` to replace
+the computed hold. GPT Image 2/2.5 cached rates are for the Responses image tool,
+not direct Images. GPT Image 2.6 direct cache billing is not documented; Lumen
+rejects unexpected modern Images cache usage rather than guessing.
+
+The default hold is **not** a tariff or hard provider limit. Lumen computes:
+
+- For each GPT Image 2+ output, choose the [official calculator](https://developers.openai.com/api/docs/guides/image-generation)
+  grid `L`: GPT Image 2 uses 16/48/96 for low/medium/high; 2.5/2.6 use
+  16/24/48/64/96 for low/medium/high/xhigh/max. Round `q = L × short / long`
+  half-to-even; `base = ceil(L × q × (2,000,000 + W×H) / 4,000,000)`.
+  For 2.6 round `base × 4.2` (low) or `base × 3.3` (medium) to nearest,
+  with halves up. Use 2880×2880 for `size:auto`, and high (2) or max
+  (2.5/2.6) for `quality:auto`. These maximize modeled cost independently.
+- Older preset models use their published image output estimates (per
+  size/quality, worst legal when auto), plus $0.001 to cover price rounding,
+  converted to tokens using the published image output rate.
+- Reserve `ceil(1.5 × estimate)` tokens per image, or per GIF frame. The 50%
+  headroom allows estimator variance; only actual aggregate provider usage
+  bills. Multiply by `n` and for GIF by `frame_count` (default 9).
+- Reserve one text input token per UTF-8 prompt byte plus 256 for hidden
+  request framing. For edits add `8192 + 512 × ceil(Wsrc/256) × ceil(Hsrc/256)`
+  input-image tokens, using the scanner's validated dimensions. OpenAI does
+  not publish GPT Image edit-input token counts. This Lumen policy budgets
+  more than its historical tile/fidelity overhead without treating that old
+  tariff as the current model's formula.
+- For SVG, add an authoring envelope for `prompt_bytes + 65,536` input
+  tokens and 32,768 output tokens. This covers space for the prompt, reference
+  image and hidden input, plus a vector document and reasoning. Admission
+  freezes exact native text model IDs and published rates (including context
+  tiers) and reserves at the highest combined candidate cost. It does not
+  request privileged author-model selection. Settlement requires a consistent
+  `svg_usage`, an exact frozen author ID, and rates sufficient to price its
+  unsplit input/output counts. Reasoning is already included in output.
+- Sum each quantity × its matching USD/token rate; round the derived USD
+  envelope up to 10 decimal places. Apply frozen margin and credit conversion.
+  Admission checks available headroom without charging; the worker atomically
+  rechecks and records the actual reservation before the one provider call.
+
+With a four-byte prompt `Draw`, before margin/credit conversion: 2.5
+high 1024×1024 (`n=1`) holds 2,634 output tokens → **$0.080320**;
+2.6 `auto:auto`, `n=2`, holds 71,158 output tokens → **$2.136040**;
+the first request as an edit with a 1024×1024 source additionally holds
+16,384 image-input tokens → **$0.211392** total.
+
+Settlement multiplies observed token categories by frozen rates, never debits
+the hold itself, and fails closed on missing, inconsistent, unpriced or
+over-hold usage. Keep an unknown hold for reconciliation; never retry a paid
+operation automatically. Project-level SVG/GIF preview access, actual
+estimator variance, and invoice parity require separate provider acceptance.
+
+### Gemini Decisions catalog
 
 For Gemini Decisions, review the [model card](https://aistudio.google.com/docs/models/gemini-decision-1),
 [API contract](https://aistudio.google.com/docs/decisions-api) and

@@ -28,10 +28,15 @@ from lumen.services.durable_runs import errors as durable_errors
 from lumen.services.durable_runs import queries
 from lumen.services.durable_runs.images import image_result
 from lumen.services.durable_runs.media import rejection_http_response
+from lumen.services.providers.errors import ProviderValidationError
+from lumen.services.providers.image_transport import IMAGE_OPTION_KEYS, reject_streaming
 
 router = APIRouter()
 _POLL_INTERVAL_SECONDS = 0.25
-_EDIT_FIELDS = frozenset({"image", "prompt", "model", "n", "size", "quality", "complexity", "response_format", "provider", "provider_id"})
+_EDIT_FIELDS = frozenset({
+    "image", "prompt", "model", "n", "size", "quality", "response_format", "provider", "provider_id",
+    "stream", "partial_images", *IMAGE_OPTION_KEYS,
+})
 
 
 def _compat_error(exc: HTTPException) -> JSONResponse:
@@ -41,14 +46,6 @@ def _compat_error(exc: HTTPException) -> JSONResponse:
 
 def _failure(exc: Exception) -> JSONResponse:
     return _compat_error(image_error(exc))
-
-
-def _request(
-    model: str, prompt: str, n: int, size: str, quality: str, provider_id: int | None = None,
-    complexity: str | None = None,
-) -> ImageGenerationRequest:
-    return ImageGenerationRequest(model_id=model, provider_id=provider_id, prompt=prompt, n=n, size=size,
-                                  quality=quality, complexity=complexity)
 
 
 async def _replayed_source(path: Path, key: uuid.UUID, principal: Principal) -> str | None:
@@ -140,7 +137,7 @@ async def generate_image(
         return openai_error_response(400, "Specify only one of provider and provider_id")
     try:
         admitted = await admit(
-            _request(body.model, body.prompt, body.n, body.size, body.quality, body.provider_id, body.complexity),
+            ImageGenerationRequest(model_id=body.model, **body.model_dump(exclude={"model", "provider", "response_format"})),
             principal=principal,
             idempotency_key=idempotency_key or uuid.uuid4(),
             api_provider=body.provider,
@@ -163,6 +160,13 @@ async def edit_image(
     size: str = Form("auto"),
     quality: str = Form("auto"),
     complexity: str | None = Form(None),
+    background: str | None = Form(None),
+    output_format: str | None = Form(None),
+    output_compression: int | None = Form(None),
+    frame_count: int | None = Form(None),
+    frame_duration_ms: int | None = Form(None),
+    stream: bool | None = Form(None),
+    partial_images: int | None = Form(None),
     response_format: str = Form("b64_json"),
     idempotency_key: uuid.UUID | None = Header(default=None, alias="Idempotency-Key"),
     principal: Principal = Depends(require_api_key_scopes("compat:images:write")),
@@ -177,7 +181,14 @@ async def edit_image(
     if provider is not None and provider_id is not None:
         return openai_error_response(400, "Specify only one of provider and provider_id")
     try:
-        payload = _request(model, prompt, n, size, quality, provider_id, complexity)
+        reject_streaming(stream=stream, partial_images=partial_images)
+        payload = ImageGenerationRequest(
+            model_id=model, provider_id=provider_id, prompt=prompt, n=n, size=size, quality=quality,
+            complexity=complexity, background=background, output_format=output_format,
+            output_compression=output_compression, frame_count=frame_count, frame_duration_ms=frame_duration_ms,
+        )
+    except ProviderValidationError as exc:
+        return openai_error_response(422, str(exc))
     except ValidationError as exc:
         return openai_error_response(400, str(exc), code="invalid_image_request")
     try:

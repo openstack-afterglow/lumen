@@ -80,7 +80,7 @@ async def batch_db(request, monkeypatch):
                                margin_multiplier=Decimal("1"))
         session.add(provider)
         await session.flush()
-        model = LlmModel(provider_id=provider.id, model_name="gpt-image-1", model_kind="image", is_active=True,
+        model = LlmModel(provider_id=provider.id, model_name="gpt-image-2", model_kind="image", is_active=True,
                          media_pricing={"image_variants": {"1024x1024:high": "0.04"}})
         session.add(model)
         await session.flush()

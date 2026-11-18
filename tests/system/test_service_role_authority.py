@@ -301,7 +301,7 @@ def _authority_payload(action, boundary, marker):
         return "/v1/chat/completions", payload
     if action == "images":
         return ("/v1/chat/images/generations" if native else "/v1/images/generations"), {
-            "model_id" if native else "model": "gpt-image-1", "prompt": marker,
+            "model_id" if native else "model": "gpt-image-2", "prompt": marker,
             "size": "1024x1024", "quality": "high", "n": 1,
         }
     assert action == "audio"

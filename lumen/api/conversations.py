@@ -138,6 +138,8 @@ async def get_chat_capabilities(
         routable = image_gate.get("available") is True
         result["available_image_variants"] = image_transport.available_image_variants(resolved) if routable else []
         result["max_image_count"] = image_transport.max_image_count(resolved) if routable else 0
+        if routable:
+            result.update(image_transport.available_image_options(resolved))
     if model_kind == "tts":
         audio_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("audio_output") or {}
         if audio_gate.get("available") is True:
