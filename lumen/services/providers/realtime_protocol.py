@@ -67,6 +67,8 @@ _NATIVE_STREAM_TRANSCRIPTS = {"session.input_transcript.delta": "transcript.inpu
                               "session.output_transcript.delta": "transcript.output.delta"}
 # GPT-Live accepts audio only after session.started.
 _LIVE_START_SECONDS = 10
+# GPT-Live's session.closed must arrive before the funded deadline's transport abort.
+_LIVE_CLOSE_MARGIN_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,49 @@ class AudioMeter:
     usage_state: str = "unmetered"
     # Monotonic seconds from completed upstream open handshake to completed close.
     connected_seconds: Decimal | None = None
+    # GPT-Live only: the provider's final billable voice seconds from ``session.closed`` and
+    # its state ("unmetered" for other kinds, "complete", "missing" or "invalid").
+    provider_seconds: Decimal | None = None
+    provider_seconds_state: str = "unmetered"
+
+
+def _usage_seconds(usage: object) -> Decimal | None:
+    value = usage.get("seconds") if isinstance(usage, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = Decimal(str(value))
+    return seconds if seconds.is_finite() and seconds >= 0 else None
+
+
+class LiveUsageMeter:
+    """GPT-Live voice seconds as the provider reports them; Lumen never substitutes its own clock.
+
+    ``session.usage.updated`` carries the cumulative total so far and is kept only as progress
+    (latest value, never summed). ``session.closed`` ``usage.seconds`` is the authoritative final
+    value. A missing, malformed or decreasing value leaves the session unsettleable.
+    """
+
+    def __init__(self) -> None:
+        self.progress: Decimal | None = None
+        self.final: Decimal | None = None
+        self.invalid = False
+
+    def observe(self, message: dict) -> None:
+        event = message.get("type")
+        if self.invalid or self.final is not None or event not in {"session.usage.updated", "session.closed"}:
+            return
+        seconds = _usage_seconds(message.get("usage"))
+        if seconds is None or (self.progress is not None and seconds < self.progress):
+            self.invalid = True
+        elif event == "session.closed":
+            self.final = seconds
+        else:
+            self.progress = seconds
+
+    def result(self) -> tuple[Decimal | None, str]:
+        if self.invalid:
+            return None, "invalid"
+        return self.final, "complete" if self.final is not None else "missing"
 
 
 def _not_less(before: UsageBreakdown, after: UsageBreakdown) -> bool:
@@ -631,6 +676,44 @@ async def _drain_final_usage(upstream, server: asyncio.Task, meter: TokenUsageMe
     return server, outgoing
 
 
+async def _drain_live_close(upstream, server: asyncio.Task, live: LiveUsageMeter, websocket, *, wire: str,
+                            send_close: bool, until: float, outgoing: int,
+                            output_limit: int) -> tuple[asyncio.Task, int]:
+    """Request GPT-Live's ``session.closed`` and read to it so provider seconds, not Lumen's clock, settle.
+
+    Frames still go to the client best-effort; a client that already left changes nothing here.
+    """
+    loop = asyncio.get_running_loop()
+    if send_close:
+        try:
+            await upstream.send(json.dumps({"type": "session.close"}))
+        except ConnectionClosed:
+            return server, outgoing
+    while live.final is None and not live.invalid:
+        remaining = until - loop.time()
+        if remaining <= 0:
+            break
+        done, _ = await asyncio.wait({server}, timeout=remaining)
+        if not done:
+            break
+        try:
+            parsed = _object(server.result())
+        except ConnectionClosed:
+            break
+        live.observe(parsed)
+        events, size = _provider_events(parsed, "openai", wire=wire, kind="live")
+        if outgoing + size > output_limit:
+            raise RealtimeTransportError("session output exceeds duration bound")
+        outgoing += size
+        server = asyncio.create_task(upstream.recv())
+        try:
+            for event in events:
+                await websocket.send_json(event)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+    return server, outgoing
+
+
 async def relay_audio(
     websocket: WebSocket,
     route: dict,
@@ -681,6 +764,7 @@ async def relay_audio(
     pending_transcriptions = 0
     finished_transcriptions: set[str] = set()
     tokens = TokenUsageMeter(provider) if token_usage else None
+    live = LiveUsageMeter() if kind == "live" else None
     spent = largest = Decimal(0)
     hold_reached = False
     loop = asyncio.get_running_loop()
@@ -693,9 +777,11 @@ async def relay_audio(
         usage, state = tokens.result() if tokens is not None else (None, "unmetered")
         if failed and tokens is not None and state != "invalid":
             state = "incomplete"
+        provider_seconds, provider_state = live.result() if live is not None else (None, "unmetered")
         return AudioMeter(incoming, outgoing, input_rate, 0 if kind == "transcription" else 24000,
                           usage=usage, usage_state=state,
-                          connected_seconds=elapsed)
+                          connected_seconds=elapsed, provider_seconds=provider_seconds,
+                          provider_seconds_state=provider_state)
 
     try:
         async with asyncio.timeout(None) as deadline, websockets.connect(
@@ -808,6 +894,8 @@ async def relay_audio(
                                 raise RealtimeTransportError("upstream realtime connection closed unexpectedly") from exc
                             break
                         parsed = _object(response)
+                        if live is not None:
+                            live.observe(parsed)
                         if tokens is not None:
                             added = tokens.observe(parsed)
                             if added is not None and token_hold is not None:
@@ -849,6 +937,14 @@ async def relay_audio(
                 if tokens is not None and tokens.pending:
                     server, outgoing = await _drain_final_usage(upstream, server, tokens, provider=provider,
                         wire=wire, outgoing=outgoing, output_limit=output_limit)
+                if live is not None and live.final is None and not live.invalid:
+                    # Only the provider's session.closed settles GPT-Live: request it on every
+                    # Lumen-side exit and drain inside the funded close window.
+                    server, outgoing = await _drain_live_close(
+                        upstream, server, live, websocket, wire=wire, send_close=closing_until is None,
+                        until=min(closing_until or loop.time() + _USAGE_DRAIN_SECONDS,
+                                  connected_at + max_duration_seconds - _LIVE_CLOSE_MARGIN_SECONDS),
+                        outgoing=outgoing, output_limit=output_limit)
                 if kind == "transcription" and pending_transcriptions:
                     # Deadline, idle, cancel, disconnect and clean upstream close must
                     # not turn an unfinished committed item into a successful terminal.

@@ -147,14 +147,55 @@ def test_input_only_duration_plans_reserve_and_settle_input_audio_seconds():
     assert cost.raw_cost == Decimal("0.0028333333")
 
 
-def test_live_bills_connected_session_seconds():
+def _live_checkpoint(*frames, connected="40"):
+    meter = realtime_protocol.LiveUsageMeter()
+    for frame in frames:
+        meter.observe(frame)
+    seconds, state = meter.result()
+    audio = AudioMeter(320, 320, 24000, 24000, connected_seconds=Decimal(connected), provider_seconds=seconds,
+                       provider_seconds_state=state)
+    # Settlement prices the durable JSON checkpoint, never the in-memory meter.
+    return json.loads(json.dumps(realtime._checkpoint(audio, "session")))
+
+
+def _usage_updated(seconds):
+    return {"type": "session.usage.updated", "usage": {"seconds": seconds}, "context_window": {"usage_ratio": 0.4}}
+
+
+def test_live_bills_the_providers_final_seconds_never_lumen_elapsed_time():
     plan = realtime_transport.validate_realtime_request(_route("gpt-live-1", _LIVE), max_duration_seconds=300)
     assert plan["billing_basis"] == "session" and plan["realtime_kind"] == "live"
     assert realtime._envelope_usd(plan, 300) == Decimal("0.25")
-    cost, components, _, summary = realtime._session_bill(_RUN, {**plan, "max_duration_seconds": 300},
-                                                          {"connected_seconds": "12.5"})
+    snapshot = {**plan, "max_duration_seconds": 300}
+    closed = {"type": "session.closed", "reason": "close_requested", "usage": {"seconds": 12.5}}
+    # Cumulative progress (4, 9, 12) is never summed; the close envelope's 12.5 s settles exactly.
+    checkpoint = _live_checkpoint(_usage_updated(4), _usage_updated(9), _usage_updated(12), closed)
+    assert (checkpoint["provider_seconds"], checkpoint["provider_seconds_state"]) == ("12.5", "complete")
+    cost, components, _, summary = realtime._session_bill(_RUN, snapshot, checkpoint)
     assert cost.raw_cost == Decimal("0.0104166667") and summary == {"session_seconds": "12.5"}
-    assert components[0]["kind"] == "realtime_session_seconds"
+    assert (components[0]["kind"], components[0]["quantity"], components[0]["metadata"]["usage_source"]) == (
+        "realtime_session_seconds", "12.5", "provider")
+    assert realtime._session_bill(_RUN, snapshot, _live_checkpoint(_usage_updated(3), {
+        "type": "session.closed", "usage": {"seconds": 3}}))[0].raw_cost == Decimal("0.0025")
+    unknown = [
+        _live_checkpoint(),  # provider ended without any usage
+        _live_checkpoint(_usage_updated(30)),  # progress only: disconnect before session.closed
+        _live_checkpoint({"type": "session.closed", "reason": "error"}),  # close without usage
+        _live_checkpoint({"type": "session.closed", "usage": {"seconds": "12"}}),  # malformed
+        _live_checkpoint({"type": "session.closed", "usage": {"seconds": True}}),
+        _live_checkpoint(_usage_updated(9), {"type": "session.closed", "usage": {"seconds": 8}}),  # decreased
+        _live_checkpoint(_usage_updated(9), _usage_updated(5)),
+        _live_checkpoint({"type": "session.closed", "usage": {"seconds": 300.5}}),  # above the held bound
+    ]
+    for checkpoint in unknown:
+        with pytest.raises(DurableRunProviderResultUnknown):
+            realtime._session_bill(_RUN, snapshot, checkpoint)
+    # Conversation models priced per session have no provider seconds and keep connected time.
+    conversation = {**realtime_transport.validate_realtime_request(_route("gpt-realtime", _LIVE)),
+                    "max_duration_seconds": 300}
+    cost, components, _, _ = realtime._session_bill(_RUN, conversation, {"connected_seconds": "12.5"})
+    assert cost.raw_cost == Decimal("0.0104166667")
+    assert components[0]["metadata"]["usage_source"] == "lumen_connected"
 
 
 def test_transcription_client_session_is_strict():
@@ -426,6 +467,7 @@ async def test_live_session_starts_from_admitted_values_and_drains_to_session_cl
     assert browser.events[-1] == {"type": "session.closed", "reason": "client_closed", "usage": {"seconds": 8.0}}
     assert (meter.input_bytes, meter.output_bytes) == (320, 640)
     assert meter.connected_seconds is not None
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (Decimal("8.0"), "complete")
 
 
 @pytest.mark.asyncio
@@ -438,6 +480,8 @@ async def test_close_drain_is_bounded_when_session_closed_never_arrives(monkeypa
         session_id="session", voice="marin", instructions=None, max_duration_seconds=30, wire="openai",
         is_canceled=_not_canceled, session_time=True), timeout=5)
     assert upstream.sent[-1] == {"type": "session.close"} and meter.output_bytes == 0
+    # No session.closed: the provider's final seconds are missing and settlement stays unknown.
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (None, "missing")
 
 
 @pytest.mark.asyncio
@@ -974,6 +1018,78 @@ async def test_native_live_waits_for_session_started_and_maps_studio_commands(mo
         {"type": "audio.output.delta", "delta": _PCM, "sample_rate_hz": 24000},
     ]
     assert (meter.input_bytes, meter.output_bytes) == (320, 320) and meter.connected_seconds is not None
+    # The cumulative 2 s progress is not added to the final 3 s from session.closed.
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (Decimal("3"), "complete")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", ["client_disconnect", "deadline", "canceled"])
+async def test_live_requests_session_closed_on_every_lumen_side_exit(monkeypatch, exit_path):
+    def react(sent):
+        if sent["type"] == "session.start":
+            return ({"type": "session.started"},)
+        if sent["type"] == "session.close":
+            return ({"type": "session.usage.updated", "usage": {"seconds": 6}},
+                    {"type": "session.closed", "reason": "close_requested", "usage": {"seconds": 6.25}})
+        return ()
+
+    upstream = ScriptedUpstream(react)
+    _connect(monkeypatch, upstream)
+
+    class Browser(ScriptedBrowser):
+        async def receive_text(self):
+            if exit_path == "client_disconnect":
+                raise WebSocketDisconnect(1001)
+            return await super().receive_text()
+
+    async def canceled():
+        return exit_path == "canceled"
+
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(Browser([]), _route("gpt-live-1", _LIVE),
+        session_id="session", voice="marin", instructions=None,
+        # The deadline path ends the relay window (max - close timeout) 1 s after connecting.
+        max_duration_seconds=6 if exit_path == "deadline" else 30, is_canceled=canceled,
+        session_time=True), timeout=10)
+    assert upstream.sent[-1] == {"type": "session.close"}
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (Decimal("6.25"), "complete")
+
+
+@pytest.mark.asyncio
+async def test_live_upstream_end_without_session_closed_leaves_usage_missing(monkeypatch):
+    from websockets.exceptions import ConnectionClosedOK
+    from websockets.frames import Close
+
+    closed = ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True)
+
+    class ClosingUpstream(ScriptedUpstream):
+        # The provider ends the socket cleanly after the user's audio, before any session.closed.
+        async def recv(self):
+            item = await self.queue.get()
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        async def send(self, message):
+            kind = json.loads(message)["type"]
+            if kind == "session.close":
+                raise closed
+            await super().send(message)
+            if kind == "session.input_audio.append":
+                await self.queue.put(closed)
+
+    upstream = ClosingUpstream(lambda sent: ({"type": "session.started"}, {
+        "type": "session.usage.updated", "usage": {"seconds": 4}}) if sent["type"] == "session.start" else ())
+    _connect(monkeypatch, upstream)
+    browser = ScriptedBrowser([{"type": "audio.input.append", "audio": _PCM}])
+    meter = await asyncio.wait_for(realtime_protocol.relay_audio(browser, _route("gpt-live-1", _LIVE),
+        session_id="session", voice="marin", instructions=None, max_duration_seconds=30,
+        is_canceled=_not_canceled, session_time=True), timeout=5)
+    # Progress (4 s) is never billed in place of the missing final value.
+    assert (meter.provider_seconds, meter.provider_seconds_state) == (None, "missing")
+    plan = realtime_transport.validate_realtime_request(_route("gpt-live-1", _LIVE), max_duration_seconds=30)
+    with pytest.raises(DurableRunProviderResultUnknown):
+        realtime._session_bill(_RUN, {**plan, "max_duration_seconds": 30}, json.loads(json.dumps(
+            realtime._checkpoint(meter, "session"))))
 
 
 @pytest.mark.asyncio

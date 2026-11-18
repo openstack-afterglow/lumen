@@ -124,6 +124,12 @@ def _checkpoint(meter, basis: str) -> dict:
     if basis == "session":
         seconds = meter.connected_seconds
         usage["connected_seconds"] = format(seconds, "f") if isinstance(seconds, Decimal) else None
+        state = meter.provider_seconds_state
+        if state != "unmetered":
+            # GPT-Live's own final voice seconds; Lumen's connected time stays evidence only.
+            usage["provider_seconds_state"] = state
+            usage["provider_seconds"] = (format(meter.provider_seconds, "f")
+                                         if isinstance(meter.provider_seconds, Decimal) else None)
     if basis == "tokens":
         usage["usage_state"] = meter.usage_state
         usage["usage"] = meter.usage.as_usage_dict() if meter.usage is not None else None
@@ -170,7 +176,16 @@ def _duration_bill(run: ChatRun, snapshot: dict, usage: dict):
 
 
 def _session_bill(run: ChatRun, snapshot: dict, usage: dict):
-    raw = usage.get("connected_seconds")
+    """Bill session seconds: GPT-Live's provider-reported final value, else Lumen-connected time.
+
+    GPT-Live publishes authoritative usage in ``session.closed``, so its absence, invalidity or
+    a value above the held bound leaves the hold unknown; local elapsed time never stands in.
+    Conversation models priced per session (no provider seconds published) bill connected time.
+    """
+    live = snapshot.get("realtime_kind") == "live"
+    if live and usage.get("provider_seconds_state") != "complete":
+        raise DurableRunProviderResultUnknown("realtime provider session usage is unavailable")
+    raw = usage.get("provider_seconds" if live else "connected_seconds")
     try:
         seconds = Decimal(raw) if isinstance(raw, str) else None
     except ArithmeticError:
@@ -183,7 +198,8 @@ def _session_bill(run: ChatRun, snapshot: dict, usage: dict):
     components = [{"segment_id": _SEGMENT, "kind": _SESSION_KIND, "quantity": format(seconds, "f"), "unit": "second",
         "unit_price_usd": format(Decimal(frozen["rate"]) / frozen["unit_seconds"], "f"),
         "cost_usd": format(cost, "f"), "source": "media", "model_name": run.model_name,
-        "metadata": {"billing_basis": "session", "rate_unit_seconds": frozen["unit_seconds"]}}]
+        "metadata": {"billing_basis": "session", "rate_unit_seconds": frozen["unit_seconds"],
+                     "usage_source": "provider" if live else "lumen_connected"}}]
     usage_cost = UsageCost(raw_cost=cost, input_cost=cost, output_cost=Decimal(0),
                            pricing_status="priced", pricing_snapshot=snapshot)
     return usage_cost, components, None, {"session_seconds": format(seconds, "f")}
