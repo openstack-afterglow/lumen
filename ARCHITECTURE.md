@@ -590,9 +590,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "812e4af872e8f1b2b96464895046353965122ab288c15b6d3f282a9ec15333db",
-  "reviewed_at": "2026-11-18T03:29:29Z",
-  "summary": "Review Kubernetes paginated LIST TypeMeta inheritance with setdefault only, real-shaped API fixture, second create/preflight plus Pod/Secret listings and UID cleanup, explicit wrong/null type and invalid List refusal; no system test exercises Kubernetes provider; 0.6.18 changelog updated"
+  "source_sha256": "741c64f879589853f90722fe7ada123268c7c7e5648a7750be37a5c04f61265b",
+  "reviewed_at": "2026-11-18T03:33:34Z",
+  "summary": "Extend real-shaped Kubernetes Pod LIST regression to prove list_owned inventory transitions 2 to 1 to 0 after UID-bound deletion; production normalization unchanged"
 }
 ```
 <!-- architecture-review:end -->

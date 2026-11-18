@@ -343,9 +343,10 @@ def test_second_create_accepts_existing_owned_list_items_without_type_metadata(p
         rows = result._list(kind)
         assert all(row["apiVersion"] and row["kind"] for row in rows)
     second_ref = ResourceRef(second_intent.resource_id, second_intent.generation, second.provider_id, second_intent.pool_id)
-    for ref in (first_ref, second_ref):
+    for ref, remaining in ((first_ref, [second]), (second_ref, [])):
         assert result.delete(ref).absent is False
         assert result.delete(ref).absent is True
+        assert result.list_owned("mcp") == remaining
     assert set(api.objects) == {("networkpolicies", "lumen-default-deny")}
 
 
