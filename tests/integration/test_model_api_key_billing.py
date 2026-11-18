@@ -6,15 +6,16 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from lumen import auth
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.billing import Payer
-from lumen.models.chat_db import ChatApiKey, UserWallet
+from lumen.models.chat_db import ChatApiKey, ChatUsageLog, UserWallet
 from lumen.models.stateless_reservations import StatelessCallReservation
 from lumen.scripts.migrate import load_manifest
 from lumen.services import api_key_store
+from lumen.services.provider_metadata import UsageCost
 
 pytestmark = pytest.mark.integration
 
@@ -78,9 +79,39 @@ async def test_persisted_model_keys_pass_real_credit_precheck_and_reservation(mo
                 assert hold.user_id == owner_id and pool.reserved_credits == 0
         with pytest.raises(credit.QuotaExceeded, match="API 키 월 사용 한도"):
             await credit.precheck(**actor, bound=Decimal(2))
+        await stateless_credit.settle(
+            **actor, event_id=event_id, model_name="fixture-model", provider="fixture-provider",
+            prompt_tokens=1, completion_tokens=0, usage_cost=UsageCost(Decimal(3), Decimal(3), Decimal(0), "priced", {}),
+            margin_multiplier=Decimal(1), credit_per_usd=Decimal(1), source="api",
+        )
+        async with factory() as session:
+            entry = await session.scalar(select(ChatUsageLog).where(ChatUsageLog.event_id == event_id))
+            assert entry.credited_cost == 3 and entry.api_key_id == key_id and entry.project_id is None
+            assert (entry.payer_user_id, entry.payer_domain_id) == (expected_payer.user_id, expected_payer.domain_id)
+            pool = await session.get(DomainCreditPool, domain_id)
+            if kind == "service":
+                assert entry.user_id is None and pool.balance_credits == 7 and pool.monthly_used_credits == 3
+                assert await session.get(UserWallet, owner_id) is None
+            else:
+                assert entry.user_id == owner_id and pool.balance_credits == 10 and pool.monthly_used_credits == 0
+                assert (await session.get(UserWallet, owner_id)).used_quota_this_month == 3
+            assert pool.reserved_credits == 0
+
+        def reject_directory_io():
+            pytest.fail("DB-only key recheck touched Keystone")
+
+        monkeypatch.setattr(auth, "_get_admin_ks_client", reject_directory_io)
+        check_actor = {"user_id": actor["user_id"], "project_id": actor["project_id"]}
+        async with factory() as session, session.begin():
+            assert await api_key_store.active_key_scopes_db(session, key_id, **check_actor) == {"compat:completions:write"}
+            assert await api_key_store.active_key_scopes_db(session, key_id, user_id="wrong", project_id=actor["project_id"]) is None
+            (await session.get(ChatApiKey, key_id)).is_active = False
+            await session.flush()
+            assert await api_key_store.active_key_scopes_db(session, key_id, **check_actor) is None
     finally:
         async with factory() as session, session.begin():
             await session.execute(delete(StatelessCallReservation).where(StatelessCallReservation.event_id == event_id))
+            await session.execute(delete(ChatUsageLog).where(ChatUsageLog.event_id == event_id))
             if key_id is not None:
                 await session.execute(delete(ChatApiKey).where(ChatApiKey.id == key_id))
             await session.execute(delete(DomainCreditLedger).where(DomainCreditLedger.domain_id == domain_id))

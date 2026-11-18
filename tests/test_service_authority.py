@@ -383,13 +383,12 @@ async def test_native_agent_crud_zero_role_system_admin_preserves_owner_namespac
         delete.side_effect = agents.ags.AgentForbidden("not owned")
         assert (await client.get("/v1/agents/8", headers=headers)).status_code == 403
         assert (await client.delete("/v1/agents/8", headers=headers)).status_code == 403
-    create.assert_awaited_once_with(owner_user_id="user", project_id="target", **agents.AgentCreate(name="owned").model_dump())
-    listing.assert_awaited_once_with(user_id="user", project_id="target", include_private=True)
-    assert detail.await_args_list == [
-        ((7,), {"user_id": "user", "project_id": "target"}),
-        ((8,), {"user_id": "user", "project_id": "target"}),
-    ]
-    update.assert_awaited_once_with(7, user_id="user", project_id="target", patch={"name": "renamed"})
+    owner = {"user_id": "user", "project_id": "target", "domain_id": "target-domain"}
+    create.assert_awaited_once_with(owner_user_id="user", project_id="target", domain_id="target-domain",
+                                    **agents.AgentCreate(name="owned").model_dump())
+    listing.assert_awaited_once_with(**owner, include_private=True)
+    assert detail.await_args_list == [((7,), owner), ((8,), owner)]
+    update.assert_awaited_once_with(7, **owner, patch={"name": "renamed"})
     assert delete.await_args_list == detail.await_args_list
     validation, authority = zero_role_system_token
     assert validation.call_count == authority.await_count == 7

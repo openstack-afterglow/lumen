@@ -14,8 +14,10 @@ from provider_fixtures import configured_provider
 from redis.asyncio import Redis
 from sqlalchemy import delete, func, select
 
+from lumen.api import domain_pools
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.main import app
+from lumen.models.billing import DomainCreditPool
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun
 from lumen.services import api_key_store, graph
@@ -24,6 +26,14 @@ from lumen.services.providers import repository
 from lumen.services.providers.errors import ProviderValidationError
 
 pytestmark = pytest.mark.integration
+
+
+async def _fund_domain(domain_id: str) -> Decimal:
+    balance = Decimal("100000")
+    await domain_pools.top_up_domain_pool(
+        domain_id, domain_pools.TopUp(amount_credits=balance), "native-flow-fixture", {"user_id": "fixture-admin"},
+    )
+    return balance
 
 
 async def _fixed_text_worker(run_id: str, identity: str) -> str:
@@ -65,6 +75,7 @@ async def test_keystone_session_admits_executes_and_replays_a_native_run(monkeyp
     assert factory is not None
 
     try:
+        await _fund_domain(project_id)
         async with factory() as session, session.begin():
             provider = configured_provider(name=f"integration-provider-{nonce}",
             provider_type="openai",
@@ -80,6 +91,9 @@ async def test_keystone_session_admits_executes_and_replays_a_native_run(monkeyp
                     input_price=Decimal("0.000001"),
                     output_price=Decimal("0.000002"),
                     price_source="manual",
+                    # Domain-paid calls reserve a worst-case bound from the frozen context limit.
+                    capabilities={"context_limit": 8192, "tool_call": True},
+                    capability_source="override",
                 )
             )
 
@@ -420,6 +434,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
     fake_provider = None
     fake_thread = None
     try:
+        opening_balance = await _fund_domain(project_id)
         assert await redis.ping() is True
 
         def validate_admin(token: str, project_id: str = "") -> dict:
@@ -551,6 +566,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                     "model_kind": "text",
                     "input_price_per_million": "2",
                     "output_price_per_million": "4",
+                    "capabilities": {"context_limit": 8192},
                 },
             )
             assert registered.status_code == 201, registered.text
@@ -657,6 +673,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                 stored = await session.get(ChatRun, run_id)
                 ledger = (await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))).scalar_one()
                 wallet = await session.get(UserWallet, user_id)
+                pool = await session.get(DomainCreditPool, project_id)
                 assert stored.status == "completed"
                 assert stored.pricing_snapshot == admitted_pricing
                 assert ledger.provider == f"onboarding-provider-{nonce}"
@@ -671,8 +688,11 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                     assert ledger.pricing_snapshot[field] == admitted_pricing[field]
                 settled_pricing = dict(ledger.pricing_snapshot)
                 assert wallet is not None
-                assert wallet.used_quota_this_month == expected_credited
+                assert wallet.used_quota_this_month == 0
                 assert wallet.balance_credits == wallet.reserved_credits == Decimal("0")
+                assert pool.balance_credits == opening_balance - expected_credited
+                assert pool.monthly_used_credits == expected_credited and pool.reserved_credits == 0
+                assert ledger.payer_domain_id == project_id and ledger.payer_user_id is None
             usage = await client.get("/v1/usage/records", headers=admin_headers)
             assert usage.status_code == 200, usage.text
             record = next(item for item in usage.json()["records"] if item["run_id"] == run_id)
@@ -699,8 +719,10 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                 assert unchanged_ledger.credited_cost == expected_credited
                 assert unchanged_ledger.pricing_snapshot == settled_pricing
                 assert unchanged_wallet is not None
-                assert unchanged_wallet.used_quota_this_month == expected_credited
+                assert unchanged_wallet.used_quota_this_month == 0
                 assert unchanged_wallet.balance_credits == unchanged_wallet.reserved_credits == Decimal("0")
+                pool = await session.get(DomainCreditPool, project_id)
+                assert pool.balance_credits == opening_balance - expected_credited
     finally:
         if fake_provider is not None:
             fake_provider.shutdown()
@@ -809,6 +831,7 @@ async def test_persistent_tool_round_keeps_its_message_when_provider_advances(mo
     monkeypatch.setattr(graph.provider_client, "acompletion_stream", provider_stream)
     monkeypatch.setattr(graph.provider_client, "direct_openai_stream_completed", lambda _: True)
     try:
+        await _fund_domain(project_id)
         async with factory() as session, session.begin():
             provider = configured_provider(name=f"turn-provider-{nonce}", provider_type="openai", is_active=True,
                                    margin_multiplier=Decimal("1"))
@@ -816,7 +839,8 @@ async def test_persistent_tool_round_keeps_its_message_when_provider_advances(mo
             await session.flush()
             session.add(LlmModel(provider_id=provider.id, model_name=model_name, is_active=True,
                                 input_price=Decimal("0.000001"), output_price=Decimal("0.000002"),
-                                price_source="manual"))
+                                price_source="manual", capabilities={"context_limit": 8192, "tool_call": True},
+                                capability_source="override"))
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver",
                                headers={"X-Auth-Token": "integration-turn-owner"}) as client:
             created = await client.post("/v1/conversations", json={"title": "Owned turn fixture"})

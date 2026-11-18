@@ -726,12 +726,53 @@ def _is_active(row: ChatApiKey) -> bool:
     return row.is_active and row.revoked_at is None and not _is_expired(row.expires_at)
 
 
-async def _active_key_scopes(session, *, api_key_id: int, user_id: str, project_id: str) -> frozenset[str]:
-    row = (
+async def _read_key_row(session, api_key_id: int) -> ChatApiKey | None:
+    return (
         await session.execute(
             select(ChatApiKey).where(ChatApiKey.id == api_key_id).execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
+
+
+def _stored_model_scopes(row: ChatApiKey) -> tuple[str, ...] | None:
+    # Keep legacy scope JSON untouched. Only the model subset is ever effective.
+    stored = row.scopes
+    if (not isinstance(stored, list) or not stored
+            or any(not isinstance(scope, str) for scope in stored) or len(set(stored)) != len(stored)):
+        return None
+    return tuple(scope for scope in stored if scope in MODEL_API_KEY_SCOPES)
+
+
+def _key_storage_actor(row: ChatApiKey) -> tuple[str, str] | None:
+    from lumen.auth import model_key_storage_id
+
+    storage_id = model_key_storage_id(row.id)
+    if row.key_kind == "personal" and row.owner_user_id:
+        if row.credential_kind == "api_key":
+            return row.owner_user_id, storage_id
+        if row.credential_kind == "claude_gateway" and row.owner_project_id:
+            return row.owner_user_id, row.owner_project_id
+    if row.credential_kind == "api_key" and row.key_kind == "service" and row.owner_domain_id:
+        return storage_id, storage_id
+    return None
+
+
+async def active_key_scopes_db(
+    session, api_key_id: int, *, user_id: str | None = None, project_id: str | None = None,
+) -> frozenset[str] | None:
+    """Recheck lifecycle and stored scopes after live authorization, without directory or policy I/O."""
+    row = await _read_key_row(session, api_key_id)
+    if row is None or not _is_active(row):
+        return None
+    actor = _key_storage_actor(row)
+    if actor is None or (user_id is not None and user_id != actor[0]) or (project_id is not None and project_id != actor[1]):
+        return None
+    scopes = _stored_model_scopes(row)
+    return None if scopes is None else frozenset(scopes)
+
+
+async def _active_key_scopes(session, *, api_key_id: int, user_id: str, project_id: str) -> frozenset[str]:
+    row = await _read_key_row(session, api_key_id)
     if row is None or not _is_active(row):
         raise ApiKeyForbidden("API 키가 더 이상 유효하지 않습니다")
     principal = await _key_principal(row)
@@ -770,39 +811,33 @@ def _verify_model_key_owner(*, user_id: str | None, domain_id: str | None) -> No
 
 
 async def _key_principal(row: ChatApiKey) -> Principal:
-    from lumen.auth import Payer, model_key_storage_id
+    from lumen.auth import Payer
 
-    # Keep legacy scope JSON untouched. Only the model subset is ever effective.
-    stored = row.scopes
-    if (not isinstance(stored, list) or not stored
-            or any(not isinstance(scope, str) for scope in stored) or len(set(stored)) != len(stored)):
+    scopes = _stored_model_scopes(row)
+    if scopes is None:
         raise ApiKeyForbidden("API 키에 필요한 scope가 없습니다")
-    scopes = tuple(scope for scope in stored if scope in MODEL_API_KEY_SCOPES)
+    actor = _key_storage_actor(row)
+    if actor is None:
+        raise ApiKeyForbidden("API key owner unavailable")
+    user_id, project_id = actor
     roles = []
     service_system_admin = False
     domain_id = None
-    if row.credential_kind == "claude_gateway" and row.key_kind == "personal":
+    if row.credential_kind == "claude_gateway":
         credential_class = "claude_gateway"
-        user_id, project_id = row.owner_user_id, row.owner_project_id
-        if not user_id or not project_id:
-            raise ApiKeyForbidden("API key owner unavailable")
         authority = await _current_owner_authority(user_id, project_id)
         roles = authority["roles"]
         service_system_admin = authority["is_system_admin"]
         payer = Payer("user", user_id, None)
-    elif row.credential_kind == "api_key" and row.key_kind == "personal" and row.owner_user_id:
+    elif row.key_kind == "personal":
         credential_class = "personal_key"
-        user_id, project_id = row.owner_user_id, model_key_storage_id(row.id)
         await run_in_threadpool(_verify_model_key_owner, user_id=user_id, domain_id=None)
         payer = Payer("user", user_id, None)
-    elif row.credential_kind == "api_key" and row.key_kind == "service" and row.owner_domain_id:
+    else:
         credential_class = "service_key"
         domain_id = row.owner_domain_id
-        user_id = project_id = model_key_storage_id(row.id)
         await run_in_threadpool(_verify_model_key_owner, user_id=None, domain_id=domain_id)
         payer = Payer("domain", None, domain_id)
-    else:
-        raise ApiKeyForbidden("API key owner unavailable")
     return {
         "auth_type": "api_key",
         "credential_class": credential_class,
