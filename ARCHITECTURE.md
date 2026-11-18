@@ -606,9 +606,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "614cd46422777068ad73c35017c17d42fe50a25396a4d61cb64dd8536d115f74",
-  "reviewed_at": "2026-11-18T09:14:30Z",
-  "summary": "OpenAI Images native token tariffs, request-specific funding, durable actual-usage settlement, and bounded GIF/SVG asset formats"
+  "source_sha256": "f68e178ece233d6f37e2d538f8f11bd5533288c299111f22aaae9389d2e0e8d9",
+  "reviewed_at": "2026-11-18T06:29:45Z",
+  "summary": "Release preparation 0.6.19: version bump (package, runtime, lock, Kolla default) for Gemini Decisions; no migration; sandbox runtime remains off."
 }
 ```
 <!-- architecture-review:end -->
