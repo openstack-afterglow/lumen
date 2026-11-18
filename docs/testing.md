@@ -1,5 +1,13 @@
 # 테스트
 
+## 0.6.18 production rollout and smoke (2026-11-18 UTC)
+
+Deployed tag `0.6.18` (`c90d0664`; images amd64+arm64, revision label `c90d06646ff8`, tag digest = `latest`) with `--tags lumen --skip-tags haproxy` after a fail-closed drain (61 runs terminal, 0 model-call or stateless holds in flight) and an encrypted backup. Observed: API/worker on the pinned digests, `lumen.__version__` 0.6.18, protocol 2 on every API/worker, restarts 0, migrate status rc0, ledger row `035-mcp-domain-owner-check`, constraint `ck_chat_mcp_servers_domain_owner` present, direct `/v1/ready` 200 on each host, public health/ready/openapi 200, managed ClamAV unchanged (VERSION 28186). Census changed only `lumen_api`/`lumen_worker` per controller; VIP, protected-setting hashes and runtime=false unchanged.
+
+Smoke (disposable keys, revoked): `gemini-2.5-flash-image` (temporarily activated, then deactivated) generated one 1.2 MB image via `/v1/images/generations` with the new `auto:auto` variant price; one priced usage row `$0.039`. Earlier on 0.6.17 the same request failed closed with `exact image variant price is unavailable` (no charge). `gemini-embedding-001` registered at catalog price earlier and returned a 3072-dim embedding, priced `$0.00000075`.
+
+Sandbox: real-cluster acceptance with the dev-build images passed isolation items (PID 256 measured, `list_owned` 2→1→0, mTLS, run isolation) but failed restart recovery/startup latency (Markitdown init 6.5 s to >60 s at 0.5 and 1.0 CPU, interleaved fresh Pods) and produced no Playwright page-content proof; runtime stays off. Receipts under `/etc/kolla/.afterglow-rollout-backups/sandbox-*-20261118T*`.
+
 ## Missed 0.6.17 slices (2026-11-18, source/local, not released)
 
 Cherry-picked `feat/mcp-catalog` `f6fc308`/`171d6c5` and `feat/chat-work-log` `9e22746` (completed after their 0.6.17 integration merge points) onto `c5b020be`, then rebased onto the docs-only `89275f05`. Review follow-up: activation now fails closed for a `scope='domain'` row whose `owner_domain_id` is NULL (the peek path skipped the membership read and `None != None` passed inside the lock; migration 033 has no CHECK), with a real-SQL regression test. `test-passed` on the final tree: `uv run --frozen lumen-test contract` 7,973 passed + 145 SDK, configured Ruff clean; `lumen-test integration` 749 passed / 4 skipped (real MariaDB/Redis, includes `test_mcp_domain_connections.py` and `test_chat_work_log_progress_db.py`). Not deployed: production 0.6.17 lacks these fixes.

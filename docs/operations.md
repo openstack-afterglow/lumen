@@ -1,6 +1,6 @@
 # 운영 가이드
 
-## 0.6.18 롤아웃 메모 (준비 중; 미발행·미배포)
+## 0.6.18 롤아웃 메모
 
 먼저 운영 DB에서 읽기 전용 사전 조회를 실행한다.
 
@@ -12,7 +12,18 @@ SELECT COUNT(*) FROM chat_mcp_servers WHERE scope='domain' AND owner_domain_id I
 
 순서: admission 차단 → 기존 실행·worker drain → writer 정지 → 백업 → 새 패키지의 `lumen-migrate --apply`로 035 적용 → 새 API·worker cohort 기동. 035는 새 writer보다 먼저 적용해야 한다. manifest checksum과 ledger를 사용하며, 적용된 SQL 수정이나 수동 ledger 삽입으로 우회하지 않는다. CHECK는 조직 행의 NULL 소유 도메인만 금지하며 개인·전역 행은 그대로 허용한다.
 
-Kolla 전환에는 항상 `--tags lumen --skip-tags haproxy`를 사용한다. 선택형 sandbox 활성화는 같은 drain된 전환에 묶되 별도 승인된 mTLS·고정 worker·기존 cluster/pool·정확한 image/manifest qualification을 먼저 완료한다. 이 메모는 발행·배포·sandbox 운영 검증의 증거가 아니다.
+Kolla 전환에는 항상 `--tags lumen --skip-tags haproxy`를 사용한다. 선택형 sandbox 활성화는 같은 drain된 전환에 묶되 별도 승인된 mTLS·고정 worker·기존 cluster/pool·정확한 image/manifest qualification을 먼저 완료한다.
+
+### 0.6.18 운영 반영 기록 (2026-11-18 UTC)
+
+- 준비: `/etc/kolla/pyproject.toml`의 `lumen` tag만 0.6.18로 바꾸고(`uv sync` dry-run 1 package), `globals.d/zzz-lumen-0.6.17.yml`을 `zzz-lumen-0.6.18.yml`(api `sha256:ed9bf22b…`, worker `sha256:94ebf64a…`, controller `sha256:5b6862cd…`, ClamAV·media·protocol 2 유지, runtime 설정 없음)로 교체했다. `pull`·`prechecks` rc0.
+- 전환(05:28 UTC): API 정지 → drain 검사(fail-closed: 비종료 run 0, model-call `reserved` 0, 무상태 예약 `reserved`/`unknown` 0) → worker 정지 → 035 위반 행 0을 단언한 뒤 암호화 백업 `/var/backups/lumen/pre-v0.6.18-20261118T051218Z`(MariaDB 67 tables, PostgreSQL dump 헤더 확인; 비밀값은 예측 불가 `mktemp -d` tmpfs 디렉터리에만 두고 종료 시 삭제) → `kolla-ansible reconfigure -i /etc/kolla/multinode --tags lumen --skip-tags haproxy` rc0(05:28:50–05:29:56, failed 0).
+- 결과: API/worker 새 digest·`0.6.18`·protocol 2·restarts 0, ledger에 `035-mcp-domain-owner-check`, `ck_chat_mcp_servers_domain_owner` 존재, 직접·공개 ready 200, ClamAV 그대로. Census 차이는 컨트롤러마다 `lumen_api`·`lumen_worker` 교체뿐이고 VIP·보호 설정 해시·runtime=false는 그대로다. 백업·census는 `/etc/kolla/.afterglow-rollout-backups/lumen-0.6.18-20261118T051218Z`.
+- 롤백 자료: 035는 additive CHECK다. 0.6.17로 되돌릴 때 CHECK를 지울 필요는 없다(0.6.17도 domain 행에 소유 도메인을 채운다).
+
+### 선택형 sandbox 활성화 보류 (2026-11-18)
+
+격리(gVisor RuntimeClass, PID 256, 기본 차단 CNI, controller·고정 worker mTLS, `list_owned` 2→1→0, 실행 간 파일·권한 격리)는 실제 cluster에서 확인했다. 그러나 gVisor 0.5/1.0 CPU에서 Markitdown 초기화가 6.5초~60초 이상으로 들쭉날쭉해(1.0 CPU에서도 60초 startup deadline 초과 관측) 첫 호출이 자주 실패하고, Playwright는 페이지 내용 증거를 얻지 못했다. 그래서 runtime을 켜지 않았다. 후속 조건: agent node의 gVisor rootfs/overlay/directfs 설정(노드 변경이므로 별도 승인), 또는 이미지 import 그래프 축소, 그리고 실제 Playwright 페이지 내용 증거. 같은 프로세스 그룹에서 `setsid`로 빠져나간 하위 프로세스는 재시작 fence가 확인하지 않으며, per-run Pod 경계(PID 256, 수명, 종료 시 삭제)로만 제한된다.
 
 ## 0.6.17 롤아웃 메모
 
