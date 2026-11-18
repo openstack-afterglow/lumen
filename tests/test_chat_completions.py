@@ -780,7 +780,7 @@ class TestExecutionCapabilityGate:
         monkeypatch.setattr(chat_admission.memory_host, "recall_for_run", load_memory)
 
         workspace, memories = await chat_admission._load_context(
-            {"workspace_id": None}, "u1", "p1", include_memory=True
+            {"workspace_id": None}, "u1", "p1", include_memory=True, memory_domain="domain"
         )
 
         assert workspace is None
@@ -791,6 +791,7 @@ class TestExecutionCapabilityGate:
             "project_id": "p1",
             "workspace_id": None,
             "include_account": True,
+            "domain_id": "domain",
             "strategy": "recency",
             "query": "",
             "limit": 30,

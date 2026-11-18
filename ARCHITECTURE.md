@@ -17,6 +17,16 @@ Native chat, context, Decisions, image, audio and realtime requests can select a
 
 Migration 039 adds nullable `chat_agents.model_row_id`. Root and delegated agents use an exact pin if configured. Without a pin, a root run honors its explicit request; an agent's legacy default must resolve uniquely when used. The column has no catalog foreign key: removing a model cannot clear a pin and silently redirect an agent. Message history projects only the row ID from the run's frozen route, never provider credentials or the full snapshot.
 
+### Dashboard Agent Vault
+
+Migration 040 makes MariaDB `memory_vault_notes` and immutable revisions the source of truth for both Agent Vault and chat memory. `/v1/vault` accepts only current, unrestricted human Keystone principals. A human reads only their global notes and notes in the selected project's verified domain; optional Vault project keys and agent roles are private subnamespaces, not OpenStack authority or shared storage.
+
+The API and model tools share scoped repository operations. Markdown is encrypted with Lumen's chat-content key, with a separate keyed revision-bound HMAC that guards replacements inside the note row lock. Logs, long-term and role memory, handoffs and worktree records are immutable entries. Credential-shaped content, titles, slugs and metadata are refused. The API renders `memory.md` from active chat notes; it never materializes a second copy.
+
+On cutover the worker imports account records globally and project records under their freshly verified Keystone domain, retaining IDs for semantic vector reindexing. Unresolved origins remain sealed in the legacy table. Workspace notes require an owned workspace and the current domain; an explicit `workspace_id` selects them for Vault CRUD, and only the active workspace can supply them to a chat prompt. The default Vault list excludes workspace notes. The outbox indexes Vault candidates, but the memory host always reapplies SQL ownership and active-state predicates before decrypting. Remembered text is untrusted model context, not a new authority.
+
+Persistent dashboard runs with memory and tools enabled bind Agent Vault tools to the admitted human and domain. Execution revalidates current Keystone domain and policy. Protocol 2 applies its existing mutation-approval rules; API keys, temporary chats and delegated children receive no bindings.
+
 ### Dashboard MCP and cloud-approval integration
 
 `mcp_domain_authority` resolves exact current project-domain membership and legitimate canonical-Default/direct-domain manager grants through native Keystone. It rejects reduced/API-key management and ignores Afterglow-derived manager projection grants. `ChatMcpServer` gains domain ownership and a scope-keyed uniqueness boundary in migration 033; the unmerged Drover migration 032 is independent and the loader permits the gap. Domain credentials are encrypted, shared only at execution, and absent from member responses. Personal activation, config fingerprint, credential version and current native membership are rechecked before frozen connections run. Activation reads Keystone membership before taking the published row lock (token refresh shares that lock) and fails closed inside the lock if the row's domain/scope changed; idempotent template install releases its lookup session before re-reading the effective view.

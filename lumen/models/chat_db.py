@@ -857,7 +857,7 @@ class ChatWorkspace(Base):
 
 
 class ChatMemory(Base):
-    """Encrypted memory source of truth, scoped for fail-closed semantic hydration."""
+    """Read-only legacy source for the Agent Vault migration."""
 
     __tablename__ = "chat_memories"
 
@@ -874,6 +874,8 @@ class ChatMemory(Base):
     # AES-256-GCM(chat_content) 암호문. 기억할 사실(예: "사용자는 Python 을 선호").
     content: Mapped[str | None] = mapped_column(MEDIUMTEXT)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
+    vault_migration_status: Mapped[str | None] = mapped_column(VARCHAR(16))
+    vault_migration_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
@@ -887,6 +889,7 @@ class ChatMemory(Base):
         ),
         Index("idx_chat_memories_user", "user_id"),
         Index("idx_chat_memories_scope", "user_id", "project_id", "workspace_id", "status", "is_active"),
+        Index("idx_chat_memories_vault_pending", "vault_migration_status", "vault_migration_retry_at", "id"),
     )
 
 

@@ -34,6 +34,7 @@ class ToolContext:
     advisor_visible_messages: tuple[dict[str, Any], ...] = ()
     binding_session: object | None = None
     plugin_tool_snapshots: tuple[dict[str, Any], ...] = ()
+    vault_domain_id: str | None = None
 
 
 async def tool_schemas() -> list[dict]:

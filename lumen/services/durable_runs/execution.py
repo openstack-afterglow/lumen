@@ -2673,6 +2673,9 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         )
         resume = await _v2_resume(run_id=run_id, owner=owner) if run.execution_protocol_version == 2 else None
         delegation_enabled = _delegation_enabled(run, payload)
+        from lumen.services.vault_store import frozen_run_domain
+
+        vault_domain_id = frozen_run_domain(run)
         sandbox_lease = None
         if run.execution_protocol_version == 2:
             try:
@@ -2743,6 +2746,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             delegation_enabled=delegation_enabled,
             sandbox_lease=sandbox_lease,
             sandbox_tools=sandbox_tools,
+            vault_domain_id=vault_domain_id,
         ).__aiter__()
         next_event_task = asyncio.create_task(anext(engine_iterator))
         lease_lost_wait_task = asyncio.create_task(lease_lost.wait())

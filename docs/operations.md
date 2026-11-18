@@ -1,5 +1,11 @@
 # 운영 가이드
 
+## Agent Vault cutover (040)
+
+Migration 040 changes the chat-memory writer and vector source; never run a pre-040 writer alongside a Vault worker. Drain existing runs, stop old writers, take an encrypted backup, apply the manifest-verified migration, and start the new online-text worker. Keep admission closed until the legacy-memory import has caught up. Use the metadata-only query `SELECT vault_migration_status, COUNT(*) FROM chat_memories GROUP BY vault_migration_status` to inspect progress; NULL rows are pending or waiting for directory or encryption recovery. Missing or disabled origins, unowned or deleted workspaces, malformed rows and credential-shaped content are not imported. Do not collapse them into global notes or expose their ciphertext.
+
+The importer is idempotent, retains original legacy rows, and assigns new Vault records IDs at or above 2^40 to avoid colliding with imported vector IDs. Semantic recall catches up through the configured vector outbox after SQL import. Rolling back old code after Vault accepts writes would hide those writes; preserve both the Vault and legacy tables and reconcile explicitly before reopening traffic.
+
 ## 0.6.20 롤아웃 메모
 
 - **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.

@@ -314,9 +314,10 @@ async def test_member_can_destroy_owned_config_without_owner_bypass(management_a
 
 async def test_memory_cleanup_requires_project_writer(management_app, monkeypatch):
     app, principal = management_app
+    principal.update(domain_id="domain", source="web")
     provider = SimpleNamespace(delete=AsyncMock())
     monkeypatch.setattr(memory, "get_plugin", lambda _: provider)
-    monkeypatch.setattr(memory.memory_host, "access_for", lambda namespace: namespace)
+    monkeypatch.setattr(memory.memory_host, "access_for", lambda namespace, **_kwargs: namespace)
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         principal["roles"] = ["reader"]
         assert (await client.delete("/v1/memories/1")).status_code == 403

@@ -121,6 +121,7 @@ def _token_info(*, is_system_admin: bool) -> dict[str, object]:
         "user_id": "test-user-123",
         "username": "testuser",
         "project_id": "test-project-123",
+        "domain_id": "test-domain-123",
         "project_name": "test-project",
         "roles": ["admin", "member"] if is_system_admin else ["member"],
         "is_system_admin": is_system_admin,
@@ -164,7 +165,7 @@ def current_project_authority(monkeypatch):
     Opt-in only: authority contract tests exercise the real resolver separately.
     Credential scopes and production action checks are never bypassed.
     """
-    lookup = AsyncMock(return_value={"roles": ["member"], "is_system_admin": False})
+    lookup = AsyncMock(return_value={"roles": ["member"], "is_system_admin": False, "domain_id": "test-domain-123"})
     monkeypatch.setattr("lumen.auth.resolve_project_authority", lookup)
     monkeypatch.setattr("lumen.services.mcp_oauth.resolve_project_authority", lookup)
     return lookup
