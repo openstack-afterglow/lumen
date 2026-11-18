@@ -7,6 +7,33 @@ def _count(messages, _tools):
     return sum((len(str(message.get("content", ""))) + 19) // 20 for message in messages)
 
 
+async def test_distinct_provider_input_ceiling_and_context_window(monkeypatch):
+    from lumen.services import context_manager, provider_metadata
+    from lumen.services.capabilities import provider_capabilities
+
+    caps = provider_capabilities("gpt-6.2-sol", "openai")
+    window, ceiling = caps["context_limit"], caps["max_input_tokens"]
+    assert (window, ceiling) == (1_050_000, 922_000)
+    messages = [{"role": "user", "content": "Keep this entire turn."}]
+    monkeypatch.setattr(
+        context_manager, "count_context_tokens",
+        lambda *_args: provider_metadata.ContextTokenCount(900_000, "estimated"),
+    )
+    state = context_manager.context_state(
+        messages, [], model_name="gpt-6.2-sol", context_limit=window, max_input_tokens=ceiling,
+        output_reserve=128_000, revision="test",
+    )
+    accepted = await prepare_model_messages(
+        messages, [], window, 128_000, {}, max_input_tokens=ceiling, token_counter=lambda *_args: 900_000,
+    )
+    assert state.input_budget == accepted.input_budget == 919_952
+    assert accepted.messages == messages
+    with pytest.raises(ContextLimitExceeded, match="context_limit_exceeded"):
+        await prepare_model_messages(
+            messages, [], window, 8_000, {}, max_input_tokens=ceiling, token_counter=lambda *_args: 922_001,
+        )
+
+
 async def test_context_compaction_preserves_system_current_and_newest_turns():
     messages = [{"role": "system", "content": "policy"}]
     messages += [

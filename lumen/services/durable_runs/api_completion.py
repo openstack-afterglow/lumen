@@ -32,7 +32,6 @@ from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunPro
 from lumen.services import (
     completion_api,
     credit,
-    openai_tool_policy,
     provider_client,
     provider_errors,
     provider_metadata,
@@ -181,10 +180,8 @@ async def prepare_api_completion_run(
         if body.service_tier not in (None, "default", "auto"):
             raise DurableRunInputError("service_tier_unsupported")
         try:
-            max_output = completion_api.clamp_max_tokens(
-                body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
-            )
             chat_options = completion_api.chat_provider_options(body.provider_options(), resolved=route)
+            max_output = completion_api.clamp_max_tokens(chat_options.get("max_completion_tokens", body.max_tokens))
             route = completion_api.billing_route(route, body.messages, protocol="chat", options={"tools": body.tools})
         except completion_api.CompletionError as exc:
             raise _input_error(exc) from exc
@@ -201,11 +198,9 @@ async def prepare_api_completion_run(
         if body.conversation is not None:
             raise DurableRunInputError("provider_reference_unsupported")
         try:
-            openai_tool_policy.validate_input(body.input)
-        except openai_tool_policy.UnsupportedProviderReference as exc:
-            raise DurableRunInputError("provider_reference_unsupported") from exc
-        except openai_tool_policy.UnsupportedHostedTool as exc:
-            raise DurableRunInputError("provider_builtin_tool_unsupported") from exc
+            completion_api.validate_openai_input(route, body.input)
+        except completion_api.CompletionError as exc:
+            raise _input_error(exc) from exc
         if body.background is True:
             raise DurableRunInputError("background_not_supported")
         if body.context_management is not None:
@@ -237,8 +232,14 @@ async def prepare_api_completion_run(
     max_provider_output = (route.get("capabilities") or {}).get("max_output_tokens")
     if type(max_provider_output) is int and max_output > max_provider_output:
         raise DurableRunInputError("max_output_tokens_exceeded")
+    max_input_tokens = (route.get("capabilities") or {}).get("max_input_tokens")
+    input_bound = limit
+    if type(max_input_tokens) is int and max_input_tokens > 0:
+        input_bound = min(max_input_tokens, limit - max_output)
+        if input_bound <= 0:
+            raise DurableRunInputError("context_length_exceeded")
     count = provider_metadata.count_context_tokens(route["model_name"], counted_messages, counted_tools)
-    if count.tokens is not None and count.tokens > limit:
+    if count.tokens is not None and count.tokens > input_bound:
         raise DurableRunInputError("context_length_exceeded")
     try:
         token_pricing = frozen_token_pricing(route)
@@ -254,11 +255,11 @@ async def prepare_api_completion_run(
         "provider_name": route["provider_name"],
         "model_name": route["model_name"],
         "rounding_version": "half_even_v1",
-        "context_limit": limit,
+        "context_limit": input_bound,
         "max_output_tokens": max_output,
     }
     try:
-        bound = credit.call_credit_bound(pricing, input_tokens=limit, output_tokens=max_output)
+        bound = credit.call_credit_bound(pricing, input_tokens=input_bound, output_tokens=max_output)
     except ValueError as exc:
         raise DurableRunInputError("pricing_unavailable") from exc
     if bound >= _MAX_BOUND:
@@ -270,6 +271,8 @@ async def prepare_api_completion_run(
     )}
     capability.update(execution_identity(route))
     capability.update({"operation": operation, "context_limit": limit, "effective_features": {}})
+    if type(max_input_tokens) is int and max_input_tokens > 0:
+        capability["max_input_tokens"] = max_input_tokens
     return PreparedApiCompletion(
         payload=payload,
         capability_snapshot=capability,

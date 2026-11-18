@@ -310,7 +310,7 @@ class TestCliCatalog:
         disabled = source == "override"
         assert row["usable"] is not disabled
         assert row["disabled_reason"] == ("tools_disabled" if disabled else None)
-        assert row["protocols"] == ([] if disabled else ["messages", "responses"])
+        assert row["protocols"] == ([] if disabled else ["responses"])
         assert row["capabilities"]["function_calling"] is not disabled
 
     @pytest.mark.parametrize("change", [

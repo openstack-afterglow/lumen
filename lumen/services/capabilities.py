@@ -225,7 +225,7 @@ def provider_capabilities(model_name: str, provider_type: str | None, api_base: 
     parallel_function_calling = bool(metadata.get("supports_parallel_function_calling")) if is_chatgpt else False
     supports_web_search = _native_web_search_available(normalized_model, provider_type, api_base)
     web_search_required = _is_perplexity_sonar(normalized_model, provider_type, api_base)
-    configured_context_limit = metadata.get("max_input_tokens")
+    configured_context_limit = metadata.get("context_window", metadata.get("max_input_tokens"))
     context_limit = (
         configured_context_limit
         if isinstance(configured_context_limit, int)
@@ -233,6 +233,7 @@ def provider_capabilities(model_name: str, provider_type: str | None, api_base: 
         and configured_context_limit > 0
         else None
     )
+    max_input_tokens = metadata.get("max_input_tokens")
     max_output_tokens = metadata.get("max_output_tokens")
     return {
         # Existing model-admin/UI fields retained until the capability API is cut over.
@@ -244,6 +245,8 @@ def provider_capabilities(model_name: str, provider_type: str | None, api_base: 
         **({"max_output_tokens": max_output_tokens} if type(max_output_tokens) is int and max_output_tokens > 0 else {}),
         "reasoning_options": metadata.get("reasoning_options") or [],
         "context_limit": context_limit,
+        **({"max_input_tokens": max_input_tokens} if type(max_input_tokens) is int
+           and context_limit is not None and 0 < max_input_tokens < context_limit else {}),
         "metadata_source": "catalog" if metadata else None,
         "metadata_status": "observed" if metadata else "missing",
         "metadata_version": catalog_version() if metadata else None,
@@ -452,6 +455,8 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
     normalized["output_budget_enforced"] = detected.get("output_budget_enforced")
     normalized["native_web_search_transport_supported"] = detected.get("native_web_search_transport_supported") is True
     normalized["decisions_transport_supported"] = detected.get("decisions_transport_supported") is True
+    if detected.get("max_input_tokens") is not None:
+        normalized["max_input_tokens"] = detected["max_input_tokens"]
     output_limit = normalized.get("max_output_tokens")
     if type(output_limit) is not int or output_limit <= 0:
         detected_limit = detected.get("max_output_tokens")

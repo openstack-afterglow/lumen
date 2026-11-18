@@ -152,6 +152,8 @@ async def chat_completions(
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
     ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
+    if body.service_tier not in (None, "default", "auto"):
+        return openai_error_response(422, "Only Standard processing is supported.", code="service_tier_unsupported")
     if body.max_completion_tokens is None and body.max_tokens is not None and body.max_tokens <= 0:
         return openai_error_response(400, "max_tokens must be positive", code="invalid_max_tokens")
     user_id, project_id = token_info["user_id"], token_info["project_id"]
@@ -243,7 +245,11 @@ async def chat_completions(
 
     cmpl_id, created = _completion_id(), int(time.time())
     options = body.provider_options()
-    max_output = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
+    max_output = body.max_tokens
+    if core._official_openai(resolved) and body.max_completion_tokens is not None:
+        max_output = body.max_completion_tokens
+    if max_output is not None and max_output <= 0:
+        return openai_error_response(400, "max_tokens must be positive", code="invalid_max_tokens")
     include_usage = bool((body.stream_options or {}).get("include_usage"))
 
     if not body.stream:

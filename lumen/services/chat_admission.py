@@ -239,6 +239,8 @@ def _feature_route_snapshot(route: dict[str, Any], *, purpose: str) -> dict[str,
         if context_limit is None and isinstance(capabilities, dict):
             context_limit = capabilities.get("context_limit")
         snapshot["context_limit"] = context_limit
+        if (capabilities or {}).get("max_input_tokens") is not None:
+            snapshot["max_input_tokens"] = capabilities["max_input_tokens"]
     return snapshot
 
 

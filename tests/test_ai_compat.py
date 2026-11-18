@@ -302,7 +302,8 @@ class TestCompletionCoreContract:
         assert upstream["closed"] is True
         assert billed == ["first"]
 
-    async def test_responses_stream_close_releases_transport_and_bills_partial_text(self, monkeypatch):
+    @pytest.mark.parametrize("api_base", [None, "https://compatible.example"])
+    async def test_responses_stream_close_releases_transport_and_bills_partial_text(self, monkeypatch, api_base):
         state = _responses_runtime_wire(monkeypatch)
         billed = []
 
@@ -312,7 +313,7 @@ class TestCompletionCoreContract:
 
         monkeypatch.setattr(core, "_bill", fake_bill)
         events = await core.complete_responses(
-            resolved={"model_name": "gpt-5", "provider_type": "openai", "api_base": "https://compatible.example",
+            resolved={"model_name": "gpt-unlisted", "provider_type": "openai", "api_base": api_base,
                       "capabilities": {"reasoning": True}},
             input="hello", stream=True, user_id="u1", project_id="p1", api_key_id=7, options={},
         )
