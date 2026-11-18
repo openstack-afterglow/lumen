@@ -670,9 +670,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "8abb5583ae219b1ebf56d9f7e4db347cb31affe46b9041bcd03982dc6a0f1ebc",
-  "reviewed_at": "2026-11-18T17:39:01Z",
-  "summary": "0.6.21 domain-scope integration review: migrations 036-040 (domain scope, domain credit pools, personal/service keys, model identity, Agent Vault), Gemini compat, leaf image pricing, client-tool key policy and billing dispatch fixes on feat/domain-scope-service-keys 3520ece; regenerated schema_snapshot.sql and docs/api (new OpenAPI tags, GoogleApiKey), test-order isolation for the domain billing migration recheck, test-infra fake/fixture fixes; contract 8727 passed/1 failed, integration 832 passed/4 skipped, system 36 passed/4 failed (owners recorded in docs/testing.md)"
+  "source_sha256": "074aeec55786e7d69e3804faf07b96f9afefa59651048e57154dc5d724c888f7",
+  "reviewed_at": "2026-11-18T17:43:52Z",
+  "summary": "Merge integration 8b7273d into feat/ds-gemini-compat (Gemini shared key tool policy, closed function parts, Messages listing, x-goog-api-key authority test); docs/api regenerated with no diff"
 }
 ```
 <!-- architecture-review:end -->
