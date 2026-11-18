@@ -6,13 +6,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
-from lumen.auth import Principal, credential_authority_snapshot, require_scopes
+from lumen.auth import Principal, credential_authority_snapshot, ensure_scopes, require_scopes
 from lumen.models.api_requests import ImageEditRequest, ImageGenerationRequest
 from lumen.models.chat_contracts import ChatRunDescriptor
 from lumen.services import assets, credit
 from lumen.services.conversation_store import ChatStorageUnavailable
 from lumen.services.durable_runs import errors as durable_errors
-from lumen.services.durable_runs.images import admit_image_run
+from lumen.services.durable_runs.images import admit_image_run, svg_author_scope
 from lumen.services.providers.errors import ProviderValidationError
 
 router = APIRouter()
@@ -48,6 +48,8 @@ async def admit(
     api_provider: str | None = None,
     required_scopes: tuple[str, ...] | None = None,
 ) -> ChatRunDescriptor:
+    if payload.svg_model is not None:
+        ensure_scopes(principal, svg_author_scope(required_scopes))
     request = payload.model_dump(mode="json")
     if api_provider is not None:
         request["provider_id"] = api_provider

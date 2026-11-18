@@ -18,7 +18,7 @@ from datetime import UTC, date, datetime
 from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import IntegrityError, OperationalError
 
@@ -476,18 +476,24 @@ async def reserve_call_credit_in_transaction(session, *, user_id: str, project_i
                 raise QuotaExceeded("API 키 주간 사용 한도를 초과했습니다")
 
 
-async def precheck(user_id: str, project_id: str | None = None, api_key_id: int | None = None) -> None:
-    """Reject exhausted monthly or weekly quotas; storage failures fail closed.
+async def precheck(user_id: str, project_id: str | None = None, api_key_id: int | None = None,
+                   *, bound: Decimal | None = None) -> None:
+    """Reject exhausted quotas, or insufficient headroom when a call bound is known.
 
-    A zero weekly quota means no separate weekly cap. The effective monthly quota
-    is still checked first, so weekly usage can never escape its monthly ceiling.
-    The check is pure DB work, so a lock conflict is retried: a new user's racing first requests create the
-    wallet row concurrently, and under snapshot isolation the loser conflicts once before the row is visible.
+    No hold is recorded here. The worker reruns the bound check under the same
+    wallet lock when committing the durable reservation and I/O intent.
     """
     from lumen.services.durable_runs.budgets import retry_deadlocks
 
+    async def check_bound():
+        assert bound is not None
+        async with _require_db()() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await reserve_call_credit_in_transaction(session, user_id=user_id, project_id=project_id,
+                                                      api_key_id=api_key_id, bound=bound)
+
     try:
-        await retry_deadlocks(lambda: _precheck_once(user_id, project_id, api_key_id))
+        await retry_deadlocks(check_bound if bound is not None else lambda: _precheck_once(user_id, project_id, api_key_id))
     except OperationalError as exc:  # only a lock conflict that outlived the retries reaches here
         raise ChatStorageUnavailable("chat DB 오류") from exc
 

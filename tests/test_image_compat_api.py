@@ -52,7 +52,7 @@ def test_compat_generation_returns_real_png_after_terminal_run(monkeypatch):
     response = client.post(
         "/v1/images/generations",
         headers={"Idempotency-Key": str(uuid4())},
-        json={"model": "gpt-image-1", "prompt": "A red dot", "provider": "openai"},
+        json={"model": "gpt-image-2", "prompt": "A red dot", "provider": "openai"},
     )
     assert response.status_code == 200
     result = response.json()
@@ -66,7 +66,7 @@ def test_compat_generation_returns_real_png_after_terminal_run(monkeypatch):
 
     unsupported = client.post(
         "/v1/images/generations",
-        json={"model": "gpt-image-1", "prompt": "A red dot", "response_format": "url"},
+        json={"model": "gpt-image-2", "prompt": "A red dot", "response_format": "url"},
     )
     assert unsupported.status_code == 400
     assert unsupported.json()["error"]["message"] == "Only response_format=b64_json is supported"
@@ -74,7 +74,7 @@ def test_compat_generation_returns_real_png_after_terminal_run(monkeypatch):
     app.dependency_overrides[get_principal] = lambda: {**_principal(), "scopes": ("compat:completions:write",)}
     denied = client.post(
         "/v1/images/generations",
-        json={"model": "gpt-image-1", "prompt": "A red dot"},
+        json={"model": "gpt-image-2", "prompt": "A red dot"},
     )
     assert denied.status_code == 403
     assert "compat:images:write" in denied.json()["detail"]
@@ -136,7 +136,7 @@ def test_compat_edit_scans_png_and_returns_generated_image(monkeypatch):
     app.include_router(image_api.router, prefix="/v1")
     app.dependency_overrides[get_principal] = _principal
     client = TestClient(app)
-    data = {"model": "gpt-image-1", "prompt": "Change the background", "provider": "openai"}
+    data = {"model": "gpt-image-2", "prompt": "Change the background", "provider": "openai"}
     url = "/v1/images/edits"
 
     response = client.post(url, data=data, files={"image": ("source.png", source, "image/png")})
@@ -144,14 +144,14 @@ def test_compat_edit_scans_png_and_returns_generated_image(monkeypatch):
     with Image.open(io.BytesIO(base64.b64decode(response.json()["data"][0]["b64_json"]))) as image:
         assert image.getpixel((0, 0)) == (55, 66, 77)
     unsupported = client.post(
-        url, data={**data, "mask": "unsupported"}, files={"image": ("source.png", source, "image/png")}
+        url, data={**data, "unknown_overlay": "unsupported"}, files={"image": ("source.png", source, "image/png")}
     )
     assert unsupported.status_code == 400
-    assert "mask" in unsupported.json()["error"]["message"]
+    assert "unknown_overlay" in unsupported.json()["error"]["message"]
     assert len(uploads) == 1
 
 
-def test_compat_generation_and_edit_forward_complexity_and_reject_unknown_levels(monkeypatch):
+def test_compat_generation_and_edit_forward_image_options_and_reject_streaming(monkeypatch):
     source = _png((20, 30, 40))
     requests = []
 
@@ -179,13 +179,25 @@ def test_compat_generation_and_edit_forward_complexity_and_reject_unknown_levels
     body = {"model": "gpt-image-2.6-flare", "prompt": "Draw", "provider": "openai", "size": "1536x864",
             "quality": "xhigh"}
 
-    assert client.post("/v1/images/generations", json={**body, "complexity": "low"}).status_code == 200
+    assert client.post("/v1/images/generations", json={
+        **body, "complexity": "low", "background": "transparent", "output_format": "webp", "output_compression": 0,
+    }).status_code == 200
     assert client.post("/v1/images/generations", json=body).status_code == 200
-    edit = client.post("/v1/images/edits", data={**body, "complexity": "high"},
+    edit = client.post("/v1/images/edits", data={
+        **body, "complexity": "high", "output_format": "gif", "frame_count": 3, "frame_duration_ms": 250,
+    },
                        files={"image": ("source.png", source, "image/png")})
     assert edit.status_code == 200
     assert [(item["size"], item["quality"], item.get("complexity")) for item in requests] == [
         ("1536x864", "xhigh", "low"), ("1536x864", "xhigh", None), ("1536x864", "xhigh", "high")]
+    assert requests[0]["background"] == "transparent" and requests[0]["output_format"] == "webp"
+    assert requests[0]["output_compression"] == 0
+    assert requests[2]["output_format"] == "gif"
+    assert (requests[2]["frame_count"], requests[2]["frame_duration_ms"]) == (3, 250)
+    for unsupported in ({"stream": True}, {"partial_images": 1}):
+        assert client.post("/v1/images/generations", json={**body, **unsupported}).status_code == 422
+        assert client.post("/v1/images/edits", data={**body, **unsupported},
+                           files={"image": ("source.png", source, "image/png")}).status_code == 422
 
     rejected = client.post("/v1/images/generations", json={**body, "complexity": "extreme"})
     assert rejected.status_code in (400, 422)
@@ -218,7 +230,7 @@ def test_compat_generation_maps_a_settled_provider_refusal_to_the_caller_status(
     client = TestClient(app)
     for upstream, (status, error_type) in outcomes.items():
         current["status"] = upstream
-        response = client.post("/v1/images/generations", json={"model": "gpt-image-1", "prompt": "A red dot",
+        response = client.post("/v1/images/generations", json={"model": "gpt-image-2", "prompt": "A red dot",
                                                               "provider": "openai"})
         assert response.status_code == status
         assert response.json()["error"]["type"] == error_type
@@ -229,5 +241,62 @@ def test_compat_generation_maps_a_settled_provider_refusal_to_the_caller_status(
         return [SimpleNamespace(type="run.failed", payload=payload)], 9
 
     monkeypatch.setattr(image_api.queries, "owned_events", unknown_events)
-    assert client.post("/v1/images/generations", json={"model": "gpt-image-1", "prompt": "A red dot",
+    assert client.post("/v1/images/generations", json={"model": "gpt-image-2", "prompt": "A red dot",
                                                        "provider": "openai"}).status_code == 500
+
+
+def test_compat_multipart_accepts_ordered_images_and_a_markup_upload(monkeypatch):
+    content = [_png((red, 0, 0)) for red in (10, 20, 30)]
+    ids = [str(uuid4()) for _ in content]
+    uploaded = []
+
+    async def upload(*, path, **_kwargs):
+        uploaded.append(path.read_bytes())
+        return {"id": ids[len(uploaded) - 1]}
+
+    async def admit_image_run(body, **_owner):
+        assert body["input_asset_ids"] == ids[:2] and body["markup_asset_id"] == ids[2]
+        assert body["moderation"] == "low"
+        return SimpleNamespace(run_id="run-edit")
+
+    async def result(*_args, **_kwargs):
+        return {"received": True}
+
+    monkeypatch.setattr(image_api.assets, "create_uploaded_asset", upload)
+    monkeypatch.setattr(native_images, "admit_image_run", admit_image_run)
+    monkeypatch.setattr(image_api, "_completed_image", result)
+    app = FastAPI()
+    app.include_router(image_api.router, prefix="/v1")
+    app.dependency_overrides[get_principal] = _principal
+    client = TestClient(app)
+    files = [(field, (f"{index}.png", data, "image/png"))
+             for index, (field, data) in enumerate(zip(("image[]", "image[]", "markup"), content, strict=True))]
+    response = client.post("/v1/images/edits", data={
+        "model": "gpt-image-2.6-flare", "prompt": "Draw", "moderation": "low",
+    }, files=files)
+    assert response.status_code == 200, response.text
+    assert uploaded == content
+
+
+def test_compat_explicit_svg_author_requires_text_scope(monkeypatch):
+    async def admit_image_run(body, **_owner):
+        assert body["svg_model"] == "gpt-5" and body["svg_reasoning_effort"] == "low"
+        return SimpleNamespace(run_id="run-svg")
+
+    async def result(*_args, **_kwargs):
+        return {"received": True}
+
+    monkeypatch.setattr(native_images, "admit_image_run", admit_image_run)
+    monkeypatch.setattr(image_api, "_completed_image", result)
+    app = FastAPI()
+    app.include_router(image_api.router, prefix="/v1")
+    app.dependency_overrides[get_principal] = _principal
+    client = TestClient(app)
+    body = {"model": "gpt-image-2.6-flare", "prompt": "Draw", "output_format": "svg",
+            "svg": {"model": "gpt-5", "reasoning": {"effort": "low"}}}
+    assert client.post("/v1/images/generations", json=body).status_code == 403
+    app.dependency_overrides[get_principal] = lambda: {
+        **_principal(), "scopes": (*_principal()["scopes"], "compat:completions:write"),
+    }
+    assert client.post("/v1/images/generations", json=body).status_code == 200
+    assert client.post("/v1/images/generations", json={**body, "svg_model": "gpt-5"}).status_code == 422

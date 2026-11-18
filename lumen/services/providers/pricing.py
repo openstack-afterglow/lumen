@@ -52,6 +52,15 @@ BILLING_BASES = {
     "stt": frozenset({"duration", "tokens"}),
     "realtime": frozenset({"duration", "session", "tokens"}),
 }
+# Token-basis kinds whose OpenAI transport derives a request-specific Lumen hold, so an
+# explicit reservation_usd is optional there; an operator-supplied value still takes
+# precedence. Other providers publish no basis for a derived hold and keep requiring one.
+DERIVED_HOLD_TOKEN_KINDS = frozenset({"image", "realtime"})
+
+
+def derived_hold_allowed(kind: str, provider_type: str | None) -> bool:
+    return kind in DERIVED_HOLD_TOKEN_KINDS and provider_type == "openai"
+
 _DEFAULT_BASIS = {
     "text": "tokens", "image": "unit", "tts": "duration", "stt": "duration",
     "realtime": "duration", "embedding": "tokens", "decision": "tokens",
@@ -128,7 +137,7 @@ def _check_duration_aliases(pricing: dict, family: str) -> tuple[Decimal, int] |
     return rate, seconds
 
 
-def validate_media_pricing(model_kind: str, pricing: dict | None) -> dict | None:
+def validate_media_pricing(model_kind: str, pricing: dict | None, *, provider_type: str | None = None) -> dict | None:
     """Validate and serialize explicit per-kind USD rates without token-price fallback.
 
     Absent keys stay absent (unpriced); an explicit zero is a real free rate.
@@ -170,7 +179,7 @@ def validate_media_pricing(model_kind: str, pricing: dict | None) -> dict | None
             raise ProviderValidationError("reservation_usd는 tokens 과금 기준에서만 사용합니다")
         if Decimal(str(result["reservation_usd"])) <= 0:
             raise ProviderValidationError("reservation_usd는 0보다 커야 합니다")
-    elif basis == "tokens":
+    elif basis == "tokens" and not derived_hold_allowed(model_kind, provider_type):
         raise ProviderValidationError("tokens 과금 기준에는 양수 reservation_usd가 필요합니다")
     return result or None
 
@@ -289,7 +298,7 @@ _TOKEN_BASIS_TEXT_DIRECTIONS = {
 
 def media_pricing_available(
     kind: str, pricing: dict | None, *, text_input_priced: bool = False, text_output_priced: bool = False,
-    duration_families: tuple[str, ...] | None = None,
+    duration_families: tuple[str, ...] | None = None, provider_type: str | None = None,
 ) -> bool:
     """Whether the selected billing basis has every rate its execution needs.
 
@@ -313,7 +322,7 @@ def media_pricing_available(
         text_priced = {"input": text_input_priced, "output": text_output_priced}
         return (
             bool(needed)
-            and media_reservation_usd(pricing) is not None
+            and (derived_hold_allowed(kind, provider_type) or media_reservation_usd(pricing) is not None)
             and all(field in rates.get(modality, {}) for modality, field in needed)
             and all(text_priced[direction] for direction in _TOKEN_BASIS_TEXT_DIRECTIONS[kind])
         )
@@ -359,6 +368,7 @@ def route_media_pricing_available(route: dict) -> bool:
         text_input_priced=route.get("input_price_per_token") is not None,
         text_output_priced=route.get("output_price_per_token") is not None,
         duration_families=_realtime_duration_families(kind, route.get("api_model_name")),
+        provider_type=route.get("provider_type"),
     )
 
 
@@ -608,15 +618,17 @@ def _effective_capabilities(
         # Media metadata does not imply an executable route. A real direct
         # provider, configured API key, supported price and asset pipeline matter.
         route_available = False
+        reservation_error = False
         kind = _kind(row)
-        if kind in {"image", "tts", "stt", "realtime"} and auth_mode == "api_key" and api_key_configured:
+        configured = auth_mode == "api_key" and api_key_configured
+        if kind == "realtime" or (configured and kind in {"image", "tts", "stt"}):
+            input_rate, output_rate = _effective_model_rates(row, provider_type, api_base)
             route = {
                 "model_kind": kind, "provider_type": provider_type,
                 "api_model_name": api_model_name(row.model_name, provider_type or ""),
-                "api_base": api_base, "api_key": "configured",
+                "api_base": api_base, "api_key": "configured" if configured else None,
                 "media_pricing": _effective_media_pricing(row, provider_type, api_base),
-                "input_price_per_token": _effective_model_rates(row, provider_type, api_base)[0],
-                "output_price_per_token": _effective_model_rates(row, provider_type, api_base)[1],
+                "input_price_per_token": input_rate, "output_price_per_token": output_rate,
                 "cache_read_price_per_token": _resolved_cache_prices(row, provider_type, api_base)[0]["cache_read_price_per_token"],
                 "provider_auth": None,
             }
@@ -625,7 +637,8 @@ def _effective_capabilities(
                 route_available = image_route_ready(route)
             elif kind == "realtime":
                 from .realtime_transport import realtime_route_ready
-                route_available = realtime_route_ready(route)
+                reservation_error = _realtime_reservation_too_small(route)
+                route_available = configured and not reservation_error and realtime_route_ready(route)
             else:
                 from .audio_transport import audio_route_ready
                 route_available = audio_route_ready(route)
@@ -649,6 +662,8 @@ def _effective_capabilities(
                         if ready
                         else "asset_pipeline_unavailable"
                         if route_available and needs_assets
+                        else "realtime_reservation_too_small"
+                        if reservation_error
                         else "route_unavailable"
                     )
                     if name in features
@@ -981,6 +996,18 @@ def _resolved_base_prices(
     return _resolved_model_prices(model, provider.provider_type, provider.api_base)
 
 
+def _realtime_reservation_too_small(route: dict) -> bool:
+    from .realtime_transport import RealtimeReservationTooSmall, validate_configured_reservation
+
+    try:
+        validate_configured_reservation(route)
+    except RealtimeReservationTooSmall:
+        return True
+    except ProviderValidationError:
+        pass  # Other invalid pricing is reported by the normal readiness checks.
+    return False
+
+
 def _resolved_model_prices(
     model: LlmModel, provider_type: str | None, api_base: str | None,
 ) -> tuple[Decimal | None, Decimal | None, str, str | None]:
@@ -996,8 +1023,11 @@ def _resolved_model_prices(
         media = _effective_media_pricing(model, provider_type, api_base)
         priced = media_pricing_available(
             kind, media, text_input_priced=input_price is not None, text_output_priced=output_price is not None,
-            duration_families=_realtime_duration_families(kind, model.model_name),
+            duration_families=_realtime_duration_families(kind, model.model_name), provider_type=provider_type,
         )
+        if priced and kind == "realtime":
+            priced = not _realtime_reservation_too_small({"model_kind": kind, "provider_type": provider_type,
+                "media_pricing": media, "input_price_per_token": input_price, "output_price_per_token": output_price})
     if priced:
         source = "manual" if manual else "native_catalog"
     else:

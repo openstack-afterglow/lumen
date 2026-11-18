@@ -145,6 +145,7 @@ async def lock_execution_routes(
     search: dict | None = None,
     advisor: dict | None = None,
     summary: dict | None = None,
+    svg_author: dict | None = None,
 ) -> None:
     """Lock all run routes in one global order, then verify their immutable hashes."""
     routes: list[tuple[str, dict]] = [("executor", executor)]
@@ -154,6 +155,8 @@ async def lock_execution_routes(
         routes.append(("advisor", advisor))
     if summary is not None:
         routes.append(("summary", summary))
+    if svg_author is not None:
+        routes.append(("svg_author", svg_author))
 
     provider_ids: set[int] = set()
     model_routes: list[dict] = []
@@ -817,6 +820,52 @@ async def resolve_model_by_id(model_id: int, *, model_kind: str = "text") -> dic
                 return _resolved_model(model, provider)
             except ProviderConfigurationChangedError:
                 return None
+    except OperationalError as exc:
+        mark_db_unhealthy()
+        raise ChatStorageUnavailable("chat DB 오류") from exc
+
+
+async def resolve_image_svg_authors(image_route: dict, *, model_name: str | None = None) -> list[dict]:
+    """Resolve registered text models on the fixed credential that will author the SVG."""
+    from .image_billing import selectable_svg_authors
+
+    identity = image_route.get("provider_auth")
+    if not isinstance(identity, dict) or image_route.get("provider_type") != "openai":
+        return []
+    allowed = selectable_svg_authors()
+    if model_name is not None:
+        if model_name not in allowed:
+            return []
+        allowed = {model_name: allowed[model_name]}
+    if not allowed:
+        return []
+    factory = _require_db()
+    try:
+        async with factory() as session:
+            candidates = set(allowed) | {f"openai/{name}" for name in allowed}
+            rows = (await session.execute(select(LlmModel, LlmProvider)
+                .join(LlmProvider, LlmModel.provider_id == LlmProvider.id)
+                .where(LlmProvider.id == image_route["provider_id"], LlmProvider.is_active.is_(True),
+                       LlmModel.model_kind == "text", LlmModel.is_active.is_(True),
+                       LlmModel.model_name.in_(candidates))
+                .order_by(LlmModel.id))).all()
+            authors: dict[str, list[dict]] = {}
+            for model, provider in rows:
+                wire_id = api_model_name(model.model_name, provider.provider_type)
+                if wire_id not in allowed or provider.provider_type != "openai" or provider.auth_mode != "api_key":
+                    continue
+                try:
+                    route = _resolved_model(model, provider, ref={**identity, "required_capabilities": ["chat"]})
+                except ProviderConfigurationChangedError:
+                    continue
+                if route["price_source"] not in {"native_catalog", "manual"}:
+                    continue
+                # Author usage has no modality split; never substitute the
+                # text tariff where a separately configured vision rate exists.
+                if (route.get("media_pricing") or {}).get("token_rates", {}).get("image"):
+                    continue
+                authors.setdefault(wire_id, []).append({**route, "svg_reasoning_efforts": allowed[wire_id]})
+            return [matches[0] for _, matches in sorted(authors.items()) if len(matches) == 1]
     except OperationalError as exc:
         mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc

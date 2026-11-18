@@ -81,6 +81,10 @@ def validate_batch_body(operation: str, body: dict, *, contract: str) -> dict:
         raise ValueError("batch requests must use stream=false")
     schema = OpenAIImageGenerationRequest if contract == "openai" and operation == "images.generations" else _NATIVE_MODELS[operation]
     validated = schema.model_validate(body).model_dump(mode="json", exclude_none=True)
+    if operation == "images.edits" and (
+            len(validated.get("input_asset_ids") or ()) > 1
+            or "mask_asset_id" in validated or "markup_asset_id" in validated):
+        raise ValueError("Batch image edits support only one source without mask or markup")
     if operation in {"chat.completions", "responses"}:
         if body.get("model") == "lumen":
             raise ValueError("virtual conversation model=lumen is not a batch operation")

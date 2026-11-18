@@ -58,7 +58,7 @@ FAKE_TOOL_ARGUMENTS = {"city": "Seoul"}
 BATCH_ERROR_SENTINEL = "SYSTEM_BATCH_CONFIRMED_ERROR"
 FAKE_ERROR_MESSAGE = "Intentional system batch provider error"
 # Explicit system-stack prices: text 1/3 USD per million tokens with fake usage 10/5,
-# gpt-image-1 1024x1024:high, tts-1 per character, whisper-1 per minute of a 1 s WAV.
+# gpt-image-2 1024x1024:high, tts-1 per character, whisper-1 per minute of a 1 s WAV.
 TEXT_RAW_COST = Decimal("0.000025")
 IMAGE_RAW_COST = Decimal("0.05")
 TTS_USD_PER_CHARACTER = Decimal("0.000015")
@@ -243,7 +243,7 @@ async def _media_models() -> dict[str, dict[str, Any]]:
     from lumen.db import close_db, get_session_factory, init_db
     from lumen.models.chat_db import LlmModel, LlmProvider
 
-    expected = {"image": "gpt-image-1", "tts": "tts-1", "stt": "whisper-1"}
+    expected = {"image": "gpt-image-2", "tts": "tts-1", "stt": "whisper-1"}
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     try:
         factory = get_session_factory()

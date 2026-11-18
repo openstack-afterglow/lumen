@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class OpenAIPromptCacheOptions(BaseModel):
@@ -143,11 +143,19 @@ class ResponsesRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
-class ImageGenerationRequest(BaseModel):
+class ImageOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model_id: str = Field(min_length=1, max_length=190)
-    provider_id: int | None = None
+    background: Literal["transparent", "opaque", "auto"] | None = None
+    output_format: Literal["png", "jpeg", "webp", "gif", "svg"] | None = None
+    output_compression: int | None = Field(default=None, ge=0, le=100, strict=True)
+    frame_count: int | None = Field(default=None, ge=2, le=16, strict=True)
+    frame_duration_ms: int | None = Field(default=None, ge=20, le=2000, strict=True)
+    stream: Literal[False] | None = None
+    partial_images: Literal[0] | None = None
+    moderation: Literal["auto", "low"] | None = None
+    svg_model: str | None = Field(default=None, min_length=1, max_length=190)
+    svg_reasoning_effort: str | None = Field(default=None, min_length=1, max_length=20)
     prompt: str = Field(min_length=1)
     size: str = "auto"
     quality: str = "auto"
@@ -155,23 +163,64 @@ class ImageGenerationRequest(BaseModel):
     complexity: Literal["low", "medium", "high"] | None = None
     n: int = Field(default=1, ge=1)
 
+    @field_validator("stream", "partial_images", mode="before")
+    @classmethod
+    def require_finite_output(cls, value, info):
+        disabled = value is False if info.field_name == "stream" else type(value) is int and value == 0
+        if value is not None and not disabled:
+            raise ValueError("image streaming and partial images are not supported")
+        return value
+
+
+class ImageGenerationRequest(ImageOptions):
+    model_id: str = Field(min_length=1, max_length=190)
+    provider_id: int | None = None
+
 
 class ImageEditRequest(ImageGenerationRequest):
-    input_asset_id: UUID
+    input_asset_id: UUID | None = None
+    input_asset_ids: list[UUID] | None = Field(default=None, min_length=1, max_length=16)
+    mask_asset_id: UUID | None = None
+    markup_asset_id: UUID | None = None
+    input_fidelity: Literal["low", "high"] | None = None
+
+    @model_validator(mode="after")
+    def validate_assets(self) -> ImageEditRequest:
+        if (self.input_asset_id is None) == (self.input_asset_ids is None):
+            raise ValueError("specify one of input_asset_id or input_asset_ids")
+        if self.mask_asset_id is not None and self.markup_asset_id is not None:
+            raise ValueError("mask and markup are mutually exclusive")
+        return self
 
 
-class OpenAIImageGenerationRequest(BaseModel):
+class OpenAIImageSvgReasoning(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    effort: str | None = Field(default=None, min_length=1, max_length=20)
+
+
+class OpenAIImageSvgOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str = Field(min_length=1, max_length=190)
+    reasoning: OpenAIImageSvgReasoning | None = None
+
+
+class OpenAIImageGenerationRequest(ImageOptions):
+    model: str = Field(min_length=1, max_length=190)
     provider: str | None = None
     provider_id: int | None = None
-    prompt: str = Field(min_length=1)
-    n: int = Field(default=1, ge=1)
-    size: str = "auto"
-    quality: str = "auto"
-    complexity: Literal["low", "medium", "high"] | None = None
     response_format: str = "b64_json"
+    svg: OpenAIImageSvgOptions | None = Field(default=None, exclude=True)
+
+    @model_validator(mode="after")
+    def normalize_svg(self) -> OpenAIImageGenerationRequest:
+        if self.svg is not None:
+            if self.svg_model is not None or self.svg_reasoning_effort is not None:
+                raise ValueError("specify either svg or flat SVG author options")
+            self.svg_model = self.svg.model
+            self.svg_reasoning_effort = self.svg.reasoning.effort if self.svg.reasoning else None
+        return self
 
 
 class SpeechRequest(BaseModel):
