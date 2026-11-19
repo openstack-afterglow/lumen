@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from lumen.scripts.test_layers import _compose_env, run_contract, run_integration, run_system
 
 
@@ -70,6 +72,15 @@ def test_run_integration_success(mock_run: MagicMock) -> None:
     projects = {call.kwargs["env"]["COMPOSE_PROJECT_NAME"] for call in calls}
     assert len(projects) == 1
     assert next(iter(projects)).startswith("lumen-integration-")
+
+
+@pytest.mark.parametrize("target", ["LUMEN_TEST_COMPOSE_PROJECT", "LUMEN_TEST_DATABASE_URL", "LUMEN_TEST_REDIS_URL"])
+def test_production_schema_never_touches_an_external_target(monkeypatch, capsys, target):
+    monkeypatch.setenv(target, "external-target")
+    with patch("subprocess.run") as run:
+        assert run_integration(production_schema=True) == 2
+    run.assert_not_called()
+    assert "requires an owned, disposable Compose stack" in capsys.readouterr().err
 
 
 @patch("subprocess.run")

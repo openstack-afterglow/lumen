@@ -81,20 +81,21 @@ async def test_migration_037_replays_after_partial_failure_and_twice():
     assert "KEY `idx_chat_usage_payer_user_created`" in clean["chat_usage_logs"]
 
 
+@pytest.mark.parametrize("migration_id", ["036-user-domain-scope", "037-domain-credit-pools"])
 @pytest.mark.parametrize("receipt", ["historical", "unknown"])
-async def test_original_037_receipt_is_accepted_without_rewrite(receipt):
-    """Databases that completed the original 037 bytes keep that receipt; any other drift still stops."""
+async def test_original_receipt_is_accepted_without_rewrite(migration_id, receipt):
+    """A known historical identity keeps its receipt; an unknown checksum still stops migration."""
     url = os.environ["DATABASE_URL"]
-    _path, historical_sha = HISTORICAL_RECEIPTS["037-domain-credit-pools"]
+    _path, historical_sha = HISTORICAL_RECEIPTS[migration_id]
     stored = historical_sha if receipt == "historical" else "0" * 64
+    select_receipt = text("SELECT sha256 FROM schema_migrations WHERE logical_id = :migration_id")
+    update_receipt = text("UPDATE schema_migrations SET sha256 = :sha WHERE logical_id = :migration_id")
+    params = {"migration_id": migration_id}
     engine = create_async_engine(url, pool_size=1, max_overflow=0)
     try:
         async with engine.begin() as connection:
-            current = (await connection.execute(text(
-                "SELECT sha256 FROM schema_migrations WHERE logical_id = '037-domain-credit-pools'"))).scalar_one()
-            await connection.execute(text(
-                "UPDATE schema_migrations SET sha256 = :sha WHERE logical_id = '037-domain-credit-pools'"),
-                {"sha": stored})
+            current = (await connection.execute(select_receipt, params)).scalar_one()
+            await connection.execute(update_receipt, {**params, "sha": stored})
         try:
             if receipt == "historical":
                 assert await migrate(url, apply=True, repair_schema_drift=False) == ([], 0)
@@ -103,13 +104,9 @@ async def test_original_037_receipt_is_accepted_without_rewrite(receipt):
                 with pytest.raises(MigrationLedgerError, match="drift"):
                     await migrate(url, apply=True, repair_schema_drift=False)
             async with engine.connect() as connection:
-                assert (await connection.execute(text(
-                    "SELECT sha256 FROM schema_migrations WHERE logical_id = '037-domain-credit-pools'"
-                ))).scalar_one() == stored
+                assert (await connection.execute(select_receipt, params)).scalar_one() == stored
         finally:
             async with engine.begin() as connection:
-                await connection.execute(text(
-                    "UPDATE schema_migrations SET sha256 = :sha WHERE logical_id = '037-domain-credit-pools'"),
-                    {"sha": current})
+                await connection.execute(update_receipt, {**params, "sha": current})
     finally:
         await engine.dispose()

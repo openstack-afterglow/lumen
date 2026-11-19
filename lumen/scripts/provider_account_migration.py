@@ -15,11 +15,14 @@ HISTORICAL_ID = "027-provider-account-credentials"
 HISTORICAL_PATH = "027_provider_account_credentials.sql"
 HISTORICAL_SHA256 = "ee01a94044de1c5466c9627bd25e21ba22ec5ef03abf63c8494818775700711a"
 DOMAIN_BILLING_ID = "037-domain-credit-pools"
-# Receipts written by an earlier byte version of a migration whose resulting schema is identical.
-# 037 was later made re-runnable (IF NOT EXISTS); databases that completed the original keep its
-# receipt, which both ledger checks accept as applied and never rewrite.
+USER_DOMAIN_SCOPE_ID = "036-user-domain-scope"
+# Receipts written by an earlier byte version of a migration. Databases that completed the original keep
+# its receipt, which both ledger checks accept as applied and never rewrite. 037 was later made
+# re-runnable (IF NOT EXISTS; identical schema). 036 later declared utf8mb4_bin for its new archive
+# table instead of inheriting the database default; an original-036 archive table keeps that default.
 HISTORICAL_RECEIPTS = {
     DOMAIN_BILLING_ID: ("037_domain_credit_pools.sql", "9233d802fb300e371f40eeaebbbbbca1aec2f7ea6c31697d3dcc80e5e992161b"),
+    USER_DOMAIN_SCOPE_ID: ("036_user_domain_scope.sql", "a7db69556f81cc95a89def6345961ce848bc640dc6893ef1b10f71f77cc51549"),
 }
 
 

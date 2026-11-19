@@ -8,7 +8,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from urllib.parse import urlsplit
 
-from sqlalchemy import and_, column, exists, func, or_, select, table, text, union, update
+from sqlalchemy import and_, cast, column, exists, func, or_, select, table, text, union, update
+from sqlalchemy.dialects.mysql import CHAR
 from sqlalchemy.exc import IntegrityError
 
 from lumen.db import get_session_factory
@@ -30,6 +31,15 @@ _LOGGER = logging.getLogger(__name__)
 _BATCH = 100
 _LOCK = "lumen:036:user-domain-scope"
 _VERIFIED = table("chat_scope_backfill_origins", column("project_id"), column("domain_id"))
+# Production tables mix utf8mb3_general_ci, utf8mb4_general_ci and utf8mb4_unicode_ci identifier
+# columns, and fresh servers pick their own defaults. Keystone IDs are exact identifiers, so every
+# compared column is converted to one charset first: COLLATE alone cannot change a utf8mb3 column.
+_ID_COLLATION = "utf8mb4_bin"
+
+
+def _exact_id(column):
+    """``CAST(column AS CHAR(64) CHARACTER SET utf8mb4) COLLATE utf8mb4_bin``."""
+    return cast(column, CHAR(64, charset="utf8mb4")).collate(_ID_COLLATION)
 
 
 @dataclass
@@ -50,13 +60,20 @@ class BackfillReport:
 
 
 def _origins():
+    def project(column):
+        return _exact_id(column).label("project_id")
+
     return union(
-        select(ChatMessageGraph.project_id.label("project_id")).where(ChatMessageGraph.domain_id.is_(None)),
-        select(ChatAgent.project_id).where(ChatAgent.domain_id.is_(None)),
-        select(ChatCustomTool.owner_project_id).where(ChatCustomTool.scope == "user", ChatCustomTool.domain_id.is_(None)),
-        select(ChatMcpServer.owner_project_id).where(ChatMcpServer.scope == "user", ChatMcpServer.owner_domain_id.is_(None)),
-        select(ChatMcpActivation.owner_project_id).where(ChatMcpActivation.owner_domain_id.is_(None)),
-        select(ChatMcpOAuthConnection.owner_project_id).join(
+        select(project(ChatMessageGraph.project_id)).where(ChatMessageGraph.domain_id.is_(None)),
+        select(project(ChatAgent.project_id)).where(ChatAgent.domain_id.is_(None)),
+        select(project(ChatCustomTool.owner_project_id)).where(
+            ChatCustomTool.scope == "user", ChatCustomTool.domain_id.is_(None),
+        ),
+        select(project(ChatMcpServer.owner_project_id)).where(
+            ChatMcpServer.scope == "user", ChatMcpServer.owner_domain_id.is_(None),
+        ),
+        select(project(ChatMcpActivation.owner_project_id)).where(ChatMcpActivation.owner_domain_id.is_(None)),
+        select(project(ChatMcpOAuthConnection.owner_project_id)).join(
             ChatMcpServer, ChatMcpServer.id == ChatMcpOAuthConnection.mcp_server_id,
         ).where(ChatMcpServer.scope != "domain", ChatMcpOAuthConnection.owner_domain_id.is_(None)),
     ).subquery()
@@ -245,7 +262,7 @@ async def _promote_extension(session, kind: str, item_id: int, project_id: str, 
         query = select(model, label_digest).where(
             model.scope == "user", model.owner_user_id == row.owner_user_id, ~restored,
             or_(scope_domain == domain_id, and_(
-                scope_domain.is_(None), model.owner_project_id.in_(
+                scope_domain.is_(None), _exact_id(model.owner_project_id).in_(
                     select(_VERIFIED.c.project_id).where(_VERIFIED.c.domain_id == domain_id),
                 ),
             )),
@@ -368,7 +385,8 @@ async def backfill_domain_scope(
         try:
             await connection.exec_driver_sql("""
                 CREATE TEMPORARY TABLE chat_scope_backfill_origins (
-                    project_id VARCHAR(64) PRIMARY KEY, domain_id VARCHAR(64) NOT NULL,
+                    project_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PRIMARY KEY,
+                    domain_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
                     KEY idx_domain (domain_id, project_id)
                 ) ENGINE=InnoDB
             """)

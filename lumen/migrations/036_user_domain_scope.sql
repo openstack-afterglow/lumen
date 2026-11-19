@@ -49,4 +49,4 @@ CREATE TABLE IF NOT EXISTS chat_extension_archives (
     restored_at DATETIME,
     KEY idx_chat_extension_archive_original (kind, original_id, entry_type),
     KEY idx_chat_extension_archive_owner (domain_id, owner_user_id, restored_at)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

@@ -592,6 +592,7 @@ Published stable `v0.6.2`는 0.6.1의 Redis5·database plugin0.1.1 recovery를 �
 | root service install | `uv sync --extra service --extra dev --frozen` | root service/test development dependencies; Kolla-Ansible은 설치하지 않는다 |
 | contract | `uv run lumen-test contract` | MariaDB/Redis/provider/Keystone를 fake 또는 in-process 경계로 둔다 |
 | integration | `uv run lumen-test integration` | MariaDB 11, Redis 7, migrations와 direct worker가 필요하다 |
+| 운영 스키마 업그레이드 검사 | `uv run lumen-test --production-schema integration -k "domain_scope or backfill or migration_reapplication or original_receipt"` | 격리 MariaDB 10.11·Redis에 0.6.20 혼합 collation DDL과 migration receipt를 적재한 뒤 036–040을 적용한다. 기존 Compose 프로젝트 또는 외부 DB·Redis를 대상으로 실행하지 않는다. |
 | system | `uv run lumen-test system` | Docker Compose process stack(API, online/batch-only worker, HTTPS MinIO, ClamAV, test CA), fake OpenAI/Responses/Anthropic/media TLS provider와 generated local credentials를 사용한다 |
 | native API-key durable path | `uv run pytest tests/integration/test_native_api_key_flow.py -q` | 실제 MariaDB/Redis가 필요하며 provider는 test-controlled path다 |
 | process stack | `uv run pytest tests/system/test_process_stack.py -q` | Docker stack과 fake provider; 실제 외부 provider proof가 아니다 |
@@ -674,9 +675,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6924049d8b88e551a50a61eef39ed53dd2f5eec7a6743d6fc7801898a5ce6758",
-  "reviewed_at": "2026-11-19T04:03:31Z",
-  "summary": "Lumen 0.6.21 release prep (final): domain scope, domain credit pools and usage views with domain_pool summary, personal/service keys with tool classification and gateway hold fix, Agent Vault with recoverable import, image token pricing, Gemini compat"
+  "source_sha256": "55dfab23a88befcff3bd25dd46accebc013ba26e812dd0a4b7fdd0c1bbed4729",
+  "reviewed_at": "2026-11-19T04:24:42Z",
+  "summary": "Normalize mixed MariaDB origin identifier charsets before domain backfill; preserve original 036 receipts; exercise the production-shaped schema on an owned disposable test stack"
 }
 ```
 <!-- architecture-review:end -->

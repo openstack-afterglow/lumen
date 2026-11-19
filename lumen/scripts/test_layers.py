@@ -14,6 +14,10 @@ import sys
 # collecting logs. Production workers and Nova guests must drain without a
 # forced timeout; this command is not an operational shutdown recipe.
 _TEARDOWN = ["down", "-v", "--remove-orphans", "--timeout", "1"]
+# Data-free DDL plus real ledger receipts observed on the production MariaDB 10.11 server.
+_PRODUCTION_SCHEMA = "tests/fixtures/production-0.6.20-schema.sql"
+_PRODUCTION_DATABASE = "ALTER DATABASE lumen CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;\nUSE lumen;\n"
+_EXTERNAL_INTEGRATION_TARGETS = ("LUMEN_TEST_COMPOSE_PROJECT", "LUMEN_TEST_DATABASE_URL", "LUMEN_TEST_REDIS_URL")
 
 
 def _run_cmd(cmd: list[str], env: dict[str, str] | None = None) -> int:
@@ -67,12 +71,32 @@ def run_contract(extra_args: list[str] | None = None) -> int:
     return code
 
 
-def run_integration(extra_args: list[str] | None = None) -> int:
-    """Run integration layer: start MariaDB+Redis from docker-compose.system.yml, run migrations, run pytest -m integration, tear down."""
+def _load_production_schema(compose_file: str, env: dict[str, str]) -> int:
+    """Replace the fresh database with the production-shaped schema and receipts before migrating."""
+    with open(_PRODUCTION_SCHEMA, encoding="utf-8") as fixture:
+        sql = _PRODUCTION_DATABASE + fixture.read()
+    command = ["docker", "compose", "-f", compose_file, "exec", "-T", "mariadb",
+               "mariadb", "-uroot", "-plocal-root-only"]
+    return subprocess.run(command, input=sql, text=True, env=env).returncode
+
+
+def run_integration(extra_args: list[str] | None = None, *, production_schema: bool = False) -> int:
+    """Run integration layer: start MariaDB+Redis from docker-compose.system.yml, run migrations, run pytest -m integration, tear down.
+
+    ``production_schema`` starts from the production 0.6.20 DDL (utf8mb3 database default, heterogeneous
+    collations) on MariaDB 10.11 unless ``LUMEN_TEST_MARIADB_IMAGE`` selects another image.
+    """
     extra = extra_args or []
     compose_file = "docker-compose.system.yml"
 
+    if production_schema and any(os.environ.get(name) for name in _EXTERNAL_INTEGRATION_TARGETS):
+        print("--production-schema requires an owned, disposable Compose stack; unset "
+              + ", ".join(_EXTERNAL_INTEGRATION_TARGETS), file=sys.stderr)
+        return 2
+
     env = _compose_env("integration")
+    if production_schema:
+        env.setdefault("LUMEN_TEST_MARIADB_IMAGE", "mariadb:10.11")
     mariadb_port = env["MARIADB_PORT"]
     redis_port = env["REDIS_PORT"]
 
@@ -102,6 +126,10 @@ def run_integration(extra_args: list[str] | None = None) -> int:
         )
         if up_code != 0:
             return up_code
+        if production_schema:
+            load_code = _load_production_schema(compose_file, env)
+            if load_code != 0:
+                return load_code
 
         # Ledger migrations only: the bootstrap schema repair would hide a migration that forgot an ORM index.
         mig_code = _run_cmd(["lumen-migrate", "--apply", "--no-schema-repair"], env=env)
@@ -158,16 +186,22 @@ def run_system(extra_args: list[str] | None = None) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lumen layered test environment runner.")
+    parser.add_argument(
+        "--production-schema", action="store_true",
+        help="integration only: migrate from the production-shaped 0.6.20 schema fixture (MariaDB 10.11)",
+    )
     parser.add_argument("layer", choices=["contract", "integration", "system"], help="Test layer to execute")
     parser.add_argument("extra", nargs=argparse.REMAINDER, help="Additional arguments forwarded to pytest")
 
     args = parser.parse_args()
+    if args.production_schema and args.layer != "integration":
+        parser.error("--production-schema is only supported for the integration layer")
 
     try:
         if args.layer == "contract":
             code = run_contract(args.extra)
         elif args.layer == "integration":
-            code = run_integration(args.extra)
+            code = run_integration(args.extra, production_schema=args.production_schema)
         elif args.layer == "system":
             code = run_system(args.extra)
         else:
