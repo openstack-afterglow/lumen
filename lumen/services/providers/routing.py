@@ -856,16 +856,22 @@ async def list_cli_models() -> list[dict]:
 _GEMINI_API_PROVIDER_TYPES = frozenset({"gemini", "openai", "anthropic", "perplexity"})
 
 
-def _gemini_api_model_row(model: LlmModel, provider: LlmProvider) -> dict | None:
-    """A route plain ``generateContent`` can execute: chat credentials, prices and text I/O.
+def _compat_text_row(model: LlmModel, provider: LlmProvider, operation: str) -> dict | None:
+    """A route a key caller can run through one compatibility ``operation``.
 
-    Unlike the coding-CLI gate, tools and streaming are not required; streaming
-    only decides whether ``streamGenerateContent`` is advertised.
+    ``chat`` (Gemini ``generateContent``) accepts API-key Gemini/OpenAI/Anthropic/
+    Perplexity routes; ``messages`` follows the model-level Messages transport
+    rule. Both require that operation's credential, prices, text I/O and a
+    sizeable payer hold. Unlike the coding-CLI gate, tools and streaming are not
+    required; streaming is reported so callers can advertise it.
     """
-    if (getattr(provider, "auth_mode", "api_key") != "api_key"
-            or provider.provider_type not in _GEMINI_API_PROVIDER_TYPES
-            or model.model_name.startswith(("chatgpt/", "anthropic-subscription/"))
-            or not _cli_credentials_configured(model, provider, required_capabilities=("chat",))):
+    auth_mode = getattr(provider, "auth_mode", "api_key")
+    if operation == "messages":
+        eligible = "messages" in _cli_transport_protocols(model, provider)
+    else:
+        eligible = (auth_mode == "api_key" and provider.provider_type in _GEMINI_API_PROVIDER_TYPES
+                    and not model.model_name.startswith(("chatgpt/", "anthropic-subscription/")))
+    if not eligible or not _cli_credentials_configured(model, provider, required_capabilities=(operation,)):
         return None
     input_price, output_price, price_source, _ = _resolved_base_prices(model, provider)
     if input_price is None or output_price is None:
@@ -878,8 +884,8 @@ def _gemini_api_model_row(model: LlmModel, provider: LlmProvider) -> dict | None
         provider_type=provider.provider_type,
         api_provider=provider.api_provider,
         provider_sort_order=provider.sort_order,
-        auth_mode="api_key",
-        api_key_configured=True,
+        auth_mode=auth_mode,
+        api_key_configured=auth_mode == "api_key",
         api_base=provider.api_base,
     )
     effective = public.get("effective_capabilities") or {}
@@ -910,7 +916,12 @@ def _gemini_api_model_row(model: LlmModel, provider: LlmProvider) -> dict | None
 
 async def list_gemini_api_models() -> list[dict]:
     """Text routes for the Gemini ``v1beta`` catalog, without decrypting credentials."""
-    return await _active_text_rows(_gemini_api_model_row)
+    return await _active_text_rows(lambda model, provider: _compat_text_row(model, provider, "chat"))
+
+
+async def list_messages_api_models() -> list[dict]:
+    """Text routes ``/v1/messages`` can execute for a key caller, without decrypting credentials."""
+    return await _active_text_rows(lambda model, provider: _compat_text_row(model, provider, "messages"))
 
 
 async def resolve_model_by_id(

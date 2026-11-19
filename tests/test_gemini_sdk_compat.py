@@ -18,6 +18,9 @@ import pytest
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
+from sdk_fixtures import model_key_principal as _model_key_principal
+from sdk_fixtures import personal_key_row as _personal_key_row
+from sdk_fixtures import record_holds as _record_holds
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -26,12 +29,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from lumen import auth
-from lumen.auth import model_key_storage_id
 from lumen.main import app
-from lumen.models.billing import Payer
 from lumen.models.chat_db import LlmModel, LlmProvider, LlmProviderAccount, LlmProviderCredential
-from lumen.services import api_key_store, credit, provider_client, stateless_credit
+from lumen.services import api_key_store, credit, provider_client
 from lumen.services.providers import credentials, routing
 
 pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
@@ -44,45 +44,6 @@ _CONTRACT = {"X-Lumen-Bifrost-Contract": "single-attempt-v1"}
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
-
-
-def _model_key_principal(scopes: tuple[str, ...]) -> dict:
-    """The post-038 personal model-key principal shape returned by ``verify_key``."""
-    return {"auth_type": "api_key", "credential_class": "personal_key", "domain_id": None,
-            "payer": Payer("user", "u1", None), "user_id": "u1", "project_id": model_key_storage_id(7),
-            "api_key_id": 7, "scopes": scopes, "credential_kind": "api_key", "expires_at": None,
-            "source": "api", "roles": [], "is_system_admin": False, "service_system_admin": False}
-
-
-def _personal_key_row(store, monkeypatch) -> None:
-    """Persisted personal model-key columns plus a synthetic live Keystone owner/domain."""
-    store.key.key_kind, store.key.credential_kind = "personal", "api_key"
-    store.key.owner_user_id, store.key.owner_domain_id = "u1", None
-    directory = SimpleNamespace(
-        users=SimpleNamespace(get=lambda user_id: SimpleNamespace(id=user_id, domain_id="d1", enabled=True)),
-        domains=SimpleNamespace(get=lambda domain_id: SimpleNamespace(id=domain_id, enabled=True)),
-    )
-    monkeypatch.setattr(auth, "_get_admin_ks_client", lambda: directory)
-
-
-def _record_holds(monkeypatch, state) -> None:
-    """Payer-scoped stateless holds: record reserve/settle/finish instead of SQL."""
-    state.holds = []
-
-    async def reserve(**kwargs):
-        state.holds.append(("reserve", kwargs["event_id"], kwargs["payer"]))
-
-    async def settle(**kwargs):
-        state.holds.append(("settle", kwargs["event_id"], kwargs["payer"]))
-        state.settled.append(kwargs)
-        return Decimal("0.000123")
-
-    async def finish(event_id, *, uncertain, payer=None):
-        state.holds.append(("finish", event_id, payer))
-
-    monkeypatch.setattr(stateless_credit, "reserve", reserve)
-    monkeypatch.setattr(stateless_credit, "settle", settle)
-    monkeypatch.setattr(stateless_credit, "finish", finish)
 
 
 class _Session(AbstractAsyncContextManager):
@@ -338,7 +299,10 @@ async def test_native_stream_chunks_then_usage(wire, boundary):
         model="gemini-sdk", contents="hello")]
 
     assert "".join(chunk.text or "" for chunk in chunks) == "gemini"
-    assert chunks[-1].usage_metadata.candidates_token_count == 4
+    final = chunks[-1]
+    assert final.usage_metadata.candidates_token_count == 4
+    # Usage rides on the held-back finish frame, never a candidate-less trailer.
+    assert final.candidates[0].finish_reason == types.FinishReason.STOP and final.text == "ini"
     assert all(chunk.usage_metadata is None for chunk in chunks[:-1])
     stream = next(item for item in wire.exchanges if item["path"].endswith(":streamGenerateContent"))
     assert stream["query"] == {"alt": "sse"}
@@ -453,7 +417,7 @@ async def test_embed_content_uses_gemini_embedding_route(wire, boundary):
     ("missing-model", None, 404, "NOT_FOUND"),
     ("lumen", None, 404, "NOT_FOUND"),
     ("gemini-sdk", types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]),
-     400, "INVALID_ARGUMENT"),
+     403, "PERMISSION_DENIED"),
     ("gemini-sdk", types.GenerateContentConfig(candidate_count=2), 400, "INVALID_ARGUMENT"),
     ("sdk-chat", types.GenerateContentConfig(top_k=3), 400, "INVALID_ARGUMENT"),
     ("sdk-chat", types.GenerateContentConfig(
@@ -465,6 +429,43 @@ async def test_generate_errors_use_google_shape(wire, boundary, model, config, c
         await _client(wire).aio.models.generate_content(model=model, contents="hello", config=config)
 
     assert (failure.value.code, failure.value.status) == (code, status)
+    assert boundary.bifrost == [] and boundary.settled == []
+
+
+@pytest.mark.parametrize("model", ["gemini-sdk", "sdk-chat", "missing-model"])
+@pytest.mark.parametrize("tool", [
+    types.Tool(google_search=types.GoogleSearch()),
+    types.Tool(code_execution=types.ToolCodeExecution()),
+    types.Tool(url_context=types.UrlContext()),
+])
+async def test_hosted_tools_are_refused_before_resolution(wire, boundary, model, tool):
+    with pytest.raises(genai_errors.ClientError) as failure:
+        await _client(wire).aio.models.generate_content(
+            model=model, contents="hello", config=types.GenerateContentConfig(tools=[tool]))
+
+    # Shared key tool policy: refused before model resolution, so even an unknown model is 403.
+    assert (failure.value.code, failure.value.status) == (403, "PERMISSION_DENIED")
+    assert failure.value.message.startswith("server_tool_not_allowed_for_key")
+    assert boundary.bifrost == [] and boundary.holds == []
+
+
+@pytest.mark.parametrize("model", ["gemini-sdk", "sdk-chat"])
+async def test_function_response_nested_parts_are_rejected(wire, boundary, model):
+    """Nested file references or bytes would reach the provider unmetered with its credential."""
+    call = types.Part(function_call=types.FunctionCall(id="c1", name="lookup", args={}))
+    smuggled = types.Part(function_response=types.FunctionResponse(
+        id="c1", name="lookup", response={"ok": True},
+        parts=[types.FunctionResponsePart(file_data=types.FunctionResponseFileData(
+            file_uri="https://generativelanguage.googleapis.com/v1beta/files/private", mime_type="application/pdf"))],
+    ))
+    contents = [types.Content(role="user", parts=[types.Part(text="look up")]),
+                types.Content(role="model", parts=[call]), types.Content(role="user", parts=[smuggled])]
+
+    with pytest.raises(genai_errors.ClientError) as failure:
+        await _client(wire).aio.models.generate_content(model=model, contents=contents)
+
+    assert (failure.value.code, failure.value.status) == (400, "INVALID_ARGUMENT")
+    assert "functionResponse" in failure.value.message
     assert boundary.bifrost == [] and boundary.settled == []
 
 

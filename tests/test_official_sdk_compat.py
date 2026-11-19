@@ -22,6 +22,9 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 from openai import AsyncOpenAI
+from sdk_fixtures import model_key_principal as _model_key_principal
+from sdk_fixtures import personal_key_row as _personal_key_row
+from sdk_fixtures import record_holds as _record_holds
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -34,7 +37,6 @@ from lumen.main import app
 from lumen.models.chat_db import LlmModel, LlmProvider, LlmProviderAccount, LlmProviderCredential
 from lumen.services import api_key_store, credit, provider_client
 from lumen.services.providers import credentials, routing
-from tests.test_gemini_sdk_compat import _model_key_principal, _personal_key_row, _record_holds
 
 pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
 
@@ -399,22 +401,28 @@ async def test_anthropic_sdk_lists_only_messages_eligible_routes(anthropic_sdk, 
                   "capabilities": {"context_limit": 200_000, "max_output_tokens": 8192},
                   "capability_source": "override"}
         session.add_all([LlmModel(id=31, provider_id=3, model_name="gpt-6.2-sol", **priced),
-                         LlmModel(id=41, provider_id=4, model_name="gemini-sdk", **priced)])
+                         LlmModel(id=41, provider_id=4, model_name="gemini-sdk", **priced),
+                         # Tools and streaming disabled: a coding-CLI refusal, not a Messages one.
+                         LlmModel(id=22, provider_id=2, model_name="claude-plain", sort_order=1,
+                                  input_price=_per_token("1"), output_price=_per_token("2"), price_source="manual",
+                                  capability_source="override", capabilities={
+                                      "context_limit": 200_000, "max_output_tokens": 8192,
+                                      "function_calling": False, "tool_call": False, "streaming": False})])
 
     page = await anthropic_sdk.models.list(limit=50)
 
     # The bounded official OpenAI row cannot settle through Messages and stays hidden.
-    assert [model.id for model in page.data] == ["sdk-chat", "claude-sdk", "gemini-sdk"]
+    assert [model.id for model in page.data] == ["sdk-chat", "claude-sdk", "claude-plain", "gemini-sdk"]
     for model in page.data:
         message = await anthropic_sdk.messages.create(
             model=model.id, max_tokens=16, messages=[{"role": "user", "content": "hello"}])
         assert [block.text for block in message.content] == ["anthropic ok"]
     assert [(call["protocol"], call["provider"]) for call in boundary.bifrost] == [
-        ("messages", "openai"), ("messages", "anthropic"), ("messages", "gemini")]
+        ("messages", "openai"), ("messages", "anthropic"), ("messages", "anthropic"), ("messages", "gemini")]
     with pytest.raises(anthropic.UnprocessableEntityError, match="messages_accounting_unsupported"):
         await anthropic_sdk.messages.create(
             model="gpt-6.2-sol", max_tokens=16, messages=[{"role": "user", "content": "hello"}])
-    assert len(boundary.bifrost) == 3
+    assert len(boundary.bifrost) == 4
 
 
 async def test_model_keys_never_see_or_call_sonar_built_in_search(openai_sdk, anthropic_sdk, wire, boundary, catalog):

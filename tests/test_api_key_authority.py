@@ -268,13 +268,28 @@ async def test_system_owner_key_has_service_authority_not_platform_admin(monkeyp
 async def test_gemini_api_key_header_uses_regular_scoped_key_authority(monkeypatch):
     monkeypatch.setattr(aks, "_verify_model_key_owner", lambda **kwargs: None)
     session = stored_key(monkeypatch, credential_kind="api_key", scopes=["embeddings:write"])
-    request = Request({"type": "http", "method": "POST", "path": "/v1beta/models/test:embedContent",
-                       "route": SimpleNamespace(path="/v1beta/models/{model}:embedContent"),
-                       "headers": [(b"x-goog-api-key", _RAW.encode())]})
-    principal = await auth.get_principal(request)
+    # The route template accepts exact ``lumen/<provider>/<model>`` IDs, so it carries a path converter.
+    template = "/v1beta/models/{model:path}:embedContent"
+    assert ("POST", template) in service_authority.MODEL_API_KEY_ROUTE_SCOPES
+
+    def gemini_request(route_template: str, path: str = "/v1beta/models/lumen/3/33:embedContent") -> Request:
+        return Request({"type": "http", "method": "POST", "path": path,
+                        "route": SimpleNamespace(path=route_template),
+                        "headers": [(b"x-goog-api-key", _RAW.encode())]})
+
+    principal = await auth.get_principal(gemini_request(template))
     assert principal["auth_type"] == "api_key"
     assert principal["api_key_id"] == 7
     assert principal["scopes"] == tuple(session.row.scopes)
+
+    # The same model-key route gate applies: an unlisted template or a missing scope is refused.
+    with pytest.raises(HTTPException) as unlisted:
+        await auth.get_principal(gemini_request("/v1beta/models/{model}:embedContent"))
+    assert unlisted.value.status_code == 403
+    with pytest.raises(HTTPException) as unscoped:
+        await auth.get_principal(gemini_request("/v1beta/models/{model:path}:generateContent",
+                                                "/v1beta/models/lumen/3/31:generateContent"))
+    assert unscoped.value.status_code == 403
 
     request_with_two_keys = Request({
         "type": "http", "method": "POST", "path": "/v1beta/models/test:embedContent",

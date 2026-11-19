@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
 from lumen.services import openai_compat
-from lumen.services.inference_authority import principal_may_use
+from lumen.services.inference_authority import HOSTED_TOOL_CODE, HOSTED_TOOL_MESSAGE, hosted_tools, principal_may_use
 from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 from lumen.services.providers import errors, routing
 
@@ -155,6 +155,18 @@ def _inline_image(data: Any, allowed: frozenset[str]) -> tuple[str, str]:
     return mime, payload
 
 
+def _function_part(part: dict, kind: str) -> dict:
+    """Closed functionCall/functionResponse: nested ``parts`` (file references,
+    non-image bytes) would reach the provider with its credential, unmetered."""
+    value = part[kind]
+    allowed, payload = ({"id", "name", "args"}, "args") if kind == "functionCall" else ({"id", "name", "response"}, "response")
+    if not isinstance(value, dict) or set(value) - allowed or not isinstance(value.get("name"), str):
+        raise _reject(f"{kind} supports only {', '.join(sorted(allowed))}")
+    if not isinstance(value.get(payload, {}), dict) or not isinstance(value.get("id", ""), str):
+        raise _reject(f"{kind}.{payload} must be an object")
+    return value
+
+
 def _validate_native_parts(parts: Any, role: str) -> None:
     if not isinstance(parts, list) or not parts:
         raise _reject(f"{role} content needs at least one part")
@@ -169,6 +181,8 @@ def _validate_native_parts(parts: Any, role: str) -> None:
             _inline_image(part["inlineData"], _NATIVE_IMAGES)
         if "text" in part and not isinstance(part["text"], str):
             raise _reject("part text must be a string")
+        for kind in kinds & {"functionCall", "functionResponse"}:
+            _function_part(part, kind)
 
 
 def _openai_schema(schema: Any) -> Any:
@@ -195,13 +209,15 @@ def _openai_schema(schema: Any) -> Any:
 
 
 def _function_tools(tools: list[dict] | None) -> list[dict]:
+    """Client function declarations; hosted tools were already refused by ``hosted_tools``."""
     declarations: list[dict] = []
     for tool in tools or ():
-        if set(tool) != {"functionDeclarations"}:
-            raise _reject("only tools.functionDeclarations are supported; server tools are not executed")
-        if not isinstance(tool["functionDeclarations"], list):
+        key = "functionDeclarations" if "functionDeclarations" in tool else "function_declarations"
+        if set(tool) != {key}:
+            raise _reject("each tool must declare only functionDeclarations")
+        if not isinstance(tool[key], list):
             raise _reject("functionDeclarations must be a list")
-        for declaration in tool["functionDeclarations"]:
+        for declaration in tool[key]:
             if not isinstance(declaration, dict) or not isinstance(declaration.get("name"), str):
                 raise _reject("each function declaration needs a name")
             if set(declaration) - {"name", "description", "parameters", "parametersJsonSchema"}:
@@ -274,7 +290,7 @@ def _chat_messages(body: GeminiGenerateRequest, *, images: frozenset[str], drop_
                 if "text" in part:
                     text.append(str(part["text"]))
                 elif "functionCall" in part:
-                    call = part["functionCall"]
+                    call = _function_part(part, "functionCall")
                     call_id = str(call.get("id") or f"call_{turn}_{index}")
                     pending.append((str(call.get("name")), call_id))
                     calls.append({"id": call_id, "type": "function", "function": {
@@ -289,7 +305,7 @@ def _chat_messages(body: GeminiGenerateRequest, *, images: frozenset[str], drop_
         user_parts: list[dict] = []
         for part in parts:
             if "functionResponse" in part:
-                response = part["functionResponse"]
+                response = _function_part(part, "functionResponse")
                 name = str(response.get("name"))
                 call_id = response.get("id")
                 if call_id is None:
@@ -368,6 +384,9 @@ def _error_frame(event: dict) -> str:
 # ── Generation ────────────────────────────────────────────────────────────────
 async def _prepare(model: str, body: GeminiGenerateRequest, provider: str | None, token_info: dict) -> dict:
     selector = model.removeprefix("models/")
+    # Same key tool policy as every compatibility route, before any provider resolution.
+    if hosted_tools(body.model_dump(exclude_none=True)):
+        raise core.CompletionError(403, f"{HOSTED_TOOL_CODE}: {HOSTED_TOOL_MESSAGE}", code=HOSTED_TOOL_CODE)
     if selector == openai_compat.VIRTUAL_MODEL_ID:
         raise core.CompletionError(404, f"model not found: {selector}")
     resolved = await core.resolve_api(selector, provider=provider, operation="chat")
@@ -414,7 +433,7 @@ def _translated_call(prepared: dict, token_info: dict) -> dict:
         "api_key_id": token_info.get("api_key_id"), "payer": token_info.get("payer"),
         "max_tokens": config.get("maxOutputTokens"), "temperature": config.get("temperature"),
         "tools": tools or None, "tool_choice": _tool_choice(None if not tools else prepared["toolConfig"]),
-        "options": _translated_options(config), "client_functions_only": True,
+        "options": _translated_options(config), "translated_options": True,
     }
 
 
