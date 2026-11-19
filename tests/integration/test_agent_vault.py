@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -129,6 +130,28 @@ async def test_immutable_notes_and_singletons(dashboard):
     result = await client.post("notes", json=payload)
     assert result.status_code == 422 and result.json() == {"detail": "secret_detected"}
     assert (await client.get("search", params={"query": "secret-shape"})).json() == []
+
+
+async def test_import_status_reports_deferred_origins_without_content(owner):
+    origin = f"deferred-origin-{uuid4().hex}"
+    async with get_session_factory()() as session, session.begin():
+        session.add_all([
+            ChatMemory(user_id=owner.user_id, project_id=origin, scope="project",
+                       content=encrypt_chat_content("Deferred fixture"),
+                       vault_migration_retry_at=datetime.now(UTC) + timedelta(minutes=15)),
+            ChatMemory(user_id=owner.user_id, project_id=origin, scope="project",
+                       content=encrypt_chat_content("Second deferred fixture"),
+                       vault_migration_retry_at=datetime.now(UTC) + timedelta(minutes=5)),
+            ChatMemory(user_id=owner.user_id, scope="account", content=encrypt_chat_content("Due fixture")),
+            ChatMemory(user_id=owner.user_id, scope="account", content=encrypt_chat_content("Sealed fixture"),
+                       vault_migration_status="origin_missing"),
+        ])
+    status = await vault_migration.migration_status()
+    rendered = json.dumps(status)
+    assert [item["rows"] for item in status["deferred_origins"] if item["project_id"] == origin] == [2]
+    assert status["pending"]["due"] >= 1 and status["pending"]["deferred"] >= 2
+    assert status["statuses"]["origin_missing"] >= 1 and status["statuses"]["pending"] >= 3
+    assert "fixture" not in rendered and owner.user_id not in rendered
 
 
 async def test_legacy_import_and_recall_use_verified_domain(owner, dashboard, monkeypatch):
