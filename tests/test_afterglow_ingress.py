@@ -145,6 +145,7 @@ async def test_vault_ingress_and_persistent_chat_admission(directory, monkeypatc
 
 def test_afterglow_raw_path_signature_matches_bff_fixed_vector(monkeypatch):
     monkeypatch.setenv("LUMEN_AFTERGLOW_INGRESS_SECRET", bytes(range(65, 97)).decode("ascii"))
+    afterglow_ingress.get_settings.cache_clear()
     monkeypatch.setattr(afterglow_ingress, "time", lambda: 1781234567)
     request = Request(
         {

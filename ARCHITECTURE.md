@@ -677,9 +677,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "ba167d525d484eeac18ee629f73236f575b992a29a26acf48da195c44a4f567e",
-  "reviewed_at": "2026-11-19T07:02:25Z",
-  "summary": "Lumen 0.6.21 follow-up: review dashboard credit admission and domain usage masking, document receipt boundaries after the 036 collation fix, and pin the Afterglow raw-path ingress vector. No production source changes."
+  "source_sha256": "2343713365d3da39332f7f08f7a8f33b1aa3f8d08979c065144dcc072a9b02c4",
+  "reviewed_at": "2026-11-19T07:22:50Z",
+  "summary": "Isolate the fixed Afterglow ingress test vector from cached plugin settings. No production code changes."
 }
 ```
 <!-- architecture-review:end -->
